@@ -1,6 +1,7 @@
 #include <iostream>
 #include <slang/util/BumpAllocator.h>
 #include <slang/util/SmallVector.h>
+#include <slang/util/Util.h>
 // #include <slang/util/Span.h>
 
 using namespace std;
@@ -22,6 +23,13 @@ int main() {
     for (int val : finalList) {
         std::cout << val << " ";
     }
+
+    // std::unique_ptr<int> ptr = std::make_unique<int>(42);
+    // not_null<int*> safe_ptr(ptr.get());
+
+    not_null<int*> test_ptr = new int(42);
+    std::cout << "Value: " << *test_ptr << "\n";
+    delete test_ptr.get(); // don't forget to free the memory
 
     return 0;
 }
