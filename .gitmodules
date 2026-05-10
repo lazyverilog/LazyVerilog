@@ -4,3 +4,6 @@
 [submodule "external/slang"]
 	path = external/slang
 	url = https://github.com/MikePopoloski/slang.git
+[submodule "external/LspCpp"]
+	path = external/LspCpp
+	url = https://github.com/kuafuwang/LspCpp.git
