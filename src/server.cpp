@@ -30,8 +30,6 @@
 #include "LibLsp/lsp/textDocument/inlayHint.h"
 #include "LibLsp/lsp/workspace/symbol.h"
 #include "syntax_index.hpp"
-#include <slang/diagnostics/DiagnosticEngine.h>
-#include <slang/text/SourceManager.h>
 #include <slang/syntax/SyntaxTree.h>
 
 #include <iostream>
@@ -201,41 +199,26 @@ void LazyVerilogServer::register_handlers() {
         }
     });
 
-    // Helper: convert slang parse diagnostics → LSP publishDiagnostics notification
+    // Helper: convert pre-formatted ParseDiagInfo → LSP publishDiagnostics notification
     auto publish_diags = [&](const std::string& uri) {
         try {
+            std::cerr << "[lazyverilog] publish_diags: " << uri << "\n";
             auto state = analyzer_.get_state(uri);
             Notify_TextDocumentPublishDiagnostics::notify notif;
             notif.params.uri.raw_uri_ = uri;
-            if (state && state->tree) {
-                auto& sm  = state->tree->sourceManager();
-                slang::DiagnosticEngine engine(sm);
+            if (state) {
                 for (const auto& d : state->parse_diagnostics) {
-                        lsDiagnostic ld;
-                        size_t ln = 0, col = 0;
-                        try {
-                            auto loc = d.location.valid()
-                                           ? sm.getFullyExpandedLoc(d.location)
-                                           : d.location;
-                            if (loc.valid() && sm.isFileLoc(loc)) {
-                                ln  = sm.getLineNumber(loc);
-                                col = sm.getColumnNumber(loc);
-                            }
-                        } catch (...) {}
-                        ld.range.start = lsPosition(ln  > 0 ? (int)ln  - 1 : 0,
-                                                    col > 0 ? (int)col - 1 : 0);
-                        ld.range.end   = ld.range.start;
-                        auto sev = slang::getDefaultSeverity(d.code);
-                        if (sev == slang::DiagnosticSeverity::Error ||
-                            sev == slang::DiagnosticSeverity::Fatal)
-                            ld.severity = lsDiagnosticSeverity::Error;
-                        else if (sev == slang::DiagnosticSeverity::Warning)
-                            ld.severity = lsDiagnosticSeverity::Warning;
-                        else
-                            ld.severity = lsDiagnosticSeverity::Information;
-                        ld.source  = std::string("lazyverilog");
-                        ld.message = engine.formatMessage(d);
-                        notif.params.diagnostics.push_back(std::move(ld));
+                    lsDiagnostic ld;
+                    ld.range.start = lsPosition(d.line, d.col);
+                    ld.range.end   = ld.range.start;
+                    switch (d.severity) {
+                        case 1:  ld.severity = lsDiagnosticSeverity::Error;       break;
+                        case 2:  ld.severity = lsDiagnosticSeverity::Warning;     break;
+                        default: ld.severity = lsDiagnosticSeverity::Information; break;
+                    }
+                    ld.source  = std::string("lazyverilog");
+                    ld.message = d.message;
+                    notif.params.diagnostics.push_back(std::move(ld));
                 }
             }
             ep.sendNotification(notif);
@@ -248,6 +231,7 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&, publish_diags](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
+            std::cerr << "[lazyverilog] didOpen: " << td.uri.raw_uri_ << "\n";
             analyzer_.open(td.uri.raw_uri_, td.text);
             publish_diags(td.uri.raw_uri_);
         } catch (const std::exception& e) {

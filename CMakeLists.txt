@@ -19,10 +19,12 @@ set(LSPCPP_BUILD_EXAMPLES OFF CACHE BOOL "Skip LspCpp examples" FORCE)
 set(OPTIONAL_BUILD_TESTS OFF CACHE BOOL "Skip tl-optional tests" FORCE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# External: fmt v11 — must come before find_package(slang) so slang's
-# find_dependency(fmt) resolves to our v11 build (slang was compiled against
-# fmt v11; the system package is v12 with incompatible ABI).
+# External: fmt v11 — must come before find_package(slang) so the system
+# slang's find_dependency(fmt) resolves to our v11 build (system slang was
+# compiled against fmt v11; the system package is v12 with incompatible ABI).
 # OVERRIDE_FIND_PACKAGE intercepts any downstream find_package(fmt) calls.
+# slang-nomimal exports its own slang::fmt; fmt::fmt is brought transitively
+# by slang::slang in both cases — do NOT link fmt::fmt explicitly.
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(
     fmt
@@ -98,7 +100,6 @@ target_include_directories(lazyverilog-lsp PRIVATE
 target_link_libraries(lazyverilog-lsp
     PRIVATE
         slang::slang
-        fmt::fmt
         lspcpp
         tomlplusplus::tomlplusplus
 )
