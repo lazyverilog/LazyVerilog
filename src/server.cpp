@@ -35,7 +35,6 @@
 #include <iostream>
 #include <memory>
 #include <filesystem>
-#include <stdexcept>
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -202,7 +201,6 @@ void LazyVerilogServer::register_handlers() {
     // Helper: convert pre-formatted ParseDiagInfo → LSP publishDiagnostics notification
     auto publish_diags = [&](const std::string& uri) {
         try {
-            std::cerr << "[lazyverilog] publish_diags: " << uri << "\n";
             auto state = analyzer_.get_state(uri);
             Notify_TextDocumentPublishDiagnostics::notify notif;
             notif.params.uri.raw_uri_ = uri;
@@ -231,7 +229,6 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&, publish_diags](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
-            std::cerr << "[lazyverilog] didOpen: " << td.uri.raw_uri_ << "\n";
             analyzer_.open(td.uri.raw_uri_, td.text);
             publish_diags(td.uri.raw_uri_);
         } catch (const std::exception& e) {

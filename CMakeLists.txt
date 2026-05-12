@@ -103,6 +103,11 @@ target_link_libraries(lazyverilog-lsp
         lspcpp
         tomlplusplus::tomlplusplus
 )
+# slang exports SLANG_DEBUG as an INTERFACE compile definition for Debug consumers,
+# but slang-nomimal is built Release (no SLANG_DEBUG). The flag changes SourceLocation
+# from 8→24 bytes and flips the x86-64 calling convention (value→hidden-pointer),
+# causing crashes. Force-undefine to match the library's Release ABI.
+target_compile_options(lazyverilog-lsp PRIVATE "-USLANG_DEBUG")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Test binary (Catch2)
@@ -138,6 +143,8 @@ target_link_libraries(lazyverilog-tests
         tomlplusplus::tomlplusplus
         Catch2::Catch2WithMain
 )
+
+target_compile_options(lazyverilog-tests PRIVATE "-USLANG_DEBUG")
 
 include(Catch)
 catch_discover_tests(lazyverilog-tests)

@@ -2,7 +2,6 @@
 #include "syntax_index.hpp"
 #include <algorithm>
 #include <cctype>
-#include <iostream>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
@@ -18,38 +17,20 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // contain internal pointers that are not safely copyable.
     if (state->tree) {
         const auto& diags = state->tree->diagnostics();
-        std::cerr << "A\n";
         auto& sm = state->tree->sourceManager();
-        std::cerr << "B\n";
         slang::DiagnosticEngine engine(sm);
-        std::cerr << "C\n";
         for (const auto& d : diags) {
-            std::cerr << "D\n";
             ParseDiagInfo info;
             try {
-                std::cerr << "EEE\n";
-                std::cerr << "G\n";
-                std::cerr << state->tree.get() << "\n";
-                // auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;
-                std::cerr << "FF\n";
-                std::cerr << "FFFF\n";
-                auto loc = d.location; // Crashing code.
-                std::cerr << "F\n";
+                auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;
                 if (loc.valid() && sm.isFileLoc(loc)) {
-                    std::cerr << "G\n";
-                    size_t ln = sm.getLineNumber(loc);
-                    std::cerr << "H\n";
+                    size_t ln  = sm.getLineNumber(loc);
                     size_t col = sm.getColumnNumber(loc);
-                    std::cerr << "I\n";
-                    info.line = ln > 0 ? (int)ln - 1 : 0;
-                    std::cerr << "J\n";
-                    info.col = col > 0 ? (int)col - 1 : 0;
-                    std::cerr << "K\n";
+                    info.line = ln  > 0 ? (int)ln  - 1 : 0;
+                    info.col  = col > 0 ? (int)col - 1 : 0;
                 }
-            } catch (...) {
-            }
+            } catch (...) {}
             auto sev = slang::getDefaultSeverity(d.code);
-            std::cerr << "L\n";
             if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
                 info.severity = 1;
             else if (sev == slang::DiagnosticSeverity::Warning)
