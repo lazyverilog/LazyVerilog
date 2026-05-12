@@ -67,10 +67,32 @@ Server registers these `executeCommand` commands (matching lazyverilogpy exactly
 
 ### Formatter
 
-`src/features/formatter.cpp` must produce output identical to `lazyverilogpy/formatter.py`:
+`src/features/formatter.cpp` produces output identical to `lazyverilogpy/formatter.py`:
 - Token-based; idempotent; semantics-neutral (whitespace only).
-- Disable regions: `// verilog_format: off` … `// verilog_format: on`.
-- `FormatOptions` fields mirror the Python `FormatOptions` dataclass.
+- Disable regions: `// verilog_format: off` … `// verilog_format: on`; `` `define `` macro bodies passed verbatim.
+- Passes (in order): `align_port_pass`, `align_assign_pass`, `align_var_pass`, `expand_instances_pass`, `format_portlist_pass`.
+- `FormatOptions` has nested structs: `StatementOptions`, `PortDeclarationOptions`, `VarDeclarationOptions`, `InstanceOptions`, `PortOptions` — mirrors Python `FormatOptions` exactly.
+
+### Lint
+
+`src/features/lint.cpp` — `LintVisitor` (slang `SyntaxVisitor` CRTP):
+
+| Rule | Config key | Trigger |
+|---|---|---|
+| case_missing_default | `[lint.statement]` | `CaseStatementSyntax` missing default item |
+| explicit_begin | `[lint.statement]` | (stub — visitor hook present, check not yet wired) |
+| functions_automatic | `[lint.function]` | `FunctionDeclarationSyntax` not automatic |
+| explicit_function_lifetime | `[lint.function]` | `FunctionDeclarationSyntax` missing lifetime |
+| explicit_task_lifetime | `[lint.function]` | `FunctionDeclarationSyntax` (task) missing lifetime |
+| latch_inference_detection | `[lint.statement]` | `always_comb` with incomplete if |
+| module_instantiation_style | `[lint.module]` | `HierarchyInstantiationSyntax` positional connections |
+| module_pattern | `[lint.naming]` | `ModuleDeclarationSyntax` name vs regex |
+| input_port_pattern | `[lint.naming]` | `ImplicitAnsiPortSyntax` / `PortDeclarationSyntax` input name vs regex |
+| output_port_pattern | `[lint.naming]` | same, output direction |
+| signal_pattern | `[lint.naming]` | `DataDeclarationSyntax` / `NetDeclarationSyntax` declarator names |
+| register_pattern | `[lint.naming]` | nonblocking assignment LHS in `always_ff` vs regex |
+
+`NamingConfig` (nested in `LintConfig`) holds all pattern strings; regexes compiled at `LintVisitor` construction. `[lint.naming].enable` must be `true` for naming rules to run.
 
 ## Architecture
 
