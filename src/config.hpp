@@ -77,6 +77,24 @@ struct FormatOptions {
     PortOptions            port;
 };
 
+struct NamingConfig {
+    bool        enable{false};
+    std::string severity{"warning"};  // "warning" | "error" | "hint"
+    std::string module_pattern;
+    std::string input_port_pattern;
+    std::string output_port_pattern;
+    std::string signal_pattern;
+    std::string interface_pattern;
+    std::string struct_pattern;
+    std::string union_pattern;
+    std::string enum_pattern;
+    std::string parameter_pattern;
+    std::string localparam_pattern;
+    std::string register_pattern;
+    bool        check_module_filename{false};
+    bool        check_package_filename{false};
+};
+
 struct LintConfig {
     // All rules default disabled; activated via [lint.*] in lazyverilog.toml
     bool case_missing_default{false};
@@ -86,7 +104,8 @@ struct LintConfig {
     bool module_instantiation_style{false};
     bool latch_inference_detection{false};
     bool explicit_begin{false};
-    bool register_naming{false};
+    bool register_naming{false};  // legacy flat key; also set when naming.register_pattern is non-empty
+    NamingConfig naming;
 };
 
 struct AutoinstOptions {

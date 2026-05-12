@@ -141,12 +141,26 @@ Config load_config(const std::filesystem::path& root) {
                     set_bool(mod, "module_instantiation_style", cfg.lint.module_instantiation_style);
                 }
             }
-            // Nested subtable: [lint.naming] — register_naming enabled when register_pattern non-empty
+            // Nested subtable: [lint.naming]
             if (auto nm = (*lint)["naming"].as_table()) {
+                set_bool(nm, "enable",                  cfg.lint.naming.enable);
+                if (auto v = (*nm)["severity"].value<std::string>())           cfg.lint.naming.severity = *v;
+                if (auto v = (*nm)["module_pattern"].value<std::string>())     cfg.lint.naming.module_pattern = *v;
+                if (auto v = (*nm)["input_port_pattern"].value<std::string>()) cfg.lint.naming.input_port_pattern = *v;
+                if (auto v = (*nm)["output_port_pattern"].value<std::string>()) cfg.lint.naming.output_port_pattern = *v;
+                if (auto v = (*nm)["signal_pattern"].value<std::string>())     cfg.lint.naming.signal_pattern = *v;
+                if (auto v = (*nm)["interface_pattern"].value<std::string>())  cfg.lint.naming.interface_pattern = *v;
+                if (auto v = (*nm)["struct_pattern"].value<std::string>())     cfg.lint.naming.struct_pattern = *v;
+                if (auto v = (*nm)["union_pattern"].value<std::string>())      cfg.lint.naming.union_pattern = *v;
+                if (auto v = (*nm)["enum_pattern"].value<std::string>())       cfg.lint.naming.enum_pattern = *v;
+                if (auto v = (*nm)["parameter_pattern"].value<std::string>())  cfg.lint.naming.parameter_pattern = *v;
+                if (auto v = (*nm)["localparam_pattern"].value<std::string>()) cfg.lint.naming.localparam_pattern = *v;
+                if (auto v = (*nm)["register_pattern"].value<std::string>())   cfg.lint.naming.register_pattern = *v;
+                set_bool(nm, "check_module_filename",   cfg.lint.naming.check_module_filename);
+                set_bool(nm, "check_package_filename",  cfg.lint.naming.check_package_filename);
+                // Legacy: register_naming bool also set when register_pattern non-empty
                 set_bool(nm, "register_naming", cfg.lint.register_naming);
-                if (auto v = (*nm)["register_pattern"].value<std::string>()) {
-                    if (!v->empty()) cfg.lint.register_naming = true;
-                }
+                if (!cfg.lint.naming.register_pattern.empty()) cfg.lint.register_naming = true;
             }
         }
 
