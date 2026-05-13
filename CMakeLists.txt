@@ -9,7 +9,7 @@ include(FetchContent)
 include(CTest)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LspCpp flags — MUST be set BEFORE add_subdirectory(external/LspCpp)
+# LspCpp flags — MUST be set BEFORE FetchContent_MakeAvailable(LspCpp)
 # LSPCPP_STANDALONE_ASIO: use vendored asio (third_party/asio) instead of Boost
 # LSPCPP_USE_CPP17: use tl::optional instead of boost::optional
 # ──────────────────────────────────────────────────────────────────────────────
@@ -19,12 +19,10 @@ set(LSPCPP_BUILD_EXAMPLES OFF CACHE BOOL "Skip LspCpp examples" FORCE)
 set(OPTIONAL_BUILD_TESTS OFF CACHE BOOL "Skip tl-optional tests" FORCE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# External: fmt v11 — must come before find_package(slang) so the system
-# slang's find_dependency(fmt) resolves to our v11 build (system slang was
-# compiled against fmt v11; the system package is v12 with incompatible ABI).
-# OVERRIDE_FIND_PACKAGE intercepts any downstream find_package(fmt) calls.
-# slang-nomimal exports its own slang::fmt; fmt::fmt is brought transitively
-# by slang::slang in both cases — do NOT link fmt::fmt explicitly.
+# External: fmt v11
+# OVERRIDE_FIND_PACKAGE lets downstream dependencies reuse this pinned fmt.
+# fmt::fmt is brought transitively by slang::slang — do NOT link fmt::fmt
+# explicitly.
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(
     fmt
@@ -57,12 +55,28 @@ FetchContent_MakeAvailable(Catch2)
 # ──────────────────────────────────────────────────────────────────────────────
 # External: slang (SystemVerilog compiler/analyzer)
 # ──────────────────────────────────────────────────────────────────────────────
-find_package(slang REQUIRED)
+set(SLANG_INCLUDE_TOOLS OFF CACHE BOOL "Skip slang tools" FORCE)
+set(SLANG_INCLUDE_TESTS OFF CACHE BOOL "Skip slang tests" FORCE)
+set(SLANG_INCLUDE_DOCS OFF CACHE BOOL "Skip slang docs" FORCE)
+set(SLANG_INCLUDE_PYLIB OFF CACHE BOOL "Skip slang Python bindings" FORCE)
+set(SLANG_INCLUDE_INSTALL OFF CACHE BOOL "Skip slang install targets" FORCE)
+FetchContent_Declare(
+    slang
+    GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
+    GIT_TAG        v10.0
+)
+FetchContent_MakeAvailable(slang)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
 # ──────────────────────────────────────────────────────────────────────────────
-add_subdirectory(external/LspCpp)
+FetchContent_Declare(
+    LspCpp
+    GIT_REPOSITORY https://github.com/kuafuwang/LspCpp.git
+    GIT_TAG        82b3d75
+    GIT_SUBMODULES "third_party/asio;third_party/ixwebsocket"
+)
+FetchContent_MakeAvailable(LspCpp)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main LSP server binary
@@ -95,7 +109,7 @@ set(LAZYVERILOG_SOURCES
 add_executable(lazyverilog-lsp ${LAZYVERILOG_SOURCES})
 target_include_directories(lazyverilog-lsp PRIVATE
     src
-    external/LspCpp/include
+    ${lspcpp_SOURCE_DIR}/include
 )
 target_link_libraries(lazyverilog-lsp
     PRIVATE
@@ -103,11 +117,6 @@ target_link_libraries(lazyverilog-lsp
         lspcpp
         tomlplusplus::tomlplusplus
 )
-# slang exports SLANG_DEBUG as an INTERFACE compile definition for Debug consumers,
-# but slang-nomimal is built Release (no SLANG_DEBUG). The flag changes SourceLocation
-# from 8→24 bytes and flips the x86-64 calling convention (value→hidden-pointer),
-# causing crashes. Force-undefine to match the library's Release ABI.
-target_compile_options(lazyverilog-lsp PRIVATE "-USLANG_DEBUG")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Test binary (Catch2)
@@ -145,7 +154,7 @@ set(LAZYVERILOG_TEST_SOURCES
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
 target_include_directories(lazyverilog-tests PRIVATE
     src
-    external/LspCpp/include
+    ${lspcpp_SOURCE_DIR}/include
 )
 target_link_libraries(lazyverilog-tests
     PRIVATE
@@ -154,8 +163,6 @@ target_link_libraries(lazyverilog-tests
         tomlplusplus::tomlplusplus
         Catch2::Catch2WithMain
 )
-
-target_compile_options(lazyverilog-tests PRIVATE "-USLANG_DEBUG")
 
 include(Catch)
 catch_discover_tests(lazyverilog-tests)

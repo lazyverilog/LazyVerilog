@@ -1,5 +1,6 @@
 #include "autowire.hpp"
 #include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
 #include <algorithm>
