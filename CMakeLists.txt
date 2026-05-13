@@ -52,6 +52,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
+FetchContent_Declare(
+    mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG        v2.2.4
+)
+FetchContent_MakeAvailable(mimalloc)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # External: slang (SystemVerilog compiler/analyzer)
 # ──────────────────────────────────────────────────────────────────────────────
