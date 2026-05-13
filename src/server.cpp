@@ -31,6 +31,12 @@
 #include "LibLsp/lsp/textDocument/signature_help.h"
 #include "LibLsp/lsp/windows/MessageNotify.h"
 #include "LibLsp/lsp/workspace/symbol.h"
+#include "features/autoinst.hpp"
+#include "features/autoarg.hpp"
+#include "features/autowire.hpp"
+#include "features/autoff.hpp"
+#include "features/autofunc.hpp"
+#include "features/code_action.hpp"
 #include "features/definition.hpp"
 #include "features/formatter.hpp"
 #include "features/hover.hpp"
@@ -40,6 +46,8 @@
 #include "features/rename.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
+#include "LibLsp/JsonRpc/serializer.h"
+#include "LibLsp/lsp/workspace/execute_command.h"
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
@@ -589,6 +597,196 @@ void LazyVerilogServer::register_handlers() {
             rsp.result = provide_workspace_symbols(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] workspaceSymbol error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/codeAction ───────────────────────────────────────────────
+    ep.registerHandler([&](const td_codeActionCode::request& req) {
+        td_codeActionCode::response rsp;
+        rsp.id = req.id;
+        try {
+            rsp.result = provide_code_actions(analyzer_, config_, req.params);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] codeAction error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── workspace/executeCommand ──────────────────────────────────────────────
+    ep.registerHandler([&](const wp_executeCommand::request& req) {
+        wp_executeCommand::response rsp;
+        rsp.id = req.id;
+        try {
+            const auto& cmd = req.params.command;
+            const auto& args = req.params.arguments;
+
+            auto get_string = [&](size_t i) -> std::string {
+                if (!args || i >= args->size()) return {};
+                std::string s;
+                const_cast<lsp::Any&>((*args)[i]).Get(s);
+                return s;
+            };
+            auto get_int = [&](size_t i) -> int {
+                if (!args || i >= args->size()) return 0;
+                int v = 0;
+                const_cast<lsp::Any&>((*args)[i]).Get(v);
+                return v;
+            };
+
+            auto apply_ff_edits = [&](const AutoffResult& result, const std::string& uri) {
+                if (result.has_error || (result.edits.empty() && result.warn)) {
+                    // Return null result
+                    lsp::Any null_result;
+                    null_result.SetJsonString("null", lsp::Any::kNullType);
+                    rsp.result = std::move(null_result);
+                    return;
+                }
+                if (result.edits.empty()) return;
+
+                auto state = analyzer_.get_state(uri);
+                if (!state) return;
+
+                // Apply edits in reverse order to build new text
+                auto lines = [&]() {
+                    std::vector<std::string> ls;
+                    size_t start = 0;
+                    const std::string& t = state->text;
+                    while (start <= t.size()) {
+                        size_t end = t.find('\n', start);
+                        if (end == std::string::npos) { ls.push_back(t.substr(start)); break; }
+                        ls.push_back(t.substr(start, end - start));
+                        start = end + 1;
+                    }
+                    return ls;
+                }();
+
+                // Insert edits (already sorted in reverse line order)
+                for (const auto& edit : result.edits) {
+                    if (edit.line >= 0 && edit.line <= (int)lines.size()) {
+                        // Split edit.text into lines and insert before lines[edit.line]
+                        std::vector<std::string> new_lines;
+                        std::string remaining = edit.text;
+                        size_t pos = 0;
+                        while (pos <= remaining.size()) {
+                            size_t nl = remaining.find('\n', pos);
+                            if (nl == std::string::npos) {
+                                if (pos < remaining.size())
+                                    new_lines.push_back(remaining.substr(pos));
+                                break;
+                            }
+                            new_lines.push_back(remaining.substr(pos, nl - pos));
+                            pos = nl + 1;
+                        }
+                        lines.insert(lines.begin() + edit.line, new_lines.begin(), new_lines.end());
+                    }
+                }
+
+                std::string new_text;
+                for (size_t i = 0; i < lines.size(); ++i) {
+                    if (i > 0) new_text += "\n";
+                    new_text += lines[i];
+                }
+
+                // Build workspace edit JSON and set as result
+                lsWorkspaceEdit we;
+                lsTextEdit text_edit;
+                text_edit.range.start = lsPosition(0, 0);
+                text_edit.range.end = lsPosition(999999, 0);
+                text_edit.newText = new_text;
+                we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
+                (*we.changes)[uri] = {text_edit};
+
+                // Serialize WorkspaceEdit manually to JSON
+                std::string json = "{\"changes\":{\"" + uri + "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":999999,\"character\":0}},\"newText\":";
+                // JSON-encode the newText
+                std::string escaped_text = "\"";
+                for (char c : new_text) {
+                    if (c == '"') escaped_text += "\\\"";
+                    else if (c == '\\') escaped_text += "\\\\";
+                    else if (c == '\n') escaped_text += "\\n";
+                    else if (c == '\r') escaped_text += "\\r";
+                    else if (c == '\t') escaped_text += "\\t";
+                    else escaped_text += c;
+                }
+                escaped_text += "\"";
+                json += escaped_text + "}]}}";
+                rsp.result.SetJsonString(json, lsp::Any::kObjectType);
+            };
+
+            if (cmd == "lazyverilogpy.autoffPreview" || cmd == "lazyverilogpy.autoffApply") {
+                std::string uri = get_string(0);
+                int ff_line = get_int(1);
+                auto state = analyzer_.get_state(uri);
+                if (state) {
+                    auto result = autoff(*state, ff_line, config_.lint.naming.register_pattern);
+                    apply_ff_edits(result, uri);
+                }
+            } else if (cmd == "lazyverilogpy.autoffAllPreview" || cmd == "lazyverilogpy.autoffAllApply") {
+                std::string uri = get_string(0);
+                auto state = analyzer_.get_state(uri);
+                if (state) {
+                    auto result = autoff_all(*state, config_.lint.naming.register_pattern);
+                    apply_ff_edits(result, uri);
+                }
+            } else if (cmd == "lazyverilogpy.autowire" || cmd == "lazyverilogpy.autowirepreview") {
+                std::string uri = get_string(0);
+                auto state = analyzer_.get_state(uri);
+                if (state && state->tree) {
+                    auto idx = SyntaxIndex::build(*state->tree, state->text);
+                    if (cmd == "lazyverilogpy.autowirepreview") {
+                        auto preview = autowire_preview(*state, idx, config_.autowire);
+                        // Return preview lines as JSON array of strings
+                        std::string json = "[";
+                        for (size_t i = 0; i < preview.size(); ++i) {
+                            if (i > 0) json += ",";
+                            json += "\"";
+                            for (char c : preview[i]) {
+                                if (c == '"') json += "\\\"";
+                                else if (c == '\\') json += "\\\\";
+                                else if (c == '\n') json += "\\n";
+                                else json += c;
+                            }
+                            json += "\"";
+                        }
+                        json += "]";
+                        rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
+                    } else {
+                        std::string new_source = autowire_apply(*state, idx, config_.autowire);
+                        if (new_source != state->text) {
+                            lsWorkspaceEdit we;
+                            lsTextEdit text_edit;
+                            text_edit.range.start = lsPosition(0, 0);
+                            text_edit.range.end = lsPosition(999999, 0);
+                            text_edit.newText = new_source;
+                            we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
+                            (*we.changes)[uri] = {text_edit};
+                            // Serialize WorkspaceEdit manually to JSON
+                            std::string json = "{\"changes\":{\"" + uri + "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":999999,\"character\":0}},\"newText\":";
+                            std::string esc = "\"";
+                            for (char c : new_source) {
+                                if (c == '"') esc += "\\\"";
+                                else if (c == '\\') esc += "\\\\";
+                                else if (c == '\n') esc += "\\n";
+                                else if (c == '\r') esc += "\\r";
+                                else if (c == '\t') esc += "\\t";
+                                else esc += c;
+                            }
+                            esc += "\"";
+                            json += esc + "}]}}";
+                            rsp.result.SetJsonString(json, lsp::Any::kObjectType);
+                        }
+                    }
+                }
+            }
+            // Other commands (rtlTree, connect, interface, lint) — return null for now
+            if (rsp.result.GetType() == lsp::Any::Type::kUnKnown) {
+                lsp::Any null_result;
+                null_result.SetJsonString("null", lsp::Any::kNullType);
+                rsp.result = std::move(null_result);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] executeCommand error: " << e.what() << "\n";
         }
         return rsp;
     });

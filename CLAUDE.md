@@ -1,4 +1,8 @@
 # CLAUDE.md
+## Goal of this project
+This is a C++ rewrite of the Python LSP server at `lazyverilogpy` (`~/.local/share/nvim/site/pack/core/opt/lazyverilogpy`).
+**Behavior must be identical** — same LSP commands, same feature semantics, same `lazyverilog.toml` config schema.
+
 ## Build
 ```bash
 # Configure (run once; slang must already be installed system-wide)
@@ -40,14 +44,6 @@ cat /tmp/lsp-cpp.log         # JSON-RPC traffic
 cat /tmp/lsp-cpp.log.stderr  # server stderr / crash output
 ```
 
-Expected: at least one diagnostic entry with `source = "lazyverilog"`. `{}` means the server didn't attach or produced no diagnostics.
-
-## Relationship to lazyverilogpy
-
-This is a C++ rewrite of the Python LSP server at `lazyverilogpy` (`~/.local/share/nvim/site/pack/core/opt/lazyverilogpy`). **Behavior must be identical** — same LSP commands, same feature semantics, same `lazyverilog.toml` config schema.
-
-The Python reference uses `pyslang` (Python bindings to slang); this rewrite uses slang's C++ API directly. When implementing or fixing a feature, consult `lazyverilogpy`'s corresponding `.py` file for the expected behavior.
-
 ### Analyzer internals (ported from Python)
 
 - `set_extra_files(paths)` re-parses all open docs immediately.
@@ -58,7 +54,8 @@ The Python reference uses `pyslang` (Python bindings to slang); this rewrite use
 
 ### Compilation guard
 
-**Rule:** Never use `state.compilation` in any feature when `perf.background_compilation` is `false`. All features must degrade gracefully to `SyntaxTree`-only when compilation is disabled.
+**Rule:** Never use `state.compilation` in any feature when `perf.background_compilation` is `false`.
+All features must degrade gracefully to `SyntaxTree`-only when compilation is disabled.
 
 ### LSP commands
 
@@ -133,4 +130,8 @@ All lint rules default **off**; enable individually under `[lint.*]`. `[perf].ba
 
 ### slang usage
 
-`SyntaxTree` (parse only, no elaboration) is always built. `Compilation` (full elaboration) is optional and controlled by `perf.background_compilation`. Prefer `SyntaxTree`-only paths unless semantic information is strictly required. `slang-playground/` is an optional scratch target for API experimentation; it is not part of the server.
+`SyntaxTree` (parse only, no elaboration) is always built.
+`Compilation` (full elaboration) is optional and controlled by `perf.background_compilation`.
+Prefer `SyntaxTree`-only paths unless semantic information is strictly required.
+it is not part of the server.
+

@@ -22,7 +22,7 @@ function packet_t sum(input packet_t i_a, input i_b);
     return packet_t'({40'b0, i_a} + i_b);
 endfunction
 
-task add_numbers(input int a, input int b, output int result);
+task add_number(input int a, input int b, output int result);
     result = a + b;
 endtask
 
@@ -67,7 +67,6 @@ reg signed          [7:0]               kj                                      
 // b
 /* ehlo */  // logic           [2:0]                   d                           ;
 
-static int                              a                                       ;
 automatic int       [3:0]               b                                       ;
 
 wire                [1:0]               addr                                    ;
@@ -89,7 +88,7 @@ memory #(.MEM_SIZE(3)) u_memory (
     .data_in    (intercontest ),
     .read_write (read_wsssrite),
     .chip_en    (tt           ),
-    .www3test   (             ),
+    .www3test   (a            ),
     .data_out   (threeshit    )
 );
 
@@ -180,7 +179,7 @@ always_comb begin
 
     sum(.i_a(i_a2), .i_b(i_b));
     sum(1, 2);
-    add_numbers(.a(a2), .b(b), .result(result));
+    add_number(.a(a2), .b(b), .result(result));
 end
 
 initial begin

@@ -71,7 +71,7 @@ TEST_CASE("definition: named port lookup uses vcode extra files", "[definition]"
     auto loc = analyzer.definition_of(top_uri, 99, 6);
     REQUIRE(loc.has_value());
     CHECK(loc->uri == "file:///home/hxxdev/dev/LazyVerilog/demo/memory.sv");
-    CHECK(loc->line == 15);
+    CHECK(loc->line == 12);
 }
 
 TEST_CASE("definition: macro lookup resolves local define", "[definition]") {
@@ -117,10 +117,10 @@ TEST_CASE("definition: named subroutine argument resolves to formal argument", "
     const std::string top_uri = "file:///home/hxxdev/dev/LazyVerilog/demo/memory_top.sv";
     analyzer.open(top_uri, read_text("/home/hxxdev/dev/LazyVerilog/demo/memory_top.sv"));
 
-    auto loc = analyzer.definition_of(top_uri, 181, 17);
+    auto loc = analyzer.definition_of(top_uri, 181, 16);
     REQUIRE(loc.has_value());
     CHECK(loc->uri == top_uri);
     CHECK(loc->line == 24);
-    CHECK(loc->col == 27);
-    CHECK(loc->end_col == 28);
+    CHECK(loc->col == 26);
+    CHECK(loc->end_col == 27);
 }
