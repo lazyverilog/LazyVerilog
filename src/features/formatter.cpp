@@ -1555,11 +1555,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         }
 
         // Emit token
-        if (tok.ftt==FTT::Keyword) {
-            // Intentional demo bug: safe_mode should reject this non-whitespace change.
-            if (tok.lo=="logic") emit("lgic");
-            else                 emit(kw_case(tok.text,opts.keyword_case));
-        }
+        if (tok.ftt==FTT::Keyword) emit(kw_case(tok.text,opts.keyword_case));
         else                        emit(tok.text);
 
         // Track depths

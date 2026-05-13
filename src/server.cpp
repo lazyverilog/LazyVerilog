@@ -33,7 +33,13 @@
 #include "LibLsp/lsp/workspace/symbol.h"
 #include "features/definition.hpp"
 #include "features/formatter.hpp"
+#include "features/hover.hpp"
+#include "features/inlay_hints.hpp"
 #include "features/lint.hpp"
+#include "features/references.hpp"
+#include "features/rename.hpp"
+#include "features/signature_help.hpp"
+#include "features/workspace_symbols.hpp"
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
@@ -437,22 +443,8 @@ void LazyVerilogServer::register_handlers() {
         td_hover::response rsp;
         rsp.id = req.id;
         try {
-            const auto& uri = req.params.textDocument.uri.raw_uri_;
-            int line = req.params.position.line;
-            int col = req.params.position.character;
-            auto sym = analyzer_.symbol_at(uri, line, col);
-            if (sym && sym->kind != "unknown") {
-                std::string md = "**" + sym->name + "**";
-                if (!sym->kind.empty())
-                    md += " *(" + sym->kind + ")*";
-                if (!sym->detail.empty())
-                    md += "\n\n" + sym->detail;
-                MarkupContent mc;
-                mc.kind = "markdown";
-                mc.value = std::move(md);
-                rsp.result.contents.first = TextDocumentHover::Left{}; // no marked strings
-                rsp.result.contents.second = optional<MarkupContent>(std::move(mc));
-            }
+            if (auto hover = provide_hover(analyzer_, req.params))
+                rsp.result = std::move(*hover);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] hover error: " << e.what() << "\n";
         }
@@ -481,23 +473,7 @@ void LazyVerilogServer::register_handlers() {
         td_references::response rsp;
         rsp.id = req.id;
         try {
-            const auto& uri = req.params.textDocument.uri.raw_uri_;
-            int line = req.params.position.line;
-            int col = req.params.position.character;
-            auto sym = analyzer_.symbol_at(uri, line, col);
-            if (sym) {
-                auto occs = analyzer_.find_occurrences(uri, sym->name);
-                std::vector<lsLocation> locs;
-                locs.reserve(occs.size());
-                for (auto& [ln, c] : occs) {
-                    lsLocation loc;
-                    loc.uri.raw_uri_ = uri;
-                    loc.range.start = lsPosition(ln, c);
-                    loc.range.end = lsPosition(ln, c + (int)sym->name.size());
-                    locs.push_back(std::move(loc));
-                }
-                rsp.result = std::move(locs);
-            }
+            rsp.result = provide_references(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] references error: " << e.what() << "\n";
         }
@@ -509,18 +485,9 @@ void LazyVerilogServer::register_handlers() {
         td_prepareRename::response rsp;
         rsp.id = req.id;
         try {
-            const auto& uri = req.params.textDocument.uri.raw_uri_;
-            int line = req.params.position.line;
-            int col = req.params.position.character;
-            auto sym = analyzer_.symbol_at(uri, line, col);
-            if (sym && sym->kind != "unknown") {
-                PrepareRenameResult pr;
-                pr.range.start = lsPosition(line, col);
-                pr.range.end = lsPosition(line, col + (int)sym->name.size());
-                pr.placeholder = sym->name;
+            if (auto prepared = prepare_rename(analyzer_, req.params))
                 rsp.result = std::make_pair(optional<lsRange>{},
-                                            optional<PrepareRenameResult>(std::move(pr)));
-            }
+                                            optional<PrepareRenameResult>(std::move(*prepared)));
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] prepareRename error: " << e.what() << "\n";
         }
@@ -532,27 +499,7 @@ void LazyVerilogServer::register_handlers() {
         td_rename::response rsp;
         rsp.id = req.id;
         try {
-            const auto& uri = req.params.textDocument.uri.raw_uri_;
-            const auto& newName = req.params.newName;
-            int line = req.params.position.line;
-            int col = req.params.position.character;
-            auto sym = analyzer_.symbol_at(uri, line, col);
-            if (sym && !sym->name.empty()) {
-                auto occs = analyzer_.find_occurrences(uri, sym->name);
-                std::vector<lsTextEdit> edits;
-                edits.reserve(occs.size());
-                for (auto& [ln, c] : occs) {
-                    lsTextEdit e;
-                    e.range.start = lsPosition(ln, c);
-                    e.range.end = lsPosition(ln, c + (int)sym->name.size());
-                    e.newText = newName;
-                    edits.push_back(std::move(e));
-                }
-                lsWorkspaceEdit we;
-                we.changes =
-                    std::map<std::string, std::vector<lsTextEdit>>{{uri, std::move(edits)}};
-                rsp.result = std::move(we);
-            }
+            rsp.result = provide_rename(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] rename error: " << e.what() << "\n";
         }
@@ -609,8 +556,12 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const td_signatureHelp::request& req) {
         td_signatureHelp::response rsp;
         rsp.id = req.id;
-        // SyntaxTree-only: no function signature analysis; return empty
-        (void)req;
+        try {
+            if (auto help = provide_signature_help(analyzer_, req.params))
+                rsp.result = std::move(*help);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] signatureHelp error: " << e.what() << "\n";
+        }
         return rsp;
     });
 
@@ -622,44 +573,8 @@ void LazyVerilogServer::register_handlers() {
             if (!config_.inlay_hint.enable)
                 return rsp;
             const auto& uri = req.params.textDocument.uri.raw_uri_;
-            auto state = analyzer_.get_state(uri);
-            if (!state || !state->tree)
-                return rsp;
-
-            auto idx = SyntaxIndex::build(*state->tree, state->text);
-            std::vector<lsInlayHint> hints;
-
-            for (const auto& inst : idx.instances) {
-                // Find module definition for port direction lookup
-                const ModuleEntry* mod_def = nullptr;
-                for (const auto& m : idx.modules)
-                    if (m.name == inst.module_name) {
-                        mod_def = &m;
-                        break;
-                    }
-                if (!mod_def)
-                    continue;
-
-                for (const auto& conn : inst.connections) {
-                    // Find matching port
-                    const PortEntry* pe = nullptr;
-                    for (const auto& p : mod_def->ports)
-                        if (p.name == conn.port_name) {
-                            pe = &p;
-                            break;
-                        }
-                    if (!pe)
-                        continue;
-
-                    // Hint shows direction before the .portname
-                    lsInlayHint hint;
-                    hint.position = lsPosition(conn.line > 0 ? conn.line - 1 : 0, conn.col);
-                    hint.label = pe->direction + " ";
-                    hint.kind = optional<lsInlayHintKind>(lsInlayHintKind::Parameter);
-                    hints.push_back(std::move(hint));
-                }
-            }
-            rsp.result = std::move(hints);
+            rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
+                                             req.params.range.end.line);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] inlayHint error: " << e.what() << "\n";
         }
@@ -671,37 +586,7 @@ void LazyVerilogServer::register_handlers() {
         wp_symbol::response rsp;
         rsp.id = req.id;
         try {
-            const std::string& query = req.params.query;
-            std::vector<lsSymbolInformation> syms;
-            analyzer_.for_each_state(
-                [&](const std::string& uri, const std::shared_ptr<const DocumentState>& state) {
-                    if (!state || !state->tree)
-                        return;
-                    auto idx = SyntaxIndex::build(*state->tree, state->text);
-                    for (const auto& m : idx.modules) {
-                        if (!query.empty() && m.name.find(query) == std::string::npos)
-                            continue;
-                        lsSymbolInformation si;
-                        si.name = m.name;
-                        si.kind = lsSymbolKind::Module;
-                        si.location.uri.raw_uri_ = uri;
-                        si.location.range.start = lsPosition(m.line > 0 ? m.line - 1 : 0, 0);
-                        si.location.range.end = si.location.range.start;
-                        syms.push_back(std::move(si));
-                    }
-                    for (const auto& inst : idx.instances) {
-                        if (!query.empty() && inst.instance_name.find(query) == std::string::npos)
-                            continue;
-                        lsSymbolInformation si;
-                        si.name = inst.instance_name;
-                        si.kind = lsSymbolKind::Object;
-                        si.location.uri.raw_uri_ = uri;
-                        si.location.range.start = lsPosition(inst.line > 0 ? inst.line - 1 : 0, 0);
-                        si.location.range.end = si.location.range.start;
-                        syms.push_back(std::move(si));
-                    }
-                });
-            rsp.result = std::move(syms);
+            rsp.result = provide_workspace_symbols(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] workspaceSymbol error: " << e.what() << "\n";
         }

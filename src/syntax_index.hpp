@@ -27,12 +27,15 @@ struct NamedPortConn {
     std::string port_name;
     int line{0};
     int col{0};
+    int hint_col{0};
 };
 
 struct InstanceEntry {
     std::string module_name;
     std::string instance_name;
     int line{0};
+    int start_line{0}; // 0-based
+    int end_line{0};   // 0-based
     std::vector<NamedPortConn> connections;
 };
 

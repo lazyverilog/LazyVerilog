@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <memory>
+#include <set>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -81,6 +84,11 @@ void Analyzer::close(const std::string& uri) {
     docs_.erase(uri);
 }
 
+std::vector<std::string> Analyzer::extra_files() const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    return extra_files_;
+}
+
 std::shared_ptr<const DocumentState> Analyzer::get_state(const std::string& uri) const {
     std::lock_guard<std::mutex> lock(map_mutex_);
     auto it = docs_.find(uri);
@@ -129,6 +137,10 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
 
     return IdentifierSpan{std::string(src.substr(start, end - start)), (int)(start - ls),
                           (int)(end - ls)};
+}
+
+static bool same_location(const Location& lhs, const Location& rhs) {
+    return lhs.uri == rhs.uri && lhs.line == rhs.line && lhs.col == rhs.col;
 }
 
 static std::string extract_ident(std::string_view src, int line, int col) {
@@ -209,6 +221,80 @@ static Location location_from_token_actual_uri(const slang::SourceManager& sm,
     return loc;
 }
 
+static std::string read_file_text(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return {};
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+static std::string trim_copy(std::string text) {
+    auto first =
+        std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
+    auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) {
+                    return std::isspace(c);
+                }).base();
+    if (first >= last)
+        return {};
+    return std::string(first, last);
+}
+
+static std::string format_ports_doc(const std::string& ports_text) {
+    auto text = trim_copy(ports_text);
+    if (text.size() < 2 || text.front() != '(' || text.back() != ')')
+        return text;
+
+    auto inner = trim_copy(text.substr(1, text.size() - 2));
+    if (inner.empty())
+        return "()";
+
+    std::vector<std::string> ports;
+    size_t start = 0;
+    while (start <= inner.size()) {
+        const size_t comma = inner.find(',', start);
+        if (comma == std::string::npos) {
+            ports.push_back(trim_copy(inner.substr(start)));
+            break;
+        }
+        ports.push_back(trim_copy(inner.substr(start, comma - start)));
+        start = comma + 1;
+    }
+    if (ports.size() <= 1)
+        return "(" + inner + ")";
+
+    std::string out = "(\n";
+    for (size_t i = 0; i < ports.size(); ++i) {
+        out += "    " + ports[i];
+        if (i + 1 != ports.size())
+            out += ",\n";
+    }
+    out += "\n)";
+    return out;
+}
+
+static std::string module_doc_from_entry(const ModuleEntry& module) {
+    if (module.ports.empty())
+        return {};
+
+    size_t max_dir = 0;
+    size_t max_type = 0;
+    for (const auto& port : module.ports) {
+        max_dir = std::max(max_dir, port.direction.size());
+        max_type = std::max(max_type, port.type.size());
+    }
+
+    std::string doc = "```\nmodule " + module.name;
+    for (const auto& port : module.ports) {
+        doc += "\n  " + port.direction;
+        doc += std::string(max_dir - port.direction.size(), ' ');
+        doc += "  " + port.type;
+        doc += std::string(max_type - port.type.size(), ' ');
+        doc += "  " + port.name;
+    }
+    doc += "\n```";
+    return doc;
+}
+
 static std::optional<Location> find_macro_definition(const slang::syntax::SyntaxTree& tree,
                                                      const std::string& uri,
                                                      const std::string& name) {
@@ -218,6 +304,38 @@ static std::optional<Location> find_macro_definition(const slang::syntax::Syntax
             return location_from_token_actual_uri(sm, uri, macro->name);
     }
     return std::nullopt;
+}
+
+static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree& tree,
+                                                 const std::string& uri,
+                                                 const std::string& name) {
+    const auto& sm = tree.sourceManager();
+    for (const auto* macro : tree.getDefinedMacros()) {
+        if (!macro || macro->name.valueText() != name)
+            continue;
+
+        std::string body;
+        for (const auto& token : macro->body)
+            body += token.toString();
+        body = trim_copy(body);
+
+        auto loc = location_from_token_actual_uri(sm, uri, macro->name);
+        return SymbolInfo{.name = name,
+                          .kind = "macro",
+                          .detail = body.empty() ? "(empty)" : body,
+                          .line = loc.line,
+                          .col = loc.col};
+    }
+    return std::nullopt;
+}
+
+static std::optional<SymbolInfo> find_macro_info_in_file(const std::filesystem::path& path,
+                                                         const std::string& name) {
+    slang::SourceManager sm;
+    auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path.string(), sm);
+    if (!tree_or_error)
+        return std::nullopt;
+    return find_macro_info(**tree_or_error, path_to_uri(path), name);
 }
 
 static std::optional<Location> find_macro_definition_in_file(const std::filesystem::path& path,
@@ -355,6 +473,223 @@ find_generic_definition_in_file(const std::filesystem::path& path, const std::st
     if (!tree_or_error)
         return std::nullopt;
     return find_generic_definition(**tree_or_error, path_to_uri(path), name, preferred_module);
+}
+
+static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
+                              const Location& location) {
+    if (!token || !token.location().valid())
+        return false;
+    const auto token_location = location_from_token_actual_uri(sm, location.uri, token);
+    return token_location.uri == location.uri && token_location.line == location.line &&
+           token_location.col == location.col;
+}
+
+static std::string token_text(const slang::parsing::Token& token) {
+    return token ? std::string(token.valueText()) : std::string{};
+}
+
+static std::string name_text(const slang::syntax::NameSyntax& name) {
+    if (const auto* identifier = name.as_if<slang::syntax::IdentifierNameSyntax>())
+        return token_text(identifier->identifier);
+    return trim_copy(name.toString());
+}
+
+static std::optional<SymbolInfo>
+symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                            const std::string& name, const Location& definition) {
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        const std::string& name;
+        const Location& definition;
+        const SyntaxIndex& index;
+        std::optional<SymbolInfo> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, const std::string& name,
+                const Location& definition, const SyntaxIndex& index)
+            : sm(sm), uri(uri), name(name), definition(definition), index(index) {}
+
+        void set_from_token(const slang::parsing::Token& token, std::string kind,
+                            std::string detail) {
+            if (result || token.valueText() != name || !token_at_location(sm, token, definition))
+                return;
+            result = SymbolInfo{.name = name,
+                                .kind = std::move(kind),
+                                .detail = std::move(detail),
+                                .line = definition.line,
+                                .col = definition.col};
+        }
+
+        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+            if (result || node.header->name.valueText() != name ||
+                !token_at_location(sm, node.header->name, definition)) {
+                visitDefault(node);
+                return;
+            }
+
+            std::string doc;
+            for (const auto& module : index.modules) {
+                if (module.name == name) {
+                    doc = module_doc_from_entry(module);
+                    break;
+                }
+            }
+
+            result = SymbolInfo{.name = name,
+                                .kind = "module",
+                                .detail = "module",
+                                .doc = std::move(doc),
+                                .line = definition.line,
+                                .col = definition.col};
+            if (!result)
+                visitDefault(node);
+        }
+
+        void handle(const slang::syntax::ImplicitAnsiPortSyntax& node) {
+            if (!node.declarator)
+                return;
+            std::string detail;
+            if (node.header) {
+                if (const auto* variable =
+                        node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
+                    detail = token_text(variable->direction);
+                    auto type = trim_copy(variable->dataType->toString());
+                    if (!type.empty())
+                        detail += (detail.empty() ? "" : " ") + type;
+                } else if (const auto* net =
+                               node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
+                    detail = token_text(net->direction);
+                    auto type = trim_copy(net->dataType->toString());
+                    if (!type.empty())
+                        detail += (detail.empty() ? "" : " ") + type;
+                }
+            }
+            set_from_token(node.declarator->name, "port", detail);
+        }
+
+        void handle(const slang::syntax::ExplicitAnsiPortSyntax& node) {
+            set_from_token(node.name, "port", token_text(node.direction));
+        }
+
+        void handle(const slang::syntax::PortDeclarationSyntax& node) {
+            std::string detail;
+            if (const auto* variable =
+                    node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
+                detail = token_text(variable->direction);
+                auto type = trim_copy(variable->dataType->toString());
+                if (!type.empty())
+                    detail += (detail.empty() ? "" : " ") + type;
+            } else if (const auto* net = node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
+                detail = token_text(net->direction);
+                auto type = trim_copy(net->dataType->toString());
+                if (!type.empty())
+                    detail += (detail.empty() ? "" : " ") + type;
+            }
+            for (const auto* declarator : node.declarators) {
+                if (declarator)
+                    set_from_token(declarator->name, "port", detail);
+            }
+        }
+
+        void handle(const slang::syntax::DataDeclarationSyntax& node) {
+            for (const auto* declarator : node.declarators) {
+                if (declarator)
+                    set_from_token(declarator->name, "variable", "");
+            }
+        }
+
+        void handle(const slang::syntax::NetDeclarationSyntax& node) {
+            auto detail = token_text(node.netType);
+            auto type = trim_copy(node.type->toString());
+            if (!type.empty())
+                detail += (detail.empty() ? "" : " ") + type;
+            for (const auto* declarator : node.declarators) {
+                if (declarator)
+                    set_from_token(declarator->name, "net", detail);
+            }
+        }
+
+        void handle(const slang::syntax::LocalVariableDeclarationSyntax& node) {
+            for (const auto* declarator : node.declarators) {
+                if (declarator)
+                    set_from_token(declarator->name, "variable", "");
+            }
+        }
+
+        void handle(const slang::syntax::ParameterDeclarationSyntax& node) {
+            auto detail = trim_copy(node.type->toString());
+            for (const auto* declarator : node.declarators) {
+                if (!declarator)
+                    continue;
+                auto param_detail = detail;
+                if (declarator->initializer)
+                    param_detail += (param_detail.empty() ? "" : " ") + std::string("= ") +
+                                    trim_copy(declarator->initializer->expr->toString());
+                set_from_token(declarator->name, "parameter", param_detail);
+            }
+        }
+
+        void handle(const slang::syntax::FunctionPortSyntax& node) {
+            auto detail = token_text(node.direction);
+            if (node.dataType) {
+                auto type = trim_copy(node.dataType->toString());
+                if (!type.empty())
+                    detail += (detail.empty() ? "" : " ") + type;
+            }
+            set_from_token(node.declarator->name, "argument", detail);
+        }
+
+        void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
+            if (const auto* identifier =
+                    node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>()) {
+                auto kind = node.kind == slang::syntax::SyntaxKind::TaskDeclaration ? "task"
+                                                                                    : "function";
+                std::string doc;
+                std::string detail(kind);
+                if (node.kind == slang::syntax::SyntaxKind::TaskDeclaration) {
+                    auto ports =
+                        node.prototype->portList ? node.prototype->portList->toString() : "";
+                    doc = "```\ntask " + name + format_ports_doc(ports) + "\n```";
+                } else {
+                    auto return_type = trim_copy(node.prototype->returnType->toString());
+                    auto ports =
+                        node.prototype->portList ? node.prototype->portList->toString() : "";
+                    doc = "```\nfunction " + return_type + " " + name +
+                          format_ports_doc(ports) + "\n```";
+                }
+                if (identifier->identifier.valueText() == name &&
+                    token_at_location(sm, identifier->identifier, definition)) {
+                    result = SymbolInfo{.name = name,
+                                        .kind = kind,
+                                        .detail = detail,
+                                        .doc = std::move(doc),
+                                        .line = definition.line,
+                                        .col = definition.col};
+                }
+            }
+            if (!result)
+                visitDefault(node);
+        }
+
+        void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
+            set_from_token(node.name, "typedef", trim_copy(node.type->toString()));
+        }
+    };
+
+    auto index = SyntaxIndex::build(tree);
+    Visitor visitor(tree.sourceManager(), uri, name, definition, index);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+static std::optional<SymbolInfo> symbol_info_from_definition_file(const std::filesystem::path& path,
+                                                                  const std::string& name,
+                                                                  const Location& definition) {
+    slang::SourceManager sm;
+    auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path.string(), sm);
+    if (!tree_or_error)
+        return std::nullopt;
+    return symbol_info_from_definition(**tree_or_error, path_to_uri(path), name, definition);
 }
 
 static slang::SourceRange visible_range_for_token(const slang::SourceManager& sm,
@@ -548,19 +883,124 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         return std::nullopt;
 
     auto idx = SyntaxIndex::build(*state->tree, state->text);
+    auto target = definition_target_at(*state->tree, line, col);
+    std::vector<std::string> extra_files;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        extra_files = extra_files_;
+    }
+
+    if (target.kind == DefinitionTargetKind::Macro) {
+        if (auto info = find_macro_info(*state->tree, uri, target.name))
+            return info;
+        for (const auto& path : extra_files) {
+            if (auto info = find_macro_info_in_file(path, target.name))
+                return info;
+        }
+        return SymbolInfo{.name = target.name,
+                          .kind = "macro",
+                          .detail = "(empty)",
+                          .line = line,
+                          .col = col};
+    }
 
     for (const auto& m : idx.modules) {
         if (m.name == ident)
-            return SymbolInfo{ident, "module", "", m.line, 0};
+            return SymbolInfo{.name = ident,
+                              .kind = "module",
+                              .detail = "module",
+                              .doc = module_doc_from_entry(m),
+                              .line = m.line,
+                              .col = m.col};
         for (const auto& p : m.ports)
             if (p.name == ident)
-                return SymbolInfo{ident, "port", p.direction, p.line, 0};
+                return SymbolInfo{.name = ident,
+                                  .kind = "port",
+                                  .detail = p.direction + (p.type.empty() ? "" : " " + p.type),
+                                  .line = p.line,
+                                  .col = p.col};
     }
     for (const auto& inst : idx.instances)
         if (inst.instance_name == ident)
-            return SymbolInfo{ident, "instance", inst.module_name, inst.line, 0};
+            return SymbolInfo{.name = ident,
+                              .kind = "instance",
+                              .detail = inst.module_name,
+                              .line = inst.line,
+                              .col = 0};
 
-    return SymbolInfo{ident, "unknown", "", line, col};
+    auto definition = definition_of(uri, line, col);
+    if (definition) {
+        std::string name = target.name.empty() ? ident : target.name;
+        if (definition->uri == uri) {
+            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+                return info;
+        } else {
+            for (const auto& path : extra_files) {
+                if (path_to_uri(path) != definition->uri)
+                    continue;
+                if (auto info = symbol_info_from_definition_file(path, name, *definition))
+                    return info;
+            }
+        }
+
+        if (target.kind == DefinitionTargetKind::Instance)
+            return SymbolInfo{.name = target.module_name,
+                              .kind = "module",
+                              .detail = "module",
+                              .line = definition->line,
+                              .col = definition->col};
+        if (target.kind == DefinitionTargetKind::NamedArgument)
+            return SymbolInfo{.name = target.name,
+                              .kind = "argument",
+                              .line = definition->line,
+                              .col = definition->col};
+        if (target.kind == DefinitionTargetKind::NamedPort)
+            return SymbolInfo{.name = target.name,
+                              .kind = "port",
+                              .line = definition->line,
+                              .col = definition->col};
+        return SymbolInfo{
+            .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};
+    }
+
+    return SymbolInfo{.name = ident, .kind = "unknown", .line = line, .col = col};
+}
+
+std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& uri, int line,
+                                                            int col) const {
+    auto state = get_state(uri);
+    if (!state || !state->tree)
+        return std::nullopt;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        int line;
+        int col;
+        std::optional<IdentifierAtPosition> result;
+
+        Visitor(const slang::SourceManager& sm, int line, int col) : sm(sm), line(line), col(col) {}
+
+        void visitToken(slang::parsing::Token token) {
+            if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
+                return;
+            if (!token_contains_position(sm, token, line, col))
+                return;
+
+            const int token_line = to_lsp_line((int)sm.getLineNumber(token.location()));
+            const int token_col = (int)sm.getColumnNumber(token.location()) - 1;
+            const std::string name(token.valueText());
+            result = IdentifierAtPosition{
+                .name = name,
+                .line = token_line,
+                .col = token_col,
+                .end_col = token_col + (int)name.size(),
+            };
+        }
+    };
+
+    Visitor visitor(state->tree->sourceManager(), line, col);
+    state->tree->root().visit(visitor);
+    return visitor.result;
 }
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
@@ -638,6 +1078,125 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     }
 
     return std::nullopt;
+}
+
+std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
+                                                bool include_declaration) const {
+    auto target = identifier_at(uri, line, col);
+    auto target_def = definition_of(uri, line, col);
+    if (!target || !target_def)
+        return {};
+
+    std::vector<std::string> extra_files;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        extra_files = extra_files_;
+    }
+
+    std::vector<Location> result;
+    std::set<std::tuple<std::string, int, int>> seen;
+
+    auto add_if_same_definition = [&](const std::string& file_uri, int ref_line, int ref_col,
+                                      const std::function<std::optional<Location>(
+                                          const std::string&, int, int)>& resolver) {
+        auto candidate_def = resolver(file_uri, ref_line, ref_col);
+        if (!candidate_def || !same_location(*candidate_def, *target_def))
+            return;
+        if (!include_declaration && file_uri == target_def->uri && ref_line == target_def->line &&
+            ref_col == target_def->col)
+            return;
+
+        auto key = std::make_tuple(file_uri, ref_line, ref_col);
+        if (!seen.insert(key).second)
+            return;
+        result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
+                                  ref_col + (int)target->name.size()});
+    };
+
+    auto visit_tree = [&](const slang::syntax::SyntaxTree& tree, const std::string& fallback_uri,
+                          const std::function<std::optional<Location>(const std::string&, int, int)>&
+                              resolver) {
+        struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+            const slang::SourceManager& sm;
+            const std::string& fallback_uri;
+            const std::string& name;
+            const std::function<void(const std::string&, int, int)>& add;
+
+            Visitor(const slang::SourceManager& sm, const std::string& fallback_uri,
+                    const std::string& name,
+                    const std::function<void(const std::string&, int, int)>& add)
+                : sm(sm), fallback_uri(fallback_uri), name(name), add(add) {}
+
+            void visitToken(slang::parsing::Token token) {
+                if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
+                    token.valueText() != name)
+                    return;
+
+                const auto loc = location_from_token_actual_uri(sm, fallback_uri, token);
+                add(loc.uri, loc.line, loc.col);
+            }
+        };
+
+        std::function<void(const std::string&, int, int)> add =
+            [&](const std::string& candidate_uri, int ref_line, int ref_col) {
+                add_if_same_definition(candidate_uri, ref_line, ref_col, resolver);
+            };
+
+        Visitor visitor(tree.sourceManager(), fallback_uri, target->name, add);
+        tree.root().visit(visitor);
+    };
+
+    std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        open_states.reserve(docs_.size());
+        for (const auto& [state_uri, state] : docs_)
+            open_states.emplace_back(state_uri, state);
+    }
+
+    for (const auto& [state_uri, state] : open_states) {
+        if (!state || !state->tree)
+            continue;
+        visit_tree(*state->tree, state_uri,
+                   [&](const std::string& candidate_uri, int ref_line, int ref_col) {
+                       return definition_of(candidate_uri, ref_line, ref_col);
+                   });
+    }
+
+    std::set<std::string> open_uris;
+    for (const auto& [state_uri, state] : open_states)
+        open_uris.insert(state_uri);
+
+    for (const auto& path_str : extra_files) {
+        const std::filesystem::path path(path_str);
+        const std::string file_uri = path_to_uri(path);
+        if (open_uris.contains(file_uri))
+            continue;
+
+        slang::SourceManager sm;
+        auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path.string(), sm);
+        if (!tree_or_error)
+            continue;
+
+        const std::string text = read_file_text(path);
+        if (text.empty())
+            continue;
+        Analyzer temp;
+        temp.set_extra_files(extra_files);
+        temp.open(file_uri, text);
+        auto resolver = [&](const std::string& candidate_uri, int ref_line,
+                            int ref_col) -> std::optional<Location> {
+            if (candidate_uri != file_uri)
+                return std::nullopt;
+            return temp.definition_of(file_uri, ref_line, ref_col);
+        };
+        visit_tree(**tree_or_error, file_uri, resolver);
+    }
+
+    std::sort(result.begin(), result.end(), [](const Location& a, const Location& b) {
+        return std::tie(a.uri, a.line, a.col) < std::tie(b.uri, b.line, b.col);
+    });
+    return result;
 }
 
 std::vector<std::pair<int, int>> Analyzer::find_occurrences(const std::string& uri,

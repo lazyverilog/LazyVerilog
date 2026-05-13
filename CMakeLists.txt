@@ -125,6 +125,8 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_references.cpp
     tests/test_rename.cpp
     tests/test_definition.cpp
+    tests/test_inlay_hints.cpp
+    tests/test_lsp_features.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
     src/config.cpp
     src/analyzer.cpp
@@ -132,15 +134,23 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp
+    src/features/inlay_hints.cpp
     src/features/references.cpp
     src/features/rename.cpp
+    src/features/hover.cpp
+    src/features/signature_help.cpp
+    src/features/workspace_symbols.cpp
 )
 
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
-target_include_directories(lazyverilog-tests PRIVATE src)
+target_include_directories(lazyverilog-tests PRIVATE
+    src
+    external/LspCpp/include
+)
 target_link_libraries(lazyverilog-tests
     PRIVATE
         slang::slang
+        lspcpp
         tomlplusplus::tomlplusplus
         Catch2::Catch2WithMain
 )

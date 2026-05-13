@@ -11,6 +11,7 @@ struct SymbolInfo {
     std::string name;
     std::string kind; // module, port, signal, instance, etc.
     std::string detail;
+    std::string doc;
     int line{-1};
     int col{-1};
 };
@@ -20,6 +21,13 @@ struct Location {
     int line{0};
     int col{0};
     int end_line{0};
+    int end_col{0};
+};
+
+struct IdentifierAtPosition {
+    std::string name;
+    int line{0};
+    int col{0};
     int end_col{0};
 };
 
@@ -45,6 +53,15 @@ class Analyzer {
     /// Resolve definition location for symbol at (line, col).
     std::optional<Location> definition_of(const std::string& uri, int line, int col) const;
 
+    /// Return the identifier token under a position using the parsed SyntaxTree.
+    std::optional<IdentifierAtPosition> identifier_at(const std::string& uri, int line,
+                                                      int col) const;
+
+    /// Find references to the symbol under a position by walking SyntaxTrees and
+    /// verifying candidate tokens resolve to the same definition.
+    std::vector<Location> find_references(const std::string& uri, int line, int col,
+                                          bool include_declaration = true) const;
+
     /// Return all (0-based line, 0-based col) positions where `name` appears
     /// as a whole identifier in the document.
     std::vector<std::pair<int, int>> find_occurrences(const std::string& uri,
@@ -59,6 +76,9 @@ class Analyzer {
 
     /// Set extra files from .f filelist.
     void set_extra_files(const std::vector<std::string>& paths);
+
+    /// Return extra files from .f filelist.
+    std::vector<std::string> extra_files() const;
 
     /// Check mtime of extra files and re-parse if stale.
     void refresh_if_stale(const std::string& uri);
