@@ -25,6 +25,7 @@ struct ModuleEntry {
 
 struct NamedPortConn {
     std::string port_name;
+    std::string signal_name;
     int line{0};
     int col{0};
     int hint_col{0};

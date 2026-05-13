@@ -2,7 +2,6 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
-#include <regex>
 #include <algorithm>
 #include <set>
 
@@ -59,6 +58,12 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
             if (d) declared.insert(std::string(d->name.valueText()));
+        }
+        visitDefault(node);
+    }
+    void handle(const ParameterDeclarationSyntax& node) {
+        for (const auto* declarator : node.declarators) {
+            if (declarator) declared.insert(std::string(declarator->name.valueText()));
         }
         visitDefault(node);
     }
@@ -119,9 +124,7 @@ struct CombLhsCollector : public SyntaxVisitor<CombLhsCollector> {
     }
 };
 
-// ── Scan instantiation source text for .port(signal) connections ───────────────
-
-static const std::regex PORT_CONN_RE(R"(\.(\w+)\s*\(([^)]*)\))");
+// ── Collect instantiation connections from SyntaxIndex ───────────────────────
 
 struct InstSignal {
     std::string signal;
@@ -132,7 +135,6 @@ struct InstSignal {
 };
 
 static std::vector<InstSignal> collect_inst_signals(
-    const std::vector<std::string>& lines,
     const SyntaxIndex& syntax_index)
 {
     std::vector<InstSignal> results;
@@ -149,51 +151,36 @@ static std::vector<InstSignal> collect_inst_signals(
             }
         }
 
-        // Scan source lines for .port(signal) connections
-        for (int i = inst.start_line; i <= inst.end_line && i < (int)lines.size(); ++i) {
-            const std::string& raw = lines[i];
-            auto begin = std::sregex_iterator(raw.begin(), raw.end(), PORT_CONN_RE);
-            auto end_it = std::sregex_iterator();
-            for (auto it = begin; it != end_it; ++it) {
-                std::string port_name = (*it)[1].str();
-                std::string signal = (*it)[2].str();
-                // trim signal
-                size_t s = signal.find_first_not_of(" \t");
-                size_t e = signal.find_last_not_of(" \t");
-                if (s != std::string::npos)
-                    signal = signal.substr(s, e - s + 1);
-                else
-                    signal.clear();
-
-                if (!is_simple_id(signal)) continue;
-                if (seen.count(signal)) continue;
+        for (const auto& conn : inst.connections) {
+            std::string port_name = conn.port_name;
+            std::string signal = conn.signal_name;
+            if (!is_simple_id(signal)) continue;
+            if (seen.count(signal)) continue;
 
                 // Look up port direction
-                std::string direction;
-                std::string type_kw = "logic";
-                std::string dimension;
-                if (mod_entry) {
-                    for (const auto& p : mod_entry->ports) {
-                        if (p.name == port_name) {
-                            direction = p.direction;
-                            // Extract dimension from type string
-                            std::regex dim_re(R"(\[.*?\])");
-                            std::smatch dm;
-                            if (std::regex_search(p.type, dm, dim_re))
-                                dimension = dm[0].str();
-                            break;
-                        }
+            std::string direction;
+            std::string type_kw = "logic";
+            std::string dimension;
+            if (mod_entry) {
+                for (const auto& p : mod_entry->ports) {
+                    if (p.name == port_name) {
+                        direction = p.direction;
+                        auto lb = p.type.find('[');
+                        auto rb = p.type.rfind(']');
+                        if (lb != std::string::npos && rb != std::string::npos && lb < rb)
+                            dimension = p.type.substr(lb, rb - lb + 1);
+                        break;
                     }
                 }
-
-                // Only include output/inout ports
-                if (direction == "input") continue;
-                if (!direction.empty() && direction != "output" && direction != "inout" &&
-                    direction != "out" && direction != "Out") continue;
-
-                seen.insert(signal);
-                results.push_back({signal, inst.module_name, type_kw, dimension, order++});
             }
+
+            // Only include output/inout ports
+            if (direction == "input") continue;
+            if (!direction.empty() && direction != "output" && direction != "inout" &&
+                direction != "out" && direction != "Out") continue;
+
+            seen.insert(signal);
+            results.push_back({signal, inst.module_name, type_kw, dimension, order++});
         }
     }
     return results;
@@ -201,72 +188,59 @@ static std::vector<InstSignal> collect_inst_signals(
 
 // ── Find module body range ────────────────────────────────────────────────────
 
-static std::pair<int, int> find_module_body_range(const std::vector<std::string>& lines) {
-    static const std::regex mod_re(R"(\s*module\b)", std::regex::icase);
-    static const std::regex endmod_re(R"(\s*endmodule\b)", std::regex::icase);
-
-    int mod_line = -1, endmod_line = -1;
-    for (int i = 0; i < (int)lines.size(); ++i) {
-        if (mod_line == -1 && std::regex_search(lines[i], mod_re))
-            mod_line = i;
-        if (std::regex_search(lines[i], endmod_re)) {
-            endmod_line = i;
-            break;
-        }
-    }
-    if (mod_line < 0 || endmod_line < 0)
-        return {0, (int)lines.size() - 1};
-
-    // Find end of module header (after semicolon)
-    int header_end = mod_line;
-    for (int i = mod_line; i < endmod_line; ++i) {
-        if (lines[i].find(';') != std::string::npos) {
-            header_end = i;
-            break;
-        }
-    }
-    return {header_end + 1, endmod_line};
-}
-
-static int find_insertion_line(const std::vector<std::string>& lines) {
-    auto [body_start, endmod_line] = find_module_body_range(lines);
-
-    // Priority 1: After last wire/logic/reg declaration
-    static const std::regex decl_re(R"(^\s*(?:wire|logic|reg|tri)\b)");
+struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
+    const SourceManager& sm;
+    int body_start{0};
+    int end_module{0};
     int last_decl = -1;
-    for (int i = body_start; i < endmod_line; ++i) {
-        if (std::regex_search(lines[i], decl_re))
-            last_decl = i;
-    }
-    if (last_decl >= 0)
-        return last_decl + 1;
+    int first_inst = -1;
+    int first_proc = -1;
 
-    // Priority 2: Before first instantiation
-    static const std::set<std::string> KEYWORDS = {
-        "module", "endmodule", "input", "output", "inout", "wire", "logic",
-        "reg", "assign", "always", "always_comb", "always_ff", "always_latch",
-        "initial", "generate", "endgenerate", "if", "else", "begin", "end",
-        "for", "while", "case", "endcase", "function", "endfunction",
-        "task", "endtask", "parameter", "localparam", "typedef", "enum",
-        "struct", "union", "interface", "endinterface", "package", "endpackage",
-    };
-    static const std::regex inst_re(R"(^\s*(\w+)\s+(?:#\s*\(|(\w+)\s*(?:\(|$)))");
-    for (int i = body_start; i < endmod_line; ++i) {
-        std::smatch m;
-        if (std::regex_search(lines[i], m, inst_re)) {
-            if (!KEYWORDS.count(m[1].str()))
-                return i;
-        }
+    explicit InsertionLineFinder(const SourceManager& sm) : sm(sm) {}
+
+    int token_line(const slang::parsing::Token& tok) const {
+        if (!tok || !tok.location().valid()) return 0;
+        auto line = sm.getLineNumber(tok.location());
+        return line > 0 ? (int)line - 1 : 0;
     }
 
-    // Priority 3: Before first begin
-    static const std::regex begin_re(R"(\s*begin\b)");
-    for (int i = body_start; i < endmod_line; ++i) {
-        if (std::regex_search(lines[i], begin_re))
-            return i;
+    void handle(const ModuleDeclarationSyntax& node) {
+        if (body_start == 0 && node.header)
+            body_start = token_line(node.header->semi) + 1;
+        end_module = token_line(node.endmodule);
+        visitDefault(node);
     }
+    void handle(const DataDeclarationSyntax& node) {
+        last_decl = std::max(last_decl, token_line(node.getFirstToken()));
+        visitDefault(node);
+    }
+    void handle(const NetDeclarationSyntax& node) {
+        last_decl = std::max(last_decl, token_line(node.getFirstToken()));
+        visitDefault(node);
+    }
+    void handle(const HierarchyInstantiationSyntax& node) {
+        int line = token_line(node.getFirstToken());
+        if (first_inst < 0 || line < first_inst) first_inst = line;
+        visitDefault(node);
+    }
+    void handle(const ProceduralBlockSyntax& node) {
+        int line = token_line(node.keyword);
+        if (first_proc < 0 || line < first_proc) first_proc = line;
+        visitDefault(node);
+    }
+};
 
-    return body_start;
+static int find_insertion_line(const DocumentState& state) {
+    if (!state.tree) return 0;
+    InsertionLineFinder finder(state.tree->sourceManager());
+    state.tree->root().visit(finder);
+    if (finder.last_decl >= 0)
+        return finder.last_decl + 1;
+    if (finder.first_inst >= 0)
+        return finder.first_inst;
+    if (finder.first_proc >= 0)
+        return finder.first_proc;
+    return finder.body_start;
 }
 
 // ── Format declarations ───────────────────────────────────────────────────────
@@ -317,19 +291,6 @@ static std::vector<SignalDecl> compute_new_signals(
     // Collect declared signals
     DeclCollector decl_coll;
     state.tree->root().visit(decl_coll);
-    // Also collect from params/localparams via regex (simple)
-    static const std::regex param_re(R"(^\s*(?:parameter|localparam)\b.*?\b(\w+)\s*=)",
-                                     std::regex::multiline);
-    auto lines = split_lines(state.text);
-    for (const auto& ln : lines) {
-        std::smatch pm;
-        std::string::const_iterator sb = ln.cbegin();
-        while (std::regex_search(sb, ln.cend(), pm, param_re)) {
-            decl_coll.declared.insert(pm[1].str());
-            sb = pm.suffix().first;
-        }
-    }
-
     // Collect assign LHS
     AssignLhsCollector assign_coll;
     state.tree->root().visit(assign_coll);
@@ -339,7 +300,7 @@ static std::vector<SignalDecl> compute_new_signals(
     state.tree->root().visit(comb_coll);
 
     // Collect instantiation signals
-    auto inst_sigs = collect_inst_signals(lines, syntax_index);
+    auto inst_sigs = collect_inst_signals(syntax_index);
 
     // Build result: filter out already declared
     std::set<std::string> seen;
@@ -388,7 +349,7 @@ std::string autowire_apply(
 
     auto lines = split_lines(state.text);
     std::string decl_text = format_declarations(new_sigs);
-    int insert_line = find_insertion_line(lines);
+    int insert_line = find_insertion_line(state);
 
     std::vector<std::string> out_lines;
     out_lines.insert(out_lines.end(), lines.begin(), lines.begin() + insert_line);

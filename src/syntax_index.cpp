@@ -24,6 +24,18 @@ static std::string trim_copy(std::string text) {
     return std::string(first, last);
 }
 
+static std::string simple_identifier_from_expr(const PropertyExprSyntax* expr) {
+    if (!expr)
+        return {};
+    if (const auto* prop = expr->as_if<SimplePropertyExprSyntax>()) {
+        if (const auto* seq = prop->expr->as_if<SimpleSequenceExprSyntax>()) {
+            if (const auto* ident = seq->expr->as_if<IdentifierNameSyntax>())
+                return tok_str(ident->identifier);
+        }
+    }
+    return {};
+}
+
 static std::pair<int, int> token_pos(const slang::SourceManager& sm,
                                      const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
@@ -164,6 +176,7 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
                 auto [paren_line, paren_col] = token_pos(sm, named->openParen);
                 entry.connections.push_back(NamedPortConn{
                     .port_name = tok_str(named->name),
+                    .signal_name = simple_identifier_from_expr(named->expr),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,

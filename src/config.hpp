@@ -113,12 +113,16 @@ struct AutoinstOptions {
 };
 
 struct AutoargOptions {
+    int indent_size{2};
     bool autoarg_on_save{false};
 };
 
 struct AutowireOptions {};
 
-struct AutoFuncOptions {};
+struct AutoFuncOptions {
+    int indent_size{4};
+    bool use_named_arguments{true};
+};
 
 struct Config {
     DesignConfig    design;

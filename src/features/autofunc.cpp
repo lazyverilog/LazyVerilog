@@ -3,8 +3,9 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
-#include <regex>
 #include <optional>
+#include <algorithm>
+#include <cctype>
 
 using namespace slang;
 using namespace slang::syntax;
@@ -28,27 +29,6 @@ static std::vector<std::string> split_lines(const std::string& text) {
     return lines;
 }
 
-// ── Find identifier at/containing character position ─────────────────────────
-
-struct IdentInfo {
-    std::string name;
-    int start_col;
-    int end_col; // exclusive
-};
-
-static std::optional<IdentInfo> find_nearest_identifier(const std::string& line, int char_pos) {
-    std::regex ident_re(R"(\b([A-Za-z_]\w*)\b)");
-    for (auto it = std::sregex_iterator(line.begin(), line.end(), ident_re);
-         it != std::sregex_iterator(); ++it)
-    {
-        int start = (int)(*it).position();
-        int end = start + (int)(*it).length();
-        if (start <= char_pos && char_pos < end)
-            return IdentInfo{(*it)[1].str(), start, end};
-    }
-    return std::nullopt;
-}
-
 // ── Find extent of call starting from identifier ─────────────────────────────
 
 struct CallExtent {
@@ -60,14 +40,12 @@ static CallExtent find_call_extent(const std::string& line, int ident_start, int
     int start_col = ident_start;
     int end_col = ident_end;
 
-    // Look for optional whitespace + '(' or ';' after identifier
-    std::string rest = line.substr(ident_end);
-    std::regex open_re(R"(\s*[\(;])");
-    std::smatch m;
-    if (!std::regex_search(rest, m, open_re))
+    int open_pos = ident_end;
+    while (open_pos < (int)line.size() && (line[open_pos] == ' ' || line[open_pos] == '\t'))
+        ++open_pos;
+    if (open_pos >= (int)line.size() || (line[open_pos] != '(' && line[open_pos] != ';'))
         return {start_col, end_col};
 
-    int open_pos = ident_end + (int)m.position() + (int)m.length() - 1;
     if (line[open_pos] == ';') {
         // No parens — consume just the name
         return {start_col, ident_end};
@@ -104,12 +82,25 @@ static std::map<std::string, std::string> parse_existing_connections(const std::
     size_t i = 0;
     while (i < call_text.size()) {
         if (call_text[i] != '.') { ++i; continue; }
-        std::regex named_re(R"(\.(\w+)\s*\()");
-        std::smatch m;
-        std::string sub = call_text.substr(i);
-        if (!std::regex_search(sub, m, named_re) || m.position() != 0) { ++i; continue; }
-        std::string port = m[1].str();
-        size_t start_paren = i + m.position() + m.length() - 1;
+        size_t name_start = i + 1;
+        if (name_start >= call_text.size() ||
+            (!std::isalpha((unsigned char)call_text[name_start]) && call_text[name_start] != '_')) {
+            ++i;
+            continue;
+        }
+        size_t name_end = name_start + 1;
+        while (name_end < call_text.size() &&
+               (std::isalnum((unsigned char)call_text[name_end]) || call_text[name_end] == '_'))
+            ++name_end;
+        std::string port = call_text.substr(name_start, name_end - name_start);
+        size_t start_paren = name_end;
+        while (start_paren < call_text.size() &&
+               (call_text[start_paren] == ' ' || call_text[start_paren] == '\t'))
+            ++start_paren;
+        if (start_paren >= call_text.size() || call_text[start_paren] != '(') {
+            i = name_end;
+            continue;
+        }
         int depth = 0;
         size_t j = start_paren;
         while (j < call_text.size()) {
@@ -192,14 +183,16 @@ static std::string generate_func_call(
     const std::string& name,
     const std::vector<std::string>& ports,
     const std::string& indent,
-    const std::map<std::string, std::string>& wire_map)
+    const std::map<std::string, std::string>& wire_map,
+    const AutoFuncOptions& options)
 {
     if (ports.empty())
         return name + "();";
 
     int base_col = (int)indent.size();
-    int arg_col = ((base_col + 4) / 4) * 4;
-    if (arg_col <= base_col) arg_col = base_col + 4;
+    int indent_size = std::max(1, options.indent_size);
+    int arg_col = ((base_col + indent_size) / indent_size) * indent_size;
+    if (arg_col <= base_col) arg_col = base_col + indent_size;
     std::string arg_indent(arg_col, ' ');
 
     std::string out = name + "(\n";
@@ -209,7 +202,10 @@ static std::string generate_func_call(
         auto it = wire_map.find(p);
         if (it != wire_map.end()) wire = it->second;
         std::string comma = (i + 1 < ports.size()) ? "," : "";
-        out += arg_indent + "." + p + "(" + wire + ")" + comma + "\n";
+        if (options.use_named_arguments)
+            out += arg_indent + "." + p + "(" + wire + ")" + comma + "\n";
+        else
+            out += arg_indent + wire + comma + "\n";
     }
     out += indent + ");";
     return out;
@@ -219,7 +215,7 @@ static std::string generate_func_call(
 
 std::optional<lsWorkspaceEdit> autofunc(
     const Analyzer& analyzer, const std::string& uri,
-    int line, int col, const AutoFuncOptions& /*options*/)
+    int line, int col, const AutoFuncOptions& options)
 {
     auto state = analyzer.get_state(uri);
     if (!state) return std::nullopt;
@@ -230,12 +226,12 @@ std::optional<lsWorkspaceEdit> autofunc(
 
     const std::string& src_line = lines[line];
 
-    // Find identifier at cursor
-    auto ident = find_nearest_identifier(src_line, col);
+    // Find identifier at cursor via the parsed SyntaxTree.
+    auto ident = analyzer.identifier_at(uri, line, col);
     if (!ident) return std::nullopt;
 
     // Find call extent on this line
-    auto extent = find_call_extent(src_line, ident->start_col, ident->end_col);
+    auto extent = find_call_extent(src_line, ident->col, ident->end_col);
 
     // Extract existing call text for connection preservation
     std::string call_text = src_line.substr(extent.start_col, extent.end_col - extent.start_col);
@@ -254,7 +250,7 @@ std::optional<lsWorkspaceEdit> autofunc(
     }
 
     // Generate replacement text
-    std::string new_call = generate_func_call(ident->name, *ports, indent, wire_map);
+    std::string new_call = generate_func_call(ident->name, *ports, indent, wire_map, options);
 
     // Build workspace edit
     lsWorkspaceEdit we;

@@ -2,7 +2,6 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
-#include <regex>
 #include <algorithm>
 
 using namespace slang;
@@ -59,6 +58,18 @@ static int find_inst_end(const std::vector<std::string>& lines, int start_line) 
             return i;
     }
     return (int)lines.size() - 1;
+}
+
+static std::string simple_identifier_from_expr(const PropertyExprSyntax* expr) {
+    if (!expr)
+        return {};
+    if (const auto* prop = expr->as_if<SimplePropertyExprSyntax>()) {
+        if (const auto* seq = prop->expr->as_if<SimpleSequenceExprSyntax>()) {
+            if (const auto* id = seq->expr->as_if<IdentifierNameSyntax>())
+                return std::string(id->identifier.valueText());
+        }
+    }
+    return {};
 }
 
 // ── Main implementation ───────────────────────────────────────────────────────
@@ -131,6 +142,18 @@ std::optional<AutoinstResult> autoinst_impl(
         result.port_names = std::move(port_names);
         result.line_start = cand.first_line;
         result.line_end = end_line;
+        for (const auto* inst : node->instances) {
+            if (!inst)
+                continue;
+            for (const auto* conn : inst->connections) {
+                if (const auto* named = conn ? conn->as_if<NamedPortConnectionSyntax>() : nullptr) {
+                    std::string signal = simple_identifier_from_expr(named->expr);
+                    if (!signal.empty())
+                        result.existing_connections[std::string(named->name.valueText())] = signal;
+                }
+            }
+            break;
+        }
         return result;
     }
     return std::nullopt;
@@ -138,31 +161,13 @@ std::optional<AutoinstResult> autoinst_impl(
 
 // ── Parse existing port connections ──────────────────────────────────────────
 
-static const std::regex PORT_CONN_RE(R"(\.\s*(\w+)\s*\(([^)]*)\))");
-
 std::map<std::string, std::string> autoinst_parse_connections(
     const std::string& source, int line_start, int line_end)
 {
-    auto lines = split_lines(source);
-    std::map<std::string, std::string> existing;
-    for (int i = line_start; i <= line_end && i < (int)lines.size(); ++i) {
-        const std::string& raw = lines[i];
-        auto begin = std::sregex_iterator(raw.begin(), raw.end(), PORT_CONN_RE);
-        auto end = std::sregex_iterator();
-        for (auto it = begin; it != end; ++it) {
-            std::string port_name = (*it)[1].str();
-            std::string conn = (*it)[2].str();
-            // trim conn
-            size_t s = conn.find_first_not_of(" \t");
-            size_t e = conn.find_last_not_of(" \t");
-            if (s != std::string::npos)
-                conn = conn.substr(s, e - s + 1);
-            else
-                conn.clear();
-            existing[port_name] = conn;
-        }
-    }
-    return existing;
+    (void)source;
+    (void)line_start;
+    (void)line_end;
+    return {};
 }
 
 // ── Format autoinst ───────────────────────────────────────────────────────────
@@ -184,7 +189,7 @@ std::string format_autoinst(
     std::string port_indent = base_indent + "    ";
 
     // Parse existing connections
-    auto existing = autoinst_parse_connections(source, result.line_start, result.line_end);
+    auto existing = result.existing_connections;
 
     // Find longest port name for alignment
     size_t max_name_len = 0;

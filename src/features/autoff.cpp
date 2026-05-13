@@ -39,30 +39,35 @@ struct DeclAtLineVisitor : public SyntaxVisitor<DeclAtLineVisitor> {
 
     DeclAtLineVisitor(const SourceManager& s, int tl) : sm(s), target_line(tl) {}
 
-    void collect_decl(const SyntaxNode& node) {
+    bool on_target_line(const SyntaxNode& node) {
         auto tok = node.getFirstToken();
-        if (!tok.valid() || !tok.location().valid()) return;
+        if (!tok.valid() || !tok.location().valid()) return false;
         size_t ln = sm.getLineNumber(tok.location());
-        int line_0 = (int)(ln > 0 ? ln - 1 : 0);
-        if (line_0 != target_line) return;
-        matched = true;
-        // Collect declarator names
-        for (uint32_t i = 0; i < node.getChildCount(); ++i) {
-            const SyntaxNode* child = node.childNode(i);
-            if (!child) continue;
-            if (const auto* d = child->as_if<DeclaratorSyntax>()) {
-                std::string name = std::string(d->name.valueText());
-                if (!name.empty()) names.push_back(name);
-            }
-        }
+        return (int)(ln > 0 ? ln - 1 : 0) == target_line;
     }
 
     void handle(const DataDeclarationSyntax& node) {
-        collect_decl(node);
+        if (on_target_line(node)) {
+            matched = true;
+            for (uint32_t i = 0; i < node.declarators.size(); ++i) {
+                if (node.declarators[i]) {
+                    std::string n = std::string(node.declarators[i]->name.valueText());
+                    if (!n.empty()) names.push_back(n);
+                }
+            }
+        }
         visitDefault(node);
     }
     void handle(const NetDeclarationSyntax& node) {
-        collect_decl(node);
+        if (on_target_line(node)) {
+            matched = true;
+            for (uint32_t i = 0; i < node.declarators.size(); ++i) {
+                if (node.declarators[i]) {
+                    std::string n = std::string(node.declarators[i]->name.valueText());
+                    if (!n.empty()) names.push_back(n);
+                }
+            }
+        }
         visitDefault(node);
     }
 };
@@ -101,45 +106,6 @@ static std::pair<std::string, std::string> pair_signals(
     return {names[0], names[1]};
 }
 
-// ── Check if signal is already assigned ──────────────────────────────────────
-
-static bool check_already_assigned(const std::string& text, const std::string& signal) {
-    bool in_ff = false;
-    int depth = 0;
-    std::regex lhs_re(R"(^\s*)" + std::regex::basic + signal + R"(\s*<=)");
-    // Build proper regex
-    std::regex lhs_re2("^\\s*" + std::regex_replace(signal, std::regex(R"([.*+?^${}()|[\]\\])"), R"(\$&)") + "\\s*<=");
-    std::regex always_ff_re(R"(\balways_ff\b)");
-    std::regex begin_re(R"(\bbegin\b)");
-    std::regex end_re(R"(\bend\b)");
-
-    for (const auto& raw_line : split_lines(text)) {
-        std::string stripped = raw_line;
-        size_t s = stripped.find_first_not_of(" \t");
-        if (s != std::string::npos) stripped = stripped.substr(s);
-        else stripped.clear();
-
-        if (std::regex_search(stripped, always_ff_re)) {
-            in_ff = true;
-            depth = 0;
-        }
-        if (in_ff) {
-            // Count begin/end for depth tracking
-            for (std::sregex_iterator it(stripped.begin(), stripped.end(), begin_re), end; it != end; ++it)
-                ++depth;
-            for (std::sregex_iterator it(stripped.begin(), stripped.end(), end_re), end; it != end; ++it)
-                --depth;
-            if (std::regex_search(raw_line, lhs_re2))
-                return true;
-            if (depth <= 0 && !std::regex_search(stripped, always_ff_re)) {
-                in_ff = false;
-                depth = 0;
-            }
-        }
-    }
-    return false;
-}
-
 // ── Parse always_ff if/else structure ────────────────────────────────────────
 
 struct FfBlock {
@@ -149,165 +115,124 @@ struct FfBlock {
     int else_begin_line{-1};
     int else_insert_line{-1};
     std::string else_indent;
+    const BlockStatementSyntax* if_block{nullptr};
+    const BlockStatementSyntax* else_block{nullptr};
 };
 
-static void depth_tokens(const std::string& line, int& depth) {
-    std::regex begin_end_re(R"(\b(begin|end)\b)");
-    for (std::sregex_iterator it(line.begin(), line.end(), begin_end_re), end_it; it != end_it; ++it) {
-        if ((*it)[1].str() == "begin") ++depth;
-        else --depth;
-    }
+static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
+    if (!tok || !tok.location().valid()) return 0;
+    auto line = sm.getLineNumber(tok.location());
+    return line > 0 ? (int)line - 1 : 0;
 }
 
-static FfBlock parse_ff_block(const std::vector<std::string>& lines, int ff_start) {
-    int n = (int)lines.size();
+static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
+    if (!tok || !tok.location().valid()) return 0;
+    auto col = sm.getColumnNumber(tok.location());
+    return col > 0 ? (int)col - 1 : 0;
+}
 
-    // Find outer begin
-    int outer_begin = -1;
-    std::regex begin_re(R"(\bbegin\b)");
-    for (int i = ff_start; i < n; ++i) {
-        if (std::regex_search(lines[i], begin_re)) {
-            outer_begin = i;
-            break;
+struct FfFinder : public SyntaxVisitor<FfFinder> {
+    const SourceManager& sm;
+    std::optional<FfBlock> block;
+    std::string error;
+
+    explicit FfFinder(const SourceManager& sm) : sm(sm) {}
+
+    void handle(const ProceduralBlockSyntax& node) {
+        if (block || node.kind != SyntaxKind::AlwaysFFBlock) {
+            visitDefault(node);
+            return;
         }
-    }
-    if (outer_begin < 0)
-        throw std::runtime_error("AutoFF: always_ff block missing 'begin'");
 
-    // Find 'if (' within depth=1
-    int depth = 1;
-    int if_line = -1;
-    std::regex if_re(R"(\bif\s*\()");
-    for (int i = outer_begin + 1; i < n; ++i) {
-        if (depth == 1 && std::regex_search(lines[i], if_re)) {
-            if_line = i;
-            break;
+        const auto* outer = node.statement->as_if<BlockStatementSyntax>();
+        if (!outer) {
+            error = "AutoFF: always_ff block missing 'begin'";
+            visitDefault(node);
+            return;
         }
-        depth_tokens(lines[i], depth);
-        if (depth <= 0)
-            throw std::runtime_error("AutoFF: always_ff block closed before finding 'if'");
-    }
-    if (if_line < 0)
-        throw std::runtime_error("AutoFF: no 'if' statement found inside always_ff block");
 
-    // Find begin of if-block
-    int if_begin = -1;
-    for (int i = if_line; i < n; ++i) {
-        if (std::regex_search(lines[i], begin_re)) {
-            if_begin = i;
-            break;
-        }
-    }
-    if (if_begin < 0)
-        throw std::runtime_error("AutoFF: if-block inside always_ff is missing 'begin'");
-
-    // Find end of if-block
-    int if_depth = 1;
-    int if_end = -1;
-    for (int i = if_begin + 1; i < n; ++i) {
-        depth_tokens(lines[i], if_depth);
-        if (if_depth <= 0) {
-            if_end = i;
-            break;
-        }
-    }
-    if (if_end < 0)
-        throw std::runtime_error("AutoFF: if-block 'end' not found");
-
-    // Extract if indent
-    std::smatch im;
-    std::regex indent_re(R"(^(\s*))");
-    std::string if_indent = "    ";
-    if (std::regex_search(lines[if_begin], im, indent_re))
-        if_indent = im[1].str() + "    ";
-
-    // Find else begin
-    int else_begin = -1;
-    std::regex else_re(R"(\belse\b)");
-    for (int i = if_end; i < std::min(if_end + 5, n); ++i) {
-        if (std::regex_search(lines[i], else_re)) {
-            for (int j = i; j < std::min(i + 4, n); ++j) {
-                if (std::regex_search(lines[j], begin_re)) {
-                    else_begin = j;
-                    break;
-                }
+        const ConditionalStatementSyntax* conditional = nullptr;
+        for (const auto* item : outer->items) {
+            if (!item) continue;
+            if (const auto* stmt = item->as_if<ConditionalStatementSyntax>()) {
+                conditional = stmt;
+                break;
             }
-            break;
         }
-    }
-    if (else_begin < 0)
-        throw std::runtime_error("AutoFF: always_ff block has no 'else begin' after the if-block");
-
-    // Find end of else-block
-    int else_depth = 1;
-    int else_end = -1;
-    for (int i = else_begin + 1; i < n; ++i) {
-        depth_tokens(lines[i], else_depth);
-        if (else_depth <= 0) {
-            else_end = i;
-            break;
+        if (!conditional) {
+            error = "AutoFF: no 'if' statement found inside always_ff block";
+            visitDefault(node);
+            return;
         }
+
+        const auto* if_block = conditional->statement->as_if<BlockStatementSyntax>();
+        if (!if_block) {
+            error = "AutoFF: if-block inside always_ff is missing 'begin'";
+            visitDefault(node);
+            return;
+        }
+        if (!conditional->elseClause) {
+            error = "AutoFF: always_ff block has no 'else begin' after the if-block";
+            visitDefault(node);
+            return;
+        }
+        const auto* else_block = conditional->elseClause->clause->as_if<BlockStatementSyntax>();
+        if (!else_block) {
+            error = "AutoFF: always_ff block has no 'else begin' after the if-block";
+            visitDefault(node);
+            return;
+        }
+
+        FfBlock ff;
+        ff.if_begin_line = token_line(sm, if_block->begin);
+        ff.if_insert_line = token_line(sm, if_block->end);
+        ff.if_indent = std::string((size_t)token_col(sm, if_block->begin) + 4, ' ');
+        ff.else_begin_line = token_line(sm, else_block->begin);
+        ff.else_insert_line = token_line(sm, else_block->end);
+        ff.else_indent = std::string((size_t)token_col(sm, else_block->begin) + 4, ' ');
+        ff.if_block = if_block;
+        ff.else_block = else_block;
+        block = ff;
+        visitDefault(node);
     }
-    if (else_end < 0)
-        throw std::runtime_error("AutoFF: else-block 'end' not found");
+};
 
-    // Extract else indent
-    std::string else_indent = "    ";
-    if (std::regex_search(lines[else_begin], im, indent_re))
-        else_indent = im[1].str() + "    ";
-
-    FfBlock block;
-    block.if_begin_line = if_begin;
-    block.if_insert_line = if_end;
-    block.if_indent = if_indent;
-    block.else_begin_line = else_begin;
-    block.else_insert_line = else_end;
-    block.else_indent = else_indent;
-    return block;
-}
-
-// Returns {block, found}: found=false if no always_ff, exception if malformed
-static std::pair<FfBlock, bool> find_always_ff_if_else(const std::string& text) {
-    auto lines = split_lines(text);
-    std::regex always_ff_re(R"(\balways_ff\b)");
-
-    std::vector<int> ff_starts;
-    for (int i = 0; i < (int)lines.size(); ++i) {
-        if (std::regex_search(lines[i], always_ff_re))
-            ff_starts.push_back(i);
-    }
-    if (ff_starts.empty())
+static std::pair<FfBlock, bool> find_always_ff_if_else(const DocumentState& state) {
+    if (!state.tree)
         return {{}, false};
-
-    std::string last_err;
-    for (int ff_start : ff_starts) {
-        try {
-            return {parse_ff_block(lines, ff_start), true};
-        } catch (const std::exception& e) {
-            last_err = e.what();
-        }
-    }
-    throw std::runtime_error(last_err.empty() ? "AutoFF: no valid always_ff if/else block found" : last_err);
+    FfFinder finder(state.tree->sourceManager());
+    state.tree->root().visit(finder);
+    if (finder.block)
+        return {*finder.block, true};
+    if (!finder.error.empty())
+        throw std::runtime_error(finder.error);
+    return {{}, false};
 }
 
-// ── Check assigned in range ───────────────────────────────────────────────────
+struct AssignmentFinder : public SyntaxVisitor<AssignmentFinder> {
+    std::string signal;
+    bool found{false};
 
-static bool check_assigned_in_range(
-    const std::vector<std::string>& lines,
-    const std::string& signal, int begin_line, int end_line)
-{
-    std::string esc_signal;
-    for (char c : signal) {
-        if (std::string(".*+?^${}()|[]\\").find(c) != std::string::npos)
-            esc_signal += '\\';
-        esc_signal += c;
+    explicit AssignmentFinder(std::string signal) : signal(std::move(signal)) {}
+
+    void handle(const BinaryExpressionSyntax& node) {
+        if (found)
+            return;
+        if (node.kind == SyntaxKind::NonblockingAssignmentExpression ||
+            node.kind == SyntaxKind::AssignmentExpression) {
+            if (const auto* id = node.left->as_if<IdentifierNameSyntax>())
+                found = std::string(id->identifier.valueText()) == signal;
+        }
+        visitDefault(node);
     }
-    std::regex lhs_re("^\\s*" + esc_signal + "\\s*<=");
-    for (int i = begin_line + 1; i < end_line && i < (int)lines.size(); ++i) {
-        if (std::regex_search(lines[i], lhs_re))
-            return true;
-    }
-    return false;
+};
+
+static bool check_assigned_in_block(const BlockStatementSyntax* block, const std::string& signal) {
+    if (!block)
+        return false;
+    AssignmentFinder finder(signal);
+    block->visit(finder);
+    return finder.found;
 }
 
 // ── Find all (src, dst) pairs in AST ─────────────────────────────────────────
@@ -319,14 +244,13 @@ struct PairCollector : public SyntaxVisitor<PairCollector> {
 
     PairCollector(const SourceManager& s, const std::regex& r) : sm(s), reg_re(r) {}
 
-    void collect(const SyntaxNode& node) {
+    template <typename T>
+    void collect(const T& node) {
         std::vector<std::string> names;
-        for (uint32_t i = 0; i < node.getChildCount(); ++i) {
-            const SyntaxNode* child = node.childNode(i);
-            if (!child) continue;
-            if (const auto* d = child->as_if<DeclaratorSyntax>()) {
-                std::string name = std::string(d->name.valueText());
-                if (!name.empty()) names.push_back(name);
+        for (uint32_t i = 0; i < node.declarators.size(); ++i) {
+            if (node.declarators[i]) {
+                std::string n = std::string(node.declarators[i]->name.valueText());
+                if (!n.empty()) names.push_back(n);
             }
         }
         if (names.size() != 2) return;
@@ -353,15 +277,14 @@ struct PairCollector : public SyntaxVisitor<PairCollector> {
 
 static std::pair<std::vector<AutoffEdit>, int> build_ff_edits(
     const std::vector<std::pair<std::string, std::string>>& pairs,
-    const FfBlock& ff,
-    const std::vector<std::string>& lines)
+    const FfBlock& ff)
 {
     std::string reset_text, capture_text;
     int pending_count = 0;
 
     for (const auto& [src, dst] : pairs) {
-        bool in_if = check_assigned_in_range(lines, dst, ff.if_begin_line, ff.if_insert_line);
-        bool in_else = check_assigned_in_range(lines, dst, ff.else_begin_line, ff.else_insert_line);
+        bool in_if = check_assigned_in_block(ff.if_block, dst);
+        bool in_else = check_assigned_in_block(ff.else_block, dst);
         if (in_if && in_else) continue;
         ++pending_count;
         if (!in_if)
@@ -415,7 +338,7 @@ AutoffResult autoff(const DocumentState& state, int cursor_line, const std::stri
     FfBlock ff;
     bool found;
     try {
-        auto [block, f] = find_always_ff_if_else(state.text);
+        auto [block, f] = find_always_ff_if_else(state);
         ff = block; found = f;
     } catch (const std::exception& e) {
         result.has_error = true;
@@ -428,8 +351,7 @@ AutoffResult autoff(const DocumentState& state, int cursor_line, const std::stri
         return result;
     }
 
-    auto lines = split_lines(state.text);
-    auto [edits, _pending] = build_ff_edits({{src, dst}}, ff, lines);
+    auto [edits, _pending] = build_ff_edits({{src, dst}}, ff);
 
     if (edits.empty()) {
         result.has_error = false;
@@ -476,7 +398,7 @@ AutoffResult autoff_all(const DocumentState& state, const std::string& register_
     FfBlock ff;
     bool found;
     try {
-        auto [block, f] = find_always_ff_if_else(state.text);
+        auto [block, f] = find_always_ff_if_else(state);
         ff = block; found = f;
     } catch (const std::exception& e) {
         result.has_error = true;
@@ -489,8 +411,7 @@ AutoffResult autoff_all(const DocumentState& state, const std::string& register_
         return result;
     }
 
-    auto lines = split_lines(state.text);
-    auto [edits, pending_count] = build_ff_edits(pc.pairs, ff, lines);
+    auto [edits, pending_count] = build_ff_edits(pc.pairs, ff);
 
     if (edits.empty()) {
         result.has_error = false;
@@ -534,7 +455,7 @@ AutoffResult preview_autoff(const DocumentState& state, int cursor_line, const s
     FfBlock ff;
     bool found;
     try {
-        auto [block, f] = find_always_ff_if_else(state.text);
+        auto [block, f] = find_always_ff_if_else(state);
         ff = block; found = f;
     } catch (const std::exception& e) {
         result.has_error = true;
@@ -547,9 +468,8 @@ AutoffResult preview_autoff(const DocumentState& state, int cursor_line, const s
         return result;
     }
 
-    auto lines = split_lines(state.text);
-    bool in_if = check_assigned_in_range(lines, dst, ff.if_begin_line, ff.if_insert_line);
-    bool in_else = check_assigned_in_range(lines, dst, ff.else_begin_line, ff.else_insert_line);
+    bool in_if = check_assigned_in_block(ff.if_block, dst);
+    bool in_else = check_assigned_in_block(ff.else_block, dst);
 
     if (in_if && in_else) {
         result.warn = true;
@@ -600,7 +520,7 @@ AutoffResult preview_autoff_all(const DocumentState& state, const std::string& r
     FfBlock ff;
     bool found;
     try {
-        auto [block, f] = find_always_ff_if_else(state.text);
+        auto [block, f] = find_always_ff_if_else(state);
         ff = block; found = f;
     } catch (const std::exception& e) {
         result.has_error = true;
@@ -613,10 +533,9 @@ AutoffResult preview_autoff_all(const DocumentState& state, const std::string& r
         return result;
     }
 
-    auto lines = split_lines(state.text);
     for (const auto& [src, dst] : pc.pairs) {
-        bool in_if = check_assigned_in_range(lines, dst, ff.if_begin_line, ff.if_insert_line);
-        bool in_else = check_assigned_in_range(lines, dst, ff.else_begin_line, ff.else_insert_line);
+        bool in_if = check_assigned_in_block(ff.if_block, dst);
+        bool in_else = check_assigned_in_block(ff.else_block, dst);
         if (!in_if || !in_else) {
             AutoffPair pair;
             pair.src = src;

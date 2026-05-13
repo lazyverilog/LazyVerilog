@@ -11,6 +11,7 @@ struct AutoinstResult {
     std::string module_name;
     std::string instance_name;
     std::vector<std::string> port_names;
+    std::map<std::string, std::string> existing_connections;
     int line_start{0};
     int line_end{0};
 };

@@ -171,7 +171,17 @@ Config load_config(const std::filesystem::path& root) {
 
         // [autoarg]
         if (auto aa = tbl["autoarg"].as_table()) {
+            if (auto v = (*aa)["indent_size"].value<int64_t>())
+                cfg.autoarg.indent_size = static_cast<int>(*v);
             if (auto v = (*aa)["autoarg_on_save"].value<bool>()) cfg.autoarg.autoarg_on_save = *v;
+        }
+
+        // [autofunc]
+        if (auto af = tbl["autofunc"].as_table()) {
+            if (auto v = (*af)["indent_size"].value<int64_t>())
+                cfg.autofunc.indent_size = static_cast<int>(*v);
+            if (auto v = (*af)["use_named_arguments"].value<bool>())
+                cfg.autofunc.use_named_arguments = *v;
         }
 
         // Unknown top-level keys silently ignored (toml++ doesn't error on them)

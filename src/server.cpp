@@ -140,6 +140,17 @@ static std::vector<std::string> load_vcode_files(const std::filesystem::path& ro
     return paths;
 }
 
+static void merge_extra_file_modules(SyntaxIndex& index, const Analyzer& analyzer) {
+    for (const auto& path : analyzer.extra_files()) {
+        slang::SourceManager sm;
+        auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path, sm);
+        if (!tree_or_error)
+            continue;
+        auto extra = SyntaxIndex::build(**tree_or_error);
+        index.modules.insert(index.modules.end(), extra.modules.begin(), extra.modules.end());
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct StderrLog : public lsp::Log {
@@ -734,6 +745,7 @@ void LazyVerilogServer::register_handlers() {
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
                     auto idx = SyntaxIndex::build(*state->tree, state->text);
+                    merge_extra_file_modules(idx, analyzer_);
                     if (cmd == "lazyverilogpy.autowirepreview") {
                         auto preview = autowire_preview(*state, idx, config_.autowire);
                         // Return preview lines as JSON array of strings
