@@ -148,6 +148,25 @@ static std::string extract_ident(std::string_view src, int line, int col) {
     return span ? span->text : std::string{};
 }
 
+static bool is_backtick_identifier(std::string_view src, int line, int ident_start_col) {
+    int cur = 0;
+    size_t pos = 0;
+    while (pos < src.size() && cur < line) {
+        if (src[pos] == '\n')
+            ++cur;
+        ++pos;
+    }
+    if (cur < line || ident_start_col <= 0)
+        return false;
+
+    size_t line_start = pos;
+    size_t line_end = src.find('\n', pos);
+    if (line_end == std::string_view::npos)
+        line_end = src.size();
+    const size_t backtick = line_start + (size_t)ident_start_col - 1;
+    return backtick < line_end && src[backtick] == '`';
+}
+
 static int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line - 1 : 0; }
 
 static std::string path_to_uri(const std::filesystem::path& path) {
@@ -226,6 +245,30 @@ static std::string read_file_text(const std::filesystem::path& path) {
     if (!in)
         return {};
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+static std::optional<std::string> read_file_text_optional(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+static std::filesystem::path normalize_path(const std::string& path) {
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(std::filesystem::path(path), ec);
+    if (ec)
+        absolute = std::filesystem::path(path);
+    return absolute.lexically_normal();
+}
+
+static std::optional<std::filesystem::file_time_type>
+file_mtime(const std::filesystem::path& path) {
+    std::error_code ec;
+    auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec)
+        return std::nullopt;
+    return mtime;
 }
 
 static std::string trim_copy(std::string text) {
@@ -307,8 +350,7 @@ static std::optional<Location> find_macro_definition(const slang::syntax::Syntax
 }
 
 static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree& tree,
-                                                 const std::string& uri,
-                                                 const std::string& name) {
+                                                 const std::string& uri, const std::string& name) {
     const auto& sm = tree.sourceManager();
     for (const auto* macro : tree.getDefinedMacros()) {
         if (!macro || macro->name.valueText() != name)
@@ -496,7 +538,8 @@ static std::string name_text(const slang::syntax::NameSyntax& name) {
 
 static std::optional<SymbolInfo>
 symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::string& uri,
-                            const std::string& name, const Location& definition) {
+                            const std::string& name, const Location& definition,
+                            const SyntaxIndex* prebuilt_index = nullptr) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
@@ -642,8 +685,8 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
             if (const auto* identifier =
                     node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>()) {
-                auto kind = node.kind == slang::syntax::SyntaxKind::TaskDeclaration ? "task"
-                                                                                    : "function";
+                auto kind =
+                    node.kind == slang::syntax::SyntaxKind::TaskDeclaration ? "task" : "function";
                 std::string doc;
                 std::string detail(kind);
                 if (node.kind == slang::syntax::SyntaxKind::TaskDeclaration) {
@@ -654,8 +697,8 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                     auto return_type = trim_copy(node.prototype->returnType->toString());
                     auto ports =
                         node.prototype->portList ? node.prototype->portList->toString() : "";
-                    doc = "```\nfunction " + return_type + " " + name +
-                          format_ports_doc(ports) + "\n```";
+                    doc = "```\nfunction " + return_type + " " + name + format_ports_doc(ports) +
+                          "\n```";
                 }
                 if (identifier->identifier.valueText() == name &&
                     token_at_location(sm, identifier->identifier, definition)) {
@@ -676,7 +719,8 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
     };
 
-    auto index = SyntaxIndex::build(tree);
+    auto built_index = prebuilt_index ? SyntaxIndex{} : SyntaxIndex::build(tree);
+    const auto& index = prebuilt_index ? *prebuilt_index : built_index;
     Visitor visitor(tree.sourceManager(), uri, name, definition, index);
     tree.root().visit(visitor);
     return visitor.result;
@@ -884,24 +928,19 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
 
     auto idx = SyntaxIndex::build(*state->tree, state->text);
     auto target = definition_target_at(*state->tree, line, col);
-    std::vector<std::string> extra_files;
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        extra_files = extra_files_;
-    }
+    auto extra_files = extra_file_snapshots();
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto info = find_macro_info(*state->tree, uri, target.name))
             return info;
-        for (const auto& path : extra_files) {
-            if (auto info = find_macro_info_in_file(path, target.name))
+        for (const auto& extra : extra_files) {
+            if (!extra.state || !extra.state->tree)
+                continue;
+            if (auto info = find_macro_info(*extra.state->tree, extra.uri, target.name))
                 return info;
         }
-        return SymbolInfo{.name = target.name,
-                          .kind = "macro",
-                          .detail = "(empty)",
-                          .line = line,
-                          .col = col};
+        return SymbolInfo{
+            .name = target.name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
     }
 
     for (const auto& m : idx.modules) {
@@ -932,13 +971,14 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     if (definition) {
         std::string name = target.name.empty() ? ident : target.name;
         if (definition->uri == uri) {
-            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition, &idx))
                 return info;
         } else {
-            for (const auto& path : extra_files) {
-                if (path_to_uri(path) != definition->uri)
+            for (const auto& extra : extra_files) {
+                if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
                     continue;
-                if (auto info = symbol_info_from_definition_file(path, name, *definition))
+                if (auto info = symbol_info_from_definition(*extra.state->tree, extra.uri, name,
+                                                            *definition, &extra.index))
                     return info;
             }
         }
@@ -1008,22 +1048,41 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     if (!state || !state->tree)
         return std::nullopt;
 
-    auto target = definition_target_at(*state->tree, line, col);
-    if (target.kind == DefinitionTargetKind::None || target.name.empty())
+    return definition_of_state(*state, uri, line, col, extra_file_snapshots());
+}
+
+std::optional<Location>
+Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
+                              const std::vector<ExtraFileInfo>& extra_files) const {
+    if (!state.tree)
         return std::nullopt;
 
-    auto idx = SyntaxIndex::build(*state->tree);
-    std::vector<std::string> extra_files;
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        extra_files = extra_files_;
+    auto target = definition_target_at(*state.tree, line, col);
+    auto idx = SyntaxIndex::build(*state.tree, state.text);
+
+    if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
+        auto ident = extract_ident_span(state.text, line, col);
+        if (!ident || !is_backtick_identifier(state.text, line, ident->start_col))
+            return std::nullopt;
+
+        if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
+            return loc;
+        for (const auto& extra : extra_files) {
+            if (!extra.state || !extra.state->tree)
+                continue;
+            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, ident->text))
+                return loc;
+        }
+        return std::nullopt;
     }
 
     if (target.kind == DefinitionTargetKind::Macro) {
-        if (auto loc = find_macro_definition(*state->tree, uri, target.name))
+        if (auto loc = find_macro_definition(*state.tree, uri, target.name))
             return loc;
-        for (const auto& path : extra_files) {
-            if (auto loc = find_macro_definition_in_file(path, target.name))
+        for (const auto& extra : extra_files) {
+            if (!extra.state || !extra.state->tree)
+                continue;
+            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, target.name))
                 return loc;
         }
         return std::nullopt;
@@ -1033,25 +1092,24 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
         if (auto loc = find_port_definition(idx, uri, target.module_name, target.name))
             return loc;
 
-        for (const auto& path : extra_files) {
-            auto indexed = build_index_for_file(path);
-            if (!indexed)
-                continue;
-            if (auto loc = find_port_definition(indexed->index, indexed->uri, target.module_name,
-                                                target.name))
+        for (const auto& extra : extra_files) {
+            if (auto loc =
+                    find_port_definition(extra.index, extra.uri, target.module_name, target.name))
                 return loc;
         }
         return std::nullopt;
     }
 
     if (target.kind == DefinitionTargetKind::NamedArgument) {
-        if (auto loc = find_subroutine_argument_definition(*state->tree, uri,
-                                                           target.subroutine_name, target.name))
+        if (auto loc = find_subroutine_argument_definition(*state.tree, uri, target.subroutine_name,
+                                                           target.name))
             return loc;
 
-        for (const auto& path : extra_files) {
-            if (auto loc = find_subroutine_argument_definition_in_file(path, target.subroutine_name,
-                                                                       target.name))
+        for (const auto& extra : extra_files) {
+            if (!extra.state || !extra.state->tree)
+                continue;
+            if (auto loc = find_subroutine_argument_definition(*extra.state->tree, extra.uri,
+                                                               target.subroutine_name, target.name))
                 return loc;
         }
         return std::nullopt;
@@ -1060,20 +1118,20 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     if (target.kind == DefinitionTargetKind::Instance) {
         if (auto loc = find_module_definition(idx, uri, target.module_name))
             return loc;
-        for (const auto& path : extra_files) {
-            auto indexed = build_index_for_file(path);
-            if (!indexed)
-                continue;
-            if (auto loc = find_module_definition(indexed->index, indexed->uri, target.module_name))
+        for (const auto& extra : extra_files) {
+            if (auto loc = find_module_definition(extra.index, extra.uri, target.module_name))
                 return loc;
         }
         return std::nullopt;
     }
 
-    if (auto loc = find_generic_definition(*state->tree, uri, target.name, target.scope_module))
+    if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module))
         return loc;
-    for (const auto& path : extra_files) {
-        if (auto loc = find_generic_definition_in_file(path, target.name, target.scope_module))
+    for (const auto& extra : extra_files) {
+        if (!extra.state || !extra.state->tree)
+            continue;
+        if (auto loc = find_generic_definition(*extra.state->tree, extra.uri, target.name,
+                                               target.scope_module))
             return loc;
     }
 
@@ -1087,64 +1145,60 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     if (!target || !target_def)
         return {};
 
-    std::vector<std::string> extra_files;
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        extra_files = extra_files_;
-    }
+    auto extra_files = extra_file_snapshots();
 
     std::vector<Location> result;
     std::set<std::tuple<std::string, int, int>> seen;
 
-    auto add_if_same_definition = [&](const std::string& file_uri, int ref_line, int ref_col,
-                                      const std::function<std::optional<Location>(
-                                          const std::string&, int, int)>& resolver) {
-        auto candidate_def = resolver(file_uri, ref_line, ref_col);
-        if (!candidate_def || !same_location(*candidate_def, *target_def))
-            return;
-        if (!include_declaration && file_uri == target_def->uri && ref_line == target_def->line &&
-            ref_col == target_def->col)
-            return;
+    auto add_if_same_definition =
+        [&](const std::string& file_uri, int ref_line, int ref_col,
+            const std::function<std::optional<Location>(const std::string&, int, int)>& resolver) {
+            auto candidate_def = resolver(file_uri, ref_line, ref_col);
+            if (!candidate_def || !same_location(*candidate_def, *target_def))
+                return;
+            if (!include_declaration && file_uri == target_def->uri &&
+                ref_line == target_def->line && ref_col == target_def->col)
+                return;
 
-        auto key = std::make_tuple(file_uri, ref_line, ref_col);
-        if (!seen.insert(key).second)
-            return;
-        result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
-                                  ref_col + (int)target->name.size()});
-    };
-
-    auto visit_tree = [&](const slang::syntax::SyntaxTree& tree, const std::string& fallback_uri,
-                          const std::function<std::optional<Location>(const std::string&, int, int)>&
-                              resolver) {
-        struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
-            const slang::SourceManager& sm;
-            const std::string& fallback_uri;
-            const std::string& name;
-            const std::function<void(const std::string&, int, int)>& add;
-
-            Visitor(const slang::SourceManager& sm, const std::string& fallback_uri,
-                    const std::string& name,
-                    const std::function<void(const std::string&, int, int)>& add)
-                : sm(sm), fallback_uri(fallback_uri), name(name), add(add) {}
-
-            void visitToken(slang::parsing::Token token) {
-                if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
-                    token.valueText() != name)
-                    return;
-
-                const auto loc = location_from_token_actual_uri(sm, fallback_uri, token);
-                add(loc.uri, loc.line, loc.col);
-            }
+            auto key = std::make_tuple(file_uri, ref_line, ref_col);
+            if (!seen.insert(key).second)
+                return;
+            result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
+                                      ref_col + (int)target->name.size()});
         };
 
-        std::function<void(const std::string&, int, int)> add =
-            [&](const std::string& candidate_uri, int ref_line, int ref_col) {
-                add_if_same_definition(candidate_uri, ref_line, ref_col, resolver);
+    auto visit_tree =
+        [&](const slang::syntax::SyntaxTree& tree, const std::string& fallback_uri,
+            const std::function<std::optional<Location>(const std::string&, int, int)>& resolver) {
+            struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+                const slang::SourceManager& sm;
+                const std::string& fallback_uri;
+                const std::string& name;
+                const std::function<void(const std::string&, int, int)>& add;
+
+                Visitor(const slang::SourceManager& sm, const std::string& fallback_uri,
+                        const std::string& name,
+                        const std::function<void(const std::string&, int, int)>& add)
+                    : sm(sm), fallback_uri(fallback_uri), name(name), add(add) {}
+
+                void visitToken(slang::parsing::Token token) {
+                    if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
+                        token.valueText() != name)
+                        return;
+
+                    const auto loc = location_from_token_actual_uri(sm, fallback_uri, token);
+                    add(loc.uri, loc.line, loc.col);
+                }
             };
 
-        Visitor visitor(tree.sourceManager(), fallback_uri, target->name, add);
-        tree.root().visit(visitor);
-    };
+            std::function<void(const std::string&, int, int)> add =
+                [&](const std::string& candidate_uri, int ref_line, int ref_col) {
+                    add_if_same_definition(candidate_uri, ref_line, ref_col, resolver);
+                };
+
+            Visitor visitor(tree.sourceManager(), fallback_uri, target->name, add);
+            tree.root().visit(visitor);
+        };
 
     std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
     {
@@ -1154,43 +1208,44 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             open_states.emplace_back(state_uri, state);
     }
 
+    std::set<std::string> open_uris;
+    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> open_state_by_uri;
+    for (const auto& [state_uri, state] : open_states) {
+        open_uris.insert(state_uri);
+        open_state_by_uri[state_uri] = state;
+    }
+
+    auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
+                                int ref_col) -> std::optional<Location> {
+        if (auto it = open_state_by_uri.find(candidate_uri); it != open_state_by_uri.end()) {
+            if (!it->second)
+                return std::nullopt;
+            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, extra_files);
+        }
+        for (const auto& extra : extra_files) {
+            if (extra.uri != candidate_uri || !extra.state)
+                continue;
+            return definition_of_state(*extra.state, candidate_uri, ref_line, ref_col, extra_files);
+        }
+        return std::nullopt;
+    };
+
     for (const auto& [state_uri, state] : open_states) {
         if (!state || !state->tree)
             continue;
-        visit_tree(*state->tree, state_uri,
-                   [&](const std::string& candidate_uri, int ref_line, int ref_col) {
-                       return definition_of(candidate_uri, ref_line, ref_col);
-                   });
+        visit_tree(*state->tree, state_uri, resolve_snapshot);
     }
 
-    std::set<std::string> open_uris;
-    for (const auto& [state_uri, state] : open_states)
-        open_uris.insert(state_uri);
-
-    for (const auto& path_str : extra_files) {
-        const std::filesystem::path path(path_str);
-        const std::string file_uri = path_to_uri(path);
-        if (open_uris.contains(file_uri))
+    for (const auto& extra : extra_files) {
+        if (open_uris.contains(extra.uri) || !extra.state || !extra.state->tree)
             continue;
-
-        slang::SourceManager sm;
-        auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path.string(), sm);
-        if (!tree_or_error)
-            continue;
-
-        const std::string text = read_file_text(path);
-        if (text.empty())
-            continue;
-        Analyzer temp;
-        temp.set_extra_files(extra_files);
-        temp.open(file_uri, text);
         auto resolver = [&](const std::string& candidate_uri, int ref_line,
                             int ref_col) -> std::optional<Location> {
-            if (candidate_uri != file_uri)
+            if (candidate_uri != extra.uri)
                 return std::nullopt;
-            return temp.definition_of(file_uri, ref_line, ref_col);
+            return resolve_snapshot(candidate_uri, ref_line, ref_col);
         };
-        visit_tree(**tree_or_error, file_uri, resolver);
+        visit_tree(*extra.state->tree, extra.uri, resolver);
     }
 
     std::sort(result.begin(), result.end(), [](const Location& a, const Location& b) {
@@ -1238,9 +1293,80 @@ std::vector<std::pair<int, int>> Analyzer::find_occurrences(const std::string& u
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths) {
     std::lock_guard<std::mutex> lock(map_mutex_);
-    extra_files_ = paths;
+    extra_files_.clear();
+    extra_files_.reserve(paths.size());
+    for (const auto& path : paths)
+        extra_files_.push_back(normalize_path(path).string());
+    refresh_extra_cache_locked();
 }
 
-void Analyzer::refresh_if_stale(const std::string& /*uri*/) {
-    // TODO: implement mtime check in US-011
+std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    refresh_extra_cache_locked();
+
+    std::vector<ExtraFileInfo> result;
+    result.reserve(extra_cache_.size());
+    for (const auto& entry : extra_cache_) {
+        if (!entry.state || docs_.contains(entry.uri))
+            continue;
+        result.push_back(ExtraFileInfo{
+            .path = entry.path,
+            .uri = entry.uri,
+            .state = entry.state,
+            .index = entry.index,
+        });
+    }
+    return result;
+}
+
+void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
+    for (const auto& extra : extra_file_snapshots())
+        index.modules.insert(index.modules.end(), extra.index.modules.begin(),
+                             extra.index.modules.end());
+}
+
+void Analyzer::refresh_if_stale(const std::string& /*uri*/) const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    refresh_extra_cache_locked();
+}
+
+void Analyzer::refresh_extra_cache_locked() const {
+    std::vector<ExtraFileCacheEntry> refreshed;
+    refreshed.reserve(extra_files_.size());
+
+    for (const auto& configured_path : extra_files_) {
+        const auto path = normalize_path(configured_path);
+        const auto path_string = path.string();
+        const auto mtime = file_mtime(path);
+        if (!mtime)
+            continue;
+
+        auto existing = std::find_if(
+            extra_cache_.begin(), extra_cache_.end(), [&](const ExtraFileCacheEntry& entry) {
+                return entry.path == path_string && entry.mtime == mtime && entry.state;
+            });
+        if (existing != extra_cache_.end()) {
+            refreshed.push_back(*existing);
+            continue;
+        }
+
+        auto text = read_file_text_optional(path);
+        if (!text)
+            continue;
+
+        const auto uri = path_to_uri(path);
+        auto state = make_state(uri, *text);
+        if (!state || !state->tree)
+            continue;
+
+        refreshed.push_back(ExtraFileCacheEntry{
+            .path = path_string,
+            .uri = uri,
+            .mtime = mtime,
+            .state = state,
+            .index = SyntaxIndex::build(*state->tree, state->text),
+        });
+    }
+
+    extra_cache_ = std::move(refreshed);
 }

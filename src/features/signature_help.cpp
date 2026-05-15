@@ -53,9 +53,7 @@ static std::string name_text(const NameSyntax& name) {
     return trim(name.toString());
 }
 
-static bool is_ident_char(char c) {
-    return std::isalnum((unsigned char)c) || c == '_' || c == '$';
-}
+static bool is_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; }
 
 static std::string ident_before(std::string_view text, size_t end) {
     while (end > 0 && std::isspace((unsigned char)text[end - 1]))
@@ -114,8 +112,9 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
                 auto name = ident_before(before, end);
                 if (name.empty())
                     return std::nullopt;
-                return CallContext{name, named_port ? std::variant<int, std::string>(*named_port)
-                                                    : std::variant<int, std::string>(active),
+                return CallContext{name,
+                                   named_port ? std::variant<int, std::string>(*named_port)
+                                              : std::variant<int, std::string>(active),
                                    module_param};
             }
             --depth;
@@ -129,10 +128,10 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
 static std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>>
 open_states(const Analyzer& analyzer) {
     std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> states;
-    analyzer.for_each_state([&](const std::string& uri,
-                                const std::shared_ptr<const DocumentState>& state) {
-        states.emplace_back(uri, state);
-    });
+    analyzer.for_each_state(
+        [&](const std::string& uri, const std::shared_ptr<const DocumentState>& state) {
+            states.emplace_back(uri, state);
+        });
     return states;
 }
 
@@ -157,8 +156,7 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
 
             if (node.prototype->portList) {
                 for (const auto* port_base : node.prototype->portList->ports) {
-                    const auto* port =
-                        port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
+                    const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
                     if (!port || !port->declarator)
                         continue;
                     ParamInfo param;
@@ -230,19 +228,17 @@ static std::optional<SubroutineInfo> find_subroutine(const Analyzer& analyzer,
                 return found;
         }
     }
-    for (const auto& path : analyzer.extra_files()) {
-        SourceManager sm;
-        auto tree = SyntaxTree::fromFile(path, sm);
-        if (!tree)
+    for (const auto& extra : analyzer.extra_file_snapshots()) {
+        if (!extra.state || !extra.state->tree)
             continue;
-        if (auto found = subroutine_from_tree(**tree, name))
+        if (auto found = subroutine_from_tree(*extra.state->tree, name))
             return found;
     }
     return std::nullopt;
 }
 
 static std::optional<std::vector<ParamInfo>> find_module_params(const Analyzer& analyzer,
-                                                               const std::string& name) {
+                                                                const std::string& name) {
     for (const auto& [uri, state] : open_states(analyzer)) {
         (void)uri;
         if (state && state->tree) {
@@ -250,12 +246,10 @@ static std::optional<std::vector<ParamInfo>> find_module_params(const Analyzer& 
                 return found;
         }
     }
-    for (const auto& path : analyzer.extra_files()) {
-        SourceManager sm;
-        auto tree = SyntaxTree::fromFile(path, sm);
-        if (!tree)
+    for (const auto& extra : analyzer.extra_file_snapshots()) {
+        if (!extra.state || !extra.state->tree)
             continue;
-        if (auto found = module_params_from_tree(**tree, name))
+        if (auto found = module_params_from_tree(*extra.state->tree, name))
             return found;
     }
     return std::nullopt;
@@ -345,16 +339,19 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
             labels.push_back(format_arg(param));
         int active = std::min(resolve_active(ctx->active, *params_info),
                               std::max((int)params_info->size() - 1, 0));
-        return make_help("module " + ctx->name + " #(" + [&] {
-                             std::string joined;
-                             for (size_t i = 0; i < labels.size(); ++i) {
-                                 if (i)
-                                     joined += ", ";
-                                 joined += labels[i];
-                             }
-                             return joined;
-                         }() + ")",
-                         labels, active);
+        return make_help(
+            "module " + ctx->name + " #(" +
+                [&] {
+                    std::string joined;
+                    for (size_t i = 0; i < labels.size(); ++i) {
+                        if (i)
+                            joined += ", ";
+                        joined += labels[i];
+                    }
+                    return joined;
+                }() +
+                ")",
+            labels, active);
     }
 
     auto subroutine = find_subroutine(analyzer, ctx->name);

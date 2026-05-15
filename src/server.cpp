@@ -19,6 +19,7 @@
 #include "LibLsp/lsp/textDocument/did_open.h"
 #include "LibLsp/lsp/workspace/did_change_configuration.h"
 // Feature handlers
+#include "LibLsp/JsonRpc/serializer.h"
 #include "LibLsp/lsp/textDocument/completion.h"
 #include "LibLsp/lsp/textDocument/declaration_definition.h"
 #include "LibLsp/lsp/textDocument/formatting.h"
@@ -30,12 +31,13 @@
 #include "LibLsp/lsp/textDocument/rename.h"
 #include "LibLsp/lsp/textDocument/signature_help.h"
 #include "LibLsp/lsp/windows/MessageNotify.h"
+#include "LibLsp/lsp/workspace/execute_command.h"
 #include "LibLsp/lsp/workspace/symbol.h"
-#include "features/autoinst.hpp"
 #include "features/autoarg.hpp"
-#include "features/autowire.hpp"
 #include "features/autoff.hpp"
 #include "features/autofunc.hpp"
+#include "features/autoinst.hpp"
+#include "features/autowire.hpp"
 #include "features/code_action.hpp"
 #include "features/definition.hpp"
 #include "features/formatter.hpp"
@@ -46,8 +48,6 @@
 #include "features/rename.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
-#include "LibLsp/JsonRpc/serializer.h"
-#include "LibLsp/lsp/workspace/execute_command.h"
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
@@ -138,17 +138,6 @@ static std::vector<std::string> load_vcode_files(const std::filesystem::path& ro
         paths.push_back(std::filesystem::absolute(path).lexically_normal().string());
     }
     return paths;
-}
-
-static void merge_extra_file_modules(SyntaxIndex& index, const Analyzer& analyzer) {
-    for (const auto& path : analyzer.extra_files()) {
-        slang::SourceManager sm;
-        auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path, sm);
-        if (!tree_or_error)
-            continue;
-        auto extra = SyntaxIndex::build(**tree_or_error);
-        index.modules.insert(index.modules.end(), extra.modules.begin(), extra.modules.end());
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -633,13 +622,15 @@ void LazyVerilogServer::register_handlers() {
             const auto& args = req.params.arguments;
 
             auto get_string = [&](size_t i) -> std::string {
-                if (!args || i >= args->size()) return {};
+                if (!args || i >= args->size())
+                    return {};
                 std::string s;
                 const_cast<lsp::Any&>((*args)[i]).Get(s);
                 return s;
             };
             auto get_int = [&](size_t i) -> int {
-                if (!args || i >= args->size()) return 0;
+                if (!args || i >= args->size())
+                    return 0;
                 int v = 0;
                 const_cast<lsp::Any&>((*args)[i]).Get(v);
                 return v;
@@ -653,10 +644,12 @@ void LazyVerilogServer::register_handlers() {
                     rsp.result = std::move(null_result);
                     return;
                 }
-                if (result.edits.empty()) return;
+                if (result.edits.empty())
+                    return;
 
                 auto state = analyzer_.get_state(uri);
-                if (!state) return;
+                if (!state)
+                    return;
 
                 // Apply edits in reverse order to build new text
                 auto lines = [&]() {
@@ -665,7 +658,10 @@ void LazyVerilogServer::register_handlers() {
                     const std::string& t = state->text;
                     while (start <= t.size()) {
                         size_t end = t.find('\n', start);
-                        if (end == std::string::npos) { ls.push_back(t.substr(start)); break; }
+                        if (end == std::string::npos) {
+                            ls.push_back(t.substr(start));
+                            break;
+                        }
                         ls.push_back(t.substr(start, end - start));
                         start = end + 1;
                     }
@@ -695,7 +691,8 @@ void LazyVerilogServer::register_handlers() {
 
                 std::string new_text;
                 for (size_t i = 0; i < lines.size(); ++i) {
-                    if (i > 0) new_text += "\n";
+                    if (i > 0)
+                        new_text += "\n";
                     new_text += lines[i];
                 }
 
@@ -709,16 +706,24 @@ void LazyVerilogServer::register_handlers() {
                 (*we.changes)[uri] = {text_edit};
 
                 // Serialize WorkspaceEdit manually to JSON
-                std::string json = "{\"changes\":{\"" + uri + "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":999999,\"character\":0}},\"newText\":";
+                std::string json = "{\"changes\":{\"" + uri +
+                                   "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":"
+                                   "{\"line\":999999,\"character\":0}},\"newText\":";
                 // JSON-encode the newText
                 std::string escaped_text = "\"";
                 for (char c : new_text) {
-                    if (c == '"') escaped_text += "\\\"";
-                    else if (c == '\\') escaped_text += "\\\\";
-                    else if (c == '\n') escaped_text += "\\n";
-                    else if (c == '\r') escaped_text += "\\r";
-                    else if (c == '\t') escaped_text += "\\t";
-                    else escaped_text += c;
+                    if (c == '"')
+                        escaped_text += "\\\"";
+                    else if (c == '\\')
+                        escaped_text += "\\\\";
+                    else if (c == '\n')
+                        escaped_text += "\\n";
+                    else if (c == '\r')
+                        escaped_text += "\\r";
+                    else if (c == '\t')
+                        escaped_text += "\\t";
+                    else
+                        escaped_text += c;
                 }
                 escaped_text += "\"";
                 json += escaped_text + "}]}}";
@@ -733,7 +738,8 @@ void LazyVerilogServer::register_handlers() {
                     auto result = autoff(*state, ff_line, config_.lint.naming.register_pattern);
                     apply_ff_edits(result, uri);
                 }
-            } else if (cmd == "lazyverilogpy.autoffAllPreview" || cmd == "lazyverilogpy.autoffAllApply") {
+            } else if (cmd == "lazyverilogpy.autoffAllPreview" ||
+                       cmd == "lazyverilogpy.autoffAllApply") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
@@ -745,19 +751,24 @@ void LazyVerilogServer::register_handlers() {
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
                     auto idx = SyntaxIndex::build(*state->tree, state->text);
-                    merge_extra_file_modules(idx, analyzer_);
+                    analyzer_.merge_extra_file_modules(idx);
                     if (cmd == "lazyverilogpy.autowirepreview") {
                         auto preview = autowire_preview(*state, idx, config_.autowire);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
                         for (size_t i = 0; i < preview.size(); ++i) {
-                            if (i > 0) json += ",";
+                            if (i > 0)
+                                json += ",";
                             json += "\"";
                             for (char c : preview[i]) {
-                                if (c == '"') json += "\\\"";
-                                else if (c == '\\') json += "\\\\";
-                                else if (c == '\n') json += "\\n";
-                                else json += c;
+                                if (c == '"')
+                                    json += "\\\"";
+                                else if (c == '\\')
+                                    json += "\\\\";
+                                else if (c == '\n')
+                                    json += "\\n";
+                                else
+                                    json += c;
                             }
                             json += "\"";
                         }
@@ -774,15 +785,24 @@ void LazyVerilogServer::register_handlers() {
                             we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
                             (*we.changes)[uri] = {text_edit};
                             // Serialize WorkspaceEdit manually to JSON
-                            std::string json = "{\"changes\":{\"" + uri + "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":999999,\"character\":0}},\"newText\":";
+                            std::string json =
+                                "{\"changes\":{\"" + uri +
+                                "\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{"
+                                "\"line\":999999,\"character\":0}},\"newText\":";
                             std::string esc = "\"";
                             for (char c : new_source) {
-                                if (c == '"') esc += "\\\"";
-                                else if (c == '\\') esc += "\\\\";
-                                else if (c == '\n') esc += "\\n";
-                                else if (c == '\r') esc += "\\r";
-                                else if (c == '\t') esc += "\\t";
-                                else esc += c;
+                                if (c == '"')
+                                    esc += "\\\"";
+                                else if (c == '\\')
+                                    esc += "\\\\";
+                                else if (c == '\n')
+                                    esc += "\\n";
+                                else if (c == '\r')
+                                    esc += "\\r";
+                                else if (c == '\t')
+                                    esc += "\\t";
+                                else
+                                    esc += c;
                             }
                             esc += "\"";
                             json += esc + "}]}}";

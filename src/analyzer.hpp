@@ -1,5 +1,7 @@
 #pragma once
 #include "document_state.hpp"
+#include "syntax_index.hpp"
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -29,6 +31,13 @@ struct IdentifierAtPosition {
     int line{0};
     int col{0};
     int end_col{0};
+};
+
+struct ExtraFileInfo {
+    std::string path;
+    std::string uri;
+    std::shared_ptr<const DocumentState> state;
+    SyntaxIndex index;
 };
 
 class Analyzer {
@@ -80,14 +89,34 @@ class Analyzer {
     /// Return extra files from .f filelist.
     std::vector<std::string> extra_files() const;
 
+    /// Return parsed/indexed extra files, refreshing stale disk entries first.
+    std::vector<ExtraFileInfo> extra_file_snapshots() const;
+
+    /// Append cached extra-file modules to an existing SyntaxIndex.
+    void merge_extra_file_modules(SyntaxIndex& index) const;
+
     /// Check mtime of extra files and re-parse if stale.
-    void refresh_if_stale(const std::string& uri);
+    void refresh_if_stale(const std::string& uri) const;
 
   private:
     std::shared_ptr<DocumentState> make_state(const std::string& uri,
                                               const std::string& text) const;
+    std::optional<Location>
+    definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
+                        const std::vector<ExtraFileInfo>& extra_files) const;
+
+    struct ExtraFileCacheEntry {
+        std::string path;
+        std::string uri;
+        std::optional<std::filesystem::file_time_type> mtime;
+        std::shared_ptr<const DocumentState> state;
+        SyntaxIndex index;
+    };
+
+    void refresh_extra_cache_locked() const;
 
     mutable std::mutex map_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
-    std::vector<std::string> extra_files_;
+    mutable std::vector<std::string> extra_files_;
+    mutable std::vector<ExtraFileCacheEntry> extra_cache_;
 };

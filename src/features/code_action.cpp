@@ -1,10 +1,10 @@
 #include "code_action.hpp"
-#include "autoinst.hpp"
+#include "../syntax_index.hpp"
 #include "autoarg.hpp"
-#include "autowire.hpp"
 #include "autoff.hpp"
 #include "autofunc.hpp"
-#include "../syntax_index.hpp"
+#include "autoinst.hpp"
+#include "autowire.hpp"
 #include <iostream>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -16,12 +16,8 @@ using namespace slang::syntax;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-static lsWorkspaceEdit make_range_edit(
-    const std::string& uri,
-    int start_line, int start_col,
-    int end_line, int end_col,
-    const std::string& new_text)
-{
+static lsWorkspaceEdit make_range_edit(const std::string& uri, int start_line, int start_col,
+                                       int end_line, int end_col, const std::string& new_text) {
     lsWorkspaceEdit we;
     lsTextEdit edit;
     edit.range.start = lsPosition(start_line, start_col);
@@ -32,25 +28,16 @@ static lsWorkspaceEdit make_range_edit(
     return we;
 }
 
-static void merge_extra_file_modules(SyntaxIndex& dest, const Analyzer& analyzer) {
-    for (const auto& path : analyzer.extra_files()) {
-        slang::SourceManager sm;
-        auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path, sm);
-        if (!tree_or_error)
-            continue;
-        auto extra = SyntaxIndex::build(**tree_or_error);
-        dest.modules.insert(dest.modules.end(), extra.modules.begin(), extra.modules.end());
-    }
-}
-
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid()) return 0;
+    if (!tok || !tok.location().valid())
+        return 0;
     auto line = sm.getLineNumber(tok.location());
     return line > 0 ? (int)line - 1 : 0;
 }
 
 static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid()) return 0;
+    if (!tok || !tok.location().valid())
+        return 0;
     auto col = sm.getColumnNumber(tok.location());
     return col > 0 ? (int)col - 1 : 0;
 }
@@ -90,10 +77,8 @@ struct QuickFixLocator : public SyntaxVisitor<QuickFixLocator> {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-std::vector<CodeAction> provide_code_actions(
-    const Analyzer& analyzer, const Config& config,
-    const lsCodeActionParams& params)
-{
+std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Config& config,
+                                             const lsCodeActionParams& params) {
     std::vector<CodeAction> actions;
 
     const std::string& uri = params.textDocument.uri.raw_uri_;
@@ -101,13 +86,14 @@ std::vector<CodeAction> provide_code_actions(
     int col = params.range.start.character;
 
     auto state = analyzer.get_state(uri);
-    if (!state) return actions;
+    if (!state)
+        return actions;
 
     // Build index once; shared by autoinst and autowire
     SyntaxIndex idx;
     if (state->tree) {
         idx = SyntaxIndex::build(*state->tree, state->text);
-        merge_extra_file_modules(idx, analyzer);
+        analyzer.merge_extra_file_modules(idx);
     }
 
     // ── 1. AutoInst ──────────────────────────────────────────────────────────
@@ -117,10 +103,8 @@ std::vector<CodeAction> provide_code_actions(
             if (result) {
                 std::string formatted = format_autoinst(*result, state->text, config.autoinst);
                 // Replace the instantiation range
-                auto we = make_range_edit(uri,
-                    result->line_start, 0,
-                    result->line_end + 1, 0,
-                    formatted + "\n");
+                auto we = make_range_edit(uri, result->line_start, 0, result->line_end + 1, 0,
+                                          formatted + "\n");
                 CodeAction action;
                 action.title = "AutoInst: expand " + result->module_name;
                 action.kind = optional<std::string>(std::string("refactor.rewrite"));
@@ -138,10 +122,8 @@ std::vector<CodeAction> provide_code_actions(
             auto result = autoarg_impl(*state, line, col);
             if (result) {
                 std::string formatted = format_autoarg(*result, config.autoarg);
-                auto we = make_range_edit(uri,
-                    result->open_line, result->open_col,
-                    result->end_line, result->end_col,
-                    formatted);
+                auto we = make_range_edit(uri, result->open_line, result->open_col,
+                                          result->end_line, result->end_col, formatted);
                 CodeAction action;
                 action.title = "AutoArg: generate port list for " + result->module_name;
                 action.kind = optional<std::string>(std::string("refactor.rewrite"));
@@ -222,7 +204,8 @@ std::vector<CodeAction> provide_code_actions(
         cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
         action.command = optional<lsCommandWithAny>(cmd);
         actions.push_back(std::move(action));
-    } catch (...) {}
+    } catch (...) {
+    }
 
     // ── 7. Lint quick-fixes from diagnostics ─────────────────────────────────
     // Pre-split lines once for all diagnostic handlers
@@ -232,7 +215,10 @@ std::vector<CodeAction> provide_code_actions(
         const std::string& t = state->text;
         while (start <= t.size()) {
             size_t end = t.find('\n', start);
-            if (end == std::string::npos) { doc_lines.push_back(t.substr(start)); break; }
+            if (end == std::string::npos) {
+                doc_lines.push_back(t.substr(start));
+                break;
+            }
             doc_lines.push_back(t.substr(start, end - start));
             start = end + 1;
         }
@@ -249,19 +235,20 @@ std::vector<CodeAction> provide_code_actions(
         try {
             const std::string& msg = diag.message;
             if (msg.find("case_missing_default") != std::string::npos ||
-                msg.find("case statement missing default") != std::string::npos)
-            {
+                msg.find("case statement missing default") != std::string::npos) {
                 int endcase_line = -1;
                 if (case_stmt)
                     endcase_line = token_line(state->tree->sourceManager(), case_stmt->endcase);
                 if (endcase_line >= 0) {
                     std::string case_indent;
                     for (char c : doc_lines[line]) {
-                        if (c == ' ' || c == '\t') case_indent += c;
-                        else break;
+                        if (c == ' ' || c == '\t')
+                            case_indent += c;
+                        else
+                            break;
                     }
                     auto we = make_range_edit(uri, endcase_line, 0, endcase_line, 0,
-                                             case_indent + "  default: ;\n");
+                                              case_indent + "  default: ;\n");
                     CodeAction action;
                     action.title = "Add default case";
                     action.kind = optional<std::string>(std::string("quickfix"));
@@ -270,18 +257,21 @@ std::vector<CodeAction> provide_code_actions(
                     actions.push_back(std::move(action));
                 }
             } else if (msg.find("functions_automatic") != std::string::npos ||
-                       msg.find("function declaration should use 'automatic'") != std::string::npos ||
+                       msg.find("function declaration should use 'automatic'") !=
+                           std::string::npos ||
                        msg.find("explicit_function_lifetime") != std::string::npos ||
-                       msg.find("function declaration missing explicit lifetime") != std::string::npos)
-            {
+                       msg.find("function declaration missing explicit lifetime") !=
+                           std::string::npos) {
                 int diag_line = diag.range.start.line;
                 if (diag_line < (int)doc_lines.size() && state->tree) {
                     QuickFixLocator locator(state->tree->sourceManager(), diag_line);
                     state->tree->root().visit(locator);
                     if (locator.function_decl) {
                         int insert_col = token_col(state->tree->sourceManager(),
-                                                   locator.function_decl->getFirstToken()) + 8;
-                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col, " automatic");
+                                                   locator.function_decl->getFirstToken()) +
+                                         8;
+                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col,
+                                                  " automatic");
                         CodeAction action;
                         action.title = "Add 'automatic' lifetime";
                         action.kind = optional<std::string>(std::string("quickfix"));
@@ -291,16 +281,18 @@ std::vector<CodeAction> provide_code_actions(
                     }
                 }
             } else if (msg.find("explicit_task_lifetime") != std::string::npos ||
-                       msg.find("task declaration missing explicit lifetime") != std::string::npos)
-            {
+                       msg.find("task declaration missing explicit lifetime") !=
+                           std::string::npos) {
                 int diag_line = diag.range.start.line;
                 if (diag_line < (int)doc_lines.size() && state->tree) {
                     QuickFixLocator locator(state->tree->sourceManager(), diag_line);
                     state->tree->root().visit(locator);
                     if (locator.task_decl) {
                         int insert_col = token_col(state->tree->sourceManager(),
-                                                   locator.task_decl->getFirstToken()) + 4;
-                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col, " automatic");
+                                                   locator.task_decl->getFirstToken()) +
+                                         4;
+                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col,
+                                                  " automatic");
                         CodeAction action;
                         action.title = "Add 'automatic' lifetime to task";
                         action.kind = optional<std::string>(std::string("quickfix"));
@@ -310,7 +302,8 @@ std::vector<CodeAction> provide_code_actions(
                     }
                 }
             }
-        } catch (...) {}
+        } catch (...) {
+        }
     }
 
     // ── 8. Template snippets ─────────────────────────────────────────────────
@@ -318,12 +311,11 @@ std::vector<CodeAction> provide_code_actions(
         CodeAction ff_snippet;
         ff_snippet.title = "Insert always_ff block";
         ff_snippet.kind = optional<std::string>(std::string("refactor.rewrite"));
-        std::string ff_text =
-            "always_ff @(posedge clk or negedge rst_n) begin\n"
-            "  if (!rst_n) begin\n"
-            "  end else begin\n"
-            "  end\n"
-            "end\n";
+        std::string ff_text = "always_ff @(posedge clk or negedge rst_n) begin\n"
+                              "  if (!rst_n) begin\n"
+                              "  end else begin\n"
+                              "  end\n"
+                              "end\n";
         auto ff_we = make_range_edit(uri, line, 0, line, 0, ff_text);
         ff_snippet.edit = optional<lsWorkspaceEdit>(ff_we);
         actions.push_back(std::move(ff_snippet));
@@ -332,9 +324,8 @@ std::vector<CodeAction> provide_code_actions(
         CodeAction comb_snippet;
         comb_snippet.title = "Insert always_comb block";
         comb_snippet.kind = optional<std::string>(std::string("refactor.rewrite"));
-        std::string comb_text =
-            "always_comb begin\n"
-            "end\n";
+        std::string comb_text = "always_comb begin\n"
+                                "end\n";
         auto comb_we = make_range_edit(uri, line, 0, line, 0, comb_text);
         comb_snippet.edit = optional<lsWorkspaceEdit>(comb_we);
         actions.push_back(std::move(comb_snippet));

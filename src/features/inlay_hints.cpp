@@ -3,23 +3,13 @@
 #include "syntax_index.hpp"
 
 #include <algorithm>
-#include <filesystem>
 #include <optional>
 #include <slang/syntax/SyntaxTree.h>
-#include <slang/text/SourceManager.h>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
-
-static std::optional<SyntaxIndex> build_index_for_file(const std::filesystem::path& path) {
-    slang::SourceManager sm;
-    auto tree_or_error = slang::syntax::SyntaxTree::fromFile(path.string(), sm);
-    if (!tree_or_error)
-        return std::nullopt;
-    return SyntaxIndex::build(**tree_or_error);
-}
 
 static std::vector<std::string_view> split_lines(std::string_view text) {
     std::vector<std::string_view> lines;
@@ -48,10 +38,8 @@ static void overlay_modules(ModuleMap& modules, const SyntaxIndex& index) {
 static ModuleMap build_module_map(const Analyzer& analyzer) {
     ModuleMap modules;
 
-    for (const auto& path : analyzer.extra_files()) {
-        if (auto index = build_index_for_file(path))
-            overlay_modules(modules, *index);
-    }
+    for (const auto& extra : analyzer.extra_file_snapshots())
+        overlay_modules(modules, extra.index);
 
     analyzer.for_each_state(
         [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {

@@ -143,6 +143,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp
+    src/features/autowire.cpp
     src/features/inlay_hints.cpp
     src/features/references.cpp
     src/features/rename.cpp

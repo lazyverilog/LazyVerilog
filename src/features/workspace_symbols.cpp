@@ -1,7 +1,6 @@
 #include "workspace_symbols.hpp"
 #include <algorithm>
 #include <cctype>
-#include <filesystem>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -15,10 +14,6 @@ static std::string lower_copy(std::string text) {
     std::transform(text.begin(), text.end(), text.begin(),
                    [](unsigned char c) { return (char)std::tolower(c); });
     return text;
-}
-
-static std::string path_to_uri(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
 }
 
 static int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line - 1 : 0; }
@@ -47,13 +42,10 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
     const auto query = lower_copy(params.query);
     std::vector<lsSymbolInformation> symbols;
 
-    for (const auto& path_str : analyzer.extra_files()) {
-        const std::filesystem::path path(path_str);
-        const std::string uri = path_to_uri(path);
-        SourceManager sm;
-        auto tree = SyntaxTree::fromFile(path.string(), sm);
-        if (!tree)
+    for (const auto& extra : analyzer.extra_file_snapshots()) {
+        if (!extra.state || !extra.state->tree)
             continue;
+        const auto& sm = extra.state->tree->sourceManager();
 
         struct Visitor : public SyntaxVisitor<Visitor> {
             const SourceManager& sm;
@@ -105,8 +97,8 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
             }
         };
 
-        Visitor visitor(sm, uri, query, symbols);
-        (*tree)->root().visit(visitor);
+        Visitor visitor(sm, extra.uri, query, symbols);
+        extra.state->tree->root().visit(visitor);
     }
 
     return symbols;
