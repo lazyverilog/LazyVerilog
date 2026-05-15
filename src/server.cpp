@@ -55,6 +55,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <string_view>
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -81,6 +82,56 @@ static size_t lsp_offset(const std::string& text, int line, int col) {
     while (pos < text.size() && text[pos] != '\n' && (int)(pos - line_start) < col)
         ++pos;
     return pos;
+}
+
+static std::string json_string(std::string_view text) {
+    std::string out = "\"";
+    for (char c : text) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    out += "\"";
+    return out;
+}
+
+static std::string rtl_tree_json(const RtlTreeNode& node) {
+    std::string out = "{\"name\":" + json_string(node.name) +
+                      ",\"inst\":" + json_string(node.inst) +
+                      ",\"file\":" + json_string(node.file) + ",\"children\":[";
+    for (size_t i = 0; i < node.children.size(); ++i) {
+        if (i > 0)
+            out += ",";
+        out += rtl_tree_json(node.children[i]);
+    }
+    out += "]";
+    if (node.recursive)
+        out += ",\"recursive\":true";
+    out += "}";
+    return out;
 }
 
 static std::string apply_incremental_change(std::string text,
@@ -249,14 +300,16 @@ void LazyVerilogServer::register_handlers() {
                 if (std::filesystem::exists(p)) {
                     root_ = p;
                     config_ = load_config(root_);
-                    analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
+                    analyzer_.set_extra_files(load_vcode_files(root_, config_),
+                                              resolve_vcode_path(root_, config_));
                 }
             } else if (req.params.rootPath && !req.params.rootPath->empty()) {
                 std::filesystem::path p(*req.params.rootPath);
                 if (std::filesystem::exists(p)) {
                     root_ = p;
                     config_ = load_config(root_);
-                    analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
+                    analyzer_.set_extra_files(load_vcode_files(root_, config_),
+                                              resolve_vcode_path(root_, config_));
                 }
             }
 
@@ -267,22 +320,22 @@ void LazyVerilogServer::register_handlers() {
             // Execute command — 16 server-side commands
             lsExecuteCommandOptions exec_opts;
             exec_opts.commands = {
-                "lazyverilogpy.rtlTree",
-                "lazyverilogpy.rtlTreeReverse",
-                "lazyverilogpy.autowire",
-                "lazyverilogpy.autowirepreview",
-                "lazyverilogpy.connectInfo",
-                "lazyverilogpy.connectApply",
-                "lazyverilogpy.connectApplyPreview",
-                "lazyverilogpy.autoffPreview",
-                "lazyverilogpy.autoffApply",
-                "lazyverilogpy.autoffAllPreview",
-                "lazyverilogpy.autoffAllApply",
-                "lazyverilogpy.interface",
-                "lazyverilogpy.interfaceConnect",
-                "lazyverilogpy.interfaceDisconnect",
-                "lazyverilogpy.singleInterface",
-                "lazyverilogpy.lint",
+                "lazyverilog.rtlTree",
+                "lazyverilog.rtlTreeReverse",
+                "lazyverilog.autowire",
+                "lazyverilog.autowirepreview",
+                "lazyverilog.connectInfo",
+                "lazyverilog.connectApply",
+                "lazyverilog.connectApplyPreview",
+                "lazyverilog.autoffPreview",
+                "lazyverilog.autoffApply",
+                "lazyverilog.autoffAllPreview",
+                "lazyverilog.autoffAllApply",
+                "lazyverilog.interface",
+                "lazyverilog.interfaceConnect",
+                "lazyverilog.interfaceDisconnect",
+                "lazyverilog.singleInterface",
+                "lazyverilog.lint",
             };
             caps.executeCommandProvider = exec_opts;
         } catch (const std::exception& e) {
@@ -321,7 +374,8 @@ void LazyVerilogServer::register_handlers() {
         try {
             // Re-read config from disk on every configuration change
             config_ = load_config(root_);
-            analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
+            analyzer_.set_extra_files(load_vcode_files(root_, config_),
+                                      resolve_vcode_path(root_, config_));
             (void)note; // settings in note.params.settings parsed lazily
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
@@ -378,7 +432,8 @@ void LazyVerilogServer::register_handlers() {
                 if (!found.empty()) {
                     root_ = found;
                     config_ = load_config(root_);
-                    analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
+                    analyzer_.set_extra_files(load_vcode_files(root_, config_),
+                                              resolve_vcode_path(root_, config_));
                 }
             }
             analyzer_.open(td.uri.raw_uri_, td.text);
@@ -735,7 +790,7 @@ void LazyVerilogServer::register_handlers() {
                 rsp.result.SetJsonString(json, lsp::Any::kObjectType);
             };
 
-            if (cmd == "lazyverilogpy.autoffPreview" || cmd == "lazyverilogpy.autoffApply") {
+            if (cmd == "lazyverilog.autoffPreview" || cmd == "lazyverilog.autoffApply") {
                 std::string uri = get_string(0);
                 int ff_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
@@ -743,21 +798,31 @@ void LazyVerilogServer::register_handlers() {
                     auto result = autoff(*state, ff_line, config_.lint.naming.register_pattern);
                     apply_ff_edits(result, uri);
                 }
-            } else if (cmd == "lazyverilogpy.autoffAllPreview" ||
-                       cmd == "lazyverilogpy.autoffAllApply") {
+            } else if (cmd == "lazyverilog.autoffAllPreview" ||
+                       cmd == "lazyverilog.autoffAllApply") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
                     auto result = autoff_all(*state, config_.lint.naming.register_pattern);
                     apply_ff_edits(result, uri);
                 }
-            } else if (cmd == "lazyverilogpy.autowire" || cmd == "lazyverilogpy.autowirepreview") {
+            } else if (cmd == "lazyverilog.rtlTree") {
+                std::string uri = get_string(0);
+                if (auto tree = analyzer_.rtl_tree(uri)) {
+                    rsp.result.SetJsonString(rtl_tree_json(*tree), lsp::Any::kObjectType);
+                }
+            } else if (cmd == "lazyverilog.rtlTreeReverse") {
+                std::string uri = get_string(0);
+                if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
+                    rsp.result.SetJsonString(rtl_tree_json(*tree), lsp::Any::kObjectType);
+                }
+            } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
                     auto idx = state->index;
                     analyzer_.merge_extra_file_modules(idx);
-                    if (cmd == "lazyverilogpy.autowirepreview") {
+                    if (cmd == "lazyverilog.autowirepreview") {
                         auto preview = autowire_preview(*state, idx, config_.autowire);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
@@ -816,7 +881,7 @@ void LazyVerilogServer::register_handlers() {
                     }
                 }
             }
-            // Other commands (rtlTree, connect, interface, lint) — return null for now
+            // Other commands (connect, interface, lint) — return null for now
             if (rsp.result.GetType() == lsp::Any::Type::kUnKnown) {
                 lsp::Any null_result;
                 null_result.SetJsonString("null", lsp::Any::kNullType);

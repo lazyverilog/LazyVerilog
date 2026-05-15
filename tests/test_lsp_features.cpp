@@ -54,6 +54,58 @@ endmodule
     std::filesystem::remove(path);
 }
 
+TEST_CASE("rtltree: builds forward hierarchy from open documents", "[rtltree]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rtltree_top.sv";
+    analyzer.open(uri, R"(
+module top;
+    mid u_mid();
+endmodule
+
+module leaf;
+endmodule
+
+module mid;
+    leaf u_leaf();
+endmodule
+)");
+
+    auto tree = analyzer.rtl_tree(uri);
+    REQUIRE(tree.has_value());
+    CHECK(tree->name == "top");
+    CHECK(tree->file == uri);
+    REQUIRE(tree->children.size() == 1);
+    CHECK(tree->children[0].name == "mid");
+    CHECK(tree->children[0].inst == "u_mid");
+    REQUIRE(tree->children[0].children.size() == 1);
+    CHECK(tree->children[0].children[0].name == "leaf");
+    CHECK(tree->children[0].children[0].inst == "u_leaf");
+}
+
+TEST_CASE("rtltree: builds reverse hierarchy through extra files", "[rtltree]") {
+    const auto top_path = std::filesystem::temp_directory_path() / "lazyverilog_rtltree_top.sv";
+    {
+        std::ofstream out(top_path);
+        out << "module top;\n"
+               "    leaf u_leaf();\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({top_path.string()});
+    const std::string leaf_uri = "file:///tmp/lazyverilog_rtltree_leaf.sv";
+    analyzer.open(leaf_uri, "module leaf;\nendmodule\n");
+
+    auto tree = analyzer.rtl_tree_reverse(leaf_uri);
+    REQUIRE(tree.has_value());
+    CHECK(tree->name == "leaf");
+    REQUIRE(tree->children.size() == 1);
+    CHECK(tree->children[0].name == "top");
+    CHECK(tree->children[0].inst == "u_leaf");
+
+    std::filesystem::remove(top_path);
+}
+
 TEST_CASE("hover: resolves variable and function/task call symbols", "[hover]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/hover_calls.sv";
@@ -90,7 +142,8 @@ endmodule
     REQUIRE(function_hover.has_value());
     REQUIRE(function_hover->contents.second.has_value());
     CHECK(function_hover->contents.second->value ==
-          "**add** — *function*\n\n---\n\n```\nfunction int add(\n    input int a,\n    input int b\n)\n```");
+          "**add** — *function*\n\n---\n\n```\nfunction int add(\n    input int a,\n    input int "
+          "b\n)\n```");
 
     auto task_hover = hover_at(12, 10);
     REQUIRE(task_hover.has_value());

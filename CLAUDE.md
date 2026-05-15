@@ -1,6 +1,6 @@
 # CLAUDE.md
 ## Goal of this project
-This is a C++ rewrite of the Python LSP server at `lazyverilogpy` (`~/.local/share/nvim/site/pack/core/opt/lazyverilogpy`).
+This is a C++ rewrite of the previous Python LSP server.
 **Behavior must be identical** — same LSP commands, same feature semantics, same `lazyverilog.toml` config schema.
 
 ## Build
@@ -58,12 +58,12 @@ All features must degrade gracefully to `SyntaxTree`-only when compilation is di
 
 ### LSP commands
 
-Server registers these `executeCommand` commands (matching lazyverilogpy exactly):
-`lazyverilogpy.rtlTree`, `lazyverilogpy.rtlTreeReverse`, `lazyverilogpy.autowire`, `lazyverilogpy.autowirepreview`, `lazyverilogpy.connectInfo`, `lazyverilogpy.connectApply`, `lazyverilogpy.connectApplyPreview`, `lazyverilogpy.autoffPreview`, `lazyverilogpy.autoffApply`, `lazyverilogpy.autoffAllPreview`, `lazyverilogpy.autoffAllApply`, `lazyverilogpy.interface`, `lazyverilogpy.interfaceConnect`, `lazyverilogpy.interfaceDisconnect`, `lazyverilogpy.singleInterface`, `lazyverilogpy.lint`.
+Server registers these `executeCommand` commands:
+`lazyverilog.rtlTree`, `lazyverilog.rtlTreeReverse`, `lazyverilog.autowire`, `lazyverilog.autowirepreview`, `lazyverilog.connectInfo`, `lazyverilog.connectApply`, `lazyverilog.connectApplyPreview`, `lazyverilog.autoffPreview`, `lazyverilog.autoffApply`, `lazyverilog.autoffAllPreview`, `lazyverilog.autoffAllApply`, `lazyverilog.interface`, `lazyverilog.interfaceConnect`, `lazyverilog.interfaceDisconnect`, `lazyverilog.singleInterface`, `lazyverilog.lint`.
 
 ### Formatter
 
-`src/features/formatter.cpp` produces output identical to `lazyverilogpy/formatter.py`:
+`src/features/formatter.cpp` produces output identical to the previous Python formatter:
 - Token-based; idempotent; semantics-neutral (whitespace only).
 - Disable regions: `// verilog_format: off` … `// verilog_format: on`; `` `define `` macro bodies passed verbatim.
 - Passes (in order): `align_port_pass`, `align_assign_pass`, `align_var_pass`, `expand_instances_pass`, `format_portlist_pass`.
@@ -133,4 +133,3 @@ All lint rules default **off**; enable individually under `[lint.*]`. `[perf].ba
 `Compilation` (full elaboration) is optional and controlled by `perf.background_compilation`.
 Prefer `SyntaxTree`-only paths unless semantic information is strictly required.
 it is not part of the server.
-

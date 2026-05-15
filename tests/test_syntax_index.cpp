@@ -67,4 +67,5 @@ TEST_CASE("syntax_index: finds memory instantiation in top", "[index]") {
                            [](const InstanceEntry& e) { return e.module_name == "memory"; });
     REQUIRE(it != idx.instances.end());
     CHECK(it->instance_name == "u_mem");
+    CHECK(it->parent_module == "top");
 }

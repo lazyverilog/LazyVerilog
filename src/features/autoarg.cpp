@@ -1,9 +1,9 @@
 #include "autoarg.hpp"
+#include <algorithm>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
-#include <algorithm>
 
 using namespace slang;
 using namespace slang::syntax;
@@ -51,7 +51,7 @@ std::optional<AutoargResult> autoarg_impl(const DocumentState& state, int line, 
     if (!module || !module->header || !module->header->ports)
         return std::nullopt;
 
-    // Match lazyverilogpy: autoarg updates only non-ANSI / empty headers; ANSI
+    // Match the legacy behavior: autoarg updates only non-ANSI / empty headers; ANSI
     // headers already carry directions and must not be rewritten to plain names.
     if (module->header->ports->as_if<AnsiPortListSyntax>())
         return std::nullopt;

@@ -36,6 +36,7 @@ struct NamedPortConn {
 struct InstanceEntry {
     std::string module_name;
     std::string instance_name;
+    std::string parent_module;
     int line{0};
     int start_line{0}; // 0-based
     int end_line{0};   // 0-based

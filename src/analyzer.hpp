@@ -40,6 +40,14 @@ struct ExtraFileInfo {
     SyntaxIndex index;
 };
 
+struct RtlTreeNode {
+    std::string name;
+    std::string inst;
+    std::string file;
+    std::vector<RtlTreeNode> children;
+    bool recursive{false};
+};
+
 class Analyzer {
   public:
     Analyzer() = default;
@@ -98,6 +106,12 @@ class Analyzer {
 
     /// Append cached extra-file modules to an existing SyntaxIndex.
     void merge_extra_file_modules(SyntaxIndex& index) const;
+
+    /// Build a forward RTL instantiation tree rooted at the first module in uri.
+    std::optional<RtlTreeNode> rtl_tree(const std::string& uri) const;
+
+    /// Build a reverse RTL instantiation tree: modules that instantiate uri's first module.
+    std::optional<RtlTreeNode> rtl_tree_reverse(const std::string& uri) const;
 
   private:
     std::shared_ptr<DocumentState> make_state(const std::string& uri,

@@ -1,4 +1,4 @@
---- LazyVerilogPy public API.
+--- LazyVerilog public API.
 ---
 --- Minimal setup:
 ---   require('lazyverilog').setup()
@@ -131,12 +131,12 @@ local function _autoff_show_preview(title, pairs, client, bufnr, apply_cmd, appl
 
 	local function apply()
 		close()
-		client.request("workspace/executeCommand", {
+		client:request("workspace/executeCommand", {
 			command   = apply_cmd,
 			arguments = apply_args,
 		}, function(aerr, edit)
 			if aerr then
-				vim.notify("[LazyVerilogPy] AutoFF apply: " .. tostring(aerr.message),
+				vim.notify("[LazyVerilog] AutoFF apply: " .. tostring(aerr.message),
 					vim.log.levels.ERROR)
 				return
 			end
@@ -160,18 +160,18 @@ local function _autoff_command_handler(preview_cmd, preview_args, apply_cmd, app
 	if not client then return end
 	local uri   = preview_args[1]
 	local bufnr = vim.uri_to_bufnr(uri)
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command   = preview_cmd,
 		arguments = preview_args,
 	}, function(err, result)
 		if err or not result or result.error then
 			local msg = (result and result.error) or tostring(err)
 			local lvl = (result and result.warn) and vim.log.levels.WARN or vim.log.levels.ERROR
-			vim.notify("[LazyVerilogPy] AutoFF: " .. (msg or "error"), lvl)
+			vim.notify("[LazyVerilog] AutoFF: " .. (msg or "error"), lvl)
 			return
 		end
 		if not result.pairs or #result.pairs == 0 then
-			vim.notify("[LazyVerilogPy] AutoFF: nothing to insert", vim.log.levels.INFO)
+			vim.notify("[LazyVerilog] AutoFF: nothing to insert", vim.log.levels.INFO)
 			return
 		end
 		vim.schedule(function()
@@ -188,9 +188,9 @@ function M.setup(user_config)
 	_cfg = config.resolve(user_config)
 
 	-- Register an autocommand that starts the server when a SV/V file is opened.
-	vim.api.nvim_create_augroup("LazyVerilogPy", { clear = true })
+	vim.api.nvim_create_augroup("LazyVerilog", { clear = true })
 	vim.api.nvim_create_autocmd("FileType", {
-		group    = "LazyVerilogPy",
+		group    = "LazyVerilog",
 		pattern  = _cfg.filetypes,
 		callback = function(ev)
 			-- vim.lsp.start() deduplicates: reuses an existing client with the same
@@ -206,7 +206,7 @@ function M.setup(user_config)
 
 	-- Sync RtlTree highlight when switching to an RTL buffer.
 	vim.api.nvim_create_autocmd("BufEnter", {
-		group    = "LazyVerilogPy",
+		group    = "LazyVerilog",
 		pattern  = { "*.sv", "*.svh", "*.v", "*.vh" },
 		callback = function()
 			_rtltree_sync(vim.api.nvim_get_current_buf())
@@ -218,7 +218,7 @@ function M.setup(user_config)
 	vim.api.nvim_create_user_command("Interface", function(opts)
 		local args = vim.split(vim.trim(opts.args), "%s+")
 		if #args < 1 or args[1] == "" then
-			vim.notify("[LazyVerilogPy] Usage: :Interface <inst>  or  :Interface <inst1> <inst2>",
+			vim.notify("[LazyVerilog] Usage: :Interface <inst>  or  :Interface <inst1> <inst2>",
 				vim.log.levels.ERROR)
 			return
 		end
@@ -228,6 +228,15 @@ function M.setup(user_config)
 			M.interface(args[1], args[2])
 		end
 	end, { nargs = "+" })
+
+	-- Register :RtlTree / :RtlTreeReverse user commands.
+	vim.api.nvim_create_user_command("RtlTree", function()
+		M.rtltree()
+	end, { nargs = 0 })
+
+	vim.api.nvim_create_user_command("RtlTreeReverse", function()
+		M.rtltreereverse()
+	end, { nargs = 0 })
 
 	-- Register :Lint user command.
 	vim.api.nvim_create_user_command("Lint", function()
@@ -243,7 +252,7 @@ function M.setup(user_config)
 	vim.api.nvim_create_user_command("Connect", function(opts)
 		local args = vim.split(vim.trim(opts.args), "%s+")
 		if #args < 2 or args[1] == "" or args[2] == "" then
-			vim.notify("[LazyVerilogPy] Usage: :Connect <module1> <module2>", vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] Usage: :Connect <module1> <module2>", vim.log.levels.ERROR)
 			return
 		end
 		M.connect(args[1], args[2])
@@ -353,7 +362,7 @@ local function _rtltree_jump(split_cmd)
 	local row  = vim.api.nvim_win_get_cursor(0)[1]
 	local data = _rtltree.line_data[row]
 	if not data or not data.file or data.file == "" then
-		vim.notify("[LazyVerilogPy] no definition for this node", vim.log.levels.WARN)
+		vim.notify("[LazyVerilog] no definition for this node", vim.log.levels.WARN)
 		return
 	end
 	local path = data.file:gsub("^file://", "")
@@ -461,12 +470,11 @@ local function _rtltree_show(tree, source_buf)
 end
 
 local function _rtltree_find_client(source_buf)
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
 	-- Try source buffer first; fall back to any attached lazyverilog client
 	-- (needed when the tree buffer, not the source buffer, is focused).
-	local clients = get_clients({ bufnr = source_buf, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = source_buf, name = "lazyverilog" })
 	if #clients == 0 then
-		clients = get_clients({ name = "lazyverilog" })
+		clients = vim.lsp.get_clients({ name = "lazyverilog" })
 	end
 	return vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
 end
@@ -482,21 +490,21 @@ local function _rtltree_request(source_buf, command, retries)
 				_rtltree_request(source_buf, command, retries - 1)
 			end, 500)
 		else
-			vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 		end
 		return
 	end
 
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command   = command,
 		arguments = { uri },
 	}, function(err, result)
 		if err then
-			vim.notify("[LazyVerilogPy] RtlTree: " .. tostring(err.message), vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] RtlTree: " .. tostring(err.message), vim.log.levels.ERROR)
 			return
 		end
 		if not result then
-			vim.notify("[LazyVerilogPy] RtlTree: no hierarchy found", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] RtlTree: no hierarchy found", vim.log.levels.WARN)
 			return
 		end
 		vim.schedule(function()
@@ -508,7 +516,7 @@ end
 function M._rtltree_refresh()
 	local src = _rtltree.source_buf
 	if not (src and vim.api.nvim_buf_is_valid(src)) then
-		vim.notify("[LazyVerilogPy] RtlTree: no source buffer", vim.log.levels.WARN)
+		vim.notify("[LazyVerilog] RtlTree: no source buffer", vim.log.levels.WARN)
 		return
 	end
 	local cmd = _rtltree.command or "lazyverilog.rtlTree"
@@ -604,8 +612,7 @@ local _interface_meta   = {} -- [buf] = meta; avoids vim.b serialisation loss
 local _interface_request     -- forward declaration; assigned below _interface_show
 
 local function _lsp_client(src_bufnr)
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-	local clients = get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
 	return vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
 end
 
@@ -618,27 +625,27 @@ local function _interface_connect_flow(buf)
 		if not s1 or s1 == "" then return end
 		local r1 = tonumber(s1)
 		if not r1 or r1 < 1 or r1 > n then
-			vim.notify("[LazyVerilogPy] invalid row: " .. s1, vim.log.levels.ERROR); return
+			vim.notify("[LazyVerilog] invalid row: " .. s1, vim.log.levels.ERROR); return
 		end
 		vim.ui.input({ prompt = "Connect — inst2 row # (1-" .. n .. "): " }, function(s2)
 			if not s2 or s2 == "" then return end
 			local r2 = tonumber(s2)
 			if not r2 or r2 < 1 or r2 > n then
-				vim.notify("[LazyVerilogPy] invalid row: " .. s2, vim.log.levels.ERROR); return
+				vim.notify("[LazyVerilog] invalid row: " .. s2, vim.log.levels.ERROR); return
 			end
 			local rd1 = meta.row_data[r1]
 			local rd2 = meta.row_data[r2]
 			if rd1.inst1_port == "" then
-				vim.notify("[LazyVerilogPy] row " .. r1 .. " has no inst1 port", vim.log.levels.ERROR); return
+				vim.notify("[LazyVerilog] row " .. r1 .. " has no inst1 port", vim.log.levels.ERROR); return
 			end
 			if rd2.inst2_port == "" then
-				vim.notify("[LazyVerilogPy] row " .. r2 .. " has no inst2 port", vim.log.levels.ERROR); return
+				vim.notify("[LazyVerilog] row " .. r2 .. " has no inst2 port", vim.log.levels.ERROR); return
 			end
 			local d1 = rd1.inst1_dir or ""
 			local d2 = rd2.inst2_dir or ""
 			if d1 ~= "" and d2 ~= "" and d1 == d2 and d1 ~= "inout" then
 				vim.notify(
-					string.format("[LazyVerilogPy] Cannot connect: both ports are '%s'", d1),
+					string.format("[LazyVerilog] Cannot connect: both ports are '%s'", d1),
 					vim.log.levels.ERROR)
 				return
 			end
@@ -657,15 +664,15 @@ local function _interface_connect_flow(buf)
 				end
 				local client = _lsp_client(meta.src_bufnr)
 				if not client then
-					vim.notify("[LazyVerilogPy] no LSP client", vim.log.levels.WARN); return
+					vim.notify("[LazyVerilog] no LSP client", vim.log.levels.WARN); return
 				end
-				client.request("workspace/executeCommand", {
+				client:request("workspace/executeCommand", {
 					command   = "lazyverilog.interfaceConnect",
 					arguments = { meta.uri, meta.inst1_name, meta.inst2_name,
 						rd1.inst1_port, rd2.inst2_port, wire_name, wire_type },
 				}, function(err, result)
 					if err then
-						vim.notify("[LazyVerilogPy] Connect: " .. tostring(err.message),
+						vim.notify("[LazyVerilog] Connect: " .. tostring(err.message),
 							vim.log.levels.ERROR)
 						return
 					end
@@ -691,23 +698,23 @@ local function _interface_disconnect_flow(buf)
 		if not s or s == "" then return end
 		local r = tonumber(s)
 		if not r or r < 1 or r > n then
-			vim.notify("[LazyVerilogPy] invalid row: " .. s, vim.log.levels.ERROR); return
+			vim.notify("[LazyVerilog] invalid row: " .. s, vim.log.levels.ERROR); return
 		end
 		local rd = meta.row_data[r]
 		if rd.signal == "" then
-			vim.notify("[LazyVerilogPy] row " .. r .. " has no connection", vim.log.levels.WARN); return
+			vim.notify("[LazyVerilog] row " .. r .. " has no connection", vim.log.levels.WARN); return
 		end
 		local client = _lsp_client(meta.src_bufnr)
 		if not client then
-			vim.notify("[LazyVerilogPy] no LSP client", vim.log.levels.WARN); return
+			vim.notify("[LazyVerilog] no LSP client", vim.log.levels.WARN); return
 		end
-		client.request("workspace/executeCommand", {
+		client:request("workspace/executeCommand", {
 			command   = "lazyverilog.interfaceDisconnect",
 			arguments = { meta.uri, meta.inst1_name, meta.inst2_name,
 				rd.inst1_port, rd.inst2_port, rd.signal },
 		}, function(err, result)
 			if err then
-				vim.notify("[LazyVerilogPy] Disconnect: " .. tostring(err.message), vim.log.levels.ERROR)
+				vim.notify("[LazyVerilog] Disconnect: " .. tostring(err.message), vim.log.levels.ERROR)
 				return
 			end
 			if result and result.changes then
@@ -999,8 +1006,7 @@ local function _interface_show(data, src_bufnr, uri)
 end
 
 _interface_request = function(bufnr, uri, inst1_name, inst2_name, retries)
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-	local clients = get_clients({ bufnr = bufnr, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
 			if _cfg then lsp.start(_cfg) end
@@ -1008,25 +1014,25 @@ _interface_request = function(bufnr, uri, inst1_name, inst2_name, retries)
 				_interface_request(bufnr, uri, inst1_name, inst2_name, retries - 1)
 			end, 500)
 		else
-			vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 		end
 		return
 	end
 	local client = vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command   = "lazyverilog.interface",
 		arguments = { uri, inst1_name, inst2_name },
 	}, function(err, result)
 		if err then
-			vim.notify("[LazyVerilogPy] Interface: " .. tostring(err.message), vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] Interface: " .. tostring(err.message), vim.log.levels.ERROR)
 			return
 		end
 		if not result then
-			vim.notify("[LazyVerilogPy] Interface: no data returned", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] Interface: no data returned", vim.log.levels.WARN)
 			return
 		end
 		if result.error then
-			vim.notify("[LazyVerilogPy] " .. result.error, vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] " .. result.error, vim.log.levels.ERROR)
 			return
 		end
 		vim.schedule(function()
@@ -1240,8 +1246,7 @@ end
 
 local _single_interface_request
 _single_interface_request = function(bufnr, uri, inst_name, retries)
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-	local clients = get_clients({ bufnr = bufnr, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
 			if _cfg then lsp.start(_cfg) end
@@ -1249,25 +1254,25 @@ _single_interface_request = function(bufnr, uri, inst_name, retries)
 				_single_interface_request(bufnr, uri, inst_name, retries - 1)
 			end, 500)
 		else
-			vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 		end
 		return
 	end
 	local client = vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command   = "lazyverilog.singleInterface",
 		arguments = { uri, inst_name },
 	}, function(err, result)
 		if err then
-			vim.notify("[LazyVerilogPy] Interface: " .. tostring(err.message), vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] Interface: " .. tostring(err.message), vim.log.levels.ERROR)
 			return
 		end
 		if not result then
-			vim.notify("[LazyVerilogPy] Interface: no data returned", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] Interface: no data returned", vim.log.levels.WARN)
 			return
 		end
 		if result.error then
-			vim.notify("[LazyVerilogPy] " .. result.error, vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] " .. result.error, vim.log.levels.ERROR)
 			return
 		end
 		vim.schedule(function()
@@ -1287,8 +1292,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function _autowire_request(bufnr, command, label, retries, callback)
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-	local clients = get_clients({ bufnr = bufnr, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
 			if _cfg then lsp.start(_cfg) end
@@ -1296,18 +1300,18 @@ local function _autowire_request(bufnr, command, label, retries, callback)
 				_autowire_request(bufnr, command, label, retries - 1, callback)
 			end, 500)
 		else
-			vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+			vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 		end
 		return
 	end
 	local client = vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
 	local uri = vim.uri_from_bufnr(bufnr)
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command = command,
 		arguments = { uri },
 	}, function(err, result)
 		if err then
-			vim.notify("[LazyVerilogPy] " .. label .. ": " .. tostring(err.message), vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] " .. label .. ": " .. tostring(err.message), vim.log.levels.ERROR)
 			return
 		end
 		callback(result, client)
@@ -1319,7 +1323,7 @@ function M.autowire()
 	local src_bufnr = vim.api.nvim_get_current_buf()
 	_autowire_request(src_bufnr, "lazyverilog.autowirepreview", "AutoWire", 3, function(result, _client)
 		if not result or #result == 0 then
-			vim.notify("[LazyVerilogPy] AutoWire: nothing to add or update", vim.log.levels.INFO)
+			vim.notify("[LazyVerilog] AutoWire: nothing to add or update", vim.log.levels.INFO)
 			return
 		end
 		vim.schedule(function()
@@ -1572,48 +1576,47 @@ end
 --- via interactive pickers and a floating preview.
 function M.connect(module1, module2)
 	if not module1 or module1 == "" or not module2 or module2 == "" then
-		vim.notify("[LazyVerilogPy] Usage: :Connect <module1> <module2>", vim.log.levels.ERROR)
+		vim.notify("[LazyVerilog] Usage: :Connect <module1> <module2>", vim.log.levels.ERROR)
 		return
 	end
 
 	local src_bufnr = vim.api.nvim_get_current_buf()
 	local uri = vim.uri_from_bufnr(src_bufnr)
 
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
 	local function _try_connect(retries)
-		local clients = get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
+		local clients = vim.lsp.get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
 		local client = vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
 		if not client then
 			if retries > 0 then
 				if _cfg then lsp.start(_cfg) end
 				vim.defer_fn(function() _try_connect(retries - 1) end, 500)
 			else
-				vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+				vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 			end
 			return
 		end
 
-		client.request("workspace/executeCommand", {
+		client:request("workspace/executeCommand", {
 			command   = "lazyverilog.connectInfo",
 			arguments = { uri },
 		}, function(err, data)
 			if err then
-				vim.notify("[LazyVerilogPy] Connect: " .. tostring(err.message), vim.log.levels.ERROR)
+				vim.notify("[LazyVerilog] Connect: " .. tostring(err.message), vim.log.levels.ERROR)
 				return
 			end
 			if not data or data.error then
-				vim.notify("[LazyVerilogPy] Connect: " .. (data and data.error or "no data"),
+				vim.notify("[LazyVerilog] Connect: " .. (data and data.error or "no data"),
 					vim.log.levels.ERROR)
 				return
 			end
 
 			local mods = data.modules or {}
 			if not mods[module1] then
-				vim.notify("[LazyVerilogPy] Connect: module '" .. module1 .. "' not found",
+				vim.notify("[LazyVerilog] Connect: module '" .. module1 .. "' not found",
 					vim.log.levels.ERROR); return
 			end
 			if not mods[module2] then
-				vim.notify("[LazyVerilogPy] Connect: module '" .. module2 .. "' not found",
+				vim.notify("[LazyVerilog] Connect: module '" .. module2 .. "' not found",
 					vim.log.levels.ERROR); return
 			end
 
@@ -1624,7 +1627,7 @@ function M.connect(module1, module2)
 				-- Step 1: pick inst1
 				local insts1 = mod1.instances or {}
 				if #insts1 == 0 then
-					vim.notify("[LazyVerilogPy] Connect: no instances of '" .. module1 .. "' found",
+					vim.notify("[LazyVerilog] Connect: no instances of '" .. module1 .. "' found",
 						vim.log.levels.ERROR); return
 				end
 				_float_select(insts1, {
@@ -1640,7 +1643,7 @@ function M.connect(module1, module2)
 					local out_ports = vim.tbl_filter(
 						function(p) return p.direction == "output" end, mod1.ports or {})
 					if #out_ports == 0 then
-						vim.notify("[LazyVerilogPy] Connect: no output ports on " .. module1,
+						vim.notify("[LazyVerilog] Connect: no output ports on " .. module1,
 							vim.log.levels.ERROR); return
 					end
 					_float_select(out_ports, {
@@ -1653,7 +1656,7 @@ function M.connect(module1, module2)
 						local insts2 = mod2.instances or {}
 						if #insts2 == 0 then
 							vim.notify(
-								"[LazyVerilogPy] Connect: no instances of '" ..
+								"[LazyVerilog] Connect: no instances of '" ..
 								module2 .. "' found",
 								vim.log.levels.ERROR); return
 						end
@@ -1672,7 +1675,7 @@ function M.connect(module1, module2)
 								mod2.ports or {})
 							if #in_ports == 0 then
 								vim.notify(
-									"[LazyVerilogPy] Connect: no input ports on " ..
+									"[LazyVerilog] Connect: no input ports on " ..
 									module2,
 									vim.log.levels.ERROR); return
 							end
@@ -1699,7 +1702,7 @@ function M.connect(module1, module2)
 											port2.name,
 											wire_name,
 										}
-										client.request(
+										client:request(
 											"workspace/executeCommand", {
 												command   =
 												"lazyverilog.connectApplyPreview",
@@ -1707,7 +1710,7 @@ function M.connect(module1, module2)
 											}, function(perr, preview)
 												if perr then
 													vim.notify(
-														"[LazyVerilogPy] Connect: " ..
+														"[LazyVerilog] Connect: " ..
 														tostring(
 															perr
 															.message),
@@ -1717,7 +1720,7 @@ function M.connect(module1, module2)
 												end
 												if not preview or preview.error then
 													vim.notify(
-														"[LazyVerilogPy] Connect: " ..
+														"[LazyVerilog] Connect: " ..
 														(preview and preview.error or "no preview"),
 														vim.log
 														.levels
@@ -1732,7 +1735,7 @@ function M.connect(module1, module2)
 															if not confirmed then return end
 
 															-- Step 7: apply
-															client.request(
+															client:request(
 																"workspace/executeCommand",
 																{
 																	command   =
@@ -1745,7 +1748,7 @@ function M.connect(module1, module2)
 																    result)
 																	if aerr then
 																		vim.notify(
-																			"[LazyVerilogPy] Connect apply: " ..
+																			"[LazyVerilog] Connect apply: " ..
 																			tostring(
 																				aerr.message),
 																			vim.log
@@ -1754,7 +1757,7 @@ function M.connect(module1, module2)
 																	end
 																	if result and result.error then
 																		vim.notify(
-																			"[LazyVerilogPy] Connect: " ..
+																			"[LazyVerilog] Connect: " ..
 																			result.error,
 																			vim.log
 																			.levels
@@ -1788,10 +1791,9 @@ end
 --- @param label string            prefix for notify messages (e.g. "Lint" or "LintAll")
 local function _run_lint(filter_file, label)
 	local src_bufnr = vim.api.nvim_get_current_buf()
-	local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-	local clients = get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
+	local clients = vim.lsp.get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
 	if #clients == 0 then
-		clients = get_clients({ name = "lazyverilog" })
+		clients = vim.lsp.get_clients({ name = "lazyverilog" })
 	end
 	local client = nil
 	for _, c in ipairs(clients) do
@@ -1801,20 +1803,20 @@ local function _run_lint(filter_file, label)
 		end
 	end
 	if not client then
-		vim.notify("[LazyVerilogPy] no LSP client attached", vim.log.levels.WARN)
+		vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
 		return
 	end
 	local current_uri = vim.uri_from_bufnr(src_bufnr)
-	client.request("workspace/executeCommand", {
+	client:request("workspace/executeCommand", {
 		command = "lazyverilog.lint",
 		arguments = { current_uri },
 	}, function(err, result)
 		if err then
-			vim.notify("[LazyVerilogPy] " .. label .. ": " .. tostring(err.message), vim.log.levels.ERROR)
+			vim.notify("[LazyVerilog] " .. label .. ": " .. tostring(err.message), vim.log.levels.ERROR)
 			return
 		end
 		if not result or #result == 0 then
-			vim.notify("[LazyVerilogPy] " .. label .. ": no violations found", vim.log.levels.INFO)
+			vim.notify("[LazyVerilog] " .. label .. ": no violations found", vim.log.levels.INFO)
 			return
 		end
 		vim.schedule(function()
@@ -1832,13 +1834,13 @@ local function _run_lint(filter_file, label)
 				end
 			end
 			if #items == 0 then
-				vim.notify("[LazyVerilogPy] " .. label .. ": no violations found", vim.log.levels.INFO)
+				vim.notify("[LazyVerilog] " .. label .. ": no violations found", vim.log.levels.INFO)
 				return
 			end
 			vim.fn.setqflist(items, "r")
 			vim.cmd("copen")
 			vim.notify(
-				string.format("[LazyVerilogPy] %s: %d violation(s)", label, #items),
+				string.format("[LazyVerilog] %s: %d violation(s)", label, #items),
 				vim.log.levels.INFO
 			)
 		end)

@@ -159,7 +159,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             // Return as command — client calls autoffPreview
             lsCommandWithAny cmd;
             cmd.title = "AutoFF: insert FF assignments";
-            cmd.command = "lazyverilogpy.autoffPreview";
+            cmd.command = "lazyverilog.autoffPreview";
             // args: [uri, line] — encode as JSON
             lsp::Any uri_arg, line_arg;
             uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
@@ -180,7 +180,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             action.kind = optional<std::string>(std::string("refactor.rewrite"));
             lsCommandWithAny cmd;
             cmd.title = "AutoWire: declare missing signals";
-            cmd.command = "lazyverilogpy.autowire";
+            cmd.command = "lazyverilog.autowire";
             lsp::Any uri_arg;
             uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
             cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
@@ -198,7 +198,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
         action.kind = optional<std::string>(std::string("refactor.rewrite"));
         lsCommandWithAny cmd;
         cmd.title = "AutoFF All";
-        cmd.command = "lazyverilogpy.autoffAllPreview";
+        cmd.command = "lazyverilog.autoffAllPreview";
         lsp::Any uri_arg;
         uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
         cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});

@@ -142,7 +142,7 @@ static int find_instance_end_line(std::string_view source, int start_line) {
 
 static void extract_instances(const SyntaxList<MemberSyntax>& members,
                               std::vector<InstanceEntry>& out, const slang::SourceManager& sm,
-                              std::string_view source) {
+                              std::string_view source, std::string_view parent_module) {
     for (const auto* member : members) {
         if (!member)
             continue;
@@ -157,6 +157,7 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
 
             InstanceEntry entry;
             entry.module_name = module_name;
+            entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = tok_str(instance->decl->name);
                 entry.line = token_pos(sm, instance->decl->name).first;
@@ -200,7 +201,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             extract_ansi_ports(*ansi, entry.ports, sm);
     }
     extract_port_declarations(module.members, entry.ports, sm);
-    extract_instances(module.members, index.instances, sm, source);
+    extract_instances(module.members, index.instances, sm, source, entry.name);
     for (size_t i = 0; i < entry.ports.size(); ++i)
         entry.port_by_name.try_emplace(entry.ports[i].name, i);
     index.module_by_name.try_emplace(entry.name, index.modules.size());

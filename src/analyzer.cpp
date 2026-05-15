@@ -14,6 +14,8 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -1415,6 +1417,152 @@ void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
         for (size_t i = base; i < index.modules.size(); ++i)
             index.module_by_name.try_emplace(index.modules[i].name, i);
     }
+}
+
+namespace {
+
+struct RtlIndexedInstance {
+    InstanceEntry entry;
+    std::string uri;
+};
+
+struct RtlIndexView {
+    std::unordered_map<std::string, std::string> module_uris;
+    std::vector<RtlIndexedInstance> instances;
+};
+
+void add_rtl_index_file(RtlIndexView& view, std::unordered_set<std::string>& seen_uris,
+                        const std::string& uri, const SyntaxIndex& index) {
+    if (!seen_uris.insert(uri).second)
+        return;
+
+    for (const auto& module : index.modules)
+        view.module_uris.try_emplace(module.name, uri);
+
+    for (const auto& instance : index.instances)
+        view.instances.push_back(RtlIndexedInstance{.entry = instance, .uri = uri});
+}
+
+} // namespace
+
+std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
+    auto state = get_state(uri);
+    if (!state || !state->tree || state->index.modules.empty())
+        return std::nullopt;
+
+    RtlIndexView view;
+    std::unordered_set<std::string> seen_uris;
+    for_each_state([&](const std::string& state_uri, const auto& state_snapshot) {
+        if (state_snapshot && state_snapshot->tree)
+            add_rtl_index_file(view, seen_uris, state_uri, state_snapshot->index);
+    });
+    for (const auto& extra : extra_file_snapshots())
+        add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
+
+    const auto* root = &state->index.modules.front();
+    for (const auto& module : state->index.modules) {
+        if (module.line > 0 && (root->line <= 0 || module.line < root->line))
+            root = &module;
+    }
+
+    std::function<RtlTreeNode(const std::string&, const std::unordered_set<std::string>&)> build =
+        [&](const std::string& module_name,
+            const std::unordered_set<std::string>& seen) -> RtlTreeNode {
+        auto module_it = view.module_uris.find(module_name);
+        RtlTreeNode node{
+            .name = module_name,
+            .inst = {},
+            .file = module_it != view.module_uris.end() ? module_it->second : std::string{},
+            .children = {},
+            .recursive = seen.contains(module_name),
+        };
+        if (node.recursive || module_it == view.module_uris.end())
+            return node;
+
+        auto next_seen = seen;
+        next_seen.insert(module_name);
+        for (const auto& inst : view.instances) {
+            if (inst.entry.parent_module != module_name)
+                continue;
+            if (inst.entry.module_name == module_name)
+                continue;
+            auto child = build(inst.entry.module_name, next_seen);
+            child.inst = inst.entry.instance_name;
+            node.children.push_back(std::move(child));
+        }
+        return node;
+    };
+
+    return build(root->name, {});
+}
+
+std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) const {
+    auto state = get_state(uri);
+    if (!state || !state->tree || state->index.modules.empty())
+        return std::nullopt;
+
+    RtlIndexView view;
+    std::unordered_set<std::string> seen_uris;
+    for_each_state([&](const std::string& state_uri, const auto& state_snapshot) {
+        if (state_snapshot && state_snapshot->tree)
+            add_rtl_index_file(view, seen_uris, state_uri, state_snapshot->index);
+    });
+    for (const auto& extra : extra_file_snapshots())
+        add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
+
+    const auto* target = &state->index.modules.front();
+    for (const auto& module : state->index.modules) {
+        if (module.line > 0 && (target->line <= 0 || module.line < target->line))
+            target = &module;
+    }
+
+    struct ParentRef {
+        std::string parent_module;
+        std::string inst_name;
+        std::string file_uri;
+    };
+    std::unordered_map<std::string, std::vector<ParentRef>> reverse_map;
+    for (const auto& inst : view.instances) {
+        if (inst.entry.parent_module.empty())
+            continue;
+        reverse_map[inst.entry.module_name].push_back(ParentRef{
+            .parent_module = inst.entry.parent_module,
+            .inst_name = inst.entry.instance_name,
+            .file_uri = inst.uri,
+        });
+    }
+
+    std::function<RtlTreeNode(const std::string&, const std::unordered_set<std::string>&)> build =
+        [&](const std::string& module_name,
+            const std::unordered_set<std::string>& seen) -> RtlTreeNode {
+        auto module_it = view.module_uris.find(module_name);
+        RtlTreeNode node{
+            .name = module_name,
+            .inst = {},
+            .file = module_it != view.module_uris.end() ? module_it->second : std::string{},
+            .children = {},
+            .recursive = seen.contains(module_name),
+        };
+        if (node.recursive)
+            return node;
+
+        auto next_seen = seen;
+        next_seen.insert(module_name);
+        auto refs = reverse_map.find(module_name);
+        if (refs == reverse_map.end())
+            return node;
+
+        for (const auto& parent : refs->second) {
+            auto child = build(parent.parent_module, next_seen);
+            child.inst = parent.inst_name;
+            if (child.file.empty())
+                child.file = parent.file_uri;
+            node.children.push_back(std::move(child));
+        }
+        return node;
+    };
+
+    return build(target->name, {});
 }
 
 void Analyzer::refresh_extra_cache_locked() const {
