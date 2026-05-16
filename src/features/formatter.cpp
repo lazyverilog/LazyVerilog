@@ -1477,7 +1477,7 @@ static std::string format_function_calls_pass(const std::string& text, const For
             std::string r = open_text + "\n";
             for(size_t i=0;i<args.size();++i) {
                 r += arg_indent + args[i];
-                if(i+1<args.size()) r += ",";
+                if(i+1<args.size() || fo.trailing_comma) r += ",";
                 r += "\n";
             }
             r += base_indent + ")" + suffix;

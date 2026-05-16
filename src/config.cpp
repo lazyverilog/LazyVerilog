@@ -95,6 +95,7 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
                 if (auto v = (*fn)["line_length"].value<int64_t>())             cfg.format.function.line_length = static_cast<int>(*v);
                 if (auto v = (*fn)["arg_count"].value<int64_t>())               cfg.format.function.arg_count = static_cast<int>(*v);
                 if (auto v = (*fn)["layout"].value<std::string>())              cfg.format.function.layout = *v;
+                if (auto v = (*fn)["trailing_comma"].value<bool>())             cfg.format.function.trailing_comma = *v;
                 if (auto v = (*fn)["space_before_paren"].value<bool>())         cfg.format.function.space_before_paren = *v;
                 if (auto v = (*fn)["space_inside_paren"].value<bool>())         cfg.format.function.space_inside_paren = *v;
             }
