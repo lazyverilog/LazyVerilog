@@ -222,6 +222,7 @@ struct LazyVerilogServer::Impl {
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
+    analyzer_.set_defines(config_.design.define);
     analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
     register_handlers();
     impl_->remote_endpoint.startProcessingMessages(impl_->input, impl_->output);
@@ -302,6 +303,7 @@ void LazyVerilogServer::register_handlers() {
                     std::string warn;
                     config_ = load_config(root_, &warn);
                     if (!warn.empty()) show_warning(warn);
+                    analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }
@@ -312,6 +314,7 @@ void LazyVerilogServer::register_handlers() {
                     std::string warn;
                     config_ = load_config(root_, &warn);
                     if (!warn.empty()) show_warning(warn);
+                    analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }
@@ -380,6 +383,7 @@ void LazyVerilogServer::register_handlers() {
             std::string warn;
             config_ = load_config(root_, &warn);
             if (!warn.empty()) show_warning(warn);
+            analyzer_.set_defines(config_.design.define);
             analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                       resolve_vcode_path(root_, config_));
             (void)note; // settings in note.params.settings parsed lazily
@@ -440,6 +444,7 @@ void LazyVerilogServer::register_handlers() {
                     std::string warn;
                     config_ = load_config(root_, &warn);
                     if (!warn.empty()) show_warning(warn);
+                    analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }

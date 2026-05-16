@@ -11,6 +11,7 @@
 #include <set>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/AllSyntax.h>
+#include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
@@ -49,8 +50,13 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // errors when the same file is re-parsed on didChange, and prevents the
     // static singleton from accumulating stale buffers across edits.
     auto sm = std::make_unique<slang::SourceManager>();
+    slang::parsing::PreprocessorOptions ppo;
+    ppo.predefines = defines_;
+    slang::Bag bag;
+    bag.set(ppo);
     auto tree = slang::syntax::SyntaxTree::fromText(std::string_view(text), *sm,
-                                                    std::string_view(uri), std::string_view(path));
+                                                    std::string_view(uri), std::string_view(path),
+                                                    bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
@@ -1348,6 +1354,13 @@ std::vector<std::pair<int, int>> Analyzer::find_occurrences(const std::string& u
         pos = found + 1;
     }
     return result;
+}
+
+void Analyzer::set_defines(const std::vector<std::string>& defines) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    defines_ = defines;
+    // Invalidate extra-file cache so reopened files pick up the new defines.
+    extra_cache_.clear();
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,

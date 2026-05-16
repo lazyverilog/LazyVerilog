@@ -98,6 +98,10 @@ class Analyzer {
     void set_extra_files(const std::vector<std::string>& paths,
                          const std::string& filelist_path = {});
 
+    /// Set preprocessor defines (from config.design.define).
+    /// Applied on every subsequent make_state call.
+    void set_defines(const std::vector<std::string>& defines);
+
     /// Return extra files from .f filelist.
     std::vector<std::string> extra_files() const;
 
@@ -140,6 +144,7 @@ class Analyzer {
 
     mutable std::mutex map_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
+    std::vector<std::string> defines_;
     mutable std::vector<std::string> extra_files_;
     mutable std::vector<ExtraFileCacheEntry> extra_cache_;
 };
