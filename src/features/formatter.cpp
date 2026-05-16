@@ -740,6 +740,8 @@ static std::string align_port_pass(const std::string& text, const FormatOptions&
 // Statement assignment alignment pass
 // ---------------------------------------------------------------------------
 
+static bool is_var_line(const std::string& line); // forward declaration
+
 static std::string align_assign_pass(const std::string& text, const FormatOptions& opts) {
     static const std::regex BLK(R"( ((?:[+\-*/%&|^]|<<|>>|<<<|>>>)?=)(?!=) )");
     static const std::regex NBLK(R"( <= )");
@@ -765,7 +767,7 @@ static std::string align_assign_pass(const std::string& text, const FormatOption
     size_t i=0;
     while(i<lines.size()) {
         auto [p0,op0]=find_op(lines[i]);
-        if(p0<0) { out.push_back(lines[i]); ++i; continue; }
+        if(p0<0||is_var_line(lines[i])) { out.push_back(lines[i]); ++i; continue; }
         size_t ind=0;
         while(ind<lines[i].size()&&(lines[i][ind]==' '||lines[i][ind]=='\t')) ++ind;
 
@@ -775,6 +777,7 @@ static std::string align_assign_pass(const std::string& text, const FormatOption
         while(j<lines.size()) {
             const auto& lj=lines[j];
             if(lj.empty()) break;
+            if(is_var_line(lj)) break;
             size_t ij=0; while(ij<lj.size()&&(lj[ij]==' '||lj[ij]=='\t')) ++ij;
             if(ij!=ind) break;
             auto[pj,oj]=find_op(lj);

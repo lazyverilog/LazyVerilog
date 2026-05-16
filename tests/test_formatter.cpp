@@ -26,6 +26,19 @@ TEST_CASE("formatter: function calls support hanging layout", "[formatter]") {
           "                 arg3);\n");
 }
 
+TEST_CASE("formatter: var declaration initializers not aligned by statement pass", "[formatter]") {
+    FormatOptions opts;
+    opts.statement.align = true;
+    opts.var_declaration.align = false;
+
+    // Two var decls with different name lengths — should NOT be aligned by align_assign_pass
+    CHECK(format_source(
+        "logic [7:0] dout = 8'hFF;\n"
+        "logic [8:0] douteeeeeeeeeeeeeeeeeee = 8'hFF;\n", opts) ==
+        "logic [7:0] dout = 8'hFF;\n"
+        "logic [8:0] douteeeeeeeeeeeeeeeeeee = 8'hFF;\n");
+}
+
 TEST_CASE("formatter: define macro body not reformatted", "[formatter]") {
     FormatOptions opts;
     opts.function.break_policy = "always";
