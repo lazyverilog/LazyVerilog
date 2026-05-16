@@ -49,3 +49,22 @@ TEST_CASE("formatter: define macro body not reformatted", "[formatter]") {
         "    end\n";
     CHECK(format_source(src, opts) == src);
 }
+
+TEST_CASE("formatter: adaptive var declarations align semicolons after overflow", "[formatter]") {
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 8;
+    opts.var_declaration.section2_min_width = 8;
+    opts.var_declaration.section3_min_width = 8;
+    opts.default_indent_level_inside_module_block = 0;
+
+    CHECK(format_source("module top;\n"
+                        "logic [7:0] short;\n"
+                        "logic [8:0] very_long_signal_name;\n"
+                        "endmodule\n", opts) ==
+          "module top;\n"
+          "logic   [7:0]   short                 ;\n"
+          "logic   [8:0]   very_long_signal_name ;\n"
+          "endmodule\n");
+}

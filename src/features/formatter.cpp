@@ -1069,12 +1069,8 @@ static std::string align_var_pass(const std::string& text, const FormatOptions& 
                     line_s2_w = e2 - e1;
                 }
 
-                line_id_widths.clear();
-                line_trail_widths.clear();
-                for (const auto& [nm, tr] : vp.declarators) {
-                    line_id_widths.push_back(std::max(vo.section3_min_width, (int)nm.size()+1));
-                    line_trail_widths.push_back(std::max(vo.section4_min_width, (int)tr.size()));
-                }
+                // Keep declarator/trailing widths block-wide so a name or initializer that overflows
+                // its minimum section still moves following semicolons consistently for the block.
             }
             std::string ln = vp.indent;
             std::string s1part = vp.type_kw + (vp.qualifier.empty()?"":" "+vp.qualifier);
