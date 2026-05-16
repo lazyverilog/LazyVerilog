@@ -36,6 +36,26 @@ static std::string format_emit_text(const std::string& text, const FormatOptions
     return formatted;
 }
 
+static std::string format_replacement_at_column(
+    const std::string& text,
+    int column,
+    const FormatOptions& options)
+{
+    std::string formatted = format_emit_text(text, options);
+    if (column <= 0)
+        return formatted;
+
+    std::string prefix(column, ' ');
+    std::string out;
+    out.reserve(formatted.size() + prefix.size());
+    for (size_t i = 0; i < formatted.size(); ++i) {
+        out += formatted[i];
+        if (formatted[i] == '\n' && i + 1 < formatted.size())
+            out += prefix;
+    }
+    return out;
+}
+
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
@@ -151,8 +171,10 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
         if (we) {
             if (we->changes) {
                 for (auto& [_, edits] : *we->changes) {
-                    for (auto& edit : edits)
-                        edit.newText = format_emit_text(edit.newText, config.format);
+                    for (auto& edit : edits) {
+                        edit.newText = format_replacement_at_column(
+                            edit.newText, edit.range.start.character, config.format);
+                    }
                 }
             }
             CodeAction action;

@@ -1,4 +1,6 @@
 #include "analyzer.hpp"
+#include "features/autofunc.hpp"
+#include "features/code_action.hpp"
 #include "features/hover.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
@@ -243,4 +245,76 @@ endclass
     CHECK(symbols[2].kind == lsSymbolKind::Class);
 
     std::filesystem::remove(path);
+}
+
+TEST_CASE("autofunc: preserves positional call arguments", "[autofunc]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/autofunc_positional.sv";
+    analyzer.open(uri, R"(
+function int sum(input int i_a, input int i_b);
+    return i_a + i_b;
+endfunction
+
+module top;
+    initial begin
+        sum(1, 2);
+    end
+endmodule
+)");
+
+    AutoFuncOptions options;
+    options.indent_size = 4;
+    options.use_named_arguments = true;
+
+    auto edit = autofunc(analyzer, uri, 7, 9, options);
+    REQUIRE(edit.has_value());
+    REQUIRE(edit->changes.has_value());
+    auto it = edit->changes->find(uri);
+    REQUIRE(it != edit->changes->end());
+    REQUIRE(it->second.size() == 1);
+    CHECK(it->second[0].newText == "sum(\n            .i_a(1),\n            .i_b(2)\n        );");
+}
+
+TEST_CASE("autofunc code action formats replacement at insertion column", "[autofunc]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/autofunc_code_action_indent.sv";
+    analyzer.open(uri, R"(
+task add_number(input int a, input int b, output int result);
+    result = a + b;
+endtask
+
+module top;
+    initial begin
+        add_number(.a(a3),
+                   .b(b),
+                   .result(result));
+    end
+endmodule
+)");
+
+    Config config;
+    config.format.indent_size = 4;
+    config.format.function.arg_count = 3;
+    config.format.function.layout = "hanging";
+    config.autofunc.indent_size = 4;
+    config.autofunc.use_named_arguments = true;
+
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.range.start = lsPosition(7, 9);
+
+    auto actions = provide_code_actions(analyzer, config, params);
+    auto it = std::find_if(actions.begin(), actions.end(), [](const CodeAction& action) {
+        return action.title == "AutoFunc: expand function call";
+    });
+    REQUIRE(it != actions.end());
+    REQUIRE(it->edit.has_value());
+    REQUIRE(it->edit->changes.has_value());
+    auto change = it->edit->changes->find(uri);
+    REQUIRE(change != it->edit->changes->end());
+    REQUIRE(change->second.size() == 1);
+    CHECK(change->second[0].newText ==
+          "add_number(.a(a3),\n"
+          "                   .b(b),\n"
+          "                   .result(result));");
 }

@@ -77,7 +77,10 @@ static CallExtent find_call_extent(const std::vector<std::string>& lines, int li
 
 // ── Parse existing .port(wire) connections ────────────────────────────────────
 
-static std::map<std::string, std::string> parse_existing_connections(const std::string& call_text) {
+static std::map<std::string, std::string> parse_existing_connections(
+    const std::string& call_text,
+    const std::vector<std::string>& ports)
+{
     std::map<std::string, std::string> result;
     size_t i = 0;
     while (i < call_text.size()) {
@@ -125,6 +128,46 @@ static std::map<std::string, std::string> parse_existing_connections(const std::
         }
         if (j >= call_text.size()) break;
     }
+
+    size_t open_paren = call_text.find('(');
+    if (open_paren == std::string::npos)
+        return result;
+
+    std::vector<std::string> positional_args;
+    int depth = 0;
+    size_t arg_start = open_paren + 1;
+    for (size_t j = open_paren; j < call_text.size(); ++j) {
+        char ch = call_text[j];
+        if (ch == '(') {
+            ++depth;
+            continue;
+        }
+        if (ch == ')') {
+            --depth;
+            if (depth == 0) {
+                positional_args.push_back(call_text.substr(arg_start, j - arg_start));
+                break;
+            }
+            continue;
+        }
+        if (ch == ',' && depth == 1) {
+            positional_args.push_back(call_text.substr(arg_start, j - arg_start));
+            arg_start = j + 1;
+        }
+    }
+
+    for (size_t arg_index = 0; arg_index < positional_args.size() && arg_index < ports.size();
+         ++arg_index) {
+        std::string wire = positional_args[arg_index];
+        size_t s = wire.find_first_not_of(" \t\n\r");
+        size_t e = wire.find_last_not_of(" \t\n\r");
+        if (s == std::string::npos)
+            continue;
+        wire = wire.substr(s, e - s + 1);
+        if (!wire.empty() && wire[0] != '.' && !result.contains(ports[arg_index]))
+            result[ports[arg_index]] = wire;
+    }
+
     return result;
 }
 
@@ -233,6 +276,11 @@ std::optional<lsWorkspaceEdit> autofunc(
     // Find call extent (may span multiple lines)
     auto extent = find_call_extent(lines, line, ident->col, ident->end_col);
 
+    // Look up function/task ports
+    auto ports = find_func_or_task_ports(analyzer, ident->name);
+    if (!ports || ports->empty())
+        return std::nullopt;
+
     // Extract existing call text (possibly multi-line) for connection preservation
     std::string call_text;
     for (int l = extent.start_line; l <= extent.end_line; ++l) {
@@ -241,12 +289,7 @@ std::optional<lsWorkspaceEdit> autofunc(
         call_text += lines[l].substr(col_s, col_e - col_s);
         if (l < extent.end_line) call_text += '\n';
     }
-    auto wire_map = parse_existing_connections(call_text);
-
-    // Look up function/task ports
-    auto ports = find_func_or_task_ports(analyzer, ident->name);
-    if (!ports || ports->empty())
-        return std::nullopt;
+    auto wire_map = parse_existing_connections(call_text, *ports);
 
     // Detect line indent
     std::string indent;
