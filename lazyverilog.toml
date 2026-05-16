@@ -78,7 +78,7 @@ lhs_min_width = 6           # minimum width of the LHS column before the operato
 wrap_end_else_clauses = true
 
 [format.port_declaration]
-align = false
+align = true
 align_adaptive = true
 section1_min_width = 6
 section2_min_width = 20
@@ -87,8 +87,8 @@ section4_min_width = 20
 section5_min_width = 20
 
 [format.var_declaration]
-align = false
-align_adaptive = false
+align = true
+align_adaptive = true
 section1_min_width = 20
 section2_min_width = 20
 section3_min_width = 20

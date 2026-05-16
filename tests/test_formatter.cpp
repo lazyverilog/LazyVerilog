@@ -39,6 +39,19 @@ TEST_CASE("formatter: var declaration initializers not aligned by statement pass
         "logic [8:0] douteeeeeeeeeeeeeeeeeee = 8'hFF;\n");
 }
 
+TEST_CASE("formatter: user-defined type var decl not aligned by statement pass", "[formatter]") {
+    FormatOptions opts;
+    opts.statement.align = true;
+    opts.var_declaration.align = false;
+
+    // User-defined type var decls should NOT be aligned by align_assign_pass
+    CHECK(format_source(
+        "packet_t test_init = 8'hFF;\n"
+        "packet_t test_init2 = 8'hFF;\n", opts) ==
+        "packet_t test_init = 8'hFF;\n"
+        "packet_t test_init2 = 8'hFF;\n");
+}
+
 TEST_CASE("formatter: define macro body not reformatted", "[formatter]") {
     FormatOptions opts;
     opts.function.break_policy = "always";
@@ -50,21 +63,43 @@ TEST_CASE("formatter: define macro body not reformatted", "[formatter]") {
     CHECK(format_source(src, opts) == src);
 }
 
-TEST_CASE("formatter: adaptive var declarations align semicolons after overflow", "[formatter]") {
+TEST_CASE("formatter: adaptive var declaration section4 does not use block max", "[formatter]") {
     FormatOptions opts;
     opts.var_declaration.align = true;
     opts.var_declaration.align_adaptive = true;
     opts.var_declaration.section1_min_width = 8;
     opts.var_declaration.section2_min_width = 8;
     opts.var_declaration.section3_min_width = 8;
+    opts.var_declaration.section4_min_width = 8;
     opts.default_indent_level_inside_module_block = 0;
 
     CHECK(format_source("module top;\n"
-                        "logic [7:0] short;\n"
-                        "logic [8:0] very_long_signal_name;\n"
+                        "logic [7:0] a = 1;\n"
+                        "logic [7:0] b = very_long_expression;\n"
                         "endmodule\n", opts) ==
           "module top;\n"
-          "logic   [7:0]   short                 ;\n"
-          "logic   [8:0]   very_long_signal_name ;\n"
+          "logic   [7:0]   a       = 1     ;\n"
+          "logic   [7:0]   b       = very_long_expression;\n"
           "endmodule\n");
+}
+
+TEST_CASE("formatter: user-defined output port type stays in type section", "[formatter]") {
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = true;
+    opts.port_declaration.section1_min_width = 6;
+    opts.port_declaration.section2_min_width = 12;
+    opts.port_declaration.section3_min_width = 8;
+    opts.port_declaration.section4_min_width = 8;
+    opts.default_indent_level_inside_module_block = 0;
+
+    std::string formatted = format_source(
+        "module top(test, VSS);\n"
+        "output logic unsigned [0:0] VDD, VSS;\n"
+        "output                                        packet_t            [0:0] test          , VSS                                     ;\n"
+        "endmodule\n", opts);
+
+    CHECK(formatted.find("output                    packet_t") == std::string::npos);
+    CHECK(formatted.find("output packet_t") != std::string::npos);
+    CHECK(formatted.find("output packet_t   [0:0]") != std::string::npos);
 }
