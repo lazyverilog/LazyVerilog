@@ -27,6 +27,7 @@ struct StatementOptions {
 
 struct PortDeclarationOptions {
     bool align{true};
+    bool align_adaptive{false};
     int  section1_min_width{10};
     int  section2_min_width{20};
     int  section3_min_width{20};
@@ -36,6 +37,7 @@ struct PortDeclarationOptions {
 
 struct VarDeclarationOptions {
     bool align{false};
+    bool align_adaptive{false};
     int  section1_min_width{0};
     int  section2_min_width{30};
     int  section3_min_width{30};
@@ -47,7 +49,18 @@ struct InstanceOptions {
     int  port_indent_level{1};
     int  instance_port_name_width{1};
     int  instance_port_between_paren_width{0};
-    bool align_instance_port_adaptive{false};
+    bool align_adaptive{false};
+};
+
+struct FunctionOptions {
+    std::string break_policy{"auto"};
+    int         line_length{100};
+    int         arg_count{-1};
+    std::string layout{"block"};
+    int         indent_width{4};
+    bool        trailing_comma{false};
+    bool        space_before_paren{false};
+    bool        space_inside_paren{false};
 };
 
 struct PortOptions {
@@ -74,6 +87,7 @@ struct FormatOptions {
     PortDeclarationOptions port_declaration;
     VarDeclarationOptions  var_declaration;
     InstanceOptions        instance;
+    FunctionOptions        function;
     PortOptions            port;
 };
 
@@ -137,8 +151,9 @@ struct Config {
 };
 
 /// Load lazyverilog.toml from root directory. Returns defaults if not found.
-/// Unknown keys are silently ignored.
-Config load_config(const std::filesystem::path& root);
+/// Unknown keys are silently ignored. On TOML syntax error, returns defaults
+/// and sets *warning to a human-readable message (if warning != nullptr).
+Config load_config(const std::filesystem::path& root, std::string* warning = nullptr);
 
 /// Walk up from `start` (file or directory) looking for lazyverilog.toml.
 /// Returns the directory containing it, or empty path if not found.

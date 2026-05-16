@@ -1,7 +1,6 @@
 #include "config.hpp"
 #include <toml++/toml.hpp>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 
 std::filesystem::path find_config_root(const std::filesystem::path& start) {
@@ -15,7 +14,7 @@ std::filesystem::path find_config_root(const std::filesystem::path& start) {
     return {};
 }
 
-Config load_config(const std::filesystem::path& root) {
+Config load_config(const std::filesystem::path& root, std::string* warning) {
     Config cfg{};
     auto toml_path = root / "lazyverilog.toml";
     if (!std::filesystem::exists(toml_path)) {
@@ -69,6 +68,7 @@ Config load_config(const std::filesystem::path& root) {
             }
             if (auto pd = (*f)["port_declaration"].as_table()) {
                 if (auto v = (*pd)["align"].value<bool>())                      cfg.format.port_declaration.align = *v;
+                if (auto v = (*pd)["align_adaptive"].value<bool>())             cfg.format.port_declaration.align_adaptive = *v;
                 if (auto v = (*pd)["section1_min_width"].value<int64_t>())      cfg.format.port_declaration.section1_min_width = static_cast<int>(*v);
                 if (auto v = (*pd)["section2_min_width"].value<int64_t>())      cfg.format.port_declaration.section2_min_width = static_cast<int>(*v);
                 if (auto v = (*pd)["section3_min_width"].value<int64_t>())      cfg.format.port_declaration.section3_min_width = static_cast<int>(*v);
@@ -77,6 +77,7 @@ Config load_config(const std::filesystem::path& root) {
             }
             if (auto vd = (*f)["var_declaration"].as_table()) {
                 if (auto v = (*vd)["align"].value<bool>())                      cfg.format.var_declaration.align = *v;
+                if (auto v = (*vd)["align_adaptive"].value<bool>())             cfg.format.var_declaration.align_adaptive = *v;
                 if (auto v = (*vd)["section1_min_width"].value<int64_t>())      cfg.format.var_declaration.section1_min_width = static_cast<int>(*v);
                 if (auto v = (*vd)["section2_min_width"].value<int64_t>())      cfg.format.var_declaration.section2_min_width = static_cast<int>(*v);
                 if (auto v = (*vd)["section3_min_width"].value<int64_t>())      cfg.format.var_declaration.section3_min_width = static_cast<int>(*v);
@@ -87,7 +88,17 @@ Config load_config(const std::filesystem::path& root) {
                 if (auto v = (*inst)["port_indent_level"].value<int64_t>())             cfg.format.instance.port_indent_level = static_cast<int>(*v);
                 if (auto v = (*inst)["instance_port_name_width"].value<int64_t>())      cfg.format.instance.instance_port_name_width = static_cast<int>(*v);
                 if (auto v = (*inst)["instance_port_between_paren_width"].value<int64_t>()) cfg.format.instance.instance_port_between_paren_width = static_cast<int>(*v);
-                if (auto v = (*inst)["align_instance_port_adaptive"].value<bool>())     cfg.format.instance.align_instance_port_adaptive = *v;
+                if (auto v = (*inst)["align_adaptive"].value<bool>())                   cfg.format.instance.align_adaptive = *v;
+            }
+            if (auto fn = (*f)["function"].as_table()) {
+                if (auto v = (*fn)["break_policy"].value<std::string>())        cfg.format.function.break_policy = *v;
+                if (auto v = (*fn)["line_length"].value<int64_t>())             cfg.format.function.line_length = static_cast<int>(*v);
+                if (auto v = (*fn)["arg_count"].value<int64_t>())               cfg.format.function.arg_count = static_cast<int>(*v);
+                if (auto v = (*fn)["layout"].value<std::string>())              cfg.format.function.layout = *v;
+                if (auto v = (*fn)["indent_width"].value<int64_t>())            cfg.format.function.indent_width = static_cast<int>(*v);
+                if (auto v = (*fn)["trailing_comma"].value<bool>())             cfg.format.function.trailing_comma = *v;
+                if (auto v = (*fn)["space_before_paren"].value<bool>())         cfg.format.function.space_before_paren = *v;
+                if (auto v = (*fn)["space_inside_paren"].value<bool>())         cfg.format.function.space_inside_paren = *v;
             }
             if (auto po = (*f)["port"].as_table()) {
                 if (auto v = (*po)["non_ansi_port_per_line_enabled"].value<bool>())        cfg.format.port.non_ansi_port_per_line_enabled = *v;
@@ -187,8 +198,9 @@ Config load_config(const std::filesystem::path& root) {
         // Unknown top-level keys silently ignored (toml++ doesn't error on them)
 
     } catch (const toml::parse_error& e) {
-        // Parse error: return defaults (log to stderr)
-        std::cerr << "[lazyverilog] config parse error: " << e.what() << "\n";
+        std::string msg = std::string("[lazyverilog] lazyverilog.toml parse error: ") + e.what();
+        std::cerr << msg << "\n";
+        if (warning) *warning = msg;
     } catch (...) {
         std::cerr << "[lazyverilog] config load error\n";
     }

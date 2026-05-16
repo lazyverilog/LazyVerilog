@@ -299,7 +299,9 @@ void LazyVerilogServer::register_handlers() {
                 auto p = uri_to_path(req.params.rootUri->raw_uri_);
                 if (std::filesystem::exists(p)) {
                     root_ = p;
-                    config_ = load_config(root_);
+                    std::string warn;
+                    config_ = load_config(root_, &warn);
+                    if (!warn.empty()) show_warning(warn);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }
@@ -307,7 +309,9 @@ void LazyVerilogServer::register_handlers() {
                 std::filesystem::path p(*req.params.rootPath);
                 if (std::filesystem::exists(p)) {
                     root_ = p;
-                    config_ = load_config(root_);
+                    std::string warn;
+                    config_ = load_config(root_, &warn);
+                    if (!warn.empty()) show_warning(warn);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }
@@ -370,10 +374,12 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── workspace/didChangeConfiguration ─────────────────────────────────────
-    ep.registerHandler([&](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
+    ep.registerHandler([&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
         try {
             // Re-read config from disk on every configuration change
-            config_ = load_config(root_);
+            std::string warn;
+            config_ = load_config(root_, &warn);
+            if (!warn.empty()) show_warning(warn);
             analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                       resolve_vcode_path(root_, config_));
             (void)note; // settings in note.params.settings parsed lazily
@@ -420,7 +426,7 @@ void LazyVerilogServer::register_handlers() {
     };
 
     // ── textDocument/didOpen ──────────────────────────────────────────────────
-    ep.registerHandler([&, publish_diags](const Notify_TextDocumentDidOpen::notify& note) {
+    ep.registerHandler([&, publish_diags, show_warning](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
             // Walk up from file to find lazyverilog.toml if not already found
@@ -431,7 +437,9 @@ void LazyVerilogServer::register_handlers() {
                 auto found = find_config_root(uri);
                 if (!found.empty()) {
                     root_ = found;
-                    config_ = load_config(root_);
+                    std::string warn;
+                    config_ = load_config(root_, &warn);
+                    if (!warn.empty()) show_warning(warn);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
                 }
