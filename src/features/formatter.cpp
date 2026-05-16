@@ -644,13 +644,34 @@ static std::string align_port_pass(const std::string& text, const FormatOptions&
 
         for(auto&[orig,pp]:blk) {
             if(!pp.valid) { out.push_back(orig); continue; }
-            std::string line=pp.indent;
-            line+=pad(pp.direction,s1);
-            if(s2>0) {
+            int line_s1 = s1;
+            int line_s2 = s2;
+            int line_s3 = s3;
+            std::vector<int> line_id_widths = id_widths;
+            std::vector<int> line_trail_widths = trail_widths;
+            if (opts.port_declaration.align_adaptive) {
                 std::string tp=pp.dtype+(pp.qualifier.empty()?"":" "+pp.qualifier);
-                line+=pad(tp,s2);
+                line_s1 = std::max(opts.port_declaration.section1_min_width,
+                                   (int)pp.direction.size()+1);
+                line_s2 = !tp.empty()?std::max(opts.port_declaration.section2_min_width,
+                                               (int)tp.size()+1):0;
+                line_s3 = !pp.dim.empty()?std::max(opts.port_declaration.section3_min_width,
+                                                   (int)pp.dim.size()+1):0;
+                line_id_widths.clear();
+                line_trail_widths.clear();
+                for (const auto& [nm, tr] : pp.names) {
+                    line_id_widths.push_back(std::max(opts.port_declaration.section4_min_width,
+                                                      (int)nm.size()+1));
+                    line_trail_widths.push_back(std::max(s5_min, (int)tr.size()));
+                }
             }
-            if(s3>0) line+=pad(pp.dim,s3);
+            std::string line=pp.indent;
+            line+=pad(pp.direction,line_s1);
+            if(line_s2>0) {
+                std::string tp=pp.dtype+(pp.qualifier.empty()?"":" "+pp.qualifier);
+                line+=pad(tp,line_s2);
+            }
+            if(line_s3>0) line+=pad(pp.dim,line_s3);
 
             // Emit per-slot names — mirrors Python _reassemble_port_line
             size_t nslots = pp.names.size();
@@ -659,27 +680,27 @@ static std::string align_port_pass(const std::string& text, const FormatOptions&
                 const auto& nm = pp.names[slot].first;
                 const auto& tr = pp.names[slot].second;
                 // Pad name to slot id width
-                if(slot<id_widths.size())
-                    line += pad(nm, id_widths[slot]);
+                if(slot<line_id_widths.size())
+                    line += pad(nm, line_id_widths[slot]);
                 else
                     line += nm;
 
                 if(!is_last) {
                     // Non-last slot: pad trailing then ", "
-                    if(!tr.empty() && s5_min>0 && slot<trail_widths.size() && trail_widths[slot]>1)
-                        line += pad(tr, trail_widths[slot]) + ", ";
-                    else if(slot<trail_widths.size())
-                        line += pad(tr, trail_widths[slot]) + ", ";
+                    if(!tr.empty() && s5_min>0 && slot<line_trail_widths.size() && line_trail_widths[slot]>1)
+                        line += pad(tr, line_trail_widths[slot]) + ", ";
+                    else if(slot<line_trail_widths.size())
+                        line += pad(tr, line_trail_widths[slot]) + ", ";
                     else
                         line += tr + ", ";
                 } else {
                     // Last slot — matches Python _reassemble_port_line last-slot logic
                     std::string term = pp.terminator.empty() ? ";" : pp.terminator;
-                    if(!tr.empty() && s5_min>0 && slot<trail_widths.size() && trail_widths[slot]>1) {
-                        line += pad(tr, trail_widths[slot]) + term;
+                    if(!tr.empty() && s5_min>0 && slot<line_trail_widths.size() && line_trail_widths[slot]>1) {
+                        line += pad(tr, line_trail_widths[slot]) + term;
                     } else {
-                        if(slot<trail_widths.size())
-                            line += pad(tr, trail_widths[slot]);
+                        if(slot<line_trail_widths.size())
+                            line += pad(tr, line_trail_widths[slot]);
                         else
                             line += tr;
                         line += term;
@@ -1006,39 +1027,57 @@ static std::string align_var_pass(const std::string& text, const FormatOptions& 
         for(auto&e:block){
             if(!e.parsed){out.push_back(e.orig); continue;}
             const auto& vp=*e.parsed;
+            int line_s1_w = s1_w;
+            int line_s2_w = s2_w;
+            std::vector<int> line_id_widths = id_widths;
+            std::vector<int> line_trail_widths = trail_widths;
+            if (vo.align_adaptive) {
+                std::string s1part = vp.type_kw + (vp.qualifier.empty()?"":" "+vp.qualifier);
+                line_s1_w = std::max(vo.section1_min_width, (int)s1part.size()+1);
+                line_s2_w = !vp.dim.empty() ? std::max(vo.section2_min_width,
+                                                       (int)vp.dim.size()+1) : 0;
+                line_id_widths.clear();
+                line_trail_widths.clear();
+                for (const auto& [nm, tr] : vp.declarators) {
+                    line_id_widths.push_back(std::max(vo.section3_min_width,
+                                                      (int)nm.size()+1));
+                    line_trail_widths.push_back(std::max(vo.section4_min_width,
+                                                         (int)tr.size()));
+                }
+            }
             std::string ln = vp.indent;
             std::string s1part = vp.type_kw + (vp.qualifier.empty()?"":" "+vp.qualifier);
-            ln += pad_to(s1part, s1_w);
-            if(s2_w>0) ln += pad_to(vp.dim, s2_w);
+            ln += pad_to(s1part, line_s1_w);
+            if(line_s2_w>0) ln += pad_to(vp.dim, line_s2_w);
             size_t nd=vp.declarators.size();
             for(size_t k=0;k<nd;++k){
                 bool is_last=(k==nd-1);
                 const auto& nm=vp.declarators[k].first;
                 const auto& tr=vp.declarators[k].second;
                 if(!is_last){
-                    ln += pad_to(nm, id_widths[k]);
-                    if(!tr.empty()&&vo.section4_min_width>0&&k<trail_widths.size()&&trail_widths[k]>1){
-                        ln += pad_to(tr, trail_widths[k]) + ", ";
-                    } else if(k<trail_widths.size()){
-                        ln += pad_to(tr, trail_widths[k]) + ", ";
+                    ln += pad_to(nm, line_id_widths[k]);
+                    if(!tr.empty()&&vo.section4_min_width>0&&k<line_trail_widths.size()&&line_trail_widths[k]>1){
+                        ln += pad_to(tr, line_trail_widths[k]) + ", ";
+                    } else if(k<line_trail_widths.size()){
+                        ln += pad_to(tr, line_trail_widths[k]) + ", ";
                     } else {
                         ln += tr + ", ";
                     }
                 } else {
                     // Last slot — mirrors Python _reassemble_var_line last-slot logic
                     // Pad name to slot width (same as Python: line = line + name.ljust(id_widths[k]))
-                    if(k<id_widths.size())
-                        ln += pad_to(nm, id_widths[k]);
+                    if(k<line_id_widths.size())
+                        ln += pad_to(nm, line_id_widths[k]);
                     else
                         ln += nm;
-                    if(!tr.empty() && vo.section4_min_width>0 && k<trail_widths.size() && trail_widths[k]>1) {
+                    if(!tr.empty() && vo.section4_min_width>0 && k<line_trail_widths.size() && line_trail_widths[k]>1) {
                         // trailing content exists + section4 configured: pad trailing then ";"
-                        ln += pad_to(tr, trail_widths[k]) + ";";
+                        ln += pad_to(tr, line_trail_widths[k]) + ";";
                     } else {
                         // Python else branch: trailing.ljust(w) + trailing + ";"
                         // For empty trailing this gives: spaces(w) + "" + ";" = padding + ";"
-                        if(k<trail_widths.size())
-                            ln += pad_to(tr, trail_widths[k]);
+                        if(k<line_trail_widths.size())
+                            ln += pad_to(tr, line_trail_widths[k]);
                         ln += tr + ";";
                     }
                 }
@@ -1178,7 +1217,7 @@ static std::string expand_instances_pass(const std::string& text, const FormatOp
     const std::string port_indent(opts.instance.port_indent_level * opts.indent_size, ' ');
     int m_before = opts.instance.instance_port_name_width;
     int m_inside = opts.instance.instance_port_between_paren_width;
-    bool adaptive = opts.instance.align_instance_port_adaptive;
+    bool adaptive = opts.instance.align_adaptive;
 
     std::vector<std::string> lines;
     { std::istringstream ss(text); std::string l; while(std::getline(ss,l)) lines.push_back(l); }
@@ -1308,6 +1347,142 @@ static std::string expand_instances_pass(const std::string& text, const FormatOp
         }
         out.push_back(indent+");");
         i=end_i;
+    }
+    std::string r; for(size_t k=0;k<out.size();++k){if(k)r+='\n'; r+=out[k];} return r;
+}
+
+// ---------------------------------------------------------------------------
+// Function/task call formatting pass
+// ---------------------------------------------------------------------------
+
+static std::string trim_copy(const std::string& s) {
+    size_t a=0; while(a<s.size()&&(s[a]==' '||s[a]=='\t')) ++a;
+    size_t b=s.size(); while(b>a&&(s[b-1]==' '||s[b-1]=='\t')) --b;
+    return s.substr(a,b-a);
+}
+
+static bool find_simple_call(const std::string& line, size_t& name_start,
+                             size_t& name_end, size_t& open, size_t& close) {
+    static const std::unordered_set<std::string> SKIP = {
+        "if","for","foreach","while","repeat","wait","case","casex","casez",
+        "module","macromodule","function","task","covergroup","class","property",
+        "sequence","assert","assume","cover"
+    };
+    for(size_t i=0;i<line.size();++i) {
+        unsigned char ch=(unsigned char)line[i];
+        if(!(std::isalpha(ch)||line[i]=='_'||line[i]=='$')) continue;
+        size_t s=i++;
+        while(i<line.size()&&(std::isalnum((unsigned char)line[i])||line[i]=='_'||line[i]=='$')) ++i;
+        size_t e=i;
+        size_t j=i;
+        while(j<line.size()&&(line[j]==' '||line[j]=='\t')) ++j;
+        if(j>=line.size()||line[j]!='(') continue;
+        if(s>0 && line[s-1]=='.') continue;
+        std::string name=line.substr(s,e-s);
+        if(has(SKIP,lower(name))) continue;
+        int depth=1;
+        size_t k=j+1;
+        for(;k<line.size();++k) {
+            if(line[k]=='(') ++depth;
+            else if(line[k]==')' && --depth==0) break;
+        }
+        if(k>=line.size()) return false;
+        name_start=s; name_end=e; open=j; close=k;
+        return true;
+    }
+    return false;
+}
+
+static std::string render_call_single(const std::string& prefix, const std::string& name,
+                                      const std::vector<std::string>& args,
+                                      const std::string& suffix,
+                                      const FunctionOptions& fo) {
+    std::string r = prefix + name + (fo.space_before_paren ? " " : "") + "(";
+    if(fo.space_inside_paren && !args.empty()) r += " ";
+    for(size_t i=0;i<args.size();++i) {
+        if(i) r += ", ";
+        r += args[i];
+    }
+    if(fo.space_inside_paren && !args.empty()) r += " ";
+    r += ")" + suffix;
+    return r;
+}
+
+static std::string format_function_calls_pass(const std::string& text, const FormatOptions& opts) {
+    const auto& fo = opts.function;
+    auto disabled = find_disabled(text);
+    std::vector<std::string> lines;
+    { std::istringstream ss(text); std::string l; while(std::getline(ss,l)) lines.push_back(l); }
+
+    std::vector<std::string> out;
+    int pos = 0;
+    for(const auto& line:lines) {
+        int line_start = pos;
+        pos += (int)line.size() + 1; // +1 for the newline consumed by getline
+        if(line.find('\n')!=std::string::npos) { out.push_back(line); continue; }
+        if(in_disabled(line_start, disabled)) { out.push_back(line); continue; }
+        size_t ns=0,ne=0,op=0,cl=0;
+        if(!find_simple_call(line, ns, ne, op, cl)) { out.push_back(line); continue; }
+        std::string args_text = line.substr(op+1, cl-op-1);
+        auto raw_args = split_top_level(args_text);
+        std::vector<std::string> args;
+        for(auto& a:raw_args) {
+            auto t=trim_copy(a);
+            if(!t.empty()) args.push_back(t);
+        }
+
+        std::string prefix = line.substr(0, ns);
+        std::string name = line.substr(ns, ne-ns);
+        std::string suffix = line.substr(cl+1);
+        std::string prefix_trimmed = trim_copy(prefix);
+        std::string prefix_lower = lower(prefix_trimmed);
+        if (std::regex_match(prefix_trimmed, std::regex(R"([A-Za-z_$][\w$]*)"))
+                || prefix_lower.find("function") != std::string::npos
+                || prefix_lower.find("task") != std::string::npos
+                || prefix_lower.find("module") != std::string::npos
+                || prefix_lower.find("class") != std::string::npos) {
+            out.push_back(line);
+            continue;
+        }
+        std::string single = render_call_single(prefix, name, args, suffix, fo);
+
+        bool do_break = false;
+        if(fo.break_policy=="always") {
+            do_break = !args.empty();
+        } else if(fo.break_policy=="auto") {
+            do_break = ((int)single.size() > fo.line_length)
+                    || (fo.arg_count >= 0 && (int)args.size() >= fo.arg_count);
+        }
+        if(!do_break || fo.break_policy=="never") {
+            out.push_back(single);
+            continue;
+        }
+
+        std::string open_text = prefix + name + (fo.space_before_paren ? " " : "") + "(";
+        if(fo.layout=="hanging") {
+            std::string hang(open_text.size(), ' ');
+            std::string r = open_text;
+            for(size_t i=0;i<args.size();++i) {
+                if(i) r += "\n" + hang;
+                r += args[i];
+                if(i+1<args.size()) r += ",";
+            }
+            r += ")" + suffix;
+            out.push_back(r);
+        } else {
+            size_t base_len=0;
+            while(base_len<prefix.size()&&(prefix[base_len]==' '||prefix[base_len]=='\t')) ++base_len;
+            std::string base_indent = prefix.substr(0, base_len);
+            std::string arg_indent = base_indent + std::string(std::max(0, fo.indent_width), ' ');
+            std::string r = open_text + "\n";
+            for(size_t i=0;i<args.size();++i) {
+                r += arg_indent + args[i];
+                if(i+1<args.size() || fo.trailing_comma) r += ",";
+                r += "\n";
+            }
+            r += base_indent + ")" + suffix;
+            out.push_back(r);
+        }
     }
     std::string r; for(size_t k=0;k<out.size();++k){if(k)r+='\n'; r+=out[k];} return r;
 }
@@ -1623,6 +1798,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         out = align_var_pass(out, opts);
     if (opts.instance.align)
         out = expand_instances_pass(out, opts);
+    out = format_function_calls_pass(out, opts);
     // Always run port list pass
     out = format_portlist_pass(out, opts);
 
