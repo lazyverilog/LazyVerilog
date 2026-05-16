@@ -90,7 +90,7 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
                 if (auto v = (*inst)["instance_port_between_paren_width"].value<int64_t>()) cfg.format.instance.instance_port_between_paren_width = static_cast<int>(*v);
                 if (auto v = (*inst)["align_adaptive"].value<bool>())                   cfg.format.instance.align_adaptive = *v;
             }
-            if (auto fn = (*f)["function"].as_table()) {
+            if (auto fn = (*f)["function_call"].as_table()) {
                 if (auto v = (*fn)["break_policy"].value<std::string>())        cfg.format.function.break_policy = *v;
                 if (auto v = (*fn)["line_length"].value<int64_t>())             cfg.format.function.line_length = static_cast<int>(*v);
                 if (auto v = (*fn)["arg_count"].value<int64_t>())               cfg.format.function.arg_count = static_cast<int>(*v);

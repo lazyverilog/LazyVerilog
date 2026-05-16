@@ -94,7 +94,7 @@ port_indent_level = 2
 instance_port_name_width = 12
 align_adaptive = true
 
-[format.function]
+[format.function_call]
 break_policy = "always"
 line_length = 80
 arg_count = 3
