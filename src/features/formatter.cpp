@@ -650,17 +650,36 @@ static std::string align_port_pass(const std::string& text, const FormatOptions&
             std::vector<int> line_id_widths = id_widths;
             std::vector<int> line_trail_widths = trail_widths;
             if (opts.port_declaration.align_adaptive) {
+                const auto& pd = opts.port_declaration;
                 std::string tp=pp.dtype+(pp.qualifier.empty()?"":" "+pp.qualifier);
-                line_s1 = std::max(opts.port_declaration.section1_min_width,
-                                   (int)pp.direction.size()+1);
-                line_s2 = !tp.empty()?std::max(opts.port_declaration.section2_min_width,
-                                               (int)tp.size()+1):0;
-                line_s3 = !pp.dim.empty()?std::max(opts.port_declaration.section3_min_width,
-                                                   (int)pp.dim.size()+1):0;
+                // Cumulative minimum target end columns (fixed reference points).
+                // Each section pads to max(target_end, actual_end).
+                // Overflow on one line is absorbed by subsequent sections' slack,
+                // so downstream sections stay aligned as long as overflow is small.
+                int t1 = pd.section1_min_width;
+                int t2 = t1 + (s2 > 0 ? pd.section2_min_width : 0);
+                int t3 = t2 + (s3 > 0 ? pd.section3_min_width : 0);
+
+                int e1 = std::max(t1, (int)pp.direction.size()+1);
+                line_s1 = e1;
+
+                int e2 = e1;
+                if (s2 > 0) {
+                    int c2 = tp.empty() ? 0 : (int)tp.size()+1;
+                    e2 = std::max(t2, e1 + c2);
+                    line_s2 = e2 - e1;
+                }
+
+                if (s3 > 0) {
+                    int c3 = pp.dim.empty() ? 0 : (int)pp.dim.size()+1;
+                    int e3 = std::max(t3, e2 + c3);
+                    line_s3 = e3 - e2;
+                }
+
                 line_id_widths.clear();
                 line_trail_widths.clear();
                 for (const auto& [nm, tr] : pp.names) {
-                    line_id_widths.push_back(std::max(opts.port_declaration.section4_min_width,
+                    line_id_widths.push_back(std::max(pd.section4_min_width,
                                                       (int)nm.size()+1));
                     line_trail_widths.push_back(std::max(s5_min, (int)tr.size()));
                 }
@@ -1033,16 +1052,25 @@ static std::string align_var_pass(const std::string& text, const FormatOptions& 
             std::vector<int> line_trail_widths = trail_widths;
             if (vo.align_adaptive) {
                 std::string s1part = vp.type_kw + (vp.qualifier.empty()?"":" "+vp.qualifier);
-                line_s1_w = std::max(vo.section1_min_width, (int)s1part.size()+1);
-                line_s2_w = !vp.dim.empty() ? std::max(vo.section2_min_width,
-                                                       (int)vp.dim.size()+1) : 0;
+                // Cumulative minimum target end columns — same model as port_declaration.
+                int t1 = vo.section1_min_width;
+                int t2 = t1 + (s2_w > 0 ? vo.section2_min_width : 0);
+
+                int e1 = std::max(t1, (int)s1part.size()+1);
+                line_s1_w = e1;
+
+                int e2 = e1;
+                if (s2_w > 0) {
+                    int c2 = vp.dim.empty() ? 0 : (int)vp.dim.size()+1;
+                    e2 = std::max(t2, e1 + c2);
+                    line_s2_w = e2 - e1;
+                }
+
                 line_id_widths.clear();
                 line_trail_widths.clear();
                 for (const auto& [nm, tr] : vp.declarators) {
-                    line_id_widths.push_back(std::max(vo.section3_min_width,
-                                                      (int)nm.size()+1));
-                    line_trail_widths.push_back(std::max(vo.section4_min_width,
-                                                         (int)tr.size()));
+                    line_id_widths.push_back(std::max(vo.section3_min_width, (int)nm.size()+1));
+                    line_trail_widths.push_back(std::max(vo.section4_min_width, (int)tr.size()));
                 }
             }
             std::string ln = vp.indent;
