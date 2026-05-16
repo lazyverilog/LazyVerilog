@@ -27,6 +27,7 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.format.indent_size == 2);
     CHECK(cfg.format.trailing_newline == true);
     CHECK(cfg.lint.case_missing_default == false);
+    CHECK(cfg.lint.trailing_whitespace == false);
     CHECK(cfg.lint.register_naming == false);
     CHECK(cfg.autoinst.align_ports == false);
     CHECK(cfg.autoarg.autoarg_on_save == false);
@@ -116,6 +117,9 @@ latch_inference_detection = true
 explicit_begin = true
 register_naming = true
 
+[lint.style]
+trailing_whitespace = true
+
 [autoinst]
 align_ports = true
 
@@ -180,6 +184,7 @@ autoarg_on_save = true
     CHECK(cfg.lint.module_instantiation_style == true);
     CHECK(cfg.lint.latch_inference_detection == true);
     CHECK(cfg.lint.explicit_begin == true);
+    CHECK(cfg.lint.trailing_whitespace == true);
     CHECK(cfg.lint.register_naming == true);
 
     CHECK(cfg.autoinst.align_ports == true);

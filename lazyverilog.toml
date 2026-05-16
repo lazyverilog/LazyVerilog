@@ -38,7 +38,7 @@ stale_autoinst_diagnostic = true
 enable = true
 severity = "warning"          # "warning" | "error" | "hint"
 no_raw_always = false         # check that there are no occurrences of raw always
-blocking_nonblocking_assignments = false  # check blocking vs non-blocking assignments
+blocking_nonblocking_assignments = true  # check blocking vs non-blocking assignments
 latch_inference_detection = false         # check for latch inference
 case_missing_default = false              # check that default case-item is always defined
 explicit_begin = false              # check that Verilog begin directive follows all applicable statements
@@ -55,6 +55,9 @@ explicit_task_lifetime = true    # check that tasks have explicit lifetime (stat
 enable = true
 severity = "warning"          # "warning" | "error" | "hint"
 max_file_size = 0             # file size limit in bytes (0 = no limit)
+
+[lint.style]
+trailing_whitespace = true
 
 [rtltree]
 show_instance_name = true   # show "cpu (u_cpu)" instead of just "cpu"

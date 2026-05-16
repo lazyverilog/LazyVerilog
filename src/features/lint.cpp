@@ -25,6 +25,45 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
     return d;
 }
 
+static std::vector<ParseDiagInfo> lint_trailing_whitespace(const std::string& text) {
+    std::vector<ParseDiagInfo> diags;
+    size_t line_start = 0;
+    int line = 0;
+
+    while (line_start < text.size()) {
+        size_t line_end = text.find('\n', line_start);
+        bool has_newline = line_end != std::string::npos;
+        if (!has_newline)
+            line_end = text.size();
+
+        size_t content_end = line_end;
+        if (content_end > line_start && text[content_end - 1] == '\r')
+            --content_end;
+
+        size_t trailing_start = content_end;
+        while (trailing_start > line_start &&
+               (text[trailing_start - 1] == ' ' || text[trailing_start - 1] == '\t')) {
+            --trailing_start;
+        }
+
+        if (trailing_start < content_end) {
+            ParseDiagInfo d;
+            d.line = line;
+            d.col = static_cast<int>(trailing_start - line_start);
+            d.severity = 2;
+            d.message = "[style] trailing whitespace";
+            diags.push_back(std::move(d));
+        }
+
+        if (!has_newline)
+            break;
+        line_start = line_end + 1;
+        ++line;
+    }
+
+    return diags;
+}
+
 // ── Naming helpers ────────────────────────────────────────────────────────────
 
 enum class PortDir { None, Input, Output, InOut };
@@ -256,8 +295,12 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 };
 
 std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig& config) {
+    std::vector<ParseDiagInfo> diags;
+    if (config.trailing_whitespace)
+        diags = lint_trailing_whitespace(state.text);
+
     if (!state.tree)
-        return {};
+        return diags;
     // Fast path: skip if no rules are enabled
     bool naming_active = config.naming.enable && (
         !config.naming.module_pattern.empty() ||
@@ -269,10 +312,11 @@ std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig
         !config.explicit_function_lifetime && !config.explicit_task_lifetime &&
         !config.module_instantiation_style && !config.latch_inference_detection &&
         !config.explicit_begin && !config.register_naming && !naming_active)
-        return {};
+        return diags;
 
     auto& sm = state.tree->sourceManager();
     LintVisitor v(config, sm);
     state.tree->root().visit(v);
-    return std::move(v.diags);
+    diags.insert(diags.end(), v.diags.begin(), v.diags.end());
+    return diags;
 }

@@ -116,6 +116,7 @@ struct LintConfig {
     bool module_instantiation_style{false};
     bool latch_inference_detection{false};
     bool explicit_begin{false};
+    bool trailing_whitespace{false};
     bool register_naming{false};  // legacy flat key; also set when naming.register_pattern is non-empty
     NamingConfig naming;
 };

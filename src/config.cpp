@@ -139,6 +139,10 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
                 set_bool(st, "latch_inference_detection", cfg.lint.latch_inference_detection);
                 set_bool(st, "explicit_begin",          cfg.lint.explicit_begin);
             }
+            // Nested subtable: [lint.style]
+            if (auto style = (*lint)["style"].as_table()) {
+                set_bool(style, "trailing_whitespace", cfg.lint.trailing_whitespace);
+            }
             // Nested subtable: [lint.module]
             if (auto mod = (*lint)["module"].as_table()) {
                 // module_instantiation_style can be a string ("", "named", "positional", "both")
