@@ -7,8 +7,8 @@
 
 std::string autowire_apply(
     const DocumentState& state, const SyntaxIndex& syntax_index,
-    const AutowireOptions& options);
+    const AutowireOptions& options, int target_line = -1);
 
 std::vector<std::string> autowire_preview(
     const DocumentState& state, const SyntaxIndex& syntax_index,
-    const AutowireOptions& options);
+    const AutowireOptions& options, int target_line = -1);

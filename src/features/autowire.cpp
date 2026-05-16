@@ -46,6 +46,10 @@ struct LineRange {
     int end{0};
 };
 
+static bool in_range(int line, LineRange range) {
+    return line >= range.start && line <= range.end;
+}
+
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
@@ -53,27 +57,27 @@ static int token_line(const SourceManager& sm, const slang::parsing::Token& tok)
     return line > 0 ? (int)line - 1 : 0;
 }
 
-struct FirstModuleRangeFinder : public SyntaxVisitor<FirstModuleRangeFinder> {
+struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {
     const SourceManager& sm;
+    int target_line;
     std::string name;
     LineRange range;
     bool found{false};
 
-    explicit FirstModuleRangeFinder(const SourceManager& sm) : sm(sm) {}
+    TargetModuleRangeFinder(const SourceManager& sm, int target_line)
+        : sm(sm), target_line(target_line) {}
 
     void handle(const ModuleDeclarationSyntax& node) {
-        if (!found) {
-            name = std::string(node.header->name.valueText());
-            range.start = token_line(sm, node.getFirstToken());
-            range.end = token_line(sm, node.endmodule);
-            found = true;
-        }
+        if (found)
+            return;
+        LineRange candidate{token_line(sm, node.getFirstToken()), token_line(sm, node.endmodule)};
+        if (target_line >= 0 && !in_range(target_line, candidate))
+            return;
+        name = std::string(node.header->name.valueText());
+        range = candidate;
+        found = true;
     }
 };
-
-static bool in_range(int line, LineRange range) {
-    return line >= range.start && line <= range.end;
-}
 
 // ── AST visitor: collect declared signal names ────────────────────────────────
 
@@ -266,6 +270,7 @@ static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_in
 
 struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     const SourceManager& sm;
+    LineRange range;
     int body_start{0};
     int end_module{0};
     int last_decl = -1;
@@ -273,10 +278,13 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     int first_proc = -1;
     bool found_module{false};
 
-    explicit InsertionLineFinder(const SourceManager& sm) : sm(sm) {}
+    InsertionLineFinder(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
 
     void handle(const ModuleDeclarationSyntax& node) {
         if (found_module)
+            return;
+        LineRange candidate{token_line(sm, node.getFirstToken()), token_line(sm, node.endmodule)};
+        if (candidate.start != range.start || candidate.end != range.end)
             return;
         found_module = true;
         if (node.header)
@@ -306,10 +314,10 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     }
 };
 
-static int find_insertion_line(const DocumentState& state) {
+static int find_insertion_line(const DocumentState& state, LineRange range) {
     if (!state.tree)
         return 0;
-    InsertionLineFinder finder(state.tree->sourceManager());
+    InsertionLineFinder finder(state.tree->sourceManager(), range);
     state.tree->root().visit(finder);
     if (finder.last_decl >= 0)
         return finder.last_decl + 1;
@@ -363,11 +371,12 @@ static std::string format_declarations(const std::vector<SignalDecl>& signals) {
 // ── Main entry points ─────────────────────────────────────────────────────────
 
 static std::vector<SignalDecl> compute_new_signals(const DocumentState& state,
-                                                   const SyntaxIndex& syntax_index) {
+                                                   const SyntaxIndex& syntax_index,
+                                                   int target_line) {
     if (!state.tree)
         return {};
 
-    FirstModuleRangeFinder module_finder(state.tree->sourceManager());
+    TargetModuleRangeFinder module_finder(state.tree->sourceManager(), target_line);
     state.tree->root().visit(module_finder);
     if (!module_finder.found)
         return {};
@@ -423,14 +432,16 @@ static std::vector<SignalDecl> compute_new_signals(const DocumentState& state,
 }
 
 std::string autowire_apply(const DocumentState& state, const SyntaxIndex& syntax_index,
-                           const AutowireOptions& /*options*/) {
-    auto new_sigs = compute_new_signals(state, syntax_index);
+                           const AutowireOptions& /*options*/, int target_line) {
+    auto new_sigs = compute_new_signals(state, syntax_index, target_line);
     if (new_sigs.empty())
         return state.text;
 
     auto lines = split_lines(state.text);
     std::string decl_text = format_declarations(new_sigs);
-    int insert_line = find_insertion_line(state);
+    TargetModuleRangeFinder module_finder(state.tree->sourceManager(), target_line);
+    state.tree->root().visit(module_finder);
+    int insert_line = module_finder.found ? find_insertion_line(state, module_finder.range) : 0;
 
     std::vector<std::string> out_lines;
     out_lines.insert(out_lines.end(), lines.begin(), lines.begin() + insert_line);
@@ -450,8 +461,8 @@ std::string autowire_apply(const DocumentState& state, const SyntaxIndex& syntax
 
 std::vector<std::string> autowire_preview(const DocumentState& state,
                                           const SyntaxIndex& syntax_index,
-                                          const AutowireOptions& /*options*/) {
-    auto new_sigs = compute_new_signals(state, syntax_index);
+                                          const AutowireOptions& /*options*/, int target_line) {
+    auto new_sigs = compute_new_signals(state, syntax_index, target_line);
     std::vector<std::string> out;
     if (!new_sigs.empty()) {
         out.push_back("Will add:");

@@ -51,4 +51,7 @@ TEST_CASE("autowire ignores missing signals in later modules", "[autowire]") {
 
     auto updated = autowire_apply(*state, state->index, AutowireOptions{});
     CHECK(updated == state->text);
+
+    updated = autowire_apply(*state, state->index, AutowireOptions{}, 4);
+    CHECK(updated.find("module inv(input logic i_a);\nlogic i_d;\n") != std::string::npos);
 }

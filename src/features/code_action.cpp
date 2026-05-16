@@ -197,9 +197,10 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             lsCommandWithAny cmd;
             cmd.title = "AutoWire: declare missing signals";
             cmd.command = "lazyverilog.autowire";
-            lsp::Any uri_arg;
+            lsp::Any uri_arg, line_arg;
             uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
-            cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
+            line_arg.SetJsonString(std::to_string(line), lsp::Any::kUnKnown);
+            cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg, line_arg});
             action.command = optional<lsCommandWithAny>(cmd);
             actions.push_back(std::move(action));
         }

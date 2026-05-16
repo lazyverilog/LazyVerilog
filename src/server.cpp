@@ -832,12 +832,13 @@ void LazyVerilogServer::register_handlers() {
                 }
             } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);
+                int target_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
                     auto idx = state->index;
                     analyzer_.merge_extra_file_modules(idx);
                     if (cmd == "lazyverilog.autowirepreview") {
-                        auto preview = autowire_preview(*state, idx, config_.autowire);
+                        auto preview = autowire_preview(*state, idx, config_.autowire, target_line);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
                         for (size_t i = 0; i < preview.size(); ++i) {
@@ -859,7 +860,8 @@ void LazyVerilogServer::register_handlers() {
                         json += "]";
                         rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
                     } else {
-                        std::string new_source = autowire_apply(*state, idx, config_.autowire);
+                        std::string new_source = autowire_apply(*state, idx, config_.autowire,
+                                                                target_line);
                         if (new_source != state->text)
                             new_source = format_source(new_source, config_.format);
                         if (new_source != state->text) {

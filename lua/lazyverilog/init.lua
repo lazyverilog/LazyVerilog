@@ -1291,13 +1291,13 @@ end
 -- autowire / autowire_preview
 -- ---------------------------------------------------------------------------
 
-local function _autowire_request(bufnr, command, label, retries, callback)
+local function _autowire_request(bufnr, command, label, retries, line, callback)
 	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
 			if _cfg then lsp.start(_cfg) end
 			vim.defer_fn(function()
-				_autowire_request(bufnr, command, label, retries - 1, callback)
+				_autowire_request(bufnr, command, label, retries - 1, line, callback)
 			end, 500)
 		else
 			vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
@@ -1308,7 +1308,7 @@ local function _autowire_request(bufnr, command, label, retries, callback)
 	local uri = vim.uri_from_bufnr(bufnr)
 	client:request("workspace/executeCommand", {
 		command = command,
-		arguments = { uri },
+		arguments = { uri, line },
 	}, function(err, result)
 		if err then
 			vim.notify("[LazyVerilog] " .. label .. ": " .. tostring(err.message), vim.log.levels.ERROR)
@@ -1321,7 +1321,8 @@ end
 --- AutoWire: show a floating preview window; [y] applies, [n/Esc/q] cancels.
 function M.autowire()
 	local src_bufnr = vim.api.nvim_get_current_buf()
-	_autowire_request(src_bufnr, "lazyverilog.autowirepreview", "AutoWire", 3, function(result, _client)
+	local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1
+	_autowire_request(src_bufnr, "lazyverilog.autowirepreview", "AutoWire", 3, cursor_line, function(result, _client)
 		if not result or #result == 0 then
 			vim.notify("[LazyVerilog] AutoWire: nothing to add or update", vim.log.levels.INFO)
 			return
@@ -1378,7 +1379,7 @@ function M.autowire()
 
 			local function apply()
 				close()
-				_autowire_request(src_bufnr, "lazyverilog.autowire", "AutoWire", 3,
+				_autowire_request(src_bufnr, "lazyverilog.autowire", "AutoWire", 3, cursor_line,
 					function(edit, client)
 						if edit then
 							vim.lsp.util.apply_workspace_edit(edit, client.offset_encoding)
