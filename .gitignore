@@ -2,4 +2,3 @@ build/
 build-*/
 .omc
 __pycache__
-lazyverilog.toml

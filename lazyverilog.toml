@@ -1,0 +1,134 @@
+[design]
+vcode = "demo/vcode.f"
+define = ["RTL_SIM"]   # preprocessor defines passed to pyslang for AST parsing
+
+[perf]
+background_compilation = false  # run full semantic elaboration in background subprocess (slower startup, richer diagnostics)
+nice_value = 10                 # subprocess CPU priority (0=normal, 19=lowest); only used when background_compilation=true
+log_timing = false              # emit [perf] timing lines to the LSP log for profiling
+
+[lint]
+enable = true   # global kill-switch; false disables all lint rules
+
+[lint.naming]
+enable = true
+severity = "hint"          # "warning" | "error" | "hint"
+module_pattern = "^m_.*$" # regex; empty = skip
+input_port_pattern = "^i_.*$"  # regex; empty = skip
+output_port_pattern = "^o_.*$" # regex; empty = skip
+signal_pattern = "^(?!q_).*"           # regex for internal logic/wire/var; empty = skip
+interface_pattern = ".*_intf$"        # regex for interface names; empty = skip
+struct_pattern = ".*_t$"           # regex for struct names; empty = skip
+union_pattern = ".*_u$"            # regex for union names; empty = skip
+enum_pattern = ""             # regex for enum names; empty = skip
+parameter_pattern = "^W_.*$"        # regex for parameter names; empty = skip
+localparam_pattern = "^LP_.*$"       # regex for localparam names; empty = skip
+register_pattern = "^r_.*$"
+check_module_filename = false # check that module name matches filename
+check_package_filename = false # check that package name matches filename
+
+[lint.module]
+enable = true
+severity = "warning"          # "warning" | "error" | "hint"
+one_module_per_file = false   # check that at most one module is declared per file
+module_instantiation_style = ""  # "positional", "named", or "both"
+stale_autoinst_diagnostic = true
+
+[lint.statement]
+enable = true
+severity = "warning"          # "warning" | "error" | "hint"
+no_raw_always = false         # check that there are no occurrences of raw always
+blocking_nonblocking_assignments = false  # check blocking vs non-blocking assignments
+latch_inference_detection = false         # check for latch inference
+case_missing_default = false              # check that default case-item is always defined
+explicit_begin = false              # check that Verilog begin directive follows all applicable statements
+
+[lint.function]
+enable = true
+severity = "warning"          # "warning" | "error" | "hint"
+functions_automatic = false   # functions should be automatic type
+function_call_style = "positional"      # "positional", "named", or "both"
+explicit_function_lifetime = true  # check that functions have explicit lifetime (static/automatic)
+explicit_task_lifetime = true    # check that tasks have explicit lifetime (static/automatic)
+
+[lint.design]
+enable = true
+severity = "warning"          # "warning" | "error" | "hint"
+max_file_size = 0             # file size limit in bytes (0 = no limit)
+
+[rtltree]
+show_instance_name = true   # show "cpu (u_cpu)" instead of just "cpu"
+show_file = true             # show "[rtl/cpu.sv]" after module name
+
+[format]
+safe_mode = true # verify no non-whitespace content changed after format
+indent_size = 4
+keyword_case = "lower"          # "lower" | "upper" | "preserve"
+compact_indexing_and_selections = true
+blank_lines_between_items = 1
+default_indent_level_inside_module_block = 0
+tab_align = false
+align_punctuation = true
+enable_format_on_save = true
+
+[format.statement]
+align = true              # align = and <= operators in consecutive assignments
+align_adaptive = false
+lhs_min_width = 6           # minimum width of the LHS column before the operator
+wrap_end_else_clauses = true
+
+[format.port_declaration]
+align = true
+align_adaptive = false
+section1_min_width = 6
+section2_min_width = 20
+section3_min_width = 20
+section4_min_width = 20
+section5_min_width = 20
+
+[format.var_declaration]
+align = true
+align_adaptive = false
+section1_min_width = 20
+section2_min_width = 20
+section3_min_width = 20
+section4_min_width = 16
+
+[format.function_call]
+break_policy = "auto"      # never | always | auto
+line_length = 100
+arg_count = 3 # when auto: break if arg count >= this value; -1 disables arg-count breaking
+layout = "hanging"           # hanging | block
+trailing_comma = true
+space_before_paren = false
+space_inside_paren = false
+
+[format.port]
+non_ansi_port_per_line_enabled = true
+non_ansi_port_per_line = 3
+non_ansi_port_max_line_length_enabled = false
+non_ansi_port_max_line_length = 18
+
+[format.instance]
+align = true
+port_indent_level = 1                   # indent levels for port lines relative to instantiation
+instance_port_name_width = 10           # total field width from '.' to '(' (port name + gap)
+instance_port_between_paren_width = 10  # total field width from '(' to ')' (signal + trailing gap)
+align_adaptive = false                  # if true, per-line gap; if false, all ports in instance align to common column
+
+[inlay_hint]
+enable = true   # set false to disable all inlay hints
+
+[autofunc]
+use_named_arguments = true
+
+[autoarg]
+indent_size = 4
+autoarg_on_save = true
+
+[autoinst]
+indent_size = 4
+
+[autowire]
+group_by_instance = false
+sort_by_name = true
