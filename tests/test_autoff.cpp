@@ -34,3 +34,21 @@ TEST_CASE("autowire uses cached extra-file modules", "[autowire]") {
 
     std::filesystem::remove(extra_path);
 }
+
+TEST_CASE("autowire ignores missing signals in later modules", "[autowire]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_autowire_two_modules.sv";
+    analyzer.open(uri, "module top;\n"
+                       "endmodule\n"
+                       "\n"
+                       "module inv(input logic i_a);\n"
+                       "assign i_d = ~i_a;\n"
+                       "endmodule\n");
+
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state);
+    REQUIRE(state->tree);
+
+    auto updated = autowire_apply(*state, state->index, AutowireOptions{});
+    CHECK(updated == state->text);
+}

@@ -41,10 +41,52 @@ static bool is_simple_id(const std::string& s) {
 
 // ── AST visitor: collect declared signal names ────────────────────────────────
 
+struct LineRange {
+    int start{0};
+    int end{0};
+};
+
+static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
+    if (!tok || !tok.location().valid())
+        return 0;
+    auto line = sm.getLineNumber(tok.location());
+    return line > 0 ? (int)line - 1 : 0;
+}
+
+struct FirstModuleRangeFinder : public SyntaxVisitor<FirstModuleRangeFinder> {
+    const SourceManager& sm;
+    std::string name;
+    LineRange range;
+    bool found{false};
+
+    explicit FirstModuleRangeFinder(const SourceManager& sm) : sm(sm) {}
+
+    void handle(const ModuleDeclarationSyntax& node) {
+        if (!found) {
+            name = std::string(node.header->name.valueText());
+            range.start = token_line(sm, node.getFirstToken());
+            range.end = token_line(sm, node.endmodule);
+            found = true;
+        }
+    }
+};
+
+static bool in_range(int line, LineRange range) {
+    return line >= range.start && line <= range.end;
+}
+
+// ── AST visitor: collect declared signal names ────────────────────────────────
+
 struct DeclCollector : public SyntaxVisitor<DeclCollector> {
+    const SourceManager& sm;
+    LineRange range;
     std::set<std::string> declared;
 
+    DeclCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+
     void handle(const DataDeclarationSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
             if (d)
@@ -53,6 +95,8 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const NetDeclarationSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
             if (d)
@@ -61,6 +105,8 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const PortDeclarationSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
             if (d)
@@ -69,6 +115,8 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const ParameterDeclarationSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         for (const auto* declarator : node.declarators) {
             if (declarator)
                 declared.insert(std::string(declarator->name.valueText()));
@@ -76,6 +124,8 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const ImplicitAnsiPortSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         if (node.declarator)
             declared.insert(std::string(node.declarator->name.valueText()));
         visitDefault(node);
@@ -85,9 +135,15 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
 // ── AST visitor: collect assign LHS signals ───────────────────────────────────
 
 struct AssignLhsCollector : public SyntaxVisitor<AssignLhsCollector> {
+    const SourceManager& sm;
+    LineRange range;
     std::vector<std::string> signals;
 
+    AssignLhsCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+
     void handle(const ContinuousAssignSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         for (uint32_t i = 0; i < node.assignments.size(); ++i) {
             const auto* expr = node.assignments[i];
             if (!expr)
@@ -109,10 +165,16 @@ struct AssignLhsCollector : public SyntaxVisitor<AssignLhsCollector> {
 // ── AST visitor: collect always_comb LHS signals ─────────────────────────────
 
 struct CombLhsCollector : public SyntaxVisitor<CombLhsCollector> {
+    const SourceManager& sm;
+    LineRange range;
     std::vector<std::string> signals;
     bool in_comb{false};
 
+    CombLhsCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+
     void handle(const ProceduralBlockSyntax& node) {
+        if (!in_range(token_line(sm, node.getFirstToken()), range))
+            return;
         if (node.kind == SyntaxKind::AlwaysCombBlock) {
             bool was = in_comb;
             in_comb = true;
@@ -145,12 +207,15 @@ struct InstSignal {
     int order;
 };
 
-static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_index) {
+static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_index,
+                                                 const std::string& parent_module) {
     std::vector<InstSignal> results;
     std::set<std::string> seen;
     int order = 0;
 
     for (const auto& inst : syntax_index.instances) {
+        if (inst.parent_module != parent_module)
+            continue;
         // Find module definition for port info
         const ModuleEntry* mod_entry = nullptr;
         auto module_it = syntax_index.module_by_name.find(inst.module_name);
@@ -206,38 +271,35 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     int last_decl = -1;
     int first_inst = -1;
     int first_proc = -1;
+    bool found_module{false};
 
     explicit InsertionLineFinder(const SourceManager& sm) : sm(sm) {}
 
-    int token_line(const slang::parsing::Token& tok) const {
-        if (!tok || !tok.location().valid())
-            return 0;
-        auto line = sm.getLineNumber(tok.location());
-        return line > 0 ? (int)line - 1 : 0;
-    }
-
     void handle(const ModuleDeclarationSyntax& node) {
-        if (body_start == 0 && node.header)
-            body_start = token_line(node.header->semi) + 1;
-        end_module = token_line(node.endmodule);
+        if (found_module)
+            return;
+        found_module = true;
+        if (node.header)
+            body_start = token_line(sm, node.header->semi) + 1;
+        end_module = token_line(sm, node.endmodule);
         visitDefault(node);
     }
     void handle(const DataDeclarationSyntax& node) {
-        last_decl = std::max(last_decl, token_line(node.getFirstToken()));
+        last_decl = std::max(last_decl, token_line(sm, node.getFirstToken()));
         visitDefault(node);
     }
     void handle(const NetDeclarationSyntax& node) {
-        last_decl = std::max(last_decl, token_line(node.getFirstToken()));
+        last_decl = std::max(last_decl, token_line(sm, node.getFirstToken()));
         visitDefault(node);
     }
     void handle(const HierarchyInstantiationSyntax& node) {
-        int line = token_line(node.getFirstToken());
+        int line = token_line(sm, node.getFirstToken());
         if (first_inst < 0 || line < first_inst)
             first_inst = line;
         visitDefault(node);
     }
     void handle(const ProceduralBlockSyntax& node) {
-        int line = token_line(node.keyword);
+        int line = token_line(sm, node.keyword);
         if (first_proc < 0 || line < first_proc)
             first_proc = line;
         visitDefault(node);
@@ -305,19 +367,24 @@ static std::vector<SignalDecl> compute_new_signals(const DocumentState& state,
     if (!state.tree)
         return {};
 
-    // Collect declared signals
-    DeclCollector decl_coll;
+    FirstModuleRangeFinder module_finder(state.tree->sourceManager());
+    state.tree->root().visit(module_finder);
+    if (!module_finder.found)
+        return {};
+
+    // Collect declared signals in the module where AutoWire inserts declarations.
+    DeclCollector decl_coll(state.tree->sourceManager(), module_finder.range);
     state.tree->root().visit(decl_coll);
-    // Collect assign LHS
-    AssignLhsCollector assign_coll;
+    // Collect assign LHS in the same module.
+    AssignLhsCollector assign_coll(state.tree->sourceManager(), module_finder.range);
     state.tree->root().visit(assign_coll);
 
-    // Collect always_comb LHS
-    CombLhsCollector comb_coll;
+    // Collect always_comb LHS in the same module.
+    CombLhsCollector comb_coll(state.tree->sourceManager(), module_finder.range);
     state.tree->root().visit(comb_coll);
 
-    // Collect instantiation signals
-    auto inst_sigs = collect_inst_signals(syntax_index);
+    // Collect instantiation signals in the same parent module.
+    auto inst_sigs = collect_inst_signals(syntax_index, module_finder.name);
 
     // Build result: filter out already declared
     std::set<std::string> seen;
