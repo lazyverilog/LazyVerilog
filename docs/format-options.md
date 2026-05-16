@@ -258,7 +258,6 @@ line_length = 100
 arg_count = null
 layout = "block"           # hanging | block
 indent_width = 4
-trailing_comma = false
 space_before_paren = false
 space_inside_paren = false
 ```
@@ -325,14 +324,6 @@ result = my_func(arg1,
 
 Used only by `layout = "block"`. Controls indentation for broken argument
 lines.
-
-### `trailing_comma`
-
-| type | default |
-|------|---------|
-| bool | `false` |
-
-Used only by `layout = "block"`. Adds a trailing comma after the last argument.
 
 ### `space_before_paren`
 

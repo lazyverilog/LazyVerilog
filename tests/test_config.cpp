@@ -99,7 +99,6 @@ break_policy = "always"
 line_length = 80
 arg_count = 3
 layout = "hanging"
-trailing_comma = true
 space_before_paren = true
 space_inside_paren = true
 
@@ -168,7 +167,6 @@ autoarg_on_save = true
     CHECK(cfg.format.function.line_length == 80);
     CHECK(cfg.format.function.arg_count == 3);
     CHECK(cfg.format.function.layout == "hanging");
-    CHECK(cfg.format.function.trailing_comma == true);
     CHECK(cfg.format.function.space_before_paren == true);
     CHECK(cfg.format.function.space_inside_paren == true);
 

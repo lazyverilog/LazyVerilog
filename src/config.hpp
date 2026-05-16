@@ -57,7 +57,6 @@ struct FunctionOptions {
     int         line_length{100};
     int         arg_count{-1};
     std::string layout{"block"};
-    bool        trailing_comma{false};
     bool        space_before_paren{false};
     bool        space_inside_paren{false};
 };
