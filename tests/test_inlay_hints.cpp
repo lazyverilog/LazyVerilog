@@ -142,3 +142,40 @@ endmodule
 
     std::filesystem::remove(extra_path);
 }
+
+TEST_CASE("inlay hints: each label is placed at its own connection expression", "[inlay]") {
+    const auto extra_path = std::filesystem::temp_directory_path() / "lazyverilog_inlay_wide.sv";
+    {
+        std::ofstream out(extra_path);
+        out << R"(module memory(address, read_write);
+input wire [5:0] address;
+input read_write;
+endmodule
+)";
+    }
+
+    const std::string top = R"(module memory_top;
+memory u_memory (
+    .address(addr),
+    .read_write(read_wsssrite)
+);
+endmodule
+)";
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({extra_path.string()});
+    const std::string uri = "file:///tmp/inlay_wide_top.sv";
+    analyzer.open(uri, top);
+
+    auto hints = provide_inlay_hints(analyzer, uri, 0, 10);
+
+    REQUIRE(hints.size() == 3);
+    CHECK(hints[1].position.line == 2);
+    CHECK(hints[1].position.character == 13);
+    CHECK(hints[1].label == "input [5:0]");
+    CHECK(hints[2].position.line == 3);
+    CHECK(hints[2].position.character == 16);
+    CHECK(hints[2].label == "input      ");
+
+    std::filesystem::remove(extra_path);
+}

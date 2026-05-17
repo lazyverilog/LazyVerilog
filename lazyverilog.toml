@@ -39,7 +39,7 @@ enable = true
 severity = "warning"          # "warning" | "error" | "hint"
 no_raw_always = true         # check that there are no occurrences of raw always
 blocking_nonblocking_assignments = true  # check blocking vs non-blocking assignments
-latch_inference_detection = true# check for latch inference
+latch_inference_detection = true # check for latch inference
 case_missing_default = true              # check that default case-item is always defined
 explicit_begin = true # check that Verilog begin directive follows all applicable statements
 
@@ -64,7 +64,7 @@ indent_size = 4
 keyword_case = "lower"          # "lower" | "upper" | "preserve"
 compact_indexing_and_selections = true
 blank_lines_between_items = 1
-default_indent_level_inside_module_block = 0
+default_indent_level_inside_outmost_block = 0
 tab_align = false
 align_punctuation = true
 enable_format_on_save = true
@@ -77,7 +77,7 @@ wrap_end_else_clauses = true
 
 [format.port_declaration]
 align = true
-align_adaptive = true
+align_adaptive = false
 section1_min_width = 6
 section2_min_width = 20
 section3_min_width = 20
