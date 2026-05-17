@@ -1,5 +1,5 @@
-#include <catch2/catch_test_macros.hpp>
 #include "config.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
 
@@ -20,9 +20,11 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     Config cfg = load_config(dir);
     CHECK(cfg.design.vcode.empty());
     CHECK(cfg.design.define.empty());
-    CHECK(cfg.perf.background_compilation == false);
-    CHECK(cfg.perf.nice_value == 10);
-    CHECK(cfg.perf.log_timing == false);
+    CHECK(cfg.compilation.background_compilation == false);
+    CHECK(cfg.compilation.background_compilation_threads == 1);
+    CHECK(cfg.compilation.background_compilation_debounce_ms == 1500);
+    CHECK(cfg.compilation.nice_value == 10);
+    CHECK(cfg.compilation.log_timing == false);
     CHECK(cfg.inlay_hint.enable == true);
     CHECK(cfg.format.indent_size == 2);
     CHECK(cfg.lint.statement.case_missing_default == false);
@@ -61,8 +63,10 @@ TEST_CASE("config: parse all sections correctly", "[config]") {
 vcode = "my.f"
 define = ["RTL_SIM", "FAST_MODEL"]
 
-[perf]
+[compilation]
 background_compilation = true
+background_compilation_threads = 2
+background_compilation_debounce_ms = 750
 nice_value = 15
 log_timing = true
 
@@ -175,9 +179,11 @@ autoarg_on_save = true
     CHECK(cfg.design.define[0] == "RTL_SIM");
     CHECK(cfg.design.define[1] == "FAST_MODEL");
 
-    CHECK(cfg.perf.background_compilation == true);
-    CHECK(cfg.perf.nice_value == 15);
-    CHECK(cfg.perf.log_timing == true);
+    CHECK(cfg.compilation.background_compilation == true);
+    CHECK(cfg.compilation.background_compilation_threads == 2);
+    CHECK(cfg.compilation.background_compilation_debounce_ms == 750);
+    CHECK(cfg.compilation.nice_value == 15);
+    CHECK(cfg.compilation.log_timing == true);
 
     CHECK(cfg.inlay_hint.enable == false);
 
@@ -255,6 +261,6 @@ TEST_CASE("config: malformed TOML returns defaults", "[config]") {
     auto dir = make_temp_toml("this is not valid toml @@@ !!!");
     Config cfg;
     REQUIRE_NOTHROW(cfg = load_config(dir));
-    CHECK(cfg.perf.background_compilation == false);
+    CHECK(cfg.compilation.background_compilation == false);
     CHECK(cfg.format.indent_size == 2);
 }

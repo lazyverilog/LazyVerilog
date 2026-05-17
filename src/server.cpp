@@ -1,5 +1,6 @@
 #include "server.hpp"
 #include "analyzer.hpp"
+#include "background_compiler.hpp"
 #include "config.hpp"
 
 // LspCpp headers
@@ -151,8 +152,7 @@ static std::string slice_lsp_range(const std::string& text, const lsRange& range
     return text.substr(start, end - start);
 }
 
-static lsTextEdit range_format_edit(const std::string& old_text,
-                                    const std::string& formatted_text,
+static lsTextEdit range_format_edit(const std::string& old_text, const std::string& formatted_text,
                                     lsRange range) {
     if (range.end < range.start)
         std::swap(range.start, range.end);
@@ -277,13 +277,85 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     config_ = load_config(root_);
     analyzer_.set_defines(config_.design.define);
     analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
+    background_compiler_ =
+        std::make_unique<BackgroundCompiler>([this](BackgroundCompileResult result) {
+            analyzer_.set_semantic_diagnostics(std::move(result.diagnostics_by_uri));
+            for (const auto& uri : result.open_uris)
+                publish_diagnostics(uri);
+        });
+    configure_background_compiler();
+    schedule_background_compilation();
     register_handlers();
     impl_->remote_endpoint.startProcessingMessages(impl_->input, impl_->output);
 }
 
-LazyVerilogServer::~LazyVerilogServer() = default;
+LazyVerilogServer::~LazyVerilogServer() {
+    if (background_compiler_)
+        background_compiler_->stop();
+}
 
 void LazyVerilogServer::run() { impl_->exit_event.wait(); }
+
+void LazyVerilogServer::configure_background_compiler() {
+    if (!background_compiler_)
+        return;
+
+    background_compiler_->configure(config_.compilation.background_compilation,
+                                    config_.compilation.background_compilation_threads,
+                                    config_.compilation.background_compilation_debounce_ms,
+                                    config_.compilation.log_timing);
+
+    if (!config_.compilation.background_compilation)
+        analyzer_.clear_all_semantic_diagnostics();
+}
+
+void LazyVerilogServer::schedule_background_compilation() {
+    if (!background_compiler_ || !config_.compilation.background_compilation)
+        return;
+    background_compiler_->schedule(analyzer_.compilation_snapshot());
+}
+
+void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
+    try {
+        auto state = analyzer_.get_state(uri);
+        Notify_TextDocumentPublishDiagnostics::notify notif;
+        notif.params.uri.raw_uri_ = uri;
+        if (state) {
+            // Merge parse diagnostics + lint diagnostics + cached semantic diagnostics.
+            auto all_diags = state->parse_diagnostics;
+            SyntaxIndex lint_index = state->index;
+            analyzer_.merge_extra_file_modules(lint_index);
+            auto lint_diags = run_lint(*state, config_.lint, &lint_index);
+            all_diags.insert(all_diags.end(), lint_diags.begin(), lint_diags.end());
+            if (config_.compilation.background_compilation) {
+                auto semantic_diags = analyzer_.semantic_diagnostics(uri);
+                all_diags.insert(all_diags.end(), semantic_diags.begin(), semantic_diags.end());
+            }
+            for (const auto& d : all_diags) {
+                lsDiagnostic ld;
+                ld.range.start = lsPosition(d.line, d.col);
+                ld.range.end = ld.range.start;
+                switch (d.severity) {
+                case 1:
+                    ld.severity = lsDiagnosticSeverity::Error;
+                    break;
+                case 2:
+                    ld.severity = lsDiagnosticSeverity::Warning;
+                    break;
+                default:
+                    ld.severity = lsDiagnosticSeverity::Information;
+                    break;
+                }
+                ld.source = std::string("lazyverilog");
+                ld.message = d.message;
+                notif.params.diagnostics.push_back(std::move(ld));
+            }
+        }
+        impl_->remote_endpoint.sendNotification(notif);
+    } catch (const std::exception& e) {
+        std::cerr << "[lazyverilog] publishDiagnostics error: " << e.what() << "\n";
+    }
+}
 
 void LazyVerilogServer::register_handlers() {
     auto* remote = &impl_->remote_endpoint;
@@ -355,10 +427,13 @@ void LazyVerilogServer::register_handlers() {
                     root_ = p;
                     std::string warn;
                     config_ = load_config(root_, &warn);
-                    if (!warn.empty()) show_warning(warn);
+                    if (!warn.empty())
+                        show_warning(warn);
                     analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
+                    configure_background_compiler();
+                    schedule_background_compilation();
                 }
             } else if (req.params.rootPath && !req.params.rootPath->empty()) {
                 std::filesystem::path p(*req.params.rootPath);
@@ -366,10 +441,13 @@ void LazyVerilogServer::register_handlers() {
                     root_ = p;
                     std::string warn;
                     config_ = load_config(root_, &warn);
-                    if (!warn.empty()) show_warning(warn);
+                    if (!warn.empty())
+                        show_warning(warn);
                     analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
+                    configure_background_compiler();
+                    schedule_background_compilation();
                 }
             }
 
@@ -431,62 +509,27 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── workspace/didChangeConfiguration ─────────────────────────────────────
-    ep.registerHandler([&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
-        try {
-            // Re-read config from disk on every configuration change
-            std::string warn;
-            config_ = load_config(root_, &warn);
-            if (!warn.empty()) show_warning(warn);
-            analyzer_.set_defines(config_.design.define);
-            analyzer_.set_extra_files(load_vcode_files(root_, config_),
-                                      resolve_vcode_path(root_, config_));
-            (void)note; // settings in note.params.settings parsed lazily
-        } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
-        }
-    });
-
-    // Helper: convert pre-formatted ParseDiagInfo → LSP publishDiagnostics notification
-    auto publish_diags = [&, remote](const std::string& uri) {
-        try {
-            auto state = analyzer_.get_state(uri);
-            Notify_TextDocumentPublishDiagnostics::notify notif;
-            notif.params.uri.raw_uri_ = uri;
-            if (state) {
-                // Merge parse diagnostics + lint diagnostics
-                auto all_diags = state->parse_diagnostics;
-                SyntaxIndex lint_index = state->index;
-                analyzer_.merge_extra_file_modules(lint_index);
-                auto lint_diags = run_lint(*state, config_.lint, &lint_index);
-                all_diags.insert(all_diags.end(), lint_diags.begin(), lint_diags.end());
-                for (const auto& d : all_diags) {
-                    lsDiagnostic ld;
-                    ld.range.start = lsPosition(d.line, d.col);
-                    ld.range.end = ld.range.start;
-                    switch (d.severity) {
-                    case 1:
-                        ld.severity = lsDiagnosticSeverity::Error;
-                        break;
-                    case 2:
-                        ld.severity = lsDiagnosticSeverity::Warning;
-                        break;
-                    default:
-                        ld.severity = lsDiagnosticSeverity::Information;
-                        break;
-                    }
-                    ld.source = std::string("lazyverilog");
-                    ld.message = d.message;
-                    notif.params.diagnostics.push_back(std::move(ld));
-                }
+    ep.registerHandler(
+        [&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
+            try {
+                // Re-read config from disk on every configuration change
+                std::string warn;
+                config_ = load_config(root_, &warn);
+                if (!warn.empty())
+                    show_warning(warn);
+                analyzer_.set_defines(config_.design.define);
+                analyzer_.set_extra_files(load_vcode_files(root_, config_),
+                                          resolve_vcode_path(root_, config_));
+                configure_background_compiler();
+                schedule_background_compilation();
+                (void)note; // settings in note.params.settings parsed lazily
+            } catch (const std::exception& e) {
+                std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }
-            remote->sendNotification(notif);
-        } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] publishDiagnostics error: " << e.what() << "\n";
-        }
-    };
+        });
 
     // ── textDocument/didOpen ──────────────────────────────────────────────────
-    ep.registerHandler([&, publish_diags, show_warning](const Notify_TextDocumentDidOpen::notify& note) {
+    ep.registerHandler([&, show_warning](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
             // Walk up from file to find lazyverilog.toml if not already found
@@ -499,21 +542,25 @@ void LazyVerilogServer::register_handlers() {
                     root_ = found;
                     std::string warn;
                     config_ = load_config(root_, &warn);
-                    if (!warn.empty()) show_warning(warn);
+                    if (!warn.empty())
+                        show_warning(warn);
                     analyzer_.set_defines(config_.design.define);
                     analyzer_.set_extra_files(load_vcode_files(root_, config_),
                                               resolve_vcode_path(root_, config_));
+                    configure_background_compiler();
                 }
             }
             analyzer_.open(td.uri.raw_uri_, td.text);
-            publish_diags(td.uri.raw_uri_);
+            analyzer_.clear_semantic_diagnostics(td.uri.raw_uri_);
+            publish_diagnostics(td.uri.raw_uri_);
+            schedule_background_compilation();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didOpen error: " << e.what() << "\n";
         }
     });
 
     // ── textDocument/didChange ────────────────────────────────────────────────
-    ep.registerHandler([&, publish_diags](const Notify_TextDocumentDidChange::notify& note) {
+    ep.registerHandler([&](const Notify_TextDocumentDidChange::notify& note) {
         try {
             const auto& uri = note.params.textDocument.uri.raw_uri_;
             if (!note.params.contentChanges.empty()) {
@@ -522,8 +569,10 @@ void LazyVerilogServer::register_handlers() {
                 for (const auto& chg : note.params.contentChanges)
                     text = apply_incremental_change(std::move(text), chg);
                 analyzer_.change(uri, text);
+                analyzer_.clear_semantic_diagnostics(uri);
             }
-            publish_diags(uri);
+            publish_diagnostics(uri);
+            schedule_background_compilation();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChange error: " << e.what() << "\n";
         }
@@ -886,7 +935,8 @@ void LazyVerilogServer::register_handlers() {
                         edit = whole_document_edit(state->text, formatted);
                     }
                     if (edit)
-                        rsp.result.SetJsonString(workspace_edit_json(uri, *edit), lsp::Any::kObjectType);
+                        rsp.result.SetJsonString(workspace_edit_json(uri, *edit),
+                                                 lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.autoffPreview" || cmd == "lazyverilog.autoffApply") {
                 std::string uri = get_string(0);
@@ -944,8 +994,8 @@ void LazyVerilogServer::register_handlers() {
                         json += "]";
                         rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
                     } else {
-                        std::string new_source = autowire_apply(*state, idx, config_.autowire,
-                                                                target_line);
+                        std::string new_source =
+                            autowire_apply(*state, idx, config_.autowire, target_line);
                         if (new_source != state->text)
                             new_source = format_source(new_source, config_.format);
                         if (new_source != state->text) {

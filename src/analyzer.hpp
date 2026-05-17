@@ -40,6 +40,18 @@ struct ExtraFileInfo {
     SyntaxIndex index;
 };
 
+struct CompilationSourceFile {
+    std::string uri;
+    std::string path;
+    std::optional<std::string> text;
+};
+
+struct CompilationSnapshot {
+    std::vector<CompilationSourceFile> files;
+    std::vector<std::string> defines;
+    std::vector<std::string> open_uris;
+};
+
 struct RtlTreeNode {
     std::string name;
     std::string inst;
@@ -111,6 +123,24 @@ class Analyzer {
     /// Append cached extra-file modules to an existing SyntaxIndex.
     void merge_extra_file_modules(SyntaxIndex& index) const;
 
+    /// Return an immutable snapshot for background semantic compilation.
+    /// Open documents include their in-memory text; filelist-only documents
+    /// include only paths and are read by the background worker.
+    CompilationSnapshot compilation_snapshot() const;
+
+    /// Replace cached semantic diagnostics from the background compiler.
+    void set_semantic_diagnostics(
+        std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics);
+
+    /// Drop cached semantic diagnostics for one URI because its text changed.
+    void clear_semantic_diagnostics(const std::string& uri);
+
+    /// Drop all cached semantic diagnostics, e.g. when background compilation is disabled.
+    void clear_all_semantic_diagnostics();
+
+    /// Return cached semantic diagnostics for one URI.
+    std::vector<ParseDiagInfo> semantic_diagnostics(const std::string& uri) const;
+
     /// Build a forward RTL instantiation tree rooted at the first module in uri.
     std::optional<RtlTreeNode> rtl_tree(const std::string& uri) const;
 
@@ -147,4 +177,5 @@ class Analyzer {
     std::vector<std::string> defines_;
     mutable std::vector<std::string> extra_files_;
     mutable std::vector<ExtraFileCacheEntry> extra_cache_;
+    std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
 };

@@ -4,13 +4,15 @@
 #include <vector>
 
 struct DesignConfig {
-    std::string vcode;                // .f filelist path
-    std::vector<std::string> define;  // preprocessor defines
+    std::string vcode;               // .f filelist path
+    std::vector<std::string> define; // preprocessor defines
 };
 
-struct PerfConfig {
+struct CompilationConfig {
     bool background_compilation{false};
-    int  nice_value{10};
+    int background_compilation_threads{1};
+    int background_compilation_debounce_ms{1500};
+    int nice_value{10};
     bool log_timing{false};
 };
 
@@ -21,73 +23,73 @@ struct InlayHintConfig {
 struct StatementOptions {
     bool align{false};
     bool align_adaptive{false};
-    int  lhs_min_width{1};
+    int lhs_min_width{1};
     bool wrap_end_else_clauses{false};
 };
 
 struct PortDeclarationOptions {
     bool align{true};
     bool align_adaptive{false};
-    int  section1_min_width{10};
-    int  section2_min_width{20};
-    int  section3_min_width{20};
-    int  section4_min_width{30};
-    int  section5_min_width{30};
+    int section1_min_width{10};
+    int section2_min_width{20};
+    int section3_min_width{20};
+    int section4_min_width{30};
+    int section5_min_width{30};
 };
 
 struct VarDeclarationOptions {
     bool align{false};
     bool align_adaptive{false};
-    int  section1_min_width{0};
-    int  section2_min_width{30};
-    int  section3_min_width{30};
-    int  section4_min_width{0};
+    int section1_min_width{0};
+    int section2_min_width{30};
+    int section3_min_width{30};
+    int section4_min_width{0};
 };
 
 struct InstanceOptions {
     bool align{false};
-    int  port_indent_level{1};
-    int  instance_port_name_width{1};
-    int  instance_port_between_paren_width{0};
+    int port_indent_level{1};
+    int instance_port_name_width{1};
+    int instance_port_between_paren_width{0};
     bool align_adaptive{false};
 };
 
 struct FunctionOptions {
     std::string break_policy{"auto"};
-    int         line_length{100};
-    int         arg_count{-1};
+    int line_length{100};
+    int arg_count{-1};
     std::string layout{"block"};
-    bool        space_before_paren{false};
-    bool        space_inside_paren{false};
+    bool space_before_paren{false};
+    bool space_inside_paren{false};
 };
 
 struct PortOptions {
     bool non_ansi_port_per_line_enabled{false};
-    int  non_ansi_port_per_line{1};
+    int non_ansi_port_per_line{1};
     bool non_ansi_port_max_line_length_enabled{false};
-    int  non_ansi_port_max_line_length{80};
+    int non_ansi_port_max_line_length{80};
 };
 
 struct FormatOptions {
-    int  indent_size{2};
+    int indent_size{2};
     bool compact_indexing_and_selections{true};
     std::string keyword_case{"preserve"};
-    int  blank_lines_between_items{1};
-    int  default_indent_level_inside_outmost_block{1};
+    int blank_lines_between_items{1};
+    int default_indent_level_inside_outmost_block{1};
     bool tab_align{false};
     bool align_punctuation{false};
     bool enable_format_on_save{false};
     bool safe_mode{false};
-    StatementOptions       statement;
+    StatementOptions statement;
     PortDeclarationOptions port_declaration;
-    VarDeclarationOptions  var_declaration;
-    InstanceOptions        instance;
-    FunctionOptions        function;
-    PortOptions            port;
+    VarDeclarationOptions var_declaration;
+    InstanceOptions instance;
+    FunctionOptions function;
+    PortOptions port;
 };
 
 struct LintRuleConfig {
-    bool        enable{false};
+    bool enable{false};
     std::string severity{"warning"};
 };
 
@@ -103,14 +105,14 @@ struct NamingConfig : LintRuleConfig {
     std::string parameter_pattern;
     std::string localparam_pattern;
     std::string register_pattern;
-    bool        check_module_filename{false};
-    bool        check_package_filename{false};
+    bool check_module_filename{false};
+    bool check_package_filename{false};
 };
 
 struct ModuleLintConfig : LintRuleConfig {
-    bool        one_module_per_file{false};
-    std::string module_instantiation_style;  // "positional" | "named" | "both" | ""
-    bool        stale_autoinst_diagnostic{false};
+    bool one_module_per_file{false};
+    std::string module_instantiation_style; // "positional" | "named" | "both" | ""
+    bool stale_autoinst_diagnostic{false};
 };
 
 struct StatementLintConfig : LintRuleConfig {
@@ -122,10 +124,10 @@ struct StatementLintConfig : LintRuleConfig {
 };
 
 struct FunctionLintConfig : LintRuleConfig {
-    bool        functions_automatic{false};
-    std::string function_call_style;  // "positional" | "named" | "both" | ""
-    bool        explicit_function_lifetime{false};
-    bool        explicit_task_lifetime{false};
+    bool functions_automatic{false};
+    std::string function_call_style; // "positional" | "named" | "both" | ""
+    bool explicit_function_lifetime{false};
+    bool explicit_task_lifetime{false};
 };
 
 struct StyleLintConfig {
@@ -134,11 +136,11 @@ struct StyleLintConfig {
 
 struct LintConfig {
     bool enable{true};
-    NamingConfig        naming;
-    ModuleLintConfig    module;
+    NamingConfig naming;
+    ModuleLintConfig module;
     StatementLintConfig statement;
-    FunctionLintConfig  function;
-    StyleLintConfig     style;
+    FunctionLintConfig function;
+    StyleLintConfig style;
 };
 
 struct RtltreeOptions {
@@ -163,14 +165,14 @@ struct AutoFuncOptions {
 };
 
 struct Config {
-    DesignConfig    design;
-    PerfConfig      perf;
+    DesignConfig design;
+    CompilationConfig compilation;
     InlayHintConfig inlay_hint;
-    FormatOptions   format;
-    LintConfig      lint;
-    RtltreeOptions  rtltree;
+    FormatOptions format;
+    LintConfig lint;
+    RtltreeOptions rtltree;
     AutoinstOptions autoinst;
-    AutoargOptions  autoarg;
+    AutoargOptions autoarg;
     AutowireOptions autowire;
     AutoFuncOptions autofunc;
 };

@@ -10,8 +10,8 @@
 #include <memory>
 #include <set>
 #include <slang/diagnostics/DiagnosticEngine.h>
-#include <slang/syntax/AllSyntax.h>
 #include <slang/parsing/Preprocessor.h>
+#include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
@@ -54,9 +54,8 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     ppo.predefines = defines_;
     slang::Bag bag;
     bag.set(ppo);
-    auto tree = slang::syntax::SyntaxTree::fromText(std::string_view(text), *sm,
-                                                    std::string_view(uri), std::string_view(path),
-                                                    bag);
+    auto tree = slang::syntax::SyntaxTree::fromText(
+        std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
@@ -1430,6 +1429,76 @@ void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
         for (size_t i = base; i < index.modules.size(); ++i)
             index.module_by_name.try_emplace(index.modules[i].name, i);
     }
+}
+
+CompilationSnapshot Analyzer::compilation_snapshot() const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+
+    CompilationSnapshot snapshot;
+    snapshot.defines = defines_;
+
+    std::unordered_set<std::string> seen_uris;
+    std::unordered_set<std::string> seen_paths;
+
+    for (const auto& [uri, state] : docs_) {
+        if (!state)
+            continue;
+
+        std::string path = uri;
+        if (path.starts_with("file://"))
+            path = path.substr(7);
+
+        snapshot.files.push_back(CompilationSourceFile{
+            .uri = uri,
+            .path = normalize_path(path).string(),
+            .text = state->text,
+        });
+        snapshot.open_uris.push_back(uri);
+        seen_uris.insert(uri);
+        seen_paths.insert(normalize_path(path).string());
+    }
+
+    for (const auto& configured_path : extra_files_) {
+        const auto path = normalize_path(configured_path);
+        const auto path_string = path.string();
+        const auto uri = path_to_uri(path);
+        if (seen_uris.contains(uri) || seen_paths.contains(path_string))
+            continue;
+
+        snapshot.files.push_back(CompilationSourceFile{
+            .uri = uri,
+            .path = path_string,
+            .text = std::nullopt,
+        });
+        seen_uris.insert(uri);
+        seen_paths.insert(path_string);
+    }
+
+    return snapshot;
+}
+
+void Analyzer::set_semantic_diagnostics(
+    std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    semantic_diagnostics_ = std::move(diagnostics);
+}
+
+void Analyzer::clear_semantic_diagnostics(const std::string& uri) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    semantic_diagnostics_.erase(uri);
+}
+
+void Analyzer::clear_all_semantic_diagnostics() {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    semantic_diagnostics_.clear();
+}
+
+std::vector<ParseDiagInfo> Analyzer::semantic_diagnostics(const std::string& uri) const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    const auto it = semantic_diagnostics_.find(uri);
+    if (it == semantic_diagnostics_.end())
+        return {};
+    return it->second;
 }
 
 namespace {

@@ -38,14 +38,18 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
             }
         }
 
-        // [perf]
-        if (auto p = tbl["perf"].as_table()) {
+        // [compilation]
+        if (auto p = tbl["compilation"].as_table()) {
             if (auto v = (*p)["background_compilation"].value<bool>())
-                cfg.perf.background_compilation = *v;
+                cfg.compilation.background_compilation = *v;
+            if (auto v = (*p)["background_compilation_threads"].value<int64_t>())
+                cfg.compilation.background_compilation_threads = static_cast<int>(*v);
+            if (auto v = (*p)["background_compilation_debounce_ms"].value<int64_t>())
+                cfg.compilation.background_compilation_debounce_ms = static_cast<int>(*v);
             if (auto v = (*p)["nice_value"].value<int64_t>())
-                cfg.perf.nice_value = static_cast<int>(*v);
+                cfg.compilation.nice_value = static_cast<int>(*v);
             if (auto v = (*p)["log_timing"].value<bool>())
-                cfg.perf.log_timing = *v;
+                cfg.compilation.log_timing = *v;
         }
 
         // [inlay_hint]

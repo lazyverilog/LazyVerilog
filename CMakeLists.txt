@@ -97,6 +97,7 @@ set(LAZYVERILOG_SOURCES
     src/server.cpp
     src/config.cpp
     src/analyzer.cpp
+    src/background_compiler.cpp
     src/syntax_index.cpp
     src/features/hover.cpp
     src/features/definition.cpp

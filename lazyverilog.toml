@@ -2,10 +2,11 @@
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]   # preprocessor defines passed to pyslang for AST parsing
 
-[perf]
-background_compilation = true # run full semantic elaboration in background subprocess (slower startup, richer diagnostics)
-nice_value = 10                 # subprocess CPU priority (0=normal, 19=lowest); only used when background_compilation=true
-log_timing = false              # emit [perf] timing lines to the LSP log for profiling
+[compilation]
+background_compilation = true # run semantic compilation in background workers (slower, richer diagnostics)
+background_compilation_threads = 1 # max background semantic compilation workers; keep at 1 on shared/HPC systems
+background_compilation_debounce_ms = 10000 # wait after edits before starting semantic compilation
+log_timing = false              # emit [compilation] timing lines to the LSP log for profiling
 
 [lint]
 enable = true   # global kill-switch; false disables all lint rules
