@@ -25,11 +25,9 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.perf.log_timing == false);
     CHECK(cfg.inlay_hint.enable == true);
     CHECK(cfg.format.indent_size == 2);
-    CHECK(cfg.format.trailing_newline == true);
-    CHECK(cfg.lint.case_missing_default == false);
-    CHECK(cfg.lint.trailing_whitespace == false);
-    CHECK(cfg.lint.register_naming == false);
-    CHECK(cfg.autoinst.align_ports == false);
+    CHECK(cfg.lint.statement.case_missing_default == false);
+    CHECK(cfg.lint.style.trailing_whitespace == false);
+    CHECK(cfg.lint.naming.register_pattern.empty());
     CHECK(cfg.autoarg.autoarg_on_save == false);
 }
 
@@ -64,17 +62,17 @@ enable = false
 
 [format]
 indent_size = 4
-trailing_newline = false
 keyword_case = "lower"
 blank_lines_between_items = 2
 default_indent_level_inside_module_block = 0
 compact_indexing_and_selections = false
 safe_mode = true
-tab_align = false
+tab_align = true
 align_punctuation = true
 
 [format.statement]
 align = true
+align_adaptive = true
 lhs_min_width = 8
 wrap_end_else_clauses = true
 
@@ -108,20 +106,55 @@ non_ansi_port_per_line_enabled = true
 non_ansi_port_per_line = 4
 
 [lint]
+enable = false
+
+[lint.statement]
+enable = true
+severity = "hint"
 case_missing_default = true
-functions_automatic = true
-explicit_function_lifetime = true
-explicit_task_lifetime = true
-module_instantiation_style = true
 latch_inference_detection = true
 explicit_begin = true
-register_naming = true
+no_raw_always = true
+blocking_nonblocking_assignments = true
+
+[lint.function]
+enable = true
+severity = "error"
+functions_automatic = true
+function_call_style = "named"
+explicit_function_lifetime = true
+explicit_task_lifetime = true
+
+[lint.module]
+enable = true
+severity = "warning"
+one_module_per_file = true
+module_instantiation_style = "named"
+stale_autoinst_diagnostic = true
+
+[lint.naming]
+enable = true
+severity = "hint"
+interface_pattern = ".*_intf$"
+struct_pattern = ".*_t$"
+union_pattern = ".*_u$"
+enum_pattern = ".*_e$"
+parameter_pattern = "^P_"
+localparam_pattern = "^LP_"
+check_module_filename = true
+check_package_filename = true
+register_pattern = "^r_"
 
 [lint.style]
 trailing_whitespace = true
 
-[autoinst]
-align_ports = true
+[rtltree]
+show_instance_name = false
+show_file = false
+
+[autowire]
+group_by_instance = true
+sort_by_name = true
 
 [autoarg]
 autoarg_on_save = true
@@ -140,16 +173,16 @@ autoarg_on_save = true
     CHECK(cfg.inlay_hint.enable == false);
 
     CHECK(cfg.format.indent_size == 4);
-    CHECK(cfg.format.trailing_newline == false);
     CHECK(cfg.format.keyword_case == "lower");
     CHECK(cfg.format.blank_lines_between_items == 2);
     CHECK(cfg.format.default_indent_level_inside_module_block == 0);
     CHECK(cfg.format.compact_indexing_and_selections == false);
     CHECK(cfg.format.safe_mode == true);
-    CHECK(cfg.format.tab_align == false);
+    CHECK(cfg.format.tab_align == true);
     CHECK(cfg.format.align_punctuation == true);
 
     CHECK(cfg.format.statement.align == true);
+    CHECK(cfg.format.statement.align_adaptive == true);
     CHECK(cfg.format.statement.lhs_min_width == 8);
     CHECK(cfg.format.statement.wrap_end_else_clauses == true);
 
@@ -177,17 +210,35 @@ autoarg_on_save = true
     CHECK(cfg.format.port.non_ansi_port_per_line_enabled == true);
     CHECK(cfg.format.port.non_ansi_port_per_line == 4);
 
-    CHECK(cfg.lint.case_missing_default == true);
-    CHECK(cfg.lint.functions_automatic == true);
-    CHECK(cfg.lint.explicit_function_lifetime == true);
-    CHECK(cfg.lint.explicit_task_lifetime == true);
-    CHECK(cfg.lint.module_instantiation_style == true);
-    CHECK(cfg.lint.latch_inference_detection == true);
-    CHECK(cfg.lint.explicit_begin == true);
-    CHECK(cfg.lint.trailing_whitespace == true);
-    CHECK(cfg.lint.register_naming == true);
+    CHECK(cfg.lint.enable == false);
+    CHECK(cfg.lint.statement.enable == true);
+    CHECK(cfg.lint.statement.severity == "hint");
+    CHECK(cfg.lint.statement.case_missing_default == true);
+    CHECK(cfg.lint.function.enable == true);
+    CHECK(cfg.lint.function.severity == "error");
+    CHECK(cfg.lint.function.functions_automatic == true);
+    CHECK(cfg.lint.function.explicit_function_lifetime == true);
+    CHECK(cfg.lint.function.explicit_task_lifetime == true);
+    CHECK(cfg.lint.function.function_call_style == "named");
+    CHECK(cfg.lint.module.enable == true);
+    CHECK(cfg.lint.module.one_module_per_file == true);
+    CHECK(cfg.lint.module.module_instantiation_style == "named");
+    CHECK(cfg.lint.module.stale_autoinst_diagnostic == true);
+    CHECK(cfg.lint.statement.latch_inference_detection == true);
+    CHECK(cfg.lint.statement.explicit_begin == true);
+    CHECK(cfg.lint.statement.no_raw_always == true);
+    CHECK(cfg.lint.statement.blocking_nonblocking_assignments == true);
+    CHECK(cfg.lint.style.trailing_whitespace == true);
+    CHECK(cfg.lint.naming.enable == true);
+    CHECK(cfg.lint.naming.interface_pattern == ".*_intf$");
+    CHECK(cfg.lint.naming.check_module_filename == true);
+    CHECK(cfg.lint.naming.check_package_filename == true);
+    CHECK(cfg.lint.naming.register_pattern == "^r_");
 
-    CHECK(cfg.autoinst.align_ports == true);
+    CHECK(cfg.rtltree.show_instance_name == false);
+    CHECK(cfg.rtltree.show_file == false);
+    CHECK(cfg.autowire.group_by_instance == true);
+    CHECK(cfg.autowire.sort_by_name == true);
     CHECK(cfg.autoarg.autoarg_on_save == true);
 }
 

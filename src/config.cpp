@@ -56,7 +56,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
             if (auto v = (*f)["default_indent_level_inside_module_block"].value<int64_t>()) cfg.format.default_indent_level_inside_module_block = static_cast<int>(*v);
             if (auto v = (*f)["enable_format_on_save"].value<bool>()) cfg.format.enable_format_on_save = *v;
             if (auto v = (*f)["safe_mode"].value<bool>())          cfg.format.safe_mode = *v;
-            if (auto v = (*f)["trailing_newline"].value<bool>())   cfg.format.trailing_newline = *v;
             if (auto v = (*f)["tab_align"].value<bool>())          cfg.format.tab_align = *v;
             if (auto v = (*f)["align_punctuation"].value<bool>())  cfg.format.align_punctuation = *v;
             // Nested subtables
@@ -106,58 +105,45 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
             }
         }
 
-        // [lint.*] — flat booleans or nested subtables ([lint.function], etc.)
+        // [lint.*]
         if (auto lint = tbl["lint"].as_table()) {
-            // Helper: apply a bool key from a table to a field
             auto set_bool = [](const toml::table* t, const char* key, bool& field) {
                 if (t) if (auto v = (*t)[key].value<bool>()) field = *v;
             };
-            // Flat keys (legacy / simple schema)
-            lint->for_each([&](const toml::key& k, auto&& val) {
-                if constexpr (toml::is_boolean<std::remove_cvref_t<decltype(val)>>) {
-                    bool enabled = *val;
-                    auto key = std::string(k.str());
-                    if (key == "case_missing_default")        cfg.lint.case_missing_default = enabled;
-                    else if (key == "functions_automatic")    cfg.lint.functions_automatic = enabled;
-                    else if (key == "explicit_function_lifetime") cfg.lint.explicit_function_lifetime = enabled;
-                    else if (key == "explicit_task_lifetime") cfg.lint.explicit_task_lifetime = enabled;
-                    else if (key == "module_instantiation_style") cfg.lint.module_instantiation_style = enabled;
-                    else if (key == "latch_inference_detection") cfg.lint.latch_inference_detection = enabled;
-                    else if (key == "explicit_begin")         cfg.lint.explicit_begin = enabled;
-                    else if (key == "register_naming")        cfg.lint.register_naming = enabled;
-                }
-            });
-            // Nested subtable: [lint.function]
+            auto set_rule = [&](const toml::table* t, LintRuleConfig& rule) {
+                set_bool(t, "enable", rule.enable);
+                if (t) if (auto v = (*t)["severity"].value<std::string>()) rule.severity = *v;
+            };
+
+            set_bool(lint, "enable", cfg.lint.enable);
+
             if (auto fn = (*lint)["function"].as_table()) {
-                set_bool(fn, "functions_automatic",        cfg.lint.functions_automatic);
-                set_bool(fn, "explicit_function_lifetime", cfg.lint.explicit_function_lifetime);
-                set_bool(fn, "explicit_task_lifetime",     cfg.lint.explicit_task_lifetime);
+                set_rule(fn, cfg.lint.function);
+                set_bool(fn, "functions_automatic", cfg.lint.function.functions_automatic);
+                if (auto v = (*fn)["function_call_style"].value<std::string>()) cfg.lint.function.function_call_style = *v;
+                set_bool(fn, "explicit_function_lifetime", cfg.lint.function.explicit_function_lifetime);
+                set_bool(fn, "explicit_task_lifetime", cfg.lint.function.explicit_task_lifetime);
             }
-            // Nested subtable: [lint.statement]
             if (auto st = (*lint)["statement"].as_table()) {
-                set_bool(st, "case_missing_default",    cfg.lint.case_missing_default);
-                set_bool(st, "latch_inference_detection", cfg.lint.latch_inference_detection);
-                set_bool(st, "explicit_begin",          cfg.lint.explicit_begin);
+                set_rule(st, cfg.lint.statement);
+                set_bool(st, "case_missing_default", cfg.lint.statement.case_missing_default);
+                set_bool(st, "latch_inference_detection", cfg.lint.statement.latch_inference_detection);
+                set_bool(st, "explicit_begin", cfg.lint.statement.explicit_begin);
+                set_bool(st, "no_raw_always", cfg.lint.statement.no_raw_always);
+                set_bool(st, "blocking_nonblocking_assignments", cfg.lint.statement.blocking_nonblocking_assignments);
             }
-            // Nested subtable: [lint.style]
             if (auto style = (*lint)["style"].as_table()) {
-                set_bool(style, "trailing_whitespace", cfg.lint.trailing_whitespace);
+                set_bool(style, "trailing_whitespace", cfg.lint.style.trailing_whitespace);
             }
-            // Nested subtable: [lint.module]
             if (auto mod = (*lint)["module"].as_table()) {
-                // module_instantiation_style can be a string ("", "named", "positional", "both")
-                // or a bool. Non-empty non-"positional" string → true.
-                if (auto v = (*mod)["module_instantiation_style"].value<std::string>()) {
-                    cfg.lint.module_instantiation_style =
-                        !v->empty() && *v != "positional";
-                } else {
-                    set_bool(mod, "module_instantiation_style", cfg.lint.module_instantiation_style);
-                }
+                set_rule(mod, cfg.lint.module);
+                set_bool(mod, "one_module_per_file", cfg.lint.module.one_module_per_file);
+                if (auto v = (*mod)["module_instantiation_style"].value<std::string>())
+                    cfg.lint.module.module_instantiation_style = *v;
+                set_bool(mod, "stale_autoinst_diagnostic", cfg.lint.module.stale_autoinst_diagnostic);
             }
-            // Nested subtable: [lint.naming]
             if (auto nm = (*lint)["naming"].as_table()) {
-                set_bool(nm, "enable",                  cfg.lint.naming.enable);
-                if (auto v = (*nm)["severity"].value<std::string>())           cfg.lint.naming.severity = *v;
+                set_rule(nm, cfg.lint.naming);
                 if (auto v = (*nm)["module_pattern"].value<std::string>())     cfg.lint.naming.module_pattern = *v;
                 if (auto v = (*nm)["input_port_pattern"].value<std::string>()) cfg.lint.naming.input_port_pattern = *v;
                 if (auto v = (*nm)["output_port_pattern"].value<std::string>()) cfg.lint.naming.output_port_pattern = *v;
@@ -169,24 +155,26 @@ Config load_config(const std::filesystem::path& root, std::string* warning) {
                 if (auto v = (*nm)["parameter_pattern"].value<std::string>())  cfg.lint.naming.parameter_pattern = *v;
                 if (auto v = (*nm)["localparam_pattern"].value<std::string>()) cfg.lint.naming.localparam_pattern = *v;
                 if (auto v = (*nm)["register_pattern"].value<std::string>())   cfg.lint.naming.register_pattern = *v;
-                set_bool(nm, "check_module_filename",   cfg.lint.naming.check_module_filename);
-                set_bool(nm, "check_package_filename",  cfg.lint.naming.check_package_filename);
-                // Legacy: register_naming bool also set when register_pattern non-empty
-                set_bool(nm, "register_naming", cfg.lint.register_naming);
-                if (!cfg.lint.naming.register_pattern.empty()) cfg.lint.register_naming = true;
+                set_bool(nm, "check_module_filename", cfg.lint.naming.check_module_filename);
+                set_bool(nm, "check_package_filename", cfg.lint.naming.check_package_filename);
             }
         }
 
-        // [autoinst]
-        if (auto ai = tbl["autoinst"].as_table()) {
-            if (auto v = (*ai)["align_ports"].value<bool>()) cfg.autoinst.align_ports = *v;
+        // [rtltree]
+        if (auto rt = tbl["rtltree"].as_table()) {
+            if (auto v = (*rt)["show_instance_name"].value<bool>()) cfg.rtltree.show_instance_name = *v;
+            if (auto v = (*rt)["show_file"].value<bool>()) cfg.rtltree.show_file = *v;
         }
 
         // [autoarg]
         if (auto aa = tbl["autoarg"].as_table()) {
-            if (auto v = (*aa)["indent_size"].value<int64_t>())
-                cfg.autoarg.indent_size = static_cast<int>(*v);
             if (auto v = (*aa)["autoarg_on_save"].value<bool>()) cfg.autoarg.autoarg_on_save = *v;
+        }
+
+        // [autowire]
+        if (auto aw = tbl["autowire"].as_table()) {
+            if (auto v = (*aw)["group_by_instance"].value<bool>()) cfg.autowire.group_by_instance = *v;
+            if (auto v = (*aw)["sort_by_name"].value<bool>()) cfg.autowire.sort_by_name = *v;
         }
 
         // [autofunc]

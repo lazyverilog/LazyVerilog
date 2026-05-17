@@ -4,8 +4,8 @@
 #include <vector>
 
 struct DesignConfig {
-    std::string vcode;           // .f filelist path
-    std::vector<std::string> define; // preprocessor defines
+    std::string vcode;                // .f filelist path
+    std::vector<std::string> define;  // preprocessor defines
 };
 
 struct PerfConfig {
@@ -69,18 +69,15 @@ struct PortOptions {
 };
 
 struct FormatOptions {
-    // Mirrors Python FormatOptions (formatter.py)
-    int  indent_size{2};                  // Python: indent_size (was indent_width)
+    int  indent_size{2};
     bool compact_indexing_and_selections{true};
-    std::string keyword_case{"preserve"}; // "preserve" | "lower" | "upper"
+    std::string keyword_case{"preserve"};
     int  blank_lines_between_items{1};
     int  default_indent_level_inside_module_block{1};
     bool tab_align{false};
     bool align_punctuation{false};
     bool enable_format_on_save{false};
     bool safe_mode{false};
-    bool trailing_newline{true};
-
     StatementOptions       statement;
     PortDeclarationOptions port_declaration;
     VarDeclarationOptions  var_declaration;
@@ -89,9 +86,12 @@ struct FormatOptions {
     PortOptions            port;
 };
 
-struct NamingConfig {
+struct LintRuleConfig {
     bool        enable{false};
-    std::string severity{"warning"};  // "warning" | "error" | "hint"
+    std::string severity{"warning"};
+};
+
+struct NamingConfig : LintRuleConfig {
     std::string module_pattern;
     std::string input_port_pattern;
     std::string output_port_pattern;
@@ -107,30 +107,55 @@ struct NamingConfig {
     bool        check_package_filename{false};
 };
 
-struct LintConfig {
-    // All rules default disabled; activated via [lint.*] in lazyverilog.toml
+struct ModuleLintConfig : LintRuleConfig {
+    bool        one_module_per_file{false};
+    std::string module_instantiation_style;  // "positional" | "named" | "both" | ""
+    bool        stale_autoinst_diagnostic{false};
+};
+
+struct StatementLintConfig : LintRuleConfig {
     bool case_missing_default{false};
-    bool functions_automatic{false};
-    bool explicit_function_lifetime{false};
-    bool explicit_task_lifetime{false};
-    bool module_instantiation_style{false};
     bool latch_inference_detection{false};
     bool explicit_begin{false};
-    bool trailing_whitespace{false};
-    bool register_naming{false};  // legacy flat key; also set when naming.register_pattern is non-empty
-    NamingConfig naming;
+    bool no_raw_always{false};
+    bool blocking_nonblocking_assignments{false};
 };
 
-struct AutoinstOptions {
-    bool align_ports{false};
+struct FunctionLintConfig : LintRuleConfig {
+    bool        functions_automatic{false};
+    std::string function_call_style;  // "positional" | "named" | "both" | ""
+    bool        explicit_function_lifetime{false};
+    bool        explicit_task_lifetime{false};
 };
+
+struct StyleLintConfig {
+    bool trailing_whitespace{false};
+};
+
+struct LintConfig {
+    bool enable{true};
+    NamingConfig        naming;
+    ModuleLintConfig    module;
+    StatementLintConfig statement;
+    FunctionLintConfig  function;
+    StyleLintConfig     style;
+};
+
+struct RtltreeOptions {
+    bool show_instance_name{true};
+    bool show_file{true};
+};
+
+struct AutoinstOptions {};
 
 struct AutoargOptions {
-    int indent_size{2};
     bool autoarg_on_save{false};
 };
 
-struct AutowireOptions {};
+struct AutowireOptions {
+    bool group_by_instance{false};
+    bool sort_by_name{false};
+};
 
 struct AutoFuncOptions {
     int indent_size{4};
@@ -143,6 +168,7 @@ struct Config {
     InlayHintConfig inlay_hint;
     FormatOptions   format;
     LintConfig      lint;
+    RtltreeOptions  rtltree;
     AutoinstOptions autoinst;
     AutoargOptions  autoarg;
     AutowireOptions autowire;

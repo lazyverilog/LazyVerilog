@@ -3,7 +3,7 @@ vcode = "demo/vcode.f"
 define = ["RTL_SIM"]   # preprocessor defines passed to pyslang for AST parsing
 
 [perf]
-background_compilation = false  # run full semantic elaboration in background subprocess (slower startup, richer diagnostics)
+background_compilation = true # run full semantic elaboration in background subprocess (slower startup, richer diagnostics)
 nice_value = 10                 # subprocess CPU priority (0=normal, 19=lowest); only used when background_compilation=true
 log_timing = false              # emit [perf] timing lines to the LSP log for profiling
 
@@ -24,24 +24,24 @@ enum_pattern = ""             # regex for enum names; empty = skip
 parameter_pattern = "^W_.*$"        # regex for parameter names; empty = skip
 localparam_pattern = "^LP_.*$"       # regex for localparam names; empty = skip
 register_pattern = "^r_.*$"
-check_module_filename = false # check that module name matches filename
-check_package_filename = false # check that package name matches filename
+check_module_filename = true # check that module name matches filename
+check_package_filename = true # check that package name matches filename
 
 [lint.module]
 enable = true
 severity = "warning"          # "warning" | "error" | "hint"
-one_module_per_file = false   # check that at most one module is declared per file
-module_instantiation_style = ""  # "positional", "named", or "both"
+one_module_per_file = true   # check that at most one module is declared per file
+module_instantiation_style = "positional"  # "positional", "named", or "both"
 stale_autoinst_diagnostic = true
 
 [lint.statement]
 enable = true
 severity = "warning"          # "warning" | "error" | "hint"
-no_raw_always = false         # check that there are no occurrences of raw always
+no_raw_always = true         # check that there are no occurrences of raw always
 blocking_nonblocking_assignments = true  # check blocking vs non-blocking assignments
-latch_inference_detection = false         # check for latch inference
-case_missing_default = false              # check that default case-item is always defined
-explicit_begin = false              # check that Verilog begin directive follows all applicable statements
+latch_inference_detection = true# check for latch inference
+case_missing_default = true              # check that default case-item is always defined
+explicit_begin = true # check that Verilog begin directive follows all applicable statements
 
 [lint.function]
 enable = true
@@ -50,11 +50,6 @@ functions_automatic = false   # functions should be automatic type
 function_call_style = "positional"      # "positional", "named", or "both"
 explicit_function_lifetime = true  # check that functions have explicit lifetime (static/automatic)
 explicit_task_lifetime = true    # check that tasks have explicit lifetime (static/automatic)
-
-[lint.design]
-enable = true
-severity = "warning"          # "warning" | "error" | "hint"
-max_file_size = 0             # file size limit in bytes (0 = no limit)
 
 [lint.style]
 trailing_whitespace = true
@@ -102,7 +97,6 @@ break_policy = "auto"      # never | always | auto
 line_length = 100
 arg_count = 3 # when auto: break if arg count >= this value; -1 disables arg-count breaking
 layout = "block"           # hanging | block
-trailing_comma = true
 space_before_paren = false
 space_inside_paren = false
 
@@ -126,11 +120,7 @@ enable = true   # set false to disable all inlay hints
 use_named_arguments = true
 
 [autoarg]
-indent_size = 4
 autoarg_on_save = true
-
-[autoinst]
-indent_size = 4
 
 [autowire]
 group_by_instance = false
