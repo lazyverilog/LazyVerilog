@@ -144,14 +144,17 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
 
         size_t max_dir = 0;
         size_t max_type = 0;
-        int max_col = 0;
         for (const auto& candidate : candidates) {
             max_dir = std::max(max_dir, candidate.direction.size());
             max_type = std::max(max_type, candidate.type.size());
-            max_col = std::max(max_col, candidate.col);
         }
 
-        std::vector<std::pair<int, std::string>> labels;
+        struct Label {
+            int line{0};
+            int col{0};
+            std::string text;
+        };
+        std::vector<Label> labels;
         size_t max_label = 0;
         for (const auto& candidate : candidates) {
             std::vector<std::string> parts;
@@ -176,13 +179,17 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
                 continue;
 
             max_label = std::max(max_label, label.size());
-            labels.emplace_back(candidate.line, std::move(label));
+            labels.push_back(Label{
+                .line = candidate.line,
+                .col = candidate.col,
+                .text = std::move(label),
+            });
         }
 
-        for (auto& [line, label] : labels) {
+        for (auto& label : labels) {
             lsInlayHint hint;
-            hint.position = lsPosition(line, max_col);
-            hint.label = padded(std::move(label), max_label);
+            hint.position = lsPosition(label.line, label.col);
+            hint.label = padded(std::move(label.text), max_label);
             hint.kind = optional<lsInlayHintKind>(lsInlayHintKind::Type);
             hint.paddingLeft = optional<bool>(false);
             hint.paddingRight = optional<bool>(true);
