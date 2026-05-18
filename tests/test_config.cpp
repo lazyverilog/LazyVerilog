@@ -118,6 +118,18 @@ space_inside_paren = true
 non_ansi_port_per_line_enabled = true
 non_ansi_port_per_line = 4
 
+[format.enum_declaration]
+align = true
+align_adaptive = true
+enum_name_min_width = 8
+enum_value_min_width = 12
+
+[format.modport]
+align = true
+align_adaptive = true
+direction_min_width = 8
+signal_min_width = 12
+
 [lint]
 enable = false
 
@@ -224,6 +236,14 @@ autoarg_on_save = true
 
     CHECK(cfg.format.port.non_ansi_port_per_line_enabled == true);
     CHECK(cfg.format.port.non_ansi_port_per_line == 4);
+    CHECK(cfg.format.enum_declaration.align == true);
+    CHECK(cfg.format.enum_declaration.align_adaptive == true);
+    CHECK(cfg.format.enum_declaration.enum_name_min_width == 8);
+    CHECK(cfg.format.enum_declaration.enum_value_min_width == 12);
+    CHECK(cfg.format.modport.align == true);
+    CHECK(cfg.format.modport.align_adaptive == true);
+    CHECK(cfg.format.modport.direction_min_width == 8);
+    CHECK(cfg.format.modport.signal_min_width == 12);
 
     CHECK(cfg.lint.enable == false);
     CHECK(cfg.lint.statement.enable == true);

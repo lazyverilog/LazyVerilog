@@ -1844,6 +1844,375 @@ static std::string trim_copy(const std::string& s) {
     return s.substr(a, b - a);
 }
 
+// ---------------------------------------------------------------------------
+// Typedef enum and modport formatting passes
+// ---------------------------------------------------------------------------
+
+static bool is_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; }
+
+static bool starts_with_word_at(const std::string& s, size_t pos, const std::string& word) {
+    if (pos + word.size() > s.size() || lower(s.substr(pos, word.size())) != word)
+        return false;
+    if (pos > 0 && is_ident_char(s[pos - 1]))
+        return false;
+    return pos + word.size() == s.size() || !is_ident_char(s[pos + word.size()]);
+}
+
+static bool collect_statement_lines(const std::vector<std::string>& lines, size_t start,
+                                    size_t& end_i, std::string& flat) {
+    int paren = 0;
+    int brace = 0;
+    std::vector<std::string> parts;
+    for (size_t i = start; i < lines.size(); ++i) {
+        std::string trimmed = trim_copy(lines[i]);
+        parts.push_back(trimmed);
+        for (char ch : trimmed) {
+            if (ch == '(')
+                ++paren;
+            else if (ch == ')' && paren > 0)
+                --paren;
+            else if (ch == '{')
+                ++brace;
+            else if (ch == '}' && brace > 0)
+                --brace;
+            else if (ch == ';' && paren == 0 && brace == 0) {
+                end_i = i;
+                flat.clear();
+                for (size_t k = 0; k < parts.size(); ++k) {
+                    if (k)
+                        flat += ' ';
+                    flat += parts[k];
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct EnumItemParsed {
+    std::string name;
+    std::string value;
+    bool has_value{false};
+};
+
+static size_t find_top_level_equal(const std::string& text) {
+    int paren = 0;
+    int bracket = 0;
+    int brace = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        if (ch == '(')
+            ++paren;
+        else if (ch == ')' && paren > 0)
+            --paren;
+        else if (ch == '[')
+            ++bracket;
+        else if (ch == ']' && bracket > 0)
+            --bracket;
+        else if (ch == '{')
+            ++brace;
+        else if (ch == '}' && brace > 0)
+            --brace;
+        else if (ch == '=' && paren == 0 && bracket == 0 && brace == 0)
+            return i;
+    }
+    return std::string::npos;
+}
+
+static std::string pad_right(std::string s, int width) {
+    if ((int)s.size() < width)
+        s.resize(width, ' ');
+    return s;
+}
+
+static std::string format_enum_declaration_pass(const std::string& text,
+                                                const FormatOptions& opts) {
+    const auto& eo = opts.enum_declaration;
+    const std::string enum_indent(opts.indent_size, ' ');
+    std::vector<std::string> lines;
+    {
+        std::istringstream ss(text);
+        std::string l;
+        while (std::getline(ss, l))
+            lines.push_back(l);
+    }
+
+    std::vector<std::string> out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& line = lines[i];
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || !starts_with_word_at(line, first, "typedef")) {
+            out.push_back(line);
+            continue;
+        }
+
+        size_t end_i = i;
+        std::string flat;
+        if (!collect_statement_lines(lines, i, end_i, flat)) {
+            out.push_back(line);
+            continue;
+        }
+
+        std::string leading = line.substr(0, first);
+        size_t typedef_pos = flat.find("typedef");
+        size_t enum_pos = flat.find("enum", typedef_pos == std::string::npos ? 0 : typedef_pos + 7);
+        size_t open = flat.find('{', enum_pos == std::string::npos ? 0 : enum_pos + 4);
+        if (typedef_pos == std::string::npos || enum_pos == std::string::npos ||
+            open == std::string::npos) {
+            out.push_back(line);
+            continue;
+        }
+        int depth = 1;
+        size_t close = open + 1;
+        for (; close < flat.size(); ++close) {
+            if (flat[close] == '{')
+                ++depth;
+            else if (flat[close] == '}' && --depth == 0)
+                break;
+        }
+        if (close >= flat.size()) {
+            out.push_back(line);
+            continue;
+        }
+        size_t semi = flat.find(';', close + 1);
+        if (semi == std::string::npos) {
+            out.push_back(line);
+            continue;
+        }
+
+        std::string prefix = trim_copy(flat.substr(0, open));
+        if (lower(prefix).find("typedef enum") == std::string::npos) {
+            out.push_back(line);
+            continue;
+        }
+        std::string body = flat.substr(open + 1, close - open - 1);
+        std::string suffix = trim_copy(flat.substr(close + 1, semi - close - 1));
+        auto raw_items = split_top_level(body);
+        std::vector<EnumItemParsed> items;
+        for (auto& item : raw_items) {
+            std::string t = trim_copy(item);
+            if (t.empty())
+                continue;
+            size_t eq = find_top_level_equal(t);
+            if (eq == std::string::npos) {
+                items.push_back({t, "", false});
+            } else {
+                items.push_back({trim_copy(t.substr(0, eq)), trim_copy(t.substr(eq + 1)), true});
+            }
+        }
+        if (items.empty()) {
+            for (size_t k = i; k <= end_i; ++k)
+                out.push_back(lines[k]);
+            i = end_i;
+            continue;
+        }
+
+        int block_name_width = eo.enum_name_min_width;
+        int block_value_width = eo.enum_value_min_width;
+        if (eo.align && !eo.align_adaptive) {
+            for (const auto& item : items) {
+                block_name_width = std::max(block_name_width, (int)item.name.size() + 1);
+                if (item.has_value)
+                    block_value_width = std::max(block_value_width, (int)item.value.size());
+            }
+        }
+
+        out.push_back(leading + prefix + " {");
+        for (size_t k = 0; k < items.size(); ++k) {
+            const auto& item = items[k];
+            std::string comma = (k + 1 < items.size()) ? "," : "";
+            std::string rendered;
+            if (!eo.align) {
+                rendered = item.name + (item.has_value ? " = " + item.value : "");
+            } else {
+                int name_width = block_name_width;
+                int value_width = block_value_width;
+                if (eo.align_adaptive) {
+                    name_width = std::max(eo.enum_name_min_width, (int)item.name.size() + 1);
+                    if (item.has_value)
+                        value_width = std::max(eo.enum_value_min_width, (int)item.value.size());
+                }
+                rendered = pad_right(item.name, name_width);
+                if (item.has_value)
+                    rendered += "= " + pad_right(item.value, value_width);
+            }
+            std::string enum_line = leading + enum_indent + rendered + comma;
+            if (comma.empty()) {
+                while (!enum_line.empty() && enum_line.back() == ' ')
+                    enum_line.pop_back();
+            }
+            out.push_back(enum_line);
+        }
+        out.push_back(leading + "} " + suffix + ";");
+        i = end_i;
+    }
+
+    std::string r;
+    for (size_t k = 0; k < out.size(); ++k) {
+        if (k)
+            r += '\n';
+        r += out[k];
+    }
+    return r;
+}
+
+struct ModportItemParsed {
+    std::string direction;
+    std::string name;
+};
+
+struct ModportParsed {
+    std::string name;
+    std::vector<ModportItemParsed> items;
+};
+
+static bool parse_modport_statement(const std::string& flat, std::vector<ModportParsed>& modports) {
+    size_t pos = 0;
+    while (pos < flat.size() && std::isspace((unsigned char)flat[pos]))
+        ++pos;
+    if (!starts_with_word_at(flat, pos, "modport"))
+        return false;
+    pos += 7;
+    size_t semi = flat.rfind(';');
+    if (semi == std::string::npos)
+        return false;
+    std::string rest = flat.substr(pos, semi - pos);
+    auto entries = split_top_level(rest);
+    static const std::unordered_set<std::string> DIRS = {"input", "output", "inout",
+                                                         "ref",   "import", "export"};
+
+    for (auto& entry_raw : entries) {
+        std::string entry = trim_copy(entry_raw);
+        if (entry.empty())
+            continue;
+        size_t name_start = 0;
+        while (name_start < entry.size() && std::isspace((unsigned char)entry[name_start]))
+            ++name_start;
+        size_t name_end = name_start;
+        while (name_end < entry.size() && is_ident_char(entry[name_end]))
+            ++name_end;
+        if (name_end == name_start)
+            return false;
+        size_t open = entry.find('(', name_end);
+        if (open == std::string::npos)
+            return false;
+        int depth = 1;
+        size_t close = open + 1;
+        for (; close < entry.size(); ++close) {
+            if (entry[close] == '(')
+                ++depth;
+            else if (entry[close] == ')' && --depth == 0)
+                break;
+        }
+        if (close >= entry.size())
+            return false;
+
+        ModportParsed mp;
+        mp.name = entry.substr(name_start, name_end - name_start);
+        auto items = split_top_level(entry.substr(open + 1, close - open - 1));
+        for (auto& item_raw : items) {
+            std::string item = trim_copy(item_raw);
+            if (item.empty())
+                continue;
+            std::istringstream ss(item);
+            std::string dir;
+            ss >> dir;
+            std::string remainder;
+            std::getline(ss, remainder);
+            remainder = trim_copy(remainder);
+            if (dir.empty() || remainder.empty() || !has(DIRS, lower(dir)))
+                return false;
+            mp.items.push_back({dir, remainder});
+        }
+        if (mp.items.empty())
+            return false;
+        modports.push_back(std::move(mp));
+    }
+    return !modports.empty();
+}
+
+static std::string format_modport_pass(const std::string& text, const FormatOptions& opts) {
+    const auto& mo = opts.modport;
+    const std::string item_indent(opts.indent_size, ' ');
+    std::vector<std::string> lines;
+    {
+        std::istringstream ss(text);
+        std::string l;
+        while (std::getline(ss, l))
+            lines.push_back(l);
+    }
+
+    std::vector<std::string> out;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::string& line = lines[i];
+        size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || !starts_with_word_at(line, first, "modport")) {
+            out.push_back(line);
+            continue;
+        }
+        size_t end_i = i;
+        std::string flat;
+        if (!collect_statement_lines(lines, i, end_i, flat)) {
+            out.push_back(line);
+            continue;
+        }
+        std::vector<ModportParsed> modports;
+        if (!parse_modport_statement(flat, modports)) {
+            for (size_t k = i; k <= end_i; ++k)
+                out.push_back(lines[k]);
+            i = end_i;
+            continue;
+        }
+
+        std::string leading = line.substr(0, first);
+        for (size_t mi = 0; mi < modports.size(); ++mi) {
+            const auto& mp = modports[mi];
+            int block_dir_width = mo.direction_min_width;
+            int block_signal_width = mo.signal_min_width;
+            if (mo.align) {
+                for (const auto& item : mp.items) {
+                    block_dir_width = std::max(block_dir_width, (int)item.direction.size() + 1);
+                    if (!mo.align_adaptive)
+                        block_signal_width = std::max(block_signal_width, (int)item.name.size());
+                }
+            }
+            out.push_back(leading + "modport " + mp.name + " (");
+            for (size_t pi = 0; pi < mp.items.size(); ++pi) {
+                const auto& item = mp.items[pi];
+                std::string comma = (pi + 1 < mp.items.size()) ? "," : "";
+                std::string rendered;
+                if (!mo.align) {
+                    rendered = item.direction + " " + item.name;
+                } else {
+                    int dir_width = block_dir_width;
+                    int signal_width = block_signal_width;
+                    if (mo.align_adaptive)
+                        signal_width = std::max(mo.signal_min_width, (int)item.name.size());
+                    rendered =
+                        pad_right(item.direction, dir_width) + pad_right(item.name, signal_width);
+                }
+                std::string port_line = leading + item_indent + rendered + comma;
+                if (comma.empty()) {
+                    while (!port_line.empty() && port_line.back() == ' ')
+                        port_line.pop_back();
+                }
+                out.push_back(port_line);
+            }
+            out.push_back(leading + std::string(")") + (mi + 1 < modports.size() ? "," : ";"));
+        }
+        i = end_i;
+    }
+
+    std::string r;
+    for (size_t k = 0; k < out.size(); ++k) {
+        if (k)
+            r += '\n';
+        r += out[k];
+    }
+    return r;
+}
+
 static bool find_simple_call(const std::string& line, size_t& name_start, size_t& name_end,
                              size_t& open, size_t& close) {
     static const std::unordered_set<std::string> SKIP = {
@@ -2954,6 +3323,8 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
         out = align_var_pass(out, opts, nullptr); // align variable declarations (syntactic)
     if (opts.port_declaration.align)
         out = align_port_pass(out, opts, nullptr); // align port decl columns (syntactic)
+    out = format_enum_declaration_pass(out, opts); // expand typedef enum bodies
+    out = format_modport_pass(out, opts);          // expand interface modports
     if (opts.instance.align)
         out = expand_instances_pass(out, opts, nullptr); // expand/align instance ports (syntactic)
     out = format_function_calls_pass(out, opts);         // format function calls

@@ -464,3 +464,145 @@ TEST_CASE("formatter: expands instances after declarations like memory_top", "[f
     CHECK(formatted.find("memory u_mem(.i_clk") == std::string::npos);
     CHECK(formatted.find("memory u_mem (\n") != std::string::npos);
 }
+
+TEST_CASE("formatter: typedef enum bodies are expanded", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    CHECK(format_source("package p;\n"
+                        "typedef enum logic[1:0]{IDLE,BUSY=2'd1,DONE} state_t;\n"
+                        "endpackage\n",
+                        opts) == "package p;\n"
+                                 "typedef enum logic [1:0] {\n"
+                                 "    IDLE,\n"
+                                 "    BUSY = 2'd1,\n"
+                                 "    DONE\n"
+                                 "} state_t;\n"
+                                 "endpackage\n");
+}
+
+TEST_CASE("formatter: interface modports are expanded and aligned", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.modport.align = true;
+    opts.modport.direction_min_width = 7;
+
+    CHECK(format_source("interface bus_if;\n"
+                        "modport master(input clk,output data), slave(output clk,input data);\n"
+                        "endinterface\n",
+                        opts) == "interface bus_if;\n"
+                                 "modport master (\n"
+                                 "    input  clk ,\n"
+                                 "    output data\n"
+                                 "),\n"
+                                 "modport slave (\n"
+                                 "    output clk ,\n"
+                                 "    input  data\n"
+                                 ");\n"
+                                 "endinterface\n");
+}
+
+TEST_CASE("formatter: enum declaration alignment supports strict and adaptive modes",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.enum_declaration.align = true;
+    opts.enum_declaration.enum_name_min_width = 8;
+    opts.enum_declaration.enum_value_min_width = 6;
+
+    CHECK(format_source("typedef enum {A=1,LONG_NAME=22,C=333333} e_t;\n", opts) ==
+          "typedef enum {\n"
+          "    A         = 1     ,\n"
+          "    LONG_NAME = 22    ,\n"
+          "    C         = 333333\n"
+          "} e_t;\n");
+
+    opts.enum_declaration.align_adaptive = true;
+    CHECK(format_source("typedef enum {A=1,LONG_NAME=22,C=333333} e_t;\n", opts) ==
+          "typedef enum {\n"
+          "    A       = 1     ,\n"
+          "    LONG_NAME = 22    ,\n"
+          "    C       = 333333\n"
+          "} e_t;\n");
+}
+
+TEST_CASE("formatter: modport alignment supports strict and adaptive modes", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.modport.align = true;
+    opts.modport.direction_min_width = 7;
+    opts.modport.signal_min_width = 6;
+
+    CHECK(format_source("interface i;\n"
+                        "modport m(input a,output long_signal,inout c);\n"
+                        "endinterface\n",
+                        opts) == "interface i;\n"
+                                 "modport m (\n"
+                                 "    input  a          ,\n"
+                                 "    output long_signal,\n"
+                                 "    inout  c\n"
+                                 ");\n"
+                                 "endinterface\n");
+
+    opts.modport.align_adaptive = true;
+    CHECK(format_source("interface i;\n"
+                        "modport m(input a,output long_signal,inout c);\n"
+                        "endinterface\n",
+                        opts) == "interface i;\n"
+                                 "modport m (\n"
+                                 "    input  a     ,\n"
+                                 "    output long_signal,\n"
+                                 "    inout  c\n"
+                                 ");\n"
+                                 "endinterface\n");
+}
+
+TEST_CASE("formatter: adaptive modport alignment keeps direction column aligned",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.modport.align = true;
+    opts.modport.align_adaptive = true;
+    opts.modport.direction_min_width = 6;
+    opts.modport.signal_min_width = 10;
+
+    CHECK(format_source("interface i;\n"
+                        "modport dut(input clk,input validdddddddd,input addr,input wdata,"
+                        "input write,output ready,output rdata);\n"
+                        "endinterface\n",
+                        opts) == "interface i;\n"
+                                 "modport dut (\n"
+                                 "    input  clk       ,\n"
+                                 "    input  validdddddddd,\n"
+                                 "    input  addr      ,\n"
+                                 "    input  wdata     ,\n"
+                                 "    input  write     ,\n"
+                                 "    output ready     ,\n"
+                                 "    output rdata\n"
+                                 ");\n"
+                                 "endinterface\n");
+}
+
+TEST_CASE("formatter: enum strict alignment does not leave trailing spaces on final item",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.enum_declaration.align = true;
+    opts.enum_declaration.align_adaptive = false;
+    opts.enum_declaration.enum_name_min_width = 0;
+    opts.enum_declaration.enum_value_min_width = 0;
+
+    CHECK(format_source("typedef enum logic [1:0] {IDLE,FETCH,EXECUTE,ERROR} state_t;\n",
+                        opts) == "typedef enum logic [1:0] {\n"
+                                 "    IDLE    ,\n"
+                                 "    FETCH   ,\n"
+                                 "    EXECUTE ,\n"
+                                 "    ERROR\n"
+                                 "} state_t;\n");
+}

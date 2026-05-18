@@ -71,6 +71,20 @@ struct PortOptions {
     int non_ansi_port_max_line_length{80};
 };
 
+struct EnumOptions {
+    bool align{false};
+    bool align_adaptive{false};
+    int enum_name_min_width{1};
+    int enum_value_min_width{0};
+};
+
+struct ModportOptions {
+    bool align{false};
+    bool align_adaptive{false};
+    int direction_min_width{1};
+    int signal_min_width{0};
+};
+
 struct FormatOptions {
     int indent_size{2};
     bool compact_indexing_and_selections{true};
@@ -87,6 +101,8 @@ struct FormatOptions {
     InstanceOptions instance;
     FunctionOptions function;
     PortOptions port;
+    EnumOptions enum_declaration;
+    ModportOptions modport;
 };
 
 struct LintRuleConfig {

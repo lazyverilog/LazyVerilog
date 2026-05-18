@@ -114,6 +114,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 cfg.format.blank_lines_between_items = static_cast<int>(*v);
             if (auto v = (*f)["default_indent_level_inside_outmost_block"].value<int64_t>())
                 cfg.format.default_indent_level_inside_outmost_block = static_cast<int>(*v);
+            if (auto v = (*f)["default_indent_level_inside_module_block"].value<int64_t>())
+                cfg.format.default_indent_level_inside_outmost_block = static_cast<int>(*v);
             if (auto v = (*f)["enable_format_on_save"].value<bool>())
                 cfg.format.enable_format_on_save = *v;
             if (auto v = (*f)["safe_mode"].value<bool>())
@@ -198,6 +200,26 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                     cfg.format.port.non_ansi_port_max_line_length_enabled = *v;
                 if (auto v = (*po)["non_ansi_port_max_line_length"].value<int64_t>())
                     cfg.format.port.non_ansi_port_max_line_length = static_cast<int>(*v);
+            }
+            if (auto en = (*f)["enum_declaration"].as_table()) {
+                if (auto v = (*en)["align"].value<bool>())
+                    cfg.format.enum_declaration.align = *v;
+                if (auto v = (*en)["align_adaptive"].value<bool>())
+                    cfg.format.enum_declaration.align_adaptive = *v;
+                if (auto v = (*en)["enum_name_min_width"].value<int64_t>())
+                    cfg.format.enum_declaration.enum_name_min_width = static_cast<int>(*v);
+                if (auto v = (*en)["enum_value_min_width"].value<int64_t>())
+                    cfg.format.enum_declaration.enum_value_min_width = static_cast<int>(*v);
+            }
+            if (auto mp = (*f)["modport"].as_table()) {
+                if (auto v = (*mp)["align"].value<bool>())
+                    cfg.format.modport.align = *v;
+                if (auto v = (*mp)["align_adaptive"].value<bool>())
+                    cfg.format.modport.align_adaptive = *v;
+                if (auto v = (*mp)["direction_min_width"].value<int64_t>())
+                    cfg.format.modport.direction_min_width = static_cast<int>(*v);
+                if (auto v = (*mp)["signal_min_width"].value<int64_t>())
+                    cfg.format.modport.signal_min_width = static_cast<int>(*v);
             }
         }
 

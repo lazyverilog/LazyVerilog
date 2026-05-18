@@ -424,3 +424,78 @@ When enabled, emits a fixed number of ports per line.
 
 When enabled, packs non-ANSI ports until the configured maximum line length
 would be exceeded.
+
+## `[format.enum_declaration]`
+
+```toml
+[format.enum_declaration]
+align = false
+align_adaptive = false
+enum_name_min_width = 1
+enum_value_min_width = 0
+```
+
+Formats `typedef enum ... { ... } name;` declarations into one enumerator per
+line. Enumerator lines are always indented by one formatter indent level.
+
+When `align = false`, enumerators are left-aligned with compact assignments:
+
+```systemverilog
+IDLE,
+BUSY = 2'd1,
+DONE
+```
+
+When `align = true`, `enum_name_min_width` and `enum_value_min_width` define
+minimum columns for enumerator names and assigned values. With
+`align_adaptive = false`, long names or values widen the whole enum block. With
+`align_adaptive = true`, long entries only affect their own line.
+
+## `[format.modport]`
+
+```toml
+[format.modport]
+align = false
+align_adaptive = false
+direction_min_width = 1
+signal_min_width = 0
+```
+
+Formats interface `modport` declarations into multi-line port lists. Port lines
+are always indented by one formatter indent level.
+
+When `align = false`, modport items are left-aligned:
+
+```systemverilog
+input clk,
+output data
+```
+
+When `align = true`, `direction_min_width` and `signal_min_width` define minimum
+columns for directions and signal names. With `align_adaptive = false`, long
+strings widen the whole modport block. With `align_adaptive = true`, long
+strings only affect their own line.
+
+## Currently unsupported or limited SystemVerilog formatter syntax
+
+The formatter is intentionally conservative. The following constructs are not
+fully syntax-aware yet and may be left mostly as token-spaced text, or should be
+wrapped in `// verilog_format: off` / `on` if the exact layout matters:
+
+- UVM class-heavy code: macros such as `` `uvm_component_utils``, factory calls,
+  constraints, and long phase/task bodies.
+- Classes, covergroups, constraints, properties, sequences, checkers, and SVA
+  assertion expressions beyond basic indentation/token spacing.
+- Complex preprocessor macro bodies and generated code; `` `define`` bodies are
+  deliberately preserved.
+- Parameter/localparam declaration alignment beyond the generic token and
+  assignment passes.
+- Struct/union field alignment beyond generic variable declaration handling.
+- Multi-line comments/docblocks: preserved, not reflowed.
+- Advanced module/interface/program headers with complex parameter-port lists or
+  preprocessor conditionals inside the header.
+- Positional instance ports and complex named connections containing comments or
+  preprocessor conditionals.
+- `generate`/`genvar` formatting is basic indentation only.
+- Specify blocks, primitives, UDP tables, configs, clocking blocks, net aliases,
+  bind statements, and package import/export grouping are not specially aligned.
