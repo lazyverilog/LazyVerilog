@@ -846,6 +846,9 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const wp_executeCommand::request& req) {
         wp_executeCommand::response rsp;
         rsp.id = req.id;
+        // executeCommand result is optional in the protocol, but LspCpp serializes an unset Any as
+        // invalid JSON (`"result":}`). Default to null so error/no-op paths stay parseable.
+        rsp.result.SetJsonString("null", lsp::Any::kNullType);
         try {
             const auto& cmd = req.params.command;
             const auto& args = req.params.arguments;
