@@ -1,7 +1,6 @@
 #include "formatter.hpp"
 #include <algorithm>
 #include <cctype>
-#include <regex>
 #include <slang/parsing/Token.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -275,28 +274,108 @@ static bool is_indexed_part_select_op(const Tok& t) { return t.text == "+:" || t
 // Disabled ranges (verilog_format: off/on and `define)
 // ---------------------------------------------------------------------------
 
+// Match "// <optional whitespace> verilog_format <optional whitespace> : <optional whitespace> <word>"
+// case-insensitive.  Returns the position past the matched word, or std::string::npos.
+static size_t match_fmt_comment(const std::string& src, size_t pos, const std::string& word) {
+    size_t n = src.size();
+    if (pos + 1 >= n || src[pos] != '/' || src[pos + 1] != '/')
+        return std::string::npos;
+    size_t i = pos + 2;
+    while (i < n && (src[i] == ' ' || src[i] == '\t'))
+        ++i;
+    const char* tag = "verilog_format";
+    for (size_t k = 0; tag[k]; ++k, ++i) {
+        if (i >= n || std::tolower((unsigned char)src[i]) != tag[k])
+            return std::string::npos;
+    }
+    while (i < n && (src[i] == ' ' || src[i] == '\t'))
+        ++i;
+    if (i >= n || src[i] != ':')
+        return std::string::npos;
+    ++i;
+    while (i < n && (src[i] == ' ' || src[i] == '\t'))
+        ++i;
+    for (size_t k = 0; k < word.size(); ++k, ++i) {
+        if (i >= n || std::tolower((unsigned char)src[i]) != (unsigned char)word[k])
+            return std::string::npos;
+    }
+    // Word boundary: next char must not be alphanumeric/underscore
+    if (i < n && (std::isalnum((unsigned char)src[i]) || src[i] == '_'))
+        return std::string::npos;
+    // Advance to end of line
+    while (i < n && src[i] != '\n')
+        ++i;
+    return i;
+}
+
 static std::vector<std::pair<int, int>> find_disabled(const std::string& src) {
     std::vector<std::pair<int, int>> out;
-    static const std::regex FMT_OFF(R"(//\s*verilog_format\s*:\s*off\b[^\n]*)", std::regex::icase);
-    static const std::regex FMT_ON(R"(//\s*verilog_format\s*:\s*on\b[^\n]*)", std::regex::icase);
-    static const std::regex DEFINE_RE(R"(`define\b(?:[^\n]*?\\\n)*[^\n]*)");
+    size_t n = src.size();
 
-    {
-        auto it = std::sregex_iterator(src.begin(), src.end(), FMT_OFF);
-        for (; it != std::sregex_iterator(); ++it) {
-            int off_pos = (int)it->position();
-            int search_from = off_pos + (int)it->length();
-            auto it2 = std::sregex_iterator(src.begin() + search_from, src.end(), FMT_ON);
-            int end = (it2 != std::sregex_iterator()) ? search_from + (int)it2->position()
-                                                      : (int)src.size();
-            out.push_back({off_pos, end});
+    // Find verilog_format: off/on regions
+    for (size_t i = 0; i < n; ++i) {
+        size_t off_end = match_fmt_comment(src, i, "off");
+        if (off_end == std::string::npos)
+            continue;
+        int off_pos = (int)i;
+        // Search for matching "on"
+        int end = (int)n;
+        for (size_t j = off_end; j < n; ++j) {
+            size_t on_end = match_fmt_comment(src, j, "on");
+            if (on_end != std::string::npos) {
+                end = (int)j;
+                break;
+            }
         }
+        out.push_back({off_pos, end});
+        i = (size_t)end;
     }
-    {
-        auto it = std::sregex_iterator(src.begin(), src.end(), DEFINE_RE);
-        for (; it != std::sregex_iterator(); ++it)
-            out.push_back({(int)it->position(), (int)(it->position() + it->length())});
+
+    // Find `define blocks (including multi-line with \ continuation)
+    for (size_t i = 0; i < n;) {
+        // Must be at start of line (or start of file)
+        if (i > 0 && src[i - 1] != '\n') {
+            ++i;
+            continue;
+        }
+        // Skip leading whitespace
+        size_t ls = i;
+        while (ls < n && (src[ls] == ' ' || src[ls] == '\t'))
+            ++ls;
+        if (ls + 7 > n || src.compare(ls, 7, "`define") != 0) {
+            // Skip to next line
+            while (i < n && src[i] != '\n')
+                ++i;
+            if (i < n)
+                ++i;
+            continue;
+        }
+        // Word boundary after `define
+        if (ls + 7 < n && (std::isalnum((unsigned char)src[ls + 7]) || src[ls + 7] == '_')) {
+            while (i < n && src[i] != '\n')
+                ++i;
+            if (i < n)
+                ++i;
+            continue;
+        }
+        // Found `define at ls.  Consume lines with trailing backslash continuation.
+        size_t j = ls;
+        while (true) {
+            while (j < n && src[j] != '\n')
+                ++j;
+            // Check if line ends with backslash (before the newline)
+            if (j > ls && src[j - 1] == '\\' && j < n) {
+                ++j; // skip newline, continue to next line
+            } else {
+                break;
+            }
+        }
+        out.push_back({(int)ls, (int)j});
+        i = j;
+        if (i < n)
+            ++i;
     }
+
     std::sort(out.begin(), out.end());
     return out;
 }
@@ -690,7 +769,9 @@ static std::vector<Tok> collect_cst_tokens(const std::string& source, const Synt
         if (!sm.isFileLoc(loc))
             continue;
         if (source_only) {
-            if (sm.getSourceText(loc.buffer()) != source)
+            auto buf_text = sm.getSourceText(loc.buffer());
+            if (buf_text.size() < source.size() ||
+                buf_text.substr(0, source.size()) != std::string_view(source))
                 continue;
         }
         size_t off = loc.offset();
