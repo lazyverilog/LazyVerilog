@@ -37,6 +37,8 @@ void log_perf(std::string_view label, Clock::time_point start) {
 
 } // namespace
 
+static std::string file_name_to_uri(std::string_view file_name, const std::string& fallback_uri);
+
 std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                                                     const std::string& text) const {
     const auto start = Clock::now();
@@ -72,6 +74,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
             ParseDiagInfo info;
             try {
                 auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;
+                info.uri = file_name_to_uri(sm.getFileName(loc), uri);
                 if (loc.valid() && sm.isFileLoc(loc)) {
                     size_t ln = sm.getLineNumber(loc);
                     size_t col = sm.getColumnNumber(loc);
@@ -1499,6 +1502,15 @@ std::vector<ParseDiagInfo> Analyzer::semantic_diagnostics(const std::string& uri
     if (it == semantic_diagnostics_.end())
         return {};
     return it->second;
+}
+
+std::vector<std::string> Analyzer::semantic_diagnostic_uris() const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    std::vector<std::string> uris;
+    uris.reserve(semantic_diagnostics_.size());
+    for (const auto& [uri, _] : semantic_diagnostics_)
+        uris.push_back(uri);
+    return uris;
 }
 
 namespace {

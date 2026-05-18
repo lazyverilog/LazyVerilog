@@ -3,6 +3,8 @@
 #include "config.hpp"
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 // Forward declarations to avoid pulling in LspCpp headers here
 class RemoteEndPoint;
@@ -28,6 +30,7 @@ class LazyVerilogServer {
     Config config_;
     Analyzer analyzer_;
     std::unique_ptr<BackgroundCompiler> background_compiler_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> diagnostic_uris_by_owner_;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

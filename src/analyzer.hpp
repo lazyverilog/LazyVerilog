@@ -141,6 +141,9 @@ class Analyzer {
     /// Return cached semantic diagnostics for one URI.
     std::vector<ParseDiagInfo> semantic_diagnostics(const std::string& uri) const;
 
+    /// Return URIs that currently have cached semantic diagnostics.
+    std::vector<std::string> semantic_diagnostic_uris() const;
+
     /// Build a forward RTL instantiation tree rooted at the first module in uri.
     std::optional<RtlTreeNode> rtl_tree(const std::string& uri) const;
 

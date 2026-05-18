@@ -58,6 +58,8 @@
 #include <iostream>
 #include <memory>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -283,8 +285,14 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     analyzer_.set_extra_files(load_vcode_files(root_, config_), resolve_vcode_path(root_, config_));
     background_compiler_ =
         std::make_unique<BackgroundCompiler>([this](BackgroundCompileResult result) {
+            std::unordered_set<std::string> uris_to_publish(result.open_uris.begin(),
+                                                            result.open_uris.end());
+            for (const auto& uri : analyzer_.semantic_diagnostic_uris())
+                uris_to_publish.insert(uri);
+            for (const auto& [uri, _] : result.diagnostics_by_uri)
+                uris_to_publish.insert(uri);
             analyzer_.set_semantic_diagnostics(std::move(result.diagnostics_by_uri));
-            for (const auto& uri : result.open_uris)
+            for (const auto& uri : uris_to_publish)
                 publish_diagnostics(uri);
         });
     configure_background_compiler();
@@ -353,19 +361,38 @@ void LazyVerilogServer::publish_config_diagnostic(const ConfigWarning* warning) 
 void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
     try {
         auto state = analyzer_.get_state(uri);
-        Notify_TextDocumentPublishDiagnostics::notify notif;
-        notif.params.uri.raw_uri_ = uri;
+        std::unordered_map<std::string, std::vector<ParseDiagInfo>> diags_by_uri;
+        diags_by_uri[uri];
         if (state) {
-            // Merge parse diagnostics + lint diagnostics + cached semantic diagnostics.
-            auto all_diags = state->parse_diagnostics;
+            auto add_diag = [&](ParseDiagInfo diag) {
+                auto target_uri = diag.uri.empty() ? uri : diag.uri;
+                diag.uri.clear();
+                diags_by_uri[target_uri].push_back(std::move(diag));
+            };
+            for (auto diag : state->parse_diagnostics)
+                add_diag(std::move(diag));
+
             SyntaxIndex lint_index = state->index;
             analyzer_.merge_extra_file_modules(lint_index);
             auto lint_diags = run_lint(*state, config_.lint, &lint_index);
-            all_diags.insert(all_diags.end(), lint_diags.begin(), lint_diags.end());
-            if (config_.compilation.background_compilation) {
-                auto semantic_diags = analyzer_.semantic_diagnostics(uri);
-                all_diags.insert(all_diags.end(), semantic_diags.begin(), semantic_diags.end());
-            }
+            for (auto diag : lint_diags)
+                add_diag(std::move(diag));
+        }
+
+        if (config_.compilation.background_compilation) {
+            auto semantic_diags = analyzer_.semantic_diagnostics(uri);
+            auto& target = diags_by_uri[uri];
+            target.insert(target.end(), semantic_diags.begin(), semantic_diags.end());
+        }
+
+        auto& previously_published = diagnostic_uris_by_owner_[uri];
+        for (const auto& old_uri : previously_published)
+            diags_by_uri.try_emplace(old_uri);
+        previously_published.clear();
+
+        for (const auto& [target_uri, all_diags] : diags_by_uri) {
+            Notify_TextDocumentPublishDiagnostics::notify notif;
+            notif.params.uri.raw_uri_ = target_uri;
             for (const auto& d : all_diags) {
                 lsDiagnostic ld;
                 ld.range.start = lsPosition(d.line, d.col);
@@ -385,8 +412,9 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
                 ld.message = d.message;
                 notif.params.diagnostics.push_back(std::move(ld));
             }
+            impl_->remote_endpoint.sendNotification(notif);
+            previously_published.insert(target_uri);
         }
-        impl_->remote_endpoint.sendNotification(notif);
     } catch (const std::exception& e) {
         std::cerr << "[lazyverilog] publishDiagnostics error: " << e.what() << "\n";
     }

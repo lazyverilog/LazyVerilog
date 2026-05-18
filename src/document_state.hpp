@@ -23,6 +23,7 @@ struct ParseDiagInfo {
     int col{0};      // 0-based
     int severity{3}; // lsDiagnosticSeverity: 1=Error,2=Warn,3=Info,4=Hint
     std::string message;
+    std::string uri; // file URI for the diagnostic location; empty = owning document
 };
 
 /// Immutable snapshot of a single open document.

@@ -4,6 +4,7 @@
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
 #include <slang/parsing/TokenKind.h>
+#include <algorithm>
 #include <filesystem>
 #include <regex>
 #include <optional>
@@ -19,6 +20,15 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
     d.severity = sev;
     d.message  = std::move(msg);
     if (loc.valid()) {
+        try {
+            auto file_name = sm.getFileName(loc);
+            if (!file_name.empty()) {
+                d.uri = std::string(file_name);
+                if (!d.uri.starts_with("file://"))
+                    d.uri = "file://" + std::filesystem::absolute(d.uri).lexically_normal().string();
+            }
+        } catch (...) {
+        }
         size_t ln = sm.getLineNumber(loc);
         size_t co = sm.getColumnNumber(loc);
         d.line = ln > 0 ? (int)ln - 1 : 0;
@@ -565,6 +575,9 @@ std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig
     auto& sm = state.tree->sourceManager();
     LintVisitor v(config, merged_index ? *merged_index : state.index, sm, file_stem_from_uri(state.uri));
     state.tree->root().visit(v);
+    v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {
+        return !diag.uri.empty() && diag.uri != state.uri;
+    }), v.diags.end());
     diags.insert(diags.end(), v.diags.begin(), v.diags.end());
     return diags;
 }

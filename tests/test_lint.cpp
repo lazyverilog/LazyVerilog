@@ -157,3 +157,29 @@ TEST_CASE("lint: naming rules emit diagnostics", "[lint]") {
     CHECK(has_message_containing(diags, "module 'wrong_mod' does not match filename"));
     CHECK(has_message_containing(diags, "package 'wrong_pkg' does not match filename"));
 }
+
+TEST_CASE("lint: included files are skipped", "[lint]") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto include_path = dir / "lazyverilog_lint_include.svh";
+    {
+        std::ofstream out(include_path);
+        REQUIRE(out.good());
+        out << "parameter BAD_NAME = 1;\n";
+    }
+
+    const auto top_path = dir / "lazyverilog_lint_top.sv";
+    const auto top_uri = "file://" + top_path.string();
+    Analyzer analyzer;
+    analyzer.open(top_uri, "`include \"lazyverilog_lint_include.svh\"\nmodule top;\nendmodule\n");
+    auto state = analyzer.get_state(top_uri);
+    REQUIRE(state != nullptr);
+
+    LintConfig cfg;
+    cfg.naming.enable = true;
+    cfg.naming.parameter_pattern = "^P_.*$";
+
+    auto diags = run_lint(*state, cfg);
+    CHECK_FALSE(has_message_containing(diags, "parameter 'BAD_NAME'"));
+
+    std::filesystem::remove(include_path);
+}
