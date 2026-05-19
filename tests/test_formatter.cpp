@@ -14,6 +14,31 @@ TEST_CASE("formatter: function calls support block layout", "[formatter]") {
                                                                           "         );\n");
 }
 
+TEST_CASE("formatter: autoarg comment in multiline module header is safe", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.port.non_ansi_port_per_line_enabled = true;
+    opts.port.non_ansi_port_per_line = 3;
+
+    std::string input =
+        "module memory_top #( parameter int WIDTH = 4, parameter int DEPTH = 8 ) ( /*autoarg*/\n"
+        "    i_clk, i_rst_n,\n"
+        "    i_data, i_data2\n"
+        ");\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
+    CHECK(formatted == "module memory_top #(parameter int WIDTH = 4, parameter int DEPTH = 8) ( "
+                       "/*autoarg*/\n"
+                       "    i_clk, i_rst_n, i_data,\n"
+                       "    i_data2\n"
+                       ");\n"
+                       "endmodule\n");
+}
+
 TEST_CASE("formatter: function calls inside if conditions use configured layout", "[formatter]") {
     FormatOptions opts;
     opts.function.break_policy = "always";
@@ -395,6 +420,82 @@ TEST_CASE("formatter: instance port name width is measured from dot to paren", "
                                  "    .address  (addr      ),\n"
                                  "    .data_in  (data      ),\n"
                                  "    .chip_en  (en        )\n"
+                                 ");\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: autoinst comment does not block instance port expansion", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.port_indent_level = 1;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("module top;\n"
+                        "memory #(.MEM_SIZE(3)) u_memory( /*autoinst*/\n"
+                        ".address(addr), .data_in(intercontest), .chip_en(tt));\n"
+                        "endmodule\n",
+                        opts) == "module top;\n"
+                                 "memory #(.MEM_SIZE(3)) u_memory ( /*autoinst*/\n"
+                                 "    .address  (addr        ),\n"
+                                 "    .data_in  (intercontest),\n"
+                                 "    .chip_en  (tt          )\n"
+                                 ");\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: line comments do not block instance port expansion", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.port_indent_level = 1;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("module top;\n"
+                        "memory u_mem( // test\n"
+                        ".i_clk(testxrp), .address(addressss), .data_in(threeshit));\n"
+                        "memory u_mem1(.address(), .data_in(zzzry), // test\n"
+                        ".dataut(), .read_te());\n"
+                                 "endmodule\n",
+                        opts) == "module top;\n"
+                                 "memory u_mem ( // test\n"
+                                 "    .i_clk    (testxrp   ),\n"
+                                 "    .address  (addressss ),\n"
+                                 "    .data_in  (threeshit )\n"
+                                 ");\n"
+                                 "memory u_mem1 (\n"
+                                 "    .address  (          ),\n"
+                                 "    .data_in  (zzzry     ), // test\n"
+                                 "    .dataut   (          ),\n"
+                                 "    .read_te  (          )\n"
+                                 ");\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: block comments do not block instance port expansion", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.port_indent_level = 1;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("module top;\n"
+                        "memory u_mem(.address(addr), .data_in(zzzry), /* test */ .dataut());\n"
+                                 "endmodule\n",
+                        opts) == "module top;\n"
+                                 "memory u_mem (\n"
+                                 "    .address  (addr      ),\n"
+                                 "    .data_in  (zzzry     ), /* test */\n"
+                                 "    .dataut   (          )\n"
                                  ");\n"
                                  "endmodule\n");
 }
