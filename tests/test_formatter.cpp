@@ -907,3 +907,25 @@ TEST_CASE("formatter: spacing options survive demo-style alignment passes", "[fo
     CHECK(formatted.find("if ( a ) begin") != std::string::npos);
     CHECK(formatted.find("case ( a )") != std::string::npos);
 }
+
+TEST_CASE("formatter: duplicate instance port comments are preserved", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+
+    std::string input = "module top;\n"
+                        "child u_child(\n"
+                        ".a(sig_a), // first a comment\n"
+                        ".a(sig_b), // second a comment\n"
+                        ".b(sig_c) // b comment\n"
+                        ");\n"
+                        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
+    CHECK(formatted.find("// first a comment") != std::string::npos);
+    CHECK(formatted.find("// second a comment") != std::string::npos);
+    CHECK(formatted.find("// b comment") != std::string::npos);
+}

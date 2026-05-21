@@ -1797,7 +1797,7 @@ static std::vector<FormattedLine> align_var_pass(std::vector<FormattedLine> line
 
 struct InstanceComments {
     std::string header;
-    std::unordered_map<std::string, std::string> port_comments;
+    std::vector<std::pair<std::string, std::string>> port_comments;
 };
 
 static size_t find_line_comment_start(const std::string& line) {
@@ -1865,7 +1865,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
             std::string comment = stripped.substr(line_comment);
             std::string port = last_named_port_before_comment(code);
             if (!port.empty())
-                comments.port_comments[port] = comment;
+                comments.port_comments.push_back({port, comment});
             else if (code.find('(') != std::string::npos && comments.header.empty())
                 comments.header = comment;
         }
@@ -1911,7 +1911,7 @@ static bool collect_instance(const std::vector<FormattedLine>& lines, size_t sta
             std::string comment = stripped.substr(line_comment);
             std::string port = last_named_port_before_comment(code);
             if (!port.empty())
-                comments.port_comments[port] = comment;
+                comments.port_comments.push_back({port, comment});
             else if (code.find('(') != std::string::npos && comments.header.empty())
                 comments.header = comment;
         }
@@ -2040,10 +2040,14 @@ static void remove_block_comments_from_instance_port_list(std::string& port_list
             }
             std::string comment = port_list.substr(i, end + 2 - i);
             std::string port = last_named_port_before_comment(code);
-            if (!port.empty())
-                append_comment(comments.port_comments[port], comment);
-            else
+            if (!port.empty()) {
+                if (!comments.port_comments.empty() && comments.port_comments.back().first == port)
+                    append_comment(comments.port_comments.back().second, comment);
+                else
+                    comments.port_comments.push_back({port, comment});
+            } else {
                 append_comment(comments.header, comment);
+            }
             i = end + 2;
             continue;
         }
@@ -2256,6 +2260,7 @@ static std::vector<FormattedLine> expand_instances_pass(std::vector<FormattedLin
         if (!comments.header.empty())
             hdr += " " + comments.header;
         out.push_back({hdr});
+        size_t comment_index = 0;
         for (size_t k = 0; k < ports.size(); ++k) {
             auto& [port, sig] = ports[k];
             std::string comma = (k + 1 == ports.size()) ? "" : ",";
@@ -2275,9 +2280,9 @@ static std::vector<FormattedLine> expand_instances_pass(std::vector<FormattedLin
             }
             while (!pline.empty() && pline.back() == ' ')
                 pline.pop_back();
-            auto comment_it = comments.port_comments.find(port);
-            if (comment_it != comments.port_comments.end())
-                pline += " " + comment_it->second;
+            if (comment_index < comments.port_comments.size() &&
+                comments.port_comments[comment_index].first == port)
+                pline += " " + comments.port_comments[comment_index++].second;
             out.push_back({pline});
         }
         out.push_back({indent + ");"});
