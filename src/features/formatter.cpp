@@ -1,8 +1,6 @@
 #include "formatter.hpp"
 #include <algorithm>
 #include <cctype>
-#include <chrono>
-#include <iostream>
 #include <slang/parsing/Lexer.h>
 #include <slang/parsing/Token.h>
 #include <slang/text/SourceManager.h>
@@ -2904,27 +2902,81 @@ static bool is_module_header_start_tokenized(const std::string& line) {
     return !toks.empty() && (toks[0].lo == "module" || toks[0].lo == "macromodule");
 }
 
-static bool module_header_statement_complete_tokenized(const std::string& flat) {
-    auto toks = significant_tokens(flat);
-    if (toks.empty())
-        return false;
-    int paren = 0;
-    int brace = 0;
-    int bracket = 0;
-    for (const auto& tok : toks) {
-        if (tok_is(tok, "(", TokenKind::OpenParenthesis))
-            ++paren;
-        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
-            --paren;
-        else if (tok_is(tok, "{", TokenKind::OpenBrace))
-            ++brace;
-        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
-            --brace;
-        else if (tok_is(tok, "[", TokenKind::OpenBracket))
-            ++bracket;
-        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
-            --bracket;
-        else if (tok_is(tok, ";", TokenKind::Semicolon) && paren == 0 && brace == 0 && bracket == 0)
+static bool could_start_module_header(const std::string& line) {
+    size_t p = 0;
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
+        ++p;
+
+    auto matches_word = [&](const char* word) {
+        const size_t len = std::char_traits<char>::length(word);
+        if (p + len > line.size() || line.compare(p, len, word) != 0)
+            return false;
+        if (p + len == line.size())
+            return true;
+        char next = line[p + len];
+        return !std::isalnum((unsigned char)next) && next != '_' && next != '$';
+    };
+
+    return matches_word("module") || matches_word("macromodule");
+}
+
+struct ModuleHeaderScan {
+    int paren{0};
+    int brace{0};
+    int bracket{0};
+    bool block_comment{false};
+    bool string{false};
+    bool escaped{false};
+};
+
+static bool scan_module_header_line(ModuleHeaderScan& scan, const std::string& line) {
+    for (size_t i = 0; i < line.size(); ++i) {
+        char ch = line[i];
+
+        if (scan.block_comment) {
+            if (ch == '*' && i + 1 < line.size() && line[i + 1] == '/') {
+                scan.block_comment = false;
+                ++i;
+            }
+            continue;
+        }
+
+        if (scan.string) {
+            if (scan.escaped) {
+                scan.escaped = false;
+            } else if (ch == '\\') {
+                scan.escaped = true;
+            } else if (ch == '"') {
+                scan.string = false;
+            }
+            continue;
+        }
+
+        if (ch == '/' && i + 1 < line.size() && line[i + 1] == '/')
+            break;
+        if (ch == '/' && i + 1 < line.size() && line[i + 1] == '*') {
+            scan.block_comment = true;
+            ++i;
+            continue;
+        }
+        if (ch == '"') {
+            scan.string = true;
+            continue;
+        }
+
+        if (ch == '(')
+            ++scan.paren;
+        else if (ch == ')' && scan.paren > 0)
+            --scan.paren;
+        else if (ch == '{')
+            ++scan.brace;
+        else if (ch == '}' && scan.brace > 0)
+            --scan.brace;
+        else if (ch == '[')
+            ++scan.bracket;
+        else if (ch == ']' && scan.bracket > 0)
+            --scan.bracket;
+        else if (ch == ';' && scan.paren == 0 && scan.brace == 0 && scan.bracket == 0)
             return true;
     }
     return false;
@@ -3005,15 +3057,28 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string line = lines[i];
 
+        if (!could_start_module_header(line)) {
+            out.push_back(lines[i]);
+            continue;
+        }
+
         bool module_start = is_module_header_start_tokenized(line);
+        if (!module_start) {
+            out.push_back(lines[i]);
+            continue;
+        }
+
+        ModuleHeaderScan header_scan;
+        bool header_complete = scan_module_header_line(header_scan, line);
+
         size_t consumed_end = i;
-        if (module_start && !module_header_statement_complete_tokenized(line)) {
+        if (!header_complete) {
             std::string flat = line;
             size_t j = i + 1;
             for (; j < lines.size(); ++j) {
                 std::string trimmed = trim_copy(lines[j]);
                 flat += " " + trimmed;
-                if (module_header_statement_complete_tokenized(flat))
+                if (scan_module_header_line(header_scan, lines[j]))
                     break;
             }
             if (j < lines.size()) {
@@ -3230,18 +3295,9 @@ static std::vector<std::string> run_structural_layout_phase(
 
 static std::vector<std::string> run_post_token_pipeline(std::vector<std::string> lines,
                                                           const FormatOptions& opts) {
-    using Clock = std::chrono::steady_clock;
-    auto t0 = Clock::now();
-    std::cerr << "phase post:start lines=" << lines.size() << "\n";
     lines = run_module_header_layout_phase(std::move(lines), opts);
-    auto t1 = Clock::now();
-    std::cerr << "phase post:module_header ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count() << " lines=" << lines.size() << "\n";
     lines = run_line_group_alignment_phase(std::move(lines), opts);
-    auto t2 = Clock::now();
-    std::cerr << "phase post:alignment ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count() << " lines=" << lines.size() << "\n";
     lines = run_structural_layout_phase(std::move(lines), opts);
-    auto t3 = Clock::now();
-    std::cerr << "phase post:structural ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t3-t2).count() << " lines=" << lines.size() << "\n";
     return lines;
 }
 
@@ -3270,8 +3326,6 @@ static void verify_safe_mode_unchanged(const std::string& source, const std::str
 // ---------------------------------------------------------------------------
 
 std::string format_source(const std::string& source, const FormatOptions& opts) {
-    using Clock = std::chrono::steady_clock;
-    auto __fmt_t0 = Clock::now();
     // -----------------------------------------------------------------------
     // STEP 1: Tokenize using slang::Lexer (no SyntaxTree/CST needed)
     // -----------------------------------------------------------------------
@@ -3292,11 +3346,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     // -----------------------------------------------------------------------
     const std::string indent_unit(opts.indent_size, ' ');
     auto disabled = find_disabled(input);
-    auto __fmt_t1 = Clock::now();
-    std::cerr << "phase find_disabled ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t1-__fmt_t0).count() << "\n";
     auto tokens = collect_lexer_tokens(input);
-    auto __fmt_t2 = Clock::now();
-    std::cerr << "phase collect_tokens ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t2-__fmt_t1).count() << " tokens=" << tokens.size() << "\n";
 
     // -----------------------------------------------------------------------
     // STEP 5: Build byte-offset → original line number table
@@ -3821,8 +3871,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     // STEP 9: Convert to plain lines and run post-token pipeline.
     // Post-passes classify lines locally from lexer tokens when needed.
     // -----------------------------------------------------------------------
-    auto __fmt_t3 = Clock::now();
-    std::cerr << "phase token_loop+line_table ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t3-__fmt_t2).count() << " out_bytes=" << out.size() << "\n";
     auto lines = text_to_lines(out);
     lines = run_post_token_pipeline(std::move(lines), opts);
     out = render_lines(lines);
@@ -3842,11 +3890,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     // Verify that only whitespace changed.  This is a safety net against
     // formatter bugs that corrupt code.
     // -----------------------------------------------------------------------
-    auto __fmt_t4 = Clock::now();
-    std::cerr << "phase render_post ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t4-__fmt_t3).count() << " out_bytes=" << out.size() << "\n";
     verify_safe_mode_unchanged(source, out, opts);
-    auto __fmt_t5 = Clock::now();
-    std::cerr << "phase safe_mode ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t5-__fmt_t4).count() << " total=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t5-__fmt_t0).count() << "\n";
 
     return out;
 }
