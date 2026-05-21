@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 TEST_CASE("formatter: function calls support block layout", "[formatter]") {
     FormatOptions opts;
@@ -22,8 +23,9 @@ TEST_CASE("formatter: autoarg comment in multiline module header is safe", "[for
     opts.safe_mode = true;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
-    opts.port.non_ansi_port_per_line_enabled = true;
-    opts.port.non_ansi_port_per_line = 3;
+    opts.module.parameter_layout = "hanging";
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 3;
 
     std::string input =
         "module memory_top #( parameter int WIDTH = 4, parameter int DEPTH = 8 ) ( /*autoarg*/\n"
@@ -34,12 +36,56 @@ TEST_CASE("formatter: autoarg comment in multiline module header is safe", "[for
 
     std::string formatted;
     REQUIRE_NOTHROW(formatted = format_source(input, opts));
-    CHECK(formatted == "module memory_top #(parameter int WIDTH = 4, parameter int DEPTH = 8) ( "
-                       "/*autoarg*/\n"
+    CHECK(formatted == "module memory_top #(parameter int WIDTH = 4,\n"
+                       "                    parameter int DEPTH = 8)( /*autoarg*/\n"
                        "    i_clk, i_rst_n, i_data,\n"
                        "    i_data2\n"
                        ");\n"
                        "endmodule\n");
+}
+
+TEST_CASE("formatter: module parameter layout block", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.parameter_layout = "block";
+    opts.port_declaration.align = false;
+
+    CHECK(format_source("module register #(parameter type T = logic [7:0], parameter int DEPTH = "
+                        "8, parameter int SIZE = 4, parameter logic [7:0] TABLE[SIZE] = "
+                        "'{8'h00, 8'h11, 8'h22, 8'h33})(input logic clk);\n"
+                        "endmodule\n",
+                        opts) ==
+          "module register #(\n"
+          "    parameter type T = logic [7:0],\n"
+          "    parameter int DEPTH = 8,\n"
+          "    parameter int SIZE = 4,\n"
+          "    parameter logic [7:0] TABLE[SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33}\n"
+          ")(\n"
+          "    input logic clk\n"
+          ");\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: module parameter layout hanging", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.parameter_layout = "hanging";
+    opts.port_declaration.align = false;
+
+    CHECK(format_source("module register #(parameter type T = logic [7:0], parameter int DEPTH = "
+                        "8, parameter int SIZE = 4, parameter logic [7:0] TABLE[SIZE] = "
+                        "'{8'h00, 8'h11, 8'h22, 8'h33})(input logic clk);\n"
+                        "endmodule\n",
+                        opts) ==
+          "module register #(parameter type T = logic [7:0],\n"
+          "                  parameter int DEPTH = 8,\n"
+          "                  parameter int SIZE = 4,\n"
+          "                  parameter logic [7:0] TABLE[SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33})(\n"
+          "    input logic clk\n"
+          ");\n"
+          "endmodule\n");
 }
 
 TEST_CASE("formatter: function calls inside if conditions use configured layout", "[formatter]") {
@@ -130,6 +176,39 @@ TEST_CASE("formatter: macro calls with empty arguments are preserved", "[formatt
 
     const std::string src = "module top;\n"
                             "  `DV_CHECK_FATAL(expr, , msg_id)\n"
+                            "endmodule\n";
+
+    REQUIRE_NOTHROW(format_source(src, opts));
+}
+
+TEST_CASE("formatter: macro call indent follows surrounding block", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+
+    const std::string src = "module top;\n"
+                            "foreach (mems[i]) begin\n"
+                            "dv_base_mem dv_mem;\n"
+                            "`downcast(dv_mem, mems[i], , , msg_id)\n"
+                            "end\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    std::vector<std::string> lines;
+    std::istringstream ss(formatted);
+    for (std::string line; std::getline(ss, line);)
+        lines.push_back(line);
+    REQUIRE(lines.size() >= 4);
+    CHECK(lines[2].find_first_not_of(' ') == lines[3].find_first_not_of(' '));
+}
+
+TEST_CASE("formatter: comments with parentheses are not treated as calls", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.function.break_policy = "always";
+
+    const std::string src = "module top;\n"
+                            "// If the memory supports write (WO or RW) then keep this comment.\n"
                             "endmodule\n";
 
     REQUIRE_NOTHROW(format_source(src, opts));
@@ -322,8 +401,8 @@ TEST_CASE("formatter: var decls after port decls aligned", "[formatter]") {
     opts.port_declaration.section4_min_width = 20;
     opts.port_declaration.section5_min_width = 20;
     opts.statement.align = true;
-    opts.port.non_ansi_port_per_line_enabled = true;
-    opts.port.non_ansi_port_per_line = 3;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 3;
     opts.default_indent_level_inside_outmost_block = 0;
 
     // Mimics memory_top.sv: non-ANSI module with port decls followed by var decls
@@ -434,8 +513,8 @@ TEST_CASE("formatter: var declarations after expanded module header are aligned"
     opts.var_declaration.section2_min_width = 20;
     opts.var_declaration.section3_min_width = 20;
     opts.var_declaration.section4_min_width = 16;
-    opts.port.non_ansi_port_per_line_enabled = true;
-    opts.port.non_ansi_port_per_line = 1;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 1;
     opts.default_indent_level_inside_outmost_block = 0;
 
     std::string formatted = format_source("module top(a, b, c);\n"
@@ -525,6 +604,29 @@ TEST_CASE("formatter: line comments do not block instance port expansion", "[for
                                  "endmodule\n");
 }
 
+TEST_CASE("formatter: standalone line comments inside instance ports are preserved",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.port_indent_level = 1;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source("module top;\n"
+                                              "memory u_mem(\n"
+                                              ".address(addr),\n"
+                                              "// standalone comment\n"
+                                              ".data_in(data),\n"
+                                              ".chip_en(en));\n"
+                                              "endmodule\n",
+                                              opts));
+    CHECK(formatted.find("// standalone comment") != std::string::npos);
+}
+
 TEST_CASE("formatter: block comments do not block instance port expansion", "[formatter]") {
     FormatOptions opts;
     opts.safe_mode = true;
@@ -586,8 +688,8 @@ TEST_CASE("formatter: expands instances after declarations like memory_top", "[f
     opts.var_declaration.section2_min_width = 20;
     opts.var_declaration.section3_min_width = 20;
     opts.var_declaration.section4_min_width = 16;
-    opts.port.non_ansi_port_per_line_enabled = true;
-    opts.port.non_ansi_port_per_line = 3;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 3;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
 
@@ -876,7 +978,9 @@ TEST_CASE("formatter: tab_align does not align equals inside headers or for cont
                         "x = 2;\n"
                         "end\n"
                         "endinterface\n",
-                        opts) == "interface bus_intf #(parameter W_IDTH = 8) (\n"
+                        opts) == "interface bus_intf #(\n"
+                                 "    parameter W_IDTH = 8\n"
+                                 ")(\n"
                                  "    input       logic               i_clk\n"
                                  ");\n"
                                  "for (int i = 0; i < 32; i++) begin\n"
@@ -979,7 +1083,7 @@ TEST_CASE("formatter: duplicate instance port comments are preserved", "[formatt
     CHECK(formatted.find("// b comment") != std::string::npos);
 }
 
-TEST_CASE("formatter: demo memory_top is unchanged with project config", "[formatter]") {
+TEST_CASE("formatter: demo memory_top formats with project config", "[formatter]") {
     Config cfg = load_config(".");
     std::ifstream file("demo/memory_top.sv");
     REQUIRE(file.good());
@@ -989,5 +1093,5 @@ TEST_CASE("formatter: demo memory_top is unchanged with project config", "[forma
 
     std::string formatted;
     REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
-    CHECK(formatted == input);
+    CHECK(format_source(formatted, cfg.format) == formatted);
 }

@@ -34,11 +34,12 @@ static std::vector<std::string> validate_config(const Config& cfg) {
                "[lint.module].module_instantiation_style", {"positional", "named", "both"});
     check_enum(cfg.lint.function.function_call_style, "[lint.function].function_call_style",
                {"positional", "named", "both"});
-    check_enum(cfg.format.keyword_case, "[format].keyword_case", {"preserve", "upper", "lower"});
     check_enum(cfg.format.function.break_policy, "[format.function_call].break_policy",
                {"auto", "always", "never"});
     check_enum(cfg.format.function.layout, "[format.function_call].layout", {"block", "hanging"});
     check_enum(cfg.format.function_declaration.layout, "[format.function_declaration].layout",
+               {"block", "hanging"});
+    check_enum(cfg.format.module.parameter_layout, "[format.module].parameter_layout",
                {"block", "hanging"});
     check_enum(cfg.format.spacing.binary_operator_spacing,
                "[format.spacing].binary_operator_spacing", {"none", "before", "after", "both"});
@@ -124,8 +125,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 cfg.format.indent_size = static_cast<int>(*v);
             if (auto v = (*f)["compact_indexing_and_selections"].value<bool>())
                 cfg.format.compact_indexing_and_selections = *v;
-            if (auto v = (*f)["keyword_case"].value<std::string>())
-                cfg.format.keyword_case = *v;
             if (auto v = (*f)["blank_lines_between_items"].value<int64_t>())
                 cfg.format.blank_lines_between_items = static_cast<int>(*v);
             if (auto v = (*f)["default_indent_level_inside_outmost_block"].value<int64_t>())
@@ -213,15 +212,17 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 if (auto v = (*fd)["line_length"].value<int64_t>())
                     cfg.format.function_declaration.line_length = static_cast<int>(*v);
             }
-            if (auto po = (*f)["port"].as_table()) {
+            if (auto po = (*f)["module"].as_table()) {
                 if (auto v = (*po)["non_ansi_port_per_line_enabled"].value<bool>())
-                    cfg.format.port.non_ansi_port_per_line_enabled = *v;
+                    cfg.format.module.non_ansi_port_per_line_enabled = *v;
                 if (auto v = (*po)["non_ansi_port_per_line"].value<int64_t>())
-                    cfg.format.port.non_ansi_port_per_line = static_cast<int>(*v);
+                    cfg.format.module.non_ansi_port_per_line = static_cast<int>(*v);
                 if (auto v = (*po)["non_ansi_port_max_line_length_enabled"].value<bool>())
-                    cfg.format.port.non_ansi_port_max_line_length_enabled = *v;
+                    cfg.format.module.non_ansi_port_max_line_length_enabled = *v;
                 if (auto v = (*po)["non_ansi_port_max_line_length"].value<int64_t>())
-                    cfg.format.port.non_ansi_port_max_line_length = static_cast<int>(*v);
+                    cfg.format.module.non_ansi_port_max_line_length = static_cast<int>(*v);
+                if (auto v = (*po)["parameter_layout"].value<std::string>())
+                    cfg.format.module.parameter_layout = *v;
             }
             if (auto en = (*f)["enum_declaration"].as_table()) {
                 if (auto v = (*en)["align"].value<bool>())

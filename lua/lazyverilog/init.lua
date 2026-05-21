@@ -7,7 +7,6 @@
 ---   require('lazyverilog').setup({
 ---     format = {
 ---       indent_size  = 2,
----       keyword_case = "lower",
 ---     },
 ---     on_attach = function(client, bufnr)
 ---       -- your keymaps / extra config here

@@ -26,7 +26,6 @@ M.defaults = {
 		-- space_after_comma    = true,
 		-- align_port_declarations = true,
 		-- port_newline         = true,
-		-- keyword_case         = "preserve",  -- "preserve" | "lower" | "upper"
 		-- max_line_length      = 120,
 		-- blank_lines_between_items = 1,
 	},

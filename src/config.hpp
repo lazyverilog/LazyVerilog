@@ -69,11 +69,12 @@ struct FunctionDeclarationOptions {
     int line_length{100};
 };
 
-struct PortOptions {
+struct ModuleOptions {
     bool non_ansi_port_per_line_enabled{false};
     int non_ansi_port_per_line{1};
     bool non_ansi_port_max_line_length_enabled{false};
     int non_ansi_port_max_line_length{80};
+    std::string parameter_layout{"block"};
 };
 
 struct EnumOptions {
@@ -106,7 +107,6 @@ struct SpacingOptions {
 struct FormatOptions {
     int indent_size{2};
     bool compact_indexing_and_selections{true};
-    std::string keyword_case{"preserve"};
     int blank_lines_between_items{1};
     int default_indent_level_inside_outmost_block{1};
     bool tab_align{false};
@@ -119,7 +119,7 @@ struct FormatOptions {
     InstanceOptions instance;
     FunctionOptions function;
     FunctionDeclarationOptions function_declaration;
-    PortOptions port;
+    ModuleOptions module;
     EnumOptions enum_declaration;
     ModportOptions modport;
     SpacingOptions spacing;

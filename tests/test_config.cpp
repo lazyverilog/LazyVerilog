@@ -75,7 +75,6 @@ enable = false
 
 [format]
 indent_size = 4
-keyword_case = "lower"
 blank_lines_between_items = 2
 default_indent_level_inside_outmost_block = 0
 compact_indexing_and_selections = false
@@ -126,7 +125,8 @@ indexed_part_select_spacing = "before"
 procedural_event_control_at_spacing = "both"
 space_inside_event_control_parens = true
 
-[format.port]
+[format.module]
+parameter_layout = "hanging"
 non_ansi_port_per_line_enabled = true
 non_ansi_port_per_line = 4
 
@@ -212,7 +212,6 @@ autoarg_on_save = true
     CHECK(cfg.inlay_hint.enable == false);
 
     CHECK(cfg.format.indent_size == 4);
-    CHECK(cfg.format.keyword_case == "lower");
     CHECK(cfg.format.blank_lines_between_items == 2);
     CHECK(cfg.format.default_indent_level_inside_outmost_block == 0);
     CHECK(cfg.format.compact_indexing_and_selections == false);
@@ -257,8 +256,9 @@ autoarg_on_save = true
     CHECK(cfg.format.spacing.procedural_event_control_at_spacing == "both");
     CHECK(cfg.format.spacing.space_inside_event_control_parens == true);
 
-    CHECK(cfg.format.port.non_ansi_port_per_line_enabled == true);
-    CHECK(cfg.format.port.non_ansi_port_per_line == 4);
+    CHECK(cfg.format.module.non_ansi_port_per_line_enabled == true);
+    CHECK(cfg.format.module.non_ansi_port_per_line == 4);
+    CHECK(cfg.format.module.parameter_layout == "hanging");
     CHECK(cfg.format.enum_declaration.align == true);
     CHECK(cfg.format.enum_declaration.align_adaptive == true);
     CHECK(cfg.format.enum_declaration.enum_name_min_width == 8);
