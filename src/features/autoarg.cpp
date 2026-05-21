@@ -89,8 +89,8 @@ std::string format_autoarg(
 {
     std::string indent((size_t)std::max(0, format_options.indent_size), ' ');
     std::string out = "(\n";
-    int ports_per_line = format_options.port.non_ansi_port_per_line_enabled
-                             ? format_options.port.non_ansi_port_per_line
+    int ports_per_line = format_options.module.non_ansi_port_per_line_enabled
+                             ? format_options.module.non_ansi_port_per_line
                              : 1;
     ports_per_line = std::max(1, ports_per_line);
 

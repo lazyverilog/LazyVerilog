@@ -24,14 +24,6 @@ Number of spaces per indentation level.
 
 Legacy option retained for compatibility. New configs should prefer `[format.spacing].dimension_binary_operator_spacing`.
 
-### `keyword_case`
-
-| type | default | values |
-|------|---------|--------|
-| string | `"preserve"` | `"preserve"`, `"lower"`, `"upper"` |
-
-Controls output casing for SystemVerilog keywords.
-
 ### `blank_lines_between_items`
 
 | type | default |
@@ -447,17 +439,42 @@ Compatibility note:
 - Old configs may still use `align_instance_port_adaptive`.
 - New configs should use `align_adaptive`.
 
-## `[format.port]`
+## `[format.module]`
 
 ```toml
-[format.port]
+[format.module]
+parameter_layout = "block"
 non_ansi_port_per_line_enabled = false
 non_ansi_port_per_line = 1
 non_ansi_port_max_line_length_enabled = false
 non_ansi_port_max_line_length = 80
 ```
 
-Controls formatting of non-ANSI module header port lists.
+Controls formatting of module parameter lists and non-ANSI module header port lists.
+
+### `parameter_layout`
+
+| type | default | values |
+|------|---------|--------|
+| string | `"block"` | `"block"`, `"hanging"` |
+
+Controls formatting of `#(...)` module parameter lists.
+
+`"block"` puts each parameter on its own indented line:
+
+```systemverilog
+module register #(
+    parameter type T = logic [7:0],
+    parameter int DEPTH = 8
+)(
+```
+
+`"hanging"` aligns subsequent parameters under the first parameter:
+
+```systemverilog
+module register #(parameter type T = logic [7:0],
+                  parameter int DEPTH = 8)(
+```
 
 ### `non_ansi_port_per_line_enabled`
 ### `non_ansi_port_per_line`

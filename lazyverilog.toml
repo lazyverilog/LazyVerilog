@@ -62,7 +62,6 @@ show_file = true             # show "[rtl/cpu.sv]" after module name
 [format]
 safe_mode = true # verify no non-whitespace content changed after format
 indent_size = 4
-keyword_case = "lower"          # "lower" | "upper" | "preserve"
 compact_indexing_and_selections = true
 blank_lines_between_items = 1
 default_indent_level_inside_outmost_block = 0
@@ -117,7 +116,8 @@ space_inside_paren = false
 layout = "block"           # hanging | block — applies to function and task declarations
 line_length = 13          # declarations shorter than this stay single-line
 
-[format.port]
+[format.module]
+parameter_layout = "hanging" # block | hanging
 non_ansi_port_per_line_enabled = true
 non_ansi_port_per_line = 3
 non_ansi_port_max_line_length_enabled = false
