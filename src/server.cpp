@@ -667,7 +667,7 @@ void LazyVerilogServer::register_handlers() {
                 const auto& uri = req.params.textDocument.uri.raw_uri_;
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    std::string formatted = format_source(state->text, config_.format, state->tree);
+                    std::string formatted = format_source(state->text, config_.format);
                     if (formatted != state->text) {
                         rsp.result.push_back(whole_document_edit(state->text, formatted));
                     }
@@ -691,7 +691,7 @@ void LazyVerilogServer::register_handlers() {
             if (state) {
                 // Format the full document so the formatter has surrounding context, but return
                 // an edit restricted to the requested range.
-                std::string formatted = format_source(state->text, config_.format, state->tree);
+                std::string formatted = format_source(state->text, config_.format);
                 auto edit = range_format_edit(state->text, formatted, req.params.range);
                 if (edit.newText != slice_lsp_range(state->text, edit.range))
                     rsp.result.push_back(std::move(edit));
@@ -996,7 +996,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string mode = get_string(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    std::string formatted = format_source(state->text, config_.format, state->tree);
+                    std::string formatted = format_source(state->text, config_.format);
                     optional<lsTextEdit> edit;
                     if (mode == "range") {
                         int start_line = get_int(2);

@@ -194,3 +194,7 @@ endif()
 
 add_executable(parse-bench tools/parse_bench.cpp)
 target_link_libraries(parse-bench PRIVATE slang::slang)
+
+add_executable(fmt-file tools/fmt_file.cpp src/features/formatter.cpp src/config.cpp)
+target_include_directories(fmt-file PRIVATE src)
+target_link_libraries(fmt-file PRIVATE slang::slang tomlplusplus::tomlplusplus)

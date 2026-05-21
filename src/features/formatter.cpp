@@ -1,18 +1,18 @@
 #include "formatter.hpp"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <iostream>
+#include <slang/parsing/Lexer.h>
 #include <slang/parsing/Token.h>
-#include <slang/syntax/AllSyntax.h>
-#include <slang/syntax/SyntaxTree.h>
-#include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
+#include <slang/util/BumpAllocator.h>
 #include <sstream>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 using namespace slang;
-using namespace slang::syntax;
+using namespace slang::parsing;
 
 namespace {
 
@@ -27,94 +27,30 @@ static int tab_aligned_width(int value, const FormatOptions& opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Slang-based line classification
+// Line vector helpers
 // ---------------------------------------------------------------------------
 
-enum class LineKind { Other, PortDecl, VarDecl, Instantiation, ModuleHeader };
-
-struct LineClassifier : SyntaxVisitor<LineClassifier> {
-    const SourceManager& sm;
-    std::unordered_map<int, LineKind> kinds; // 0-based line -> kind
-
-    explicit LineClassifier(const SourceManager& s) : sm(s) {}
-
-    int line_of(const SyntaxNode& node) const {
-        auto tok = node.getFirstToken();
-        if (!tok || !tok.location().valid())
-            return -1;
-        return (int)sm.getLineNumber(tok.location()) - 1; // convert to 0-based
-    }
-
-    void set(const SyntaxNode& node, LineKind k) {
-        int ln = line_of(node);
-        if (ln >= 0)
-            kinds.emplace(ln, k);
-    }
-
-    void handle(const ImplicitAnsiPortSyntax& n) {
-        set(n, LineKind::PortDecl);
-        visitDefault(n);
-    }
-    void handle(const PortDeclarationSyntax& n) {
-        set(n, LineKind::PortDecl);
-        visitDefault(n);
-    }
-    void handle(const DataDeclarationSyntax& n) {
-        set(n, LineKind::VarDecl);
-        visitDefault(n);
-    }
-    void handle(const NetDeclarationSyntax& n) {
-        set(n, LineKind::VarDecl);
-        visitDefault(n);
-    }
-    void handle(const HierarchyInstantiationSyntax& n) {
-        set(n, LineKind::Instantiation);
-        visitDefault(n);
-    }
-    void handle(const ModuleDeclarationSyntax& n) {
-        if (n.kind == SyntaxKind::ModuleDeclaration)
-            set(n, LineKind::ModuleHeader);
-        visitDefault(n);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// FormattedLine — intermediate representation passed between formatter passes
-// ---------------------------------------------------------------------------
-//
-// Each line carries its text content plus metadata (syntactic kind, disabled
-// status).  Passes receive and return vectors of FormattedLine instead of flat
-// strings, eliminating redundant split/join per pass and fragile line-number
-// remapping for kind classification.
-
-struct FormattedLine {
-    std::string text;
-    LineKind kind{LineKind::Other};
-    bool disabled{false};
-};
-
-static std::string render_lines(const std::vector<FormattedLine>& lines) {
+static std::string render_lines(const std::vector<std::string>& lines) {
     std::string r;
     for (size_t k = 0; k < lines.size(); ++k) {
         if (k)
             r += '\n';
-        r += lines[k].text;
+        r += lines[k];
     }
     return r;
 }
 
-static std::vector<FormattedLine> text_to_lines(const std::string& text,
-                                                 LineKind kind = LineKind::Other) {
-    std::vector<FormattedLine> lines;
+static std::vector<std::string> text_to_lines(const std::string& text) {
+    std::vector<std::string> lines;
     std::istringstream ss(text);
     std::string l;
     while (std::getline(ss, l))
-        lines.push_back({std::move(l), kind, false});
+        lines.push_back(std::move(l));
     return lines;
 }
 
 // ---------------------------------------------------------------------------
-// CST formatting token helpers
+// Formatting token helpers
 // ---------------------------------------------------------------------------
 
 using slang::parsing::TokenKind;
@@ -789,34 +725,79 @@ static std::string normalize_bracket_spacing(const std::string& text, const Form
     return out;
 }
 
-static std::vector<Tok> collect_cst_tokens(const std::string& source, const SyntaxTree& tree,
-                                           bool source_only) {
+static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
     std::vector<Tok> toks;
+    SourceManager sm;
+    auto buffer = sm.assignText(source);
+    BumpAllocator alloc;
+    Diagnostics diagnostics;
+    Lexer lexer(buffer, alloc, diagnostics, sm);
+
     size_t cursor = 0;
-    const auto& sm = tree.sourceManager();
-    for (auto it = tree.root().tokens_begin(); it != tree.root().tokens_end(); ++it) {
-        auto token = *it;
-        if (!token || token.isMissing() || token.kind == TokenKind::EndOfFile)
-            continue;
+    while (true) {
+        Token token = lexer.lex();
+        if (token.kind == TokenKind::EndOfFile) {
+            break;
+        }
+        // Get the offset of this token
         auto loc = token.location();
         if (!loc.valid())
             continue;
-        if (!sm.isFileLoc(loc))
-            continue;
-        if (source_only) {
-            auto buf_text = sm.getSourceText(loc.buffer());
-            if (buf_text.size() < source.size() ||
-                buf_text.substr(0, source.size()) != std::string_view(source))
-                continue;
-        }
         size_t off = loc.offset();
         if (off > source.size())
             continue;
         if (off < cursor)
             continue;
+        // Fill gap between cursor and this token with trivia text
+        // (handles comments, directives, strings in gaps)
         if (cursor < off)
             append_trivia_text(toks, source, cursor, off);
         std::string raw(token.rawText());
+        if (!raw.empty() && raw[0] == '`') {
+            size_t line_start = off;
+            while (line_start > 0 && source[line_start - 1] != '\n')
+                --line_start;
+            size_t first = line_start;
+            while (first < off && (source[first] == ' ' || source[first] == '\t'))
+                ++first;
+            size_t name_end = off + 1;
+            while (name_end < source.size() &&
+                   (std::isalnum((unsigned char)source[name_end]) || source[name_end] == '_' ||
+                    source[name_end] == '$'))
+                ++name_end;
+            std::string name = source.substr(off, name_end - off);
+            static const std::unordered_set<std::string> DIRECTIVES = {
+                "`include", "`define", "`ifdef", "`ifndef", "`elsif", "`else", "`endif"};
+            if (first == off && has(DIRECTIVES, name)) {
+                size_t end = off;
+                do {
+                    while (end < source.size() && source[end] != '\n')
+                        ++end;
+                    if (end == 0 || source[end - 1] != '\\')
+                        break;
+                    if (end < source.size())
+                        ++end;
+                } while (end < source.size());
+                push_tok(toks, token.kind, source.substr(off, end - off), (int)off, false, false,
+                         true);
+                cursor = std::max(cursor, end);
+                continue;
+            }
+        }
+        if (!raw.empty() && std::isdigit((unsigned char)raw[0])) {
+            size_t end = off + raw.size();
+            if (end < source.size() && source[end] == '\'') {
+                ++end;
+                while (end < source.size() &&
+                       (std::isalnum((unsigned char)source[end]) || source[end] == '_' ||
+                        source[end] == '\'' || source[end] == '?' || source[end] == 'x' ||
+                        source[end] == 'X' || source[end] == 'z' || source[end] == 'Z'))
+                    ++end;
+                push_tok(toks, token.kind, source.substr(off, end - off), (int)off);
+                cursor = std::max(cursor, end);
+                continue;
+            }
+        }
         if (!raw.empty())
             push_tok(toks, token.kind, raw, (int)off);
         cursor = std::max(cursor, off + raw.size());
@@ -824,6 +805,76 @@ static std::vector<Tok> collect_cst_tokens(const std::string& source, const Synt
     if (cursor < source.size())
         append_trivia_text(toks, source, cursor, source.size());
     return toks;
+}
+
+static std::string trim_left_copy(std::string s) {
+    size_t first = s.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return "";
+    s.erase(0, first);
+    return s;
+}
+
+static std::string trim_right_copy(std::string s) {
+    size_t last = s.find_last_not_of(" \t");
+    if (last == std::string::npos)
+        return "";
+    s.erase(last + 1);
+    return s;
+}
+
+static std::pair<std::string, std::string> split_code_line_comment_tokenized(
+    const std::string& line) {
+    for (const auto& tok : collect_lexer_tokens(line)) {
+        if (tok.comment) {
+            return {trim_right_copy(line.substr(0, (size_t)tok.pos)), " " + line.substr(tok.pos)};
+        }
+    }
+    return {trim_right_copy(line), ""};
+}
+
+static std::vector<std::string> code_tokens_for_alignment(const std::string& code) {
+    std::vector<std::string> out;
+    for (const auto& tok : collect_lexer_tokens(code)) {
+        if (tok.whitespace || tok.comment || tok.directive)
+            continue;
+        out.push_back(tok.text);
+    }
+    return out;
+}
+
+static std::vector<std::string> group_bracket_tokens(std::vector<std::string> toks) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        if (toks[i] != "[") {
+            out.push_back(std::move(toks[i]));
+            continue;
+        }
+        std::string grouped = "[";
+        int depth = 1;
+        while (++i < toks.size()) {
+            grouped += toks[i];
+            if (toks[i] == "[")
+                ++depth;
+            else if (toks[i] == "]" && --depth == 0)
+                break;
+        }
+        out.push_back(std::move(grouped));
+    }
+    return out;
+}
+
+static std::vector<Tok> significant_tokens(const std::string& text) {
+    std::vector<Tok> out;
+    for (auto& tok : collect_lexer_tokens(text)) {
+        if (!tok.whitespace && !tok.comment && !tok.directive)
+            out.push_back(std::move(tok));
+    }
+    return out;
+}
+
+static bool tok_is(const Tok& tok, const std::string& text, TokenKind kind) {
+    return tok.text == text || tok.kind == kind;
 }
 
 // ---------------------------------------------------------------------------
@@ -871,15 +922,8 @@ static PortParsed parse_port(const std::string& raw, const FormatOptions& opts) 
     while (p < s.size() && (s[p] == ' ' || s[p] == '\t'))
         ++p;
     r.indent = s.substr(0, p);
-    std::string code = s.substr(p);
-
-    auto cp = code.find("//");
-    if (cp != std::string::npos) {
-        r.comment = " " + code.substr(cp);
-        code = code.substr(0, cp);
-        while (!code.empty() && (code.back() == ' ' || code.back() == '\t'))
-            code.pop_back();
-    }
+    auto [code, comment] = split_code_line_comment_tokenized(s.substr(p));
+    r.comment = std::move(comment);
     if (!code.empty() && (code.back() == ',' || code.back() == ';')) {
         r.terminator = std::string(1, code.back());
         code.pop_back();
@@ -887,27 +931,7 @@ static PortParsed parse_port(const std::string& raw, const FormatOptions& opts) 
             code.pop_back();
     }
 
-    std::vector<std::string> toks;
-    {
-        std::vector<std::string> raw;
-        std::istringstream ss(code);
-        std::string w;
-        while (ss >> w)
-            raw.push_back(w);
-        // Expand compact "ident[...]" tokens (e.g., "packet_t[0:0]" → "packet_t" + "[0:0]")
-        // so parse_port correctly identifies user-defined types with packed dimensions.
-        for (auto& t : raw) {
-            if (!t.empty() && t[0] != '[' && (std::isalpha((unsigned char)t[0]) || t[0] == '_')) {
-                auto bk = t.find('[');
-                if (bk != std::string::npos) {
-                    toks.push_back(t.substr(0, bk));
-                    toks.push_back(t.substr(bk));
-                    continue;
-                }
-            }
-            toks.push_back(t);
-        }
-    }
+    std::vector<std::string> toks = group_bracket_tokens(code_tokens_for_alignment(code));
     if (toks.empty())
         return r;
 
@@ -953,7 +977,7 @@ static PortParsed parse_port(const std::string& raw, const FormatOptions& opts) 
         bool pure_id = is_pure_id(cand);
         if (pure_id && cand[0] != '[' && !has(QUALS, cl)) {
             bool is_builtin = has(BTYPES, cl);
-            bool is_usertype = pure_id && idx + 1 < toks.size();
+            bool is_usertype = pure_id && idx + 1 < toks.size() && toks[idx + 1] != ",";
             if (is_builtin || is_usertype) {
                 r.dtype = toks[idx++];
                 if (has(NET_TYPES, cl) && idx < toks.size()) {
@@ -1030,9 +1054,9 @@ static PortParsed parse_port(const std::string& raw, const FormatOptions& opts) 
     return r;
 }
 
-static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
                                                    const FormatOptions& opts) {
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     size_t i = 0;
     bool disabled_region = false;
     bool module_header_region = false;
@@ -1048,14 +1072,14 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
     auto is_port_decl_line = [&](int idx) -> bool {
         if (idx < 0 || idx >= (int)lines.size())
             return false;
-        if (starts_with_port_dir(lines[idx].text))
+        if (starts_with_port_dir(lines[idx]))
             return true;
-        return lines[(size_t)idx].kind == LineKind::PortDecl;
+        return false;
     };
     auto is_semi_only = [&](int idx) -> bool {
         if (idx < 0 || idx >= (int)lines.size())
             return false;
-        const std::string& line = lines[idx].text;
+        const std::string& line = lines[idx];
         size_t p = 0;
         while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
             ++p;
@@ -1063,7 +1087,7 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
                line.find_first_not_of(" \t", p + 1) == std::string::npos;
     };
     while (i < lines.size()) {
-        std::string trimmed_line = lines[i].text;
+        std::string trimmed_line = lines[i];
         size_t ta = trimmed_line.find_first_not_of(" \t");
         size_t tb = trimmed_line.find_last_not_of(" \t");
         trimmed_line =
@@ -1105,7 +1129,7 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
         }
 
         struct PortBlkEntry {
-            FormattedLine orig;
+            std::string orig;
             std::string port_text;
             PortParsed parsed;
         };
@@ -1114,8 +1138,8 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
         while (j < lines.size()) {
             if (!is_port_decl_line((int)j))
                 break;
-            FormattedLine fl = lines[j];
-            std::string port_line = lines[j].text;
+            std::string fl = lines[j];
+            std::string port_line = lines[j];
             ++j;
             if (is_semi_only((int)j)) {
                 port_line += ";";
@@ -1273,7 +1297,7 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
                 line += pp.comment;
             while (!line.empty() && line.back() == ' ')
                 line.pop_back();
-            out.push_back({line, e.orig.kind});
+            out.push_back(line);
         }
         i = j;
     }
@@ -1284,73 +1308,110 @@ static std::vector<FormattedLine> align_port_pass(std::vector<FormattedLine> lin
 // Statement assignment alignment pass
 // ---------------------------------------------------------------------------
 
-static std::vector<FormattedLine> align_assign_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> align_assign_pass(std::vector<std::string> lines,
                                                      const FormatOptions& opts) {
     auto find_op = [&](const std::string& line) -> std::pair<int, std::string> {
-        size_t cp = line.find("//");
-        std::string code = (cp != std::string::npos) ? line.substr(0, cp) : line;
         static const std::vector<std::string> OPS = {"<<<=", ">>>=", "<<=", ">>=", "<=", "+=", "-=",
                                                      "*=",   "/=",   "%=",  "&=",  "|=", "^=", "="};
         int paren = 0;
         int bracket = 0;
         int brace = 0;
-        for (size_t i = 0; i < code.size(); ++i) {
-            char ch = code[i];
-            if (ch == '(')
-                ++paren;
-            else if (ch == ')' && paren > 0)
-                --paren;
-            else if (ch == '[')
-                ++bracket;
-            else if (ch == ']' && bracket > 0)
-                --bracket;
-            else if (ch == '{')
-                ++brace;
-            else if (ch == '}' && brace > 0)
-                --brace;
-            if (paren != 0 || bracket != 0 || brace != 0 || ch != ' ')
+        for (const auto& tok : collect_lexer_tokens(line)) {
+            if (tok.comment)
+                break;
+            if (tok.whitespace || tok.directive)
                 continue;
-            for (const auto& op : OPS) {
-                size_t op_pos = i + 1;
-                size_t after = op_pos + op.size();
-                if (after < code.size() && code.compare(op_pos, op.size(), op) == 0 &&
-                    code[after] == ' ') {
-                    return {(int)i, op};
-                }
-            }
+            if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+                ++paren;
+            else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+                --paren;
+            else if (tok_is(tok, "[", TokenKind::OpenBracket))
+                ++bracket;
+            else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+                --bracket;
+            else if (tok_is(tok, "{", TokenKind::OpenBrace))
+                ++brace;
+            else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+                --brace;
+            if (paren == 0 && bracket == 0 && brace == 0 &&
+                std::find(OPS.begin(), OPS.end(), tok.text) != OPS.end())
+                return {tok.pos, tok.text};
         }
         return {-1, ""};
     };
 
     auto is_var = [&](int line_idx) -> bool {
-        return lines[line_idx].kind == LineKind::VarDecl;
+        auto toks = significant_tokens(lines[(size_t)line_idx]);
+        if (toks.size() < 3 || toks.back().text != ";")
+            return false;
+        static const std::unordered_set<std::string> BUILTIN_TYPES = {
+            "wire", "logic", "reg", "bit", "byte", "int", "integer", "time",
+            "shortint", "longint", "signed", "unsigned"};
+        static const std::unordered_set<std::string> PREFIX_KW = {
+            "static", "automatic", "const", "var"};
+        static const std::unordered_set<std::string> EXCLUDED = {
+            "input", "output", "inout", "ref"};
+        if (has(EXCLUDED, toks[0].lo))
+            return false;
+        size_t idx = 0;
+        while (idx < toks.size() && has(PREFIX_KW, toks[idx].lo))
+            ++idx;
+        if (idx >= toks.size())
+            return false;
+        if (has(BUILTIN_TYPES, toks[idx].lo))
+            return true;
+        return is_identifier(toks[idx]) && !is_keyword(toks[idx]) && idx + 1 < toks.size() &&
+               (is_identifier(toks[idx + 1]) || toks[idx + 1].text == "[" ||
+                toks[idx + 1].lo == "signed" || toks[idx + 1].lo == "unsigned");
+    };
+    auto starts_with_token = [](const std::string& line, const std::string& text) -> bool {
+        for (const auto& tok : collect_lexer_tokens(line)) {
+            if (tok.whitespace || tok.comment || tok.directive)
+                continue;
+            return tok.lo == text;
+        }
+        return false;
     };
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
-        auto [p0, op0] = find_op(lines[i].text);
+        auto [p0, op0] = find_op(lines[i]);
         if (p0 < 0 || is_var((int)i)) {
             out.push_back(lines[i]);
             ++i;
             continue;
         }
         size_t ind = 0;
-        while (ind < lines[i].text.size() &&
-               (lines[i].text[ind] == ' ' || lines[i].text[ind] == '\t'))
+        while (ind < lines[i].size() &&
+               (lines[i][ind] == ' ' || lines[i][ind] == '\t'))
             ++ind;
+        if (i > 0 && starts_with_token(lines[i - 1], "for")) {
+            size_t j = i;
+            while (j < lines.size()) {
+                const auto& lj = lines[j];
+                size_t ij = 0;
+                while (ij < lj.size() && (lj[ij] == ' ' || lj[ij] == '\t'))
+                    ++ij;
+                if (ij != ind || is_var((int)j) || find_op(lj).first < 0)
+                    break;
+                out.push_back(lines[j]);
+                ++j;
+            }
+            i = j;
+            continue;
+        }
 
         struct E {
             std::string line;
             int pos;
             std::string op;
             int lw;
-            LineKind kind;
         };
         std::vector<E> grp;
         size_t j = i;
         while (j < lines.size()) {
-            const auto& lj = lines[j].text;
+            const auto& lj = lines[j];
             if (lj.empty())
                 break;
             if (is_var((int)j))
@@ -1363,7 +1424,8 @@ static std::vector<FormattedLine> align_assign_pass(std::vector<FormattedLine> l
             auto [pj, oj] = find_op(lj);
             if (pj < 0)
                 break;
-            grp.push_back({lj, pj, oj, (int)(pj - (int)ij), lines[j].kind});
+            std::string lhs = trim_right_copy(lj.substr(0, (size_t)pj));
+            grp.push_back({lj, pj, oj, (int)(lhs.size() - ij)});
             ++j;
         }
         if (grp.empty()) {
@@ -1380,10 +1442,10 @@ static std::vector<FormattedLine> align_assign_pass(std::vector<FormattedLine> l
             col = snap_to_indent_grid((int)ind + mx + 1, opts.indent_size) - (int)ind;
         for (auto& e : grp) {
             int sp = std::max(1, col - e.lw);
-            std::string lhs = e.line.substr(0, e.pos);
-            size_t rs = (size_t)(e.pos + 1 + (int)e.op.size() + 1);
-            std::string rhs = (rs < e.line.size()) ? e.line.substr(rs) : "";
-            out.push_back({lhs + std::string(sp, ' ') + e.op + " " + rhs, e.kind});
+            std::string lhs = trim_right_copy(e.line.substr(0, (size_t)e.pos));
+            size_t rs = (size_t)(e.pos + (int)e.op.size());
+            std::string rhs = (rs < e.line.size()) ? trim_left_copy(e.line.substr(rs)) : "";
+            out.push_back(lhs + std::string(sp, ' ') + e.op + " " + rhs);
         }
         i = j;
     }
@@ -1425,18 +1487,7 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
     while (ip < stripped.size() && (stripped[ip] == ' ' || stripped[ip] == '\t'))
         ++ip;
     std::string indent = stripped.substr(0, ip);
-    std::string code = stripped.substr(ip);
-
-    // Strip trailing // comment
-    std::string comment;
-    auto cm = code.rfind("//");
-    if (cm != std::string::npos) {
-        // Make sure // is not inside a string
-        comment = " " + code.substr(cm);
-        code = code.substr(0, cm);
-        while (!code.empty() && (code.back() == ' ' || code.back() == '\t'))
-            code.pop_back();
-    }
+    auto [code, comment] = split_code_line_comment_tokenized(stripped.substr(ip));
 
     // Must end with ;
     if (code.empty() || code.back() != ';')
@@ -1445,29 +1496,9 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
     while (!code.empty() && (code.back() == ' ' || code.back() == '\t'))
         code.pop_back();
 
-    // Split into tokens, expanding compact "identifier[...]" tokens
-    std::vector<std::string> raw_toks;
-    {
-        std::istringstream ss(code);
-        std::string w;
-        while (ss >> w)
-            raw_toks.push_back(w);
-    }
-    if (raw_toks.empty())
+    std::vector<std::string> toks = group_bracket_tokens(code_tokens_for_alignment(code));
+    if (toks.empty())
         return nullptr;
-    // Expand compact "ident[...]" -> "ident" + "[...]"
-    std::vector<std::string> toks;
-    for (auto& t : raw_toks) {
-        if (!t.empty() && t[0] != '[' && (std::isalpha((unsigned char)t[0]) || t[0] == '_')) {
-            auto bk = t.find('[');
-            if (bk != std::string::npos) {
-                toks.push_back(t.substr(0, bk));
-                toks.push_back(t.substr(bk));
-                continue;
-            }
-        }
-        toks.push_back(t);
-    }
 
     std::string first = lower(toks[0]);
     if (has(VAR_EXCLUDED, first))
@@ -1593,21 +1624,19 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
     return vp;
 }
 
-static std::vector<FormattedLine> align_var_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> align_var_pass(std::vector<std::string> lines,
                                                   const FormatOptions& opts) {
     const auto& vo = opts.var_declaration;
 
     auto is_var_idx = [&](int idx) -> bool {
-        if (lines[(size_t)idx].kind == LineKind::VarDecl)
-            return true;
-        VarParsed* parsed = parse_var_line(lines[(size_t)idx].text, opts);
+        VarParsed* parsed = parse_var_line(lines[(size_t)idx], opts);
         if (!parsed)
             return false;
         delete parsed;
         return true;
     };
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
         // Enter a block only if this line is a variable declaration.
@@ -1619,13 +1648,13 @@ static std::vector<FormattedLine> align_var_pass(std::vector<FormattedLine> line
 
         // Collect block
         struct BlkEntry {
-            FormattedLine orig;
+            std::string orig;
             VarParsed* parsed;
         };
         std::vector<BlkEntry> block;
         size_t j = i;
         while (j < lines.size()) {
-            const std::string& cur = lines[j].text;
+            const std::string& cur = lines[j];
             if (is_var_idx((int)j)) {
                 block.push_back({lines[j], parse_var_line(cur, opts)});
                 ++j;
@@ -1783,7 +1812,7 @@ static std::vector<FormattedLine> align_var_pass(std::vector<FormattedLine> line
                 ln += vp.comment;
             while (!ln.empty() && ln.back() == ' ')
                 ln.pop_back();
-            out.push_back({ln, e.orig.kind});
+            out.push_back(ln);
             delete e.parsed;
         }
         i = j;
@@ -1853,52 +1882,6 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
     size_t j = start;
     while (j < lines.size()) {
         std::string stripped = lines[j];
-        size_t sp = 0;
-        while (sp < stripped.size() && (stripped[sp] == ' ' || stripped[sp] == '\t'))
-            ++sp;
-        stripped = stripped.substr(sp);
-
-        std::string code = stripped;
-        size_t line_comment = find_line_comment_start(stripped);
-        if (line_comment != std::string::npos) {
-            code = stripped.substr(0, line_comment);
-            std::string comment = stripped.substr(line_comment);
-            std::string port = last_named_port_before_comment(code);
-            if (!port.empty())
-                comments.port_comments.push_back({port, comment});
-            else if (code.find('(') != std::string::npos && comments.header.empty())
-                comments.header = comment;
-        }
-
-        parts.push_back(code);
-        for (char ch : code) {
-            if (ch == '(')
-                ++depth;
-            else if (ch == ')')
-                --depth;
-            else if (ch == ';' && depth == 0) {
-                end_i = j + 1;
-                flat = "";
-                for (size_t k = 0; k < parts.size(); ++k) {
-                    if (k)
-                        flat += ' ';
-                    flat += parts[k];
-                }
-                return true;
-            }
-        }
-        ++j;
-    }
-    return false;
-}
-
-static bool collect_instance(const std::vector<FormattedLine>& lines, size_t start, size_t& end_i,
-                             std::string& flat, InstanceComments& comments) {
-    std::vector<std::string> parts;
-    int depth = 0;
-    size_t j = start;
-    while (j < lines.size()) {
-        std::string stripped = lines[j].text;
         size_t sp = 0;
         while (sp < stripped.size() && (stripped[sp] == ' ' || stripped[sp] == '\t'))
             ++sp;
@@ -2153,17 +2136,17 @@ static bool split_inst_parts(const std::string& flat, std::string& module_type,
     return true;
 }
 
-static std::vector<FormattedLine> expand_instances_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> expand_instances_pass(std::vector<std::string> lines,
                                                         const FormatOptions& opts) {
     const std::string port_indent(opts.instance.port_indent_level * opts.indent_size, ' ');
     int m_before = opts.instance.instance_port_name_width;
     int m_inside = opts.instance.instance_port_between_paren_width;
     bool adaptive = opts.instance.align_adaptive;
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
-        const std::string& line = lines[i].text;
+        const std::string& line = lines[i];
 
         size_t first = line.find_first_not_of(" \t");
         if (first == std::string::npos || !(std::isalpha((unsigned char)line[first]) ||
@@ -2259,7 +2242,7 @@ static std::vector<FormattedLine> expand_instances_pass(std::vector<FormattedLin
             hdr += " " + leading_comments;
         if (!comments.header.empty())
             hdr += " " + comments.header;
-        out.push_back({hdr});
+        out.push_back(hdr);
         size_t comment_index = 0;
         for (size_t k = 0; k < ports.size(); ++k) {
             auto& [port, sig] = ports[k];
@@ -2283,9 +2266,9 @@ static std::vector<FormattedLine> expand_instances_pass(std::vector<FormattedLin
             if (comment_index < comments.port_comments.size() &&
                 comments.port_comments[comment_index].first == port)
                 pline += " " + comments.port_comments[comment_index++].second;
-            out.push_back({pline});
+            out.push_back(pline);
         }
-        out.push_back({indent + ");"});
+        out.push_back(indent + ");");
         i = end_i;
     }
     return out;
@@ -2351,38 +2334,6 @@ static bool collect_statement_lines(const std::vector<std::string>& lines, size_
     return false;
 }
 
-static bool collect_statement_lines(const std::vector<FormattedLine>& lines, size_t start,
-                                    size_t& end_i, std::string& flat) {
-    int paren = 0;
-    int brace = 0;
-    std::vector<std::string> parts;
-    for (size_t i = start; i < lines.size(); ++i) {
-        std::string trimmed = trim_copy(lines[i].text);
-        parts.push_back(trimmed);
-        for (char ch : trimmed) {
-            if (ch == '(')
-                ++paren;
-            else if (ch == ')' && paren > 0)
-                --paren;
-            else if (ch == '{')
-                ++brace;
-            else if (ch == '}' && brace > 0)
-                --brace;
-            else if (ch == ';' && paren == 0 && brace == 0) {
-                end_i = i;
-                flat.clear();
-                for (size_t k = 0; k < parts.size(); ++k) {
-                    if (k)
-                        flat += ' ';
-                    flat += parts[k];
-                }
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 struct EnumItemParsed {
     std::string name;
     std::string value;
@@ -2419,14 +2370,14 @@ static std::string pad_right(std::string s, int width) {
     return s;
 }
 
-static std::vector<FormattedLine> format_enum_declaration_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> format_enum_declaration_pass(std::vector<std::string> lines,
                                                                const FormatOptions& opts) {
     const auto& eo = opts.enum_declaration;
     const std::string enum_indent(opts.indent_size, ' ');
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string& line = lines[i].text;
+        const std::string& line = lines[i];
         size_t first = line.find_first_not_of(" \t");
         if (first == std::string::npos || !starts_with_word_at(line, first, "typedef")) {
             out.push_back(lines[i]);
@@ -2514,7 +2465,7 @@ static std::vector<FormattedLine> format_enum_declaration_pass(std::vector<Forma
             }
         }
 
-        out.push_back({leading + prefix + " {"});
+        out.push_back(leading + prefix + " {");
         for (size_t k = 0; k < items.size(); ++k) {
             const auto& item = items[k];
             std::string comma = (k + 1 < items.size()) ? "," : "";
@@ -2549,9 +2500,9 @@ static std::vector<FormattedLine> format_enum_declaration_pass(std::vector<Forma
                 while (!enum_line.empty() && enum_line.back() == ' ')
                     enum_line.pop_back();
             }
-            out.push_back({enum_line});
+            out.push_back(enum_line);
         }
-        out.push_back({leading + "} " + suffix + ";"});
+        out.push_back(leading + "} " + suffix + ";");
         i = end_i;
     }
 
@@ -2633,14 +2584,14 @@ static bool parse_modport_statement(const std::string& flat, std::vector<Modport
     return !modports.empty();
 }
 
-static std::vector<FormattedLine> format_modport_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> format_modport_pass(std::vector<std::string> lines,
                                                       const FormatOptions& opts) {
     const auto& mo = opts.modport;
     const std::string item_indent(opts.indent_size, ' ');
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     for (size_t i = 0; i < lines.size(); ++i) {
-        const std::string& line = lines[i].text;
+        const std::string& line = lines[i];
         size_t first = line.find_first_not_of(" \t");
         if (first == std::string::npos || !starts_with_word_at(line, first, "modport")) {
             out.push_back(lines[i]);
@@ -2682,7 +2633,7 @@ static std::vector<FormattedLine> format_modport_pass(std::vector<FormattedLine>
                         item_base_col - block_dir_width;
                 }
             }
-            out.push_back({leading + "modport " + mp.name + " ("});
+            out.push_back(leading + "modport " + mp.name + " (");
             for (size_t pi = 0; pi < mp.items.size(); ++pi) {
                 const auto& item = mp.items[pi];
                 std::string comma = (pi + 1 < mp.items.size()) ? "," : "";
@@ -2709,9 +2660,9 @@ static std::vector<FormattedLine> format_modport_pass(std::vector<FormattedLine>
                     while (!port_line.empty() && port_line.back() == ' ')
                         port_line.pop_back();
                 }
-                out.push_back({port_line});
+                out.push_back(port_line);
             }
-            out.push_back({leading + std::string(")") + (mi + 1 < modports.size() ? "," : ";")});
+            out.push_back(leading + std::string(")") + (mi + 1 < modports.size() ? "," : ";"));
         }
         i = end_i;
     }
@@ -2780,16 +2731,16 @@ static std::string render_call_single(const std::string& prefix, const std::stri
     return r;
 }
 
-static std::vector<FormattedLine> format_function_calls_pass(std::vector<FormattedLine> lines,
+static std::vector<std::string> format_function_calls_pass(std::vector<std::string> lines,
                                                                 const FormatOptions& opts) {
     const auto& fo = opts.function;
     std::string text = render_lines(lines);
     auto disabled = find_disabled(text);
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     int pos = 0;
     for (size_t li = 0; li < lines.size(); ++li) {
-        const std::string& line = lines[li].text;
+        const std::string& line = lines[li];
         int line_start = pos;
         pos += (int)line.size() + 1; // +1 for the newline consumed by getline
         if (line.find('\n') != std::string::npos) {
@@ -2849,7 +2800,7 @@ static std::vector<FormattedLine> format_function_calls_pass(std::vector<Formatt
                        (fo.arg_count >= 0 && (int)args.size() >= fo.arg_count);
         }
         if (!do_break || fo.break_policy == "never") {
-            out.push_back({single});
+            out.push_back(single);
             continue;
         }
 
@@ -2865,7 +2816,7 @@ static std::vector<FormattedLine> format_function_calls_pass(std::vector<Formatt
                     r += ",";
             }
             r += ")" + suffix;
-            out.push_back({r});
+            out.push_back(r);
         } else {
             std::string base_indent(prefix.size(), ' ');
             std::string arg_indent = base_indent + std::string(std::max(0, opts.indent_size), ' ');
@@ -2877,7 +2828,7 @@ static std::vector<FormattedLine> format_function_calls_pass(std::vector<Formatt
                 r += "\n";
             }
             r += base_indent + ")" + suffix;
-            out.push_back({r});
+            out.push_back(r);
         }
     }
     return out;
@@ -2892,107 +2843,177 @@ static std::vector<FormattedLine> format_function_calls_pass(std::vector<Formatt
 // Returns false if not a single-line module header.
 static bool extract_single_line_module_header(const std::string& line, std::string& prefix,
                                               std::string& ports_str, std::string& suffix_str) {
-    size_t i = 0, n = line.size();
-    // Skip leading whitespace
-    while (i < n && (line[i] == ' ' || line[i] == '\t'))
-        ++i;
-    // Skip keyword (module/macromodule)
-    size_t kw_start = i;
-    while (i < n && std::isalnum((unsigned char)line[i]))
-        ++i;
-    std::string keyword = lower(line.substr(kw_start, i - kw_start));
-    if (keyword != "module" && keyword != "macromodule")
-        return false;
-    while (i < n && (line[i] == ' ' || line[i] == '\t'))
-        ++i;
-    // Skip module name (identifier)
-    while (i < n && (std::isalnum((unsigned char)line[i]) || line[i] == '_'))
-        ++i;
-    while (i < n && (line[i] == ' ' || line[i] == '\t'))
-        ++i;
-    // Skip optional #(...) param block
-    if (i < n && line[i] == '#') {
-        ++i;
-        while (i < n && (line[i] == ' ' || line[i] == '\t'))
-            ++i;
-        if (i < n && line[i] == '(') {
-            int depth = 1;
-            ++i;
-            while (i < n && depth > 0) {
-                if (line[i] == '(')
-                    ++depth;
-                else if (line[i] == ')')
-                    --depth;
-                ++i;
-            }
-            while (i < n && (line[i] == ' ' || line[i] == '\t'))
-                ++i;
-        }
-    }
-    // Expect '('
-    if (i >= n || line[i] != '(')
-        return false;
-    size_t open_paren = i;
-    ++i;
-    // Find matching ')' on same line
-    int depth = 1;
-    while (i < n && depth > 0) {
-        if (line[i] == '(')
-            ++depth;
-        else if (line[i] == ')') {
-            if (--depth == 0)
-                break;
-        }
-        if (depth > 0)
-            ++i;
-    }
-    if (i >= n || depth != 0)
-        return false;
-    size_t close_paren = i;
-    ++i;
-    // Skip whitespace, expect ';'
-    while (i < n && (line[i] == ' ' || line[i] == '\t'))
-        ++i;
-    if (i >= n || line[i] != ';')
-        return false;
-    size_t semi_pos = i;
-    ++i;
-    // Must be end of line
-    while (i < n && (line[i] == ' ' || line[i] == '\t'))
-        ++i;
-    if (i != n)
+    auto toks = significant_tokens(line);
+    if (toks.size() < 4 || (toks[0].lo != "module" && toks[0].lo != "macromodule"))
         return false;
 
-    prefix = line.substr(0, open_paren + 1); // up to and including '('
+    size_t i = 1;
+    if (i >= toks.size() || !is_identifier(toks[i]))
+        return false;
+    ++i;
+
+    if (i < toks.size() && tok_is(toks[i], "#", TokenKind::Hash)) {
+        ++i;
+        if (i >= toks.size() || !tok_is(toks[i], "(", TokenKind::OpenParenthesis))
+            return false;
+        int depth = 1;
+        while (i + 1 < toks.size() && depth > 0) {
+            ++i;
+            if (tok_is(toks[i], "(", TokenKind::OpenParenthesis))
+                ++depth;
+            else if (tok_is(toks[i], ")", TokenKind::CloseParenthesis))
+                --depth;
+        }
+        if (depth != 0)
+            return false;
+        ++i;
+    }
+
+    if (i >= toks.size() || !tok_is(toks[i], "(", TokenKind::OpenParenthesis))
+        return false;
+    size_t open_paren = (size_t)toks[i].pos;
+
+    int depth = 1;
+    size_t close_index = i;
+    while (close_index + 1 < toks.size() && depth > 0) {
+        ++close_index;
+        if (tok_is(toks[close_index], "(", TokenKind::OpenParenthesis))
+            ++depth;
+        else if (tok_is(toks[close_index], ")", TokenKind::CloseParenthesis))
+            --depth;
+    }
+    if (depth != 0 || close_index >= toks.size())
+        return false;
+    size_t close_paren = (size_t)toks[close_index].pos;
+
+    size_t semi_index = close_index + 1;
+    if (semi_index >= toks.size() || !tok_is(toks[semi_index], ";", TokenKind::Semicolon))
+        return false;
+    if (semi_index + 1 != toks.size())
+        return false;
+    size_t semi_pos = (size_t)toks[semi_index].pos;
+
+    prefix = line.substr(0, open_paren + 1);
     ports_str = line.substr(open_paren + 1, close_paren - open_paren - 1);
-    suffix_str = line.substr(close_paren, semi_pos - close_paren + 1); // ')...;'
+    suffix_str = line.substr(close_paren, semi_pos - close_paren + 1);
     return true;
 }
 
-static std::vector<FormattedLine> format_portlist_pass(std::vector<FormattedLine> lines,
+static bool is_module_header_start_tokenized(const std::string& line) {
+    auto toks = significant_tokens(line);
+    return !toks.empty() && (toks[0].lo == "module" || toks[0].lo == "macromodule");
+}
+
+static bool module_header_statement_complete_tokenized(const std::string& flat) {
+    auto toks = significant_tokens(flat);
+    if (toks.empty())
+        return false;
+    int paren = 0;
+    int brace = 0;
+    int bracket = 0;
+    for (const auto& tok : toks) {
+        if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+            ++paren;
+        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+            --paren;
+        else if (tok_is(tok, "{", TokenKind::OpenBrace))
+            ++brace;
+        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+            --brace;
+        else if (tok_is(tok, "[", TokenKind::OpenBracket))
+            ++bracket;
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+            --bracket;
+        else if (tok_is(tok, ";", TokenKind::Semicolon) && paren == 0 && brace == 0 && bracket == 0)
+            return true;
+    }
+    return false;
+}
+
+static std::vector<std::string> split_top_level_tokenized(const std::string& text) {
+    std::vector<std::string> parts;
+    int paren = 0;
+    int bracket = 0;
+    int brace = 0;
+    size_t start = 0;
+    for (const auto& tok : significant_tokens(text)) {
+        if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+            ++paren;
+        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+            --paren;
+        else if (tok_is(tok, "[", TokenKind::OpenBracket))
+            ++bracket;
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+            --bracket;
+        else if (tok_is(tok, "{", TokenKind::OpenBrace))
+            ++brace;
+        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+            --brace;
+        else if (tok_is(tok, ",", TokenKind::Comma) && paren == 0 && bracket == 0 && brace == 0) {
+            parts.push_back(text.substr(start, (size_t)tok.pos - start));
+            start = (size_t)tok.pos + tok.text.size();
+        }
+    }
+    parts.push_back(text.substr(start));
+    return parts;
+}
+
+static bool is_simple_identifier_tokenized(const std::string& text) {
+    auto toks = significant_tokens(text);
+    return toks.size() == 1 && is_identifier(toks[0]);
+}
+
+static std::string first_token_lower(const std::string& text) {
+    auto toks = significant_tokens(text);
+    return toks.empty() ? std::string() : toks[0].lo;
+}
+
+static std::string take_leading_portlist_block_comments_tokenized(std::string& ports_str) {
+    size_t erase_end = 0;
+    std::string comments;
+    for (const auto& tok : collect_lexer_tokens(ports_str)) {
+        if (tok.whitespace)
+            continue;
+        if (!tok.comment || tok.text.rfind("/*", 0) != 0)
+            break;
+        comments += ports_str.substr(erase_end, (size_t)tok.pos + tok.text.size() - erase_end);
+        erase_end = (size_t)tok.pos + tok.text.size();
+    }
+    if (erase_end > 0)
+        ports_str.erase(0, erase_end);
+    return comments;
+}
+
+static std::string leading_horizontal_whitespace_tokenized(const std::string& line) {
+    for (const auto& tok : collect_lexer_tokens(line)) {
+        if (tok.whitespace)
+            continue;
+        return line.substr(0, (size_t)tok.pos);
+    }
+    return line;
+}
+
+static std::vector<std::string> format_portlist_pass(std::vector<std::string> lines,
                                                        const FormatOptions& opts) {
     const std::string indent_unit(opts.indent_size, ' ');
 
-    std::vector<FormattedLine> out;
+    std::vector<std::string> out;
     auto push_original_lines = [&](size_t first, size_t last) {
         for (size_t k = first; k <= last; ++k)
             out.push_back(lines[k]);
     };
     for (size_t i = 0; i < lines.size(); ++i) {
-        std::string line = lines[i].text;
+        std::string line = lines[i];
 
-        size_t first = line.find_first_not_of(" \t");
-        bool module_start =
-            first != std::string::npos && (line.compare(first, 7, "module ") == 0 ||
-                                           line.compare(first, 12, "macromodule ") == 0);
+        bool module_start = is_module_header_start_tokenized(line);
         size_t consumed_end = i;
-        if (module_start && line.find(';') == std::string::npos) {
+        if (module_start && !module_header_statement_complete_tokenized(line)) {
             std::string flat = line;
             size_t j = i + 1;
             for (; j < lines.size(); ++j) {
-                std::string trimmed = trim_copy(lines[j].text);
+                std::string trimmed = trim_copy(lines[j]);
                 flat += " " + trimmed;
-                if (trimmed.find(");") != std::string::npos)
+                if (module_header_statement_complete_tokenized(flat))
                     break;
             }
             if (j < lines.size()) {
@@ -3008,19 +3029,14 @@ static std::vector<FormattedLine> format_portlist_pass(std::vector<FormattedLine
             i = consumed_end;
             continue;
         }
-        prefix += take_leading_portlist_block_comments(ports_str);
+        prefix += take_leading_portlist_block_comments_tokenized(ports_str);
 
-        auto ports = split_top_level(ports_str);
+        auto ports = split_top_level_tokenized(ports_str);
         std::vector<std::string> trimmed_ports;
         for (auto& p : ports) {
-            size_t a = 0;
-            while (a < p.size() && (p[a] == ' ' || p[a] == '\t'))
-                ++a;
-            size_t b = p.size();
-            while (b > a && (p[b - 1] == ' ' || p[b - 1] == '\t'))
-                --b;
-            if (b > a)
-                trimmed_ports.push_back(p.substr(a, b - a));
+            std::string trimmed = trim_copy(p);
+            if (!trimmed.empty())
+                trimmed_ports.push_back(std::move(trimmed));
         }
         if (trimmed_ports.empty()) {
             push_original_lines(i, consumed_end);
@@ -3029,18 +3045,14 @@ static std::vector<FormattedLine> format_portlist_pass(std::vector<FormattedLine
         }
 
         // Leading whitespace
-        std::string leading_ws;
-        for (size_t k = 0; k < line.size() && (line[k] == ' ' || line[k] == '\t'); ++k)
-            leading_ws += line[k];
+        std::string leading_ws = leading_horizontal_whitespace_tokenized(line);
         std::string port_indent = leading_ws + indent_unit;
 
         // ANSI vs non-ANSI detection
         static const std::unordered_set<std::string> ANSI_DIR = {"input", "output", "inout", "ref"};
         bool is_ansi = false;
         for (auto& p : trimmed_ports) {
-            std::istringstream ss(p);
-            std::string first;
-            ss >> first;
+            std::string first = first_token_lower(p);
             if (!first.empty() && has(ANSI_DIR, lower(first))) {
                 is_ansi = true;
                 break;
@@ -3088,27 +3100,13 @@ static std::vector<FormattedLine> format_portlist_pass(std::vector<FormattedLine
             }
             new_lines_str = prefix + "\n" + port_lines + "\n" + leading_ws + suffix_str;
         } else {
-            // Check all are simple identifiers (char scan)
+            // Check all are simple identifiers.
             bool all_simple = true;
             for (auto& p : trimmed_ports) {
-                if (p.empty()) {
+                if (!is_simple_identifier_tokenized(p)) {
                     all_simple = false;
                     break;
                 }
-                char c0 = p[0];
-                if (!std::isalpha((unsigned char)c0) && c0 != '_' && c0 != '$') {
-                    all_simple = false;
-                    break;
-                }
-                for (size_t k = 1; k < p.size(); ++k) {
-                    char c = p[k];
-                    if (!std::isalnum((unsigned char)c) && c != '_' && c != '$') {
-                        all_simple = false;
-                        break;
-                    }
-                }
-                if (!all_simple)
-                    break;
             }
             if (!all_simple) {
                 push_original_lines(i, consumed_end);
@@ -3201,19 +3199,15 @@ static std::vector<FormattedLine> format_portlist_pass(std::vector<FormattedLine
 //   Phase 2: structural layout / reflow of multiline constructs  (post-token)
 //   Phase 3: line-group alignment                                (post-token)
 //
-// All post-token passes operate on vectors of FormattedLine.  Each line
-// carries its syntactic kind (from the slang LineClassifier), so passes
-// can identify line roles without re-parsing text or maintaining fragile
-// line-number maps.
-//
-// All passes now operate natively on FormattedLine vectors.
+// Post-token passes operate on plain line vectors.  Passes that need syntactic
+// roles classify the relevant lines locally from lexer tokens.
 
-static std::vector<FormattedLine> run_module_header_layout_phase(std::vector<FormattedLine> lines,
+static std::vector<std::string> run_module_header_layout_phase(std::vector<std::string> lines,
                                                                  const FormatOptions& opts) {
     return format_portlist_pass(std::move(lines), opts);
 }
 
-static std::vector<FormattedLine> run_line_group_alignment_phase(std::vector<FormattedLine> lines,
+static std::vector<std::string> run_line_group_alignment_phase(std::vector<std::string> lines,
                                                                  const FormatOptions& opts) {
     if (opts.statement.align)
         lines = align_assign_pass(std::move(lines), opts);
@@ -3224,8 +3218,8 @@ static std::vector<FormattedLine> run_line_group_alignment_phase(std::vector<For
     return lines;
 }
 
-static std::vector<FormattedLine> run_structural_layout_phase(
-    std::vector<FormattedLine> lines, const FormatOptions& opts) {
+static std::vector<std::string> run_structural_layout_phase(
+    std::vector<std::string> lines, const FormatOptions& opts) {
     lines = format_enum_declaration_pass(std::move(lines), opts);
     lines = format_modport_pass(std::move(lines), opts);
     if (opts.instance.align)
@@ -3234,11 +3228,20 @@ static std::vector<FormattedLine> run_structural_layout_phase(
     return lines;
 }
 
-static std::vector<FormattedLine> run_post_token_pipeline(std::vector<FormattedLine> lines,
+static std::vector<std::string> run_post_token_pipeline(std::vector<std::string> lines,
                                                           const FormatOptions& opts) {
+    using Clock = std::chrono::steady_clock;
+    auto t0 = Clock::now();
+    std::cerr << "phase post:start lines=" << lines.size() << "\n";
     lines = run_module_header_layout_phase(std::move(lines), opts);
+    auto t1 = Clock::now();
+    std::cerr << "phase post:module_header ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count() << " lines=" << lines.size() << "\n";
     lines = run_line_group_alignment_phase(std::move(lines), opts);
+    auto t2 = Clock::now();
+    std::cerr << "phase post:alignment ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count() << " lines=" << lines.size() << "\n";
     lines = run_structural_layout_phase(std::move(lines), opts);
+    auto t3 = Clock::now();
+    std::cerr << "phase post:structural ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(t3-t2).count() << " lines=" << lines.size() << "\n";
     return lines;
 }
 
@@ -3266,32 +3269,13 @@ static void verify_safe_mode_unchanged(const std::string& source, const std::str
 // format_source — main entry point
 // ---------------------------------------------------------------------------
 
-std::string format_source(const std::string& source, const FormatOptions& opts,
-                          std::shared_ptr<const SyntaxTree> ext_tree) {
+std::string format_source(const std::string& source, const FormatOptions& opts) {
+    using Clock = std::chrono::steady_clock;
+    auto __fmt_t0 = Clock::now();
     // -----------------------------------------------------------------------
-    // STEP 1: Build (or reuse) the slang SyntaxTree
-    //
-    // The SyntaxTree is slang's parse tree — it represents the full structure
-    // of the Verilog/SystemVerilog source (modules, ports, statements, etc.)
-    // without doing any semantic elaboration.
-    //
-    // If the caller already parsed the same source (ext_tree != null), reuse
-    // it to avoid a redundant parse.  Otherwise we own our own SourceManager.
-    //
-    // source_only_tree = true means we are using the caller's tree; the token
-    // positions in that tree map directly to `source` bytes.
+    // STEP 1: Tokenize using slang::Lexer (no SyntaxTree/CST needed)
     // -----------------------------------------------------------------------
     const std::string& input = source;
-    std::unique_ptr<SourceManager> sm_owned;
-    std::shared_ptr<const SyntaxTree> tree;
-    bool source_only_tree = false;
-    if (ext_tree) {
-        tree = ext_tree;
-        source_only_tree = true;
-    } else {
-        sm_owned = std::make_unique<SourceManager>();
-        tree = SyntaxTree::fromText(input, *sm_owned);
-    }
 
     // -----------------------------------------------------------------------
     // STEP 3: Build helper data structures
@@ -3302,28 +3286,17 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
     //                `// verilog_format: off` … `// verilog_format: on`
     //                regions.  Tokens inside these ranges are copied verbatim.
     //
-    // tokens       — ordered list of Tok structs extracted from the CST.
+    // tokens       — ordered list of Tok structs extracted from the Lexer.
     //                Each Tok has: text, pos (byte offset), and bool flags
     //                (whitespace, comment, directive, keyword, etc.).
     // -----------------------------------------------------------------------
     const std::string indent_unit(opts.indent_size, ' ');
     auto disabled = find_disabled(input);
-    auto tokens = collect_cst_tokens(input, *tree, source_only_tree);
-
-    // -----------------------------------------------------------------------
-    // STEP 4: Classify every original source line by its syntactic role
-    //
-    // LineClassifier walks the SyntaxTree and assigns each line a LineKind
-    // (e.g. port declaration, variable declaration, assignment, instance, …).
-    // This is used later by the alignment passes so they only align lines of
-    // the same kind within a contiguous block.
-    // -----------------------------------------------------------------------
-    std::unordered_map<int, LineKind> orig_line_kinds;
-    {
-        LineClassifier clf(tree->sourceManager());
-        clf.visit(tree->root());
-        orig_line_kinds = std::move(clf.kinds);
-    }
+    auto __fmt_t1 = Clock::now();
+    std::cerr << "phase find_disabled ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t1-__fmt_t0).count() << "\n";
+    auto tokens = collect_lexer_tokens(input);
+    auto __fmt_t2 = Clock::now();
+    std::cerr << "phase collect_tokens ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t2-__fmt_t1).count() << " tokens=" << tokens.size() << "\n";
 
     // -----------------------------------------------------------------------
     // STEP 5: Build byte-offset → original line number table
@@ -3351,12 +3324,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
     // the formatted output string.  All the variables below track the
     // "current state of the world" as we advance through the token stream.
     // -----------------------------------------------------------------------
-
-    // fmt_line_count  — how many '\n' characters have been written to `out`
-    //                   so far.  Used to assign LineKind to formatted lines.
-    int fmt_line_count = 0;
-    std::unordered_map<int, LineKind> fmt_line_kinds;
-    std::unordered_set<int> fmt_line_seen; // track first token per orig line
 
     std::string out;
     out.reserve(input.size() + input.size() / 4); // pre-allocate ~25% extra
@@ -3465,19 +3432,16 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
             out += '\n';
             at_bol = true;
             pending_nl = false;
-            ++fmt_line_count;
         }
         if (blank_pend > 0) {
             if (!at_bol) {
                 out += '\n';
                 at_bol = true;
-                ++fmt_line_count;
-            }
+                }
             for (int k = 0; k < blank_pend; ++k) {
                 out += '\n';
                 at_bol = true;
-                ++fmt_line_count;
-            }
+                }
             blank_pend = 0;
         }
     };
@@ -3519,9 +3483,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
         // disabled region doesn't influence spacing after it.
         if (in_disabled(tok.pos, disabled)) {
             flush_nl();
-            for (char c : tok.text)
-                if (c == '\n')
-                    ++fmt_line_count;
             out += tok.text;
             at_bol = !tok.text.empty() && tok.text.back() == '\n';
             after_dis = !at_bol; // remember we just left a disabled region mid-line
@@ -3561,10 +3522,10 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
         bool procedural_at = prev && ((tok.text == "@" && is_procedural_event_keyword(*prev)) ||
                                       (prev->text == "@" && prev_at_procedural));
         ParenKind paren_kind = ParenKind::Ordinary;
-        if (prev && (prev->text == "(" || tok.text == ")")) {
+        if (prev && (prev->text == "(" || tok_is(tok, ")", TokenKind::CloseParenthesis))) {
             if (!paren_stack.empty())
                 paren_kind = paren_stack.back();
-        } else if (prev && tok.text == "(")
+        } else if (prev && tok_is(tok, "(", TokenKind::OpenParenthesis))
             paren_kind = classify_paren(*prev, procedural_at);
         int spaces = 0;
         SD dec = SD::Undecided;
@@ -3614,12 +3575,10 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
             if (!at_bol) {
                 out += '\n';
                 at_bol = true;
-                ++fmt_line_count;
-            }
+                }
             for (int k = 0; k < blank_pend; ++k) {
                 out += '\n';
-                ++fmt_line_count;
-            }
+                }
             blank_pend = 0;
         } else if (dec == SD::MustAppend) {
             // Force this token onto the same line — cancel any pending newline.
@@ -3665,7 +3624,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
             if (!indent_stack.empty())
                 indent_stack.pop_back();
             indent_level = std::max(0, indent_level - delta);
-        } else if (is_close_group(tok) && tok.text == "}" && !brace_stk.empty() &&
+        } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace) && !brace_stk.empty() &&
                    brace_stk.back() == "struct") {
             int delta = indent_stack.empty() ? 1 : indent_stack.back();
             if (!indent_stack.empty())
@@ -3682,29 +3641,17 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
         else
             emit(tok.text);
 
-        // --- I. Assign LineKind to formatted line ---
-        // Only the first token from each original line is recorded.
-        // Directly maps orig_line_kinds to the current formatted line.
-        if (!in_disabled(tok.pos, disabled) && !tok.whitespace) {
-            int orig_ln = (tok.pos < (int)pos_to_orig_line.size()) ? pos_to_orig_line[tok.pos] : 0;
-            if (fmt_line_seen.insert(orig_ln).second) {
-                auto kit = orig_line_kinds.find(orig_ln);
-                if (kit != orig_line_kinds.end())
-                    fmt_line_kinds.emplace(fmt_line_count, kit->second);
-            }
-        }
-
         // --- J. Update bracket/paren/dim depth counters ---
         // dim_depth tracks `[…]` nesting for array dimensions.
         // paren_depth tracks `(…)` nesting.
         // When we see `(` after case/if/for/while, record the depth so we
         // know which `)` closes the expression.
         // `;` resets dim_depth because dimensions never span statements.
-        if (tok.text == "[")
+        if (tok_is(tok, "[", TokenKind::OpenBracket))
             ++dim_depth;
-        else if (tok.text == "]" && dim_depth > 0)
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && dim_depth > 0)
             --dim_depth;
-        else if (tok.text == "(") {
+        else if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
             ++paren_depth;
             paren_stack.push_back(prev ? classify_paren(*prev, prev_at_procedural)
                                        : ParenKind::Ordinary);
@@ -3718,7 +3665,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
                 control_expr_depth = paren_depth; // remember which ')' ends the control expr
                 control_expr_pending = false;
             }
-        } else if (tok.text == ")" && paren_depth > 0) {
+        } else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren_depth > 0) {
             if (case_expr_depth == paren_depth) {
                 // Closing `)` of `case (expr)` → next token goes on a new line
                 pending_nl = true;
@@ -3737,7 +3684,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
                 paren_stack.pop_back();
             if (!for_header_stack.empty())
                 for_header_stack.pop_back();
-        } else if (tok.text == ";")
+        } else if (tok_is(tok, ";", TokenKind::Semicolon))
             dim_depth = 0; // `;` always ends any dimension context
 
         // --- K. Post-emit housekeeping ---
@@ -3792,7 +3739,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
                 // Next `{` should be treated as a struct/union brace (indented).
                 struct_pend = true;
             }
-        } else if (is_open_group(tok) && tok.text == "{") {
+        } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
             if (struct_pend) {
                 // `{` right after `struct`/`union` → indent the members inside.
                 brace_stk.push_back("struct");
@@ -3804,11 +3751,11 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
                 brace_stk.push_back("other");
             }
             struct_pend = false;
-        } else if (is_close_group(tok) && tok.text == "}") {
+        } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace)) {
             // Pop the brace stack (indent was already decremented in step G).
             if (!brace_stk.empty())
                 brace_stk.pop_back();
-        } else if (tok.text == ";") {
+        } else if (tok_is(tok, ";", TokenKind::Semicolon)) {
             // Semicolon = end of statement.
             // At top-level (paren_depth==0) schedule a newline after it.
             // Inside `for (init; cond; incr)` paren_depth > 0 → no newline.
@@ -3864,7 +3811,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
     // -----------------------------------------------------------------------
     if (!at_bol) {
         out += '\n';
-        ++fmt_line_count;
     }
 
     // Collapse extra trailing newlines to one
@@ -3872,20 +3818,14 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
         out.pop_back();
 
     // -----------------------------------------------------------------------
-    // STEP 9: Convert to FormattedLine vector and run post-token pipeline
-    //
-    // Each line carries its syntactic kind directly, so downstream passes
-    // can identify line roles (port decl, var decl, etc.) without a separate
-    // line-number map.
+    // STEP 9: Convert to plain lines and run post-token pipeline.
+    // Post-passes classify lines locally from lexer tokens when needed.
     // -----------------------------------------------------------------------
-    auto flines = text_to_lines(out);
-    for (size_t fi = 0; fi < flines.size(); ++fi) {
-        auto it = fmt_line_kinds.find((int)fi);
-        if (it != fmt_line_kinds.end())
-            flines[fi].kind = it->second;
-    }
-    flines = run_post_token_pipeline(std::move(flines), opts);
-    out = render_lines(flines);
+    auto __fmt_t3 = Clock::now();
+    std::cerr << "phase token_loop+line_table ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t3-__fmt_t2).count() << " out_bytes=" << out.size() << "\n";
+    auto lines = text_to_lines(out);
+    lines = run_post_token_pipeline(std::move(lines), opts);
+    out = render_lines(lines);
 
     // -----------------------------------------------------------------------
     // STEP 10: Final newline normalization
@@ -3902,7 +3842,11 @@ std::string format_source(const std::string& source, const FormatOptions& opts,
     // Verify that only whitespace changed.  This is a safety net against
     // formatter bugs that corrupt code.
     // -----------------------------------------------------------------------
+    auto __fmt_t4 = Clock::now();
+    std::cerr << "phase render_post ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t4-__fmt_t3).count() << " out_bytes=" << out.size() << "\n";
     verify_safe_mode_unchanged(source, out, opts);
+    auto __fmt_t5 = Clock::now();
+    std::cerr << "phase safe_mode ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t5-__fmt_t4).count() << " total=" << std::chrono::duration_cast<std::chrono::milliseconds>(__fmt_t5-__fmt_t0).count() << "\n";
 
     return out;
 }

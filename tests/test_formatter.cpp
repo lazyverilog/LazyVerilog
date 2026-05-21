@@ -1,5 +1,8 @@
 #include "features/formatter.hpp"
+#include "config.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <fstream>
+#include <sstream>
 
 TEST_CASE("formatter: function calls support block layout", "[formatter]") {
     FormatOptions opts;
@@ -928,4 +931,17 @@ TEST_CASE("formatter: duplicate instance port comments are preserved", "[formatt
     CHECK(formatted.find("// first a comment") != std::string::npos);
     CHECK(formatted.find("// second a comment") != std::string::npos);
     CHECK(formatted.find("// b comment") != std::string::npos);
+}
+
+TEST_CASE("formatter: demo memory_top is unchanged with project config", "[formatter]") {
+    Config cfg = load_config(".");
+    std::ifstream file("demo/memory_top.sv");
+    REQUIRE(file.good());
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string input = ss.str();
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
+    CHECK(formatted == input);
 }
