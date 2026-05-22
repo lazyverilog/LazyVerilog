@@ -385,6 +385,20 @@ TEST_CASE("formatter: macro calls with empty arguments are preserved", "[formatt
     REQUIRE_NOTHROW(format_source(src, opts));
 }
 
+TEST_CASE("formatter: import declarations do not indent on function or task", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.indent_size = 4;
+
+    CHECK(format_source("import \"DPI-C\" function chandle usbdpi_create(input string name, input int loglevel);\n"
+                        "import \"DPI-C\" context task usbdpi_wait(input chandle ctx);\n"
+                        "import \"DPI-C\" function void usbdpi_close(input chandle ctx);\n",
+                        opts) ==
+          "import \"DPI-C\" function chandle usbdpi_create(input string name, input int loglevel);\n"
+          "import \"DPI-C\" context task usbdpi_wait(input chandle ctx);\n"
+          "import \"DPI-C\" function void usbdpi_close(input chandle ctx);\n");
+}
+
 TEST_CASE("formatter: labeled endtask stays on one line", "[formatter]") {
     FormatOptions opts;
     opts.safe_mode = true;

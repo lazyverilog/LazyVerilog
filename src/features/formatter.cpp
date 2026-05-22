@@ -4599,6 +4599,10 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     //                 (which would set control_expr_pending again).
     bool do_while_tail = false;
 
+    // Import/export declarations can contain `function` / `task` keywords, but
+    // those keywords are part of the declaration and do not open SV blocks.
+    bool in_import_export_decl = false;
+
     // brace_stk — stack that records whether each open `{` is a struct/union
     //             brace (value "struct") or something else ("other").
     //             Only struct braces trigger indentation.
@@ -4917,6 +4921,9 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
             if (tok.lo == "do")
                 ++do_depth;
 
+            if (tok.lo == "import" || tok.lo == "export")
+                in_import_export_decl = true;
+
             // After `case`/`casex`/`casez`/`caseinside`, expect `(expr)`.
             // When the `)` arrives we'll emit a newline before the case items.
             if (tok.lo == "case" || tok.lo == "casex" || tok.lo == "casez" ||
@@ -4935,7 +4942,9 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
             if (tok.lo == "begin")
                 single_stmt_pending = false;
 
-            if (has(INDENT_OPEN, tok.lo) && !disable_target) {
+            bool import_export_function_or_task = in_import_export_decl &&
+                                                  (tok.lo == "function" || tok.lo == "task");
+            if (has(INDENT_OPEN, tok.lo) && !disable_target && !import_export_function_or_task) {
                 // Keywords that increase indentation for everything inside them.
                 // Outmost design blocks use a configurable delta (default 1);
                 // everything else adds exactly 1 level.
@@ -4976,6 +4985,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
             if (!brace_stk.empty())
                 brace_stk.pop_back();
         } else if (tok_is(tok, ";", TokenKind::Semicolon)) {
+            in_import_export_decl = false;
             // Semicolon = end of statement.
             // At top-level (paren_depth==0) schedule a newline after it.
             // Inside `for (init; cond; incr)` paren_depth > 0 → no newline.
