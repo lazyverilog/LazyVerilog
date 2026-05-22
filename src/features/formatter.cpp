@@ -2238,6 +2238,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
             std::string comment = stripped.substr(line_comment);
             if (next_param_depth > 0) {
                 // Comment inside #(...) param block — preserve order before closing )
+                comments.preserve_original = true;
                 if (comments.param_comment.empty())
                     comments.param_comment = comment;
                 else

@@ -166,6 +166,34 @@ TEST_CASE("formatter: multiline ANSI module header preserves line comments", "[f
                                  "endmodule\n");
 }
 
+TEST_CASE("formatter: instance parameter comments do not trip safe mode", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.instance.align = true;
+
+    const std::string src = "module tb;\n"
+                            "prim_lfsr #(\n"
+                            "  .LfsrType(LfsrType),\n"
+                            "  .DefaultSeed(k'(SEED)),\n"
+                            "  // Preserve this comment before StatePermEn.\n"
+                            "  .StatePermEn(1'b1),\n"
+                            "  .MaxLenSVA(1'b1)\n"
+                            ") i_prim_lfsr (\n"
+                            "  .clk_i(clk)\n"
+                            ");\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    size_t comment_pos = formatted.find("// Preserve this comment before StatePermEn.");
+    size_t param_pos = formatted.find(".StatePermEn");
+    REQUIRE(comment_pos != std::string::npos);
+    REQUIRE(param_pos != std::string::npos);
+    CHECK(comment_pos < param_pos);
+}
+
 TEST_CASE("formatter: imported parameterized ANSI header is idempotent", "[formatter]") {
     FormatOptions opts;
     opts.safe_mode = true;
