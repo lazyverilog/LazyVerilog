@@ -238,6 +238,35 @@ TEST_CASE("definition: generic lookup uses cached extra files", "[definition]") 
     std::filesystem::remove(extra_path);
 }
 
+TEST_CASE("definition: nested include cursor matching is file-aware", "[definition]") {
+    Analyzer analyzer;
+    const auto b_path = write_temp_sv("B_nested_collision.svh",
+                                      "// B line 0\n"
+                                      "// B line 1\n"
+                                      "parameter int B_PARAMETER = 2;\n");
+    const auto a_path = write_temp_sv("A_nested_collision.svh",
+                                      "`include \"B_nested_collision.svh\"\n"
+                                      "parameter int A_PARAMETER = 1;\n");
+    const std::string top_uri = "file:///tmp/top_nested_collision.sv";
+    analyzer.open(top_uri, "`include \"A_nested_collision.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = A_PARAMETER;\n"
+                           "endmodule\n");
+
+    auto ident = analyzer.identifier_at(top_uri, 2, 22);
+    REQUIRE(ident.has_value());
+    CHECK(ident->name == "A_PARAMETER");
+
+    auto loc = analyzer.definition_of(top_uri, 2, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == "file://" + a_path.string());
+    CHECK(loc->line == 1);
+    CHECK(loc->col == 14);
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+}
+
 TEST_CASE("extra file cache refreshes by mtime and drops removed files", "[definition]") {
     Analyzer analyzer;
     const auto extra_path = write_temp_sv("lazyverilog_definition_cache.sv",

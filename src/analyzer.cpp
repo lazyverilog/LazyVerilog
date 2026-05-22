@@ -819,10 +819,23 @@ static bool contains_position(const slang::SourceManager& sm, slang::SourceRange
     return true;
 }
 
-static bool token_contains_position(const slang::SourceManager& sm,
-                                    const slang::parsing::Token& token, int line, int col) {
+static bool range_starts_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
+                                const std::string& uri) {
+    if (!range.start().valid())
+        return false;
+    return file_name_to_uri(sm.getFileName(range.start()), uri) == uri;
+}
+
+static bool contains_position_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
+                                     const std::string& uri, int line, int col) {
+    return range_starts_in_uri(sm, range, uri) && contains_position(sm, range, line, col);
+}
+
+static bool token_contains_position_in_uri(const slang::SourceManager& sm,
+                                           const slang::parsing::Token& token,
+                                           const std::string& uri, int line, int col) {
     return token && token.location().valid() &&
-           contains_position(sm, visible_range_for_token(sm, token), line, col);
+           contains_position_in_uri(sm, visible_range_for_token(sm, token), uri, line, col);
 }
 
 enum class DefinitionTargetKind {
@@ -844,18 +857,20 @@ struct DefinitionTarget {
 
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
     const slang::SourceManager& sm;
+    const std::string& uri;
     int line;
     int col;
     DefinitionTarget target;
     std::string current_module;
 
-    DefinitionTargetVisitor(const slang::SourceManager& sm, int line, int col)
-        : sm(sm), line(line), col(col) {}
+    DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
+                            int col)
+        : sm(sm), uri(uri), line(line), col(col) {}
 
     bool found() const { return target.kind != DefinitionTargetKind::None; }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
-        if (token_contains_position(sm, node.header->name, line, col)) {
+        if (token_contains_position_in_uri(sm, node.header->name, uri, line, col)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(node.header->name.valueText());
             target.scope_module = current_module;
@@ -869,7 +884,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
-        if (token_contains_position(sm, node.type, line, col)) {
+        if (token_contains_position_in_uri(sm, node.type, uri, line, col)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(node.type.valueText());
             target.scope_module = current_module;
@@ -880,7 +895,8 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         for (const auto* instance : node.instances) {
             if (!instance)
                 continue;
-            if (instance->decl && token_contains_position(sm, instance->decl->name, line, col)) {
+            if (instance->decl &&
+                token_contains_position_in_uri(sm, instance->decl->name, uri, line, col)) {
                 target.kind = DefinitionTargetKind::Instance;
                 target.name = std::string(instance->decl->name.valueText());
                 target.module_name = module_name;
@@ -892,7 +908,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 if (!connection)
                     continue;
                 const auto* named = connection->as_if<slang::syntax::NamedPortConnectionSyntax>();
-                if (named && token_contains_position(sm, named->name, line, col)) {
+                if (named && token_contains_position_in_uri(sm, named->name, uri, line, col)) {
                     target.kind = DefinitionTargetKind::NamedPort;
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
@@ -918,7 +934,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             const auto* named = argument->as_if<slang::syntax::NamedArgumentSyntax>();
             if (!named)
                 continue;
-            if (token_contains_position(sm, named->name, line, col)) {
+            if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
                 target.kind = DefinitionTargetKind::NamedArgument;
                 target.name = std::string(named->name.valueText());
                 target.subroutine_name = subroutine_name;
@@ -932,7 +948,8 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
     void handle(const slang::syntax::NamedTypeSyntax& node) {
         const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>();
-        if (identifier && token_contains_position(sm, identifier->identifier, line, col)) {
+        if (identifier &&
+            token_contains_position_in_uri(sm, identifier->identifier, uri, line, col)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(identifier->identifier.valueText());
             target.scope_module = current_module;
@@ -946,7 +963,8 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
 
         if (sm.isMacroLoc(token.location())) {
-            if (!contains_position(sm, sm.getExpansionRange(token.location()), line, col))
+            if (!contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
+                                          col))
                 return;
 
             auto macro_name = sm.getMacroName(token.location());
@@ -959,7 +977,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         }
 
         if (token.kind == slang::parsing::TokenKind::Identifier &&
-            token_contains_position(sm, token, line, col)) {
+            token_contains_position_in_uri(sm, token, uri, line, col)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
@@ -967,9 +985,9 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 };
 
-static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tree, int line,
-                                             int col) {
-    DefinitionTargetVisitor visitor(tree.sourceManager(), line, col);
+static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tree,
+                                             const std::string& uri, int line, int col) {
+    DefinitionTargetVisitor visitor(tree.sourceManager(), uri, line, col);
     tree.root().visit(visitor);
     return visitor.target;
 }
@@ -984,7 +1002,7 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         return std::nullopt;
 
     const auto& idx = state->index;
-    auto target = definition_target_at(*state->tree, line, col);
+    auto target = definition_target_at(*state->tree, uri, line, col);
     auto extra_files = extra_file_snapshots();
 
     if (target.kind == DefinitionTargetKind::Macro) {
@@ -1071,16 +1089,18 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
+        const std::string& uri;
         int line;
         int col;
         std::optional<IdentifierAtPosition> result;
 
-        Visitor(const slang::SourceManager& sm, int line, int col) : sm(sm), line(line), col(col) {}
+        Visitor(const slang::SourceManager& sm, const std::string& uri, int line, int col)
+            : sm(sm), uri(uri), line(line), col(col) {}
 
         void visitToken(slang::parsing::Token token) {
             if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
                 return;
-            if (!token_contains_position(sm, token, line, col))
+            if (!token_contains_position_in_uri(sm, token, uri, line, col))
                 return;
 
             const int token_line = to_lsp_line((int)sm.getLineNumber(token.location()));
@@ -1095,7 +1115,7 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
         }
     };
 
-    Visitor visitor(state->tree->sourceManager(), line, col);
+    Visitor visitor(state->tree->sourceManager(), uri, line, col);
     state->tree->root().visit(visitor);
     return visitor.result;
 }
@@ -1124,7 +1144,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     if (!state.tree)
         return std::nullopt;
 
-    auto target = definition_target_at(*state.tree, line, col);
+    auto target = definition_target_at(*state.tree, uri, line, col);
     const auto& idx = state.index;
 
     if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
