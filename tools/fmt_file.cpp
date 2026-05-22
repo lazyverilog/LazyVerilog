@@ -6,7 +6,7 @@
 #include "config.hpp"
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) { std::cerr << "Usage: fmt_file <file>\n"; return 1; }
+    if (argc < 2) { std::cerr << "Usage: lazyverilog-fmt <file>\n"; return 1; }
     std::ifstream f(argv[1]);
     if (!f) { std::cerr << "Cannot open " << argv[1] << "\n"; return 1; }
     std::ostringstream ss;
