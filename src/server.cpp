@@ -372,9 +372,7 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             for (auto diag : state->parse_diagnostics)
                 add_diag(std::move(diag));
 
-            SyntaxIndex lint_index = state->index;
-            analyzer_.merge_extra_file_modules(lint_index);
-            auto lint_diags = run_lint(*state, config_.lint, &lint_index);
+            auto lint_diags = run_lint(*state, config_.lint, &state->index);
             for (auto diag : lint_diags)
                 add_diag(std::move(diag));
         }

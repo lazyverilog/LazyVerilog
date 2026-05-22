@@ -1363,6 +1363,7 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     defines_ = defines;
     // Invalidate extra-file cache so reopened files pick up the new defines.
     extra_cache_.clear();
+    filelist_mtime_.reset();
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
@@ -1373,11 +1374,9 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     extra_files_.reserve(paths.size());
     for (const auto& path : paths)
         extra_files_.push_back(normalize_path(path).string());
-    refresh_extra_cache_locked();
-    // Cache current filelist mtime so the next extra_file_snapshots() call
-    // skips the refresh (nothing changed since this forced full parse).
-    if (!filelist_path_.empty())
-        filelist_mtime_ = file_mtime(std::filesystem::path(filelist_path_));
+    filelist_mtime_.reset();
+    if (filelist_path_.empty())
+        refresh_extra_cache_locked();
 }
 
 std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
@@ -1393,6 +1392,8 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
             refresh_extra_cache_locked();
             filelist_mtime_ = current_mtime;
         }
+    } else if (!extra_files_.empty() && extra_cache_.empty()) {
+        refresh_extra_cache_locked();
     }
 
     std::vector<ExtraFileInfo> result;
