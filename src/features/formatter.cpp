@@ -6,6 +6,7 @@
 #include <slang/text/SourceManager.h>
 #include <slang/util/BumpAllocator.h>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -72,6 +73,17 @@ struct Tok {
     bool whitespace{false};
     bool comment{false};
     bool directive{false};
+};
+
+using TokenCache = std::unordered_map<std::string, std::vector<Tok>>;
+thread_local TokenCache* active_token_cache = nullptr;
+
+struct ScopedTokenCache {
+    TokenCache cache;
+    TokenCache* prev{nullptr};
+
+    ScopedTokenCache() : prev(active_token_cache) { active_token_cache = &cache; }
+    ~ScopedTokenCache() { active_token_cache = prev; }
 };
 
 enum class SD { MustAppend, MustWrap, Preserve, Undecided };
@@ -864,6 +876,12 @@ static std::string normalize_bracket_spacing(const std::string& text, const Form
 }
 
 static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
+    if (active_token_cache) {
+        auto it = active_token_cache->find(source);
+        if (it != active_token_cache->end())
+            return it->second;
+    }
+
     std::vector<Tok> toks;
     SourceManager sm;
     auto buffer = sm.assignText(source);
@@ -942,6 +960,11 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
     }
     if (cursor < source.size())
         append_trivia_text(toks, source, cursor, source.size());
+
+    if (active_token_cache) {
+        auto [it, _] = active_token_cache->emplace(source, std::move(toks));
+        return it->second;
+    }
     return toks;
 }
 
@@ -1020,6 +1043,15 @@ static std::vector<Tok> significant_tokens(const std::string& text) {
     for (auto& tok : collect_lexer_tokens(text)) {
         if (!tok.whitespace && !tok.comment && !tok.directive)
             out.push_back(std::move(tok));
+    }
+    return out;
+}
+
+static std::vector<Tok> significant_tokens_from(const std::vector<Tok>& toks) {
+    std::vector<Tok> out;
+    for (const auto& tok : toks) {
+        if (!tok.whitespace && !tok.comment && !tok.directive)
+            out.push_back(tok);
     }
     return out;
 }
@@ -2104,9 +2136,8 @@ static size_t find_line_comment_start(const std::string& line) {
     return std::string::npos;
 }
 
-static std::string last_named_port_before_comment(const std::string& code) {
+static std::string last_named_port_before_comment(const std::vector<Tok>& toks) {
     std::string last;
-    auto toks = collect_lexer_tokens(code);
     for (size_t i = 0; i + 2 < toks.size(); ++i) {
         if (toks[i].whitespace || toks[i].comment || toks[i].directive || toks[i].text != ".")
             continue;
@@ -2124,8 +2155,11 @@ static std::string last_named_port_before_comment(const std::string& code) {
     return last;
 }
 
-static std::string first_named_port_in_code(const std::string& code) {
-    auto toks = collect_lexer_tokens(code);
+static std::string last_named_port_before_comment(const std::string& code) {
+    return last_named_port_before_comment(collect_lexer_tokens(code));
+}
+
+static std::string first_named_port_in_code(const std::vector<Tok>& toks) {
     for (size_t i = 0; i + 2 < toks.size(); ++i) {
         if (toks[i].whitespace || toks[i].comment || toks[i].directive || toks[i].text != ".")
             continue;
@@ -2141,6 +2175,10 @@ static std::string first_named_port_in_code(const std::string& code) {
             return toks[name_i].text;
     }
     return "";
+}
+
+static std::string first_named_port_in_code(const std::string& code) {
+    return first_named_port_in_code(collect_lexer_tokens(code));
 }
 
 // Collect lines from start until ')' at depth 0 followed by ';'
@@ -2160,18 +2198,21 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
 
         std::string code = stripped;
         size_t line_comment = std::string::npos;
-        for (const auto& tok : collect_lexer_tokens(stripped)) {
+        auto stripped_toks = collect_lexer_tokens(stripped);
+        for (const auto& tok : stripped_toks) {
             if (tok.comment && starts_with_chars(tok.text, '/', '/')) {
                 line_comment = (size_t)tok.pos;
                 code = stripped.substr(0, line_comment);
                 break;
             }
         }
+        auto code_toks = line_comment == std::string::npos ? std::move(stripped_toks)
+                                                           : collect_lexer_tokens(code);
 
-        auto param_depth_after = [](int start_depth, const std::string& text) {
+        auto param_depth_after = [](int start_depth, const std::vector<Tok>& toks) {
             int pd = start_depth;
             bool saw_hash = false;
-            for (const auto& tok : collect_lexer_tokens(text)) {
+            for (const auto& tok : toks) {
                 if (tok.whitespace || tok.comment || tok.directive)
                     continue;
                 if (pd > 0) {
@@ -2192,7 +2233,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
             }
             return pd;
         };
-        int next_param_depth = param_depth_after(param_depth, code);
+        int next_param_depth = param_depth_after(param_depth, code_toks);
 
         if (line_comment != std::string::npos) {
             std::string comment = stripped.substr(line_comment);
@@ -2207,7 +2248,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
                 bool line_closes = false;
                 {
                     int d = depth;
-                    for (const auto& tok : collect_lexer_tokens(code)) {
+                    for (const auto& tok : code_toks) {
                         if (tok.whitespace || tok.comment || tok.directive)
                             continue;
                         if (tok_is(tok, "(", TokenKind::OpenParenthesis))
@@ -2223,12 +2264,13 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
                 if (line_closes) {
                     comments.trailing = comment;
                 } else {
-                    std::string port = last_named_port_before_comment(code);
+                    auto sig_toks = significant_tokens_from(code_toks);
+                    std::string port = last_named_port_before_comment(code_toks);
                     if (!port.empty())
                         comments.port_comments.push_back({port, comment});
-                    else if (significant_tokens(code).empty())
+                    else if (sig_toks.empty())
                         pending_standalone_comments.push_back(comment);
-                    else if (!significant_tokens(code).empty() && comments.header.empty())
+                    else if (comments.header.empty())
                         comments.header = comment;
                 }
             }
@@ -2236,7 +2278,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
 
         param_depth = next_param_depth;
 
-        std::string next_port = first_named_port_in_code(code);
+        std::string next_port = first_named_port_in_code(code_toks);
         if (!next_port.empty() && !pending_standalone_comments.empty()) {
             for (const auto& comment : pending_standalone_comments)
                 comments.leading_port_comments.push_back({next_port, comment});
@@ -2244,7 +2286,7 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
         }
 
         parts.push_back(code);
-        for (const auto& tok : collect_lexer_tokens(code)) {
+        for (const auto& tok : code_toks) {
             if (tok.whitespace || tok.comment || tok.directive)
                 continue;
             if (tok_is(tok, "(", TokenKind::OpenParenthesis))
@@ -4418,6 +4460,8 @@ static void verify_safe_mode_unchanged(const std::string& source, const std::str
 // ---------------------------------------------------------------------------
 
 std::string format_source(const std::string& source, const FormatOptions& opts) {
+    ScopedTokenCache token_cache;
+
     // -----------------------------------------------------------------------
     // STEP 1: Tokenize using slang::Lexer (no SyntaxTree/CST needed)
     // -----------------------------------------------------------------------
