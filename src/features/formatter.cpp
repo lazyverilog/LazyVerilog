@@ -179,6 +179,57 @@ static bool is_identifier(const Tok& t) {
              !is_keyword(t)));
 }
 
+static bool is_port_direction_token(const Tok& tok) {
+    return tok.kind == TokenKind::InputKeyword || tok.kind == TokenKind::OutputKeyword ||
+           tok.kind == TokenKind::InOutKeyword || tok.kind == TokenKind::RefKeyword;
+}
+
+static bool is_sign_qualifier_token(const Tok& tok) {
+    return tok.kind == TokenKind::SignedKeyword || tok.kind == TokenKind::UnsignedKeyword;
+}
+
+static bool is_var_prefix_token(const Tok& tok) {
+    return tok.kind == TokenKind::StaticKeyword || tok.kind == TokenKind::AutomaticKeyword ||
+           tok.kind == TokenKind::ConstKeyword || tok.kind == TokenKind::VarKeyword;
+}
+
+static bool is_var_builtin_type_token(const Tok& tok) {
+    return tok.kind == TokenKind::WireKeyword || tok.kind == TokenKind::LogicKeyword ||
+           tok.kind == TokenKind::RegKeyword || tok.kind == TokenKind::BitKeyword ||
+           tok.kind == TokenKind::ByteKeyword || tok.kind == TokenKind::IntKeyword ||
+           tok.kind == TokenKind::IntegerKeyword || tok.kind == TokenKind::TimeKeyword ||
+           tok.kind == TokenKind::ShortIntKeyword || tok.kind == TokenKind::LongIntKeyword ||
+           tok.kind == TokenKind::SignedKeyword || tok.kind == TokenKind::UnsignedKeyword;
+}
+
+static bool is_function_call_skip_token(const Tok& tok) {
+    switch (tok.kind) {
+    case TokenKind::IfKeyword:
+    case TokenKind::ForKeyword:
+    case TokenKind::ForeachKeyword:
+    case TokenKind::WhileKeyword:
+    case TokenKind::RepeatKeyword:
+    case TokenKind::WaitKeyword:
+    case TokenKind::CaseKeyword:
+    case TokenKind::CaseXKeyword:
+    case TokenKind::CaseZKeyword:
+    case TokenKind::ModuleKeyword:
+    case TokenKind::MacromoduleKeyword:
+    case TokenKind::FunctionKeyword:
+    case TokenKind::TaskKeyword:
+    case TokenKind::CoverGroupKeyword:
+    case TokenKind::ClassKeyword:
+    case TokenKind::PropertyKeyword:
+    case TokenKind::SequenceKeyword:
+    case TokenKind::AssertKeyword:
+    case TokenKind::AssumeKeyword:
+    case TokenKind::CoverKeyword:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool is_numeric(const Tok& t) {
     return t.kind == TokenKind::IntegerLiteral || t.kind == TokenKind::IntegerBase ||
            t.kind == TokenKind::UnbasedUnsizedLiteral || t.kind == TokenKind::RealLiteral ||
@@ -985,6 +1036,14 @@ static bool tok_contains(const Tok& tok, char ch) {
     return tok.text.find(ch) != std::string::npos;
 }
 
+static bool starts_with_chars(const std::string& s, char a) {
+    return !s.empty() && s[0] == a;
+}
+
+static bool starts_with_chars(const std::string& s, char a, char b) {
+    return s.size() >= 2 && s[0] == a && s[1] == b;
+}
+
 // ---------------------------------------------------------------------------
 // Split by top-level comma (depth-0)
 // ---------------------------------------------------------------------------
@@ -1176,18 +1235,17 @@ static PortParsed parse_port(const std::string& raw, const FormatOptions& opts) 
 
 static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
                                                    const FormatOptions& opts) {
+    std::string text = render_lines(lines);
+    auto disabled = find_disabled(text);
+    auto line_starts = line_start_offsets(lines);
     std::vector<std::string> out;
     size_t i = 0;
-    bool disabled_region = false;
     bool module_header_region = false;
     auto starts_with_port_dir = [](const std::string& line) -> bool {
-        size_t p = 0;
-        while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
-            ++p;
-        size_t q = p;
-        while (q < line.size() && std::isalpha((unsigned char)line[q]))
-            ++q;
-        return has(PORT_DIRS, lower(line.substr(p, q - p)));
+        auto toks = significant_tokens(line);
+        if (toks.empty())
+            return false;
+        return is_port_direction_token(toks[0]);
     };
     auto is_port_decl_line = [&](int idx) -> bool {
         if (idx < 0 || idx >= (int)lines.size())
@@ -1199,66 +1257,65 @@ static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
     auto is_semi_only = [&](int idx) -> bool {
         if (idx < 0 || idx >= (int)lines.size())
             return false;
-        const std::string& line = lines[idx];
-        size_t p = 0;
-        while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
-            ++p;
-        return p < line.size() && line[p] == ';' &&
-               line.find_first_not_of(" \t", p + 1) == std::string::npos;
-    };
-    auto trim_line = [](const std::string& text) {
-        size_t a = 0;
-        while (a < text.size() && std::isspace((unsigned char)text[a]))
-            ++a;
-        size_t b = text.size();
-        while (b > a && std::isspace((unsigned char)text[b - 1]))
-            --b;
-        return text.substr(a, b - a);
+        auto toks = significant_tokens(lines[idx]);
+        return toks.size() == 1 && tok_is(toks[0], ";", TokenKind::Semicolon);
     };
     auto is_standalone_comment = [&](const std::string& text) {
-        std::string trimmed = trim_line(text);
-        return trimmed.rfind("//", 0) == 0 || trimmed.rfind("/*", 0) == 0;
+        for (const auto& tok : collect_lexer_tokens(text)) {
+            if (tok.whitespace)
+                continue;
+            return tok.comment;
+        }
+        return false;
+    };
+    auto has_header_end = [](const std::string& line) {
+        auto toks = significant_tokens(line);
+        bool saw_close = false;
+        for (const auto& tok : toks) {
+            if (tok_is(tok, ")", TokenKind::CloseParenthesis))
+                saw_close = true;
+            else if (saw_close && tok_is(tok, ";", TokenKind::Semicolon))
+                return true;
+        }
+        return false;
+    };
+    auto has_kind = [](const std::string& line, TokenKind kind) {
+        for (const auto& tok : significant_tokens(line))
+            if (tok.kind == kind)
+                return true;
+        return false;
+    };
+    auto is_header_start_line = [&](const std::string& line) {
+        auto toks = significant_tokens(line);
+        if (toks.empty())
+            return false;
+        bool starts_header = toks[0].kind == TokenKind::ModuleKeyword ||
+                             toks[0].kind == TokenKind::MacromoduleKeyword ||
+                             toks[0].kind == TokenKind::InterfaceKeyword ||
+                             toks[0].kind == TokenKind::ProgramKeyword ||
+                             toks[0].kind == TokenKind::TaskKeyword ||
+                             toks[0].kind == TokenKind::FunctionKeyword;
+        if (!starts_header || has_header_end(line))
+            return false;
+        return has_kind(line, TokenKind::OpenParenthesis) || !has_kind(line, TokenKind::Semicolon) ||
+               has_kind(line, TokenKind::ImportKeyword);
     };
     while (i < lines.size()) {
-        std::string trimmed_line = lines[i];
-        size_t ta = trimmed_line.find_first_not_of(" \t");
-        size_t tb = trimmed_line.find_last_not_of(" \t");
-        trimmed_line =
-            (ta == std::string::npos) ? std::string() : trimmed_line.substr(ta, tb - ta + 1);
+        if (in_disabled(line_starts[i], disabled)) {
+            out.push_back(lines[i]);
+            ++i;
+            continue;
+        }
         if (module_header_region) {
             out.push_back(lines[i]);
-            if (trimmed_line.find(");") != std::string::npos)
+            if (has_header_end(lines[i]))
                 module_header_region = false;
             ++i;
             continue;
         }
-        if ((trimmed_line.rfind("module ", 0) == 0 ||
-             trimmed_line.rfind("macromodule ", 0) == 0 ||
-             trimmed_line.rfind("interface ", 0) == 0 ||
-             trimmed_line.rfind("program ", 0) == 0 ||
-             trimmed_line.rfind("task ", 0) == 0 ||
-             trimmed_line.rfind("function ", 0) == 0) &&
-            trimmed_line.find(");") == std::string::npos &&
-            (trimmed_line.find('(') != std::string::npos ||
-             trimmed_line.find(';') == std::string::npos ||
-             trimmed_line.find(" import ") != std::string::npos)) {
+        if (is_header_start_line(lines[i])) {
             module_header_region = true;
             out.push_back(lines[i]);
-            ++i;
-            continue;
-        }
-        if (trimmed_line.find("verilog_format") != std::string::npos &&
-            trimmed_line.find("off") != std::string::npos) {
-            disabled_region = true;
-            out.push_back(lines[i]);
-            ++i;
-            continue;
-        }
-        if (disabled_region) {
-            out.push_back(lines[i]);
-            if (trimmed_line.find("verilog_format") != std::string::npos &&
-                trimmed_line.find("on") != std::string::npos)
-                disabled_region = false;
             ++i;
             continue;
         }
@@ -1277,8 +1334,7 @@ static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
         size_t j = i;
         while (j < lines.size()) {
             if (!is_port_decl_line((int)j)) {
-                std::string trimmed = trim_line(lines[j]);
-                if (trimmed.empty() || is_standalone_comment(trimmed)) {
+                if (significant_tokens(lines[j]).empty() || is_standalone_comment(lines[j])) {
                     blk.push_back({lines[j], lines[j], PortParsed{}});
                     ++j;
                     continue;
@@ -1306,7 +1362,8 @@ static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
             md = std::max(md, (int)e.parsed.direction.size());
             std::string s2 = e.parsed.dtype + (e.parsed.qualifier.empty() ? "" : " " + e.parsed.qualifier);
             ms2_content = std::max(ms2_content, (int)s2.size());
-            has_qualified_type = has_qualified_type || s2.find("::") != std::string::npos;
+            for (const auto& tok : significant_tokens(s2))
+                has_qualified_type = has_qualified_type || tok.kind == TokenKind::DoubleColon;
             mdim = std::max(mdim, (int)e.parsed.dim.size());
             max_slots = std::max(max_slots, e.parsed.names.size());
         }
@@ -1494,44 +1551,46 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
 
     auto is_var = [&](int line_idx) -> bool {
         auto toks = significant_tokens(lines[(size_t)line_idx]);
-        if (toks.size() < 3 || toks.back().text != ";")
+        if (toks.size() < 3 || !tok_is(toks.back(), ";", TokenKind::Semicolon))
             return false;
-        static const std::unordered_set<std::string> BUILTIN_TYPES = {
-            "wire", "logic", "reg", "bit", "byte", "int", "integer", "time",
-            "shortint", "longint", "signed", "unsigned"};
-        static const std::unordered_set<std::string> PREFIX_KW = {
-            "static", "automatic", "const", "var"};
-        static const std::unordered_set<std::string> EXCLUDED = {
-            "input", "output", "inout", "ref"};
-        if (has(EXCLUDED, toks[0].lo))
+        if (is_port_direction_token(toks[0]))
             return false;
         size_t idx = 0;
-        while (idx < toks.size() && has(PREFIX_KW, toks[idx].lo))
+        while (idx < toks.size() && is_var_prefix_token(toks[idx]))
             ++idx;
         if (idx >= toks.size())
             return false;
-        if (has(BUILTIN_TYPES, toks[idx].lo))
+        if (is_var_builtin_type_token(toks[idx]))
             return true;
         return is_identifier(toks[idx]) && !is_keyword(toks[idx]) && idx + 1 < toks.size() &&
-               (is_identifier(toks[idx + 1]) || toks[idx + 1].text == "[" ||
-                toks[idx + 1].lo == "signed" || toks[idx + 1].lo == "unsigned");
+               (is_identifier(toks[idx + 1]) ||
+                tok_is(toks[idx + 1], "[", TokenKind::OpenBracket) ||
+                is_sign_qualifier_token(toks[idx + 1]));
     };
-    auto starts_with_token = [](const std::string& line, const std::string& text) -> bool {
+    auto starts_with_kind = [](const std::string& line, TokenKind kind) -> bool {
         for (const auto& tok : collect_lexer_tokens(line)) {
             if (tok.whitespace || tok.comment || tok.directive)
                 continue;
-            return tok.lo == text;
+            return tok.kind == kind;
         }
         return false;
     };
     auto starts_module_header = [](const std::string& line) -> bool {
         auto toks = significant_tokens(line);
-        return !toks.empty() &&
-               (toks[0].lo == "module" || toks[0].lo == "interface" || toks[0].lo == "program") &&
-               line.find("#(") != std::string::npos;
+        if (toks.empty() ||
+            (toks[0].kind != TokenKind::ModuleKeyword &&
+             toks[0].kind != TokenKind::InterfaceKeyword &&
+             toks[0].kind != TokenKind::ProgramKeyword))
+            return false;
+        for (size_t i = 1; i + 1 < toks.size(); ++i) {
+            if (tok_is(toks[i], "#", TokenKind::Hash) &&
+                tok_is(toks[i + 1], "(", TokenKind::OpenParenthesis))
+                return true;
+        }
+        return false;
     };
     auto is_module_header_parameter = [&](int line_idx) -> bool {
-        if (!starts_with_token(lines[(size_t)line_idx], "parameter"))
+        if (!starts_with_kind(lines[(size_t)line_idx], TokenKind::ParameterKeyword))
             return false;
         for (int k = line_idx - 1; k >= 0; --k) {
             std::string trimmed = trim_left_copy(trim_right_copy(lines[(size_t)k]));
@@ -1539,7 +1598,16 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
                 continue;
             if (starts_module_header(trimmed))
                 return true;
-            if (trimmed.find(';') != std::string::npos || trimmed.find(")(") != std::string::npos)
+            auto toks = significant_tokens(trimmed);
+            bool has_semicolon = false;
+            bool has_close_open = false;
+            for (size_t ti = 0; ti < toks.size(); ++ti) {
+                has_semicolon = has_semicolon || tok_is(toks[ti], ";", TokenKind::Semicolon);
+                if (ti + 1 < toks.size() && tok_is(toks[ti], ")", TokenKind::CloseParenthesis) &&
+                    tok_is(toks[ti + 1], "(", TokenKind::OpenParenthesis))
+                    has_close_open = true;
+            }
+            if (has_semicolon || has_close_open)
                 return false;
         }
         return false;
@@ -1558,7 +1626,7 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
         while (ind < lines[i].size() &&
                (lines[i][ind] == ' ' || lines[i][ind] == '\t'))
             ++ind;
-        if (i > 0 && starts_with_token(lines[i - 1], "for")) {
+        if (i > 0 && starts_with_kind(lines[i - 1], TokenKind::ForKeyword)) {
             size_t j = i;
             while (j < lines.size()) {
                 const auto& lj = lines[j];
@@ -1672,36 +1740,33 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
     std::vector<std::string> toks = group_bracket_tokens(code_tokens_for_alignment(code));
     if (toks.empty())
         return nullptr;
+    auto sig_toks = significant_tokens(code);
+    if (sig_toks.empty())
+        return nullptr;
 
-    std::string first = lower(toks[0]);
-    if (has(VAR_EXCLUDED, first))
+    if (is_port_direction_token(sig_toks[0]))
         return nullptr;
 
     size_t idx = 0;
     std::vector<std::string> type_parts;
-    while (idx < toks.size() && has(VAR_PREFIX_KW, lower(toks[idx]))) {
+    while (idx < toks.size() && idx < sig_toks.size() && is_var_prefix_token(sig_toks[idx])) {
         type_parts.push_back(toks[idx++]);
     }
     if (idx >= toks.size())
         return nullptr;
 
-    first = lower(toks[idx]);
-    if (has(VAR_BUILTIN_TYPES, first)) {
+    if (idx < sig_toks.size() && is_var_builtin_type_token(sig_toks[idx])) {
         type_parts.push_back(toks[idx++]);
     } else {
         // User-defined type: must be an identifier not an SV keyword
-        if (!std::isalpha((unsigned char)toks[idx][0]) && toks[idx][0] != '_')
-            return nullptr;
-        if (has(SV_KW, first))
+        if (idx >= sig_toks.size() || !is_identifier(sig_toks[idx]) || is_keyword(sig_toks[idx]))
             return nullptr;
         if (idx + 1 >= toks.size())
             return nullptr;
         // Next must look like dimension, qualifier, or identifier
-        const std::string& nxt = toks[idx + 1];
-        std::string nxtl = lower(nxt);
-        static const std::unordered_set<std::string> QUALS2 = {"signed", "unsigned"};
-        bool ok = nxt[0] == '[' || std::isalpha((unsigned char)nxt[0]) || nxt[0] == '_' ||
-                  has(QUALS2, nxtl);
+        bool ok = idx + 1 < sig_toks.size() &&
+                  (tok_is(sig_toks[idx + 1], "[", TokenKind::OpenBracket) ||
+                   is_identifier(sig_toks[idx + 1]) || is_sign_qualifier_token(sig_toks[idx + 1]));
         if (!ok)
             return nullptr;
         type_parts.push_back(toks[idx++]);
@@ -1716,8 +1781,7 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
 
     // Optional qualifier
     std::string qualifier;
-    static const std::unordered_set<std::string> QUALS = {"signed", "unsigned"};
-    if (idx < toks.size() && has(QUALS, lower(toks[idx])))
+    if (idx < sig_toks.size() && is_sign_qualifier_token(sig_toks[idx]))
         qualifier = toks[idx++];
 
     // Optional packed dim
@@ -1788,8 +1852,14 @@ static VarParsed* parse_var_line(const std::string& line, const FormatOptions& o
     }
     // Reject if any declarator looks like a function/instance call (has '(' in name or trailing)
     for (auto& decl : vp->declarators) {
-        if (decl.first.find('(') != std::string::npos ||
-            decl.second.find('(') != std::string::npos) {
+        bool has_call_paren = false;
+        for (const auto& tok : significant_tokens(decl.first + decl.second)) {
+            if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
+                has_call_paren = true;
+                break;
+            }
+        }
+        if (has_call_paren) {
             delete vp;
             return nullptr;
         }
@@ -1834,12 +1904,14 @@ static std::vector<std::string> align_var_pass(std::vector<std::string> lines,
                 continue;
             }
             // Comment/blank lines pass through without breaking block
-            size_t sp = 0;
-            while (sp < cur.size() && (cur[sp] == ' ' || cur[sp] == '\t'))
-                ++sp;
-            std::string trimmed = cur.substr(sp);
-            if (trimmed.empty() || trimmed.substr(0, 2) == "//" ||
-                (trimmed.size() >= 2 && trimmed[0] == '/' && trimmed[1] == '*')) {
+            bool comment_or_blank = true;
+            for (const auto& tok : collect_lexer_tokens(cur)) {
+                if (tok.whitespace)
+                    continue;
+                comment_or_blank = tok.comment;
+                break;
+            }
+            if (comment_or_blank) {
                 block.push_back({lines[j], nullptr});
                 ++j;
                 continue;
@@ -1999,6 +2071,7 @@ static std::vector<std::string> align_var_pass(std::vector<std::string> lines,
 
 struct InstanceComments {
     std::string header;
+    std::string param_comment; // line comment inside #(...) param block
     std::vector<std::pair<std::string, std::string>> leading_port_comments;
     std::vector<std::pair<std::string, std::string>> port_comments;
     std::vector<std::string> footer_comments;
@@ -2086,9 +2159,14 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
         stripped = stripped.substr(sp);
 
         std::string code = stripped;
-        size_t line_comment = find_line_comment_start(stripped);
-        if (line_comment != std::string::npos)
-            code = stripped.substr(0, line_comment);
+        size_t line_comment = std::string::npos;
+        for (const auto& tok : collect_lexer_tokens(stripped)) {
+            if (tok.comment && starts_with_chars(tok.text, '/', '/')) {
+                line_comment = (size_t)tok.pos;
+                code = stripped.substr(0, line_comment);
+                break;
+            }
+        }
 
         auto param_depth_after = [](int start_depth, const std::string& text) {
             int pd = start_depth;
@@ -2118,8 +2196,12 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
 
         if (line_comment != std::string::npos) {
             std::string comment = stripped.substr(line_comment);
-            if (param_depth > 0 || next_param_depth > 0) {
-                comments.preserve_original = true;
+            if (next_param_depth > 0) {
+                // Comment inside #(...) param block — preserve order before closing )
+                if (comments.param_comment.empty())
+                    comments.param_comment = comment;
+                else
+                    comments.param_comment += " " + comment;
             } else {
                 // Check if this line closes the instance (; at depth 0)
                 bool line_closes = false;
@@ -2245,7 +2327,7 @@ static void remove_block_comments_from_instance_port_list(std::string& port_list
         if (tok_start > cursor)
             code += port_list.substr(cursor, tok_start - cursor);
 
-        if (tok.comment && tok.text.rfind("/*", 0) == 0 && paren_depth == 0) {
+        if (tok.comment && starts_with_chars(tok.text, '/', '*') && paren_depth == 0) {
             size_t next = ti + 1;
             while (next < toks.size() && toks[next].whitespace)
                 ++next;
@@ -2312,7 +2394,7 @@ static bool parse_named_ports(const std::string& port_list,
         ++i;
         while (i < toks.size() && toks[i].whitespace)
             ++i;
-        while (i < toks.size() && toks[i].comment && toks[i].text.rfind("/*", 0) == 0) {
+        while (i < toks.size() && toks[i].comment && starts_with_chars(toks[i].text, '/', '*')) {
             port_name += " " + toks[i].text;
             ++i;
             while (i < toks.size() && toks[i].whitespace)
@@ -2435,12 +2517,7 @@ static std::vector<std::string> expand_instances_pass(std::vector<std::string> l
         }
 
         auto line_toks = significant_tokens(line);
-        if (line_toks.empty() || !is_identifier(line_toks[0])) {
-            out.push_back(lines[i]);
-            ++i;
-            continue;
-        }
-        if (has(SV_KW, line_toks[0].lo)) {
+        if (line_toks.empty() || line_toks[0].kind != TokenKind::Identifier) {
             out.push_back(lines[i]);
             ++i;
             continue;
@@ -2489,14 +2566,6 @@ static std::vector<std::string> expand_instances_pass(std::vector<std::string> l
             continue;
         }
 
-        // Skip SV keywords
-        if (has(SV_KW, lower(module_type)) || has(SV_KW, lower(inst_name))) {
-            for (size_t k = i; k < end_i; ++k)
-                out.push_back(lines[k]);
-            i = end_i;
-            continue;
-        }
-
         std::string port_list;
         if (!extract_port_list(flat, port_list)) {
             for (size_t k = i; k < end_i; ++k)
@@ -2529,15 +2598,34 @@ static std::vector<std::string> expand_instances_pass(std::vector<std::string> l
             eff_inside = close_paren - open_paren - 1 - max_sig;
         }
 
-        std::string hdr = indent + module_type;
-        if (!param_block.empty())
-            hdr += " " + param_block;
-        hdr += " " + inst_name + inst_suffix + " (";
-        if (!leading_comments.empty())
-            hdr += " " + leading_comments;
-        if (!comments.header.empty())
-            hdr += " " + comments.header;
-        out.push_back(hdr);
+        if (!comments.param_comment.empty() && !param_block.empty()) {
+            // Split header: comment before param block closing ), then ) inst_name ( on next line
+            size_t last_close = param_block.rfind(')');
+            if (last_close != std::string::npos) {
+                std::string param_inner = param_block.substr(0, last_close);
+                while (!param_inner.empty() &&
+                       (param_inner.back() == ' ' || param_inner.back() == '\t'))
+                    param_inner.pop_back();
+                out.push_back(indent + module_type + " " + param_inner + " " +
+                              comments.param_comment);
+            }
+            std::string hdr = indent + ") " + inst_name + inst_suffix + " (";
+            if (!leading_comments.empty())
+                hdr += " " + leading_comments;
+            if (!comments.header.empty())
+                hdr += " " + comments.header;
+            out.push_back(hdr);
+        } else {
+            std::string hdr = indent + module_type;
+            if (!param_block.empty())
+                hdr += " " + param_block;
+            hdr += " " + inst_name + inst_suffix + " (";
+            if (!leading_comments.empty())
+                hdr += " " + leading_comments;
+            if (!comments.header.empty())
+                hdr += " " + comments.header;
+            out.push_back(hdr);
+        }
         size_t leading_comment_index = 0;
         size_t comment_index = 0;
         for (size_t k = 0; k < ports.size(); ++k) {
@@ -2597,16 +2685,6 @@ static std::string trim_copy(const std::string& s) {
 // ---------------------------------------------------------------------------
 // Typedef enum and modport formatting passes
 // ---------------------------------------------------------------------------
-
-static bool is_ident_char(char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; }
-
-static bool starts_with_word_at(const std::string& s, size_t pos, const std::string& word) {
-    if (pos + word.size() > s.size() || lower(s.substr(pos, word.size())) != word)
-        return false;
-    if (pos > 0 && is_ident_char(s[pos - 1]))
-        return false;
-    return pos + word.size() == s.size() || !is_ident_char(s[pos + word.size()]);
-}
 
 static bool collect_statement_lines(const std::vector<std::string>& lines, size_t start,
                                     size_t& end_i, std::string& flat) {
@@ -2694,7 +2772,7 @@ static std::vector<std::string> format_enum_declaration_pass(std::vector<std::st
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string& line = lines[i];
         auto first_line_toks = significant_tokens(line);
-        if (first_line_toks.empty() || first_line_toks[0].lo != "typedef") {
+        if (first_line_toks.empty() || first_line_toks[0].kind != TokenKind::TypedefKeyword) {
             out.push_back(lines[i]);
             continue;
         }
@@ -2709,12 +2787,12 @@ static std::vector<std::string> format_enum_declaration_pass(std::vector<std::st
         std::string leading = line.substr(0, (size_t)first_line_toks[0].pos);
         auto toks = significant_tokens(flat);
         size_t typedef_i = 0;
-        if (toks.empty() || toks[typedef_i].lo != "typedef") {
+        if (toks.empty() || toks[typedef_i].kind != TokenKind::TypedefKeyword) {
             out.push_back(lines[i]);
             continue;
         }
         size_t enum_i = typedef_i + 1;
-        while (enum_i < toks.size() && toks[enum_i].lo != "enum")
+        while (enum_i < toks.size() && toks[enum_i].kind != TokenKind::EnumKeyword)
             ++enum_i;
         if (enum_i >= toks.size()) {
             out.push_back(lines[i]);
@@ -2751,10 +2829,6 @@ static std::vector<std::string> format_enum_declaration_pass(std::vector<std::st
         size_t semi = (size_t)toks[semi_i].pos;
 
         std::string prefix = trim_copy(flat.substr(0, open));
-        if (lower(prefix).find("typedef enum") == std::string::npos) {
-            out.push_back(lines[i]);
-            continue;
-        }
         std::string body = flat.substr(open + 1, close - open - 1);
         std::string suffix = trim_copy(flat.substr(close + 1, semi - close - 1));
         auto raw_items = split_top_level(body);
@@ -2853,7 +2927,7 @@ struct ModportParsed {
 
 static bool parse_modport_statement(const std::string& flat, std::vector<ModportParsed>& modports) {
     auto toks = significant_tokens(flat);
-    if (toks.empty() || toks[0].lo != "modport")
+    if (toks.empty() || toks[0].kind != TokenKind::ModPortKeyword)
         return false;
     if (!tok_is(toks.back(), ";", TokenKind::Semicolon))
         return false;
@@ -2861,8 +2935,11 @@ static bool parse_modport_statement(const std::string& flat, std::vector<Modport
     size_t semi = (size_t)toks.back().pos;
     std::string rest = flat.substr(rest_start, semi - rest_start);
     auto entries = split_top_level(rest);
-    static const std::unordered_set<std::string> DIRS = {"input", "output", "inout",
-                                                         "ref",   "import", "export"};
+    auto is_modport_dir = [](TokenKind kind) {
+        return kind == TokenKind::InputKeyword || kind == TokenKind::OutputKeyword ||
+               kind == TokenKind::InOutKeyword || kind == TokenKind::RefKeyword ||
+               kind == TokenKind::ImportKeyword || kind == TokenKind::ExportKeyword;
+    };
 
     for (auto& entry_raw : entries) {
         std::string entry = trim_copy(entry_raw);
@@ -2903,7 +2980,7 @@ static bool parse_modport_statement(const std::string& flat, std::vector<Modport
             std::string dir = item_toks[0].text;
             size_t remainder_start = (size_t)item_toks[0].pos + item_toks[0].text.size();
             std::string remainder = trim_copy(item.substr(remainder_start));
-            if (dir.empty() || remainder.empty() || !has(DIRS, lower(dir)))
+            if (dir.empty() || remainder.empty() || !is_modport_dir(item_toks[0].kind))
                 return false;
             mp.items.push_back({dir, remainder});
         }
@@ -2923,7 +3000,7 @@ static std::vector<std::string> format_modport_pass(std::vector<std::string> lin
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string& line = lines[i];
         auto line_toks = significant_tokens(line);
-        if (line_toks.empty() || line_toks[0].lo != "modport") {
+        if (line_toks.empty() || line_toks[0].kind != TokenKind::ModPortKeyword) {
             out.push_back(lines[i]);
             continue;
         }
@@ -3002,16 +3079,12 @@ static std::vector<std::string> format_modport_pass(std::vector<std::string> lin
 
 static bool find_simple_call(const std::string& line, size_t& name_start, size_t& name_end,
                              size_t& open, size_t& close) {
-    static const std::unordered_set<std::string> SKIP = {
-        "if",    "for",      "foreach",  "while",       "repeat",   "wait", "case",
-        "casex", "casez",    "module",   "macromodule", "function", "task", "covergroup",
-        "class", "property", "sequence", "assert",      "assume",   "cover"};
     auto toks = collect_lexer_tokens(line);
     for (size_t i = 0; i < toks.size(); ++i) {
         const auto& tok = toks[i];
         if (tok.whitespace || tok.comment)
             continue;
-        bool callable = is_identifier(tok) || tok.text.rfind("`", 0) == 0;
+        bool callable = is_identifier(tok) || starts_with_chars(tok.text, '`');
         if (!callable)
             continue;
         size_t prev = i;
@@ -3024,7 +3097,7 @@ static bool find_simple_call(const std::string& line, size_t& name_start, size_t
             ++j;
         if (j >= toks.size() || !tok_is(toks[j], "(", TokenKind::OpenParenthesis))
             continue;
-        if (has(SKIP, tok.lo))
+        if (is_function_call_skip_token(tok))
             continue;
         int depth = 1;
         size_t k = j;
@@ -3074,7 +3147,7 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
     auto find_macro_call_start = [](const std::string& ln) -> size_t {
         auto toks = collect_lexer_tokens(ln);
         for (size_t i = 0; i < toks.size(); ++i) {
-            if (toks[i].whitespace || toks[i].comment || toks[i].text.rfind("`", 0) != 0)
+            if (toks[i].whitespace || toks[i].comment || !starts_with_chars(toks[i].text, '`'))
                 continue;
             size_t k = i + 1;
             while (k < toks.size() && toks[k].whitespace)
@@ -3240,25 +3313,16 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
         std::string prefix = line.substr(0, ns);
         std::string name = line.substr(ns, ne - ns);
         std::string suffix = line.substr(cl + 1);
-        std::string prefix_trimmed = trim_copy(prefix);
-        std::string prefix_lower = lower(prefix_trimmed);
-        auto is_bare_id = [](const std::string& s) -> bool {
-            if (s.empty())
-                return false;
-            char c0 = s[0];
-            if (!std::isalpha((unsigned char)c0) && c0 != '_' && c0 != '$')
-                return false;
-            for (size_t k = 1; k < s.size(); ++k) {
-                char c = s[k];
-                if (!std::isalnum((unsigned char)c) && c != '_' && c != '$')
-                    return false;
-            }
-            return true;
-        };
-        if (is_bare_id(prefix_trimmed) || prefix_lower.find("function") != std::string::npos ||
-            prefix_lower.find("task") != std::string::npos ||
-            prefix_lower.find("module") != std::string::npos ||
-            prefix_lower.find("class") != std::string::npos) {
+        auto prefix_toks = significant_tokens(prefix);
+        bool bare_id_prefix = prefix_toks.size() == 1 && is_identifier(prefix_toks[0]);
+        bool declaration_prefix = false;
+        for (const auto& tok : prefix_toks) {
+            declaration_prefix = declaration_prefix || tok.kind == TokenKind::FunctionKeyword ||
+                                 tok.kind == TokenKind::TaskKeyword ||
+                                 tok.kind == TokenKind::ModuleKeyword ||
+                                 tok.kind == TokenKind::ClassKeyword;
+        }
+        if (bare_id_prefix || declaration_prefix) {
             out.push_back(lines[li]);
             continue;
         }
@@ -3317,7 +3381,9 @@ static bool extract_single_line_module_header(const std::string& line, std::stri
                                               std::string& ports_str, std::string& suffix_str) {
     auto toks = significant_tokens(line);
     if (toks.size() < 4 ||
-        (toks[0].lo != "module" && toks[0].lo != "macromodule" && toks[0].lo != "interface"))
+        (toks[0].kind != TokenKind::ModuleKeyword &&
+         toks[0].kind != TokenKind::MacromoduleKeyword &&
+         toks[0].kind != TokenKind::InterfaceKeyword))
         return false;
 
     size_t i = 1;
@@ -3342,7 +3408,7 @@ static bool extract_single_line_module_header(const std::string& line, std::stri
         ++i;
     }
 
-    while (i < toks.size() && toks[i].lo == "import") {
+    while (i < toks.size() && toks[i].kind == TokenKind::ImportKeyword) {
         while (i < toks.size() && !tok_is(toks[i], ";", TokenKind::Semicolon))
             ++i;
         if (i >= toks.size())
@@ -3403,99 +3469,50 @@ static bool extract_single_line_module_header(const std::string& line, std::stri
 static bool is_module_header_start_tokenized(const std::string& line) {
     auto toks = significant_tokens(line);
     return !toks.empty() &&
-           (toks[0].lo == "module" || toks[0].lo == "macromodule" || toks[0].lo == "interface");
+           (toks[0].kind == TokenKind::ModuleKeyword ||
+            toks[0].kind == TokenKind::MacromoduleKeyword ||
+            toks[0].kind == TokenKind::InterfaceKeyword);
 }
 
 static bool could_start_module_header(const std::string& line) {
-    size_t p = 0;
-    while (p < line.size() && (line[p] == ' ' || line[p] == '\t'))
-        ++p;
-
-    auto matches_word = [&](const char* word) {
-        const size_t len = std::char_traits<char>::length(word);
-        if (p + len > line.size() || line.compare(p, len, word) != 0)
-            return false;
-        if (p + len == line.size())
-            return true;
-        char next = line[p + len];
-        return !std::isalnum((unsigned char)next) && next != '_' && next != '$';
-    };
-
-    return matches_word("module") || matches_word("macromodule") || matches_word("interface");
+    return is_module_header_start_tokenized(line);
 }
 
 struct ModuleHeaderScan {
     int paren{0};
     int brace{0};
     int bracket{0};
-    bool block_comment{false};
-    bool string{false};
-    bool escaped{false};
     bool saw_paren{false};
+    bool saw_import_before_port_list{false};
 };
 
 static bool scan_module_header_line(ModuleHeaderScan& scan, const std::string& line) {
-    for (size_t i = 0; i < line.size(); ++i) {
-        char ch = line[i];
-
-        if (scan.block_comment) {
-            if (ch == '*' && i + 1 < line.size() && line[i + 1] == '/') {
-                scan.block_comment = false;
-                ++i;
-            }
+    for (const auto& tok : collect_lexer_tokens(line)) {
+        if (tok.whitespace || tok.comment || tok.directive)
             continue;
-        }
 
-        if (scan.string) {
-            if (scan.escaped) {
-                scan.escaped = false;
-            } else if (ch == '\\') {
-                scan.escaped = true;
-            } else if (ch == '"') {
-                scan.string = false;
-            }
-            continue;
-        }
+        if (!scan.saw_paren && tok.kind == TokenKind::ImportKeyword)
+            scan.saw_import_before_port_list = true;
 
-        if (ch == '/' && i + 1 < line.size() && line[i + 1] == '/')
-            break;
-        if (ch == '/' && i + 1 < line.size() && line[i + 1] == '*') {
-            scan.block_comment = true;
-            ++i;
-            continue;
-        }
-        if (ch == '"') {
-            scan.string = true;
-            continue;
-        }
-
-        if (ch == '(') {
+        if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
             scan.saw_paren = true;
             ++scan.paren;
         }
-        else if (ch == ')' && scan.paren > 0)
+        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && scan.paren > 0)
             --scan.paren;
-        else if (ch == '{')
+        else if (tok_is(tok, "{", TokenKind::OpenBrace) ||
+                 tok.kind == TokenKind::ApostropheOpenBrace)
             ++scan.brace;
-        else if (ch == '}' && scan.brace > 0)
+        else if (tok_is(tok, "}", TokenKind::CloseBrace) && scan.brace > 0)
             --scan.brace;
-        else if (ch == '[')
+        else if (tok_is(tok, "[", TokenKind::OpenBracket))
             ++scan.bracket;
-        else if (ch == ']' && scan.bracket > 0)
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && scan.bracket > 0)
             --scan.bracket;
-        else if (ch == ';' && scan.paren == 0 && scan.brace == 0 && scan.bracket == 0) {
-            if (!scan.saw_paren) {
-                std::string before = line.substr(0, i);
-                bool is_import_semicolon = false;
-                for (const auto& tok : significant_tokens(before)) {
-                    if (tok.lo == "import") {
-                        is_import_semicolon = true;
-                        break;
-                    }
-                }
-                if (is_import_semicolon)
-                    continue;
-            }
+        else if (tok_is(tok, ";", TokenKind::Semicolon) && scan.paren == 0 && scan.brace == 0 &&
+                 scan.bracket == 0) {
+            if (!scan.saw_paren && scan.saw_import_before_port_list)
+                continue;
             return true;
         }
     }
@@ -3584,8 +3601,100 @@ static std::vector<std::string> split_module_ports_tokenized(const std::string& 
 }
 
 static bool is_standalone_comment_line(const std::string& text) {
-    std::string trimmed = trim_all_copy(text);
-    return trimmed.rfind("//", 0) == 0 || trimmed.rfind("/*", 0) == 0;
+    for (const auto& tok : collect_lexer_tokens(text)) {
+        if (tok.whitespace)
+            continue;
+        return tok.comment;
+    }
+    return false;
+}
+
+static bool is_line_comment_token(const Tok& tok) {
+    return tok.comment && starts_with_chars(tok.text, '/', '/');
+}
+
+static size_t first_line_comment_start_tokenized(const std::string& text) {
+    for (const auto& tok : collect_lexer_tokens(text)) {
+        if (is_line_comment_token(tok))
+            return (size_t)tok.pos;
+    }
+    return std::string::npos;
+}
+
+static bool token_starts_physical_line(const std::string& text, const Tok& tok) {
+    size_t p = (size_t)tok.pos;
+    while (p > 0 && (text[p - 1] == ' ' || text[p - 1] == '\t'))
+        --p;
+    return p == 0 || text[p - 1] == '\n';
+}
+
+static size_t first_standalone_line_comment_tokenized(const std::string& text) {
+    for (const auto& tok : collect_lexer_tokens(text)) {
+        if (is_line_comment_token(tok) && token_starts_physical_line(text, tok))
+            return (size_t)tok.pos;
+    }
+    return std::string::npos;
+}
+
+static size_t token_end(const Tok& tok) {
+    return (size_t)tok.pos + tok.text.size();
+}
+
+static size_t line_end_after_token(const std::string& text, const Tok& tok) {
+    size_t end = token_end(tok);
+    while (end < text.size() && text[end] != '\n')
+        ++end;
+    return end;
+}
+
+static void erase_extra_comma_before_line_comment(std::string& line) {
+    auto toks = significant_tokens(line);
+    for (size_t i = 0; i + 1 < toks.size(); ++i) {
+        if (!tok_is(toks[i], ",", TokenKind::Comma) || !tok_is(toks[i + 1], ",", TokenKind::Comma))
+            continue;
+        size_t comment = first_line_comment_start_tokenized(line);
+        if (comment != std::string::npos && (size_t)toks[i + 1].pos < comment) {
+            line.erase((size_t)toks[i + 1].pos, token_end(toks[i + 1]) - (size_t)toks[i + 1].pos);
+            return;
+        }
+    }
+}
+
+static void remove_space_before_comma_token(std::string& line, size_t comma_pos) {
+    if (comma_pos == 0 || comma_pos > line.size())
+        return;
+    size_t before = comma_pos;
+    while (before > 0 && (line[before - 1] == ' ' || line[before - 1] == '\t'))
+        --before;
+    if (before < comma_pos)
+        line.erase(before, comma_pos - before);
+}
+
+static void normalize_trailing_comma_spacing(std::string& line) {
+    auto toks = significant_tokens(line);
+    size_t comment = first_line_comment_start_tokenized(line);
+    for (const auto& tok : toks) {
+        if (!tok_is(tok, ",", TokenKind::Comma))
+            continue;
+        size_t comma = (size_t)tok.pos;
+        if (comment == std::string::npos || comma < comment)
+            remove_space_before_comma_token(line, comma);
+    }
+}
+
+static bool remove_last_code_comma(std::string& line) {
+    size_t comment = first_line_comment_start_tokenized(line);
+    auto toks = significant_tokens(line);
+    for (size_t i = toks.size(); i > 0; --i) {
+        const auto& tok = toks[i - 1];
+        if (comment != std::string::npos && (size_t)tok.pos >= comment)
+            continue;
+        if (!tok_is(tok, ",", TokenKind::Comma))
+            return false;
+        line.erase((size_t)tok.pos, token_end(tok) - (size_t)tok.pos);
+        return true;
+    }
+    return false;
 }
 
 static bool is_simple_identifier_tokenized(const std::string& text) {
@@ -3600,8 +3709,6 @@ static bool is_comma_eligible_portlist_entry(PortListEntryKind kind) {
 }
 
 static PortListEntryKind classify_portlist_entry(const std::string& text) {
-    static const std::unordered_set<std::string> ANSI_DIR = {"input", "output", "inout", "ref"};
-
     for (const auto& tok : collect_lexer_tokens(text)) {
         if (tok.whitespace)
             continue;
@@ -3609,7 +3716,7 @@ static PortListEntryKind classify_portlist_entry(const std::string& text) {
             return PortListEntryKind::Comment;
         if (tok.directive)
             return PortListEntryKind::Directive;
-        if (has(ANSI_DIR, tok.lo))
+        if (is_port_direction_token(tok))
             return PortListEntryKind::Port;
         return PortListEntryKind::Other;
     }
@@ -3622,7 +3729,7 @@ static std::string take_leading_portlist_block_comments_tokenized(std::string& p
     for (const auto& tok : collect_lexer_tokens(ports_str)) {
         if (tok.whitespace)
             continue;
-        if (!tok.comment || tok.text.rfind("/*", 0) != 0)
+        if (!tok.comment || !starts_with_chars(tok.text, '/', '*'))
             break;
         comments += ports_str.substr(erase_end, (size_t)tok.pos + tok.text.size() - erase_end);
         erase_end = (size_t)tok.pos + tok.text.size();
@@ -3643,23 +3750,22 @@ static std::string leading_horizontal_whitespace_tokenized(const std::string& li
 
 static bool find_module_parameter_block(const std::string& prefix, size_t& hash_pos,
                                         size_t& param_open, size_t& param_close) {
-    for (size_t i = 0; i + 1 < prefix.size(); ++i) {
-        if (prefix[i] != '#')
+    auto toks = significant_tokens(prefix);
+    for (size_t i = 0; i + 1 < toks.size(); ++i) {
+        if (!tok_is(toks[i], "#", TokenKind::Hash))
             continue;
         size_t j = i + 1;
-        while (j < prefix.size() && (prefix[j] == ' ' || prefix[j] == '\t'))
-            ++j;
-        if (j >= prefix.size() || prefix[j] != '(')
+        if (j >= toks.size() || !tok_is(toks[j], "(", TokenKind::OpenParenthesis))
             continue;
 
         int depth = 1;
-        for (size_t k = j + 1; k < prefix.size(); ++k) {
-            if (prefix[k] == '(')
+        for (size_t k = j + 1; k < toks.size(); ++k) {
+            if (tok_is(toks[k], "(", TokenKind::OpenParenthesis))
                 ++depth;
-            else if (prefix[k] == ')' && --depth == 0) {
-                hash_pos = i;
-                param_open = j;
-                param_close = k;
+            else if (tok_is(toks[k], ")", TokenKind::CloseParenthesis) && --depth == 0) {
+                hash_pos = (size_t)toks[i].pos;
+                param_open = (size_t)toks[j].pos;
+                param_close = (size_t)toks[k].pos;
                 return true;
             }
         }
@@ -3676,13 +3782,21 @@ static std::string format_module_parameter_prefix(const std::string& prefix,
         return prefix;
 
     std::string before_hash = trim_right_copy(prefix.substr(0, hash_pos));
+    bool has_import = false;
+    for (const auto& tok : significant_tokens(before_hash)) {
+        if (tok.kind == TokenKind::ImportKeyword) {
+            has_import = true;
+            break;
+        }
+    }
     bool split_import_parameter_header =
-        before_hash.find('\n') != std::string::npos && before_hash.find("import") != std::string::npos;
+        before_hash.find('\n') != std::string::npos && has_import;
     if (!split_import_parameter_header)
         before_hash += " ";
     std::string params_str = prefix.substr(param_open + 1, param_close - param_open - 1);
     std::string after_params = trim_copy(prefix.substr(param_close + 1));
-    if (after_params != "(")
+    auto after_toks = significant_tokens(after_params);
+    if (after_toks.size() != 1 || !tok_is(after_toks[0], "(", TokenKind::OpenParenthesis))
         return prefix;
 
     auto params = split_top_level(params_str);
@@ -3853,9 +3967,18 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                 if (consumed_directive)
                     continue;
 
-                if (rest.rfind("//", 0) == 0) {
-                    size_t line_end = rest.find('\n');
-                    if (line_end == std::string::npos) {
+                auto rest_toks = collect_lexer_tokens(rest);
+                const Tok* first_tok = nullptr;
+                for (const auto& tok : rest_toks) {
+                    if (!tok.whitespace) {
+                        first_tok = &tok;
+                        break;
+                    }
+                }
+
+                if (first_tok && is_line_comment_token(*first_tok)) {
+                    size_t line_end = line_end_after_token(rest, *first_tok);
+                    if (line_end >= rest.size()) {
                         trimmed_ports.push_back(rest);
                         rest.clear();
                     } else {
@@ -3865,18 +3988,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                     continue;
                 }
 
-                size_t standalone_comment = std::string::npos;
-                size_t search = 0;
-                while ((search = rest.find('\n', search)) != std::string::npos) {
-                    size_t p = search + 1;
-                    while (p < rest.size() && (rest[p] == ' ' || rest[p] == '\t'))
-                        ++p;
-                    if (p + 1 < rest.size() && rest[p] == '/' && rest[p + 1] == '/') {
-                        standalone_comment = search;
-                        break;
-                    }
-                    ++search;
-                }
+                size_t standalone_comment = first_standalone_line_comment_tokenized(rest);
                 if (standalone_comment == std::string::npos) {
                     trimmed_ports.push_back(std::move(rest));
                     break;
@@ -3885,7 +3997,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                 std::string code = trim_all_copy(rest.substr(0, standalone_comment));
                 if (!code.empty())
                     trimmed_ports.push_back(std::move(code));
-                rest = trim_all_copy(rest.substr(standalone_comment + 1));
+                rest = trim_all_copy(rest.substr(standalone_comment));
             }
         }
         if (trimmed_ports.empty()) {
@@ -3947,41 +4059,13 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                     std::string l;
                     while (std::getline(ss, l)) {
                         while (true) {
-                            size_t first_comma = l.find(',');
-                            bool changed = false;
-                            while (first_comma != std::string::npos) {
-                                size_t p = first_comma + 1;
-                                while (p < l.size() && (l[p] == ' ' || l[p] == '\t'))
-                                    ++p;
-                                if (p < l.size() && l[p] == ',') {
-                                    size_t q = p + 1;
-                                    while (q < l.size() && (l[q] == ' ' || l[q] == '\t'))
-                                        ++q;
-                                    if (q + 1 < l.size() && l[q] == '/' && l[q + 1] == '/') {
-                                        l.erase(p, q - p);
-                                        changed = true;
-                                        break;
-                                    }
-                                }
-                                first_comma = l.find(',', first_comma + 1);
-                            }
+                            std::string before = l;
+                            erase_extra_comma_before_line_comment(l);
+                            bool changed = l != before;
                             if (!changed)
                                 break;
                         }
-                        size_t comment = find_line_comment_start(l);
-                        if (comment != std::string::npos) {
-                            size_t comma = l.find_last_not_of(" \t", comment - 1);
-                            if (comma != std::string::npos && l[comma] == ',') {
-                                size_t before = l.find_last_not_of(" \t", comma - 1);
-                                if (before != std::string::npos)
-                                    l.erase(before + 1, comma - before - 1);
-                            }
-                        }
-                        size_t last = l.find_last_not_of(" \t");
-                        if (last != std::string::npos && l[last] == ',') {
-                            size_t before = l.find_last_not_of(" \t", last - 1);
-                            l.erase(before + 1, last - before - 1);
-                        }
+                        normalize_trailing_comma_spacing(l);
                         aligned_lines.push_back(l);
                     }
                 }
@@ -3989,15 +4073,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                     std::string& l = aligned_lines[ai - 1];
                     if (is_standalone_comment_line(l))
                         continue;
-                    size_t comment = find_line_comment_start(l);
-                    if (comment != std::string::npos) {
-                        size_t comma = l.find_last_not_of(" \t", comment - 1);
-                        if (comma != std::string::npos && l[comma] == ',') {
-                            size_t before = l.find_last_not_of(" \t", comma - 1);
-                            if (before != std::string::npos)
-                                l.erase(before + 1, comma - before);
-                        }
-                    }
+                    remove_last_code_comma(l);
                     break;
                 }
                 port_lines.clear();
@@ -4006,9 +4082,16 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                         port_lines += '\n';
                     port_lines += aligned_lines[ai];
                 }
-                size_t last = port_lines.find_last_not_of(" \t\n");
-                if (last != std::string::npos && port_lines[last] == ',')
-                    port_lines.erase(last, 1);
+                auto port_toks = significant_tokens(port_lines);
+                for (size_t ti = port_toks.size(); ti > 0; --ti) {
+                    const auto& tok = port_toks[ti - 1];
+                    if (tok_is(tok, ",", TokenKind::Comma)) {
+                        port_lines.erase((size_t)tok.pos, tok.text.size());
+                        break;
+                    }
+                    if (!tok.comment)
+                        break;
+                }
                 while (!port_lines.empty() &&
                        (port_lines.back() == ' ' || port_lines.back() == '\t'))
                     port_lines.pop_back();
@@ -4148,7 +4231,8 @@ static std::vector<std::string> format_function_declaration_pass(
             continue;
         }
         auto toks = significant_tokens(line);
-        if (toks.empty() || (toks[0].lo != "function" && toks[0].lo != "task")) {
+        if (toks.empty() || (toks[0].kind != TokenKind::FunctionKeyword &&
+                             toks[0].kind != TokenKind::TaskKeyword)) {
             out.push_back(line);
             continue;
         }
