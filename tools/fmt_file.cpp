@@ -21,7 +21,12 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
-    std::string result = format_source(ss.str(), opts);
-    std::cout << result;
-    return 0;
+    try {
+        std::string result = format_source(ss.str(), opts);
+        std::cout << result;
+        return 0;
+    } catch (const SafeModeError& e) {
+        std::cerr << e.what() << "\n";
+        return 2;
+    }
 }
