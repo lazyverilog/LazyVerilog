@@ -89,6 +89,54 @@ TEST_CASE("formatter: module parameter layout hanging", "[formatter]") {
           "endmodule\n");
 }
 
+TEST_CASE("formatter: module parameter comments with commas are not split", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.parameter_layout = "hanging";
+
+    const std::string src = "module m #(\n"
+                            "  // Size of the instruction memory, in bytes\n"
+                            "  parameter int ImemSizeByte = 4096,\n"
+                            "  // Size of the data memory, in bytes\n"
+                            "  parameter int DmemSizeByte = 4096\n"
+                            ")();\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("// Size of the instruction memory, in bytes") != std::string::npos);
+    CHECK(formatted.find("\nin bytes\n") == std::string::npos);
+    CHECK(formatted.find("// Size of the data memory, in bytes") != std::string::npos);
+}
+
+TEST_CASE("formatter: block module parameter comments do not emit trailing whitespace",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.parameter_layout = "block";
+
+    const std::string src = "module m #(\n"
+                            "  // Size of the instruction memory, in bytes\n"
+                            "  parameter int ImemSizeByte = 4096,\n"
+                            "  // Size of the data memory, in bytes\n"
+                            "  parameter int DmemSizeByte = 4096\n"
+                            ")();\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("// Size of the instruction memory, in bytes") != std::string::npos);
+    CHECK(formatted.find("\nin bytes\n") == std::string::npos);
+    std::istringstream lines(formatted);
+    std::string line;
+    while (std::getline(lines, line))
+        CHECK((line.empty() || (line.back() != ' ' && line.back() != '\t')));
+}
+
 TEST_CASE("formatter: multiline ANSI module header preserves line comments", "[formatter]") {
     FormatOptions opts;
     opts.safe_mode = true;
@@ -1363,6 +1411,31 @@ TEST_CASE("formatter: duplicate instance port comments are preserved", "[formatt
     CHECK(formatted.find("// first a comment") != std::string::npos);
     CHECK(formatted.find("// second a comment") != std::string::npos);
     CHECK(formatted.find("// b comment") != std::string::npos);
+}
+
+TEST_CASE("formatter: ANSI port directives do not receive commas", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = true;
+
+    std::string input = "module top (\n"
+                        "  input clk_i,\n"
+                        "  `INOUT_AO(IOA2), // macro port\n"
+                        "`ifdef USE_EXTRA\n"
+                        "  input extra_i,\n"
+                        "`endif // USE_EXTRA\n"
+                        "  output done_o\n"
+                        ");\n"
+                        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
+    CHECK(formatted.find("`ifdef USE_EXTRA,") == std::string::npos);
+    CHECK(formatted.find("`endif,") == std::string::npos);
+    CHECK(formatted.find("`INOUT_AO(IOA2),") != std::string::npos);
+    CHECK(formatted.find("extra_i,") != std::string::npos);
 }
 
 TEST_CASE("formatter: demo memory_top formats with project config", "[formatter]") {

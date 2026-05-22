@@ -18,7 +18,9 @@ typedef struct {
     logic                                   valid                               ;
 } packet_ta;
 
-interface bus_intf #(parameter W_IDTH=8)(
+interface bus_intf #(
+    parameter W_IDTH=8
+)(
     input   logic               i_clk
 );
 
@@ -55,8 +57,10 @@ endinterface
 
 parameter DEPTH = 8;
 
-module memory_top #(parameter int WIDTH=4,
-                    parameter int DEPTH=8)( /*autoarg*/
+module memory_top #(
+    parameter int WIDTH=4,
+    parameter int DEPTH=8
+)( /*autoarg*/
     i_clk, i_rst_n, i_data,
     i_d
 );

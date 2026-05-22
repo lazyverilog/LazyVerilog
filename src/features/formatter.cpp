@@ -987,6 +987,32 @@ static std::vector<std::string> split_top_level(const std::string& text) {
     size_t start = 0;
     for (size_t i = 0; i < text.size(); ++i) {
         char c = text[i];
+        if (c == '"' ||
+            (c == '/' && i + 1 < text.size() &&
+             (text[i + 1] == '/' || text[i + 1] == '*'))) {
+            if (c == '"') {
+                ++i;
+                while (i < text.size()) {
+                    if (text[i] == '\\' && i + 1 < text.size()) {
+                        i += 2;
+                    } else if (text[i] == '"') {
+                        break;
+                    } else {
+                        ++i;
+                    }
+                }
+            } else if (text[i + 1] == '/') {
+                i += 2;
+                while (i < text.size() && text[i] != '\n')
+                    ++i;
+            } else {
+                size_t end = text.find("*/", i + 2);
+                if (end == std::string::npos)
+                    break;
+                i = end + 1;
+            }
+            continue;
+        }
         if (c == '(' || c == '[' || c == '{')
             ++depth;
         else if (c == ')' || c == ']' || c == '}')
@@ -3585,9 +3611,27 @@ static bool is_simple_identifier_tokenized(const std::string& text) {
     return toks.size() == 1 && is_identifier(toks[0]);
 }
 
-static std::string first_token_lower(const std::string& text) {
-    auto toks = significant_tokens(text);
-    return toks.empty() ? std::string() : toks[0].lo;
+enum class PortListEntryKind { Port, Comment, Directive, Other };
+
+static bool is_comma_eligible_portlist_entry(PortListEntryKind kind) {
+    return kind != PortListEntryKind::Comment && kind != PortListEntryKind::Directive;
+}
+
+static PortListEntryKind classify_portlist_entry(const std::string& text) {
+    static const std::unordered_set<std::string> ANSI_DIR = {"input", "output", "inout", "ref"};
+
+    for (const auto& tok : collect_lexer_tokens(text)) {
+        if (tok.whitespace)
+            continue;
+        if (tok.comment)
+            return PortListEntryKind::Comment;
+        if (tok.directive)
+            return PortListEntryKind::Directive;
+        if (has(ANSI_DIR, tok.lo))
+            return PortListEntryKind::Port;
+        return PortListEntryKind::Other;
+    }
+    return PortListEntryKind::Other;
 }
 
 static std::string take_leading_portlist_block_comments_tokenized(std::string& ports_str) {
@@ -3719,21 +3763,32 @@ static std::string format_module_parameter_prefix(const std::string& prefix,
 
     std::string param_indent = leading_ws + std::string(opts.indent_size, ' ');
     std::string out = before_hash + "#(\n";
-    for (size_t i = 0; i < trimmed_params.size(); ++i) {
-        std::string param = trimmed_params[i];
-        {
-            size_t pos = 0;
-            while ((pos = param.find('\n', pos)) != std::string::npos) {
-                size_t next = pos + 1;
-                if (next < param.size() && param[next] != '\n') {
-                    param.insert(next, param_indent);
-                    pos += 1 + param_indent.size();
-                } else {
-                    pos = next;
-                }
-            }
+    auto normalize_block_param = [&](const std::string& raw) {
+        std::vector<std::string> raw_lines;
+        std::istringstream ss(raw);
+        std::string line;
+        while (std::getline(ss, line)) {
+            raw_lines.push_back(trim_copy(line));
         }
-        out += param_indent + param;
+        if (!raw.empty() && raw.back() == '\n')
+            raw_lines.push_back("");
+
+        if (!raw_lines.empty() && raw_lines.front().empty())
+            raw_lines.erase(raw_lines.begin());
+        while (!raw_lines.empty() && raw_lines.back().empty())
+            raw_lines.pop_back();
+
+        std::string result;
+        for (size_t line_idx = 0; line_idx < raw_lines.size(); ++line_idx) {
+            if (line_idx)
+                result += "\n";
+            if (!raw_lines[line_idx].empty())
+                result += param_indent + raw_lines[line_idx];
+        }
+        return result;
+    };
+    for (size_t i = 0; i < trimmed_params.size(); ++i) {
+        out += normalize_block_param(trimmed_params[i]);
         if (i + 1 < trimmed_params.size())
             out += ",";
         out += "\n";
@@ -3802,6 +3857,20 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
         for (auto& p : ports) {
             std::string rest = trim_all_copy(p);
             while (!rest.empty()) {
+                bool consumed_directive = false;
+                for (const auto& tok : collect_lexer_tokens(rest)) {
+                    if (tok.whitespace)
+                        continue;
+                    if (tok.directive && tok.pos == 0) {
+                        trimmed_ports.push_back(trim_all_copy(tok.text));
+                        rest = trim_all_copy(rest.substr(tok.text.size()));
+                        consumed_directive = true;
+                    }
+                    break;
+                }
+                if (consumed_directive)
+                    continue;
+
                 if (rest.rfind("//", 0) == 0) {
                     size_t line_end = rest.find('\n');
                     if (line_end == std::string::npos) {
@@ -3847,13 +3916,14 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
         std::string port_indent = leading_ws + indent_unit;
 
         // ANSI vs non-ANSI detection
-        static const std::unordered_set<std::string> ANSI_DIR = {"input", "output", "inout", "ref"};
+        std::vector<PortListEntryKind> port_kinds;
+        port_kinds.reserve(trimmed_ports.size());
         bool is_ansi = false;
         for (auto& p : trimmed_ports) {
-            std::string first = first_token_lower(p);
-            if (!first.empty() && has(ANSI_DIR, lower(first))) {
+            PortListEntryKind kind = classify_portlist_entry(p);
+            port_kinds.push_back(kind);
+            if (kind == PortListEntryKind::Port) {
                 is_ansi = true;
-                break;
             }
         }
 
@@ -3861,7 +3931,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
         if (is_ansi) {
             auto has_later_port = [&](size_t index) {
                 for (size_t pi = index + 1; pi < trimmed_ports.size(); ++pi) {
-                    if (!is_standalone_comment_line(trimmed_ports[pi]))
+                    if (is_comma_eligible_portlist_entry(port_kinds[pi]))
                         return true;
                 }
                 return false;
@@ -3870,7 +3940,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
             for (size_t k = 0; k < trimmed_ports.size(); ++k) {
                 std::string port = trimmed_ports[k];
                 std::string comma =
-                    (!is_standalone_comment_line(port) &&
+                    (is_comma_eligible_portlist_entry(port_kinds[k]) &&
                      (has_later_port(k) || opts.port_declaration.align))
                         ? ","
                         : "";

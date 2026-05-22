@@ -118,7 +118,7 @@ layout = "block"           # hanging | block — applies to function and task de
 line_length = 13          # declarations shorter than this stay single-line
 
 [format.module]
-parameter_layout = "hanging" # block | hanging
+parameter_layout = "block" # block | hanging
 non_ansi_port_per_line_enabled = true
 non_ansi_port_per_line = 3
 non_ansi_port_max_line_length_enabled = false
