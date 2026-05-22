@@ -1,14 +1,14 @@
 typedef struct packed {
     logic                                   valid                               ;
-    logic               [ 3 : 0 ]           id                                  ;
-    logic               [ 31 : 0 ]          data                                ;
+    logic               [3:0]               id                                  ;
+    logic               [31:0]              data                                ;
 } fifo_entry_t;
 
 function packet_t sum(
     input packet_t i_a,
     input i_b
 );
-    return packet_t'( {40'b0, i_a}+i_b );
+    return packet_t'({40'b0, i_a}+i_b);
 endfunction
 
 task add_number(
@@ -22,7 +22,7 @@ endtask
 package cpu_pkg;
 
 // State machine states
-typedef enum logic [ 1 : 0 ] {
+typedef enum logic [1:0] {
     IDLE        = 2'd0          ,
     FETCH       ,
     EXECUTE     = 2'd2          ,
@@ -30,7 +30,7 @@ typedef enum logic [ 1 : 0 ] {
 } state_t;
 
 // Instruction opcode
-typedef enum logic [ 2 : 0 ] {
+typedef enum logic [2:0] {
     OP_NOP      = 3'b000        ,
     OP_ADD      = 3'b001        ,
     OP_SUB      = 3'b010        ,
@@ -43,7 +43,7 @@ parameter int DATA_WIDTH    = 32;
 
 endpackage
 
-typedef enum logic [ 1 : 0 ] {
+typedef enum logic [1:0] {
     IDLE        ,
     FETCH       ,
     EXECUTE     ,
