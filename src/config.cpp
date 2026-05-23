@@ -132,8 +132,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 cfg.format.blank_lines_between_items = static_cast<int>(*v);
             if (auto v = (*f)["default_indent_level_inside_outmost_block"].value<int64_t>())
                 cfg.format.default_indent_level_inside_outmost_block = static_cast<int>(*v);
-            if (auto v = (*f)["default_indent_level_inside_module_block"].value<int64_t>())
-                cfg.format.default_indent_level_inside_outmost_block = static_cast<int>(*v);
             if (auto v = (*f)["enable_format_on_save"].value<bool>())
                 cfg.format.enable_format_on_save = *v;
             if (auto v = (*f)["safe_mode"].value<bool>())
