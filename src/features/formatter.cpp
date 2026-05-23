@@ -227,6 +227,10 @@ static bool is_pp_cond_bare(syntax::SyntaxKind kind) {
            kind == syntax::SyntaxKind::EndIfDirective;
 }
 
+static bool is_pp_conditional(syntax::SyntaxKind kind) {
+    return is_pp_cond_with(kind) || is_pp_cond_bare(kind);
+}
+
 static bool is_macro_usage(const Tok& t) {
     return t.kind == TokenKind::MacroUsage ||
            (t.kind == TokenKind::Directive && t.directive_kind == syntax::SyntaxKind::MacroUsage);
@@ -661,6 +665,70 @@ static std::vector<std::pair<int, int>> find_disabled(const std::string& src) {
             ++i;
     }
 
+    // Preprocessor conditionals can make a single lexical line stream represent multiple
+    // different SystemVerilog token streams. Keep each conditional group verbatim so later
+    // line-based passes never collect or align across inactive branch boundaries.
+    auto directive_at_line = [&](size_t line_start) -> syntax::SyntaxKind {
+        size_t p = line_start;
+        while (p < n && (src[p] == ' ' || src[p] == '\t'))
+            ++p;
+        if (p >= n || src[p] != '`')
+            return syntax::SyntaxKind::Unknown;
+        size_t q = p + 1;
+        while (q < n && (std::isalnum((unsigned char)src[q]) || src[q] == '_' || src[q] == '$'))
+            ++q;
+        std::string name = src.substr(p, q - p);
+        if (name == "`ifdef")
+            return syntax::SyntaxKind::IfDefDirective;
+        if (name == "`ifndef")
+            return syntax::SyntaxKind::IfNDefDirective;
+        if (name == "`elsif")
+            return syntax::SyntaxKind::ElsIfDirective;
+        if (name == "`else")
+            return syntax::SyntaxKind::ElseDirective;
+        if (name == "`endif")
+            return syntax::SyntaxKind::EndIfDirective;
+        return syntax::SyntaxKind::Unknown;
+    };
+    for (size_t i = 0; i < n;) {
+        size_t line_start = i;
+        syntax::SyntaxKind kind = directive_at_line(line_start);
+        if (kind != syntax::SyntaxKind::IfDefDirective &&
+            kind != syntax::SyntaxKind::IfNDefDirective) {
+            while (i < n && src[i] != '\n')
+                ++i;
+            if (i < n)
+                ++i;
+            continue;
+        }
+
+        int depth = 0;
+        size_t j = line_start;
+        for (;;) {
+            syntax::SyntaxKind line_kind = directive_at_line(j);
+            if (line_kind == syntax::SyntaxKind::IfDefDirective ||
+                line_kind == syntax::SyntaxKind::IfNDefDirective) {
+                ++depth;
+            } else if (line_kind == syntax::SyntaxKind::EndIfDirective && depth > 0) {
+                --depth;
+                if (depth == 0) {
+                    while (j < n && src[j] != '\n')
+                        ++j;
+                    out.push_back({(int)line_start, (int)j});
+                    break;
+                }
+            }
+            while (j < n && src[j] != '\n')
+                ++j;
+            if (j >= n)
+                break;
+            ++j;
+        }
+        i = j;
+        if (i < n)
+            ++i;
+    }
+
     // Backtick macro calls are not lexically safe to rewrite: empty macro arguments (",,") and
     // token-paste / stringify operators can be significant. Preserve each macro invocation
     // verbatim, but keep compiler directives handled above formatable where possible.
@@ -952,6 +1020,41 @@ static void push_tok(std::vector<Tok>& toks, TokenKind kind, std::string text, i
     toks.push_back(std::move(t));
 }
 
+static TokenKind single_punct_token_kind(char ch) {
+    switch (ch) {
+        case '+':
+            return TokenKind::Plus;
+        case '-':
+            return TokenKind::Minus;
+        case '*':
+            return TokenKind::Star;
+        case '/':
+            return TokenKind::Slash;
+        case '%':
+            return TokenKind::Percent;
+        case '&':
+            return TokenKind::And;
+        case '|':
+            return TokenKind::Or;
+        case '^':
+            return TokenKind::Xor;
+        case '<':
+            return TokenKind::LessThan;
+        case '>':
+            return TokenKind::GreaterThan;
+        case '?':
+            return TokenKind::Question;
+        case '=':
+            return TokenKind::Equals;
+        case '!':
+            return TokenKind::Exclamation;
+        case '~':
+            return TokenKind::Tilde;
+        default:
+            return TokenKind::Unknown;
+    }
+}
+
 static void append_trivia_text(std::vector<Tok>& toks, const std::string& source, size_t start,
                                size_t end) {
     size_t i = start;
@@ -1050,7 +1153,7 @@ static void append_trivia_text(std::vector<Tok>& toks, const std::string& source
                 }
             }
             if (!matched) {
-                push_tok(toks, TokenKind::Unknown, source.substr(i, 1), (int)i);
+                push_tok(toks, single_punct_token_kind(source[i]), source.substr(i, 1), (int)i);
                 ++i;
             }
         } else {
@@ -1198,6 +1301,26 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
         return it->second;
     }
     return toks;
+}
+
+static bool line_has_pp_conditional(const std::string& line) {
+    for (const auto& tok : collect_lexer_tokens(line)) {
+        if (tok.whitespace || tok.comment)
+            continue;
+        return is_line_directive(tok) && is_pp_conditional(tok.directive_kind);
+    }
+    return false;
+}
+
+static bool range_has_pp_conditional(const std::vector<std::string>& lines, size_t first,
+                                     size_t last_inclusive) {
+    if (lines.empty() || first >= lines.size())
+        return false;
+    last_inclusive = std::min(last_inclusive, lines.size() - 1);
+    for (size_t i = first; i <= last_inclusive; ++i)
+        if (line_has_pp_conditional(lines[i]))
+            return true;
+    return false;
 }
 
 static std::string trim_left_copy(std::string s) {
@@ -1565,7 +1688,7 @@ static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
                has_kind(line, TokenKind::ImportKeyword);
     };
     while (i < lines.size()) {
-        if (in_disabled(line_starts[i], disabled)) {
+        if (in_disabled(line_starts[i], disabled) || line_has_pp_conditional(lines[i])) {
             out.push_back(lines[i]);
             ++i;
             continue;
@@ -1597,6 +1720,8 @@ static std::vector<std::string> align_port_pass(std::vector<std::string> lines,
         std::vector<PortBlkEntry> blk;
         size_t j = i;
         while (j < lines.size()) {
+            if (line_has_pp_conditional(lines[j]))
+                break;
             if (!is_port_decl_line((int)j)) {
                 if (significant_tokens(lines[j]).empty() || is_standalone_comment(lines[j])) {
                     blk.push_back({lines[j], lines[j], PortParsed{}});
@@ -1880,6 +2005,11 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
     std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
+        if (line_has_pp_conditional(lines[i])) {
+            out.push_back(lines[i]);
+            ++i;
+            continue;
+        }
         auto [p0, op0] = find_op(lines[i]);
         if (p0 < 0 || is_var((int)i) || is_module_header_parameter((int)i)) {
             out.push_back(lines[i]);
@@ -1897,8 +2027,8 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
                 size_t ij = 0;
                 while (ij < lj.size() && (lj[ij] == ' ' || lj[ij] == '\t'))
                     ++ij;
-                if (ij != ind || is_var((int)j) || is_module_header_parameter((int)j) ||
-                    find_op(lj).first < 0)
+                if (line_has_pp_conditional(lj) || ij != ind || is_var((int)j) ||
+                    is_module_header_parameter((int)j) || find_op(lj).first < 0)
                     break;
                 out.push_back(lines[j]);
                 ++j;
@@ -1918,6 +2048,8 @@ static std::vector<std::string> align_assign_pass(std::vector<std::string> lines
         while (j < lines.size()) {
             const auto& lj = lines[j];
             if (lj.empty())
+                break;
+            if (line_has_pp_conditional(lj))
                 break;
             if (is_var((int)j) || is_module_header_parameter((int)j))
                 break;
@@ -2146,7 +2278,7 @@ static std::vector<std::string> align_var_pass(std::vector<std::string> lines,
     size_t i = 0;
     while (i < lines.size()) {
         // Enter a block only if this line is a variable declaration.
-        if (!is_var_idx((int)i)) {
+        if (line_has_pp_conditional(lines[i]) || !is_var_idx((int)i)) {
             out.push_back(lines[i]);
             ++i;
             continue;
@@ -2161,6 +2293,8 @@ static std::vector<std::string> align_var_pass(std::vector<std::string> lines,
         size_t j = i;
         while (j < lines.size()) {
             const std::string& cur = lines[j];
+            if (line_has_pp_conditional(cur))
+                break;
             if (is_var_idx((int)j)) {
                 block.push_back({lines[j], parse_var_line(cur, opts)});
                 ++j;
@@ -2426,6 +2560,8 @@ static bool collect_instance(const std::vector<std::string>& lines, size_t start
         while (sp < stripped.size() && (stripped[sp] == ' ' || stripped[sp] == '\t'))
             ++sp;
         stripped = stripped.substr(sp);
+        if (line_has_pp_conditional(stripped))
+            comments.preserve_original = true;
 
         std::string code = stripped;
         size_t line_comment = std::string::npos;
@@ -2784,7 +2920,7 @@ static std::vector<std::string> expand_instances_pass(std::vector<std::string> l
     while (i < lines.size()) {
         const std::string& line = lines[i];
 
-        if (in_disabled(line_starts[i], disabled)) {
+        if (in_disabled(line_starts[i], disabled) || line_has_pp_conditional(lines[i])) {
             out.push_back(lines[i]);
             ++i;
             continue;
@@ -2968,6 +3104,8 @@ static bool collect_statement_lines(const std::vector<std::string>& lines, size_
     std::vector<std::string> parts;
     for (size_t i = start; i < lines.size(); ++i) {
         std::string trimmed = trim_copy(lines[i]);
+        if (line_has_pp_conditional(trimmed))
+            return false;
         parts.push_back(trimmed);
         for (const auto& tok : collect_lexer_tokens(trimmed)) {
             if (tok.whitespace || tok.comment || tok.directive)
@@ -3428,7 +3566,7 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
             continue;
         }
         // Never reformat macro calls inside disabled regions or `define bodies.
-        if (in_disabled(line_start, disabled)) {
+        if (in_disabled(line_start, disabled) || line_has_pp_conditional(line)) {
             out.push_back(lines[li]);
             continue;
         }
@@ -4068,7 +4206,7 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string line = lines[i];
 
-        if (!could_start_module_header(line)) {
+        if (line_has_pp_conditional(line) || !could_start_module_header(line)) {
             out.push_back(lines[i]);
             continue;
         }
@@ -4098,6 +4236,11 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
                 line = flat;
                 consumed_end = j;
             }
+        }
+        if (range_has_pp_conditional(lines, i, consumed_end)) {
+            push_original_lines(i, consumed_end);
+            i = consumed_end;
+            continue;
         }
 
         // Try to extract single-line module header: module foo [#(...)] (ports);
@@ -4389,7 +4532,7 @@ static std::vector<std::string> format_function_declaration_pass(
         const std::string& line = lines[li];
         int line_start = pos;
         pos += (int)line.size() + 1;
-        if (in_disabled(line_start, disabled)) {
+        if (in_disabled(line_start, disabled) || line_has_pp_conditional(line)) {
             out.push_back(line);
             continue;
         }
@@ -4478,7 +4621,7 @@ static std::vector<std::string> split_semicolon_statements_pass(std::vector<std:
     std::vector<std::string> out;
     for (const auto& line : lines) {
         std::string trimmed_line = trim_right_copy(line);
-        if (!trimmed_line.empty() && trimmed_line.back() == '\\') {
+        if (line_has_pp_conditional(line) || (!trimmed_line.empty() && trimmed_line.back() == '\\')) {
             out.push_back(line);
             continue;
         }
@@ -4582,13 +4725,13 @@ static std::vector<std::string> align_define_continuation_pass(std::vector<std::
     std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
-        if (!ends_with_bs(lines[i])) {
+        if (line_has_pp_conditional(lines[i]) || !ends_with_bs(lines[i])) {
             out.push_back(lines[i]);
             ++i;
             continue;
         }
         size_t start = i;
-        while (i < lines.size() && ends_with_bs(lines[i]))
+        while (i < lines.size() && !line_has_pp_conditional(lines[i]) && ends_with_bs(lines[i]))
             ++i;
         // lines[start..i) all end with '\'
         size_t max_cw = 0;

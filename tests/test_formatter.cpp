@@ -1597,6 +1597,29 @@ TEST_CASE("formatter: spacing options control control parens and brackets", "[fo
                                  "endmodule\n");
 }
 
+TEST_CASE("formatter: var alignment preserves dimension binary spacing for macro ranges",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    opts.spacing.dimension_binary_operator_spacing = "none";
+
+    std::string formatted = format_source("module top;\n"
+                                          "logic [`WIDTH - 1123:0] addr;\n"
+                                          "logic [`WIDTH - 1:0] data;\n"
+                                          "endmodule\n",
+                                          opts);
+
+    CHECK(formatted.find("[`WIDTH-1123:0]") != std::string::npos);
+    CHECK(formatted.find("[`WIDTH-1:0]") != std::string::npos);
+    CHECK(formatted.find("`WIDTH - ") == std::string::npos);
+}
+
 TEST_CASE("formatter: wait has no space before paren", "[formatter]") {
     FormatOptions opts;
     opts.spacing.control_keyword_space = true;
@@ -1722,6 +1745,61 @@ TEST_CASE("formatter: duplicate instance port comments are preserved", "[formatt
     CHECK(formatted.find("// first a comment") != std::string::npos);
     CHECK(formatted.find("// second a comment") != std::string::npos);
     CHECK(formatted.find("// b comment") != std::string::npos);
+}
+
+TEST_CASE("formatter: conditional instance headers do not corrupt following instances",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+
+    std::string input = "module tb;\n"
+                        "`ifdef FOO\n"
+                        "  chip #(\n"
+                        "    .P(1)\n"
+                        "  ) dut (\n"
+                        "`else\n"
+                        "  chip dut (\n"
+                        "`endif\n"
+                        "    .a(a)\n"
+                        "  );\n"
+                        "\n"
+                        "`ifdef BAR\n"
+                        "  prim_buf #(\n"
+                        "    .Width(W0)\n"
+                        "  ) u_req (\n"
+                        "    .in_i(x),\n"
+                        "    .out_o(y)\n"
+                        "  );\n"
+                        "  prim_buf #(\n"
+                        "    .Width(W1)\n"
+                        "  ) u_rsp (\n"
+                        "    .in_i(p),\n"
+                        "    .out_o(q)\n"
+                        "  );\n"
+                        "`endif\n"
+                        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
+
+    auto strip_ws = [](const std::string& text) {
+        std::string out;
+        for (char c : text)
+            if (!std::isspace((unsigned char)c))
+                out += c;
+        return out;
+    };
+    CHECK(strip_ws(formatted) == strip_ws(input));
+    CHECK(formatted.find("u_req") != std::string::npos);
+    CHECK(formatted.find(".in_i(x)") != std::string::npos);
+    CHECK(formatted.find("u_rsp") != std::string::npos);
+    CHECK(formatted.find(".in_i(p)") != std::string::npos);
+    CHECK(formatted.find("u_req (\n    .in_i(p)") == std::string::npos);
 }
 
 TEST_CASE("formatter: ANSI port directives do not receive commas", "[formatter]") {
