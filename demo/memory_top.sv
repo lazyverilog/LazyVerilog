@@ -1,10 +1,10 @@
 `include "params.svh"
 `define WIDTH 32
-`define print_bytes(ARR, STARTBYTE, NUMBYTES)                   \
-    for (int ii=STARTBYTE; ii<STARTBYTE+NUMBYTES; ii++) begin   \
-        if ((ii != 0) && (ii % 16 == 0))                        \
-            display("\n");                                      \
-        $display("0x%x ", ARR[ii]);                             \
+`define print_bytes(ARR, STARTBYTE, NUMBYTES)                 \
+    for (int ii=STARTBYTE; ii<STARTBYTE+NUMBYTES; ii++) begin \
+        if ((ii != 0) && (ii % 16 == 0))                      \
+            display("\n");                                    \
+        $display("0x%x ", ARR[ii]);                           \
     end
 
 typedef struct {
@@ -21,7 +21,7 @@ typedef struct {
 interface bus_intf #(
     parameter W_IDTH=8
 )(
-    input   logic               i_clk
+    input     logic      i_clk
 );
 
 logic                                   valid                               ;
@@ -33,24 +33,24 @@ logic                                   write                               ;
 
 // DUT view
 modport dut (
-    input           clk         ,
-    input           validdddddddd   ,
-    input           addr        ,
-    input           wdata       ,
-    input           write       ,
-    output          ready       ,
-    output          rdata
+    input          clk       ,
+    input          validdddddddd,
+    input          addr      ,
+    input          wdata     ,
+    input          write     ,
+    output         ready     ,
+    output         rdata
 );
 
 // Testbench/driver view
 modport tb (
-    input           clk         ,
-    input           ready       ,
-    input           rdata       ,
-    output          valid       ,
-    output          addr        ,
-    output          wdata       ,
-    output          write
+    input          clk       ,
+    input          ready     ,
+    input          rdata     ,
+    output         valid     ,
+    output         addr      ,
+    output         wdata     ,
+    output         write
 );
 
 endinterface
@@ -64,27 +64,27 @@ module memory_top #(
     i_clk, i_rst_n, i_data,
     i_d
 );
-input                                           i_clk                                   ;
-input                                           i_rst_n                                 ;
-input   logic signed        [1:0]               i_data              [7:0]               ;
-input   var byte                                i_data2                                 ;
-input                                           i_data3                                 ;
-input                                           i_dd                                    ;
-input                                           i_dd22222                               ;
-input                                           dd22222                                 ;
-input                                           i_d33333                                ;
-input                                           i_d44333                                , i_dd44321                               ;
-input                                           i_d44334                                ;
-output  logic unsigned      [0:0]               VDD                                     , VSS                                     ;
-output  packet_tttttttttttttt   [0:0]           test                                    , VSS                                     ;
+input                            i_clk                      ;
+input                            i_rst_n                    ;
+input     logic      [1:0]       i_data       [7:0]         ;
+input     var byte               i_data2                    ;
+input                            i_data3                    ;
+input                            i_dd                       ;
+input                            i_dd22222                  ;
+input                            dd22222                    ;
+input                            i_d33333                   ;
+input                            i_d44333                   , i_dd44321                  ;
+input                            i_d44334                   ;
+output    logic unsigned [0:0]   VDD                        , VSS                        ;
+output    packet_tttttttttttttt [0:0] test                       , VSS                        ;
 
 logic               [7:0]               dout                = 8'hFF         ;
 logic               [8:0]               douteeeeeee         = 8'hFF         ;
-packet_tttttttttttttt   [1:0]           test_init           = 8'hFF         ;
+packet_tttttttttttttt [1:0]             test_init           = 8'hFF         ;
 packet_t                                test_init2          = 8'hFF         ;
 logic               [`WIDTH-1:0]        data                                ;
 
-packet_ttttttttttteeettt    [1:0]       dp                                  ;
+packet_ttttttttttteeettt [1:0]          dp                                  ;
 // test
 logic               [2:0]               a                                   , b                                   ;
 //dd
@@ -128,86 +128,86 @@ assign d    = a+2;
 assign daaa = a+2;
 
 memory #(.MEM_SIZE(3)) u_memory ( /*autoinst*/
-    .address    (addr           ),
-    .data_in    (intercontest   ),
-    .read_write (read_wsssrite  ),
-    .chip_en    (tt             ),
-    .www3test   (a              ),
-    .data_out   (threeshit      )
+    .address  (addr      ),
+    .data_in  (intercontest),
+    .read_write (read_wsssrite),
+    .chip_en  (tt        ),
+    .www3test (a         ),
+    .data_out (threeshit )
 );
 
 memory u_mem ( // test
-    .i_clk      (testxrp    ),
-    .address    (addressss  ),
-    .data_in    (threeshit  ),
-    .chip_en    (chip_en    ),
-    .www333     (www333     ),
-    .zzfuk      (zzfuk      )
+    .i_clk    (testxrp   ),
+    .address  (addressss ),
+    .data_in  (threeshit ),
+    .chip_en  (chip_en   ),
+    .www333   (www333    ),
+    .zzfuk    (zzfuk     )
 );
 
 memory u_mem1 (
-    .address    (           ),
-    .data_in    (zzzry      ), // test
-    .dataut     (           ),
-    .read_te    (           ),
-    .chip_en    (           ),
-    .wwtest     (           )
+    .address  (          ),
+    .data_in  (zzzry     ), // test
+    .dataut   (          ),
+    .read_te  (          ),
+    .chip_en  (          ),
+    .wwtest   (          )
 );
 
 memory u_mem2 (
-    .address    (           ),
-    .data_in    (           ),
-    .data_out   (           ),
-    .read_write (           )
+    .address  (          ),
+    .data_in  (          ),
+    .data_out (          ),
+    .read_write (          )
 );
 
 memory u_mem5 (
-    .i_clk      (i_clk      ),
-    .address    (addr       ),
-    .data_in    (data_in    ),
-    .data_out   (kj         ),
-    .read_write (read_write ),
-    .chip_en    (chip_en    ),
-    .www333     (www333     ),
-    .www333     (www333     ),
-    .zzfuk      (zzfuk      ),
-    .zzfuk      (zzfuk      )
+    .i_clk    (i_clk     ),
+    .address  (addr      ),
+    .data_in  (data_in   ),
+    .data_out (kj        ),
+    .read_write (read_write),
+    .chip_en  (chip_en   ),
+    .www333   (www333    ),
+    .www333   (www333    ),
+    .zzfuk    (zzfuk     ),
+    .zzfuk    (zzfuk     )
 );
 
 `ifdef RTL_SIM
 memory u_mem3 (
-    .i_clk      (i_clk      ),
-    .address    (address    ),
-    .data_in    (data_in    ),
-    .data_out   (addr       ),
-    .read_write (read_write ),
-    .chip_en    (tt         ),
-    .www333     (www333     ),
-    .www333     (www333     ),
-    .zzfuk      (zzfuk      ),
-    .zzfuk      (zzfuk      )
+    .i_clk    (i_clk     ),
+    .address  (address   ),
+    .data_in  (data_in   ),
+    .data_out (addr      ),
+    .read_write (read_write),
+    .chip_en  (tt        ),
+    .www333   (www333    ),
+    .www333   (www333    ),
+    .zzfuk    (zzfuk     ),
+    .zzfuk    (zzfuk     )
 );
 `else
 memory u_mem4();
 `endif
 
 inv u_intq (
-    .i_a        (i_a        ),
-    .o_d        (o_d        )
+    .i_a      (i_a       ),
+    .o_d      (o_d       )
 );
 
 always @ ( * ) begin
     if (a) begin
-        a2      <= 3; /* ttt*/
+        a2     <= 3; /* ttt*/
     end
 end
 
 always_comb begin
     // tte
-    a       <= 3; /* ttt*/
+    a      <= 3; /* ttt*/
 
     if (a==3) begin
-        a       += 1;
+        a      += 1;
         //test
     end
 
@@ -220,20 +220,23 @@ always_comb begin
     end
 
     while (i<5) begin
-        $display("i = %0d", i);
+        $display("i = %0d",
+                 i);
         /* test*/
         i++;
     end
 
     for (int i=0 ; i<32 ; i++) begin
         while (i<5) begin
-            $display("i = %0d", i);
+            $display("i = %0d",
+                     i);
             i++;
         end
     end
 
     do begin
-        $display("i = %0d", i);
+        $display("i = %0d",
+                 i);
         i++;
     end while (i<5);
 
@@ -249,15 +252,23 @@ always_comb begin
 
     forever begin
         #10;
-        $display("Tick at time %0t", $time);
+        $display("Tick at time %0t",
+                 $time);
     end
 
-    sum(.i_a(i_a2), .i_b(i_b));
-    sum(.i_a(1), .i_b(2));
-    sum(.i_a(1), .i_b(i_b));
-    sum(.i_a(1), .i_b(i_b));
+    // verilog_format: off
+        sum(.i_a(i_a2),
+        .i_b(i_b));
+    // verilog_format: on
+    sum(.i_a(1),
+        .i_b(2));
+    sum(.i_a(1),
+        .i_b(i_b));
+    sum(.i_a(1),
+        .i_b(i_b));
     // com
-    sum(.i_a(1), .i_b(i_b));
+    sum(.i_a(1),
+        .i_b(i_b));
     /**/
     add_number(.a(a3),
                .b(b),
@@ -268,36 +279,36 @@ always_comb begin
     if (add_number(.a(a),
                    .b(b),
                    .result(result))) begin
-        a       = 3;
-        b       = 7+1;
+        a      = 3;
+        b      = 7+1;
     end
 
     if (add_number(.a(a),
                    .b(b),
                    .result(result)))
-        a       = 3;
-    b       = 3;
+        a      = 3;
+    b      = 3;
 
-    b       = 7;
+    b      = 7;
     add_number(.a(a),
                .b(b),
                .result(result));
 end
 
 initial begin
-    forever #5 clk  = ~clk;
+    forever #5 clk = ~clk;
     // 10 time-unit period
 end
 
 // Standard D-FF with synchronous active-low reset
 always_ff @ ( posedge i_clk or negedge i_rst_n ) begin
     if (!i_rst_n) begin
-        data    <= 32'b0;
-        r_test  <= '0;
+        data   <= 32'b0;
+        r_test <= '0;
     end
     else begin
-        data    <= d;
-        r_test  <= test;
+        data   <= d;
+        r_test <= test;
     end
 end
 
@@ -312,10 +323,10 @@ module inv(
 logic               i_d                                 ;
 logic               i_e                                 ;
 
-input   fifo_entry_t        [3:0]               i_a                                     ;
-output  fifo_entry_t        [3:0]               o_d                                     ;
+input     fifo_entry_t [3:0]     i_a                        ;
+output    fifo_entry_t [3:0]     o_d                        ;
 
-assign i_d  = ~i_a;
-assign i_e  = i_a;
+assign i_d = ~i_a;
+assign i_e = i_a;
 
 endmodule
