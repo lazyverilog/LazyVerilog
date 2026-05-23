@@ -182,6 +182,19 @@ static bool is_keyword(const Tok& t) {
     return !t.directive && !t.comment && !t.whitespace && has(SV_KW, t.lo);
 }
 
+static bool is_constraint_keyword(const Tok& t) {
+    return !t.directive && !t.comment && !t.whitespace &&
+           t.kind == TokenKind::ConstraintKeyword;
+}
+
+static bool is_begin_keyword(const Tok& t) {
+    return !t.directive && !t.comment && !t.whitespace && t.kind == TokenKind::BeginKeyword;
+}
+
+static bool is_else_keyword(const Tok& t) {
+    return !t.directive && !t.comment && !t.whitespace && t.kind == TokenKind::ElseKeyword;
+}
+
 static bool is_identifier(const Tok& t) {
     return !t.directive && !t.comment && !t.whitespace &&
            (t.kind == TokenKind::Identifier || t.kind == TokenKind::SystemIdentifier ||
@@ -256,6 +269,66 @@ static bool is_hierarchy(const Tok& t) { return t.text == "." || t.text == "::";
 
 static bool is_unary_op(const Tok& t) { return has(ALWAYS_UNARY, t.text); }
 
+static bool is_combined_operator_token(TokenKind kind) {
+    switch (kind) {
+        case TokenKind::ColonEquals:
+        case TokenKind::ColonSlash:
+        case TokenKind::DoubleColon:
+        case TokenKind::DoubleStar:
+        case TokenKind::StarArrow:
+        case TokenKind::DoublePlus:
+        case TokenKind::PlusColon:
+        case TokenKind::PlusDivMinus:
+        case TokenKind::PlusModMinus:
+        case TokenKind::DoubleMinus:
+        case TokenKind::MinusColon:
+        case TokenKind::MinusArrow:
+        case TokenKind::MinusDoubleArrow:
+        case TokenKind::TildeAnd:
+        case TokenKind::TildeOr:
+        case TokenKind::TildeXor:
+        case TokenKind::DoubleHash:
+        case TokenKind::HashMinusHash:
+        case TokenKind::HashEqualsHash:
+        case TokenKind::XorTilde:
+        case TokenKind::DoubleEquals:
+        case TokenKind::DoubleEqualsQuestion:
+        case TokenKind::TripleEquals:
+        case TokenKind::EqualsArrow:
+        case TokenKind::PlusEqual:
+        case TokenKind::MinusEqual:
+        case TokenKind::SlashEqual:
+        case TokenKind::StarEqual:
+        case TokenKind::AndEqual:
+        case TokenKind::OrEqual:
+        case TokenKind::PercentEqual:
+        case TokenKind::XorEqual:
+        case TokenKind::LeftShiftEqual:
+        case TokenKind::TripleLeftShiftEqual:
+        case TokenKind::RightShiftEqual:
+        case TokenKind::TripleRightShiftEqual:
+        case TokenKind::LeftShift:
+        case TokenKind::RightShift:
+        case TokenKind::TripleLeftShift:
+        case TokenKind::TripleRightShift:
+        case TokenKind::ExclamationEquals:
+        case TokenKind::ExclamationEqualsQuestion:
+        case TokenKind::ExclamationDoubleEquals:
+        case TokenKind::LessThanEquals:
+        case TokenKind::LessThanMinusArrow:
+        case TokenKind::GreaterThanEquals:
+        case TokenKind::DoubleOr:
+        case TokenKind::OrMinusArrow:
+        case TokenKind::OrEqualsArrow:
+        case TokenKind::DoubleAt:
+        case TokenKind::DoubleAnd:
+        case TokenKind::TripleAnd:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool is_control_keyword(const Tok& t) {
     return is_keyword(t) &&
            (t.lo == "if" || t.lo == "for" || t.lo == "foreach" || t.lo == "while" ||
@@ -269,7 +342,7 @@ static bool is_procedural_event_keyword(const Tok& t) {
 
 static bool is_binary_op(const Tok& t) {
     static const std::unordered_set<std::string> EXTRA_BINARY = {
-        "+",   "-",   "<=", "<",   ">",   "?",      "<<", ">>",
+        "+",   "-",   "^",  "&",  "|", "<=", "<",   ">",   "?",      "<<", ">>",
         "<<<", ">>>", "->", "<->", "|->", "inside", "&&&"};
     return has(ALWAYS_BINARY, t.text) || has(EXTRA_BINARY, t.text);
 }
@@ -557,6 +630,8 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
         return sp.space_inside_dimension_brackets ? 1 : 0;
     if (is_open_group(L) || is_close_group(R))
         return 0;
+    if (is_unary_op(L) && is_binary_op(R))
+        return 1;
     if (is_unary_op(L))
         return 0;
     if (is_hierarchy(L) && lx == "::")
@@ -597,6 +672,8 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
         return (lx == ":") ? (binary_space_after(sp.range_colon_spacing) ? 1 : 0)
                            : (binary_space_before(sp.range_colon_spacing) ? 1 : 0);
     if ((is_binary_op(L) && !L_assign) || (is_binary_op(R) && !R_assign)) {
+        if (is_binary_op(L) && is_unary_op(R))
+            return 1;
         if (looks_unary_context(L, R))
             return 0;
         const std::string& mode =
@@ -641,8 +718,8 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
     }
     if (lx == "}")
         return 1;
-    if (rx == "{")
-        return is_keyword(L) ? 1 : 0;
+    if (R.kind == TokenKind::OpenBrace)
+        return (is_keyword(L) || is_identifier(L) || L.kind == TokenKind::CloseParenthesis) ? 1 : 0;
     if (rx == "[") {
         if (lx == "]")
             return 0;
@@ -694,17 +771,20 @@ static SD break_dec(const Tok& L, const Tok& R, const FormatOptions& opts, bool 
         return SD::MustAppend;
     if (has(INDENT_CLOSE, rl))
         return SD::MustWrap;
-    if (rl == "else") {
+    if (is_else_keyword(R)) {
         if (ll == "end")
             return opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
-        if (lx == "}")
-            return SD::MustAppend;
+        if (L.kind == TokenKind::CloseBrace)
+            return opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
         return SD::MustWrap;
     }
-    if (ll == "else" && (rl == "begin" || rl == "if"))
-        return SD::MustAppend;
-    if (lx == ")" && rl == "begin")
-        return SD::MustAppend;
+    if (is_else_keyword(L) &&
+        (is_begin_keyword(R) || R.kind == TokenKind::IfKeyword || R.kind == TokenKind::OpenBrace))
+        return (R.kind == TokenKind::OpenBrace && opts.statement.begin_newline) ? SD::MustWrap
+                                                                                : SD::MustAppend;
+    if (L.kind == TokenKind::CloseParenthesis &&
+        (is_begin_keyword(R) || R.kind == TokenKind::OpenBrace))
+        return opts.statement.begin_newline ? SD::MustWrap : SD::MustAppend;
     if (lx == "#")
         return SD::MustAppend;
     return SD::Undecided;
@@ -953,6 +1033,12 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
                 cursor = std::max(cursor, end);
                 continue;
             }
+        }
+        if (is_combined_operator_token(token.kind) &&
+            (off + raw.size() > source.size() || source.compare(off, raw.size(), raw) != 0)) {
+            push_tok(toks, TokenKind::Unknown, raw.substr(0, 1), (int)off);
+            cursor = std::max(cursor, off + 1);
+            continue;
         }
         if (!raw.empty())
             push_tok(toks, token.kind, raw, (int)off);
@@ -3185,21 +3271,6 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
     std::string text = render_lines(lines);
     auto disabled = find_disabled(text);
 
-    // Helper: detect if a line starts a backtick macro call.
-    auto find_macro_call_start = [](const std::string& ln) -> size_t {
-        auto toks = collect_lexer_tokens(ln);
-        for (size_t i = 0; i < toks.size(); ++i) {
-            if (toks[i].whitespace || toks[i].comment || !starts_with_chars(toks[i].text, '`'))
-                continue;
-            size_t k = i + 1;
-            while (k < toks.size() && toks[k].whitespace)
-                ++k;
-            if (k < toks.size() && tok_is(toks[k], "(", TokenKind::OpenParenthesis))
-                return (size_t)toks[i].pos;
-        }
-        return std::string::npos;
-    };
-
     std::vector<std::string> out;
     int pos = 0;
     for (size_t li = 0; li < lines.size(); ++li) {
@@ -3210,109 +3281,9 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
             out.push_back(lines[li]);
             continue;
         }
-        // For macro calls in disabled regions, join multi-line and format.
-        // But never reformat lines inside `define bodies (trailing '\').
+        // Never reformat macro calls inside disabled regions or `define bodies.
         if (in_disabled(line_start, disabled)) {
-            // Skip `define continuation lines entirely.
-            auto rtrim = trim_copy(line);
-            if (!rtrim.empty() && rtrim.back() == '\\') {
-                out.push_back(lines[li]);
-                continue;
-            }
-            size_t mcs = find_macro_call_start(line);
-            if (mcs == std::string::npos) {
-                out.push_back(lines[li]);
-                continue;
-            }
-            // Join lines until parens balance.
-            std::string joined = line;
-            int depth = 0;
-            bool balanced = false;
-            for (size_t ci = mcs; ci < joined.size(); ++ci) {
-                if (joined[ci] == '(') ++depth;
-                else if (joined[ci] == ')' && --depth == 0) { balanced = true; break; }
-            }
-            size_t consumed = 0;
-            while (!balanced && li + consumed + 1 < lines.size()) {
-                ++consumed;
-                joined += " " + trim_copy(lines[li + consumed]);
-                depth = 0;
-                balanced = false;
-                for (size_t ci = mcs; ci < joined.size(); ++ci) {
-                    if (joined[ci] == '(') ++depth;
-                    else if (joined[ci] == ')' && --depth == 0) { balanced = true; break; }
-                }
-            }
-            if (!balanced) {
-                out.push_back(lines[li]);
-                continue;
-            }
-            // Update pos for consumed lines
-            for (size_t c = 0; c < consumed; ++c)
-                pos += (int)lines[li + 1 + c].size() + 1;
-            li += consumed;
-
-            // Now format the joined macro call line through find_simple_call.
-            // Only reformat if the matched call is actually a backtick macro.
-            size_t ns = 0, ne = 0, op = 0, cl = 0;
-            if (!find_simple_call(joined, ns, ne, op, cl) ||
-                ns >= joined.size() || joined[ns] != '`') {
-                out.push_back(joined);
-                continue;
-            }
-            // Reuse the main formatting below by assigning to 'line' equivalent.
-            // (fall through by pushing to a local and continuing)
-            std::string args_text = joined.substr(op + 1, cl - op - 1);
-            auto raw_args = split_top_level(args_text);
-            std::vector<std::string> args;
-            bool has_empty_arg = false;
-            for (auto& a : raw_args) {
-                auto t = trim_copy(a);
-                if (!t.empty()) args.push_back(t);
-                else has_empty_arg = true;
-            }
-            if (has_empty_arg && !(raw_args.size() == 1 && args.empty())) {
-                out.push_back(joined);
-                continue;
-            }
-            std::string prefix = joined.substr(0, ns);
-            std::string name = joined.substr(ns, ne - ns);
-            std::string suffix = joined.substr(cl + 1);
-            std::string single = render_call_single(prefix, name, args, suffix, fo);
-            bool do_break = false;
-            if (fo.break_policy == "always") {
-                do_break = !args.empty();
-            } else if (fo.break_policy == "auto") {
-                do_break = ((int)single.size() > fo.line_length) ||
-                           (fo.arg_count >= 0 && (int)args.size() >= fo.arg_count);
-            }
-            if (!do_break || fo.break_policy == "never") {
-                out.push_back(single);
-                continue;
-            }
-            std::string open_text = prefix + name + (fo.space_before_paren ? " " : "") + "(";
-            if (fo.layout == "hanging") {
-                std::string hang(open_text.size(), ' ');
-                std::string r = open_text;
-                for (size_t i = 0; i < args.size(); ++i) {
-                    if (i) r += "\n" + hang;
-                    r += args[i];
-                    if (i + 1 < args.size()) r += ",";
-                }
-                r += ")" + suffix;
-                out.push_back(r);
-            } else {
-                std::string base_indent(prefix.size(), ' ');
-                std::string arg_indent = base_indent + std::string(std::max(0, opts.indent_size), ' ');
-                std::string r = open_text + "\n";
-                for (size_t i = 0; i < args.size(); ++i) {
-                    r += arg_indent + args[i];
-                    if (i + 1 < args.size()) r += ",";
-                    r += "\n";
-                }
-                r += base_indent + ")" + suffix;
-                out.push_back(r);
-            }
+            out.push_back(lines[li]);
             continue;
         }
         size_t ns = 0, ne = 0, op = 0, cl = 0;
@@ -3335,6 +3306,10 @@ static std::vector<std::string> format_function_calls_pass(std::vector<std::stri
                 out.push_back(lines[li]);
                 continue;
             }
+        }
+        if (ns < line.size() && line[ns] == '`') {
+            out.push_back(lines[li]);
+            continue;
         }
         std::string args_text = line.substr(op + 1, cl - op - 1);
         auto raw_args = split_top_level(args_text);
@@ -4352,6 +4327,66 @@ static std::vector<std::string> format_function_declaration_pass(
     return out;
 }
 
+
+static std::vector<std::string> split_semicolon_statements_pass(std::vector<std::string> lines) {
+    std::vector<std::string> out;
+    for (const auto& line : lines) {
+        std::string trimmed_line = trim_right_copy(line);
+        if (!trimmed_line.empty() && trimmed_line.back() == '\\') {
+            out.push_back(line);
+            continue;
+        }
+        std::vector<size_t> split_points;
+        int paren = 0;
+        int bracket = 0;
+        int brace = 0;
+        for (const auto& tok : collect_lexer_tokens(line)) {
+            if (tok.comment)
+                break;
+            if (tok.whitespace || tok.directive)
+                continue;
+            if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+                ++paren;
+            else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+                --paren;
+            else if (tok_is(tok, "[", TokenKind::OpenBracket))
+                ++bracket;
+            else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+                --bracket;
+            else if (tok_is(tok, "{", TokenKind::OpenBrace))
+                ++brace;
+            else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+                --brace;
+            if (paren == 0 && bracket == 0 && brace == 0 && tok_is(tok, ";", TokenKind::Semicolon)) {
+                size_t rest = (size_t)tok.pos + tok.text.size();
+                while (rest < line.size() && (line[rest] == ' ' || line[rest] == '\t'))
+                    ++rest;
+                if (rest < line.size() && line.compare(rest, 2, "//") != 0 &&
+                    line.compare(rest, 2, "/*") != 0)
+                    split_points.push_back((size_t)tok.pos + tok.text.size());
+            }
+        }
+        if (split_points.empty()) {
+            out.push_back(line);
+            continue;
+        }
+        size_t start = 0;
+        std::string indent;
+        while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+            indent += line[start++];
+        start = 0;
+        for (size_t point : split_points) {
+            out.push_back(trim_right_copy(line.substr(start, point - start)));
+            start = point;
+            while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
+                ++start;
+        }
+        if (start < line.size())
+            out.push_back(indent + trim_left_copy(line.substr(start)));
+    }
+    return out;
+}
+
 static std::vector<std::string> run_structural_layout_phase(
     std::vector<std::string> lines, const FormatOptions& opts) {
     lines = format_enum_declaration_pass(std::move(lines), opts);
@@ -4359,6 +4394,8 @@ static std::vector<std::string> run_structural_layout_phase(
     if (opts.instance.align)
         lines = expand_instances_pass(std::move(lines), opts);
     lines = format_function_calls_pass(std::move(lines), opts);
+    lines = text_to_lines(render_lines(lines));
+    lines = split_semicolon_statements_pass(std::move(lines));
     return lines;
 }
 
@@ -4484,6 +4521,83 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     auto disabled = find_disabled(input);
     auto tokens = collect_lexer_tokens(input);
 
+    struct MacroPassthroughRange {
+        int macro_start;
+        int end;
+    };
+    std::vector<MacroPassthroughRange> macro_passthrough_ranges;
+    {
+        static const std::unordered_set<std::string> DIRECTIVES = {
+            "`include", "`define", "`ifdef", "`ifndef", "`elsif", "`else", "`endif"};
+        size_t line_start = 0;
+        while (line_start < input.size()) {
+            size_t line_end = input.find('\n', line_start);
+            if (line_end == std::string::npos)
+                line_end = input.size();
+            size_t first = line_start;
+            while (first < line_end && (input[first] == ' ' || input[first] == '\t'))
+                ++first;
+            if (first < line_end && input[first] == '`') {
+                size_t name_end = first + 1;
+                while (name_end < line_end &&
+                       (std::isalnum((unsigned char)input[name_end]) || input[name_end] == '_' ||
+                        input[name_end] == '$'))
+                    ++name_end;
+                std::string name = input.substr(first, name_end - first);
+                if (!has(DIRECTIVES, name)) {
+                    size_t scan = name_end;
+                    while (scan < line_end && (input[scan] == ' ' || input[scan] == '\t'))
+                        ++scan;
+                    size_t range_end = line_end + (line_end < input.size() ? 1 : 0);
+                    if (scan < line_end && input[scan] == '(') {
+                        int depth = 0;
+                        bool in_string = false;
+                        bool in_line_comment = false;
+                        for (size_t pos = scan; pos < input.size(); ++pos) {
+                            char c = input[pos];
+                            if (in_line_comment) {
+                                if (c == '\n')
+                                    in_line_comment = false;
+                                continue;
+                            }
+                            if (in_string) {
+                                if (c == '\\' && pos + 1 < input.size()) {
+                                    ++pos;
+                                    continue;
+                                }
+                                if (c == '"')
+                                    in_string = false;
+                                continue;
+                            }
+                            if (c == '/' && pos + 1 < input.size() && input[pos + 1] == '/') {
+                                in_line_comment = true;
+                                ++pos;
+                                continue;
+                            }
+                            if (c == '"') {
+                                in_string = true;
+                                continue;
+                            }
+                            if (c == '(')
+                                ++depth;
+                            else if (c == ')' && --depth == 0) {
+                                size_t end_line = input.find('\n', pos);
+                                range_end = (end_line == std::string::npos) ? input.size() : end_line + 1;
+                                break;
+                            }
+                        }
+                    }
+                    macro_passthrough_ranges.push_back({(int)first, (int)range_end});
+                }
+            }
+            line_start = line_end + (line_end < input.size() ? 1 : 0);
+        }
+        std::sort(macro_passthrough_ranges.begin(), macro_passthrough_ranges.end(),
+                  [](const auto& a, const auto& b) { return a.macro_start < b.macro_start; });
+    }
+    size_t macro_passthrough_index = 0;
+    int macro_passthrough_until = -1;
+
     // -----------------------------------------------------------------------
     // STEP 5: Build byte-offset → original line number table
     //
@@ -4570,6 +4684,8 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     //               `{` should be treated as a struct-brace (indented block)
     //               rather than a concatenation brace.
     bool struct_pend = false;
+    bool constraint_pend = false;
+    int constraint_depth = 0;
 
     // case_expr_pending / case_expr_depth
     //   After `case`/`casex`/`casez`/`caseinside` we expect a `(expr)`.
@@ -4669,6 +4785,30 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     // -----------------------------------------------------------------------
     for (size_t i = 0; i < tokens.size(); ++i) {
         const Tok& tok = tokens[i];
+
+        if (tok.pos < macro_passthrough_until)
+            continue;
+        while (macro_passthrough_index < macro_passthrough_ranges.size() &&
+               macro_passthrough_ranges[macro_passthrough_index].end <= tok.pos)
+            ++macro_passthrough_index;
+        if (macro_passthrough_index < macro_passthrough_ranges.size() &&
+            tok.pos == macro_passthrough_ranges[macro_passthrough_index].macro_start) {
+            flush_nl();
+            if (at_bol) {
+                for (int k = 0; k < indent_level; ++k)
+                    out += indent_unit;
+                at_bol = false;
+            }
+            const auto& range = macro_passthrough_ranges[macro_passthrough_index];
+            out += input.substr((size_t)range.macro_start,
+                                (size_t)(range.end - range.macro_start));
+            at_bol = !out.empty() && out.back() == '\n';
+            pending_nl = false;
+            blank_pend = 0;
+            macro_passthrough_until = range.end;
+            ++macro_passthrough_index;
+            continue;
+        }
 
         // --- A. Disabled region — pass through verbatim ---
         // Tokens between `// verilog_format: off` and `// verilog_format: on`
@@ -4832,7 +4972,10 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         //     will open its own indented block via INDENT_OPEN).
         //   • Otherwise → bump indent_level by 1 for this single statement.
         if (single_stmt_pending && at_bol) {
-            if (is_keyword(tok) && tok.lo == "begin") {
+            if (constraint_depth > 0 && tok_is(tok, "{", TokenKind::OpenBrace)) {
+                // Constraint if/else bodies use braces instead of begin/end; let the
+                // brace handler below create the indentation scope.
+            } else if (is_keyword(tok) && tok.lo == "begin") {
                 single_stmt_pending = false; // begin handles its own indent
             } else {
                 ++indent_level;
@@ -4854,7 +4997,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
                 indent_stack.pop_back();
             indent_level = std::max(0, indent_level - delta);
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace) && !brace_stk.empty() &&
-                   brace_stk.back() == "struct") {
+                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint")) {
             int delta = indent_stack.empty() ? 1 : indent_stack.back();
             if (!indent_stack.empty())
                 indent_stack.pop_back();
@@ -4949,9 +5092,14 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
             if (tok.lo == "begin")
                 single_stmt_pending = false;
 
+            if (is_constraint_keyword(tok))
+                constraint_pend = true;
+
             bool import_export_function_or_task = in_import_export_decl &&
                                                   (tok.lo == "function" || tok.lo == "task");
-            if (has(INDENT_OPEN, tok.lo) && !disable_target && !import_export_function_or_task) {
+            bool typedef_class_forward_decl = tok.lo == "class" && prev && prev->lo == "typedef";
+            if (has(INDENT_OPEN, tok.lo) && !disable_target && !import_export_function_or_task &&
+                !typedef_class_forward_decl) {
                 // Keywords that increase indentation for everything inside them.
                 // Outmost design blocks use a configurable delta (default 1);
                 // everything else adds exactly 1 level.
@@ -4976,12 +5124,19 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
                 struct_pend = true;
             }
         } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
-            if (struct_pend) {
-                // `{` right after `struct`/`union` → indent the members inside.
-                brace_stk.push_back("struct");
+            if (struct_pend || constraint_pend || (constraint_depth > 0 && single_stmt_pending)) {
+                bool is_constraint_brace = constraint_pend || (constraint_depth > 0 && single_stmt_pending);
+                // `{` right after `struct`/`union`, `constraint`, or a constraint
+                // control item body → indent the members inside.
+                brace_stk.push_back(is_constraint_brace ? "constraint" : "struct");
                 pending_nl = true;
                 indent_level += 1;
                 indent_stack.push_back(1);
+                if (is_constraint_brace) {
+                    ++constraint_depth;
+                    constraint_pend = false;
+                    single_stmt_pending = false;
+                }
             } else {
                 // `{` for concatenation, array literal, etc. → no extra indent.
                 brace_stk.push_back("other");
@@ -4989,8 +5144,13 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
             struct_pend = false;
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace)) {
             // Pop the brace stack (indent was already decremented in step G).
-            if (!brace_stk.empty())
+            if (!brace_stk.empty()) {
+                if (brace_stk.back() == "constraint") {
+                    constraint_depth = std::max(0, constraint_depth - 1);
+                    pending_nl = true;
+                }
                 brace_stk.pop_back();
+            }
         } else if (tok_is(tok, ";", TokenKind::Semicolon)) {
             in_import_export_decl = false;
             // Semicolon = end of statement.

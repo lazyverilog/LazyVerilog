@@ -25,6 +25,7 @@ struct StatementOptions {
     bool align{false};
     bool align_adaptive{false};
     int lhs_min_width{1};
+    bool begin_newline{false};
     bool wrap_end_else_clauses{false};
 };
 

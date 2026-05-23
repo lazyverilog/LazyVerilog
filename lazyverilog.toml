@@ -84,6 +84,7 @@ assignment_operator_spacing = "none"                  # none | before | after | 
 align = true              # align = and <= operators in consecutive assignments
 align_adaptive = false
 lhs_min_width = 6           # minimum width of the LHS column before the operator
+begin_newline = false       # true: place begin / constraint { on the next line
 wrap_end_else_clauses = true
 
 [format.port_declaration]

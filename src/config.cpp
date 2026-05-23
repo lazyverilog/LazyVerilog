@@ -144,6 +144,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                     cfg.format.statement.align_adaptive = *v;
                 if (auto v = (*st)["lhs_min_width"].value<int64_t>())
                     cfg.format.statement.lhs_min_width = static_cast<int>(*v);
+                if (auto v = (*st)["begin_newline"].value<bool>())
+                    cfg.format.statement.begin_newline = *v;
                 if (auto v = (*st)["wrap_end_else_clauses"].value<bool>())
                     cfg.format.statement.wrap_end_else_clauses = *v;
             }

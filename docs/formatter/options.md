@@ -428,9 +428,49 @@ data = 2;
 
 ---
 
+### `begin_newline`
+
+When `true`, block openers after control expressions are placed on a new line. When `false`,
+they stay on the control line. This applies to `begin` and to constraint block braces.
+
+```toml
+[format.statement]
+begin_newline = false
+```
+
+```systemverilog
+// begin_newline = false
+if (a) begin
+  ...
+end
+
+constraint c {
+  if (a) {
+    x == 1;
+  }
+}
+
+// begin_newline = true
+if (a)
+begin
+  ...
+end
+
+constraint c
+{
+  if (a)
+  {
+    x == 1;
+  }
+}
+```
+
+---
+
 ### `wrap_end_else_clauses`
 
-When `true`, `else` after `end` is placed on a new line. When `false`, `end else` stays on the same line.
+When `true`, `else` after `end` or `}` is placed on a new line. When `false`, `end else` or `} else`
+stays on the same line.
 
 ```toml
 [format.statement]
@@ -444,10 +484,19 @@ else begin
   ...
 end
 
+}
+else {
+  ...
+}
+
 // wrap_end_else_clauses = false
 end else begin
   ...
 end
+
+} else {
+  ...
+}
 ```
 
 ---
@@ -741,6 +790,16 @@ When `break_policy = "auto"`, break if the single-line rendering exceeds this ch
 line_length = 100
 ```
 
+```systemverilog
+// break_policy = auto
+// line_length = 10
+    sum(.i_a(i_a2),
+        .i_b(i_b));
+// break_policy = auto
+// line_length = 20
+    sum(.i_a(i_a2), .i_b(i_b));
+```
+
 ---
 
 ### `arg_count`
@@ -758,9 +817,9 @@ foo(a, b);
 
 // arg_count = 3, 3 args → breaks
 foo(
-  a,
-  b,
-  c
+    a,
+    b,
+    c
 );
 ```
 
@@ -987,6 +1046,26 @@ Per-member adaptive alignment instead of block-wide alignment.
 ```toml
 [format.enum_declaration]
 align_adaptive = false
+```
+
+```systemverilog
+// align = true
+// align_adaptive = true
+typedef enum logic [1:0] {
+    IDLE            = 2'b00,
+    ACTIVE          = 2'b01,
+    DONE            = 2'b10,
+    VERY_LONG_TEXT  = 2'b11
+} state_t;
+
+// align = true
+// align_adaptive = true
+typedef enum logic [1:0] {
+    IDLE    = 2'b00,
+    ACTIVE  = 2'b01,
+    DONE    = 2'b10
+    VERY_LONG_TEXT = 2'b11
+} state_t;
 ```
 
 ---

@@ -413,6 +413,125 @@ TEST_CASE("formatter: macro calls with empty arguments are preserved", "[formatt
     REQUIRE_NOTHROW(format_source(src, opts));
 }
 
+
+TEST_CASE("formatter: multiline macro calls with comments are preserved and idempotent",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string src = "module top;\n"
+                            "initial begin\n"
+                            "`DV_CHECK_RANDOMIZE_WITH_FATAL(req,\n"
+                            "                               a == 1;\n"
+                            "                               b == 0; // inline comment\n"
+                            "                               )\n"
+                            "`uvm_info(`gfn, $sformatf(\"msg\",\n"
+                            "                          a, b), UVM_MEDIUM)\n"
+                            "finish_item(req);\n"
+                            "end\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("// inline comment\n") != std::string::npos);
+    CHECK(formatted.find("// inline comment )`uvm_info") == std::string::npos);
+    CHECK(formatted.find("// inline comment ) finish_item") == std::string::npos);
+    CHECK(formatted.find("finish_item(req);") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: constraint brace blocks are idempotent", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.indent_size = 4;
+
+    const std::string src =
+        "class c;\n"
+        "  rand bit parity_err;\n"
+        "  rand bit parity;\n"
+        "\n"
+        "  constraint parity_c {\n"
+        "    if (parity_err) {\n"
+        "      parity != `GET_PARITY(data, p_sequencer.cfg.odd_parity);\n"
+        "    } else {\n"
+        "      parity == `GET_PARITY(data, p_sequencer.cfg.odd_parity);\n"
+        "    }\n"
+        "  }\n"
+        "  `uvm_object_new\n"
+        "endclass\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(format_source(formatted, opts) == formatted);
+    CHECK(formatted.find("}\n    `uvm_object_new") != std::string::npos);
+}
+
+TEST_CASE("formatter: begin_newline applies to begin and constraint braces", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.indent_size = 4;
+    opts.statement.begin_newline = false;
+    opts.statement.wrap_end_else_clauses = false;
+
+    const std::string src =
+        "class c;\n"
+        "  constraint cstr {\n"
+        "    if (a) {\n"
+        "      x == 1;\n"
+        "    } else {\n"
+        "      x == 0;\n"
+        "    }\n"
+        "  }\n"
+        "  task t();\n"
+        "    if (a) begin\n"
+        "      x = 1;\n"
+        "    end\n"
+        "  endtask\n"
+        "endclass\n";
+
+    std::string formatted = format_source(src, opts);
+    CHECK(formatted.find("if (a) begin") != std::string::npos);
+    CHECK(formatted.find("if (a) {") != std::string::npos);
+    CHECK(formatted.find("} else {") != std::string::npos);
+
+    opts.statement.begin_newline = true;
+    opts.statement.wrap_end_else_clauses = true;
+    formatted = format_source(src, opts);
+    CHECK(formatted.find("if (a)\n        begin") != std::string::npos);
+    CHECK(formatted.find("if (a)\n        {") != std::string::npos);
+    CHECK(formatted.find("}\n        else\n        {") != std::string::npos);
+}
+
+TEST_CASE("formatter: adjacent operators keep source token boundaries", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string formatted = format_source("module top;\n"
+                                                "always_comb begin\n"
+                                                "y0 = ~ &a;\n"
+                                                "y1 = ~ |a;\n"
+                                                "y2 = ~ ^a;\n"
+                                                "y3 = a ^ ~b;\n"
+                                                "y4 = a & ~b;\n"
+                                                "y5 = a | ~b;\n"
+                                                "end\n"
+                                                "endmodule\n",
+                                                opts);
+
+    CHECK(formatted.find("~ &") != std::string::npos);
+    CHECK(formatted.find("~ |") != std::string::npos);
+    CHECK(formatted.find("~ ^") != std::string::npos);
+    CHECK(formatted.find("~&") == std::string::npos);
+    CHECK(formatted.find("~|") == std::string::npos);
+    CHECK(formatted.find("~^") == std::string::npos);
+    CHECK(formatted.find("a ^ ~b") != std::string::npos);
+    CHECK(formatted.find("a & ~b") != std::string::npos);
+    CHECK(formatted.find("a | ~b") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
 TEST_CASE("formatter: import declarations do not indent on function or task", "[formatter]") {
     FormatOptions opts;
     opts.safe_mode = true;
@@ -425,6 +544,27 @@ TEST_CASE("formatter: import declarations do not indent on function or task", "[
           "import \"DPI-C\" function chandle usbdpi_create(input string name, input int loglevel);\n"
           "import \"DPI-C\" context task usbdpi_wait(input chandle ctx);\n"
           "import \"DPI-C\" function void usbdpi_close(input chandle ctx);\n");
+}
+
+TEST_CASE("formatter: typedef class forward declarations do not indent following declarations",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    CHECK(format_source("package p;\n"
+                        "typedef class item;\n"
+                        "typedef class cfg;\n"
+                        "typedef enum {A, B} kind_e;\n"
+                        "endpackage\n",
+                        opts) == "package p;\n"
+                                 "typedef class item;\n"
+                                 "typedef class cfg;\n"
+                                 "typedef enum {\n"
+                                 "  A,\n"
+                                 "  B\n"
+                                 "} kind_e;\n"
+                                 "endpackage\n");
 }
 
 TEST_CASE("formatter: labeled endtask stays on one line", "[formatter]") {

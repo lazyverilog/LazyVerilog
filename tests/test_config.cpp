@@ -84,6 +84,7 @@ tab_align = true
 align = true
 align_adaptive = true
 lhs_min_width = 8
+begin_newline = true
 wrap_end_else_clauses = true
 
 [format.port_declaration]
@@ -218,6 +219,7 @@ autoarg_on_save = true
     CHECK(cfg.format.statement.align == true);
     CHECK(cfg.format.statement.align_adaptive == true);
     CHECK(cfg.format.statement.lhs_min_width == 8);
+    CHECK(cfg.format.statement.begin_newline == true);
     CHECK(cfg.format.statement.wrap_end_else_clauses == true);
 
     CHECK(cfg.format.port_declaration.align == true);
