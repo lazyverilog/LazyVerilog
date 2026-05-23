@@ -126,8 +126,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
         if (auto f = tbl["format"].as_table()) {
             if (auto v = (*f)["indent_size"].value<int64_t>())
                 cfg.format.indent_size = static_cast<int>(*v);
-            if (auto v = (*f)["compact_indexing_and_selections"].value<bool>())
-                cfg.format.compact_indexing_and_selections = *v;
             if (auto v = (*f)["blank_lines_between_items"].value<int64_t>())
                 cfg.format.blank_lines_between_items = static_cast<int>(*v);
             if (auto v = (*f)["default_indent_level_inside_outmost_block"].value<int64_t>())
@@ -138,8 +136,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 cfg.format.safe_mode = *v;
             if (auto v = (*f)["tab_align"].value<bool>())
                 cfg.format.tab_align = *v;
-            if (auto v = (*f)["align_punctuation"].value<bool>())
-                cfg.format.align_punctuation = *v;
             // Nested subtables
             if (auto st = (*f)["statement"].as_table()) {
                 if (auto v = (*st)["align"].value<bool>())

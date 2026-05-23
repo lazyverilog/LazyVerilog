@@ -107,11 +107,9 @@ struct SpacingOptions {
 
 struct FormatOptions {
     int indent_size{2};
-    bool compact_indexing_and_selections{true};
     int blank_lines_between_items{1};
     int default_indent_level_inside_outmost_block{1};
     bool tab_align{false};
-    bool align_punctuation{false};
     bool enable_format_on_save{false};
     bool safe_mode{false};
     StatementOptions statement;

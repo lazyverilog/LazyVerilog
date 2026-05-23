@@ -709,7 +709,6 @@ TEST_CASE("formatter: var decl with backtick macro dim is idempotent", "[formatt
     opts.var_declaration.section4_min_width = 16;
     opts.statement.align = true;
     opts.default_indent_level_inside_outmost_block = 0;
-    opts.compact_indexing_and_selections = true;
     opts.safe_mode = true;
 
     // `WIDTH is a macro — formatter must not expand it (would change non-whitespace content)

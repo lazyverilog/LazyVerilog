@@ -77,10 +77,8 @@ enable = false
 indent_size = 4
 blank_lines_between_items = 2
 default_indent_level_inside_outmost_block = 0
-compact_indexing_and_selections = false
 safe_mode = true
 tab_align = true
-align_punctuation = true
 
 [format.statement]
 align = true
@@ -214,10 +212,8 @@ autoarg_on_save = true
     CHECK(cfg.format.indent_size == 4);
     CHECK(cfg.format.blank_lines_between_items == 2);
     CHECK(cfg.format.default_indent_level_inside_outmost_block == 0);
-    CHECK(cfg.format.compact_indexing_and_selections == false);
     CHECK(cfg.format.safe_mode == true);
     CHECK(cfg.format.tab_align == true);
-    CHECK(cfg.format.align_punctuation == true);
 
     CHECK(cfg.format.statement.align == true);
     CHECK(cfg.format.statement.align_adaptive == true);
