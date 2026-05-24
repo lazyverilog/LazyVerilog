@@ -6,13 +6,29 @@
 #include "config.hpp"
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) { std::cerr << "Usage: lazyverilog-fmt <file>\n"; return 1; }
-    std::ifstream f(argv[1]);
-    if (!f) { std::cerr << "Cannot open " << argv[1] << "\n"; return 1; }
+    bool log = false;
+    const char* log_path = nullptr;
+    const char* path = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--log") {
+            log = true;
+            if (i + 1 >= argc) {
+                std::cerr << "Usage: lazyverilog-fmt [--log <log-dir>] <file>\n";
+                return 1;
+            }
+            log_path = argv[++i];
+        }
+        else
+            path = argv[i];
+    }
+    if (!path) { std::cerr << "Usage: lazyverilog-fmt [--log <log-dir>] <file>\n"; return 1; }
+    std::ifstream f(path);
+    if (!f) { std::cerr << "Cannot open " << path << "\n"; return 1; }
     std::ostringstream ss;
     ss << f.rdbuf();
     // Walk up from file's directory to find lazyverilog.toml
-    auto dir = std::filesystem::absolute(std::filesystem::path(argv[1])).parent_path();
+    auto dir = std::filesystem::absolute(std::filesystem::path(path)).parent_path();
     FormatOptions opts;
     for (auto d = dir; !d.empty() && d != d.parent_path(); d = d.parent_path()) {
         if (std::filesystem::exists(d / "lazyverilog.toml")) {
@@ -21,6 +37,9 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
+    opts.debug_main_token_loop = log;
+    if (log_path)
+        opts.log_path = log_path;
     try {
         std::string result = format_source(ss.str(), opts);
         std::cout << result;
