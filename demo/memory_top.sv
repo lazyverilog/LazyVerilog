@@ -161,18 +161,19 @@ memory u_mem2 (
     .read_write (          )
 );
 
-memory u_mem5 (
-    .i_clk    (i_clk     ),
-    .address  (addr      ),
-    .data_in  (data_in   ),
-    .data_out (kj        ),
-    .read_write (read_write),
-    .chip_en  (chip_en   ),
-    .www333   (www333    ),
-    .www333   (www333    ),
-    .zzfuk    (zzfuk     ),
-    .zzfuk    (zzfuk     )
-);
+memory u_mem5(.i_clk(i_clk),
+              .address(addr),
+              .data_in(data_in),
+`ifdef A
+              .data_out(kj),
+`elsif B
+              .read_write(read_write),
+`endif
+              .chip_en(chip_en),
+              .www333(www333),
+              .www333(www333),
+              .zzfuk(zzfuk),
+              .zzfuk(zzfuk));
 
 `ifdef RTL_SIM
 memory u_mem3 (
@@ -220,23 +221,20 @@ always_comb begin
     end
 
     while (i<5) begin
-        $display("i = %0d",
-                 i);
+        $display("i = %0d", i);
         /* test*/
         i++;
     end
 
     for (int i=0 ; i<32 ; i++) begin
         while (i<5) begin
-            $display("i = %0d",
-                     i);
+            $display("i = %0d", i);
             i++;
         end
     end
 
     do begin
-        $display("i = %0d",
-                 i);
+        $display("i = %0d", i);
         i++;
     end while (i<5);
 
@@ -250,25 +248,24 @@ always_comb begin
         $display("Hello");
     end
 
+    // Whitespace-sensitive macro invocation: formatter should preserve the
+    // original spacing and nested call layout inside the macro arguments.
+    `print_bytes(data_out, 0, add_number(1, 2, 3))
+
     forever begin
         #10;
-        $display("Tick at time %0t",
-                 $time);
+        $display("Tick at time %0t", $time);
     end
 
     // verilog_format: off
         sum(.i_a(i_a2),
         .i_b(i_b));
     // verilog_format: on
-    sum(.i_a(1),
-        .i_b(2));
-    sum(.i_a(1),
-        .i_b(i_b));
-    sum(.i_a(1),
-        .i_b(i_b));
+    sum(.i_a(1), .i_b(2));
+    sum(.i_a(1), .i_b(i_b));
+    sum(.i_a(1), .i_b(i_b));
     // com
-    sum(.i_a(1),
-        .i_b(i_b));
+    sum(.i_a(1), .i_b(i_b));
     /**/
     add_number(.a(a3),
                .b(b),
