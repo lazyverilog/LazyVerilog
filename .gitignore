@@ -2,3 +2,4 @@ build/
 build-*/
 .omc
 __pycache__
+log
