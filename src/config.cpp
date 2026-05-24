@@ -2,7 +2,14 @@
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
+#include <unordered_map>
 #include <toml++/toml.hpp>
+
+static std::string normalize_macro_config_name(std::string name) {
+    if (!name.empty() && name[0] == '`')
+        name.erase(name.begin());
+    return name;
+}
 
 static std::vector<std::string> validate_config(const Config& cfg) {
     std::vector<std::string> errors;
@@ -58,6 +65,28 @@ static std::vector<std::string> validate_config(const Config& cfg) {
     check_enum(cfg.format.spacing.assignment_operator_spacing,
                "[format.spacing].assignment_operator_spacing",
                {"none", "before", "after", "both"});
+
+    std::unordered_map<std::string, std::vector<std::string>> macro_roles;
+    auto add_macro_role = [&](const std::vector<std::string>& names, const char* role) {
+        for (const auto& name : names)
+            macro_roles[normalize_macro_config_name(name)].push_back(role);
+    };
+    add_macro_role(cfg.format.macros.object_like_expr, "object_like_expr");
+    add_macro_role(cfg.format.macros.function_like_expr, "function_like_expr");
+    add_macro_role(cfg.format.macros.statement_like, "statement_like");
+    add_macro_role(cfg.format.macros.declaration_like, "declaration_like");
+    add_macro_role(cfg.format.macros.control_flow_like, "control_flow_like");
+    add_macro_role(cfg.format.macros.block_begin_like, "block_begin_like");
+    add_macro_role(cfg.format.macros.block_end_like, "block_end_like");
+    for (const auto& [name, roles] : macro_roles) {
+        if (roles.size() <= 1)
+            continue;
+        std::string msg = "[format.macros]: macro \"" + name +
+                          "\" appears in multiple role lists:";
+        for (const auto& role : roles)
+            msg += " " + role;
+        errors.push_back(msg);
+    }
 
     return errors;
 }
@@ -266,6 +295,27 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                     cfg.format.spacing.space_inside_event_control_parens = *v;
                 if (auto v = (*sp)["assignment_operator_spacing"].value<std::string>())
                     cfg.format.spacing.assignment_operator_spacing = *v;
+            }
+            if (auto macros = (*f)["macros"].as_table()) {
+                auto append_strings = [](const toml::table* t, const char* key,
+                                         std::vector<std::string>& dst) {
+                    if (auto arr = (*t)[key].as_array()) {
+                        arr->for_each([&](auto&& el) {
+                            if constexpr (toml::is_string<std::remove_cvref_t<decltype(el)>>)
+                                dst.push_back(*el);
+                        });
+                    }
+                };
+                append_strings(macros, "object_like_expr", cfg.format.macros.object_like_expr);
+                append_strings(macros, "function_like_expr",
+                               cfg.format.macros.function_like_expr);
+                append_strings(macros, "statement_like", cfg.format.macros.statement_like);
+                append_strings(macros, "declaration_like", cfg.format.macros.declaration_like);
+                append_strings(macros, "control_flow_like", cfg.format.macros.control_flow_like);
+                append_strings(macros, "block_begin_like", cfg.format.macros.block_begin_like);
+                append_strings(macros, "block_end_like", cfg.format.macros.block_end_like);
+                append_strings(macros, "whitespace_sensitive",
+                               cfg.format.macros.whitespace_sensitive);
             }
         }
 

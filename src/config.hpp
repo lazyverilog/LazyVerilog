@@ -106,6 +106,53 @@ struct SpacingOptions {
     std::string assignment_operator_spacing{"both"};
 };
 
+struct MacroOptions {
+    std::vector<std::string> object_like_expr;
+    std::vector<std::string> function_like_expr;
+    std::vector<std::string> statement_like{
+        "uvm_info",
+        "uvm_warning",
+        "uvm_error",
+        "uvm_fatal",
+        "uvm_create",
+        "uvm_create_on",
+        "uvm_send",
+        "uvm_send_pri",
+        "uvm_rand_send",
+        "uvm_rand_send_with",
+        "uvm_rand_send_pri",
+        "uvm_rand_send_pri_with",
+        "uvm_do",
+        "uvm_do_with",
+        "uvm_do_on",
+        "uvm_do_on_with",
+        "uvm_do_pri",
+        "uvm_do_pri_with",
+        "uvm_do_on_pri",
+        "uvm_do_on_pri_with",
+        "uvm_field_int",
+        "uvm_field_enum",
+        "uvm_field_object",
+        "uvm_field_array_int",
+        "uvm_field_array_object",
+        "uvm_field_queue_int",
+        "uvm_field_queue_object",
+        "uvm_field_string"};
+    std::vector<std::string> declaration_like{
+        "uvm_object_utils",          "uvm_component_utils",
+        "uvm_object_param_utils",    "uvm_component_param_utils",
+        "uvm_sequence_utils"};
+    std::vector<std::string> control_flow_like;
+    std::vector<std::string> block_begin_like{
+        "uvm_object_utils_begin",       "uvm_component_utils_begin",
+        "uvm_object_param_utils_begin", "uvm_component_param_utils_begin",
+        "uvm_sequence_utils_begin"};
+    std::vector<std::string> block_end_like{
+        "uvm_object_utils_end", "uvm_component_utils_end", "uvm_object_param_utils_end",
+        "uvm_component_param_utils_end", "uvm_sequence_utils_end"};
+    std::vector<std::string> whitespace_sensitive{"DV_CHECK_FATAL"};
+};
+
 struct FormatOptions {
     int indent_size{2};
     int blank_lines_between_items{1};
@@ -113,6 +160,8 @@ struct FormatOptions {
     bool tab_align{false};
     bool enable_format_on_save{false};
     bool safe_mode{false};
+    bool debug_main_token_loop{false};
+    std::string log_path;
     StatementOptions statement;
     PortDeclarationOptions port_declaration;
     VarDeclarationOptions var_declaration;
@@ -123,6 +172,7 @@ struct FormatOptions {
     EnumOptions enum_declaration;
     ModportOptions modport;
     SpacingOptions spacing;
+    MacroOptions macros;
 };
 
 struct LintRuleConfig {
