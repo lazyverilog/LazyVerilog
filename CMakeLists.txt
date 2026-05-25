@@ -184,14 +184,6 @@ target_link_libraries(lazyverilog-tests
 include(Catch)
 catch_discover_tests(lazyverilog-tests)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Slang playground (optional, for experimentation)
-# ──────────────────────────────────────────────────────────────────────────────
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/slang-playground/common.cpp")
-    add_executable(slang-playground slang-playground/common.cpp)
-    target_link_libraries(slang-playground PRIVATE slang::slang)
-endif()
-
 add_executable(parse-bench tools/parse_bench.cpp)
 target_link_libraries(parse-bench PRIVATE slang::slang)
 
