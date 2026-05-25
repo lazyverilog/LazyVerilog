@@ -1,5 +1,6 @@
 #include "formatter.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -46,7 +47,7 @@ static std::string render_lines(const std::vector<std::string>& lines) {
 
 static void write_log(const FormatOptions& opts, const std::string& filename,
                             const std::string& text) {
-    if (!opts.debug_main_token_loop || opts.log_path.empty())
+    if (opts.log_path.empty())
         return;
     std::filesystem::path dir(opts.log_path);
     std::filesystem::create_directories(dir);
@@ -5201,27 +5202,10 @@ static std::vector<std::string> format_portlist_pass(std::vector<std::string> li
 // The formatter is organized as:
 //   Phase 1: token-level spacing, line breaks, and indentation   (token loop)
 //   Phase 2: structural layout / reflow of multiline constructs  (post-token)
-//   Phase 3: line-group alignment                                (post-token)
+//   Phase 3: line-group alignment                                (v2 bridge)
 //
 // Post-token passes operate on plain line vectors.  Passes that need syntactic
 // roles classify the relevant lines locally from lexer tokens.
-
-static std::vector<std::string> run_module_header_layout_phase(std::vector<std::string> lines,
-                                                                 const FormatOptions& opts) {
-    lines = format_class_extends_parameter_pass(std::move(lines), opts);
-    return format_portlist_pass(std::move(lines), opts);
-}
-
-static std::vector<std::string> run_line_group_alignment_phase(std::vector<std::string> lines,
-                                                                 const FormatOptions& opts) {
-    if (opts.statement.align)
-        lines = align_assign_pass(std::move(lines), opts);
-    if (opts.var_declaration.align)
-        lines = align_var_pass(std::move(lines), opts);
-    if (opts.port_declaration.align)
-        lines = align_port_pass(std::move(lines), opts);
-    return lines;
-}
 
 // ---------------------------------------------------------------------------
 // Function/task declaration formatting pass
@@ -5761,24 +5745,6 @@ static std::vector<std::string> format_constraint_dist_pass(std::vector<std::str
     return out;
 }
 
-static std::vector<std::string> run_structural_layout_phase(
-    std::vector<std::string> lines, const FormatOptions& opts) {
-    PPContext pp = build_pp_context(lines);
-    lines = format_enum_declaration_pass(std::move(lines), opts);
-    lines = format_modport_pass(std::move(lines), opts);
-    if (opts.instance.align)
-        lines = expand_instances_pass(std::move(lines), opts);
-    pp = build_pp_context(lines);
-    lines = format_pp_conditional_function_calls_pass(std::move(lines), opts, pp);
-    lines = format_multiline_macro_arg_calls_pass(std::move(lines), opts);
-    lines = format_function_calls_pass(std::move(lines), opts);
-    lines = text_to_lines(render_lines(lines));
-    lines = format_covergroup_pass(std::move(lines), opts);
-    lines = format_constraint_dist_pass(std::move(lines), opts);
-    lines = split_semicolon_statements_pass(std::move(lines));
-    return lines;
-}
-
 // ---------------------------------------------------------------------------
 // `define continuation backslash alignment pass
 // ---------------------------------------------------------------------------
@@ -5819,15 +5785,14 @@ static std::vector<std::string> align_define_continuation_pass(std::vector<std::
     std::vector<std::string> out;
     size_t i = 0;
     while (i < lines.size()) {
-        if (in_disabled(line_starts[i], disabled) || line_has_pp_conditional(lines[i]) ||
-            !ends_with_bs(lines[i])) {
+        if (line_has_pp_conditional(lines[i]) || !ends_with_bs(lines[i])) {
             out.push_back(lines[i]);
             ++i;
             continue;
         }
         size_t start = i;
-        while (i < lines.size() && !in_disabled(line_starts[i], disabled) &&
-               !line_has_pp_conditional(lines[i]) && ends_with_bs(lines[i]))
+        while (i < lines.size() && !line_has_pp_conditional(lines[i]) &&
+               ends_with_bs(lines[i]))
             ++i;
         // lines[start..i) all end with '\'
         size_t max_cw = 0;
@@ -5847,34 +5812,6 @@ static std::vector<std::string> align_define_continuation_pass(std::vector<std::
     return out;
 }
 
-static std::vector<std::string> run_post_token_pipeline(std::vector<std::string> lines,
-                                                          const FormatOptions& opts) {
-    auto debug_dump = [&](const char* pass_name, const std::vector<std::string>& pass_lines) {
-        write_log(opts, std::string(pass_name) + ".sv", render_lines(pass_lines) + "\n");
-    };
-
-    // Post-token pipeline order:
-    // 1. Module header layout can reshape module declarations before broad
-    //    alignment sees those lines.
-    // 2. Line-group alignment handles local declaration/assignment groups.
-    // 3. Structural layout expands instances, calls, covergroups, constraints,
-    //    and semicolon-separated statements.
-    // 4. Function/task declaration layout runs after structural call/layout
-    //    changes so declarations get their final multi-line shape.
-    // 5. `define continuation alignment runs last because macro bodies should
-    //    not be reflowed by earlier structural passes.
-    lines = run_module_header_layout_phase(std::move(lines), opts);
-    debug_dump("01_run_module_header_layout_phase", lines);
-    lines = run_line_group_alignment_phase(std::move(lines), opts);
-    debug_dump("02_run_line_group_alignment_phase", lines);
-    lines = run_structural_layout_phase(std::move(lines), opts);
-    debug_dump("03_run_structural_layout_phase", lines);
-    lines = format_function_declaration_pass(std::move(lines), opts);
-    debug_dump("04_format_function_declaration_pass", lines);
-    lines = align_define_continuation_pass(std::move(lines), opts);
-    debug_dump("05_align_define_continuation_pass", lines);
-    return lines;
-}
 
 static void verify_safe_mode_unchanged(const std::string& source, const std::string& formatted,
                                        const FormatOptions& opts) {
@@ -5892,6 +5829,1031 @@ static void verify_safe_mode_unchanged(const std::string& source, const std::str
     if (strip(source) != strip(formatted))
         throw SafeModeError(
             "Formatter safe-mode: non-whitespace content changed — formatting aborted");
+}
+
+// ---------------------------------------------------------------------------
+// tok_line_starts — returns start indices of each logical line
+// ---------------------------------------------------------------------------
+static std::vector<size_t> tok_line_starts(const std::vector<Tok>& tokens) {
+    std::vector<size_t> starts;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (i == 0 || (tokens[i].fmt_newline_before && !tokens[i].whitespace)) {
+            starts.push_back(i);
+        }
+    }
+    return starts;
+}
+
+// ---------------------------------------------------------------------------
+// split_semicolon_statements_pass_v2 — token-metadata version
+// ---------------------------------------------------------------------------
+static void split_semicolon_statements_pass_v2(std::vector<Tok>& tokens) {
+    int paren = 0;
+    int bracket = 0;
+    int brace = 0;
+    bool line_has_pp = false;
+    bool line_has_backslash = false;
+
+    // Pre-scan: check if first logical line has pp conditional or backslash
+    for (size_t i = 0; i < tokens.size() && !(i > 0 && tokens[i].fmt_newline_before && !tokens[i].whitespace); ++i) {
+        if (tokens[i].whitespace)
+            continue;
+        if ((tokens[i].directive && is_pp_conditional(tokens[i].directive_kind)) ||
+            is_pp_conditional_text(tokens[i].text))
+            line_has_pp = true;
+        if (!tokens[i].text.empty() && tokens[i].text.back() == '\\')
+            line_has_backslash = true;
+    }
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        auto& tok = tokens[i];
+
+        // Reset per-line state at logical line boundaries
+        if (tok.fmt_newline_before && !tok.whitespace && i > 0) {
+            paren = 0;
+            bracket = 0;
+            brace = 0;
+            line_has_pp = false;
+            line_has_backslash = false;
+            // Scan this logical line for pp conditionals and backslash
+            for (size_t j = i; j < tokens.size(); ++j) {
+                if (j > i && tokens[j].fmt_newline_before && !tokens[j].whitespace)
+                    break;
+                if (tokens[j].whitespace)
+                    continue;
+                if ((tokens[j].directive && is_pp_conditional(tokens[j].directive_kind)) ||
+                    is_pp_conditional_text(tokens[j].text))
+                    line_has_pp = true;
+                if (!tokens[j].text.empty() && tokens[j].text.back() == '\\')
+                    line_has_backslash = true;
+            }
+        }
+
+        if (tok.fmt_disabled || tok.fmt_passthrough || tok.whitespace)
+            continue;
+
+        if (line_has_pp || line_has_backslash)
+            continue;
+
+        // Track nesting
+        if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+            ++paren;
+        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+            --paren;
+        else if (tok_is(tok, "[", TokenKind::OpenBracket))
+            ++bracket;
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+            --bracket;
+        else if (tok_is(tok, "{", TokenKind::OpenBrace))
+            ++brace;
+        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+            --brace;
+
+        if (paren == 0 && bracket == 0 && brace == 0 &&
+            tok_is(tok, ";", TokenKind::Semicolon)) {
+            // Find next significant token on the same logical line
+            for (size_t j = i + 1; j < tokens.size(); ++j) {
+                if (tokens[j].fmt_newline_before && !tokens[j].whitespace)
+                    break; // different logical line — nothing to split
+                if (tokens[j].whitespace || tokens[j].fmt_disabled || tokens[j].fmt_passthrough)
+                    continue;
+                if (tokens[j].comment)
+                    break; // trailing comment — don't split
+                // Found code after `;` on same line — split it
+                tokens[j].fmt_newline_before = true;
+                tokens[j].fmt_indent = tok.fmt_indent;
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// align_define_continuation_pass_v2 — token-metadata version
+// ---------------------------------------------------------------------------
+static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
+                                               const FormatOptions& opts) {
+    auto starts = tok_line_starts(tokens);
+
+    // For each logical line, determine: (a) whether it ends with backslash,
+    // (b) the content width before the backslash, (c) whether it has pp conditional.
+    // A "line end" token is the last non-whitespace token before the next line start.
+
+    struct LineInfo {
+        size_t start_idx;       // first token index
+        size_t end_idx;         // one past last token index
+        bool ends_with_bs;      // last significant token text ends with '\'
+        bool has_pp_cond;       // line contains pp conditional
+        bool disabled;          // line is in disabled region
+        size_t bs_tok_idx;      // index of the backslash-ending token
+        int content_col;        // rendered column of content before backslash
+    };
+
+    std::vector<LineInfo> line_infos;
+    line_infos.reserve(starts.size());
+
+    for (size_t li = 0; li < starts.size(); ++li) {
+        size_t s = starts[li];
+        size_t e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
+
+        LineInfo info{};
+        info.start_idx = s;
+        info.end_idx = e;
+        info.ends_with_bs = false;
+        info.has_pp_cond = false;
+        info.disabled = false;
+        info.bs_tok_idx = 0;
+        info.content_col = 0;
+
+        // Scan line tokens
+        size_t last_sig = s; // last significant (non-whitespace) token
+        bool found_sig = false;
+        for (size_t j = s; j < e; ++j) {
+            if (tokens[j].whitespace)
+                continue;
+            if (tokens[j].fmt_disabled) {
+                info.disabled = true;
+                break;
+            }
+            found_sig = true;
+            last_sig = j;
+            if ((tokens[j].directive && is_pp_conditional(tokens[j].directive_kind)) ||
+                is_pp_conditional_text(tokens[j].text))
+                info.has_pp_cond = true;
+        }
+
+        if (found_sig && !info.disabled) {
+            std::string txt = tokens[last_sig].text;
+            // Trim trailing whitespace from token text
+            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
+                txt.pop_back();
+            if (!txt.empty() && txt.back() == '\\') {
+                info.ends_with_bs = true;
+                info.bs_tok_idx = last_sig;
+
+                // Compute rendered column of content before backslash.
+                // Walk tokens on this line, accumulating column position.
+                int col = tokens[s].fmt_indent * opts.indent_size;
+                bool first = true;
+                for (size_t j = s; j < e; ++j) {
+                    if (tokens[j].whitespace)
+                        continue;
+                    if (j == last_sig) {
+                        // Content width = col + text length minus the trailing backslash
+                        size_t text_len = txt.size() - 1; // exclude '\'
+                        while (text_len > 0 && (txt[text_len - 1] == ' ' || txt[text_len - 1] == '\t'))
+                            --text_len;
+                        info.content_col = col + (int)text_len;
+                        break;
+                    }
+                    if (!first)
+                        col += tokens[j].fmt_spaces_before;
+                    col += (int)tokens[j].text.size();
+                    first = false;
+                }
+            }
+        }
+
+        line_infos.push_back(info);
+    }
+
+    // Group consecutive lines that end with backslash (excluding disabled/pp-conditional)
+    size_t i = 0;
+    while (i < line_infos.size()) {
+        if (line_infos[i].disabled || line_infos[i].has_pp_cond || !line_infos[i].ends_with_bs) {
+            ++i;
+            continue;
+        }
+        size_t group_start = i;
+        while (i < line_infos.size() && !line_infos[i].disabled &&
+               !line_infos[i].has_pp_cond && line_infos[i].ends_with_bs)
+            ++i;
+        // line_infos[group_start..i) is a group of continuation lines
+        int max_cw = 0;
+        for (size_t k = group_start; k < i; ++k)
+            max_cw = std::max(max_cw, line_infos[k].content_col);
+
+        int bs_col = opts.tab_align
+                         ? snap_to_indent_grid(max_cw + 1, opts.indent_size)
+                         : max_cw + 1;
+
+        for (size_t k = group_start; k < i; ++k) {
+            auto& info = line_infos[k];
+            auto& bs_tok = tokens[info.bs_tok_idx];
+
+            // Strip trailing backslash (and surrounding spaces) from token text
+            std::string txt = bs_tok.text;
+            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
+                txt.pop_back();
+            if (!txt.empty() && txt.back() == '\\')
+                txt.pop_back();
+            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
+                txt.pop_back();
+
+            // Recompute how many spaces we need between content and backslash
+            int pad = bs_col - info.content_col;
+            if (pad < 1)
+                pad = 1;
+
+            // Rebuild token text: content + padding + backslash
+            bs_tok.text = txt + std::string(pad, ' ') + "\\";
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// align_assign_pass_v2 — token-based assignment alignment
+// ---------------------------------------------------------------------------
+static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opts) {
+    if (!opts.statement.align)
+        return;
+
+    // --- Build logical lines from token stream ---
+    struct Line {
+        size_t first_sig;       // index of first significant (non-ws) token
+        size_t end;             // one-past-last token index for this line
+        int indent_level;
+        bool disabled;
+        bool has_pp_cond;
+        bool is_var;
+        bool is_module_header_param;
+        size_t assign_op_idx;   // index of assignment op token (SIZE_MAX if none)
+        int lhs_inline_width;   // inline width from first_sig to just before assign_op
+        bool empty;             // no significant tokens
+        bool prev_starts_for;   // previous line starts with ForKeyword
+    };
+
+    std::vector<Line> lines;
+
+    // Walk tokens building line boundaries
+    // A line starts at each non-ws token that has fmt_newline_before=true, or is the very first
+    // non-ws token.
+    bool next_is_line_start = true;
+    size_t cur_line_first_sig = SIZE_MAX;
+
+    auto finalize_line = [&](size_t end_idx) {
+        if (cur_line_first_sig == SIZE_MAX) {
+            // empty line
+            lines.push_back({SIZE_MAX, end_idx, 0, false, false, false, false, SIZE_MAX, 0, true, false});
+            return;
+        }
+        Line ln{};
+        ln.first_sig = cur_line_first_sig;
+        ln.end = end_idx;
+        ln.indent_level = tokens[cur_line_first_sig].fmt_indent;
+        ln.disabled = false;
+        ln.has_pp_cond = false;
+        ln.empty = false;
+
+        // Scan tokens on this line
+        std::vector<size_t> sig_indices;
+        int paren = 0, bracket = 0, brace = 0;
+        ln.assign_op_idx = SIZE_MAX;
+
+        for (size_t k = cur_line_first_sig; k < end_idx; ++k) {
+            const auto& tok = tokens[k];
+            if (tok.whitespace)
+                continue;
+            if (tok.fmt_disabled)
+                ln.disabled = true;
+            if (tok.directive && is_pp_conditional(tok.directive_kind))
+                ln.has_pp_cond = true;
+            if (is_pp_conditional_text(tok.text))
+                ln.has_pp_cond = true;
+            sig_indices.push_back(k);
+        }
+
+        // Find assignment op at depth 0
+        if (!ln.disabled && !ln.has_pp_cond) {
+            static const std::vector<std::string> OPS = {"<<<=", ">>>=", "<<=", ">>=", "<=", "+=", "-=",
+                                                         "*=",   "/=",   "%=",  "&=",  "|=", "^=", "="};
+            paren = 0; bracket = 0; brace = 0;
+            for (size_t si = 0; si < sig_indices.size(); ++si) {
+                const auto& tok = tokens[sig_indices[si]];
+                if (tok.comment)
+                    break;
+                if (tok_is(tok, "(", TokenKind::OpenParenthesis))
+                    ++paren;
+                else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
+                    --paren;
+                else if (tok_is(tok, "[", TokenKind::OpenBracket))
+                    ++bracket;
+                else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
+                    --bracket;
+                else if (tok_is(tok, "{", TokenKind::OpenBrace))
+                    ++brace;
+                else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
+                    --brace;
+                if (paren == 0 && bracket == 0 && brace == 0 &&
+                    std::find(OPS.begin(), OPS.end(), tok.text) != OPS.end()) {
+                    ln.assign_op_idx = sig_indices[si];
+                    break;
+                }
+            }
+        }
+
+        // is_var check
+        ln.is_var = false;
+        {
+            // Collect non-ws, non-comment, non-directive significant tokens
+            std::vector<size_t> code_sigs;
+            for (auto idx : sig_indices) {
+                const auto& tok = tokens[idx];
+                if (!tok.comment && !tok.directive)
+                    code_sigs.push_back(idx);
+            }
+            if (code_sigs.size() >= 3 &&
+                tok_is(tokens[code_sigs.back()], ";", TokenKind::Semicolon) &&
+                !is_port_direction_token(tokens[code_sigs[0]])) {
+                size_t ci = 0;
+                while (ci < code_sigs.size() && is_var_prefix_token(tokens[code_sigs[ci]]))
+                    ++ci;
+                if (ci < code_sigs.size()) {
+                    if (is_var_builtin_type_token(tokens[code_sigs[ci]])) {
+                        ln.is_var = true;
+                    } else if (is_identifier(tokens[code_sigs[ci]]) &&
+                               !is_keyword(tokens[code_sigs[ci]]) &&
+                               ci + 1 < code_sigs.size() &&
+                               (is_identifier(tokens[code_sigs[ci + 1]]) ||
+                                tok_is(tokens[code_sigs[ci + 1]], "[", TokenKind::OpenBracket) ||
+                                is_sign_qualifier_token(tokens[code_sigs[ci + 1]]))) {
+                        ln.is_var = true;
+                    }
+                }
+            }
+        }
+
+        // is_module_header_parameter check
+        ln.is_module_header_param = false;
+        if (ln.assign_op_idx != SIZE_MAX && !sig_indices.empty() &&
+            tokens[sig_indices[0]].kind == TokenKind::ParameterKeyword) {
+            // Walk backward through previous lines
+            for (int prev = (int)lines.size() - 1; prev >= 0; --prev) {
+                const auto& pl = lines[(size_t)prev];
+                if (pl.empty)
+                    continue;
+                if (pl.first_sig == SIZE_MAX)
+                    continue;
+                // Check if previous line is comment-only
+                bool is_comment_only = true;
+                for (size_t k = pl.first_sig; k < pl.end; ++k) {
+                    if (tokens[k].whitespace) continue;
+                    if (!tokens[k].comment) { is_comment_only = false; break; }
+                }
+                if (is_comment_only)
+                    continue;
+
+                // Check if it starts with module/interface/program and has #(
+                std::vector<size_t> prev_sigs;
+                for (size_t k = pl.first_sig; k < pl.end; ++k) {
+                    if (!tokens[k].whitespace && !tokens[k].comment && !tokens[k].directive)
+                        prev_sigs.push_back(k);
+                }
+                if (!prev_sigs.empty() &&
+                    (tokens[prev_sigs[0]].kind == TokenKind::ModuleKeyword ||
+                     tokens[prev_sigs[0]].kind == TokenKind::InterfaceKeyword ||
+                     tokens[prev_sigs[0]].kind == TokenKind::ProgramKeyword)) {
+                    for (size_t pi = 1; pi + 1 < prev_sigs.size(); ++pi) {
+                        if (tok_is(tokens[prev_sigs[pi]], "#", TokenKind::Hash) &&
+                            tok_is(tokens[prev_sigs[pi + 1]], "(", TokenKind::OpenParenthesis)) {
+                            ln.is_module_header_param = true;
+                            break;
+                        }
+                    }
+                }
+                // Check for semicolon or )( which would mean NOT a header
+                bool has_semi = false, has_close_open = false;
+                for (size_t pi = 0; pi < prev_sigs.size(); ++pi) {
+                    has_semi = has_semi || tok_is(tokens[prev_sigs[pi]], ";", TokenKind::Semicolon);
+                    if (pi + 1 < prev_sigs.size() &&
+                        tok_is(tokens[prev_sigs[pi]], ")", TokenKind::CloseParenthesis) &&
+                        tok_is(tokens[prev_sigs[pi + 1]], "(", TokenKind::OpenParenthesis))
+                        has_close_open = true;
+                }
+                if (has_semi || has_close_open)
+                    break;
+                if (ln.is_module_header_param)
+                    break;
+            }
+        }
+
+        // Compute lhs_inline_width
+        ln.lhs_inline_width = 0;
+        if (ln.assign_op_idx != SIZE_MAX) {
+            bool first = true;
+            for (size_t k = ln.first_sig; k < ln.end; ++k) {
+                if (tokens[k].whitespace)
+                    continue;
+                if (k == ln.assign_op_idx)
+                    break;
+                if (first) {
+                    ln.lhs_inline_width += (int)tokens[k].text.size();
+                    first = false;
+                } else {
+                    ln.lhs_inline_width += tokens[k].fmt_spaces_before + (int)tokens[k].text.size();
+                }
+            }
+        }
+
+        ln.prev_starts_for = false;
+        lines.push_back(ln);
+    };
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const auto& tok = tokens[i];
+        if (tok.whitespace) {
+            if (tok.fmt_newline_before)
+                next_is_line_start = true;
+            continue;
+        }
+        if (tok.fmt_newline_before && i > 0) {
+            // Close previous line
+            finalize_line(i);
+            cur_line_first_sig = SIZE_MAX;
+            next_is_line_start = false; // we handle it right here
+        }
+        if (next_is_line_start || cur_line_first_sig == SIZE_MAX) {
+            if (cur_line_first_sig == SIZE_MAX)
+                cur_line_first_sig = i;
+            next_is_line_start = false;
+        }
+        if (cur_line_first_sig == SIZE_MAX)
+            cur_line_first_sig = i;
+    }
+    // Finalize last line
+    if (cur_line_first_sig != SIZE_MAX)
+        finalize_line(tokens.size());
+
+    // Set prev_starts_for for each line
+    for (size_t li = 1; li < lines.size(); ++li) {
+        const auto& prev = lines[li - 1];
+        if (!prev.empty && prev.first_sig != SIZE_MAX) {
+            lines[li].prev_starts_for = (tokens[prev.first_sig].kind == TokenKind::ForKeyword);
+        }
+    }
+
+    // --- Group and align ---
+    size_t li = 0;
+    while (li < lines.size()) {
+        const auto& ln = lines[li];
+        if (ln.empty || ln.disabled || ln.has_pp_cond || ln.is_var ||
+            ln.is_module_header_param || ln.assign_op_idx == SIZE_MAX) {
+            ++li;
+            continue;
+        }
+
+        // Check: if previous line starts with 'for', skip this line (no grouping)
+        if (ln.prev_starts_for) {
+            // Consume all consecutive same-indent assign lines after 'for'
+            size_t j = li;
+            while (j < lines.size() && !lines[j].empty && !lines[j].disabled &&
+                   !lines[j].has_pp_cond && !lines[j].is_var &&
+                   !lines[j].is_module_header_param &&
+                   lines[j].assign_op_idx != SIZE_MAX &&
+                   lines[j].indent_level == ln.indent_level) {
+                ++j;
+            }
+            li = j;
+            continue;
+        }
+
+        // Collect group of consecutive alignable lines
+        size_t j = li;
+        while (j < lines.size()) {
+            const auto& lj = lines[j];
+            if (lj.empty || lj.disabled || lj.has_pp_cond || lj.is_var ||
+                lj.is_module_header_param || lj.assign_op_idx == SIZE_MAX)
+                break;
+            if (lj.indent_level != ln.indent_level)
+                break;
+            if (j > li && lj.prev_starts_for)
+                break;
+            ++j;
+        }
+
+        if (j - li < 2) {
+            // Single line: still apply lhs_min_width if needed
+            if (j - li == 1 && opts.statement.lhs_min_width > 0) {
+                const auto& sl = lines[li];
+                int target = opts.statement.lhs_min_width;
+                if (opts.tab_align && opts.indent_size > 0)
+                    target = snap_to_indent_grid(sl.indent_level * opts.indent_size + target, opts.indent_size) - sl.indent_level * opts.indent_size;
+                int sp = std::max(1, target - sl.lhs_inline_width + 1);
+                tokens[sl.assign_op_idx].fmt_spaces_before = sp;
+            }
+            li = j;
+            continue;
+        }
+
+        // Compute alignment
+        int max_lhs = opts.statement.lhs_min_width;
+        for (size_t k = li; k < j; ++k)
+            max_lhs = std::max(max_lhs, lines[k].lhs_inline_width);
+
+        int target = max_lhs;
+        if (opts.tab_align && opts.indent_size > 0)
+            target = snap_to_indent_grid(ln.indent_level * opts.indent_size + max_lhs, opts.indent_size) - ln.indent_level * opts.indent_size;
+
+        for (size_t k = li; k < j; ++k) {
+            int sp = std::max(1, target - lines[k].lhs_inline_width + 1);
+            tokens[lines[k].assign_op_idx].fmt_spaces_before = sp;
+        }
+
+        li = j;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// align_var_pass_v2 — token-based variable declaration alignment
+// ---------------------------------------------------------------------------
+
+struct VarTokenParsed {
+    bool valid{false};
+    size_t first_sig;         // first significant token index
+    size_t line_end;          // one-past-last token index
+
+    // Type+qualifier section: tokens [first_sig .. type_qual_end)
+    size_t type_qual_end;     // exclusive end (next sig token index after type+qual)
+    std::string type_qual_str;
+    int type_qual_inline_width;
+
+    // Dimension section (packed dims)
+    size_t dim_start;         // SIZE_MAX if none
+    size_t dim_end;           // exclusive end
+    std::string dim_str;
+    int dim_inline_width;
+
+    // Declarators
+    struct Declarator {
+        size_t name_idx;       // index of first token of declarator name
+        std::string name_str;
+        size_t trail_start;    // first token of trailing (unpacked dim, = init)
+        size_t trail_end;      // exclusive end (before comma or semicolon)
+        std::string trail_str;
+    };
+    std::vector<Declarator> declarators;
+
+    // Trailing comment
+    size_t comment_idx;       // SIZE_MAX if none
+    std::string comment_str;
+};
+
+static VarTokenParsed parse_var_tokens(const std::vector<Tok>& tokens, size_t line_start,
+                                        size_t line_end, const FormatOptions& opts) {
+    VarTokenParsed result{};
+
+    // Collect significant (non-ws, non-comment, non-directive) token indices and all non-ws indices
+    std::vector<size_t> sig_indices;   // code tokens (no ws, no comment, no directive)
+    std::vector<size_t> all_nonsig;    // all non-ws indices (for comment detection)
+    size_t comment_idx = SIZE_MAX;
+
+    for (size_t k = line_start; k < line_end; ++k) {
+        if (tokens[k].whitespace)
+            continue;
+        if (tokens[k].comment) {
+            if (comment_idx == SIZE_MAX)
+                comment_idx = k;
+            continue;
+        }
+        if (tokens[k].directive)
+            continue;
+        sig_indices.push_back(k);
+    }
+
+    if (sig_indices.size() < 3)
+        return result;
+    if (!tok_is(tokens[sig_indices.back()], ";", TokenKind::Semicolon))
+        return result;
+
+    // Remove the semicolon from consideration
+    size_t semi_idx = sig_indices.back();
+    sig_indices.pop_back();
+
+    if (is_port_direction_token(tokens[sig_indices[0]]))
+        return result;
+
+    // Parse type prefix
+    size_t idx = 0;
+    std::vector<size_t> type_parts_indices;
+    while (idx < sig_indices.size() && is_var_prefix_token(tokens[sig_indices[idx]])) {
+        type_parts_indices.push_back(sig_indices[idx]);
+        ++idx;
+    }
+    if (idx >= sig_indices.size())
+        return result;
+
+    if (is_var_builtin_type_token(tokens[sig_indices[idx]])) {
+        type_parts_indices.push_back(sig_indices[idx]);
+        ++idx;
+    } else {
+        if (!is_identifier(tokens[sig_indices[idx]]) || is_keyword(tokens[sig_indices[idx]]))
+            return result;
+        if (idx + 1 >= sig_indices.size())
+            return result;
+        bool ok = (is_identifier(tokens[sig_indices[idx + 1]]) ||
+                   tok_is(tokens[sig_indices[idx + 1]], "[", TokenKind::OpenBracket) ||
+                   is_sign_qualifier_token(tokens[sig_indices[idx + 1]]));
+        if (!ok)
+            return result;
+        type_parts_indices.push_back(sig_indices[idx]);
+        ++idx;
+    }
+
+    // Handle scope resolution (e.g., pkg::type_t)
+    while (idx < sig_indices.size() && tokens[sig_indices[idx]].text == "::" &&
+           idx + 1 < sig_indices.size()) {
+        type_parts_indices.push_back(sig_indices[idx]);     // ::
+        type_parts_indices.push_back(sig_indices[idx + 1]); // type name
+        idx += 2;
+    }
+
+    // Build type_qual_str
+    std::string type_kw_str;
+    for (size_t k = 0; k < type_parts_indices.size(); ++k) {
+        if (k > 0) type_kw_str += ' ';
+        type_kw_str += tokens[type_parts_indices[k]].text;
+    }
+
+    // Optional qualifier (signed/unsigned)
+    std::string qualifier_str;
+    if (idx < sig_indices.size() && is_sign_qualifier_token(tokens[sig_indices[idx]])) {
+        qualifier_str = tokens[sig_indices[idx]].text;
+        ++idx;
+    }
+
+    result.type_qual_str = type_kw_str + (qualifier_str.empty() ? "" : " " + qualifier_str);
+
+    // Compute type_qual_end: the token index of the next sig token after type+qual
+    if (idx < sig_indices.size())
+        result.type_qual_end = sig_indices[idx];
+    else
+        return result; // nothing after type — not a valid var decl
+
+    // Compute type_qual_inline_width: width from first_sig to type_qual_end
+    result.type_qual_inline_width = (int)result.type_qual_str.size();
+
+    // Optional packed dimension
+    result.dim_start = SIZE_MAX;
+    result.dim_end = SIZE_MAX;
+    result.dim_inline_width = 0;
+    if (idx < sig_indices.size() &&
+        tok_is(tokens[sig_indices[idx]], "[", TokenKind::OpenBracket)) {
+        result.dim_start = sig_indices[idx];
+        int depth = 0;
+        std::string dim_str;
+        size_t dim_first = idx;
+        while (idx < sig_indices.size()) {
+            const auto& tok = tokens[sig_indices[idx]];
+            if (idx > dim_first) dim_str += ' ';  // space between bracket tokens
+            dim_str += tok.text;
+            for (char c : tok.text) {
+                if (c == '[') ++depth;
+                else if (c == ']') --depth;
+            }
+            ++idx;
+            if (depth <= 0)
+                break;
+        }
+        result.dim_end = (idx < sig_indices.size()) ? sig_indices[idx] : semi_idx;
+        // Normalize dim_str using normalize_bracket_spacing
+        result.dim_str = normalize_bracket_spacing(dim_str, opts);
+        result.dim_inline_width = (int)result.dim_str.size();
+    }
+
+    if (idx >= sig_indices.size())
+        return result; // no declarators
+
+    // Remaining tokens are declarators separated by commas at depth 0
+    // Parse declarators
+    int paren = 0, bracket2 = 0, brace = 0;
+    size_t decl_start = idx;
+
+    auto flush_declarator = [&](size_t end_exclusive) {
+        if (decl_start >= end_exclusive)
+            return;
+        // First token of this declarator should be the name
+        size_t name_si = decl_start;
+        size_t name_tok = sig_indices[name_si];
+        const auto& name_token = tokens[name_tok];
+
+        // Validate: must start with [A-Za-z_]
+        if (name_token.text.empty() ||
+            (!std::isalpha((unsigned char)name_token.text[0]) && name_token.text[0] != '_'))
+            return;
+
+        std::string name_str = name_token.text;
+
+        // Everything after the name is trailing (unpacked dims, = init, etc.)
+        std::string trail_str;
+        size_t trail_start_si = name_si + 1;
+        for (size_t k = trail_start_si; k < end_exclusive; ++k) {
+            if (k > trail_start_si) trail_str += ' ';
+            trail_str += tokens[sig_indices[k]].text;
+        }
+        trail_str = normalize_bracket_spacing(trail_str, opts);
+
+        // Check for function call (has '(' in trailing)
+        for (size_t k = trail_start_si; k < end_exclusive; ++k) {
+            if (tok_is(tokens[sig_indices[k]], "(", TokenKind::OpenParenthesis))
+                return; // reject
+        }
+        // Also check for '(' in name+trailing combined
+        if (tok_is(tokens[name_tok], "(", TokenKind::OpenParenthesis))
+            return;
+
+        size_t trail_start_tok = (trail_start_si < end_exclusive) ? sig_indices[trail_start_si] : semi_idx;
+        size_t trail_end_tok = (end_exclusive > 0 && end_exclusive <= sig_indices.size()) ?
+            ((end_exclusive < sig_indices.size()) ? sig_indices[end_exclusive] : semi_idx) : semi_idx;
+
+        result.declarators.push_back({name_tok, name_str, trail_start_tok, trail_end_tok, trail_str});
+    };
+
+    for (size_t k = idx; k < sig_indices.size(); ++k) {
+        const auto& tok = tokens[sig_indices[k]];
+        if (tok_is(tok, "(", TokenKind::OpenParenthesis)) ++paren;
+        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
+        else if (tok_is(tok, "[", TokenKind::OpenBracket)) ++bracket2;
+        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket2 > 0) --bracket2;
+        else if (tok_is(tok, "{", TokenKind::OpenBrace)) ++brace;
+        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0) --brace;
+        else if (tok_is(tok, ",", TokenKind::Comma) && paren == 0 && bracket2 == 0 && brace == 0) {
+            flush_declarator(k);
+            decl_start = k + 1;
+        }
+    }
+    flush_declarator(sig_indices.size());
+
+    if (result.declarators.empty())
+        return result;
+
+    result.valid = true;
+    result.first_sig = sig_indices[0];
+    result.line_end = line_end;
+    result.comment_idx = comment_idx;
+    if (comment_idx != SIZE_MAX) {
+        result.comment_str = " ";
+        for (size_t k = comment_idx; k < line_end; ++k) {
+            if (tokens[k].whitespace) continue;
+            if (tokens[k].comment) {
+                result.comment_str += tokens[k].text;
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
+static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opts) {
+    if (!opts.var_declaration.align)
+        return;
+
+    const auto& vo = opts.var_declaration;
+
+    // Build logical lines
+    struct Line {
+        size_t start;   // first token index (may be ws)
+        size_t end;     // one-past-last
+        size_t first_sig;
+        bool disabled;
+        bool has_pp_cond;
+        bool is_comment_or_blank;
+        VarTokenParsed parsed;
+    };
+
+    std::vector<Line> lines;
+    bool next_is_line_start = true;
+    size_t cur_line_start = 0;
+    size_t cur_first_sig = SIZE_MAX;
+
+    auto finalize_line = [&](size_t end_idx) {
+        Line ln{};
+        ln.start = cur_line_start;
+        ln.end = end_idx;
+        ln.first_sig = cur_first_sig;
+        ln.disabled = false;
+        ln.has_pp_cond = false;
+        ln.is_comment_or_blank = true;
+
+        for (size_t k = cur_line_start; k < end_idx; ++k) {
+            if (tokens[k].whitespace) continue;
+            if (tokens[k].fmt_disabled) ln.disabled = true;
+            if (tokens[k].directive && is_pp_conditional(tokens[k].directive_kind))
+                ln.has_pp_cond = true;
+            if (is_pp_conditional_text(tokens[k].text))
+                ln.has_pp_cond = true;
+            if (!tokens[k].comment)
+                ln.is_comment_or_blank = false;
+        }
+        if (cur_first_sig == SIZE_MAX)
+            ln.is_comment_or_blank = true;
+
+        if (!ln.disabled && !ln.has_pp_cond && !ln.is_comment_or_blank && cur_first_sig != SIZE_MAX) {
+            ln.parsed = parse_var_tokens(tokens, cur_first_sig, end_idx, opts);
+        }
+
+        lines.push_back(std::move(ln));
+    };
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const auto& tok = tokens[i];
+        if (tok.whitespace) {
+            if (tok.fmt_newline_before)
+                next_is_line_start = true;
+            continue;
+        }
+        if (tok.fmt_newline_before && i > 0) {
+            finalize_line(i);
+            cur_line_start = i;
+            cur_first_sig = SIZE_MAX;
+            next_is_line_start = false;
+        }
+        if (next_is_line_start) {
+            cur_line_start = i;
+            cur_first_sig = SIZE_MAX;
+            next_is_line_start = false;
+        }
+        if (cur_first_sig == SIZE_MAX)
+            cur_first_sig = i;
+    }
+    if (cur_first_sig != SIZE_MAX || cur_line_start < tokens.size())
+        finalize_line(tokens.size());
+
+    // Group consecutive lines where var declarations are found
+    // (comments/blanks pass through without breaking the group)
+    size_t li = 0;
+    while (li < lines.size()) {
+        if (lines[li].disabled || lines[li].has_pp_cond || !lines[li].parsed.valid) {
+            ++li;
+            continue;
+        }
+
+        // Collect block
+        struct BlkEntry {
+            size_t line_idx;
+            bool is_var;
+        };
+        std::vector<BlkEntry> block;
+        size_t j = li;
+        while (j < lines.size()) {
+            const auto& lj = lines[j];
+            if (lj.disabled || lj.has_pp_cond)
+                break;
+            if (lj.parsed.valid) {
+                block.push_back({j, true});
+                ++j;
+                continue;
+            }
+            if (lj.is_comment_or_blank) {
+                block.push_back({j, false});
+                ++j;
+                continue;
+            }
+            break;
+        }
+
+        // Count parseable entries
+        int np = 0;
+        for (auto& e : block)
+            if (e.is_var) ++np;
+
+        if (np <= 0) {
+            li = j;
+            continue;
+        }
+
+        // Compute section widths
+        int max_s1 = 0;
+        for (auto& e : block) {
+            if (!e.is_var) continue;
+            max_s1 = std::max(max_s1, (int)lines[e.line_idx].parsed.type_qual_str.size());
+        }
+        int vo_s1_min = tab_aligned_width(vo.section1_min_width, opts);
+        int vo_s2_min = tab_aligned_width(vo.section2_min_width, opts);
+        int vo_s3_min = tab_aligned_width(vo.section3_min_width, opts);
+        int vo_s4_min = tab_aligned_width(vo.section4_min_width, opts);
+
+        int s1_w = tab_aligned_width(std::max(vo_s1_min, max_s1 + 1), opts);
+
+        int max_dim = 0;
+        for (auto& e : block) {
+            if (!e.is_var) continue;
+            max_dim = std::max(max_dim, (int)lines[e.line_idx].parsed.dim_str.size());
+        }
+        int s2_w = max_dim > 0 ? tab_aligned_width(std::max(vo_s2_min, max_dim + 1), opts) : 0;
+
+        size_t max_slots = 0;
+        for (auto& e : block)
+            if (e.is_var)
+                max_slots = std::max(max_slots, lines[e.line_idx].parsed.declarators.size());
+
+        std::vector<int> id_widths(max_slots, 0), trail_widths(max_slots, 0);
+        for (size_t slot = 0; slot < max_slots; ++slot) {
+            int mx_id = 0, mx_tr = 0;
+            for (auto& e : block) {
+                if (!e.is_var) continue;
+                const auto& vp = lines[e.line_idx].parsed;
+                if (slot < vp.declarators.size()) {
+                    mx_id = std::max(mx_id, (int)vp.declarators[slot].name_str.size());
+                    mx_tr = std::max(mx_tr, (int)vp.declarators[slot].trail_str.size());
+                }
+            }
+            id_widths[slot] = tab_aligned_width(std::max(vo_s3_min, mx_id + 1), opts);
+            trail_widths[slot] = tab_aligned_width(std::max(vo_s4_min, mx_tr), opts);
+        }
+
+        // Apply alignment to tokens
+        for (auto& e : block) {
+            if (!e.is_var) continue;
+            const auto& vp = lines[e.line_idx].parsed;
+
+            int line_s1_w = s1_w;
+            int line_s2_w = s2_w;
+            std::vector<int> line_id_widths = id_widths;
+            std::vector<int> line_trail_widths = trail_widths;
+
+            if (vo.align_adaptive) {
+                std::string s1part = vp.type_qual_str;
+                int t1 = vo_s1_min;
+                int t2 = t1 + (s2_w > 0 ? vo_s2_min : 0);
+
+                int e1 = tab_aligned_width(std::max(t1, (int)s1part.size() + 1), opts);
+                line_s1_w = e1;
+
+                int e2 = e1;
+                if (s2_w > 0) {
+                    int c2 = vp.dim_str.empty() ? 0 : (int)vp.dim_str.size() + 1;
+                    e2 = tab_aligned_width(std::max(t2, e1 + c2), opts);
+                    line_s2_w = e2 - e1;
+                }
+
+                line_trail_widths.clear();
+                for (const auto& decl : vp.declarators)
+                    line_trail_widths.push_back(
+                        tab_aligned_width(std::max(vo_s4_min, (int)decl.trail_str.size()), opts));
+            }
+
+            // Now set fmt_spaces_before on the tokens to achieve alignment
+            // Section 1 → type+qualifier: pad to line_s1_w
+            // The token after type+qualifier gets fmt_spaces_before adjusted
+            size_t next_after_type = vp.type_qual_end;
+            int s1_spaces = std::max(1, line_s1_w - (int)vp.type_qual_str.size());
+            tokens[next_after_type].fmt_spaces_before = s1_spaces;
+
+            // Section 2 → dim: pad to line_s2_w (if dims exist in block)
+            if (line_s2_w > 0 && vp.dim_start != SIZE_MAX) {
+                // dim tokens are already in place, need to pad to line_s2_w
+                // The first declarator name comes after dim
+                if (!vp.declarators.empty()) {
+                    int dim_space = std::max(1, line_s2_w - (int)vp.dim_str.size());
+                    tokens[vp.declarators[0].name_idx].fmt_spaces_before = dim_space;
+                }
+            } else if (line_s2_w > 0 && vp.dim_start == SIZE_MAX) {
+                // No dim on this line but block has dims — add s2_w padding to name
+                if (!vp.declarators.empty()) {
+                    int existing = tokens[vp.declarators[0].name_idx].fmt_spaces_before;
+                    tokens[vp.declarators[0].name_idx].fmt_spaces_before = existing + line_s2_w;
+                }
+            }
+
+            // Section 3+4 → declarator names and trailing
+            size_t nd = vp.declarators.size();
+            for (size_t k = 0; k < nd; ++k) {
+                bool is_last = (k == nd - 1);
+                const auto& decl = vp.declarators[k];
+
+                // Name width padding: for non-last declarators and last one if id_widths available
+                if (k < line_id_widths.size() && !decl.trail_str.empty()) {
+                    // Need to set spacing on trail_start token
+                    if (decl.trail_start != decl.trail_end && decl.trail_start < tokens.size()) {
+                        int name_pad = std::max(1, line_id_widths[k] - (int)decl.name_str.size());
+                        tokens[decl.trail_start].fmt_spaces_before = name_pad;
+                    }
+                } else if (k < line_id_widths.size() && decl.trail_str.empty()) {
+                    // No trailing: for non-last, need to pad name to id_width + trail_width before comma
+                    // The comma/semicolon spacing is handled differently
+                }
+
+                if (!is_last) {
+                    // After trail, there's a comma — find it and set spacing for next decl name
+                    // The comma token is between this decl's trail_end and next decl's name_idx
+                    if (k + 1 < nd) {
+                        // Set spacing before next declarator's name
+                        // (accounts for ", " between declarators)
+                    }
+                } else {
+                    // Last declarator: the semicolon follows
+                    // Need to pad trail if section4_min_width
+                    if (!decl.trail_str.empty() && vo.section4_min_width > 0 &&
+                        k < line_trail_widths.size() && line_trail_widths[k] > 1) {
+                        // Need padding between trail and semicolon
+                    }
+                }
+            }
+        }
+
+        li = j;
+    }
 }
 
 } // anonymous namespace
@@ -6130,6 +7092,7 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
 
         // --- A. Disabled region ---
         if (in_disabled(tok.pos, disabled)) {
+            tok.fmt_disabled = true;
             apply_newline(i);
             if (is_line_directive(tok) && tok.directive_kind == syntax::SyntaxKind::DefineDirective)
                 in_define_disabled = true;
@@ -6596,918 +7559,89 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     ScopedTokenCache token_cache;
 
     // -----------------------------------------------------------------------
-    // STEP 1: Tokenize using slang::Lexer (no SyntaxTree/CST needed)
+    // Tokenize using slang::Lexer (no SyntaxTree/CST needed)
     // -----------------------------------------------------------------------
     const std::string& input = source;
-    write_log(opts, "main_token_loop_input.sv", input);
+    write_log(opts, "format_source_input.sv", input);
 
-    // -----------------------------------------------------------------------
-    // STEP 3: Build helper data structures
-    //
-    // indent_unit  — the string for one indent level, e.g. "    " (4 spaces).
-    //
-    // disabled     — list of [start, end) byte ranges that are inside
-    //                1. `// verilog_format: off` … `// verilog_format: on`
-    //                regions.  Tokens inside these ranges are copied verbatim.
-    //                2. multi-line ``define` macros
-    //
-    // tokens       — ordered list of Tok structs extracted from the Lexer.
-    //                Each Tok has: text, pos (byte offset), and bool flags
-    //                (whitespace, comment, directive, keyword, etc.).
-    // -----------------------------------------------------------------------
-    const std::string indent_unit(opts.indent_size, ' ');
-    auto disabled = find_disabled(input);
     auto tokens = collect_lexer_tokens(input);
 
-    const MacroClassifier macro_classifier(opts.macros);
+    // -----------------------------------------------------------------------
+    // Primary output path: pass0 → render_tokens
+    // -----------------------------------------------------------------------
+    pass0_populate_metadata(tokens, input, opts);
+    split_semicolon_statements_pass_v2(tokens);
+    align_define_continuation_pass_v2(tokens, opts);
+    std::string v2_out = render_tokens(tokens, opts);
+    // normalize trailing newlines:
+    if (!v2_out.empty() && v2_out.back() != '\n') v2_out += '\n';
+    while (v2_out.size() >= 2 && v2_out[v2_out.size()-1] == '\n' && v2_out[v2_out.size()-2] == '\n')
+        v2_out.pop_back();
+    write_log(opts, "pass0_render_output.sv", v2_out);
 
     // -----------------------------------------------------------------------
-    // STEP 6: State variables for the token-walking loop
-    //
-    // The main loop below walks every token exactly once and builds `out` —
-    // the formatted output string.  All the variables below track the
-    // "current state of the world" as we advance through the token stream.
+    // Module-header layout passes (v2 bridge — operate on rendered lines)
     // -----------------------------------------------------------------------
-
-    std::string out;
-    out.reserve(input.size() + input.size() / 4); // pre-allocate ~25% extra
-
-    // indent_level — current nesting depth (in units of indent_unit).
-    // indent_stack — stack of how much each indent-opening keyword added, so
-    //               the matching indent-closing keyword can pop the exact same amount.
-    //               (outmost module/interface/package blocks add
-    //                opts.default_indent_level_inside_outmost_block, everything else adds 1.)
-    int indent_level = 0;
-    std::vector<int> indent_stack;
-
-    // at_bol    — true when the next character we emit starts a fresh line,
-    //             so we must emit the indentation prefix first.
-    bool at_bol = true;
-
-    // dim_depth — how many unmatched '[' we have seen since the last ';'.
-    //             Nonzero means we are inside an array dimension like [7:0].
-    //             Spacing rules differ inside dimensions.
-    int dim_depth = 0;
-
-    // paren_depth — how many unmatched '(' we have seen.
-    //               Used to distinguish top-level ';' (statement end) from
-    //               ';' inside a for(;;) header.
-    int paren_depth = 0;
-    std::vector<ParenKind> paren_stack;
-    std::vector<bool> for_header_stack;
-
-    // do_depth  — counts nested `do` keywords so we know when `end while`
-    //             belongs to a do…while (MustAppend) vs. a plain `while`.
-    int do_depth = 0;
-
-    // pending_nl — true means we want a newline BEFORE the next token, but
-    //              haven't emitted it yet.  Deferred so that inline comments
-    //              can suppress it if they live on the same source line.
-    bool pending_nl = false;
-    bool original_newline_before_token = false;
-
-    // blank_pend — number of extra blank lines to insert before the next
-    //              token (capped at opts.blank_lines_between_items).
-    int blank_pend = 0;
-
-    // in_pp_cond — true while we are inside a preprocessor conditional that
-    //              takes an argument on the same line, e.g. `ifdef MACRO_NAME.
-    //              We need a newline after the argument.
-    bool in_pp_cond = false;
-
-    // after_dis  — true immediately after we exit a disabled region.
-    //              If the next whitespace token contains a newline, we must
-    //              emit pending_nl so the re-enabled code starts on its own line.
-    bool after_dis = false;
-    bool in_define_disabled = false;
-
-    // block_label_state — tracks `begin: label` / `fork: label` sequences.
-    //   0 = idle, 1 = just emitted begin/fork (expecting ':'), 2 = saw ':'
-    //   (expecting label name).  Used to keep `begin: label` on one line.
-    int block_label_state = 0;
-
-    // struct_pend — true after we see `struct` or `union` keyword; the next
-    //               `{` should be treated as a struct-brace (indented block)
-    //               rather than a concatenation brace.
-    bool struct_pend = false;
-    bool constraint_pend = false;
-    int constraint_depth = 0;
-
-    // case_expr_pending / case_expr_depth
-    //   After `case`/`casex`/`casez` we expect a `(expr)`.
-    //   pending goes true at the keyword; depth records the paren nesting level
-    //   of the opening `(`.  When we see the matching `)`, we schedule a newline
-    //   (the case items start on the next line).
-    bool case_expr_pending = false;
-    int case_expr_depth = -1;
-    int case_depth = 0;
-    int case_conditional_depth = 0;
-    bool case_label_pending_nl = false;
-
-    // control_expr_pending / control_expr_depth
-    //   Same idea for `if`/`for`/`foreach`/`while`/`repeat` — after the closing
-    //   `)` of the condition, we set single_stmt_pending so the body gets
-    //   an extra indent level if it has no `begin`.
-    bool control_expr_pending = false;
-    int control_expr_depth = -1;
-
-    // single_stmt_pending — set after the `)` of an if/for/while condition.
-    //                       If the very next token at BOL is NOT `begin`, we
-    //                       bump indent_level by 1 (single_stmt_active = true).
-    // single_stmt_active  — true while we are inside a bodyless single-statement
-    //                       block; reset (and indent_level decremented) at `;`.
-    bool single_stmt_pending = false;
-    bool single_stmt_active = false;
-
-    // do_while_tail — true for the `while` token that closes a `do…while`.
-    //                 Prevents that `while` from being treated as a loop header
-    //                 (which would set control_expr_pending again).
-    bool do_while_tail = false;
-
-    // Import/export declarations can contain `function` / `task` keywords, but
-    // those keywords are part of the declaration and do not open SV blocks.
-    bool in_import_export_decl = false;
-    bool in_extern_decl = false;
-    struct ActiveMacro {
-        MacroClassification classification;
-        bool wait_open{false};
-        int paren_depth{-1};
-    };
-    std::vector<ActiveMacro> active_macros;
-    bool macro_wrap_pending = false;
-    bool function_macro_newline_candidate = false;
-    int function_macro_newline_depth = -1;
-    bool prev_macro_role_valid = false;
-    MacroRole prev_macro_role = MacroRole::ObjectLikeExpr;
-    bool whitespace_macro_passthrough = false;
-    bool whitespace_macro_seen_open = false;
-    int whitespace_macro_paren_depth = 0;
-    MacroClassification whitespace_macro_class;
-    Tok whitespace_macro_prev;
-
-    // brace_stk — stack that records whether each open `{` is a struct/union
-    //             brace (value "struct") or something else ("other").
-    //             Only struct braces trigger indentation.
-    std::vector<std::string> brace_stk;
-
-    // prev — pointer to the previous non-whitespace Tok, used by spaces_req()
-    //        and break_dec() to decide spacing/line-break between token pairs.
-    const Tok* prev = nullptr;
-    bool prev_at_procedural = false;
-
-    // -----------------------------------------------------------------------
-    // Helper lambdas
-    //
-    // flush_nl() — actually writes the deferred newlines to `out`.
-    //              Called just before emitting a token (unless MustAppend).
-    //
-    // emit(text) — writes `text` to `out`, prepending indentation if we are
-    //              at the beginning of a line (at_bol == true).
-    // -----------------------------------------------------------------------
-    auto flush_nl = [&]() {
-        if (pending_nl) {
-            out += '\n';
-            at_bol = true;
-            pending_nl = false;
-        }
-        if (blank_pend > 0) {
-            if (!at_bol) {
-                out += '\n';
-                at_bol = true;
-                }
-            for (int k = 0; k < blank_pend; ++k) {
-                out += '\n';
-                at_bol = true;
-                }
-            blank_pend = 0;
-        }
-    };
-    auto emit = [&](const std::string& text) {
-        if (at_bol) {
-            for (int k = 0; k < indent_level; ++k)
-                out += indent_unit;
-            at_bol = false;
-        }
-        out += text;
-    };
-    auto next_significant = [&](size_t idx) -> const Tok* {
-        for (size_t j = idx + 1; j < tokens.size(); ++j) {
-            if (!tokens[j].whitespace && !tokens[j].comment)
-                return &tokens[j];
-        }
-        return nullptr;
-    };
-    auto macro_force_own_line = [](MacroRole role) {
-        return role == MacroRole::DeclarationLike || role == MacroRole::ControlFlowLike ||
-               role == MacroRole::BlockBeginLike || role == MacroRole::BlockEndLike;
-    };
-    auto macro_newline_after = [](MacroRole role) {
-        return role == MacroRole::StatementLike || role == MacroRole::DeclarationLike ||
-               role == MacroRole::ControlFlowLike || role == MacroRole::BlockBeginLike ||
-               role == MacroRole::BlockEndLike;
-    };
-    auto finish_macro_invocation = [&](const MacroClassification& classification) {
-        if (macro_newline_after(classification.role)) {
-            pending_nl = true;
-            macro_wrap_pending = true;
-        }
-        if (classification.role == MacroRole::ControlFlowLike)
-            single_stmt_pending = true;
-        if (classification.role == MacroRole::BlockBeginLike) {
-            indent_level += 1;
-            indent_stack.push_back(1);
-        }
-        if ((classification.role == MacroRole::StatementLike ||
-             classification.role == MacroRole::DeclarationLike) &&
-            single_stmt_active) {
-            indent_level = std::max(0, indent_level - 1);
-            single_stmt_active = false;
-        }
-    };
-
-    // -----------------------------------------------------------------------
-    // STEP 7: Main token loop — single pass over all tokens
-    //
-    // For each token we:
-    //   A. Skip / passthrough disabled-region tokens verbatim.
-    //   B. Skip whitespace tokens (we reconstruct spacing from scratch).
-    //   C. Decide spacing (spaces_req) and line-break (break_dec) from the
-    //      previous token.
-    //   D. Handle inline comments (don't let pending_nl split them off).
-    //   E. Flush pending newlines or append-space depending on break decision.
-    //   F. Handle single-statement indent (no `begin` after if/for/while).
-    //   G. Decrement indent BEFORE emitting indent-closing keywords (end, endmodule, …)
-    //      so the closing keyword aligns with the matching open keyword.
-    //   H. Emit the token text.
-    //   I. Record orig→fmt line mapping.
-    //   J. Update bracket/paren/dim depth counters.
-    //   K. Post-emit: open new indent level, schedule newlines, track pp-conds.
-    // -----------------------------------------------------------------------
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        const Tok& tok = tokens[i];
-        bool tok_is_macro = is_macro_usage(tok);
-        MacroClassification tok_macro_class;
-        bool tok_macro_has_args = false;
-        if (tok_is_macro) {
-            if (const Tok* next = next_significant(i))
-                tok_macro_has_args = tok_is(*next, "(", TokenKind::OpenParenthesis);
-            tok_macro_class = classify_macro(tok, tok_macro_has_args, macro_classifier);
-        }
-        syntax::SyntaxKind tok_pp_cond_kind = syntax::SyntaxKind::Unknown;
-        if (is_line_directive(tok) && is_pp_conditional(tok.directive_kind))
-            tok_pp_cond_kind = tok.directive_kind;
-        else if (is_pp_conditional_text(tok.text))
-            tok_pp_cond_kind = directive_at_offset(tok.text, 0).kind;
-        bool tok_is_pp_conditional = is_pp_conditional(tok_pp_cond_kind);
-
-        if (whitespace_macro_passthrough) {
-            out += tok.text;
-            at_bol = !tok.text.empty() && tok.text.back() == '\n';
-            if (!tok.whitespace && !tok.comment) {
-                if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
-                    ++whitespace_macro_paren_depth;
-                    whitespace_macro_seen_open = true;
-                } else if (tok_is(tok, ")", TokenKind::CloseParenthesis) &&
-                           whitespace_macro_seen_open && whitespace_macro_paren_depth > 0) {
-                    --whitespace_macro_paren_depth;
-                    if (whitespace_macro_paren_depth == 0) {
-                        whitespace_macro_passthrough = false;
-                        whitespace_macro_seen_open = false;
-                        if (macro_newline_after(whitespace_macro_class.role))
-                            pending_nl = true;
-                        prev_macro_role_valid = true;
-                        prev_macro_role = whitespace_macro_class.role;
-                        prev = &whitespace_macro_prev;
-                        original_newline_before_token = false;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (tok_is_macro && tok_macro_has_args && tok_macro_class.whitespace_sensitive) {
-            flush_nl();
-            emit(tok.text);
-            whitespace_macro_passthrough = true;
-            whitespace_macro_seen_open = false;
-            whitespace_macro_paren_depth = 0;
-            whitespace_macro_class = tok_macro_class;
-            whitespace_macro_prev = tok;
-            prev_macro_role_valid = false;
-            original_newline_before_token = false;
-            continue;
-        }
-
-        // --- A. Disabled region — pass through verbatim ---
-        // Tokens between `// verilog_format: off` and `// verilog_format: on`
-        // are copied to `out` exactly as-is, with no reformatting at all.
-        // We still flush any pending newline first so the disabled block starts
-        // on a fresh line.  Define bodies and preprocessor conditionals are
-        // appended raw instead of using emit(), so they normalize to column 0
-        // rather than inheriting formatter indentation.  `prev` is NOT updated
-        // so the token before the disabled region doesn't influence spacing
-        // after it.
-        if (in_disabled(tok.pos, disabled)) {
-            flush_nl();
-            if (is_line_directive(tok) && tok.directive_kind == syntax::SyntaxKind::DefineDirective)
-                in_define_disabled = true;
-            if (tok_is_pp_conditional || in_define_disabled || !at_bol || tok.whitespace) {
-                out += tok.text;
-            } else {
-                emit(tok.text);
-            }
-            at_bol = !tok.text.empty() && tok.text.back() == '\n';
-            after_dis = !at_bol; // remember we just left a disabled region mid-line
-            continue;            // don't update prev
-        }
-        in_define_disabled = false;
-
-        // --- B. Whitespace tokens — discard, but extract blank-line info ---
-        // We never copy original whitespace; spacing is completely rewritten.
-        // However, we do respect blank lines between items up to the configured
-        // maximum (opts.blank_lines_between_items).
-        if (tok.whitespace) {
-            int nl = (int)std::count(tok.text.begin(), tok.text.end(), '\n');
-            original_newline_before_token = nl > 0;
-            // If a disabled region ended mid-line and now we see a newline in
-            // the following whitespace, emit the pending newline.
-            if (after_dis && nl >= 1)
-                pending_nl = true;
-            after_dis = false;
-            if (nl > 0 && paren_depth > 0)
-                continue;
-            if (nl > 1) {
-                // More than one newline = at least one blank line between items.
-                // extra = number of blank lines (nl-1 because first \n ends the
-                // current line, subsequent \n's are the blank lines themselves).
-                int extra = std::min(nl - 1, opts.blank_lines_between_items);
-                blank_pend = std::max(blank_pend, extra);
-            }
-            continue;
-        }
-
-        if (tok_is_pp_conditional) {
-            flush_nl();
-            if (!at_bol) {
-                out += '\n';
-                at_bol = true;
-            }
-            out += tok.text;
-            at_bol = !tok.text.empty() && tok.text.back() == '\n';
-            pending_nl = false;
-            blank_pend = 0;
-
-            bool has_inline_arg = false;
-            if (is_pp_cond_with(tok_pp_cond_kind)) {
-                auto directive = directive_at_offset(tok.text, 0);
-                size_t arg = directive.end;
-                while (arg < tok.text.size() && (tok.text[arg] == ' ' || tok.text[arg] == '\t'))
-                    ++arg;
-                has_inline_arg = arg < tok.text.size() && tok.text[arg] != '\n';
-            }
-            if (is_pp_cond_with(tok_pp_cond_kind) && !has_inline_arg) {
-                in_pp_cond = true;
-            } else {
-                in_pp_cond = false;
-                pending_nl = true;
-            }
-            prev_macro_role_valid = false;
-            prev = &tok;
-            original_newline_before_token = false;
-            continue;
-        }
-
-        if (in_pp_cond) {
-            if (!at_bol)
-                out += ' ';
-            out += tok.text;
-            at_bol = !tok.text.empty() && tok.text.back() == '\n';
-            in_pp_cond = false;
-            pending_nl = true;
-            prev_macro_role_valid = false;
-            prev = &tok;
-            original_newline_before_token = false;
-            continue;
-        }
-
-        // --- C. Decide spacing and line-break between prev and tok ---
-        // in_dim: inside array dimension brackets [hi:lo], spacing is tighter.
-        // spaces: how many spaces to insert between prev and tok (0 or 1).
-        // dec:    SD::MustWrap   → force a newline before tok
-        //         SD::MustAppend → force tok onto the same line as prev
-        //         SD::Undecided  → use pending_nl / blank_pend to decide
-        bool in_dim = dim_depth > 0;
-        bool in_for_header =
-            std::any_of(for_header_stack.begin(), for_header_stack.end(), [](bool v) { return v; });
-        bool procedural_at = prev && ((tok.text == "@" && is_procedural_event_keyword(*prev)) ||
-                                      (prev->text == "@" && prev_at_procedural));
-        ParenKind paren_kind = ParenKind::Ordinary;
-        if (prev && (prev->text == "(" || tok_is(tok, ")", TokenKind::CloseParenthesis))) {
-            if (!paren_stack.empty())
-                paren_kind = paren_stack.back();
-        } else if (prev && tok_is(tok, "(", TokenKind::OpenParenthesis))
-            paren_kind = classify_paren(*prev, procedural_at);
-        int spaces = 0;
-        SD dec = SD::Undecided;
-        if (prev) {
-            spaces = spaces_req(*prev, tok, opts, in_dim, in_for_header, !paren_stack.empty(),
-                                paren_kind, procedural_at);
-            dec = break_dec(*prev, tok, opts, in_dim);
-        }
-        if (prev_macro_role_valid && tok.kind == TokenKind::ElseKeyword &&
-            prev_macro_role == MacroRole::BlockEndLike)
-            dec = opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
-        if (tok_is_macro && macro_force_own_line(tok_macro_class.role)) {
-            if (tok_macro_class.role == MacroRole::BlockBeginLike && prev &&
-                prev->kind == TokenKind::CloseParenthesis) {
-                dec = opts.statement.begin_newline ? SD::MustWrap : SD::MustAppend;
-            } else if (!at_bol) {
-                dec = SD::MustWrap;
-            }
-        }
-
-        // --- D. Inline-comment suppression ---
-        // A `;` sets pending_nl=true (statement ended → new line).
-        // But if the very next token is a comment that lives on the same
-        // original source line (e.g. `foo; // comment`), we must NOT emit
-        // the newline yet — the comment must stay on the same line as `foo;`.
-        bool inline_comment = tok.comment && prev && !original_newline_before_token;
-
-        // --- Special: `end while` in a do…while statement ---
-        // In `do begin … end while (cond);` the `while` after `end` is NOT
-        // the start of a new while-loop — it is the tail of the do…while.
-        // We must append it to the same line as `end` (MustAppend) and must
-        // NOT treat it as a new control-expression header.
-        do_while_tail = false;
-        if (prev && prev->kind == TokenKind::EndKeyword && tok.kind == TokenKind::WhileKeyword) {
-            if (do_depth > 0) {
-                dec = SD::MustAppend;
-                --do_depth;
-                do_while_tail = true;
-            } else {
-                dec = SD::Undecided;
-            }
-        }
-        if (macro_wrap_pending && !tok.whitespace && !tok.comment) {
-            dec = SD::MustWrap;
-            macro_wrap_pending = false;
-        }
-        if (function_macro_newline_candidate) {
-            if (original_newline_before_token && function_macro_newline_depth == 0 &&
-                paren_depth == 0 && !continues_after_function_like_macro(tok))
-                dec = SD::MustWrap;
-            function_macro_newline_candidate = false;
-            function_macro_newline_depth = -1;
-        }
-        // In `disable <block_name>;`, the token after `disable` names the
-        // target block. It must not be treated as a structural keyword even
-        // when the target is `fork`.
-        bool disable_target = prev && prev->kind == TokenKind::DisableKeyword;
-        bool wait_fork_target = prev && prev->kind == TokenKind::WaitKeyword &&
-                                tok.kind == TokenKind::ForkKeyword;
-
-        // --- Block label: keep `begin: label` on one line ---
-        if (block_label_state == 1 && !tok.whitespace && !tok.comment) {
-            if (tok.text == ":") {
-                dec = SD::MustAppend;
-                spaces = 0;
-                block_label_state = 2;
-            } else {
-                block_label_state = 0;
-            }
-        } else if (block_label_state == 2 && !tok.whitespace && !tok.comment) {
-            dec = SD::MustAppend;
-        }
-        if (case_label_pending_nl && tok.kind == TokenKind::BeginKeyword)
-            case_label_pending_nl = false;
-
-        // Suppress the pending newline if this comment is on the same source line.
-        if (inline_comment && pending_nl) {
-            if (!case_label_pending_nl)
-                pending_nl = false;
-        } else if (tok.comment && tok.text.rfind("//", 0) == 0) {
-            size_t line_start = input.rfind('\n', (size_t)tok.pos);
-            line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
-            bool standalone_comment = true;
-            for (size_t p = line_start; p < (size_t)tok.pos; ++p) {
-                if (input[p] != ' ' && input[p] != '\t') {
-                    standalone_comment = false;
-                    break;
-                }
-            }
-            if (standalone_comment)
-                dec = SD::MustWrap;
-        }
-
-        // --- E. Emit newline / spacing based on break decision ---
-        if (dec == SD::MustWrap) {
-            // Force newline before this token regardless of pending_nl.
-            pending_nl = false;
-            if (!at_bol) {
-                out += '\n';
-                at_bol = true;
-                }
-            for (int k = 0; k < blank_pend; ++k) {
-                out += '\n';
-                }
-            blank_pend = 0;
-        } else if (dec == SD::MustAppend) {
-            // Force this token onto the same line — cancel any pending newline.
-            if (pending_nl) {
-                pending_nl = false;
-                blank_pend = 0;
-            }
-            if (!at_bol && spaces > 0)
-                out += std::string(spaces, ' ');
-        } else {
-            // Normal: flush deferred newlines first, then add spaces.
-            flush_nl();
-            if (!at_bol && spaces > 0)
-                out += std::string(spaces, ' ');
-        }
-
-        // --- F. Single-statement indent (bodyless if/for/while body) ---
-        // single_stmt_pending is set after the `)` closing an if/for/while
-        // condition.  We wait until we are truly at the start of a new line
-        // (at_bol) to decide:
-        //   • If the next token is `begin` → no extra indent needed (begin
-        //     will open its own indented block as an indent-opening keyword).
-        //   • Otherwise → bump indent_level by 1 for this single statement.
-        if (single_stmt_pending && at_bol) {
-            if (constraint_depth > 0 && tok_is(tok, "{", TokenKind::OpenBrace)) {
-                // Constraint if/else bodies use braces instead of begin/end; let the
-                // brace handler below create the indentation scope.
-            } else if (tok.kind == TokenKind::BeginKeyword) {
-                single_stmt_pending = false; // begin handles its own indent
-            } else {
-                ++indent_level;
-                single_stmt_pending = false;
-                single_stmt_active = true; // remember to undo at the next `;`
-            }
-        }
-
-        // --- G. Indent-close: decrement indent BEFORE emitting the token ---
-        // Keywords like `end`, `endmodule`, `endfunction`, `join`, etc. are
-        // indent-closing keywords.  They should appear at the SAME indentation level
-        // as the matching open keyword, so we reduce indent_level first.
-        //
-        // Closing `}` of a struct/union block works the same way — the `}`
-        // should align with the `struct {` line.
-        if (tok_is_macro && tok_macro_class.role == MacroRole::BlockEndLike) {
-            int delta = indent_stack.empty() ? 1 : indent_stack.back();
-            if (!indent_stack.empty())
-                indent_stack.pop_back();
-            indent_level = std::max(0, indent_level - delta);
-        } else if (is_indent_close(tok.kind)) {
-            if (tok.kind == TokenKind::EndCaseKeyword) {
-                case_depth = std::max(0, case_depth - 1);
-                case_conditional_depth = 0;
-            }
-            int delta = indent_stack.empty() ? 1 : indent_stack.back();
-            if (!indent_stack.empty())
-                indent_stack.pop_back();
-            indent_level = std::max(0, indent_level - delta);
-        } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace) && !brace_stk.empty() &&
-                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint")) {
-            int delta = indent_stack.empty() ? 1 : indent_stack.back();
-            if (!indent_stack.empty())
-                indent_stack.pop_back();
-            indent_level = std::max(0, indent_level - delta);
-        }
-
-        // --- H. Emit the token ---
-        // Tokens are emitted verbatim. emit() prepends the indentation string if at_bol is true.
-        emit(tok.text);
-
-        // --- J. Update bracket/paren/dim depth counters ---
-        // dim_depth tracks `[…]` nesting for array dimensions.
-        // paren_depth tracks `(…)` nesting.
-        // When we see `(` after case/if/for/while, record the depth so we
-        // know which `)` closes the expression.
-        // `;` resets dim_depth because dimensions never span statements.
-        if (tok_is(tok, "[", TokenKind::OpenBracket))
-            ++dim_depth;
-        else if (tok_is(tok, "]", TokenKind::CloseBracket) && dim_depth > 0)
-            --dim_depth;
-        else if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
-            ++paren_depth;
-            paren_stack.push_back(prev ? classify_paren(*prev, prev_at_procedural)
-                                       : ParenKind::Ordinary);
-            for_header_stack.push_back(prev && (prev->kind == TokenKind::ForKeyword ||
-                                                prev->kind == TokenKind::ForeachKeyword));
-            if (!active_macros.empty() && active_macros.back().wait_open && prev &&
-                is_macro_usage(*prev)) {
-                active_macros.back().paren_depth = paren_depth;
-                active_macros.back().wait_open = false;
-            }
-            if (case_expr_pending) {
-                case_expr_depth = paren_depth; // remember which ')' ends the case expr
-                case_expr_pending = false;
-            }
-            if (control_expr_pending) {
-                control_expr_depth = paren_depth; // remember which ')' ends the control expr
-                control_expr_pending = false;
-            }
-        } else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren_depth > 0) {
-            size_t closing_macro_index = active_macros.size();
-            for (size_t mi = active_macros.size(); mi > 0; --mi) {
-                const auto& macro = active_macros[mi - 1];
-                if (!macro.wait_open && macro.paren_depth == paren_depth) {
-                    closing_macro_index = mi - 1;
-                    break;
-                }
-            }
-            if (case_expr_depth == paren_depth) {
-                // Closing `)` of `case (expr)` → next token goes on a new line
-                pending_nl = true;
-                case_expr_depth = -1;
-            }
-            if (control_expr_depth == paren_depth) {
-                // Closing `)` of `if (cond)` / `for (…)` / etc.
-                // → schedule a newline so the body starts on a fresh line.
-                // `if (cond) begin` suppresses this via MustAppend in break_dec.
-                single_stmt_pending = true;
-                pending_nl = true;
-                control_expr_depth = -1;
-            }
-            --paren_depth;
-            if (!paren_stack.empty())
-                paren_stack.pop_back();
-            if (!for_header_stack.empty())
-                for_header_stack.pop_back();
-            if (closing_macro_index < active_macros.size()) {
-                MacroClassification classification =
-                    active_macros[closing_macro_index].classification;
-                active_macros.erase(active_macros.begin() + (ptrdiff_t)closing_macro_index);
-                finish_macro_invocation(classification);
-                if (classification.role == MacroRole::FunctionLikeExpr) {
-                    function_macro_newline_candidate = true;
-                    function_macro_newline_depth = paren_depth;
-                }
-            }
-        } else if (tok_is(tok, ";", TokenKind::Semicolon))
-            dim_depth = 0; // `;` always ends any dimension context
-
-        // --- K. Post-emit housekeeping ---
-        // After emitting a token, update state for the NEXT token:
-        //   • Open new indent levels for indent-opening keywords.
-        //   • Schedule newlines (pending_nl) after block-opening keywords, `;`, etc.
-        //   • Set flags for upcoming special tokens (case expr, control expr, struct).
-        if (tok_is_macro) {
-            if (tok_macro_has_args) {
-                active_macros.push_back({tok_macro_class, true, -1});
-            } else {
-                finish_macro_invocation(tok_macro_class);
-            }
-        } else if (is_keyword(tok)) {
-            // Count `do` depth so `end while` can be recognized as do…while tail.
-            if (tok.kind == TokenKind::DoKeyword)
-                ++do_depth;
-
-            if (tok.kind == TokenKind::ImportKeyword || tok.kind == TokenKind::ExportKeyword)
-                in_import_export_decl = true;
-            if (tok.kind == TokenKind::ExternKeyword)
-                in_extern_decl = true;
-
-            // After `case`/`casex`/`casez`, expect `(expr)`.
-            // When the `)` arrives we'll emit a newline before the case items.
-            if (tok.kind == TokenKind::CaseKeyword || tok.kind == TokenKind::CaseXKeyword ||
-                tok.kind == TokenKind::CaseZKeyword) {
-                case_expr_pending = true;
-                ++case_depth;
-                case_conditional_depth = 0;
-            }
-
-            // After `if`/`for`/`foreach`/`while`/`repeat`, expect `(cond)`.
-            // When the `)` arrives we'll decide single-statement indentation.
-            // `while` that closes a do…while (do_while_tail) is excluded.
-            if (tok.kind == TokenKind::IfKeyword || tok.kind == TokenKind::ForKeyword ||
-                tok.kind == TokenKind::ForeachKeyword ||
-                (tok.kind == TokenKind::WhileKeyword && !do_while_tail) ||
-                tok.kind == TokenKind::RepeatKeyword)
-                control_expr_pending = true;
-
-            // `else` bodies without begin/end should be formatted like other
-            // single-statement control bodies.
-            if (tok.kind == TokenKind::ElseKeyword) {
-                single_stmt_pending = true;
-                pending_nl = true;
-            }
-
-            // `begin` cancels single_stmt_pending set by a preceding if/for/while/else,
-            // because begin…end is its own indented block.
-            if (tok.kind == TokenKind::BeginKeyword)
-                single_stmt_pending = false;
-
-            if (is_constraint_keyword(tok))
-                constraint_pend = true;
-
-            bool import_export_function_or_task = in_import_export_decl &&
-                                                  (tok.kind == TokenKind::FunctionKeyword ||
-                                                   tok.kind == TokenKind::TaskKeyword);
-            bool extern_function_or_task = in_extern_decl &&
-                                           (tok.kind == TokenKind::FunctionKeyword ||
-                                            tok.kind == TokenKind::TaskKeyword);
-            bool typedef_class_forward_decl = tok.kind == TokenKind::ClassKeyword && prev &&
-                                              prev->kind == TokenKind::TypedefKeyword;
-            if (is_indent_open(tok.kind) && !disable_target && !wait_fork_target &&
-                !import_export_function_or_task && !extern_function_or_task &&
-                !typedef_class_forward_decl) {
-                // Keywords that increase indentation for everything inside them.
-                // Outmost design blocks use a configurable delta (default 1);
-                // everything else adds exactly 1 level.
-                int delta = (tok.kind == TokenKind::ModuleKeyword ||
-                             tok.kind == TokenKind::MacromoduleKeyword ||
-                             tok.kind == TokenKind::InterfaceKeyword ||
-                             tok.kind == TokenKind::PackageKeyword)
-                                ? opts.default_indent_level_inside_outmost_block
-                                : 1;
-                indent_level += delta;
-                indent_stack.push_back(delta);
-                // Block-opening keywords (begin, fork, …) also schedule a newline
-                // so the first statement inside appears on the next line.
-                // `case` is handled separately via case_expr_pending.
-                if (is_block_open(tok.kind) && tok.kind != TokenKind::CaseKeyword &&
-                    tok.kind != TokenKind::CaseXKeyword && tok.kind != TokenKind::CaseZKeyword)
-                    pending_nl = true;
-            } else if (is_indent_close(tok.kind)) {
-                // After emitting `end`/`endmodule`/etc. schedule a newline so
-                // the next statement starts on a fresh line.
-                pending_nl = true;
-            } else if (tok.kind == TokenKind::StructKeyword || tok.kind == TokenKind::UnionKeyword) {
-                // Next `{` should be treated as a struct/union brace (indented).
-                struct_pend = true;
-            }
-        } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
-            if (struct_pend || constraint_pend || (constraint_depth > 0 && single_stmt_pending)) {
-                bool is_constraint_brace = constraint_pend || (constraint_depth > 0 && single_stmt_pending);
-                // `{` right after `struct`/`union`, `constraint`, or a constraint
-                // control item body → indent the members inside.
-                brace_stk.push_back(is_constraint_brace ? "constraint" : "struct");
-                pending_nl = true;
-                indent_level += 1;
-                indent_stack.push_back(1);
-                if (is_constraint_brace) {
-                    ++constraint_depth;
-                    constraint_pend = false;
-                    single_stmt_pending = false;
-                }
-            } else {
-                // `{` for concatenation, array literal, etc. → no extra indent.
-                brace_stk.push_back("other");
-            }
-            struct_pend = false;
-        } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace)) {
-            // Pop the brace stack (indent was already decremented in step G).
-            if (!brace_stk.empty()) {
-                if (brace_stk.back() == "constraint") {
-                    constraint_depth = std::max(0, constraint_depth - 1);
-                    pending_nl = true;
-                }
-                brace_stk.pop_back();
-            }
-        } else if (tok_is(tok, ";", TokenKind::Semicolon)) {
-            in_import_export_decl = false;
-            in_extern_decl = false;
-            // Semicolon = end of statement.
-            // At top-level (paren_depth==0) schedule a newline after it.
-            // Inside `for (init; cond; incr)` paren_depth > 0 → no newline.
-            bool in_for_header_now =
-                std::any_of(for_header_stack.begin(), for_header_stack.end(),
-                            [](bool v) { return v; });
-            if (paren_depth == 0 || (case_depth > 0 && !in_for_header_now))
-                pending_nl = true;
-            // If we were in a single-statement body (no begin…end), this `;`
-            // ends it → undo the extra indent level we added.
-            if (single_stmt_active) {
-                indent_level = std::max(0, indent_level - 1);
-                single_stmt_active = false;
-            }
-        } else if (is_line_directive(tok)) {
-            // Compiler directives (`define, `include, `ifdef, …) always end
-            // their logical line → schedule a newline after them.
-            pending_nl = true;
-            if (is_pp_cond_bare(tok.directive_kind) || is_pp_cond_with(tok.directive_kind))
-                in_pp_cond = false;
-        } else if (tok.comment) {
-            // A comment that is followed by a newline in the original whitespace
-            // → schedule a newline (the comment ends the line).
-            if (i + 1 < tokens.size() && tokens[i + 1].whitespace &&
-                tokens[i + 1].text.find('\n') != std::string::npos)
-                pending_nl = true;
-        } else if (tok.kind == TokenKind::Directive) {
-            if (is_pp_cond_bare(tok.directive_kind)) {
-                pending_nl = true;
-                in_pp_cond = false;
-            } else if (is_pp_cond_with(tok.directive_kind)) {
-                in_pp_cond = true;
-            }
-        } else if (is_identifier(tok)) {
-            // Preprocessor condition argument after a split `ifdef-style directive.
-            if (in_pp_cond) {
-                pending_nl = true;
-                in_pp_cond = false;
-            }
-            if (is_macro_usage(tok) && tok.text.find(';') != std::string::npos) {
-                pending_nl = true;
-                if (single_stmt_active) {
-                    indent_level = std::max(0, indent_level - 1);
-                    single_stmt_active = false;
-                }
-            }
-        } else if (in_pp_cond) {
-            // Non-identifier token after a `ifdef-style directive → treat it as
-            // the end of the argument and schedule a newline.
-            pending_nl = true;
-            in_pp_cond = false;
-        }
-
-        if (tok_is(tok, "?", TokenKind::Question) && case_depth > 0 && dim_depth == 0)
-            ++case_conditional_depth;
-        else if (tok_is(tok, ":", TokenKind::Colon) && case_depth > 0 && dim_depth == 0) {
-            if (case_conditional_depth > 0) {
-                --case_conditional_depth;
-            } else if (block_label_state == 0) {
-                pending_nl = false;
-                case_label_pending_nl = true;
-            }
-        } else if (tok_is(tok, ";", TokenKind::Semicolon) || tok.kind == TokenKind::EndCaseKeyword) {
-            case_label_pending_nl = false;
-            case_conditional_depth = 0;
-        } else if (!tok.comment && !tok.whitespace) {
-            case_label_pending_nl = false;
-        }
-
-        // --- Block label post-emit: restore newline after label name ---
-        if (block_label_state == 2 && !tok.whitespace && !tok.comment && tok.text != ":") {
-            pending_nl = true;
-            block_label_state = 0;
-        }
-        if (!tok.whitespace && !tok.comment && is_keyword(tok) &&
-            (tok.kind == TokenKind::BeginKeyword || tok.kind == TokenKind::ForkKeyword ||
-             is_indent_close(tok.kind)) &&
-            !disable_target && !wait_fork_target) {
-            block_label_state = 1;
-        }
-
-        prev_macro_role_valid = tok_is_macro;
-        if (tok_is_macro)
-            prev_macro_role = tok_macro_class.role;
-        prev_at_procedural = tok.text == "@" && prev && is_procedural_event_keyword(*prev);
-        prev = &tok; // remember this token for next iteration's spacing decisions
-        original_newline_before_token = false;
-    } // end main token loop
-
-    // -----------------------------------------------------------------------
-    // STEP 8: Finalize raw output
-    //
-    // If the last token didn't end with a newline, add one.
-    // Collapse multiple trailing newlines to a single one.
-    // -----------------------------------------------------------------------
-    if (!at_bol) {
-        out += '\n';
+    {
+        auto lines = text_to_lines(v2_out);
+        lines = format_class_extends_parameter_pass(std::move(lines), opts);
+        lines = format_portlist_pass(std::move(lines), opts);
+        v2_out = render_lines(lines);
     }
 
-    // Collapse extra trailing newlines to one
-    while (out.size() >= 2 && out[out.size() - 1] == '\n' && out[out.size() - 2] == '\n')
-        out.pop_back();
-    write_log(opts, "main_token_loop_output.sv", out);
+    // -----------------------------------------------------------------------
+    // Line-group alignment passes (v2 bridge — operate on rendered lines)
+    // -----------------------------------------------------------------------
+    {
+        auto lines = text_to_lines(v2_out);
+        if (opts.statement.align)
+            lines = align_assign_pass(std::move(lines), opts);
+        if (opts.var_declaration.align)
+            lines = align_var_pass(std::move(lines), opts);
+        if (opts.port_declaration.align)
+            lines = align_port_pass(std::move(lines), opts);
+        v2_out = render_lines(lines);
+    }
 
     // -----------------------------------------------------------------------
-    // STEP 9: Convert to plain lines and run post-token pipeline.
-    // Post-passes classify lines locally from lexer tokens when needed.
+    // Structural layout passes (v2 bridge — operate on rendered lines)
     // -----------------------------------------------------------------------
-    auto lines = text_to_lines(out);
-    lines = run_post_token_pipeline(std::move(lines), opts);
-    out = render_lines(lines);
+    {
+        auto lines = text_to_lines(v2_out);
+        lines = format_enum_declaration_pass(std::move(lines), opts);
+        lines = format_modport_pass(std::move(lines), opts);
+        if (opts.instance.align)
+            lines = expand_instances_pass(std::move(lines), opts);
+        PPContext pp = build_pp_context(lines);
+        lines = format_pp_conditional_function_calls_pass(std::move(lines), opts, pp);
+        lines = format_multiline_macro_arg_calls_pass(std::move(lines), opts);
+        lines = format_function_calls_pass(std::move(lines), opts);
+        lines = text_to_lines(render_lines(lines));
+        lines = format_covergroup_pass(std::move(lines), opts);
+        lines = format_constraint_dist_pass(std::move(lines), opts);
+        lines = format_function_declaration_pass(std::move(lines), opts);
+        v2_out = render_lines(lines);
+    }
 
     // -----------------------------------------------------------------------
-    // STEP 10: Final newline normalization
-    //
-    // Mirrors Python: result.rstrip('\n') + '\n'
+    // Final line pass: align define continuations
+    // -----------------------------------------------------------------------
+    std::string out;
+    {
+        auto lines = text_to_lines(v2_out);
+        lines = align_define_continuation_pass(std::move(lines), opts);
+        out = render_lines(lines);
+    }
+
+    // -----------------------------------------------------------------------
+    // Final newline normalization: result.rstrip('\n') + '\n'
     // -----------------------------------------------------------------------
     while (!out.empty() && out.back() == '\n')
         out.pop_back();
     out += '\n';
 
     // -----------------------------------------------------------------------
-    // STEP 11: Dual-mode verification (new architecture)
-    {
-        auto tokens_v2 = collect_lexer_tokens(input);
-        pass0_populate_metadata(tokens_v2, input, opts);
-        std::string v2_out = render_tokens(tokens_v2, opts);
-        if (!v2_out.empty() && v2_out.back() != '\n')
-            v2_out += '\n';
-        while (v2_out.size() >= 2 && v2_out[v2_out.size() - 1] == '\n' && v2_out[v2_out.size() - 2] == '\n')
-            v2_out.pop_back();
-        write_log(opts, "pass0_render_output.sv", v2_out);
-    }
-
-    // -----------------------------------------------------------------------
-    // STEP 12: Safe-mode integrity check
-    //
-    // Verify that only whitespace changed.  This is a safety net against
-    // formatter bugs that corrupt code.
+    // Safe-mode integrity check: verify only whitespace changed.
     // -----------------------------------------------------------------------
     verify_safe_mode_unchanged(source, out, opts);
 

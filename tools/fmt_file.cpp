@@ -6,13 +6,11 @@
 #include "config.hpp"
 
 int main(int argc, char* argv[]) {
-    bool log = false;
     const char* log_path = nullptr;
     const char* path = nullptr;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log") {
-            log = true;
             if (i + 1 >= argc) {
                 std::cerr << "Usage: lazyverilog-fmt [--log <log-dir>] <file>\n";
                 return 1;
@@ -37,7 +35,6 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
-    opts.debug_main_token_loop = log;
     if (log_path)
         opts.log_path = log_path;
     try {

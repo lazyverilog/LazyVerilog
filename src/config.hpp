@@ -160,7 +160,6 @@ struct FormatOptions {
     bool tab_align{false};
     bool enable_format_on_save{false};
     bool safe_mode{false};
-    bool debug_main_token_loop{false};
     std::string log_path;
     StatementOptions statement;
     PortDeclarationOptions port_declaration;
