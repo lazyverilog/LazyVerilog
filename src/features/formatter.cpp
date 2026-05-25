@@ -6092,91 +6092,26 @@ static std::vector<size_t> tok_line_starts(const std::vector<Tok>& tokens) {
 }
 
 // ---------------------------------------------------------------------------
-// split_semicolon_statements_pass_v2 — token-metadata version
-// ---------------------------------------------------------------------------
-static void split_semicolon_statements_pass_v2(std::vector<Tok>& tokens) {
-    int paren = 0;
-    int bracket = 0;
-    int brace = 0;
-    bool line_has_pp = false;
-    bool line_has_backslash = false;
-
-    // Pre-scan: check if first logical line has pp conditional or backslash
-    for (size_t i = 0; i < tokens.size() && !(i > 0 && tokens[i].fmt_newline_before && !tok_whitespace(tokens[i])); ++i) {
-        if (tok_whitespace(tokens[i]))
-            continue;
-        if ((tok_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i]))) ||
-            is_pp_conditional_text(tok_text(tokens[i])))
-            line_has_pp = true;
-        if (!tok_text(tokens[i]).empty() && tok_text(tokens[i]).back() == '\\')
-            line_has_backslash = true;
-    }
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        auto& tok = tokens[i];
-
-        // Reset per-line state at logical line boundaries
-        if (tok.fmt_newline_before && !tok_whitespace(tok) && i > 0) {
-            paren = 0;
-            bracket = 0;
-            brace = 0;
-            line_has_pp = false;
-            line_has_backslash = false;
-            // Scan this logical line for pp conditionals and backslash
-            for (size_t j = i; j < tokens.size(); ++j) {
-                if (j > i && tokens[j].fmt_newline_before && !tok_whitespace(tokens[j]))
-                    break;
-                if (tok_whitespace(tokens[j]))
-                    continue;
-                if ((tok_directive(tokens[j]) && is_pp_conditional(tok_directive_kind(tokens[j]))) ||
-                    is_pp_conditional_text(tok_text(tokens[j])))
-                    line_has_pp = true;
-                if (!tok_text(tokens[j]).empty() && tok_text(tokens[j]).back() == '\\')
-                    line_has_backslash = true;
-            }
-        }
-
-        if (tok.fmt_disabled || tok.fmt_passthrough || tok_whitespace(tok))
-            continue;
-
-        if (line_has_pp || line_has_backslash)
-            continue;
-
-        // Track nesting
-        if (tok_is(tok, "(", TokenKind::OpenParenthesis))
-            ++paren;
-        else if (tok_is(tok, ")", TokenKind::CloseParenthesis) && paren > 0)
-            --paren;
-        else if (tok_is(tok, "[", TokenKind::OpenBracket))
-            ++bracket;
-        else if (tok_is(tok, "]", TokenKind::CloseBracket) && bracket > 0)
-            --bracket;
-        else if (tok_is(tok, "{", TokenKind::OpenBrace))
-            ++brace;
-        else if (tok_is(tok, "}", TokenKind::CloseBrace) && brace > 0)
-            --brace;
-
-        if (paren == 0 && bracket == 0 && brace == 0 &&
-            tok_is(tok, ";", TokenKind::Semicolon)) {
-            // Find next significant token on the same logical line
-            for (size_t j = i + 1; j < tokens.size(); ++j) {
-                if (tokens[j].fmt_newline_before && !tok_whitespace(tokens[j]))
-                    break; // different logical line — nothing to split
-                if (tok_whitespace(tokens[j]) || tokens[j].fmt_disabled || tokens[j].fmt_passthrough)
-                    continue;
-                if (tok_comment(tokens[j]))
-                    break; // trailing comment — don't split
-                // Found code after `;` on same line — split it
-                tokens[j].fmt_newline_before = true;
-                tokens[j].fmt_indent = tok.fmt_indent;
-                break;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // align_define_continuation_pass_v2 — token-metadata version
+//
+// Aligns trailing continuation backslashes for consecutive macro/body lines.
+// The pass only changes fmt_text_override for the token that owns the trailing
+// '\'; it does not create/remove lines or reindent the macro body.
+//
+// Example:
+//
+//   `define FOO(a) a = 1; \
+//     b = 2; \
+//     long_name = 3
+//
+// becomes:
+//
+//   `define FOO(a) a = 1; \
+//     b = 2;              \
+//     long_name = 3
+//
+// The target backslash column is max(content width before '\') + 1, optionally
+// snapped to the indent grid when tab_align is enabled.
 // ---------------------------------------------------------------------------
 static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
                                                const FormatOptions& opts) {
@@ -9184,8 +9119,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     write_log(opts, "00_input.sv", input);
     basic_formatting(tokens, input, opts);
     write_log(opts, "01_basic_formatting.sv", render_tokens(tokens, opts));
-    split_semicolon_statements_pass_v2(tokens);
-    write_log(opts, "02_split_semicolon_statements_pass.sv", render_tokens(tokens, opts));
     align_define_continuation_pass_v2(tokens, opts);
     write_log(opts, "03_align_define_continuation_pass.sv", render_tokens(tokens, opts));
 
