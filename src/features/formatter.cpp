@@ -764,7 +764,15 @@ static bool binary_space_after(const std::string& mode) {
     return mode == "after" || mode == "both";
 }
 
-enum class ParenKind { Ordinary, FunctionCall, EventControl };
+enum class ParenKind {
+    Ordinary,
+    FunctionCall,
+    EventControl,
+    InstantiationParamList,
+    InstantiationParamConnection,
+    InstantiationPortList,
+    InstantiationPortConnection
+};
 
 static ParenKind classify_paren(const Tok& L, bool procedural_at = false) {
     if (tok_text(L) == "@")
@@ -937,6 +945,8 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
     if (tok_comment(R))
         return 1;
     if (lx == "(") {
+        if (paren_kind == ParenKind::InstantiationPortList)
+            return 0;
         if (paren_kind == ParenKind::EventControl)
             return sp.space_inside_event_control_parens ? 1 : 0;
         if (paren_kind == ParenKind::Ordinary)
@@ -944,6 +954,8 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
         return 0;
     }
     if (rx == ")") {
+        if (paren_kind == ParenKind::InstantiationPortList)
+            return 0;
         if (paren_kind == ParenKind::EventControl)
             return sp.space_inside_event_control_parens ? 1 : 0;
         if (paren_kind == ParenKind::Ordinary)
@@ -7362,6 +7374,167 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
             at_bol = true;
         }
     };
+    auto matching_open_paren = [&](size_t close_idx) -> size_t {
+        int depth = 0;
+        for (size_t n = close_idx + 1; n > 0; --n) {
+            size_t idx = n - 1;
+            if (tok_whitespace(tokens[idx]) || tok_comment(tokens[idx]) || tok_directive(tokens[idx]))
+                continue;
+            if (tok_is(tokens[idx], ")", TokenKind::CloseParenthesis))
+                ++depth;
+            else if (tok_is(tokens[idx], "(", TokenKind::OpenParenthesis) && --depth == 0)
+                return idx;
+        }
+        return SIZE_MAX;
+    };
+    auto instance_name_before_port_open = [&](size_t open_idx) -> size_t {
+        size_t prev_sig = prev_code_sig(tokens, 0, open_idx);
+        if (prev_sig == SIZE_MAX)
+            return SIZE_MAX;
+        if (is_identifier(tokens[prev_sig]))
+            return prev_sig;
+        if (!tok_is(tokens[prev_sig], "]", TokenKind::CloseBracket))
+            return SIZE_MAX;
+
+        int depth = 0;
+        for (size_t n = prev_sig + 1; n > 0; --n) {
+            size_t idx = n - 1;
+            if (tok_whitespace(tokens[idx]) || tok_comment(tokens[idx]) || tok_directive(tokens[idx]))
+                continue;
+            if (tok_is(tokens[idx], "]", TokenKind::CloseBracket))
+                ++depth;
+            else if (tok_is(tokens[idx], "[", TokenKind::OpenBracket) && --depth == 0)
+                return prev_code_sig(tokens, 0, idx);
+        }
+        return SIZE_MAX;
+    };
+    auto paren_list_has_top_level_named_connections = [&](size_t open_idx, size_t close_idx) -> bool {
+        bool saw_named_connection = false;
+        bool expect_item_start = true;
+        int paren = 0, bracket = 0, brace = 0;
+        for (size_t idx = open_idx + 1; idx < close_idx && idx < tokens.size(); ++idx) {
+            if (tok_whitespace(tokens[idx]) || tok_comment(tokens[idx]) || tok_directive(tokens[idx]))
+                continue;
+            if (tok_is(tokens[idx], "(", TokenKind::OpenParenthesis)) {
+                ++paren;
+                continue;
+            }
+            if (tok_is(tokens[idx], ")", TokenKind::CloseParenthesis) && paren > 0) {
+                --paren;
+                continue;
+            }
+            if (tok_is(tokens[idx], "[", TokenKind::OpenBracket)) {
+                ++bracket;
+                continue;
+            }
+            if (tok_is(tokens[idx], "]", TokenKind::CloseBracket) && bracket > 0) {
+                --bracket;
+                continue;
+            }
+            if (tok_is(tokens[idx], "{", TokenKind::OpenBrace)) {
+                ++brace;
+                continue;
+            }
+            if (tok_is(tokens[idx], "}", TokenKind::CloseBrace) && brace > 0) {
+                --brace;
+                continue;
+            }
+            if (paren == 0 && bracket == 0 && brace == 0 && tok_is(tokens[idx], ",", TokenKind::Comma)) {
+                expect_item_start = true;
+                continue;
+            }
+            if (paren == 0 && bracket == 0 && brace == 0 && expect_item_start) {
+                if (!tok_is(tokens[idx], ".", TokenKind::Dot))
+                    return false;
+                saw_named_connection = true;
+                expect_item_start = false;
+            }
+        }
+        return saw_named_connection;
+    };
+    auto is_instantiation_port_list_open = [&](size_t open_idx) -> bool {
+        size_t close_idx = matching_close_paren(tokens, open_idx, tokens.size());
+        if (close_idx == SIZE_MAX)
+            return false;
+        if (!paren_list_has_top_level_named_connections(open_idx, close_idx))
+            return false;
+        size_t semi = next_code_sig(tokens, close_idx + 1, tokens.size());
+        if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon))
+            return false;
+
+        size_t inst_name = instance_name_before_port_open(open_idx);
+        if (inst_name == SIZE_MAX || !is_identifier(tokens[inst_name]) || is_keyword(tokens[inst_name]))
+            return false;
+
+        size_t before_inst = prev_code_sig(tokens, 0, inst_name);
+        if (before_inst == SIZE_MAX)
+            return false;
+        if (is_identifier(tokens[before_inst]) && !is_keyword(tokens[before_inst]))
+            return true;
+        if (!tok_is(tokens[before_inst], ")", TokenKind::CloseParenthesis))
+            return false;
+
+        size_t param_open = matching_open_paren(before_inst);
+        if (param_open == SIZE_MAX)
+            return false;
+        size_t hash = prev_code_sig(tokens, 0, param_open);
+        if (hash == SIZE_MAX || !tok_is(tokens[hash], "#", TokenKind::Hash))
+            return false;
+        size_t mod = prev_code_sig(tokens, 0, hash);
+        return mod != SIZE_MAX && is_identifier(tokens[mod]) && !is_keyword(tokens[mod]);
+    };
+    auto is_instantiation_param_list_open = [&](size_t open_idx) -> bool {
+        size_t hash = prev_code_sig(tokens, 0, open_idx);
+        if (hash == SIZE_MAX || !tok_is(tokens[hash], "#", TokenKind::Hash))
+            return false;
+        size_t mod = prev_code_sig(tokens, 0, hash);
+        if (mod == SIZE_MAX || !is_identifier(tokens[mod]) || is_keyword(tokens[mod]))
+            return false;
+
+        size_t param_close = matching_close_paren(tokens, open_idx, tokens.size());
+        if (param_close == SIZE_MAX)
+            return false;
+        if (!paren_list_has_top_level_named_connections(open_idx, param_close))
+            return false;
+        size_t inst_name = next_code_sig(tokens, param_close + 1, tokens.size());
+        if (inst_name == SIZE_MAX || !is_identifier(tokens[inst_name]))
+            return false;
+        size_t port_open = next_code_sig(tokens, inst_name + 1, tokens.size());
+        while (port_open != SIZE_MAX && tok_is(tokens[port_open], "[", TokenKind::OpenBracket)) {
+            int depth = 1;
+            size_t j = port_open;
+            while (++j < tokens.size() && depth > 0) {
+                if (tok_is(tokens[j], "[", TokenKind::OpenBracket))
+                    ++depth;
+                else if (tok_is(tokens[j], "]", TokenKind::CloseBracket))
+                    --depth;
+            }
+            port_open = next_code_sig(tokens, j + 1, tokens.size());
+        }
+        return port_open != SIZE_MAX && tok_is(tokens[port_open], "(", TokenKind::OpenParenthesis) &&
+               is_instantiation_port_list_open(port_open);
+    };
+    auto classify_paren_at = [&](size_t open_idx, bool procedural_at_context) -> ParenKind {
+        size_t prev_sig = prev_code_sig(tokens, 0, open_idx);
+        if (prev_sig == SIZE_MAX)
+            return ParenKind::Ordinary;
+        const Tok& left = tokens[prev_sig];
+
+        if (tok_is(left, "#", TokenKind::Hash) && is_instantiation_param_list_open(open_idx))
+            return ParenKind::InstantiationParamList;
+        if (is_instantiation_port_list_open(open_idx))
+            return ParenKind::InstantiationPortList;
+        if (is_identifier(left) && !paren_stack.empty()) {
+            size_t before_name = prev_code_sig(tokens, 0, prev_sig);
+            if (before_name != SIZE_MAX && tok_text(tokens[before_name]) == ".") {
+                if (paren_stack.back() == ParenKind::InstantiationParamList)
+                    return ParenKind::InstantiationParamConnection;
+                if (paren_stack.back() == ParenKind::InstantiationPortList)
+                    return ParenKind::InstantiationPortConnection;
+            }
+        }
+        return classify_paren(left, procedural_at_context);
+    };
 
     // -----------------------------------------------------------------------
     // Main token loop
@@ -7469,8 +7642,9 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
         if (tok_whitespace(tok)) {
             // Whitespace tokens are not emitted directly unless passthrough is
             // active.  Convert their newline count into deferred layout state.
-            // Newlines inside parentheses are ignored here because expression
-            // wrapping/alignment is handled by later passes.
+            // Original newlines inside parentheses are ignored here; pass0 and
+            // later structural passes decide which paren contexts should wrap
+            // (for example function calls and instantiation port lists).
             int nl = (int)std::count(tok_text(tok).begin(), tok_text(tok).end(), '\n');
             original_newline_before_token = nl > 0;
             if (after_dis && nl >= 1)
@@ -7539,7 +7713,11 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
         // --- C. Decide spacing and line-break ---
         // Compute local context for the pair (prev, tok), then delegate the
         // ordinary spacing/wrapping policy to spaces_req() and break_dec().
-        // Special constructs below can override that baseline decision.
+        // ParenKind is the important extra context here: the same raw tokens
+        // "(" / ")" can mean ordinary expression grouping, a function call,
+        // event control, instantiation parameter overrides, instantiation port
+        // lists, or individual named connections inside those lists.  Special
+        // constructs below can override the generic baseline decision.
         bool in_dim = dim_depth > 0;
         bool in_for_header =
             std::any_of(for_header_stack.begin(), for_header_stack.end(), [](bool v) { return v; });
@@ -7547,16 +7725,55 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
                                       (tok_text(*prev) == "@" && prev_at_procedural));
         ParenKind paren_kind = ParenKind::Ordinary;
         if (prev && (tok_text(*prev) == "(" || tok_is(tok, ")", TokenKind::CloseParenthesis))) {
+            // For the first token after "(", and for the matching ")", use the
+            // currently-open paren context.  This is how spacing/wrapping knows
+            // whether it is inside an instantiation port list versus a normal
+            // function call.
             if (!paren_stack.empty())
                 paren_kind = paren_stack.back();
         } else if (prev && tok_is(tok, "(", TokenKind::OpenParenthesis))
-            paren_kind = classify_paren(*prev, procedural_at);
+            // For an opening "(", classify the paren before it is pushed below
+            // so the pairwise spacing decision for "prev (" can use the new
+            // context immediately.
+            paren_kind = classify_paren_at(i, procedural_at);
         int spaces = 0;
         SD dec = SD::Undecided;
         if (prev) {
             spaces = spaces_req(*prev, tok, opts, in_dim, in_for_header, !paren_stack.empty(),
                                 paren_kind, procedural_at);
             dec = break_dec(*prev, tok, opts, in_dim);
+        }
+        if (paren_kind == ParenKind::InstantiationPortList && prev &&
+            tok_is(*prev, "(", TokenKind::OpenParenthesis) && !tok_comment(tok)) {
+            // Start the first real port entry on a new line after the instance
+            // port-list "(".  Inline comments immediately after "(" are
+            // intentionally excluded so headers like "u_mem ( // comment" are
+            // preserved on one line.
+            //
+            //   memory u_mem (        ->  memory u_mem (
+            //       .a(a)                         .a(a)
+            //
+            // but:
+            //
+            //   memory u_mem ( // keep this comment on the header line
+            dec = SD::MustWrap;
+        }
+        if (paren_kind == ParenKind::InstantiationPortList &&
+            tok_is(tok, ")", TokenKind::CloseParenthesis)) {
+            // Do not insert padding before the closing ")" of an instantiation
+            // port list; the close line should render as ")" followed directly
+            // by the semicolon spacing handled by the next token.
+            //
+            //   memory u_mem (
+            //       .a(a)
+            //   );
+            //
+            // not:
+            //
+            //   memory u_mem (
+            //       .a(a)
+            //    );
+            spaces = 0;
         }
         if (prev_macro_role_valid && tok.kind == TokenKind::ElseKeyword &&
             prev_macro_role == MacroRole::BlockEndLike)
@@ -7710,15 +7927,16 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
         // --- J. Update bracket/paren/dim depth counters ---
         // Update grouping state after annotating the current token.  This makes
         // an opening token use the outer indentation/context, while following
-        // tokens see the inner context.
+        // tokens see the inner context.  paren_stack stores the classified
+        // ParenKind for each open "(", including instantiation-specific kinds
+        // needed by later comma and close-paren handling.
         if (tok_is(tok, "[", TokenKind::OpenBracket))
             ++dim_depth;
         else if (tok_is(tok, "]", TokenKind::CloseBracket) && dim_depth > 0)
             --dim_depth;
         else if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
             ++paren_depth;
-            paren_stack.push_back(prev ? classify_paren(*prev, prev_at_procedural)
-                                       : ParenKind::Ordinary);
+            paren_stack.push_back(classify_paren_at(i, prev_at_procedural));
             for_header_stack.push_back(prev && (prev->kind == TokenKind::ForKeyword ||
                                                 prev->kind == TokenKind::ForeachKeyword));
             if (!active_macros.empty() && active_macros.back().wait_open && prev &&
@@ -7876,6 +8094,26 @@ static void pass0_populate_metadata(std::vector<Tok>& tokens, const std::string&
                 indent_level = std::max(0, indent_level - 1);
                 single_stmt_active = false;
             }
+        } else if (tok_is(tok, ",", TokenKind::Comma) && prev &&
+                   tok_is(*prev, ")", TokenKind::CloseParenthesis) &&
+                   !paren_stack.empty() &&
+                   paren_stack.back() == ParenKind::InstantiationPortList) {
+            // A comma after a named instantiation port connection terminates the
+            // current port item.  Schedule a newline for the following token.
+            // If that following token is an inline comment, the inline-comment
+            // suppression above keeps it attached to the comma line; otherwise
+            // the next .port entry starts on a new line.
+            //
+            //   .a(a), .b(b)          ->  .a(a),
+            //                              .b(b)
+            //
+            //   .a(a), // comment     ->  .a(a), // comment
+            //   .b(b)                     .b(b)
+            //
+            //   .a(a),                ->  .a(a),
+            //   // comment                // comment
+            //   .b(b)                     .b(b)
+            pending_nl = true;
         } else if (is_line_directive(tok)) {
             pending_nl = true;
             if (is_pp_cond_bare(tok_directive_kind(tok)) || is_pp_cond_with(tok_directive_kind(tok)))
