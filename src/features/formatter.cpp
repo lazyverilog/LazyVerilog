@@ -7535,6 +7535,36 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         }
         return classify_paren(left, procedural_at_context);
     };
+    auto is_user_type_packed_dimension_open = [&](size_t open_idx) -> bool {
+        size_t type_idx = prev_code_sig(tokens, 0, open_idx);
+        if (type_idx == SIZE_MAX || !is_identifier(tokens[type_idx]) || is_keyword(tokens[type_idx]))
+            return false;
+
+        int bracket_depth = 0;
+        size_t close_idx = SIZE_MAX;
+        for (size_t j = open_idx; j < tokens.size(); ++j) {
+            if (tok_whitespace(tokens[j]) || tok_comment(tokens[j]) || tok_directive(tokens[j]))
+                continue;
+            if (tok_is(tokens[j], "[", TokenKind::OpenBracket)) {
+                ++bracket_depth;
+            } else if (tok_is(tokens[j], "]", TokenKind::CloseBracket)) {
+                if (bracket_depth > 0)
+                    --bracket_depth;
+                if (bracket_depth == 0) {
+                    close_idx = j;
+                    break;
+                }
+            } else if (tok_is(tokens[j], ";", TokenKind::Semicolon)) {
+                return false;
+            }
+        }
+        if (close_idx == SIZE_MAX)
+            return false;
+
+        size_t after_dim = next_code_sig(tokens, close_idx + 1, tokens.size());
+        return after_dim != SIZE_MAX && is_identifier(tokens[after_dim]) &&
+               !is_keyword(tokens[after_dim]);
+    };
 
     // -----------------------------------------------------------------------
     // Main token loop
@@ -7775,6 +7805,10 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             //    );
             dec = SD::MustWrap;
             spaces = 0;
+        }
+        if (prev && tok_is(tok, "[", TokenKind::OpenBracket) &&
+            is_user_type_packed_dimension_open(i)) {
+            spaces = 1;
         }
         if (prev_macro_role_valid && tok.kind == TokenKind::ElseKeyword &&
             prev_macro_role == MacroRole::BlockEndLike)
@@ -9147,7 +9181,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
 
     auto tokens = collect_lexer_tokens(input);
 
-    write_log(opts, "00_input.sv", render_tokens(tokens, opts));
+    write_log(opts, "00_input.sv", input);
     basic_formatting(tokens, input, opts);
     write_log(opts, "01_basic_formatting.sv", render_tokens(tokens, opts));
     split_semicolon_statements_pass_v2(tokens);
