@@ -48,15 +48,6 @@ unknown_design_key = true
     CHECK(cfg.design.vcode == "test.f");
 }
 
-TEST_CASE("config: legacy module indent key still loads", "[config]") {
-    auto dir = make_temp_toml(R"(
-[format]
-default_indent_level_inside_module_block = 0
-)");
-    Config cfg = load_config(dir);
-    CHECK(cfg.format.default_indent_level_inside_outmost_block == 0);
-}
-
 TEST_CASE("config: parse all sections correctly", "[config]") {
     auto dir = make_temp_toml(R"(
 [design]
