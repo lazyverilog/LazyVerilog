@@ -6332,6 +6332,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         int lhs_inline_width;   // inline width from first_sig to just before assign_op
         bool empty;             // no significant tokens
         bool prev_starts_for;   // previous line starts with ForKeyword
+        bool in_enum;           // line is inside an enum { } body
     };
 
     std::vector<Line> lines;
@@ -6341,11 +6342,13 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
     // non-ws token.
     bool next_is_line_start = true;
     size_t cur_line_first_sig = SIZE_MAX;
+    bool align_pending_enum_brace = false;
+    std::vector<bool> align_brace_is_enum;
 
     auto finalize_line = [&](size_t end_idx) {
         if (cur_line_first_sig == SIZE_MAX) {
             // empty line
-            lines.push_back({SIZE_MAX, end_idx, 0, false, false, false, false, SIZE_MAX, 0, true, false});
+            lines.push_back({SIZE_MAX, end_idx, 0, false, false, false, false, SIZE_MAX, 0, true, false, false});
             return;
         }
         Line ln{};
@@ -6355,6 +6358,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         ln.disabled = false;
         ln.has_pp_cond = false;
         ln.empty = false;
+        ln.in_enum = !align_brace_is_enum.empty() && align_brace_is_enum.back();
 
         // Scan tokens on this line
         std::vector<size_t> sig_indices;
@@ -6537,6 +6541,16 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         }
         if (cur_line_first_sig == SIZE_MAX)
             cur_line_first_sig = i;
+        // Track enum brace nesting so finalize_line can mark enum-body lines
+        if (tok.kind == TokenKind::EnumKeyword) {
+            align_pending_enum_brace = true;
+        } else if (tok_is(tok, "{", TokenKind::OpenBrace)) {
+            align_brace_is_enum.push_back(align_pending_enum_brace);
+            align_pending_enum_brace = false;
+        } else if (tok_is(tok, "}", TokenKind::CloseBrace)) {
+            if (!align_brace_is_enum.empty())
+                align_brace_is_enum.pop_back();
+        }
     }
     // Finalize last line
     if (cur_line_first_sig != SIZE_MAX)
@@ -6555,7 +6569,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
     while (li < lines.size()) {
         const auto& ln = lines[li];
         if (ln.empty || ln.disabled || ln.has_pp_cond || ln.is_var ||
-            ln.is_module_header_param || ln.assign_op_idx == SIZE_MAX) {
+            ln.is_module_header_param || ln.assign_op_idx == SIZE_MAX || ln.in_enum) {
             ++li;
             continue;
         }
@@ -7284,6 +7298,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
     // next "{" opens such a block; constraint_depth also handles nested
     // constraint single-statement bodies.
     bool struct_pend = false;
+    bool enum_pend = false;
     bool constraint_pend = false;
     int constraint_depth = 0;
 
@@ -8009,7 +8024,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 indent_stack.pop_back();
             indent_level = std::max(0, indent_level - delta);
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace) && !brace_stk.empty() &&
-                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint")) {
+                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint" || brace_stk.back() == "enum")) {
             int delta = indent_stack.empty() ? 1 : indent_stack.back();
             if (!indent_stack.empty())
                 indent_stack.pop_back();
@@ -8172,11 +8187,14 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 pending_nl = true;
             } else if (tok.kind == TokenKind::StructKeyword || tok.kind == TokenKind::UnionKeyword) {
                 struct_pend = true;
+            } else if (tok.kind == TokenKind::EnumKeyword) {
+                enum_pend = true;
             }
         } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
-            if (struct_pend || constraint_pend || (constraint_depth > 0 && single_stmt_pending)) {
+            if (struct_pend || enum_pend || constraint_pend || (constraint_depth > 0 && single_stmt_pending)) {
                 bool is_constraint_brace = constraint_pend || (constraint_depth > 0 && single_stmt_pending);
-                brace_stk.push_back(is_constraint_brace ? "constraint" : "struct");
+                bool is_enum_brace = enum_pend && !is_constraint_brace;
+                brace_stk.push_back(is_constraint_brace ? "constraint" : (is_enum_brace ? "enum" : "struct"));
                 pending_nl = true;
                 indent_level += 1;
                 indent_stack.push_back(1);
@@ -8189,11 +8207,15 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 brace_stk.push_back("other");
             }
             struct_pend = false;
+            enum_pend = false;
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace)) {
             if (!brace_stk.empty()) {
                 if (brace_stk.back() == "constraint") {
                     constraint_depth = std::max(0, constraint_depth - 1);
                     pending_nl = true;
+                } else if (brace_stk.back() == "enum") {
+                    tok.fmt_newline_before = true;
+                    tok.fmt_blank_lines = 0;
                 }
                 brace_stk.pop_back();
             }
@@ -8228,6 +8250,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             //   .a(a),                ->  .a(a),
             //   // comment                // comment
             //   .b(b)                     .b(b)
+            pending_nl = true;
+        } else if (tok_is(tok, ",", TokenKind::Comma) && !brace_stk.empty() && brace_stk.back() == "enum") {
             pending_nl = true;
         } else if (is_line_directive(tok)) {
             pending_nl = true;
@@ -8593,7 +8617,63 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
             trail_widths[slot] = tab_aligned_width(std::max(s5_min, max_tr), opts);
         }
 
-        for (auto& e : blk) {
+        // In adaptive mode, pre-compute per-line per-slot id widths so that the
+        // absolute comma column aligns across all lines in the block, even though
+        // each line's s1/s2/s3 sections may be different widths.
+        // We do this slot-by-slot: for each slot, track each line's current column
+        // (cur_start), find the global max comma column, assign adjusted widths,
+        // then advance cur_start past this slot using block-wide trail_widths.
+        std::vector<std::vector<int>> adaptive_id_widths;
+        if (opts.port_declaration.align_adaptive) {
+            adaptive_id_widths.resize(blk.size());
+            // Compute per-line e3 (column where name section starts)
+            std::vector<int> cur_start(blk.size(), 0);
+            for (size_t bi = 0; bi < blk.size(); ++bi) {
+                const auto& pp = blk[bi].parsed;
+                if (!pp.valid) continue;
+                std::string tp = pp.dtype + (pp.qualifier.empty() ? "" : " " + pp.qualifier);
+                int t1 = pd_s1_min;
+                int t2 = t1 + (s2 > 0 ? pd_s2_min : 0);
+                int t3 = t2 + (s3 > 0 ? pd_s3_min : 0);
+                int e1 = tab_aligned_width(std::max(t1, (int)pp.direction.size() + 1), opts);
+                int e2 = e1;
+                if (s2 > 0) {
+                    int c2 = tp.empty() ? 0 : (int)tp.size() + 1;
+                    e2 = tab_aligned_width(std::max(t2, e1 + c2), opts);
+                }
+                int e3 = e2;
+                if (s3 > 0) {
+                    int c3 = pp.dim.empty() ? 0 : (int)pp.dim.size() + 1;
+                    e3 = tab_aligned_width(std::max(t3, e2 + c3), opts);
+                }
+                cur_start[bi] = e3;
+            }
+            // Slot-by-slot: align comma columns using each slot's actual start column
+            for (size_t slot = 0; slot < max_slots; ++slot) {
+                int global_end = 0;
+                for (size_t bi = 0; bi < blk.size(); ++bi) {
+                    const auto& pp = blk[bi].parsed;
+                    if (!pp.valid || slot >= pp.names.size()) continue;
+                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)pp.names[slot].first.size() + 1), opts);
+                    global_end = std::max(global_end, cur_start[bi] + nw);
+                }
+                for (size_t bi = 0; bi < blk.size(); ++bi) {
+                    const auto& pp = blk[bi].parsed;
+                    if (!pp.valid || slot >= pp.names.size()) {
+                        adaptive_id_widths[bi].push_back(0);
+                        continue;
+                    }
+                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)pp.names[slot].first.size() + 1), opts);
+                    int aw = global_end > cur_start[bi] ? std::max(nw, global_end - cur_start[bi]) : nw;
+                    adaptive_id_widths[bi].push_back(aw);
+                    // Advance past this slot: id_width + trail_width + ", " separator
+                    cur_start[bi] += aw + trail_widths[slot] + 2;
+                }
+            }
+        }
+
+        for (size_t bi = 0; bi < blk.size(); ++bi) {
+            auto& e = blk[bi];
             const auto& pp = e.parsed;
             if (!pp.valid) {
                 out.push_back(e.orig);
@@ -8619,12 +8699,10 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
                     int e3 = tab_aligned_width(std::max(t3, e2 + c3), opts);
                     line_s3 = e3 - e2;
                 }
-                line_id_widths.clear();
-                line_trail_widths.clear();
-                for (const auto& [nm, tr] : pp.names) {
-                    line_id_widths.push_back(tab_aligned_width(std::max(pd_s4_min, (int)nm.size() + 1), opts));
-                    line_trail_widths.push_back(tab_aligned_width(std::max(s5_min, (int)tr.size()), opts));
-                }
+                // Use pre-computed slot-aligned id widths; keep block-wide trail widths
+                if (bi < adaptive_id_widths.size())
+                    line_id_widths = adaptive_id_widths[bi];
+                line_trail_widths = trail_widths;
             }
 
             std::string line = pp.indent;
