@@ -75,12 +75,13 @@ struct TokLexeme {
     bool whitespace{false};
     bool comment{false};
     bool directive{false};
+    bool define_block{false};
     syntax::SyntaxKind directive_kind{syntax::SyntaxKind::Unknown};
 };
 
 struct Tok {
-    // Lexical identity is immutable after token collection.  Formatting passes may
-    // only update fmt_* metadata or fmt_text_override for emitted text.
+    // Lexical identity is immutable after token collection. Formatting passes may
+    // only update fmt_* metadata; token text itself is never rewritten.
     std::shared_ptr<const TokLexeme> lex;
     TokenKind kind{TokenKind::Unknown};
 
@@ -91,11 +92,10 @@ struct Tok {
     int fmt_blank_lines{0};       // blank lines before this token (after newline)
     bool fmt_disabled{false};     // inside verilog_format:off region (verbatim)
     bool fmt_passthrough{false};  // whitespace-sensitive macro (verbatim)
-    std::string fmt_text_override; // emitted spelling override, lexical text stays immutable
 };
 
 static const std::string& tok_text(const Tok& tok) {
-    return tok.fmt_text_override.empty() ? tok.lex->text : tok.fmt_text_override;
+    return tok.lex->text;
 }
 static const std::string& tok_lex_text(const Tok& tok) { return tok.lex->text; }
 static const std::string& tok_lo(const Tok& tok) { return tok.lex->lo; }
@@ -103,8 +103,8 @@ static int tok_pos(const Tok& tok) { return tok.lex->pos; }
 static bool tok_whitespace(const Tok& tok) { return tok.lex->whitespace; }
 static bool tok_comment(const Tok& tok) { return tok.lex->comment; }
 static bool tok_directive(const Tok& tok) { return tok.lex->directive; }
+static bool tok_define_block(const Tok& tok) { return tok.lex->define_block; }
 static syntax::SyntaxKind tok_directive_kind(const Tok& tok) { return tok.lex->directive_kind; }
-static void tok_set_formatted_text(Tok& tok, std::string text) { tok.fmt_text_override = std::move(text); }
 
 static std::vector<Tok> collect_lexer_tokens(const std::string& source);
 static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOptions& opts);
@@ -1132,7 +1132,8 @@ static SD break_dec(const Tok& L, const Tok& R, const FormatOptions& opts, bool 
 
 static void push_tok(std::vector<Tok>& toks, TokenKind kind, std::string text, int pos,
                      bool whitespace = false, bool comment = false, bool directive = false,
-                     syntax::SyntaxKind directive_kind = syntax::SyntaxKind::Unknown) {
+                     syntax::SyntaxKind directive_kind = syntax::SyntaxKind::Unknown,
+                     bool define_block = false) {
     auto lex = std::make_shared<TokLexeme>();
     lex->kind = kind;
     lex->lo = lower(text);
@@ -1141,6 +1142,7 @@ static void push_tok(std::vector<Tok>& toks, TokenKind kind, std::string text, i
     lex->whitespace = whitespace;
     lex->comment = comment;
     lex->directive = directive;
+    lex->define_block = define_block;
     lex->directive_kind = directive_kind;
     Tok t;
     t.lex = std::move(lex);
@@ -1183,37 +1185,51 @@ static TokenKind single_punct_token_kind(char ch) {
     }
 }
 
+// Mini-lexer: scans source[start..end] and appends typed Tok entries to toks.
+// define_block: true when scanning inside a `define body — changes backtick handling.
+// define_directive_kind: SyntaxKind to attach to a `define directive token found in a define block.
 static void append_trivia_text(std::vector<Tok>& toks, const std::string& source, size_t start,
-                               size_t end) {
+                               size_t end, bool define_block = false,
+                               syntax::SyntaxKind define_directive_kind =
+                                   syntax::SyntaxKind::Unknown) {
     size_t i = start;
     while (i < end) {
         if (source[i] == '/' && i + 1 < end && source[i + 1] == '/') {
+            // Line comment: consume to end of line (excluding the newline itself).
             size_t j = i + 2;
             while (j < end && source[j] != '\n')
                 ++j;
-            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, true, false);
+            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, true,
+                     false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (source[i] == '/' && i + 1 < end && source[i + 1] == '*') {
+            // Block comment: consume up to and including the closing */.
             size_t j = i + 2;
             while (j + 1 < end && !(source[j] == '*' && source[j + 1] == '/'))
                 ++j;
             if (j + 1 < end)
                 j += 2;
-            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, true, false);
+            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, true,
+                     false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (source[i] == '`') {
+            // Backtick: compiler directive or macro identifier.
+            // Find the start of the current line to determine if the backtick is line-leading.
             size_t line_start = i;
             while (line_start > start && source[line_start - 1] != '\n')
                 --line_start;
             size_t first = line_start;
             while (first < i && (source[first] == ' ' || source[first] == '\t'))
                 ++first;
+            // Collect the directive/macro name (backtick + alphanumeric/_/$).
             size_t name_end = i + 1;
             while (name_end < end && (std::isalnum((unsigned char)source[name_end]) ||
                                       source[name_end] == '_' || source[name_end] == '$'))
                 ++name_end;
             std::string name = source.substr(i, name_end - i);
-            if (first == i && is_compiler_directive_name(name)) {
+            if (!define_block && first == i && is_compiler_directive_name(name)) {
+                // Line-leading compiler directive outside a define block:
+                // consume the entire (possibly line-continuation-escaped) directive line.
                 size_t j = i;
                 do {
                     while (j < end && source[j] != '\n')
@@ -1224,13 +1240,21 @@ static void append_trivia_text(std::vector<Tok>& toks, const std::string& source
                         ++j;
                 } while (j < end);
                 push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, false,
-                         true);
+                         true, syntax::SyntaxKind::Unknown, define_block);
                 i = j;
             } else {
-                push_tok(toks, TokenKind::Identifier, std::move(name), (int)i);
+                // Inside a define block, a line-leading `define becomes a Directive token;
+                // all other backtick names are treated as Identifiers (macro uses).
+                bool define_directive =
+                    define_block && name == "`define" && first == i;
+                push_tok(toks, define_directive ? TokenKind::Directive : TokenKind::Identifier,
+                         std::move(name), (int)i, false, false, define_directive,
+                         define_directive ? define_directive_kind : syntax::SyntaxKind::Unknown,
+                         define_block);
                 i = name_end;
             }
         } else if (source[i] == '"') {
+            // String literal: handle backslash escapes, stop at closing quote.
             size_t j = i + 1;
             while (j < end) {
                 if (source[j] == '\\' && j + 1 < end) {
@@ -1242,29 +1266,37 @@ static void append_trivia_text(std::vector<Tok>& toks, const std::string& source
                     ++j;
                 }
             }
-            push_tok(toks, TokenKind::StringLiteral, source.substr(i, j - i), (int)i);
+            push_tok(toks, TokenKind::StringLiteral, source.substr(i, j - i), (int)i, false,
+                     false, false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (std::isspace((unsigned char)source[i])) {
+            // Whitespace run (spaces, tabs, newlines) — single token marked is_whitespace.
             size_t j = i + 1;
             while (j < end && std::isspace((unsigned char)source[j]))
                 ++j;
-            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, true, false, false);
+            push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, true, false,
+                     false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (std::isalpha((unsigned char)source[i]) || source[i] == '_' || source[i] == '$') {
+            // Identifier or system task/function name ($display, etc.).
             size_t j = i + 1;
             while (j < end &&
                    (std::isalnum((unsigned char)source[j]) || source[j] == '_' || source[j] == '$'))
                 ++j;
-            push_tok(toks, TokenKind::Identifier, source.substr(i, j - i), (int)i);
+            push_tok(toks, TokenKind::Identifier, source.substr(i, j - i), (int)i, false,
+                     false, false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (std::isdigit((unsigned char)source[i])) {
+            // Numeric literal; ' is included to handle SV sized literals (e.g. 8'hFF).
             size_t j = i + 1;
             while (j < end && (std::isalnum((unsigned char)source[j]) || source[j] == '_' ||
                                source[j] == '\''))
                 ++j;
-            push_tok(toks, TokenKind::IntegerLiteral, source.substr(i, j - i), (int)i);
+            push_tok(toks, TokenKind::IntegerLiteral, source.substr(i, j - i), (int)i, false,
+                     false, false, syntax::SyntaxKind::Unknown, define_block);
             i = j;
         } else if (std::ispunct((unsigned char)source[i])) {
+            // Operator or punctuation: try longest multi-char match first, then single char.
             static const std::vector<std::string> OPS = {
                 "<<=", ">>=", "===", "!==", "<<<", ">>>", "->", "<->", "&&", "||", "**", "##",
                 "|->", "+=",  "-=",  "*=",  "/=",  "%=",  "&=", "|=",  "^=", "<=", ">=", "==",
@@ -1272,18 +1304,23 @@ static void append_trivia_text(std::vector<Tok>& toks, const std::string& source
             bool matched = false;
             for (const auto& op : OPS) {
                 if (i + op.size() <= end && source.compare(i, op.size(), op) == 0) {
-                    push_tok(toks, TokenKind::Unknown, op, (int)i);
+                    push_tok(toks, TokenKind::Unknown, op, (int)i, false, false, false,
+                             syntax::SyntaxKind::Unknown, define_block);
                     i += op.size();
                     matched = true;
                     break;
                 }
             }
             if (!matched) {
-                push_tok(toks, single_punct_token_kind(source[i]), source.substr(i, 1), (int)i);
+                push_tok(toks, single_punct_token_kind(source[i]), source.substr(i, 1),
+                         (int)i, false, false, false, syntax::SyntaxKind::Unknown,
+                         define_block);
                 ++i;
             }
         } else {
-            push_tok(toks, TokenKind::Unknown, source.substr(i, 1), (int)i);
+            // Unrecognised character — emit as Unknown.
+            push_tok(toks, TokenKind::Unknown, source.substr(i, 1), (int)i, false, false,
+                     false, syntax::SyntaxKind::Unknown, define_block);
             ++i;
         }
     }
@@ -1340,7 +1377,42 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
             return it->second;
     }
 
+    struct DefineRange {
+        size_t start;
+        size_t end;
+        syntax::SyntaxKind kind;
+    };
     std::vector<Tok> toks;
+    std::vector<DefineRange> define_ranges;
+    auto in_define_range = [&](size_t pos) {
+        for (const auto& range : define_ranges)
+            if (range.start <= pos && pos < range.end)
+                return true;
+        return false;
+    };
+    auto define_kind_at = [&](size_t pos) {
+        for (const auto& range : define_ranges)
+            if (range.start <= pos && pos < range.end)
+                return range.kind;
+        return syntax::SyntaxKind::Unknown;
+    };
+    auto append_gap = [&](size_t start, size_t end) {
+        size_t p = start;
+        while (p < end) {
+            bool in_def = in_define_range(p);
+            size_t q = end;
+            for (const auto& range : define_ranges) {
+                if (in_def && range.start <= p && p < range.end) {
+                    q = std::min(q, range.end);
+                } else if (!in_def && p < range.start) {
+                    q = std::min(q, range.start);
+                }
+            }
+            append_trivia_text(toks, source, p, q, in_def, define_kind_at(p));
+            p = q;
+        }
+    };
+
     SourceManager sm;
     auto buffer = sm.assignText(source);
     BumpAllocator alloc;
@@ -1362,10 +1434,11 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
             continue;
         if (off < cursor)
             continue;
+        bool token_define_block = in_define_range(off);
         // Fill gap between cursor and this token with trivia text
         // (handles comments, directives, strings in gaps)
         if (cursor < off)
-            append_trivia_text(toks, source, cursor, off);
+            append_gap(cursor, off);
         std::string raw(token.rawText());
         if (!raw.empty() && raw[0] == '`') {
             size_t line_start = off;
@@ -1378,16 +1451,25 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
                 token.directiveKind() != syntax::SyntaxKind::MacroUsage &&
                 !is_pp_conditional(token.directiveKind()) && first == off) {
                 size_t end = off;
+                bool has_continuation = false;
                 do {
                     while (end < source.size() && source[end] != '\n')
                         ++end;
                     if (end == 0 || source[end - 1] != '\\')
                         break;
+                    has_continuation = true;
                     if (end < source.size())
                         ++end;
                 } while (end < source.size());
-                push_tok(toks, token.kind, source.substr(off, end - off), (int)off, false, false,
-                         true, token.directiveKind());
+                if (token.directiveKind() == syntax::SyntaxKind::DefineDirective) {
+                    if (!has_continuation && end < source.size() && source[end] == '\n')
+                        ++end;
+                    define_ranges.push_back({off, end, token.directiveKind()});
+                    append_gap(off, end);
+                } else {
+                    push_tok(toks, token.kind, source.substr(off, end - off), (int)off,
+                             false, false, true, token.directiveKind());
+                }
                 cursor = std::max(cursor, end);
                 continue;
             }
@@ -1401,14 +1483,16 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
                         source[end] == '\'' || source[end] == '?' || source[end] == 'x' ||
                         source[end] == 'X' || source[end] == 'z' || source[end] == 'Z'))
                     ++end;
-                push_tok(toks, token.kind, source.substr(off, end - off), (int)off);
+                push_tok(toks, token.kind, source.substr(off, end - off), (int)off, false,
+                         false, false, syntax::SyntaxKind::Unknown, token_define_block);
                 cursor = std::max(cursor, end);
                 continue;
             }
         }
         if (is_combined_operator_token(token.kind) &&
             (off + raw.size() > source.size() || source.compare(off, raw.size(), raw) != 0)) {
-            push_tok(toks, TokenKind::Unknown, raw.substr(0, 1), (int)off);
+            push_tok(toks, TokenKind::Unknown, raw.substr(0, 1), (int)off, false, false,
+                     false, syntax::SyntaxKind::Unknown, token_define_block);
             cursor = std::max(cursor, off + 1);
             continue;
         }
@@ -1416,12 +1500,14 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
             syntax::SyntaxKind directive_kind = syntax::SyntaxKind::Unknown;
             if (token.kind == TokenKind::Directive)
                 directive_kind = token.directiveKind();
-            push_tok(toks, token.kind, raw, (int)off, false, false, false, directive_kind);
+            push_tok(toks, token.kind, raw, (int)off, false, false,
+                     token.kind == TokenKind::Directive,
+                     directive_kind, token_define_block);
         }
         cursor = std::max(cursor, off + raw.size());
     }
     if (cursor < source.size())
-        append_trivia_text(toks, source, cursor, source.size());
+        append_gap(cursor, source.size());
 
     if (active_token_cache) {
         auto [it, _] = active_token_cache->emplace(source, std::move(toks));
@@ -6095,8 +6181,8 @@ static std::vector<size_t> tok_line_starts(const std::vector<Tok>& tokens) {
 // align_define_continuation_pass_v2 — token-metadata version
 //
 // Aligns trailing continuation backslashes for consecutive macro/body lines.
-// The pass only changes fmt_text_override for the token that owns the trailing
-// '\'; it does not create/remove lines or reindent the macro body.
+// The pass keeps token text immutable: the '\' is a standalone token and this
+// pass changes only fmt_spaces_before on that token.
 //
 // Example:
 //
@@ -6165,33 +6251,24 @@ static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
         }
 
         if (found_sig && !info.disabled) {
-            std::string txt = tok_text(tokens[last_sig]);
-            // Trim trailing whitespace from token text
-            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
-                txt.pop_back();
-            if (!txt.empty() && txt.back() == '\\') {
+            if (tok_text(tokens[last_sig]) == "\\") {
                 info.ends_with_bs = true;
                 info.bs_tok_idx = last_sig;
 
                 // Compute rendered column of content before backslash.
                 // Walk tokens on this line, accumulating column position.
                 int col = tokens[s].fmt_indent * opts.indent_size;
-                bool first = true;
                 for (size_t j = s; j < e; ++j) {
                     if (tok_whitespace(tokens[j]))
                         continue;
                     if (j == last_sig) {
-                        // Content width = col + text length minus the trailing backslash
-                        size_t text_len = txt.size() - 1; // exclude '\'
-                        while (text_len > 0 && (txt[text_len - 1] == ' ' || txt[text_len - 1] == '\t'))
-                            --text_len;
-                        info.content_col = col + (int)text_len;
+                        // Backslash is its own immutable token. col is already
+                        // the rendered content column before the backslash.
+                        info.content_col = col;
                         break;
                     }
-                    if (!first)
-                        col += tokens[j].fmt_spaces_before;
+                    col += tokens[j].fmt_spaces_before;
                     col += (int)tok_text(tokens[j]).size();
-                    first = false;
                 }
             }
         }
@@ -6223,22 +6300,14 @@ static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
             auto& info = line_infos[k];
             auto& bs_tok = tokens[info.bs_tok_idx];
 
-            // Strip trailing backslash (and surrounding spaces) from token text
-            std::string txt = tok_text(bs_tok);
-            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
-                txt.pop_back();
-            if (!txt.empty() && txt.back() == '\\')
-                txt.pop_back();
-            while (!txt.empty() && (txt.back() == ' ' || txt.back() == '\t'))
-                txt.pop_back();
-
             // Recompute how many spaces we need between content and backslash
             int pad = bs_col - info.content_col;
             if (pad < 1)
                 pad = 1;
 
-            // Rebuild token text: content + padding + backslash
-            tok_set_formatted_text(bs_tok, txt + std::string(pad, ' ') + "\\");
+            // Keep token text immutable. Alignment is represented as spacing
+            // metadata before the standalone "\" token.
+            bs_tok.fmt_spaces_before = pad;
         }
     }
 }
@@ -7215,6 +7284,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
 
     // True only while formatting the trailing while of a do-while construct.
     bool do_while_tail = false;
+    int define_spaces_pending = 0;
 
     // import/export and extern declarations can contain function/task keywords
     // that must not open normal function/task indentation scopes.
@@ -7506,7 +7576,6 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
     // -----------------------------------------------------------------------
     for (size_t i = 0; i < tokens.size(); ++i) {
         Tok& tok = tokens[i];
-
         // Classify macro tokens before normal spacing decisions.  The macro
         // configuration determines whether a macro acts like an expression, a
         // statement, a declaration, a control construct, or a synthetic block
@@ -7576,6 +7645,39 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             whitespace_macro_class = tok_macro_class;
             whitespace_macro_prev = tok;
             prev_macro_role_valid = false;
+            original_newline_before_token = false;
+            continue;
+        }
+
+        if (tok_define_block(tok)) {
+            if (tok_whitespace(tok)) {
+                int cols = 0;
+                bool saw_newline = false;
+                for (char ch : tok_text(tok)) {
+                    if (ch == '\n') {
+                        saw_newline = true;
+                        cols = 0;
+                    } else if (ch == ' ' || ch == '\t') {
+                        ++cols;
+                    }
+                }
+                if (tok_text(tok).find('\n') != std::string::npos) {
+                    pending_nl = true;
+                    at_bol = true;
+                }
+                if (saw_newline)
+                    define_spaces_pending = cols;
+                else
+                    define_spaces_pending += cols;
+                original_newline_before_token = tok_text(tok).find('\n') != std::string::npos;
+                continue;
+            }
+            apply_newline(i);
+            tok.fmt_spaces_before = define_spaces_pending;
+            define_spaces_pending = 0;
+            tok.fmt_indent = 0;
+            at_bol = false;
+            prev = &tok;
             original_newline_before_token = false;
             continue;
         }
@@ -8252,7 +8354,6 @@ static std::vector<Tok> tokens_from_formatted_text(const std::string& text, cons
         tok.fmt_blank_lines = 0;
         tok.fmt_disabled = false;
         tok.fmt_passthrough = false;
-        tok.fmt_text_override.clear();
 
         if (tok_whitespace(tok)) {
             for (char ch : tok_text(tok)) {
@@ -9115,7 +9216,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     write_log(opts, "format_source_input.sv", input);
 
     auto tokens = collect_lexer_tokens(input);
-
     write_log(opts, "00_input.sv", input);
     basic_formatting(tokens, input, opts);
     write_log(opts, "01_basic_formatting.sv", render_tokens(tokens, opts));
