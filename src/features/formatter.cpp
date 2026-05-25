@@ -6488,15 +6488,22 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
             }
         }
 
-        // Compute lhs_inline_width
+        // Compute lhs_inline_width — width of the LHS expression before the assignment op.
+        // For continuous assignments ("assign <expr> = ..."), skip the leading "assign" keyword
+        // so that lhs_min_width applies to the actual LHS expression, not the "assign" prefix.
         ln.lhs_inline_width = 0;
         if (ln.assign_op_idx != SIZE_MAX) {
             bool first = true;
+            bool skip_next = tokens[ln.first_sig].kind == TokenKind::AssignKeyword;
             for (size_t k = ln.first_sig; k < ln.end; ++k) {
                 if (tok_whitespace(tokens[k]))
                     continue;
                 if (k == ln.assign_op_idx)
                     break;
+                if (skip_next) {
+                    skip_next = false;
+                    continue;
+                }
                 if (first) {
                     ln.lhs_inline_width += (int)tok_text(tokens[k]).size();
                     first = false;
@@ -6582,15 +6589,26 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
             ++j;
         }
 
+        // op_gap: cols between widest LHS and the operator.
+        // With space_after=true, the trailing space after the op provides visual separation,
+        // so op_gap=1 suffices. With space_after=false, we add an extra col before the op to
+        // keep the RHS content at the same visual column as when space_after=true.
+        bool space_before = binary_space_before(opts.spacing.assignment_operator_spacing);
+        bool space_after  = binary_space_after(opts.spacing.assignment_operator_spacing);
+        int  op_gap       = space_after ? 1 : 2;
+        int  min_sp       = space_before ? 1 : 0;
+
         if (j - li < 2) {
             // Single line: still apply lhs_min_width if needed
             if (j - li == 1 && opts.statement.lhs_min_width > 0) {
                 const auto& sl = lines[li];
-                int base_width = std::max(opts.statement.lhs_min_width, sl.lhs_inline_width);
-                int target = base_width + 1;
+                int base_width = opts.statement.align_adaptive
+                    ? opts.statement.lhs_min_width
+                    : std::max(opts.statement.lhs_min_width, sl.lhs_inline_width);
+                int target = base_width + (space_before ? 1 : 0);
                 if (opts.tab_align && opts.indent_size > 0)
                     target = snap_to_indent_grid(sl.indent_level * opts.indent_size + target, opts.indent_size) - sl.indent_level * opts.indent_size;
-                int sp = std::max(1, target - sl.lhs_inline_width);
+                int sp = std::max(min_sp, target - sl.lhs_inline_width);
                 tokens[sl.assign_op_idx].fmt_spaces_before = sp;
             }
             li = j;
@@ -6598,16 +6616,19 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         }
 
         // Compute alignment
+        // With align_adaptive, fix target at lhs_min_width — wide lines get min_sp only.
         int max_lhs = opts.statement.lhs_min_width;
-        for (size_t k = li; k < j; ++k)
-            max_lhs = std::max(max_lhs, lines[k].lhs_inline_width);
+        if (!opts.statement.align_adaptive) {
+            for (size_t k = li; k < j; ++k)
+                max_lhs = std::max(max_lhs, lines[k].lhs_inline_width);
+        }
 
-        int target = max_lhs + 1;
+        int target = max_lhs + op_gap;
         if (opts.tab_align && opts.indent_size > 0)
-            target = snap_to_indent_grid(ln.indent_level * opts.indent_size + max_lhs + 1, opts.indent_size) - ln.indent_level * opts.indent_size;
+            target = snap_to_indent_grid(ln.indent_level * opts.indent_size + max_lhs + op_gap, opts.indent_size) - ln.indent_level * opts.indent_size;
 
         for (size_t k = li; k < j; ++k) {
-            int sp = std::max(1, target - lines[k].lhs_inline_width);
+            int sp = std::max(min_sp, target - lines[k].lhs_inline_width);
             tokens[lines[k].assign_op_idx].fmt_spaces_before = sp;
         }
 
@@ -6768,8 +6789,15 @@ static VarTokenParsed parse_var_tokens(const std::vector<Tok>& tokens, size_t li
                 break;
         }
         result.dim_end = (idx < sig_indices.size()) ? sig_indices[idx] : semi_idx;
-        // Normalize dim_str using normalize_bracket_spacing
-        result.dim_str = normalize_bracket_spacing(dim_str, opts);
+        // Rebuild dim_str from actual token range to include macro/directive tokens
+        // (sig_indices skips directives, so `MACRO in dims would be missed above)
+        std::string actual_dim;
+        for (size_t k = result.dim_start; k < result.dim_end; ++k) {
+            if (tok_whitespace(tokens[k])) continue;
+            if (!actual_dim.empty()) actual_dim += ' ';
+            actual_dim += tok_text(tokens[k]);
+        }
+        result.dim_str = normalize_bracket_spacing(actual_dim, opts);
         result.dim_inline_width = (int)result.dim_str.size();
     }
 
