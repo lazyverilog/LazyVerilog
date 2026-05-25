@@ -1185,6 +1185,27 @@ static TokenKind single_punct_token_kind(char ch) {
     }
 }
 
+// Scans from pos to the end of a directive line, following '\' line continuations.
+// Returns the position just past the last consumed character (≤ limit).
+// If has_continuation is non-null, sets it true when any continuation line was consumed.
+static size_t scan_directive_end(const std::string& src, size_t pos, size_t limit,
+                                 bool* has_continuation = nullptr) {
+    if (has_continuation)
+        *has_continuation = false;
+    size_t j = pos;
+    do {
+        while (j < limit && src[j] != '\n')
+            ++j;
+        if (j == 0 || src[j - 1] != '\\')
+            break;
+        if (has_continuation)
+            *has_continuation = true;
+        if (j < limit)
+            ++j;
+    } while (j < limit);
+    return j;
+}
+
 // Mini-lexer: scans source[start..end] and appends typed Tok entries to toks.
 // define_block: true when scanning inside a `define body — changes backtick handling.
 // define_directive_kind: SyntaxKind to attach to a `define directive token found in a define block.
@@ -1230,15 +1251,7 @@ static void append_trivia_text(std::vector<Tok>& toks, const std::string& source
             if (!define_block && first == i && is_compiler_directive_name(name)) {
                 // Line-leading compiler directive outside a define block:
                 // consume the entire (possibly line-continuation-escaped) directive line.
-                size_t j = i;
-                do {
-                    while (j < end && source[j] != '\n')
-                        ++j;
-                    if (j == 0 || source[j - 1] != '\\')
-                        break;
-                    if (j < end)
-                        ++j;
-                } while (j < end);
+                size_t j = scan_directive_end(source, i, end);
                 push_tok(toks, TokenKind::Unknown, source.substr(i, j - i), (int)i, false, false,
                          true, syntax::SyntaxKind::Unknown, define_block);
                 i = j;
@@ -1384,22 +1397,17 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
     };
     std::vector<Tok> toks;
     std::vector<DefineRange> define_ranges;
-    auto in_define_range = [&](size_t pos) {
+    auto find_define_range = [&](size_t pos) -> const DefineRange* {
         for (const auto& range : define_ranges)
             if (range.start <= pos && pos < range.end)
-                return true;
-        return false;
-    };
-    auto define_kind_at = [&](size_t pos) {
-        for (const auto& range : define_ranges)
-            if (range.start <= pos && pos < range.end)
-                return range.kind;
-        return syntax::SyntaxKind::Unknown;
+                return &range;
+        return nullptr;
     };
     auto append_gap = [&](size_t start, size_t end) {
         size_t p = start;
         while (p < end) {
-            bool in_def = in_define_range(p);
+            const DefineRange* dr = find_define_range(p);
+            bool in_def = dr != nullptr;
             size_t q = end;
             for (const auto& range : define_ranges) {
                 if (in_def && range.start <= p && p < range.end) {
@@ -1408,7 +1416,8 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
                     q = std::min(q, range.start);
                 }
             }
-            append_trivia_text(toks, source, p, q, in_def, define_kind_at(p));
+            append_trivia_text(toks, source, p, q, in_def,
+                               dr ? dr->kind : syntax::SyntaxKind::Unknown);
             p = q;
         }
     };
@@ -1434,7 +1443,7 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
             continue;
         if (off < cursor)
             continue;
-        bool token_define_block = in_define_range(off);
+        bool token_define_block = find_define_range(off) != nullptr;
         // Fill gap between cursor and this token with trivia text
         // (handles comments, directives, strings in gaps)
         if (cursor < off)
@@ -1450,17 +1459,8 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
             if (token.kind == TokenKind::Directive &&
                 token.directiveKind() != syntax::SyntaxKind::MacroUsage &&
                 !is_pp_conditional(token.directiveKind()) && first == off) {
-                size_t end = off;
                 bool has_continuation = false;
-                do {
-                    while (end < source.size() && source[end] != '\n')
-                        ++end;
-                    if (end == 0 || source[end - 1] != '\\')
-                        break;
-                    has_continuation = true;
-                    if (end < source.size())
-                        ++end;
-                } while (end < source.size());
+                size_t end = scan_directive_end(source, off, source.size(), &has_continuation);
                 if (token.directiveKind() == syntax::SyntaxKind::DefineDirective) {
                     if (!has_continuation && end < source.size() && source[end] == '\n')
                         ++end;
