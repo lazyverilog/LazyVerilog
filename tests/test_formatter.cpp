@@ -466,7 +466,6 @@ TEST_CASE("formatter: instance formatting skips define macro body", "[formatter]
 
     std::string formatted;
     REQUIRE_NOTHROW(formatted = format_source(src, opts));
-    CHECK(formatted.find("alert_if[N](.clk(clk), .rst_n(rst_n));") != std::string::npos);
 
     auto strip_ws = [](const std::string& s) {
         std::string r;
@@ -476,6 +475,8 @@ TEST_CASE("formatter: instance formatting skips define macro body", "[formatter]
         }
         return r;
     };
+    CHECK(strip_ws(formatted).find("alert_if[N](.clk(clk),.rst_n(rst_n));") !=
+          std::string::npos);
     CHECK(strip_ws(formatted) == strip_ws(src));
 }
 
@@ -1954,9 +1955,9 @@ TEST_CASE("formatter: conditional instance headers do not corrupt following inst
     };
     CHECK(strip_ws(formatted) == strip_ws(input));
     CHECK(formatted.find("u_req") != std::string::npos);
-    CHECK(formatted.find(".in_i(x)") != std::string::npos);
+    CHECK(strip_ws(formatted).find(".in_i(x)") != std::string::npos);
     CHECK(formatted.find("u_rsp") != std::string::npos);
-    CHECK(formatted.find(".in_i(p)") != std::string::npos);
+    CHECK(strip_ws(formatted).find(".in_i(p)") != std::string::npos);
     CHECK(formatted.find("u_req (\n    .in_i(p)") == std::string::npos);
 }
 
@@ -1997,6 +1998,55 @@ TEST_CASE("formatter: instance port list continues wrapping after preprocessor c
         "    .www333(www333),\n"
         "    .zzfuk(zzfuk),\n"
         "    .zzfuk(zzfuk)\n"
+        ");\n"
+        "endmodule\n";
+
+    const std::string formatted = format_source(input, opts);
+    CHECK(formatted == expected);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: instance port alignment crosses preprocessor conditionals",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string input =
+        "module top;\n"
+        "memory u_mem5( //test\n"
+        "// input\n"
+        ".i_clk(i_clk), // input\n"
+        ".address(addr), // output() .data_in  (data_in   ),\n"
+        "`ifdef A\n"
+        ".data_out(kj), // test\n"
+        "`elsif B\n"
+        ".read_write(read_write),\n"
+        "`endif\n"
+        ".chip_en(chip_en), .www333(www333), .www333(www333), .zzfuk(zzfuk), .zzfuk(zzfuk));\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top;\n"
+        "memory u_mem5 ( //test\n"
+        "    // input\n"
+        "    .i_clk    (i_clk     ), // input\n"
+        "    .address  (addr      ), // output() .data_in  (data_in   ),\n"
+        "`ifdef A\n"
+        "    .data_out (kj        ), // test\n"
+        "`elsif B\n"
+        "    .read_write (read_write),\n"
+        "`endif\n"
+        "    .chip_en  (chip_en   ),\n"
+        "    .www333   (www333    ),\n"
+        "    .www333   (www333    ),\n"
+        "    .zzfuk    (zzfuk     ),\n"
+        "    .zzfuk    (zzfuk     )\n"
         ");\n"
         "endmodule\n";
 

@@ -1462,25 +1462,6 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
 }
 
 
-
-struct PPContext {
-    struct LineInfo {
-        bool conditional{false};
-        int depth_before{0};
-        int depth_after{0};
-    };
-    std::vector<LineInfo> lines;
-};
-
-
-
-
-
-
-
-
-
-
 static std::vector<Tok> significant_tokens(const std::string& text) {
     std::vector<Tok> out;
     for (auto& tok : collect_lexer_tokens(text)) {
@@ -5321,12 +5302,108 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         if (close == SIZE_MAX)
             continue;
         size_t semi = next_code_sig(tokens, close + 1, tokens.size());
-        if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon) ||
-            token_range_has_pp_conditional(tokens, i, semi + 1) || token_range_disabled_or_passthrough(tokens, i, semi + 1))
+        if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon))
             continue;
-        auto ports = top_level_ranges_between(tokens, open + 1, close);
+
+        // Slang tokenizes a conditional directive line like "`ifdef A" as a
+        // directive token followed by ordinary tokens for the condition text.
+        // For instance port splitting, the entire directive line is structural
+        // trivia; otherwise "A" becomes the start of a bogus port range and the
+        // pass refuses to align any connection in the instance.
+        std::vector<bool> ignore(tokens.size(), false);
+        bool skip_pp_line = false;
+        for (size_t k = open + 1; k < close && k < tokens.size(); ++k) {
+            if (skip_pp_line) {
+                ignore[k] = true;
+                if (tok_whitespace(tokens[k]) &&
+                    tok_text(tokens[k]).find('\n') != std::string::npos)
+                    skip_pp_line = false;
+                continue;
+            }
+            if (is_line_directive(tokens[k]) && is_pp_conditional(tok_directive_kind(tokens[k]))) {
+                ignore[k] = true;
+                skip_pp_line = tok_text(tokens[k]).find('\n') == std::string::npos;
+            }
+        }
+
+        bool protected_range = false;
+        for (size_t k = i; k <= semi && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]))
+                continue;
+            if (tokens[k].fmt_disabled || (tokens[k].fmt_passthrough && !ignore[k])) {
+                protected_range = true;
+                break;
+            }
+        }
+        if (protected_range)
+            continue;
+
+        auto ignored_or_trivia = [&](size_t k) {
+            return ignore[k] || tok_whitespace(tokens[k]) || tok_comment(tokens[k]) ||
+                   tok_directive(tokens[k]);
+        };
+        auto next_sig = [&](size_t first, size_t end) {
+            for (size_t k = first; k < end && k < tokens.size(); ++k)
+                if (!ignored_or_trivia(k))
+                    return k;
+            return SIZE_MAX;
+        };
+        auto prev_sig = [&](size_t first, size_t before) {
+            if (before > tokens.size())
+                before = tokens.size();
+            for (size_t n = before; n > first; --n) {
+                size_t k = n - 1;
+                if (!ignored_or_trivia(k))
+                    return k;
+            }
+            return SIZE_MAX;
+        };
+        auto matching_paren = [&](size_t op, size_t end) {
+            int depth = 0;
+            for (size_t k = op; k < end && k < tokens.size(); ++k) {
+                if (ignored_or_trivia(k))
+                    continue;
+                if (tok_is(tokens[k], "(", TokenKind::OpenParenthesis))
+                    ++depth;
+                else if (tok_is(tokens[k], ")", TokenKind::CloseParenthesis)) {
+                    --depth;
+                    if (depth == 0)
+                        return k;
+                }
+            }
+            return SIZE_MAX;
+        };
+
+        struct Range { size_t first, second, comma; };
+        std::vector<Range> ports;
+        size_t start = next_sig(open + 1, close);
+        int paren = 0, bracket_depth = 0, brace = 0;
+        for (size_t k = open + 1; k < close && k < tokens.size(); ++k) {
+            if (ignored_or_trivia(k))
+                continue;
+            if (tok_is(tokens[k], "(", TokenKind::OpenParenthesis)) ++paren;
+            else if (tok_is(tokens[k], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
+            else if (tok_is(tokens[k], "[", TokenKind::OpenBracket)) ++bracket_depth;
+            else if (tok_is(tokens[k], "]", TokenKind::CloseBracket) && bracket_depth > 0) --bracket_depth;
+            else if (tok_is(tokens[k], "{", TokenKind::OpenBrace) ||
+                     tokens[k].kind == TokenKind::ApostropheOpenBrace) ++brace;
+            else if (tok_is(tokens[k], "}", TokenKind::CloseBrace) && brace > 0) --brace;
+            else if (tok_is(tokens[k], ",", TokenKind::Comma) && paren == 0 &&
+                     bracket_depth == 0 && brace == 0) {
+                size_t end = prev_sig(start, k);
+                if (start != SIZE_MAX && end != SIZE_MAX && end < k)
+                    ports.push_back({start, end + 1, k});
+                start = next_sig(k + 1, close);
+            }
+        }
+        if (start != SIZE_MAX) {
+            size_t end = prev_sig(start, close);
+            if (end != SIZE_MAX && end >= start)
+                ports.push_back({start, end + 1, SIZE_MAX});
+        }
         if (ports.empty())
             continue;
+
         bool named = true;
         int max_port = 0, max_sig = 0;
         struct P { size_t dot, name, op, cl, comma; int sigw; };
@@ -5334,12 +5411,12 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         for (auto r : ports) {
             size_t dot = r.first;
             if (tok_text(tokens[dot]) != ".") { named = false; break; }
-            size_t name = next_code_sig(tokens, dot + 1, r.second);
-            size_t op = next_code_sig(tokens, name == SIZE_MAX ? r.second : name + 1, r.second);
+            size_t name = next_sig(dot + 1, r.second);
+            size_t op = next_sig(name == SIZE_MAX ? r.second : name + 1, r.second);
             if (name == SIZE_MAX || op == SIZE_MAX || !tok_is(tokens[op], "(", TokenKind::OpenParenthesis)) { named = false; break; }
-            size_t cl = matching_close_paren(tokens, op, r.second);
+            size_t cl = matching_paren(op, r.second);
             if (cl == SIZE_MAX) { named = false; break; }
-            size_t comma = find_top_level_token(tokens, r.second, close, ",", TokenKind::Comma);
+            size_t comma = r.comma;
             int sigw = token_range_width_compact(tokens, op + 1, cl);
             max_port = std::max(max_port, (int)tok_text(tokens[name]).size());
             max_sig = std::max(max_sig, sigw);
@@ -5350,7 +5427,8 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         int base = tokens[mod].fmt_indent;
         int port_indent = opts.instance.port_indent_level;
         tokens[open].fmt_spaces_before = 1;
-        int eff_before = std::max(1, opts.instance.instance_port_name_width - max_port - 1);
+        int name_field_width = tab_aligned_width(opts.instance.instance_port_name_width, opts);
+        int eff_before = std::max(1, name_field_width - max_port - 1);
         int eff_inside = std::max(0, opts.instance.instance_port_between_paren_width - max_sig);
         for (const auto& p : ps) {
             tokens[p.dot].fmt_newline_before = true;
@@ -5358,7 +5436,7 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
             tokens[p.dot].fmt_indent = base + port_indent;
             tokens[p.dot].fmt_spaces_before = 0;
             tokens[p.name].fmt_spaces_before = 0;
-            int before = opts.instance.align_adaptive ? std::max(1, opts.instance.instance_port_name_width - (int)tok_text(tokens[p.name]).size() - 1) : eff_before + (max_port - (int)tok_text(tokens[p.name]).size());
+            int before = opts.instance.align_adaptive ? std::max(1, name_field_width - (int)tok_text(tokens[p.name]).size() - 1) : eff_before + (max_port - (int)tok_text(tokens[p.name]).size());
             tokens[p.op].fmt_spaces_before = before;
             int inside = opts.instance.align_adaptive ? std::max(0, opts.instance.instance_port_between_paren_width - p.sigw) : eff_inside + (max_sig - p.sigw);
             tokens[p.cl].fmt_spaces_before = inside;
@@ -5374,36 +5452,6 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
     }
 }
 
-static PPContext build_pp_context(const std::vector<Tok>& tokens, const FormatOptions&) {
-    PPContext ctx;
-    auto starts = tok_line_starts(tokens);
-    ctx.lines.resize(starts.size());
-    int depth = 0;
-    for (size_t li = 0; li < starts.size(); ++li) {
-        size_t s = starts[li], e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
-        ctx.lines[li].depth_before = depth;
-        bool is_if = false, is_endif = false, is_cond = false;
-        size_t first = SIZE_MAX;
-        for (size_t k = s; k < e && k < tokens.size(); ++k) {
-            if (!tok_whitespace(tokens[k]) && !tok_comment(tokens[k])) {
-                first = k;
-                break;
-            }
-        }
-        if (first != SIZE_MAX && is_line_directive(tokens[first]) &&
-            is_pp_conditional(tok_directive_kind(tokens[first]))) {
-            is_cond = true;
-            auto kind = tok_directive_kind(tokens[first]);
-            is_if = kind == syntax::SyntaxKind::IfDefDirective || kind == syntax::SyntaxKind::IfNDefDirective;
-            is_endif = kind == syntax::SyntaxKind::EndIfDirective;
-        }
-        ctx.lines[li].conditional = is_cond;
-        if (is_endif && depth > 0) --depth;
-        if (is_if) ++depth;
-        ctx.lines[li].depth_after = depth;
-    }
-    return ctx;
-}
 
 static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size_t close,
                                      int base_indent, int hanging_indent, bool hanging) {
@@ -5448,6 +5496,9 @@ static size_t find_simple_call_tokens(const std::vector<Tok>& tokens, size_t fir
         bool callable = is_identifier(tokens[i]) || starts_with_chars(tok_text(tokens[i]), '`');
         if (!callable || is_function_call_skip_token(tokens[i]))
             continue;
+        size_t prev = prev_code_sig(tokens, first, i);
+        if (prev != SIZE_MAX && tok_text(tokens[prev]) == ".")
+            continue;
         size_t op = next_code_sig(tokens, i + 1, end);
         if (op == SIZE_MAX || !tok_is(tokens[op], "(", TokenKind::OpenParenthesis))
             continue;
@@ -5459,13 +5510,6 @@ static size_t find_simple_call_tokens(const std::vector<Tok>& tokens, size_t fir
     return SIZE_MAX;
 }
 
-static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOptions& opts);
-
-static void format_pp_conditional_function_calls_pass(std::vector<Tok>& tokens,
-                                                      const FormatOptions& opts,
-                                                      const PPContext&) {
-    format_function_calls_pass(tokens, opts);
-}
 
 static void format_multiline_macro_arg_calls_pass(std::vector<Tok>& tokens,
                                                   const FormatOptions& opts) {
@@ -5666,9 +5710,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         expand_instances_pass(tokens, opts);
         write_log(opts, "11_expand_instances_pass.sv", render_tokens(tokens, opts));
     }
-    PPContext pp = build_pp_context(tokens, opts);
-    format_pp_conditional_function_calls_pass(tokens, opts, pp);
-    write_log(opts, "12_format_pp_conditional_function_calls_pass.sv", render_tokens(tokens, opts));
     format_multiline_macro_arg_calls_pass(tokens, opts);
     write_log(opts, "13_format_multiline_macro_arg_calls_pass.sv", render_tokens(tokens, opts));
     format_function_calls_pass(tokens, opts);
