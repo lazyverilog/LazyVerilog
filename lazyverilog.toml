@@ -78,12 +78,12 @@ range_colon_spacing = "none"                        # none | before | after | bo
 indexed_part_select_spacing = "none"                # none | before | after | both; +: and -:
 procedural_event_control_at_spacing = "both"      # none | before | after | both; always @(...)
 space_inside_event_control_parens = true
-assignment_operator_spacing = "none"                  # none | before | after | both; = and <= operators
+assignment_operator_spacing = "both"                  # none | before | after | both; = and <= operators
 
 [format.statement]
 align = true              # align = and <= operators in consecutive assignments
-align_adaptive = false
-lhs_min_width = 6           # minimum width of the LHS column before the operator
+align_adaptive = true
+lhs_min_width = 10           # minimum width of the LHS column before the operator
 begin_newline = false       # true: place begin / constraint { on the next line
 wrap_end_else_clauses = true
 
@@ -108,7 +108,7 @@ section4_min_width = 16
 break_policy = "auto"      # never | always | auto
 line_length = 100
 arg_count = 3 # when auto: break if arg count >= this value; -1 disables arg-count breaking
-layout = "hanging"           # hanging | block
+layout = "block"           # hanging | block
 space_before_paren = false
 space_inside_paren = false
 
