@@ -56,15 +56,6 @@ static void write_log(const FormatOptions& opts, const std::string& filename,
     out << text;
 }
 
-static std::vector<std::string> text_to_lines(const std::string& text) {
-    std::vector<std::string> lines;
-    std::istringstream ss(text);
-    std::string l;
-    while (std::getline(ss, l))
-        lines.push_back(std::move(l));
-    return lines;
-}
-
 using slang::parsing::TokenKind;
 
 struct TokLexeme {
@@ -108,18 +99,8 @@ static syntax::SyntaxKind tok_directive_kind(const Tok& tok) { return tok.lex->d
 
 static std::vector<Tok> collect_lexer_tokens(const std::string& source);
 static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOptions& opts);
-static std::vector<Tok> tokens_from_formatted_text(const std::string& text, const FormatOptions& opts);
-static std::string join_lines(const std::vector<std::string>& lines);
 static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts);
 
-struct TokenLineText {
-    size_t start{0};
-    size_t end{0};
-    std::string text;
-};
-
-static std::vector<TokenLineText> token_line_texts(const std::vector<Tok>& tokens,
-                                                   const FormatOptions& opts);
 static std::vector<size_t> tok_line_starts(const std::vector<Tok>& tokens);
 
 static bool is_pp_cond_with(syntax::SyntaxKind kind);
@@ -4961,8 +4942,7 @@ static bool token_range_has_pp_conditional(const std::vector<Tok>& tokens, size_
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
             continue;
-        if ((is_line_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i]))) ||
-            is_pp_conditional_text(tok_text(tokens[i])))
+        if (is_line_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i])))
             return true;
     }
     return false;
@@ -6246,8 +6226,7 @@ static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
             }
             found_sig = true;
             last_sig = j;
-            if ((tok_directive(tokens[j]) && is_pp_conditional(tok_directive_kind(tokens[j]))) ||
-                is_pp_conditional_text(tok_text(tokens[j])))
+            if (tok_directive(tokens[j]) && is_pp_conditional(tok_directive_kind(tokens[j])))
                 info.has_pp_cond = true;
         }
 
@@ -6374,8 +6353,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
                 ln.disabled = true;
             if (tok_directive(tok) && is_pp_conditional(tok_directive_kind(tok)))
                 ln.has_pp_cond = true;
-            if (is_pp_conditional_text(tok_text(tok)))
-                ln.has_pp_cond = true;
+
             sig_indices.push_back(k);
         }
 
@@ -6937,8 +6915,7 @@ static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opt
             if (tokens[k].fmt_disabled) ln.disabled = true;
             if (tok_directive(tokens[k]) && is_pp_conditional(tok_directive_kind(tokens[k])))
                 ln.has_pp_cond = true;
-            if (is_pp_conditional_text(tok_text(tokens[k])))
-                ln.has_pp_cond = true;
+
             if (!tok_comment(tokens[k]))
                 ln.is_comment_or_blank = false;
         }
@@ -7469,9 +7446,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                     skip_pp_cond_line = false;
                 continue;
             }
-            if ((is_line_directive(tokens[idx]) &&
-                 is_pp_conditional(tok_directive_kind(tokens[idx]))) ||
-                is_pp_conditional_text(tok_text(tokens[idx]))) {
+            if (is_line_directive(tokens[idx]) &&
+                is_pp_conditional(tok_directive_kind(tokens[idx]))) {
                 // Slang lexes conditionals like "`ifdef A" as a directive token
                 // followed by ordinary identifier tokens for the condition.  For
                 // list classification, the whole directive line is structural
@@ -7661,8 +7637,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         syntax::SyntaxKind tok_pp_cond_kind = syntax::SyntaxKind::Unknown;
         if (is_line_directive(tok) && is_pp_conditional(tok_directive_kind(tok)))
             tok_pp_cond_kind = tok_directive_kind(tok);
-        else if (is_pp_conditional_text(tok_text(tok)))
-            tok_pp_cond_kind = directive_at_offset(tok_text(tok), 0).kind;
+
         bool tok_is_pp_conditional = is_pp_conditional(tok_pp_cond_kind);
 
         if (whitespace_macro_passthrough) {
@@ -8352,120 +8327,6 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
 }
 
 
-// ---------------------------------------------------------------------------
-// Token pass adapters for legacy structural passes.
-// ---------------------------------------------------------------------------
-
-
-static std::vector<TokenLineText> token_line_texts(const std::vector<Tok>& tokens,
-                                                   const FormatOptions& opts) {
-    std::vector<TokenLineText> out;
-    size_t start = 0;
-    bool have = false;
-    auto flush = [&](size_t end) {
-        if (!have && end <= start)
-            return;
-        std::vector<Tok> slice(tokens.begin() + (ptrdiff_t)start, tokens.begin() + (ptrdiff_t)end);
-        if (!slice.empty()) {
-            if (slice.front().fmt_newline_before) {
-                for (int b = 0; b < slice.front().fmt_blank_lines; ++b)
-                    out.push_back({start, start, ""});
-            }
-            slice.front().fmt_newline_before = false;
-            slice.front().fmt_blank_lines = 0;
-        }
-        std::string rendered = render_tokens(slice, opts);
-        size_t begin = 0;
-        while (true) {
-            size_t nl = rendered.find('\n', begin);
-            std::string part = nl == std::string::npos ? rendered.substr(begin)
-                                                       : rendered.substr(begin, nl - begin);
-            out.push_back({start, end, part});
-            if (nl == std::string::npos)
-                break;
-            begin = nl + 1;
-            if (begin >= rendered.size())
-                break;
-        }
-    };
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (!tok_whitespace(tokens[i]) && tokens[i].fmt_newline_before && have) {
-            flush(i);
-            start = i;
-            have = false;
-        }
-        if (!tok_whitespace(tokens[i]))
-            have = true;
-    }
-    if (have || start < tokens.size())
-        flush(tokens.size());
-    return out;
-}
-
-static std::string join_lines(const std::vector<std::string>& lines) {
-    std::string r;
-    for (size_t i = 0; i < lines.size(); ++i) {
-        if (i)
-            r += '\n';
-        r += lines[i];
-    }
-    return r;
-}
-
-static std::vector<Tok> tokens_from_formatted_text(const std::string& text, const FormatOptions& opts) {
-    auto out = collect_lexer_tokens(text);
-    bool at_bol = true;
-    int col = 0;
-    int blank_lines = 0;
-    for (size_t i = 0; i < out.size(); ++i) {
-        auto& tok = out[i];
-        tok.fmt_indent = 0;
-        tok.fmt_spaces_before = 0;
-        tok.fmt_newline_before = false;
-        tok.fmt_blank_lines = 0;
-        tok.fmt_disabled = false;
-        tok.fmt_passthrough = false;
-
-        if (tok_whitespace(tok)) {
-            for (char ch : tok_text(tok)) {
-                if (ch == '\n') {
-                    at_bol = true;
-                    col = 0;
-                    ++blank_lines;
-                } else if (ch == ' ' || ch == '\t') {
-                    ++col;
-                }
-            }
-            continue;
-        }
-
-        if (at_bol) {
-            if (i != 0 || blank_lines > 0)
-                tok.fmt_newline_before = true;
-            tok.fmt_blank_lines = std::max(0, blank_lines - 1);
-            tok.fmt_indent = opts.indent_size > 0 ? col / opts.indent_size : 0;
-            int indent_cols = tok.fmt_indent * std::max(0, opts.indent_size);
-            tok.fmt_spaces_before = std::max(0, col - indent_cols);
-        } else {
-            tok.fmt_spaces_before = col;
-        }
-        at_bol = false;
-        col = 0;
-        blank_lines = 0;
-    }
-    return out;
-}
-
-template <typename Pass>
-static void apply_legacy_line_pass_to_tokens(std::vector<Tok>& tokens, const FormatOptions& opts,
-                                             Pass pass) {
-    std::string text = render_tokens(tokens, opts);
-    auto lines = text_to_lines(text);
-    lines = pass(std::move(lines));
-    tokens = tokens_from_formatted_text(render_lines(lines), opts);
-}
-
 static void align_assign_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     align_assign_pass_v2(tokens, opts);
 }
@@ -8475,139 +8336,285 @@ static void align_var_pass(std::vector<Tok>& tokens, const FormatOptions& opts) 
 }
 
 static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
-    auto tlines = token_line_texts(tokens, opts);
-    std::vector<std::string> lines;
-    lines.reserve(tlines.size());
-    for (const auto& tl : tlines)
-        lines.push_back(tl.text);
+    struct PortNameSlot {
+        size_t name{SIZE_MAX};
+        size_t trail_start{SIZE_MAX};
+        size_t trail_end{SIZE_MAX};
+        size_t terminator{SIZE_MAX};
+        std::string name_text;
+        std::string trail_text;
+    };
+    struct PortLineParsedTok {
+        bool valid{false};
+        size_t line_start{SIZE_MAX};
+        size_t line_end{SIZE_MAX};
+        size_t direction{SIZE_MAX};
+        size_t dtype_start{SIZE_MAX};
+        size_t dtype_end{SIZE_MAX};
+        size_t qualifier{SIZE_MAX};
+        size_t dim_start{SIZE_MAX};
+        size_t dim_end{SIZE_MAX};
+        std::string direction_text;
+        std::string dtype_text;
+        std::string qualifier_text;
+        std::string dim_text;
+        std::vector<PortNameSlot> names;
+    };
 
-    std::vector<std::string> out;
-    size_t i = 0;
-    bool module_header_region = false;
-    auto starts_with_port_dir = [](const std::string& line) -> bool {
-        auto toks = significant_tokens(line);
-        return !toks.empty() && is_port_direction_token(toks[0]);
+    auto line_first_sig = [&](size_t s, size_t e) -> size_t {
+        return next_code_sig(tokens, s, e);
     };
-    auto is_port_decl_line = [&](int idx) -> bool {
-        return idx >= 0 && idx < (int)lines.size() && starts_with_port_dir(lines[(size_t)idx]);
-    };
-    auto is_semi_only = [&](int idx) -> bool {
-        if (idx < 0 || idx >= (int)lines.size())
-            return false;
-        auto toks = significant_tokens(lines[(size_t)idx]);
-        return toks.size() == 1 && tok_is(toks[0], ";", TokenKind::Semicolon);
-    };
-    auto is_standalone_comment = [&](const std::string& text) {
-        for (const auto& tok : collect_lexer_tokens(text)) {
-            if (tok_whitespace(tok))
-                continue;
-            return tok_comment(tok);
-        }
+    auto line_has_kind = [&](size_t s, size_t e, TokenKind kind) {
+        for (size_t k = s; k < e && k < tokens.size(); ++k)
+            if (!tok_whitespace(tokens[k]) && !tok_comment(tokens[k]) && !tok_directive(tokens[k]) &&
+                tokens[k].kind == kind)
+                return true;
         return false;
     };
-    auto has_header_end = [](const std::string& line) {
-        auto toks = significant_tokens(line);
+    auto line_has_header_end = [&](size_t s, size_t e) {
         bool saw_close = false;
-        for (const auto& tok : toks) {
-            if (tok_is(tok, ")", TokenKind::CloseParenthesis))
+        for (size_t k = s; k < e && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]) || tok_comment(tokens[k]) || tok_directive(tokens[k]))
+                continue;
+            if (tok_is(tokens[k], ")", TokenKind::CloseParenthesis))
                 saw_close = true;
-            else if (saw_close && tok_is(tok, ";", TokenKind::Semicolon))
+            else if (saw_close && tok_is(tokens[k], ";", TokenKind::Semicolon))
                 return true;
         }
         return false;
     };
-    auto has_kind = [](const std::string& line, TokenKind kind) {
-        for (const auto& tok : significant_tokens(line))
-            if (tok.kind == kind)
-                return true;
-        return false;
-    };
-    auto is_header_start_line = [&](const std::string& line) {
-        auto toks = significant_tokens(line);
-        if (toks.empty())
+    auto is_header_start_line = [&](size_t s, size_t e) {
+        size_t first = line_first_sig(s, e);
+        if (first == SIZE_MAX)
             return false;
-        bool starts_header = toks[0].kind == TokenKind::ModuleKeyword ||
-                             toks[0].kind == TokenKind::MacromoduleKeyword ||
-                             toks[0].kind == TokenKind::InterfaceKeyword ||
-                             toks[0].kind == TokenKind::ProgramKeyword ||
-                             toks[0].kind == TokenKind::TaskKeyword ||
-                             toks[0].kind == TokenKind::FunctionKeyword;
-        if (!starts_header || has_header_end(line))
+        bool starts_header = tokens[first].kind == TokenKind::ModuleKeyword ||
+                             tokens[first].kind == TokenKind::MacromoduleKeyword ||
+                             tokens[first].kind == TokenKind::InterfaceKeyword ||
+                             tokens[first].kind == TokenKind::ProgramKeyword ||
+                             tokens[first].kind == TokenKind::TaskKeyword ||
+                             tokens[first].kind == TokenKind::FunctionKeyword;
+        if (!starts_header || line_has_header_end(s, e))
             return false;
-        return has_kind(line, TokenKind::OpenParenthesis) || !has_kind(line, TokenKind::Semicolon) ||
-               has_kind(line, TokenKind::ImportKeyword);
+        return line_has_kind(s, e, TokenKind::OpenParenthesis) ||
+               !line_has_kind(s, e, TokenKind::Semicolon) ||
+               line_has_kind(s, e, TokenKind::ImportKeyword);
     };
-    auto pad = [](std::string s, int w) -> std::string {
-        s.resize(std::max((int)s.size(), w), ' ');
-        return s;
+    auto is_comment_or_blank_line = [&](size_t s, size_t e) {
+        bool saw_comment = false;
+        for (size_t k = s; k < e && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]))
+                continue;
+            if (tok_comment(tokens[k])) {
+                saw_comment = true;
+                continue;
+            }
+            return false;
+        }
+        return saw_comment || line_first_sig(s, e) == SIZE_MAX;
+    };
+    auto is_semi_only_line = [&](size_t s, size_t e) {
+        size_t first = line_first_sig(s, e);
+        if (first == SIZE_MAX || !tok_is(tokens[first], ";", TokenKind::Semicolon))
+            return false;
+        return next_code_sig(tokens, first + 1, e) == SIZE_MAX;
+    };
+    auto is_port_decl_line = [&](size_t s, size_t e) {
+        size_t first = line_first_sig(s, e);
+        return first != SIZE_MAX && is_port_direction_token(tokens[first]);
+    };
+    auto pure_type_id = [&](size_t idx) {
+        return is_identifier(tokens[idx]) && !is_keyword(tokens[idx]);
+    };
+    auto parse_line = [&](size_t s, size_t e, size_t extra_semi) {
+        PortLineParsedTok r;
+        r.line_start = s;
+        r.line_end = e;
+        std::vector<size_t> sigs;
+        for (size_t k = s; k < e && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]) || tok_comment(tokens[k]) || tok_directive(tokens[k]))
+                continue;
+            sigs.push_back(k);
+        }
+        if (extra_semi != SIZE_MAX)
+            sigs.push_back(extra_semi);
+        if (sigs.empty() || !is_port_direction_token(tokens[sigs[0]]))
+            return r;
+        r.direction = sigs[0];
+        r.direction_text = tok_text(tokens[r.direction]);
+
+        size_t term = SIZE_MAX;
+        if (!sigs.empty() && (tok_is(tokens[sigs.back()], ";", TokenKind::Semicolon) ||
+                              tok_is(tokens[sigs.back()], ",", TokenKind::Comma))) {
+            term = sigs.back();
+            sigs.pop_back();
+        }
+        if (sigs.size() < 2)
+            return r;
+
+        size_t si = 1;
+        if (si < sigs.size()) {
+            bool builtin = is_var_builtin_type_token(tokens[sigs[si]]) ||
+                           is_port_net_type_text(tok_text(tokens[sigs[si]]));
+            bool usertype = pure_type_id(sigs[si]) && si + 1 < sigs.size() &&
+                            !tok_is(tokens[sigs[si + 1]], ",", TokenKind::Comma);
+            if ((builtin || usertype) && !is_sign_qualifier_token(tokens[sigs[si]]) &&
+                !tok_is(tokens[sigs[si]], "[", TokenKind::OpenBracket)) {
+                r.dtype_start = sigs[si++];
+                if (is_port_net_type_text(tok_text(tokens[r.dtype_start])) && si < sigs.size() &&
+                    is_port_data_type_text(tok_text(tokens[sigs[si]])))
+                    ++si;
+                while (si + 1 < sigs.size() && tok_text(tokens[sigs[si]]) == "::")
+                    si += 2;
+                r.dtype_end = si < sigs.size() ? sigs[si] : sigs.back() + 1;
+                r.dtype_text = token_join_compact(tokens, r.dtype_start, r.dtype_end);
+            }
+        }
+        if (si < sigs.size() && is_sign_qualifier_token(tokens[sigs[si]])) {
+            r.qualifier = sigs[si++];
+            r.qualifier_text = tok_text(tokens[r.qualifier]);
+        }
+        if (si < sigs.size() && tok_is(tokens[sigs[si]], "[", TokenKind::OpenBracket)) {
+            r.dim_start = sigs[si];
+            int depth = 0;
+            while (si < sigs.size()) {
+                if (tok_is(tokens[sigs[si]], "[", TokenKind::OpenBracket))
+                    ++depth;
+                else if (tok_is(tokens[sigs[si]], "]", TokenKind::CloseBracket))
+                    --depth;
+                ++si;
+                if (depth <= 0)
+                    break;
+            }
+            r.dim_end = si < sigs.size() ? sigs[si] : sigs.back() + 1;
+            r.dim_text = normalize_bracket_spacing(token_join_compact(tokens, r.dim_start, r.dim_end), opts);
+        }
+        if (si >= sigs.size())
+            return r;
+
+        size_t names_first = sigs[si];
+        size_t names_last = sigs.back() + 1;
+        std::vector<std::pair<size_t, size_t>> ranges;
+        size_t range_start = names_first;
+        int paren = 0, bracket = 0, brace = 0;
+        for (size_t k = names_first; k < names_last && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]) || tok_comment(tokens[k]) || tok_directive(tokens[k]))
+                continue;
+            if (tok_is(tokens[k], "(", TokenKind::OpenParenthesis)) ++paren;
+            else if (tok_is(tokens[k], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
+            else if (tok_is(tokens[k], "[", TokenKind::OpenBracket)) ++bracket;
+            else if (tok_is(tokens[k], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
+            else if (tok_is(tokens[k], "{", TokenKind::OpenBrace) || tokens[k].kind == TokenKind::ApostropheOpenBrace) ++brace;
+            else if (tok_is(tokens[k], "}", TokenKind::CloseBrace) && brace > 0) --brace;
+            else if (tok_is(tokens[k], ",", TokenKind::Comma) && paren == 0 && bracket == 0 && brace == 0) {
+                size_t end = prev_code_sig(tokens, range_start, k);
+                if (end != SIZE_MAX && end >= range_start)
+                    ranges.push_back({range_start, end + 1});
+                range_start = next_code_sig(tokens, k + 1, names_last);
+                if (range_start == SIZE_MAX)
+                    break;
+            }
+        }
+        if (range_start != SIZE_MAX) {
+            size_t end = prev_code_sig(tokens, range_start, names_last);
+            if (end != SIZE_MAX && end >= range_start)
+                ranges.push_back({range_start, end + 1});
+        }
+        if (ranges.empty())
+            return r;
+        for (size_t ri = 0; ri < ranges.size(); ++ri) {
+            auto [first, end] = ranges[ri];
+            PortNameSlot slot;
+            slot.name = first;
+            slot.name_text = tok_text(tokens[first]);
+            size_t trail = next_code_sig(tokens, first + 1, end);
+            if (trail != SIZE_MAX) {
+                slot.trail_start = trail;
+                slot.trail_end = end;
+                slot.trail_text = normalize_bracket_spacing(token_join_compact(tokens, trail, end), opts);
+            }
+            if (ri + 1 < ranges.size()) {
+                for (size_t k = end; k < ranges[ri + 1].first && k < tokens.size(); ++k) {
+                    if (tok_whitespace(tokens[k]) || tok_comment(tokens[k]) || tok_directive(tokens[k]))
+                        continue;
+                    if (tok_is(tokens[k], ",", TokenKind::Comma)) {
+                        slot.terminator = k;
+                        break;
+                    }
+                }
+            } else {
+                slot.terminator = term;
+            }
+            r.names.push_back(std::move(slot));
+        }
+        r.valid = !r.names.empty();
+        return r;
     };
 
-    while (i < lines.size()) {
-        if (line_has_pp_conditional(lines[i])) {
-            out.push_back(lines[i++]);
+    auto starts = tok_line_starts(tokens);
+    size_t li = 0;
+    bool module_header_region = false;
+    while (li < starts.size()) {
+        size_t s = starts[li], e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
+        if (token_range_has_pp_conditional(tokens, s, e) || token_range_disabled_or_passthrough(tokens, s, e)) {
+            ++li;
             continue;
         }
         if (module_header_region) {
-            out.push_back(lines[i]);
-            if (has_header_end(lines[i]))
+            if (line_has_header_end(s, e))
                 module_header_region = false;
-            ++i;
+            ++li;
             continue;
         }
-        if (is_header_start_line(lines[i])) {
+        if (is_header_start_line(s, e)) {
             module_header_region = true;
-            out.push_back(lines[i++]);
+            ++li;
             continue;
         }
-        if (!is_port_decl_line((int)i)) {
-            out.push_back(lines[i++]);
+        if (!is_port_decl_line(s, e)) {
+            ++li;
             continue;
         }
 
-        struct PortBlkEntry { std::string orig; std::string port_text; PortParsed parsed; };
-        std::vector<PortBlkEntry> blk;
-        size_t j = i;
-        while (j < lines.size()) {
-            if (line_has_pp_conditional(lines[j]))
+        std::vector<PortLineParsedTok> blk;
+        size_t j = li;
+        while (j < starts.size()) {
+            size_t bs = starts[j], be = (j + 1 < starts.size()) ? starts[j + 1] : tokens.size();
+            if (token_range_has_pp_conditional(tokens, bs, be) || token_range_disabled_or_passthrough(tokens, bs, be))
                 break;
-            if (!is_port_decl_line((int)j)) {
-                if (significant_tokens(lines[j]).empty() || is_standalone_comment(lines[j])) {
-                    blk.push_back({lines[j], lines[j], PortParsed{}});
+            if (!is_port_decl_line(bs, be)) {
+                if (is_comment_or_blank_line(bs, be)) {
                     ++j;
                     continue;
                 }
                 break;
             }
-            std::string fl = lines[j];
-            std::string port_line = lines[j];
-            ++j;
-            if (is_semi_only((int)j)) {
-                port_line += ";";
-                ++j;
+            size_t extra_semi = SIZE_MAX;
+            if (j + 1 < starts.size()) {
+                size_t ns = starts[j + 1], ne = (j + 2 < starts.size()) ? starts[j + 2] : tokens.size();
+                if (is_semi_only_line(ns, ne)) {
+                    extra_semi = line_first_sig(ns, ne);
+                    ++j;
+                }
             }
-            blk.push_back({fl, port_line, parse_port(port_line, opts)});
+            auto parsed = parse_line(bs, be, extra_semi);
+            if (parsed.valid)
+                blk.push_back(std::move(parsed));
+            ++j;
         }
 
         int md = 0, ms2_content = 0, mdim = 0;
         bool has_qualified_type = false;
-        int np = 0;
         size_t max_slots = 0;
-        for (auto& e : blk) {
-            if (!e.parsed.valid)
-                continue;
-            ++np;
-            md = std::max(md, (int)e.parsed.direction.size());
-            std::string s2 = e.parsed.dtype + (e.parsed.qualifier.empty() ? "" : " " + e.parsed.qualifier);
+        for (const auto& p : blk) {
+            md = std::max(md, (int)p.direction_text.size());
+            std::string s2 = p.dtype_text + (p.qualifier_text.empty() ? "" : " " + p.qualifier_text);
             ms2_content = std::max(ms2_content, (int)s2.size());
-            for (const auto& tok : significant_tokens(s2))
-                has_qualified_type = has_qualified_type || tok.kind == TokenKind::DoubleColon;
-            mdim = std::max(mdim, (int)e.parsed.dim.size());
-            max_slots = std::max(max_slots, e.parsed.names.size());
+            has_qualified_type = has_qualified_type || s2.find("::") != std::string::npos;
+            mdim = std::max(mdim, (int)p.dim_text.size());
+            max_slots = std::max(max_slots, p.names.size());
         }
-        if (!np) {
-            for (auto& e : blk)
-                out.push_back(e.orig);
-            i = j;
+        if (blk.empty()) {
+            li = std::max(li + 1, j);
             continue;
         }
 
@@ -8617,148 +8624,132 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
         int pd_s3_min = tab_aligned_width(pd.section3_min_width, opts);
         int pd_s4_min = tab_aligned_width(pd.section4_min_width, opts);
         int pd_s5_min = tab_aligned_width(pd.section5_min_width, opts);
-        int s1 = tab_aligned_width(std::max(pd_s1_min, md + 1), opts);
-        int s2 = ms2_content > 0 ? tab_aligned_width(std::max(pd_s2_min, ms2_content + (has_qualified_type ? 3 : 1)), opts) : 0;
-        int s3 = mdim > 0 ? tab_aligned_width(std::max(pd_s3_min, mdim + 1), opts) : 0;
-        int s5_min = pd_s5_min;
-
+        int s1w = tab_aligned_width(std::max(pd_s1_min, md + 1), opts);
+        int s2w = ms2_content > 0 ? tab_aligned_width(std::max(pd_s2_min, ms2_content + (has_qualified_type ? 3 : 1)), opts) : 0;
+        int s3w = mdim > 0 ? tab_aligned_width(std::max(pd_s3_min, mdim + 1), opts) : 0;
         std::vector<int> id_widths(max_slots, 0), trail_widths(max_slots, 0);
         for (size_t slot = 0; slot < max_slots; ++slot) {
             int max_id = 0, max_tr = 0;
-            for (auto& e : blk) {
-                if (!e.parsed.valid)
-                    continue;
-                if (slot < e.parsed.names.size()) {
-                    max_id = std::max(max_id, (int)e.parsed.names[slot].first.size());
-                    max_tr = std::max(max_tr, (int)e.parsed.names[slot].second.size());
+            for (const auto& p : blk) {
+                if (slot < p.names.size()) {
+                    max_id = std::max(max_id, (int)p.names[slot].name_text.size());
+                    max_tr = std::max(max_tr, (int)p.names[slot].trail_text.size());
                 }
             }
             id_widths[slot] = tab_aligned_width(std::max(pd_s4_min, max_id + 1), opts);
-            trail_widths[slot] = tab_aligned_width(std::max(s5_min, max_tr), opts);
+            trail_widths[slot] = tab_aligned_width(std::max(pd_s5_min, max_tr), opts);
         }
 
-        // In adaptive mode, pre-compute per-line per-slot id widths so that the
-        // absolute comma column aligns across all lines in the block, even though
-        // each line's s1/s2/s3 sections may be different widths.
-        // We do this slot-by-slot: for each slot, track each line's current column
-        // (cur_start), find the global max comma column, assign adjusted widths,
-        // then advance cur_start past this slot using block-wide trail_widths.
         std::vector<std::vector<int>> adaptive_id_widths;
-        if (opts.port_declaration.align_adaptive) {
+        if (pd.align_adaptive) {
             adaptive_id_widths.resize(blk.size());
-            // Compute per-line e3 (column where name section starts)
             std::vector<int> cur_start(blk.size(), 0);
             for (size_t bi = 0; bi < blk.size(); ++bi) {
-                const auto& pp = blk[bi].parsed;
-                if (!pp.valid) continue;
-                std::string tp = pp.dtype + (pp.qualifier.empty() ? "" : " " + pp.qualifier);
+                const auto& p = blk[bi];
+                std::string tp = p.dtype_text + (p.qualifier_text.empty() ? "" : " " + p.qualifier_text);
                 int t1 = pd_s1_min;
-                int t2 = t1 + (s2 > 0 ? pd_s2_min : 0);
-                int t3 = t2 + (s3 > 0 ? pd_s3_min : 0);
-                int e1 = tab_aligned_width(std::max(t1, (int)pp.direction.size() + 1), opts);
+                int t2 = t1 + (s2w > 0 ? pd_s2_min : 0);
+                int t3 = t2 + (s3w > 0 ? pd_s3_min : 0);
+                int e1 = tab_aligned_width(std::max(t1, (int)p.direction_text.size() + 1), opts);
                 int e2 = e1;
-                if (s2 > 0) {
+                if (s2w > 0) {
                     int c2 = tp.empty() ? 0 : (int)tp.size() + 1;
                     e2 = tab_aligned_width(std::max(t2, e1 + c2), opts);
                 }
                 int e3 = e2;
-                if (s3 > 0) {
-                    int c3 = pp.dim.empty() ? 0 : (int)pp.dim.size() + 1;
+                if (s3w > 0) {
+                    int c3 = p.dim_text.empty() ? 0 : (int)p.dim_text.size() + 1;
                     e3 = tab_aligned_width(std::max(t3, e2 + c3), opts);
                 }
                 cur_start[bi] = e3;
             }
-            // Slot-by-slot: align comma columns using each slot's actual start column
             for (size_t slot = 0; slot < max_slots; ++slot) {
                 int global_end = 0;
                 for (size_t bi = 0; bi < blk.size(); ++bi) {
-                    const auto& pp = blk[bi].parsed;
-                    if (!pp.valid || slot >= pp.names.size()) continue;
-                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)pp.names[slot].first.size() + 1), opts);
+                    if (slot >= blk[bi].names.size())
+                        continue;
+                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)blk[bi].names[slot].name_text.size() + 1), opts);
                     global_end = std::max(global_end, cur_start[bi] + nw);
                 }
                 for (size_t bi = 0; bi < blk.size(); ++bi) {
-                    const auto& pp = blk[bi].parsed;
-                    if (!pp.valid || slot >= pp.names.size()) {
+                    if (slot >= blk[bi].names.size()) {
                         adaptive_id_widths[bi].push_back(0);
                         continue;
                     }
-                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)pp.names[slot].first.size() + 1), opts);
+                    int nw = tab_aligned_width(std::max(pd_s4_min, (int)blk[bi].names[slot].name_text.size() + 1), opts);
                     int aw = global_end > cur_start[bi] ? std::max(nw, global_end - cur_start[bi]) : nw;
                     adaptive_id_widths[bi].push_back(aw);
-                    // Advance past this slot: id_width + trail_width + ", " separator
                     cur_start[bi] += aw + trail_widths[slot] + 2;
                 }
             }
         }
 
         for (size_t bi = 0; bi < blk.size(); ++bi) {
-            auto& e = blk[bi];
-            const auto& pp = e.parsed;
-            if (!pp.valid) {
-                out.push_back(e.orig);
-                continue;
-            }
-            int line_s1 = s1, line_s2 = s2, line_s3 = s3;
-            std::vector<int> line_id_widths = id_widths, line_trail_widths = trail_widths;
-            if (opts.port_declaration.align_adaptive) {
-                std::string tp = pp.dtype + (pp.qualifier.empty() ? "" : " " + pp.qualifier);
+            auto& p = blk[bi];
+            int line_s1 = s1w, line_s2 = s2w, line_s3 = s3w;
+            std::vector<int> line_id_widths = id_widths;
+            std::vector<int> line_trail_widths = trail_widths;
+            std::string type_part = p.dtype_text + (p.qualifier_text.empty() ? "" : " " + p.qualifier_text);
+            if (pd.align_adaptive) {
                 int t1 = pd_s1_min;
-                int t2 = t1 + (s2 > 0 ? pd_s2_min : 0);
-                int t3 = t2 + (s3 > 0 ? pd_s3_min : 0);
-                int e1 = tab_aligned_width(std::max(t1, (int)pp.direction.size() + 1), opts);
+                int t2 = t1 + (s2w > 0 ? pd_s2_min : 0);
+                int t3 = t2 + (s3w > 0 ? pd_s3_min : 0);
+                int e1 = tab_aligned_width(std::max(t1, (int)p.direction_text.size() + 1), opts);
                 line_s1 = e1;
                 int e2 = e1;
-                if (s2 > 0) {
-                    int c2 = tp.empty() ? 0 : (int)tp.size() + 1;
+                if (s2w > 0) {
+                    int c2 = type_part.empty() ? 0 : (int)type_part.size() + 1;
                     e2 = tab_aligned_width(std::max(t2, e1 + c2), opts);
                     line_s2 = e2 - e1;
                 }
-                if (s3 > 0) {
-                    int c3 = pp.dim.empty() ? 0 : (int)pp.dim.size() + 1;
+                if (s3w > 0) {
+                    int c3 = p.dim_text.empty() ? 0 : (int)p.dim_text.size() + 1;
                     int e3 = tab_aligned_width(std::max(t3, e2 + c3), opts);
                     line_s3 = e3 - e2;
                 }
-                // Use pre-computed slot-aligned id widths; keep block-wide trail widths
                 if (bi < adaptive_id_widths.size())
                     line_id_widths = adaptive_id_widths[bi];
-                line_trail_widths = trail_widths;
             }
 
-            std::string line = pp.indent;
-            line += pad(pp.direction, line_s1);
-            if (line_s2 > 0) {
-                std::string tp = pp.dtype + (pp.qualifier.empty() ? "" : " " + pp.qualifier);
-                line += pad(tp, line_s2);
-            }
-            if (line_s3 > 0)
-                line += pad(pp.dim, line_s3);
-            size_t nslots = pp.names.size();
-            for (size_t slot = 0; slot < nslots; ++slot) {
-                bool is_last = slot == nslots - 1;
-                const auto& nm = pp.names[slot].first;
-                const auto& tr = pp.names[slot].second;
-                line += slot < line_id_widths.size() ? pad(nm, line_id_widths[slot]) : nm;
-                if (!is_last) {
-                    line += (slot < line_trail_widths.size() ? pad(tr, line_trail_widths[slot]) : tr) + ", ";
+            if (p.dtype_start != SIZE_MAX || p.qualifier != SIZE_MAX) {
+                size_t type_first = p.dtype_start != SIZE_MAX ? p.dtype_start : p.qualifier;
+                tokens[type_first].fmt_spaces_before = std::max(1, line_s1 - (int)p.direction_text.size());
+                if (p.dim_start != SIZE_MAX) {
+                    tokens[p.dim_start].fmt_spaces_before = std::max(1, line_s2 - (int)type_part.size());
+                    tokens[p.names[0].name].fmt_spaces_before = std::max(1, line_s3 - (int)p.dim_text.size());
                 } else {
-                    std::string term = pp.terminator.empty() ? ";" : pp.terminator;
-                    line += slot < line_trail_widths.size() ? pad(tr, line_trail_widths[slot]) : tr;
-                    line += term;
+                    tokens[p.names[0].name].fmt_spaces_before = std::max(1, line_s2 - (int)type_part.size()) + (line_s3 > 0 ? line_s3 : 0);
+                }
+            } else if (p.dim_start != SIZE_MAX) {
+                tokens[p.dim_start].fmt_spaces_before = std::max(1, line_s1 - (int)p.direction_text.size()) + (line_s2 > 0 ? line_s2 : 0);
+                tokens[p.names[0].name].fmt_spaces_before = std::max(1, line_s3 - (int)p.dim_text.size());
+            } else {
+                tokens[p.names[0].name].fmt_spaces_before = std::max(1, line_s1 - (int)p.direction_text.size()) +
+                                                            (line_s2 > 0 ? line_s2 : 0) + (line_s3 > 0 ? line_s3 : 0);
+            }
+
+            for (size_t slot = 0; slot < p.names.size(); ++slot) {
+                const auto& nm = p.names[slot];
+                if (slot > 0)
+                    tokens[nm.name].fmt_spaces_before = 1;
+                if (nm.trail_start != SIZE_MAX) {
+                    int idw = slot < line_id_widths.size() ? line_id_widths[slot] : (int)nm.name_text.size() + 1;
+                    tokens[nm.trail_start].fmt_spaces_before = std::max(0, idw - (int)nm.name_text.size());
+                }
+                if (nm.terminator != SIZE_MAX) {
+                    int idw = slot < line_id_widths.size() ? line_id_widths[slot] : (int)nm.name_text.size() + 1;
+                    int trailw = slot < line_trail_widths.size() ? line_trail_widths[slot] : 0;
+                    int pad = nm.trail_text.empty()
+                                  ? std::max(0, idw - (int)nm.name_text.size() + trailw)
+                                  : std::max(0, trailw - (int)nm.trail_text.size());
+                    tokens[nm.terminator].fmt_newline_before = false;
+                    tokens[nm.terminator].fmt_spaces_before = pad;
                 }
             }
-            if (!pp.comment.empty())
-                line += pp.comment;
-            while (!line.empty() && line.back() == ' ')
-                line.pop_back();
-            out.push_back(line);
         }
-        i = j;
+        li = j;
     }
-
-    tokens = tokens_from_formatted_text(join_lines(out), opts);
 }
-
 
 static size_t matching_close_token(const std::vector<Tok>& tokens, size_t open_idx,
                                    size_t end_limit, const std::string& open_text,
@@ -9138,9 +9129,15 @@ static PPContext build_pp_context(const std::vector<Tok>& tokens, const FormatOp
         size_t s = starts[li], e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
         ctx.lines[li].depth_before = depth;
         bool is_if = false, is_endif = false, is_cond = false;
-        size_t first = next_code_sig(tokens, s, e);
-        if (first != SIZE_MAX && ((is_line_directive(tokens[first]) && is_pp_conditional(tok_directive_kind(tokens[first]))) ||
-                                  is_pp_conditional_text(tok_text(tokens[first])))) {
+        size_t first = SIZE_MAX;
+        for (size_t k = s; k < e && k < tokens.size(); ++k) {
+            if (!tok_whitespace(tokens[k]) && !tok_comment(tokens[k])) {
+                first = k;
+                break;
+            }
+        }
+        if (first != SIZE_MAX && is_line_directive(tokens[first]) &&
+            is_pp_conditional(tok_directive_kind(tokens[first]))) {
             is_cond = true;
             auto kind = tok_directive_kind(tokens[first]);
             is_if = kind == syntax::SyntaxKind::IfDefDirective || kind == syntax::SyntaxKind::IfNDefDirective;
