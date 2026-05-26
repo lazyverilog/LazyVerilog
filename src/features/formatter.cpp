@@ -71,7 +71,20 @@ struct Tok {
     // Populated before basic_formatting() for structural facts reused by later
     // passes. These fields must not directly affect render_tokens(); rendering is
     // controlled only by fmt_* fields below.
+    size_t matching_token{SIZE_MAX};
+    size_t stmt_end{SIZE_MAX};
+    bool is_pp_conditional_directive{false};
+    bool in_pp_conditional_line_tail{false};
+    bool stmt_has_pp_conditional{false};
+    bool stmt_has_define_block{false};
     bool in_modport{false};
+    bool in_covergroup{false};
+    bool in_function_decl{false};
+    bool in_task_decl{false};
+    bool in_module_header{false};
+    bool in_interface_header{false};
+    bool in_program_header{false};
+    bool in_class_decl{false};
 
     // --- Mutable formatting metadata (set/updated by passes) ---
     int fmt_indent{0};            // indentation level at this token
@@ -1787,7 +1800,8 @@ static bool token_range_has_pp_conditional(const std::vector<Tok>& tokens, size_
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
             continue;
-        if (is_line_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i])))
+        if (tokens[i].is_pp_conditional_directive ||
+            (is_line_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i]))))
             return true;
     }
     return false;
@@ -1841,6 +1855,10 @@ static size_t prev_code_sig(const std::vector<Tok>& tokens, size_t first, size_t
 
 static size_t matching_close_paren(const std::vector<Tok>& tokens, size_t open_idx,
                                    size_t end_limit) {
+    if (open_idx < tokens.size() && tok_is(tokens[open_idx], "(", TokenKind::OpenParenthesis) &&
+        tokens[open_idx].matching_token != SIZE_MAX && tokens[open_idx].matching_token < end_limit)
+        return tokens[open_idx].matching_token;
+
     int depth = 0;
     for (size_t i = open_idx; i < end_limit && i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
@@ -3543,6 +3561,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
     bool struct_pend = false;
     bool enum_pend = false;
     bool constraint_pend = false;
+    bool coverpoint_brace_pend = false;
     int constraint_depth = 0;
 
     // case handling needs to distinguish the case expression, case item labels,
@@ -4284,7 +4303,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 indent_stack.pop_back();
             indent_level = std::max(0, indent_level - delta);
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace) && !brace_stk.empty() &&
-                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint" || brace_stk.back() == "enum")) {
+                   (brace_stk.back() == "struct" || brace_stk.back() == "constraint" ||
+                    brace_stk.back() == "enum" || brace_stk.back() == "coverpoint")) {
             int delta = indent_stack.empty() ? 1 : indent_stack.back();
             if (!indent_stack.empty())
                 indent_stack.pop_back();
@@ -4441,7 +4461,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 indent_level += delta;
                 indent_stack.push_back(delta);
                 if (is_block_open(tok.kind) && tok.kind != TokenKind::CaseKeyword &&
-                    tok.kind != TokenKind::CaseXKeyword && tok.kind != TokenKind::CaseZKeyword)
+                    tok.kind != TokenKind::CaseXKeyword && tok.kind != TokenKind::CaseZKeyword &&
+                    tok.kind != TokenKind::CoverGroupKeyword)
                     pending_nl = true;
             } else if (is_indent_close(tok.kind)) {
                 pending_nl = true;
@@ -4449,12 +4470,21 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 struct_pend = true;
             } else if (tok.kind == TokenKind::EnumKeyword) {
                 enum_pend = true;
+            } else if (tokens[i].in_covergroup &&
+                       (tok.kind == TokenKind::CoverPointKeyword ||
+                        tok.kind == TokenKind::CrossKeyword)) {
+                coverpoint_brace_pend = true;
             }
         } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
-            if (struct_pend || enum_pend || constraint_pend || (constraint_depth > 0 && single_stmt_pending)) {
+            bool coverpoint_body_brace = coverpoint_brace_pend && paren_depth == 0;
+            if (struct_pend || enum_pend || constraint_pend || coverpoint_body_brace ||
+                (constraint_depth > 0 && single_stmt_pending)) {
                 bool is_constraint_brace = constraint_pend || (constraint_depth > 0 && single_stmt_pending);
                 bool is_enum_brace = enum_pend && !is_constraint_brace;
-                brace_stk.push_back(is_constraint_brace ? "constraint" : (is_enum_brace ? "enum" : "struct"));
+                bool is_coverpoint_brace = coverpoint_body_brace && !is_constraint_brace && !is_enum_brace;
+                brace_stk.push_back(is_constraint_brace ? "constraint" :
+                                    (is_enum_brace ? "enum" :
+                                     (is_coverpoint_brace ? "coverpoint" : "struct")));
                 pending_nl = true;
                 indent_level += 1;
                 indent_stack.push_back(1);
@@ -4468,6 +4498,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             }
             struct_pend = false;
             enum_pend = false;
+            coverpoint_brace_pend = false;
         } else if (is_close_group(tok) && tok_is(tok, "}", TokenKind::CloseBrace)) {
             if (!brace_stk.empty()) {
                 if (brace_stk.back() == "constraint") {
@@ -4476,12 +4507,15 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 } else if (brace_stk.back() == "enum") {
                     tok.fmt_newline_before = true;
                     tok.fmt_blank_lines = 0;
+                } else if (brace_stk.back() == "coverpoint") {
+                    pending_nl = true;
                 }
                 brace_stk.pop_back();
             }
         } else if (tok_is(tok, ";", TokenKind::Semicolon)) {
             in_import_export_decl = false;
             in_extern_decl = false;
+            coverpoint_brace_pend = false;
             bool in_for_header_now =
                 std::any_of(for_header_stack.begin(), for_header_stack.end(),
                             [](bool v) { return v; });
@@ -5020,6 +5054,11 @@ static size_t matching_close_token(const std::vector<Tok>& tokens, size_t open_i
                                    size_t end_limit, const std::string& open_text,
                                    const std::string& close_text, TokenKind open_kind,
                                    TokenKind close_kind) {
+    if (open_idx < tokens.size() && tok_is(tokens[open_idx], open_text, open_kind) &&
+        tokens[open_idx].matching_token != SIZE_MAX && tokens[open_idx].matching_token < end_limit &&
+        tok_is(tokens[tokens[open_idx].matching_token], close_text, close_kind))
+        return tokens[open_idx].matching_token;
+
     int depth = 0;
     for (size_t i = open_idx; i < end_limit && i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
@@ -5089,6 +5128,9 @@ static int token_range_width_compact(const std::vector<Tok>& tokens, size_t firs
 }
 
 static size_t statement_end_semicolon(const std::vector<Tok>& tokens, size_t start) {
+    if (start < tokens.size() && tokens[start].stmt_end != SIZE_MAX)
+        return tokens[start].stmt_end;
+
     int paren = 0, bracket = 0, brace = 0;
     for (size_t i = start; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
@@ -5106,21 +5148,163 @@ static size_t statement_end_semicolon(const std::vector<Tok>& tokens, size_t sta
 }
 
 static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
-    for (auto& tok : tokens)
+    for (auto& tok : tokens) {
+        tok.matching_token = SIZE_MAX;
+        tok.stmt_end = SIZE_MAX;
+        tok.is_pp_conditional_directive = false;
+        tok.in_pp_conditional_line_tail = false;
+        tok.stmt_has_pp_conditional = false;
+        tok.stmt_has_define_block = false;
         tok.in_modport = false;
+        tok.in_covergroup = false;
+        tok.in_function_decl = false;
+        tok.in_task_decl = false;
+        tok.in_module_header = false;
+        tok.in_interface_header = false;
+        tok.in_program_header = false;
+        tok.in_class_decl = false;
+    }
+
+    std::vector<size_t> parens;
+    std::vector<size_t> brackets;
+    std::vector<size_t> braces;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
+            continue;
+        if (tok_is(tokens[i], "(", TokenKind::OpenParenthesis))
+            parens.push_back(i);
+        else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && !parens.empty()) {
+            size_t open = parens.back();
+            parens.pop_back();
+            tokens[open].matching_token = i;
+            tokens[i].matching_token = open;
+        } else if (tok_is(tokens[i], "[", TokenKind::OpenBracket))
+            brackets.push_back(i);
+        else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && !brackets.empty()) {
+            size_t open = brackets.back();
+            brackets.pop_back();
+            tokens[open].matching_token = i;
+            tokens[i].matching_token = open;
+        } else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
+                   tokens[i].kind == TokenKind::ApostropheOpenBrace)
+            braces.push_back(i);
+        else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && !braces.empty()) {
+            size_t open = braces.back();
+            braces.pop_back();
+            tokens[open].matching_token = i;
+            tokens[i].matching_token = open;
+        }
+    }
+
+    bool pp_tail = false;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (pp_tail)
+            tokens[i].in_pp_conditional_line_tail = true;
+
+        if (is_line_directive(tokens[i]) && is_pp_conditional(tok_directive_kind(tokens[i]))) {
+            tokens[i].is_pp_conditional_directive = true;
+            tokens[i].in_pp_conditional_line_tail = false;
+            pp_tail = tok_text(tokens[i]).find('\n') == std::string::npos;
+            continue;
+        }
+
+        if (pp_tail && tok_whitespace(tokens[i]) && tok_text(tokens[i]).find('\n') != std::string::npos) {
+            pp_tail = false;
+            tokens[i].in_pp_conditional_line_tail = false;
+        }
+    }
+
+    size_t stmt_start = 0;
+    int paren = 0, bracket = 0, brace = 0;
+    auto mark_stmt = [&](size_t first, size_t semi) {
+        bool has_pp = false;
+        bool has_define = false;
+        for (size_t k = first; k <= semi && k < tokens.size(); ++k) {
+            if (tok_whitespace(tokens[k]))
+                continue;
+            has_pp = has_pp || tokens[k].is_pp_conditional_directive;
+            has_define = has_define || tok_define_block(tokens[k]);
+        }
+        for (size_t k = first; k <= semi && k < tokens.size(); ++k) {
+            tokens[k].stmt_end = semi;
+            tokens[k].stmt_has_pp_conditional = has_pp;
+            tokens[k].stmt_has_define_block = has_define;
+        }
+    };
 
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].kind != TokenKind::ModPortKeyword)
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
             continue;
+        if (tok_is(tokens[i], "(", TokenKind::OpenParenthesis)) ++paren;
+        else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
+        else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
+        else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
+        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
+                 tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+        else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
+        else if (tok_is(tokens[i], ";", TokenKind::Semicolon) && paren == 0 &&
+                 bracket == 0 && brace == 0) {
+            mark_stmt(stmt_start, i);
+            stmt_start = i + 1;
+        }
+    }
 
+    auto mark_range = [&](size_t first, size_t last, auto member) {
+        for (size_t k = first; k <= last && k < tokens.size(); ++k)
+            tokens[k].*member = true;
+    };
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind == TokenKind::ModPortKeyword) {
+            size_t semi = statement_end_semicolon(tokens, i);
+            if (semi != SIZE_MAX) {
+                mark_range(i, semi, &Tok::in_modport);
+                i = semi;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind != TokenKind::CoverGroupKeyword)
+            continue;
+        size_t end = SIZE_MAX;
+        for (size_t j = i + 1; j < tokens.size(); ++j) {
+            if (tokens[j].kind == TokenKind::EndGroupKeyword) {
+                end = j;
+                break;
+            }
+        }
+        if (end != SIZE_MAX) {
+            mark_range(i, end, &Tok::in_covergroup);
+            i = end;
+        }
+    }
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
         size_t semi = statement_end_semicolon(tokens, i);
         if (semi == SIZE_MAX)
             continue;
 
-        for (size_t k = i; k <= semi && k < tokens.size(); ++k)
-            tokens[k].in_modport = true;
-
-        i = semi;
+        if (tokens[i].kind == TokenKind::FunctionKeyword) {
+            mark_range(i, semi, &Tok::in_function_decl);
+            i = semi;
+        } else if (tokens[i].kind == TokenKind::TaskKeyword) {
+            mark_range(i, semi, &Tok::in_task_decl);
+            i = semi;
+        } else if (tokens[i].kind == TokenKind::ModuleKeyword ||
+                   tokens[i].kind == TokenKind::MacromoduleKeyword) {
+            mark_range(i, semi, &Tok::in_module_header);
+            i = semi;
+        } else if (tokens[i].kind == TokenKind::InterfaceKeyword) {
+            mark_range(i, semi, &Tok::in_interface_header);
+            i = semi;
+        } else if (tokens[i].kind == TokenKind::ProgramKeyword) {
+            mark_range(i, semi, &Tok::in_program_header);
+            i = semi;
+        } else if (tokens[i].kind == TokenKind::ClassKeyword) {
+            mark_range(i, semi, &Tok::in_class_decl);
+            i = semi;
+        }
     }
 }
 
@@ -5130,8 +5314,8 @@ static void format_enum_declaration_pass(std::vector<Tok>& tokens, const FormatO
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
             tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].kind != TokenKind::TypedefKeyword)
             continue;
-        size_t semi = statement_end_semicolon(tokens, i);
-        if (semi == SIZE_MAX || token_range_has_pp_conditional(tokens, i, semi + 1) ||
+        size_t semi = tokens[i].stmt_end;
+        if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
             token_range_disabled_or_passthrough(tokens, i, semi + 1))
             continue;
         size_t enum_i = SIZE_MAX, open = SIZE_MAX;
@@ -5251,8 +5435,8 @@ static void format_modport_pass(std::vector<Tok>& tokens, const FormatOptions& o
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
             tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].kind != TokenKind::ModPortKeyword)
             continue;
-        size_t semi = statement_end_semicolon(tokens, i);
-        if (semi == SIZE_MAX || token_range_has_pp_conditional(tokens, i, semi + 1) ||
+        size_t semi = tokens[i].stmt_end;
+        if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
             token_range_disabled_or_passthrough(tokens, i, semi + 1))
             continue;
         auto modports = top_level_ranges_between(tokens, next_code_sig(tokens, i + 1, semi), semi);
@@ -5354,32 +5538,16 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon))
             continue;
 
-        // Slang tokenizes a conditional directive line like "`ifdef A" as a
-        // directive token followed by ordinary tokens for the condition text.
-        // For instance port splitting, the entire directive line is structural
-        // trivia; otherwise "A" becomes the start of a bogus port range and the
-        // pass refuses to align any connection in the instance.
-        std::vector<bool> ignore(tokens.size(), false);
-        bool skip_pp_line = false;
-        for (size_t k = open + 1; k < close && k < tokens.size(); ++k) {
-            if (skip_pp_line) {
-                ignore[k] = true;
-                if (tok_whitespace(tokens[k]) &&
-                    tok_text(tokens[k]).find('\n') != std::string::npos)
-                    skip_pp_line = false;
-                continue;
-            }
-            if (is_line_directive(tokens[k]) && is_pp_conditional(tok_directive_kind(tokens[k]))) {
-                ignore[k] = true;
-                skip_pp_line = tok_text(tokens[k]).find('\n') == std::string::npos;
-            }
-        }
+        auto pp_conditional_line_token = [&](size_t k) {
+            return tokens[k].is_pp_conditional_directive || tokens[k].in_pp_conditional_line_tail;
+        };
 
         bool protected_range = false;
         for (size_t k = i; k <= semi && k < tokens.size(); ++k) {
             if (tok_whitespace(tokens[k]))
                 continue;
-            if (tokens[k].fmt_disabled || (tokens[k].fmt_passthrough && !ignore[k])) {
+            if (tokens[k].fmt_disabled ||
+                (tokens[k].fmt_passthrough && !pp_conditional_line_token(k))) {
                 protected_range = true;
                 break;
             }
@@ -5388,8 +5556,8 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
             continue;
 
         auto ignored_or_trivia = [&](size_t k) {
-            return ignore[k] || tok_whitespace(tokens[k]) || tok_comment(tokens[k]) ||
-                   tok_directive(tokens[k]);
+            return pp_conditional_line_token(k) || tok_whitespace(tokens[k]) ||
+                   tok_comment(tokens[k]) || tok_directive(tokens[k]);
         };
         auto next_sig = [&](size_t first, size_t end) {
             for (size_t k = first; k < end && k < tokens.size(); ++k)
@@ -5408,6 +5576,9 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
             return SIZE_MAX;
         };
         auto matching_paren = [&](size_t op, size_t end) {
+            if (op < tokens.size() && tokens[op].matching_token != SIZE_MAX &&
+                tokens[op].matching_token < end)
+                return tokens[op].matching_token;
             int depth = 0;
             for (size_t k = op; k < end && k < tokens.size(); ++k) {
                 if (ignored_or_trivia(k))
@@ -5683,10 +5854,10 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
         if (tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].in_modport ||
             tok_define_block(tokens[i]) || tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
             continue;
-        size_t semi = statement_end_semicolon(tokens, i);
-        if (semi == SIZE_MAX || token_range_has_pp_conditional(tokens, i, semi + 1) ||
+        size_t semi = tokens[i].stmt_end;
+        if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
             token_range_disabled_or_passthrough(tokens, i, semi + 1) ||
-            token_range_has_define_block(tokens, i, semi + 1))
+            tokens[i].stmt_has_define_block)
             continue;
         size_t name, open, close;
         if (find_simple_call_tokens(tokens, i, semi + 1, name, open, close, true) == SIZE_MAX ||
@@ -5748,10 +5919,8 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
         if (find_simple_call_tokens(tokens, s, e, name, open, close, false) == SIZE_MAX ||
             !is_format_function_call_name(tokens[name], macro_classifier))
             continue;
-        bool decl_prefix = false;
-        for (size_t k = s; k < name; ++k)
-            decl_prefix = decl_prefix || tokens[k].kind == TokenKind::FunctionKeyword || tokens[k].kind == TokenKind::TaskKeyword || tokens[k].kind == TokenKind::ModuleKeyword || tokens[k].kind == TokenKind::ClassKeyword;
-        if (decl_prefix)
+        if (tokens[name].in_function_decl || tokens[name].in_task_decl ||
+            tokens[name].in_module_header || tokens[name].in_class_decl)
             continue;
         auto args = function_arg_ranges_between(tokens, open + 1, close);
         bool has_macro_arg = false;
@@ -5787,7 +5956,6 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
 }
 
 static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
-    int cover_depth = 0;
     int brace_depth = 0;
     int cover_base = 0;
     auto coverpoint_block_open = [&](size_t coverpoint, size_t limit) -> size_t {
@@ -5874,9 +6042,8 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
             continue;
         if (tokens[i].kind == TokenKind::CoverGroupKeyword) {
-            cover_depth++;
             cover_base = tokens[i].fmt_indent;
-            size_t semi = statement_end_semicolon(tokens, i);
+            size_t semi = tokens[i].stmt_end;
             if (semi != SIZE_MAX) {
                 size_t first_after = next_code_sig(tokens, i + 1, semi);
                 for (size_t j = i + 1; j < semi && j < tokens.size(); ++j) {
@@ -5890,9 +6057,8 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
             }
         } else if (tokens[i].kind == TokenKind::EndGroupKeyword) {
             tokens[i].fmt_indent = cover_base;
-            cover_depth = std::max(0, cover_depth - 1);
             brace_depth = 0;
-        } else if (cover_depth > 0 &&
+        } else if (tokens[i].in_covergroup &&
                    (tokens[i].kind == TokenKind::CoverPointKeyword ||
                     tokens[i].kind == TokenKind::CrossKeyword) &&
                    !tokens[i].fmt_disabled && !tokens[i].fmt_passthrough) {
@@ -5907,7 +6073,8 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
                     continue;
                 }
             }
-        } else if (cover_depth > 0 && !tokens[i].fmt_disabled && !tokens[i].fmt_passthrough) {
+        } else if (tokens[i].in_covergroup && !tokens[i].fmt_disabled &&
+                   !tokens[i].fmt_passthrough) {
             bool close_brace = tok_is(tokens[i], "}", TokenKind::CloseBrace);
             if (tokens[i].fmt_newline_before) {
                 int d = brace_depth - (close_brace ? 1 : 0);
