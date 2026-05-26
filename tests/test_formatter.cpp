@@ -394,6 +394,34 @@ TEST_CASE("formatter: function calls inside if conditions use configured layout"
                                  "endmodule\n");
 }
 
+TEST_CASE("formatter: block function call in indented if condition keeps nested indent",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.function.break_policy = "always";
+    opts.function.layout = "block";
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    CHECK(format_source("module top;\n"
+                        "always_comb begin\n"
+                        "if(add_number(.a(a), .b(b), .result(result))) begin\n"
+                        "a = 3;\n"
+                        "end\n"
+                        "end\n"
+                        "endmodule\n",
+                        opts) == "module top;\n"
+                                 "always_comb begin\n"
+                                 "    if (add_number(\n"
+                                 "            .a(a),\n"
+                                 "            .b(b),\n"
+                                 "            .result(result)\n"
+                                 "        )) begin\n"
+                                 "        a = 3;\n"
+                                 "    end\n"
+                                 "end\n"
+                                 "endmodule\n");
+}
+
 TEST_CASE("formatter: function calls support hanging layout", "[formatter]") {
     FormatOptions opts;
     opts.function.break_policy = "always";
@@ -403,6 +431,29 @@ TEST_CASE("formatter: function calls support hanging layout", "[formatter]") {
           "result = my_func(arg1,\n"
           "                 arg2,\n"
           "                 arg3);\n");
+}
+
+TEST_CASE("formatter: multiline function calls use hanging indentation", "[formatter]") {
+    FormatOptions opts;
+    opts.function.break_policy = "always";
+    opts.function.layout = "hanging";
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    CHECK(format_source("module top;\n"
+                        "always_comb begin\n"
+                        "$display(\"arr[%0d]  = %0d\",\n"
+                        "i,\n"
+                        "arr[i]);\n"
+                        "end\n"
+                        "endmodule\n",
+                        opts) == "module top;\n"
+                                 "always_comb begin\n"
+                                 "    $display(\"arr[%0d]  = %0d\",\n"
+                                 "             i,\n"
+                                 "             arr[i]);\n"
+                                 "end\n"
+                                 "endmodule\n");
 }
 
 TEST_CASE("formatter: var declaration initializers not aligned by statement pass", "[formatter]") {
@@ -491,6 +542,45 @@ TEST_CASE("formatter: macro calls with empty arguments are preserved", "[formatt
     std::string formatted;
     REQUIRE_NOTHROW(formatted = format_source(src, opts));
     CHECK(formatted.find("`DV_CHECK_FATAL(expr, , msg_id)") != std::string::npos);
+}
+
+TEST_CASE("formatter: function-like macro call without semicolon is formatted", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.function.break_policy = "always";
+    opts.function.layout = "hanging";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source("module top;\n"
+                                              "initial begin\n"
+                                              "`print_bytes(1, 2, 3)\n"
+                                              "end\n"
+                                              "endmodule\n",
+                                              opts));
+    CHECK(formatted.find("`print_bytes(1,\n                 2,\n                 3)") !=
+          std::string::npos);
+}
+
+TEST_CASE("formatter: object-like macro argument is a function call argument", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.function.break_policy = "auto";
+    opts.function.arg_count = 3;
+    opts.function.layout = "hanging";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source("module top;\n"
+                                              "initial begin\n"
+                                              "add_number(a, `WIDTH,\n"
+                                              "           c);\n"
+                                              "end\n"
+                                              "endmodule\n",
+                                              opts));
+    CHECK(formatted.find("add_number(a,\n"
+                         "               `WIDTH,\n"
+                         "               c);") != std::string::npos);
 }
 
 

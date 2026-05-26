@@ -1418,6 +1418,20 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
                 cursor = std::max(cursor, end);
                 continue;
             }
+            if ((token.kind == TokenKind::MacroUsage ||
+                 (token.kind == TokenKind::Directive &&
+                  token.directiveKind() == syntax::SyntaxKind::MacroUsage)) &&
+                !token_define_block) {
+                size_t name_end = off + 1;
+                while (name_end < source.size() &&
+                       (std::isalnum((unsigned char)source[name_end]) ||
+                        source[name_end] == '_' || source[name_end] == '$'))
+                    ++name_end;
+                push_tok(toks, token.kind, source.substr(off, name_end - off), (int)off,
+                         false, false, true, token.directiveKind(), token_define_block);
+                cursor = std::max(cursor, name_end);
+                continue;
+            }
         }
         if (!raw.empty() && std::isdigit((unsigned char)raw[0])) {
             size_t end = off + raw.size();
@@ -1782,6 +1796,15 @@ static bool token_range_disabled_or_passthrough(const std::vector<Tok>& tokens, 
     return false;
 }
 
+static bool token_range_has_define_block(const std::vector<Tok>& tokens, size_t first,
+                                         size_t end) {
+    for (size_t i = first; i < end && i < tokens.size(); ++i) {
+        if (!tok_whitespace(tokens[i]) && tok_define_block(tokens[i]))
+            return true;
+    }
+    return false;
+}
+
 static std::vector<size_t> code_sig_indices(const std::vector<Tok>& tokens, size_t first,
                                             size_t end) {
     std::vector<size_t> out;
@@ -1954,7 +1977,8 @@ struct HeaderPortEntry {
 static std::string token_join_compact(const std::vector<Tok>& tokens, size_t first, size_t end) {
     std::string out;
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
-        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) ||
+            (tok_directive(tokens[i]) && !is_macro_usage(tokens[i])))
             continue;
         if (!out.empty() && tok_text(tokens[i]) != "]" && tok_text(tokens[i]) != ")" &&
             tok_text(tokens[i]) != "," && tok_text(tokens[i]) != ";" && tok_text(tokens[i]) != ":" &&
@@ -5453,9 +5477,39 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
 }
 
 
+static int rendered_column_after_token(const std::vector<Tok>& tokens, size_t line_start,
+                                       size_t token_idx, const FormatOptions& opts) {
+    int col = 0;
+    for (size_t i = line_start; i <= token_idx && i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]))
+            continue;
+        if (i == line_start || tokens[i].fmt_newline_before)
+            col = tokens[i].fmt_indent * std::max(0, opts.indent_size);
+        col += tokens[i].fmt_spaces_before;
+        col += (int)tok_text(tokens[i]).size();
+    }
+    return col;
+}
+
+static void column_to_indent_spaces(int col, const FormatOptions& opts, int& indent,
+                                    int& spaces) {
+    int indent_size = std::max(0, opts.indent_size);
+    if (indent_size > 0) {
+        indent = col / indent_size;
+        spaces = col - indent * indent_size;
+    } else {
+        indent = 0;
+        spaces = col;
+    }
+}
+
+static std::vector<std::pair<size_t, size_t>> function_arg_ranges_between(
+    const std::vector<Tok>& tokens, size_t first, size_t last);
+
 static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size_t close,
-                                     int base_indent, int hanging_indent, bool hanging) {
-    auto args = top_level_ranges_between(tokens, open + 1, close);
+                                     int base_indent, int hanging_indent, bool hanging,
+                                     int hanging_spaces = 0, int block_base_spaces = 0) {
+    auto args = function_arg_ranges_between(tokens, open + 1, close);
     if (args.empty())
         return;
     if (hanging) {
@@ -5465,7 +5519,7 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
             tokens[args[k].first].fmt_newline_before = true;
             tokens[args[k].first].fmt_blank_lines = 0;
             tokens[args[k].first].fmt_indent = hanging_indent;
-            tokens[args[k].first].fmt_spaces_before = 0;
+            tokens[args[k].first].fmt_spaces_before = hanging_spaces;
         }
         tokens[close].fmt_newline_before = false;
         tokens[close].fmt_spaces_before = 0;
@@ -5474,12 +5528,12 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
             tokens[r.first].fmt_newline_before = true;
             tokens[r.first].fmt_blank_lines = 0;
             tokens[r.first].fmt_indent = base_indent + 1;
-            tokens[r.first].fmt_spaces_before = 0;
+            tokens[r.first].fmt_spaces_before = block_base_spaces;
         }
         tokens[close].fmt_newline_before = true;
         tokens[close].fmt_blank_lines = 0;
         tokens[close].fmt_indent = base_indent;
-        tokens[close].fmt_spaces_before = 0;
+        tokens[close].fmt_spaces_before = block_base_spaces;
     }
     for (auto r : args) {
         size_t comma = find_top_level_token(tokens, r.second, close, ",", TokenKind::Comma);
@@ -5488,16 +5542,86 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
     }
 }
 
-static size_t find_simple_call_tokens(const std::vector<Tok>& tokens, size_t first, size_t end,
-                                      size_t& name, size_t& open, size_t& close) {
+static bool function_arg_skip_token(const Tok& tok) {
+    return tok_whitespace(tok) || tok_comment(tok) || (tok_directive(tok) && !is_macro_usage(tok));
+}
+
+static size_t next_function_arg_sig(const std::vector<Tok>& tokens, size_t first,
+                                    size_t end) {
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
-        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
+        if (!function_arg_skip_token(tokens[i]))
+            return i;
+    }
+    return SIZE_MAX;
+}
+
+static size_t prev_function_arg_sig(const std::vector<Tok>& tokens, size_t first,
+                                    size_t before) {
+    if (before > tokens.size())
+        before = tokens.size();
+    for (size_t i = before; i > first; --i) {
+        size_t idx = i - 1;
+        if (!function_arg_skip_token(tokens[idx]))
+            return idx;
+    }
+    return SIZE_MAX;
+}
+
+static std::vector<std::pair<size_t, size_t>> function_arg_ranges_between(
+    const std::vector<Tok>& tokens, size_t first, size_t last) {
+    std::vector<std::pair<size_t, size_t>> ranges;
+    size_t start = next_function_arg_sig(tokens, first, last);
+    int paren = 0, bracket = 0, brace = 0;
+    for (size_t i = first; i < last && i < tokens.size(); ++i) {
+        if (function_arg_skip_token(tokens[i]))
             continue;
-        bool callable = is_identifier(tokens[i]) || starts_with_chars(tok_text(tokens[i]), '`');
+        if (tok_is(tokens[i], "(", TokenKind::OpenParenthesis)) ++paren;
+        else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
+        else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
+        else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
+        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
+                 tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+        else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
+        else if (tok_is(tokens[i], ",", TokenKind::Comma) && paren == 0 &&
+                 bracket == 0 && brace == 0) {
+            size_t end = prev_function_arg_sig(tokens, start, i);
+            if (start != SIZE_MAX && end != SIZE_MAX && end < i)
+                ranges.push_back({start, i});
+            start = next_function_arg_sig(tokens, i + 1, last);
+        }
+    }
+    if (start != SIZE_MAX) {
+        size_t end = prev_function_arg_sig(tokens, start, last);
+        if (end != SIZE_MAX && end >= start)
+            ranges.push_back({start, end + 1});
+    }
+    return ranges;
+}
+
+static size_t find_simple_call_tokens(const std::vector<Tok>& tokens, size_t first, size_t end,
+                                      size_t& name, size_t& open, size_t& close,
+                                      bool use_global_prev) {
+    for (size_t i = first; i < end && i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) ||
+            (tok_directive(tokens[i]) && !is_macro_usage(tokens[i])))
+            continue;
+        bool callable = is_identifier(tokens[i]) || starts_with_chars(tok_text(tokens[i]), '`') ||
+                        starts_with_chars(tok_text(tokens[i]), '$');
         if (!callable || is_function_call_skip_token(tokens[i]))
             continue;
-        size_t prev = prev_code_sig(tokens, first, i);
-        if (prev != SIZE_MAX && tok_text(tokens[prev]) == ".")
+        size_t prev = prev_code_sig(tokens, use_global_prev ? 0 : first, i);
+        if (prev != SIZE_MAX && tok_text(tokens[prev]) == ".") {
+            size_t before_dot = prev_code_sig(tokens, first, prev);
+            bool member_call = before_dot != SIZE_MAX &&
+                               (is_identifier(tokens[before_dot]) ||
+                                tok_is(tokens[before_dot], ")", TokenKind::CloseParenthesis) ||
+                                tok_is(tokens[before_dot], "]", TokenKind::CloseBracket));
+            if (!member_call)
+                continue;
+        }
+        if (prev != SIZE_MAX && (is_identifier(tokens[prev]) ||
+                                 tok_is(tokens[prev], ")", TokenKind::CloseParenthesis) ||
+                                 tok_is(tokens[prev], "]", TokenKind::CloseBracket)))
             continue;
         size_t op = next_code_sig(tokens, i + 1, end);
         if (op == SIZE_MAX || !tok_is(tokens[op], "(", TokenKind::OpenParenthesis))
@@ -5510,48 +5634,112 @@ static size_t find_simple_call_tokens(const std::vector<Tok>& tokens, size_t fir
     return SIZE_MAX;
 }
 
-
-static void format_multiline_macro_arg_calls_pass(std::vector<Tok>& tokens,
-                                                  const FormatOptions& opts) {
-    const auto& fo = opts.function;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
-            continue;
-        size_t semi = statement_end_semicolon(tokens, i);
-        if (semi == SIZE_MAX || token_range_has_pp_conditional(tokens, i, semi + 1))
-            continue;
-        size_t name, open, close;
-        if (find_simple_call_tokens(tokens, i, semi + 1, name, open, close) == SIZE_MAX || tok_text(tokens[name])[0] == '`')
-            continue;
-        bool has_macro = false;
-        for (size_t k = open + 1; k < close; ++k)
-            has_macro = has_macro || tok_text(tokens[k]).find('`') != std::string::npos;
-        auto args = top_level_ranges_between(tokens, open + 1, close);
-        if (!has_macro || args.size() <= 1)
-            continue;
-        tokens[open].fmt_spaces_before = fo.space_before_paren ? 1 : 0;
-        int hang = tokens[name].fmt_indent;
-        format_arg_list_metadata(tokens, open, close, tokens[name].fmt_indent, hang, true);
-        i = semi;
-    }
+static bool is_format_function_call_name(const Tok& tok, const MacroClassifier& macros) {
+    if (!is_macro_usage(tok))
+        return true;
+    MacroClassification cls = classify_macro(tok, true, macros);
+    return cls.role == MacroRole::FunctionLikeExpr && !cls.whitespace_sensitive;
 }
 
 static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     const auto& fo = opts.function;
+    MacroClassifier macro_classifier(opts.macros);
+    std::vector<bool> in_modport(tokens.size(), false);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind != TokenKind::ModPortKeyword)
+            continue;
+        size_t semi = statement_end_semicolon(tokens, i);
+        if (semi == SIZE_MAX)
+            continue;
+        for (size_t k = i; k <= semi && k < tokens.size(); ++k)
+            in_modport[k] = true;
+        i = semi;
+    }
+
+    // Statement-range path for calls that are already split across physical
+    // lines, plus calls with macro arguments.  The line-based pass below cannot
+    // see the whole call in cases like:
+    //
+    //   foo(a,
+    //       b,
+    //       c);
+    //
+    // because each physical line is scanned independently.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].fmt_disabled || tokens[i].fmt_passthrough || in_modport[i] ||
+            tok_define_block(tokens[i]) || tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
+            continue;
+        size_t semi = statement_end_semicolon(tokens, i);
+        if (semi == SIZE_MAX || token_range_has_pp_conditional(tokens, i, semi + 1) ||
+            token_range_disabled_or_passthrough(tokens, i, semi + 1) ||
+            token_range_has_define_block(tokens, i, semi + 1))
+            continue;
+        size_t name, open, close;
+        if (find_simple_call_tokens(tokens, i, semi + 1, name, open, close, true) == SIZE_MAX ||
+            !is_format_function_call_name(tokens[name], macro_classifier) || in_modport[name])
+            continue;
+        bool has_macro = false;
+        for (size_t k = open + 1; k < close; ++k)
+            has_macro = has_macro || tok_text(tokens[k]).find('`') != std::string::npos;
+        auto args = function_arg_ranges_between(tokens, open + 1, close);
+        bool already_multiline = tokens[close].fmt_newline_before;
+        for (auto r : args)
+            already_multiline = already_multiline || tokens[r.first].fmt_newline_before;
+        for (size_t k = open + 1; k < close && k < tokens.size(); ++k)
+            already_multiline = already_multiline ||
+                                (tok_whitespace(tokens[k]) &&
+                                 tok_text(tokens[k]).find('\n') != std::string::npos);
+        if ((!has_macro && !already_multiline) || args.size() <= 1)
+            continue;
+        bool do_break = false;
+        if (has_macro) do_break = true;
+        else if (fo.break_policy == "always") do_break = true;
+        else if (fo.break_policy == "auto") do_break = fo.arg_count >= 0 && (int)args.size() >= fo.arg_count;
+        tokens[open].fmt_spaces_before = fo.space_before_paren ? 1 : 0;
+        if (!do_break || fo.break_policy == "never") {
+            if (!args.empty() && fo.space_inside_paren)
+                tokens[args.front().first].fmt_spaces_before = 1;
+            tokens[close].fmt_spaces_before = (!args.empty() && fo.space_inside_paren) ? 1 : 0;
+            i = semi;
+            continue;
+        }
+        int hang = tokens[name].fmt_indent;
+        int hang_spaces = 0;
+        bool hanging = has_macro || fo.layout == "hanging";
+        if (hanging)
+            column_to_indent_spaces(rendered_column_after_token(tokens, i, open, opts), opts,
+                                    hang, hang_spaces);
+        int block_base = tokens[name].fmt_indent;
+        int block_base_spaces = 0;
+        if (!hanging) {
+            int name_col = rendered_column_after_token(tokens, i, name, opts) -
+                           (int)tok_text(tokens[name]).size();
+            column_to_indent_spaces(name_col, opts, block_base, block_base_spaces);
+        }
+        format_arg_list_metadata(tokens, open, close, block_base, hang, hanging,
+                                 hang_spaces, block_base_spaces);
+        i = semi;
+    }
+
     auto starts = tok_line_starts(tokens);
     for (size_t li = 0; li < starts.size(); ++li) {
         size_t s = starts[li], e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
-        if (token_range_disabled_or_passthrough(tokens, s, e) || token_range_has_pp_conditional(tokens, s, e))
+        bool line_in_modport = false;
+        for (size_t k = s; k < e && k < tokens.size(); ++k)
+            line_in_modport = line_in_modport || in_modport[k];
+        if (line_in_modport || token_range_disabled_or_passthrough(tokens, s, e) ||
+            token_range_has_pp_conditional(tokens, s, e) || token_range_has_define_block(tokens, s, e))
             continue;
         size_t name, open, close;
-        if (find_simple_call_tokens(tokens, s, e, name, open, close) == SIZE_MAX || tok_text(tokens[name])[0] == '`')
+        if (find_simple_call_tokens(tokens, s, e, name, open, close, false) == SIZE_MAX ||
+            !is_format_function_call_name(tokens[name], macro_classifier))
             continue;
         bool decl_prefix = false;
         for (size_t k = s; k < name; ++k)
             decl_prefix = decl_prefix || tokens[k].kind == TokenKind::FunctionKeyword || tokens[k].kind == TokenKind::TaskKeyword || tokens[k].kind == TokenKind::ModuleKeyword || tokens[k].kind == TokenKind::ClassKeyword;
         if (decl_prefix)
             continue;
-        auto args = top_level_ranges_between(tokens, open + 1, close);
+        auto args = function_arg_ranges_between(tokens, open + 1, close);
         bool has_macro_arg = false;
         for (auto r : args)
             for (size_t k = r.first; k < r.second; ++k)
@@ -5567,7 +5755,20 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
             tokens[close].fmt_spaces_before = (!args.empty() && fo.space_inside_paren) ? 1 : 0;
             continue;
         }
-        format_arg_list_metadata(tokens, open, close, tokens[name].fmt_indent, tokens[name].fmt_indent, fo.layout == "hanging");
+        int hang = tokens[name].fmt_indent;
+        int hang_spaces = 0;
+        if (fo.layout == "hanging")
+            column_to_indent_spaces(rendered_column_after_token(tokens, s, open, opts), opts,
+                                    hang, hang_spaces);
+        int block_base = tokens[name].fmt_indent;
+        int block_base_spaces = 0;
+        if (fo.layout != "hanging") {
+            int name_col = rendered_column_after_token(tokens, s, name, opts) -
+                           (int)tok_text(tokens[name]).size();
+            column_to_indent_spaces(name_col, opts, block_base, block_base_spaces);
+        }
+        format_arg_list_metadata(tokens, open, close, block_base, hang,
+                                 fo.layout == "hanging", hang_spaces, block_base_spaces);
     }
 }
 
@@ -5710,8 +5911,6 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         expand_instances_pass(tokens, opts);
         write_log(opts, "11_expand_instances_pass.sv", render_tokens(tokens, opts));
     }
-    format_multiline_macro_arg_calls_pass(tokens, opts);
-    write_log(opts, "13_format_multiline_macro_arg_calls_pass.sv", render_tokens(tokens, opts));
     format_function_calls_pass(tokens, opts);
     write_log(opts, "14_format_function_calls_pass.sv", render_tokens(tokens, opts));
     format_covergroup_pass(tokens, opts);
