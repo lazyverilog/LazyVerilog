@@ -96,6 +96,7 @@ struct Tok {
     // --- Mutable formatting metadata (set/updated by passes) ---
     int fmt_indent{0};            // indentation level at this token
     int fmt_spaces_before{0};     // spaces before this token (within a line)
+    std::string fmt_text_before;   // synthetic text emitted immediately before this token
     bool fmt_newline_before{false}; // emit newline before this token
     int fmt_blank_lines{0};       // blank lines before this token (after newline)
     bool fmt_passthrough{false};  // whitespace-sensitive macro (verbatim)
@@ -3363,7 +3364,7 @@ static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opt
 static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOptions& opts) {
     std::string out;
     size_t total_len = 0;
-    for (const auto& t : tokens) total_len += tok_text(t).size();
+    for (const auto& t : tokens) total_len += tok_text(t).size() + t.fmt_text_before.size();
     out.reserve(total_len + total_len / 4);
 
     const std::string indent_unit(opts.indent_size, ' ');
@@ -3379,6 +3380,7 @@ static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOpt
             }
             if (!at_bol && tok.fmt_spaces_before > 0)
                 out.append(tok.fmt_spaces_before, ' ');
+            out += tok.fmt_text_before;
             out += tok_text(tok);
             at_bol = !tok_text(tok).empty() && tok_text(tok).back() == '\n';
             continue;
@@ -3402,6 +3404,7 @@ static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOpt
             out.append(tok.fmt_spaces_before, ' ');
         }
 
+        out += tok.fmt_text_before;
         out += tok_text(tok);
         if (!tok_text(tok).empty() && tok_text(tok).back() == '\n')
             at_bol = true;
@@ -4083,10 +4086,10 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 dec = SD::MustWrap;
             }
         }
-        if (tok_is_macro && original_newline_before_token && !at_bol)
+        if (tok_is_macro && original_newline_before_token && !at_bol && paren_depth == 0)
             dec = SD::MustWrap;
         if (prev && is_macro_usage(*prev) && original_newline_before_token &&
-            !tok_whitespace(tok) && !tok_comment(tok) &&
+            paren_depth == 0 && !tok_whitespace(tok) && !tok_comment(tok) &&
             !tok_is(tok, "(", TokenKind::OpenParenthesis)) {
             dec = SD::MustWrap;
         }
@@ -5330,7 +5333,9 @@ static void format_enum_declaration_pass(std::vector<Tok>& tokens, const FormatO
             }
             if (opts.tab_align) {
                 name_width = snap_to_indent_grid(item_base_col + name_width, opts.indent_size) - item_base_col;
-                value_width = snap_to_indent_grid(item_base_col + name_width + eq_gap + value_width, opts.indent_size) - item_base_col - name_width - eq_gap;
+                value_width = snap_to_indent_grid(item_base_col + name_width + eq_gap + value_width,
+                                                  opts.indent_size) -
+                              item_base_col - name_width - eq_gap;
             }
         }
         tokens[open].fmt_newline_before = false;
@@ -5446,8 +5451,21 @@ static void format_modport_pass(std::vector<Tok>& tokens, const FormatOptions& o
             if (opts.tab_align) {
                 int col = (base + 1) * std::max(0, opts.indent_size);
                 dir_width = snap_to_indent_grid(col + dir_width, opts.indent_size) - col;
+                sig_width = snap_to_indent_grid(col + dir_width + sig_width, opts.indent_size) -
+                            col - dir_width;
             }
-            tokens[name].fmt_spaces_before = (i == mp.first ? 1 : tokens[name].fmt_spaces_before);
+            if (mp.first == next_code_sig(tokens, i + 1, semi)) {
+                tokens[name].fmt_spaces_before = 1;
+            } else {
+                size_t comma = prev_code_sig(tokens, i + 1, name);
+                if (comma != SIZE_MAX && tok_is(tokens[comma], ",", TokenKind::Comma))
+                    tokens[comma].fmt_spaces_before = 0;
+                tokens[name].fmt_newline_before = true;
+                tokens[name].fmt_blank_lines = 0;
+                tokens[name].fmt_indent = base;
+                tokens[name].fmt_spaces_before = 0;
+                tokens[name].fmt_text_before = "modport ";
+            }
             tokens[open].fmt_spaces_before = 1;
             for (size_t k = 0; k < items.size(); ++k) {
                 auto item = items[k];
