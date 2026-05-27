@@ -55,6 +55,27 @@ TEST_CASE("formatter: function call pass ignores hidden source whitespace", "[fo
 }
 
 
+
+TEST_CASE("formatter: function call leading line comments keep following argument separate", "[formatter]") {
+    FormatOptions opts;
+    opts.function.break_policy = "auto";
+    opts.function.arg_count = 3;
+    opts.function.layout = "hanging";
+
+    const std::string src =
+        "function void f();\n"
+        "  string cmd = $sformatf(\n"
+        "      // use `--wide` to avoid truncating the output\n"
+        "      // `\\s%0s$` ensures an exact match.\n"
+        "      \"/usr/bin/readelf -s --wide %0s | grep \\\"\\\\s%0s$\\\" > %0s\",\n"
+        "      elf_file, escaped_symbol, out_file);\n"
+        "endfunction\n";
+
+    const std::string once = format_source(src, opts);
+    CHECK(once.find("exact match.\"/usr/bin/readelf") == std::string::npos);
+    CHECK(format_source(once, opts) == once);
+}
+
 TEST_CASE("formatter: macro before function declaration is split", "[formatter]") {
     FormatOptions opts;
 
