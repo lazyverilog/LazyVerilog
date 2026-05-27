@@ -192,3 +192,9 @@ target_include_directories(lazyverilog-fmt PRIVATE src)
 target_link_libraries(lazyverilog-fmt PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
 add_executable(lazyverilog-rtl-format-test tests/rtl_format_sweep.cpp)
+add_test(
+    NAME formatter-rtl-corpus
+    COMMAND lazyverilog-rtl-format-test
+            $<TARGET_FILE:lazyverilog-fmt>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/lazyverilog_formatter_corpus
+)
