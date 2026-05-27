@@ -8,19 +8,23 @@
 int main(int argc, char* argv[]) {
     const char* log_path = nullptr;
     const char* path = nullptr;
+    bool in_place = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--log") {
             if (i + 1 >= argc) {
-                std::cerr << "Usage: lazyverilog-fmt [--log <log-dir>] <file>\n";
+                std::cerr << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n";
                 return 1;
             }
             log_path = argv[++i];
         }
+        else if (arg == "-i" || arg == "--in-place") {
+            in_place = true;
+        }
         else
             path = argv[i];
     }
-    if (!path) { std::cerr << "Usage: lazyverilog-fmt [--log <log-dir>] <file>\n"; return 1; }
+    if (!path) { std::cerr << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n"; return 1; }
     std::ifstream f(path);
     if (!f) { std::cerr << "Cannot open " << path << "\n"; return 1; }
     std::ostringstream ss;
@@ -39,7 +43,17 @@ int main(int argc, char* argv[]) {
         opts.log_path = log_path;
     try {
         std::string result = format_source(ss.str(), opts);
-        std::cout << result;
+        if (in_place) {
+            std::ofstream out(path);
+            if (!out) {
+                std::cerr << "Cannot write " << path << "\n";
+                return 1;
+            }
+            out << result;
+        }
+        else {
+            std::cout << result;
+        }
         return 0;
     } catch (const SafeModeError& e) {
         std::cerr << e.what() << "\n";
