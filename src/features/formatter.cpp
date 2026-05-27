@@ -6111,8 +6111,8 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     }
     // Must run after all alignment passes so fmt_spaces_before for define-block tokens
     // reflects the final aligned spacing, giving a stable content_col for \ placement.
-    align_define_continuation_pass_v2(tokens, opts);
-    write_log(opts, "08_align_define_continuation_pass.sv", render_tokens(tokens, opts));
+    // align_define_continuation_pass_v2(tokens, opts);
+    // write_log(opts, "08_align_define_continuation_pass.sv", render_tokens(tokens, opts));
 
     format_enum_declaration_pass(tokens, opts);
     write_log(opts, "09_format_enum_declaration_pass.sv", render_tokens(tokens, opts));
