@@ -5147,6 +5147,36 @@ static size_t statement_end_semicolon(const std::vector<Tok>& tokens, size_t sta
     return SIZE_MAX;
 }
 
+// Rewrite whitespace token text to a canonical form so that basic_formatting
+// always reads the same whitespace regardless of the original source layout.
+// Rule:
+//   - whitespace with N newlines  → "\n" repeated N times  (spaces/tabs stripped)
+//   - whitespace with no newlines → " "  (single space)
+//
+// Blank-line counts are preserved (newline count is kept), but leading/trailing
+// spaces and mixed indentation are discarded.  In particular, define-block
+// whitespace spaces are zeroed so that align_define_continuation_pass_v2
+// always starts from a clean baseline instead of whatever spacing the previous
+// format run produced.
+//
+// Result: same non-whitespace token sequence → same fmt_* values every run
+// (idempotency guarantee).
+static void normalization_pass(std::vector<Tok>& tokens) {
+    for (auto& tok : tokens) {
+        if (!tok_whitespace(tok))
+            continue;
+        const std::string& text = tok_text(tok);
+        int nl = (int)std::count(text.begin(), text.end(), '\n');
+        std::string normalized = nl > 0 ? std::string(nl, '\n') : " ";
+        if (normalized == text)
+            continue;
+        auto new_lex = std::make_shared<TokLexeme>(*tok.lex);
+        new_lex->text = normalized;
+        new_lex->lo   = normalized;
+        tok.lex = std::move(new_lex);
+    }
+}
+
 static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
     for (auto& tok : tokens) {
         tok.matching_token = SIZE_MAX;
@@ -6170,32 +6200,34 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
 
     auto tokens = collect_lexer_tokens(input);
     write_log(opts, "00_input.sv", input);
+    normalization_pass(tokens);
+    write_log(opts, "01_normalization_pass.sv", render_tokens(tokens, opts));
     populate_nonrender_metadata_pass(tokens);
     basic_formatting(tokens, input, opts);
-    write_log(opts, "01_basic_formatting.sv", render_tokens(tokens, opts));
+    write_log(opts, "02_basic_formatting.sv", render_tokens(tokens, opts));
 
     // Module-header reflow mutates token metadata directly.
     format_class_extends_parameter_pass(tokens, opts);
-    write_log(opts, "04_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "03_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
     format_portlist_pass(tokens, opts);
-    write_log(opts, "05_format_portlist_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "04_format_portlist_pass.sv", render_tokens(tokens, opts));
 
     if (opts.statement.align) {
         align_assign_pass(tokens, opts);
-        write_log(opts, "06_align_assign_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "05_align_assign_pass.sv", render_tokens(tokens, opts));
     }
     if (opts.var_declaration.align) {
         align_var_pass(tokens, opts);
-        write_log(opts, "07_align_var_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "06_align_var_pass.sv", render_tokens(tokens, opts));
     }
     if (opts.port_declaration.align) {
         align_port_pass(tokens, opts);
-        write_log(opts, "08_align_port_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "07_align_port_pass.sv", render_tokens(tokens, opts));
     }
     // Must run after all alignment passes so fmt_spaces_before for define-block tokens
     // reflects the final aligned spacing, giving a stable content_col for \ placement.
     align_define_continuation_pass_v2(tokens, opts);
-    write_log(opts, "08b_align_define_continuation_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "08_align_define_continuation_pass.sv", render_tokens(tokens, opts));
 
     format_enum_declaration_pass(tokens, opts);
     write_log(opts, "09_format_enum_declaration_pass.sv", render_tokens(tokens, opts));
@@ -6206,13 +6238,13 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
         write_log(opts, "11_expand_instances_pass.sv", render_tokens(tokens, opts));
     }
     format_function_calls_pass(tokens, opts);
-    write_log(opts, "14_format_function_calls_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "12_format_function_calls_pass.sv", render_tokens(tokens, opts));
     format_covergroup_pass(tokens, opts);
-    write_log(opts, "15_format_covergroup_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "13_format_covergroup_pass.sv", render_tokens(tokens, opts));
     format_constraint_dist_pass(tokens, opts);
-    write_log(opts, "16_format_constraint_dist_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "14_format_constraint_dist_pass.sv", render_tokens(tokens, opts));
     format_function_declaration_pass(tokens, opts);
-    write_log(opts, "17_format_function_declaration_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "15_format_function_declaration_pass.sv", render_tokens(tokens, opts));
 
     std::string out = render_tokens(tokens, opts);
 
