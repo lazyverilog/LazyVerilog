@@ -12,6 +12,7 @@
 #include <slang/util/BumpAllocator.h>
 #include <iostream>
 #include <memory>
+#include <regex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,8 +66,6 @@ struct Tok {
     // Lexical identity is immutable after token collection. Formatting passes may
     // only update fmt_* metadata; token text itself is never rewritten.
     std::shared_ptr<const TokLexeme> lex;
-    TokenKind kind{TokenKind::Unknown};
-
     // --- Non-rendering pass metadata ---
     // Populated before basic_formatting() for structural facts reused by later
     // passes. These fields must not directly affect render_tokens(); rendering is
@@ -85,19 +84,20 @@ struct Tok {
     bool in_interface_header{false};
     bool in_program_header{false};
     bool in_class_decl{false};
+    bool in_disabled_region{false};   // inside verilog_format/verilog-format off/on region
 
     // --- Mutable formatting metadata (set/updated by passes) ---
     int fmt_indent{0};            // indentation level at this token
     int fmt_spaces_before{0};     // spaces before this token (within a line)
     bool fmt_newline_before{false}; // emit newline before this token
     int fmt_blank_lines{0};       // blank lines before this token (after newline)
-    bool fmt_disabled{false};     // inside verilog_format:off region (verbatim)
     bool fmt_passthrough{false};  // whitespace-sensitive macro (verbatim)
 };
 
 static const std::string& tok_text(const Tok& tok) {
     return tok.lex->text;
 }
+static TokenKind tok_kind(const Tok& tok) { return tok.lex->kind; }
 static const std::string& tok_lo(const Tok& tok) { return tok.lex->lo; }
 static int tok_pos(const Tok& tok) { return tok.lex->pos; }
 static bool tok_whitespace(const Tok& tok) { return tok.lex->whitespace; }
@@ -127,7 +127,7 @@ struct DirectiveIndex {
 
     explicit DirectiveIndex(const std::string& text) {
         for (const auto& tok : collect_lexer_tokens(text)) {
-            if (tok.kind != TokenKind::Directive)
+            if (tok_kind(tok) != TokenKind::Directive)
                 continue;
             size_t start = (size_t)tok_pos(tok);
             by_start.emplace(start, DirectiveMatch{tok_directive_kind(tok), start,
@@ -153,7 +153,7 @@ static DirectiveMatch directive_at_offset(const std::string& text, size_t offset
     for (const auto& tok : collect_lexer_tokens(line)) {
         if (tok_whitespace(tok) || tok_comment(tok))
             continue;
-        if (tok.kind != TokenKind::Directive)
+        if (tok_kind(tok) != TokenKind::Directive)
             return {};
         return {tok_directive_kind(tok), offset + (size_t)tok_pos(tok),
                 offset + (size_t)tok_pos(tok) + tok_text(tok).size()};
@@ -185,17 +185,6 @@ static DirectiveMatch first_directive_on_line(const std::string& text, size_t li
 // ---------------------------------------------------------------------------
 // Formatting token helpers
 // ---------------------------------------------------------------------------
-
-using TokenCache = std::unordered_map<std::string, std::vector<Tok>>;
-thread_local TokenCache* active_token_cache = nullptr;
-
-struct ScopedTokenCache {
-    TokenCache cache;
-    TokenCache* prev{nullptr};
-
-    ScopedTokenCache() : prev(active_token_cache) { active_token_cache = &cache; }
-    ~ScopedTokenCache() { active_token_cache = prev; }
-};
 
 enum class SD { MustAppend, MustWrap, Preserve, Undecided };
 
@@ -349,8 +338,8 @@ static bool is_pp_conditional(syntax::SyntaxKind kind) {
 
 
 static bool is_macro_usage(const Tok& t) {
-    return t.kind == TokenKind::MacroUsage ||
-           (t.kind == TokenKind::Directive && tok_directive_kind(t) == syntax::SyntaxKind::MacroUsage);
+    return tok_kind(t) == TokenKind::MacroUsage ||
+           (tok_kind(t) == TokenKind::Directive && tok_directive_kind(t) == syntax::SyntaxKind::MacroUsage);
 }
 
 enum class MacroRole {
@@ -445,25 +434,25 @@ static bool is_line_directive(const Tok& t) {
 }
 
 static bool is_keyword(const Tok& t) {
-    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && LexerFacts::isKeyword(t.kind);
+    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && LexerFacts::isKeyword(tok_kind(t));
 }
 
 static bool is_constraint_keyword(const Tok& t) {
     return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) &&
-           t.kind == TokenKind::ConstraintKeyword;
+           tok_kind(t) == TokenKind::ConstraintKeyword;
 }
 
 static bool is_begin_keyword(const Tok& t) {
-    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && t.kind == TokenKind::BeginKeyword;
+    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && tok_kind(t) == TokenKind::BeginKeyword;
 }
 
 static bool is_else_keyword(const Tok& t) {
-    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && t.kind == TokenKind::ElseKeyword;
+    return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) && tok_kind(t) == TokenKind::ElseKeyword;
 }
 
 static bool is_identifier(const Tok& t) {
     return !tok_directive(t) && !tok_comment(t) && !tok_whitespace(t) &&
-           (t.kind == TokenKind::Identifier || t.kind == TokenKind::SystemIdentifier ||
+           (tok_kind(t) == TokenKind::Identifier || tok_kind(t) == TokenKind::SystemIdentifier ||
             (!tok_text(t).empty() &&
              (std::isalpha((unsigned char)tok_text(t)[0]) || tok_text(t)[0] == '_' || tok_text(t)[0] == '$' ||
               tok_text(t)[0] == '`') &&
@@ -471,30 +460,30 @@ static bool is_identifier(const Tok& t) {
 }
 
 static bool is_port_direction_token(const Tok& tok) {
-    return tok.kind == TokenKind::InputKeyword || tok.kind == TokenKind::OutputKeyword ||
-           tok.kind == TokenKind::InOutKeyword || tok.kind == TokenKind::RefKeyword;
+    return tok_kind(tok) == TokenKind::InputKeyword || tok_kind(tok) == TokenKind::OutputKeyword ||
+           tok_kind(tok) == TokenKind::InOutKeyword || tok_kind(tok) == TokenKind::RefKeyword;
 }
 
 static bool is_sign_qualifier_token(const Tok& tok) {
-    return tok.kind == TokenKind::SignedKeyword || tok.kind == TokenKind::UnsignedKeyword;
+    return tok_kind(tok) == TokenKind::SignedKeyword || tok_kind(tok) == TokenKind::UnsignedKeyword;
 }
 
 static bool is_var_prefix_token(const Tok& tok) {
-    return tok.kind == TokenKind::StaticKeyword || tok.kind == TokenKind::AutomaticKeyword ||
-           tok.kind == TokenKind::ConstKeyword || tok.kind == TokenKind::VarKeyword;
+    return tok_kind(tok) == TokenKind::StaticKeyword || tok_kind(tok) == TokenKind::AutomaticKeyword ||
+           tok_kind(tok) == TokenKind::ConstKeyword || tok_kind(tok) == TokenKind::VarKeyword;
 }
 
 static bool is_var_builtin_type_token(const Tok& tok) {
-    return tok.kind == TokenKind::WireKeyword || tok.kind == TokenKind::LogicKeyword ||
-           tok.kind == TokenKind::RegKeyword || tok.kind == TokenKind::BitKeyword ||
-           tok.kind == TokenKind::ByteKeyword || tok.kind == TokenKind::IntKeyword ||
-           tok.kind == TokenKind::IntegerKeyword || tok.kind == TokenKind::TimeKeyword ||
-           tok.kind == TokenKind::ShortIntKeyword || tok.kind == TokenKind::LongIntKeyword ||
-           tok.kind == TokenKind::SignedKeyword || tok.kind == TokenKind::UnsignedKeyword;
+    return tok_kind(tok) == TokenKind::WireKeyword || tok_kind(tok) == TokenKind::LogicKeyword ||
+           tok_kind(tok) == TokenKind::RegKeyword || tok_kind(tok) == TokenKind::BitKeyword ||
+           tok_kind(tok) == TokenKind::ByteKeyword || tok_kind(tok) == TokenKind::IntKeyword ||
+           tok_kind(tok) == TokenKind::IntegerKeyword || tok_kind(tok) == TokenKind::TimeKeyword ||
+           tok_kind(tok) == TokenKind::ShortIntKeyword || tok_kind(tok) == TokenKind::LongIntKeyword ||
+           tok_kind(tok) == TokenKind::SignedKeyword || tok_kind(tok) == TokenKind::UnsignedKeyword;
 }
 
 static bool is_function_call_skip_token(const Tok& tok) {
-    switch (tok.kind) {
+    switch (tok_kind(tok)) {
     case TokenKind::IfKeyword:
     case TokenKind::ForKeyword:
     case TokenKind::ForeachKeyword:
@@ -523,9 +512,9 @@ static bool is_function_call_skip_token(const Tok& tok) {
 
 
 static bool is_numeric(const Tok& t) {
-    return t.kind == TokenKind::IntegerLiteral || t.kind == TokenKind::IntegerBase ||
-           t.kind == TokenKind::UnbasedUnsizedLiteral || t.kind == TokenKind::RealLiteral ||
-           t.kind == TokenKind::TimeLiteral;
+    return tok_kind(t) == TokenKind::IntegerLiteral || tok_kind(t) == TokenKind::IntegerBase ||
+           tok_kind(t) == TokenKind::UnbasedUnsizedLiteral || tok_kind(t) == TokenKind::RealLiteral ||
+           tok_kind(t) == TokenKind::TimeLiteral;
 }
 
 static bool is_open_group(const Tok& t) { return tok_text(t) == "(" || tok_text(t) == "[" || tok_text(t) == "{"; }
@@ -535,7 +524,7 @@ static bool is_close_group(const Tok& t) { return tok_text(t) == ")" || tok_text
 static bool is_hierarchy(const Tok& t) { return tok_text(t) == "." || tok_text(t) == "::"; }
 
 static bool is_unary_op(const Tok& t) {
-    switch (t.kind) {
+    switch (tok_kind(t)) {
         case TokenKind::Tilde:
         case TokenKind::Exclamation:
         case TokenKind::TildeAnd:
@@ -611,7 +600,7 @@ static bool is_combined_operator_token(TokenKind kind) {
 }
 
 static bool is_control_keyword(const Tok& t) {
-    switch (t.kind) {
+    switch (tok_kind(t)) {
         case TokenKind::IfKeyword:
         case TokenKind::ForKeyword:
         case TokenKind::ForeachKeyword:
@@ -627,7 +616,7 @@ static bool is_control_keyword(const Tok& t) {
 }
 
 static bool is_procedural_event_keyword(const Tok& t) {
-    switch (t.kind) {
+    switch (tok_kind(t)) {
         case TokenKind::AlwaysKeyword:
         case TokenKind::AlwaysFFKeyword:
         case TokenKind::AlwaysCombKeyword:
@@ -639,7 +628,7 @@ static bool is_procedural_event_keyword(const Tok& t) {
 }
 
 static bool is_binary_op(const Tok& t) {
-    switch (t.kind) {
+    switch (tok_kind(t)) {
         case TokenKind::TripleEquals:
         case TokenKind::ExclamationDoubleEquals:
         case TokenKind::DoubleEquals:
@@ -689,9 +678,9 @@ static bool is_binary_op(const Tok& t) {
 }
 
 static bool is_assignment_op(const Tok& t, bool in_parens = false) {
-    if (t.kind == TokenKind::LessThanEquals && in_parens)
+    if (tok_kind(t) == TokenKind::LessThanEquals && in_parens)
         return false;
-    switch (t.kind) {
+    switch (tok_kind(t)) {
         case TokenKind::Equals:
         case TokenKind::LessThanEquals:
         case TokenKind::PlusEqual:
@@ -759,134 +748,16 @@ static bool is_indexed_part_select_op_pair(const Tok& A, const Tok& B) {
 static bool is_indexed_part_select_op(const Tok& t) { return tok_text(t) == "+:" || tok_text(t) == "-:"; }
 
 // ---------------------------------------------------------------------------
-// Disabled ranges (verilog_format: off/on and `define)
+// Format-disabled markers
 // ---------------------------------------------------------------------------
 
-// Match "// <optional whitespace> verilog_format <optional whitespace> : <optional whitespace> <word>"
-// case-insensitive.  Returns the position past the matched word, or std::string::npos.
-static size_t match_fmt_comment(const std::string& src, size_t pos, const std::string& word) {
-    size_t n = src.size();
-    if (pos + 1 >= n || src[pos] != '/' || src[pos + 1] != '/')
-        return std::string::npos;
-    size_t i = pos + 2;
-    while (i < n && (src[i] == ' ' || src[i] == '\t'))
-        ++i;
-    const char* tag = "verilog_format";
-    for (size_t k = 0; tag[k]; ++k, ++i) {
-        if (i >= n || std::tolower((unsigned char)src[i]) != tag[k])
-            return std::string::npos;
-    }
-    while (i < n && (src[i] == ' ' || src[i] == '\t'))
-        ++i;
-    if (i >= n || src[i] != ':')
-        return std::string::npos;
-    ++i;
-    while (i < n && (src[i] == ' ' || src[i] == '\t'))
-        ++i;
-    for (size_t k = 0; k < word.size(); ++k, ++i) {
-        if (i >= n || std::tolower((unsigned char)src[i]) != (unsigned char)word[k])
-            return std::string::npos;
-    }
-    // Word boundary: next char must not be alphanumeric/underscore
-    if (i < n && (std::isalnum((unsigned char)src[i]) || src[i] == '_'))
-        return std::string::npos;
-    // Advance to end of line
-    while (i < n && src[i] != '\n')
-        ++i;
-    return i;
-}
-
-static std::vector<std::pair<int, int>> find_disabled(const std::string& src) {
-    std::vector<std::pair<int, int>> out;
-    size_t n = src.size();
-    DirectiveIndex directives(src);
-
-    // Find verilog_format: off/on regions
-    for (size_t i = 0; i < n; ++i) {
-        size_t off_end = match_fmt_comment(src, i, "off");
-        if (off_end == std::string::npos)
-            continue;
-        int off_pos = (int)i;
-        // Search for matching "on"
-        int end = (int)n;
-        for (size_t j = off_end; j < n; ++j) {
-            size_t on_end = match_fmt_comment(src, j, "on");
-            if (on_end != std::string::npos) {
-                end = (int)on_end;
-                break;
-            }
-        }
-        out.push_back({off_pos, end});
-        i = (size_t)end;
-    }
-
-    // Find `define blocks (including multi-line with \ continuation)
-    for (size_t i = 0; i < n;) {
-        // Must be at start of line (or start of file)
-        if (i > 0 && src[i - 1] != '\n') {
-            ++i;
-            continue;
-        }
-        size_t line_end = src.find('\n', i);
-        if (line_end == std::string::npos)
-            line_end = n;
-        auto directive = first_directive_on_line(src, i, line_end, directives);
-        if (directive.kind != syntax::SyntaxKind::DefineDirective) {
-            // Skip to next line
-            i = line_end;
-            if (i < n)
-                ++i;
-            continue;
-        }
-        size_t ls = directive.start;
-        // Found `define at ls.  First skip past the macro name and any argument
-        // list.  The argument list `(...)` can span multiple lines WITHOUT
-        // backslash continuation (only the body needs `\`).
-        size_t j = directive.end;
-        // Skip whitespace after `define
-        while (j < n && (src[j] == ' ' || src[j] == '\t'))
-            ++j;
-        // Skip macro name
-        while (j < n && (std::isalnum((unsigned char)src[j]) || src[j] == '_' || src[j] == '$'))
-            ++j;
-        // If there's an argument list, skip it (may span lines)
-        if (j < n && src[j] == '(') {
-            int depth = 1;
-            ++j;
-            while (j < n && depth > 0) {
-                if (src[j] == '(')
-                    ++depth;
-                else if (src[j] == ')')
-                    --depth;
-                ++j;
-            }
-        }
-        // Now consume lines with trailing backslash continuation (macro body).
-        while (true) {
-            while (j < n && src[j] != '\n')
-                ++j;
-            // Check if line ends with backslash (before the newline)
-            if (j > ls && src[j - 1] == '\\' && j < n) {
-                ++j; // skip newline, continue to next line
-            } else {
-                break;
-            }
-        }
-        out.push_back({(int)ls, (int)j});
-        i = j;
-        if (i < n)
-            ++i;
-    }
-
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
-static bool in_disabled(int pos, const std::vector<std::pair<int, int>>& ranges) {
-    for (auto& r : ranges)
-        if (r.first <= pos && pos < r.second)
-            return true;
-    return false;
+static bool is_format_control_comment(const Tok& tok, const std::regex& pattern) {
+    if (!tok_comment(tok))
+        return false;
+    const std::string& text = tok_text(tok);
+    if (text.rfind("//", 0) != 0)
+        return false;
+    return std::regex_search(text, pattern);
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +817,7 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
                              : ((lx == ":") ? 1 : 0);
     if (lx == ";")
         return in_for_header ? (binary_space_after(sp.semicolon_spacing) ? 1 : 0) : 1;
-    if (is_indent_close(L.kind) && rx == ":")
+    if (is_indent_close(tok_kind(L)) && rx == ":")
         return 0;
     if (lx == "@")
         return procedural_at ? (binary_space_after(sp.procedural_event_control_at_spacing) ? 1 : 0)
@@ -972,7 +843,7 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
     if (in_dim && (lx == ":" || rx == ":"))
         return (lx == ":") ? (binary_space_after(sp.range_colon_spacing) ? 1 : 0)
                            : (binary_space_before(sp.range_colon_spacing) ? 1 : 0);
-    if (L.kind == TokenKind::InsideKeyword || R.kind == TokenKind::InsideKeyword)
+    if (tok_kind(L) == TokenKind::InsideKeyword || tok_kind(R) == TokenKind::InsideKeyword)
         return 1;
     if ((is_binary_op(L) && !L_assign) || (is_binary_op(R) && !R_assign)) {
         if (is_binary_op(L) && is_unary_op(R))
@@ -998,7 +869,7 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
             return 0;
         if (lx == ")")
             return 1;
-        if (L.kind == TokenKind::WaitKeyword)
+        if (tok_kind(L) == TokenKind::WaitKeyword)
             return 0;
         if (is_identifier(L))
             return 0;
@@ -1011,7 +882,7 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
     if (lx == ":")
         return in_dim ? 0 : 1;
     if (rx == ":") {
-        if (L.kind == TokenKind::DefaultKeyword)
+        if (tok_kind(L) == TokenKind::DefaultKeyword)
             return 0;
         if (in_dim)
             return 0;
@@ -1021,13 +892,13 @@ static int spaces_req(const Tok& L, const Tok& R, const FormatOptions& opts, boo
     }
     if (lx == "}")
         return 1;
-    if (R.kind == TokenKind::OpenBrace)
-        return (is_keyword(L) || is_identifier(L) || L.kind == TokenKind::CloseParenthesis ||
-                L.kind == TokenKind::CloseBracket) ? 1 : 0;
+    if (tok_kind(R) == TokenKind::OpenBrace)
+        return (is_keyword(L) || is_identifier(L) || tok_kind(L) == TokenKind::CloseParenthesis ||
+                tok_kind(L) == TokenKind::CloseBracket) ? 1 : 0;
     if (rx == "[") {
         if (lx == "]")
             return 0;
-        if (is_type_keyword(L.kind))
+        if (is_type_keyword(tok_kind(L)))
             return 1;
         return 0;
     }
@@ -1071,23 +942,23 @@ static SD break_dec(const Tok& L, const Tok& R, const FormatOptions& opts, bool 
         return SD::MustWrap;
     if (is_unary_op(L))
         return SD::MustAppend;
-    if (is_indent_close(L.kind) && rx == ":")
+    if (is_indent_close(tok_kind(L)) && rx == ":")
         return SD::MustAppend;
-    if (is_indent_close(R.kind))
+    if (is_indent_close(tok_kind(R)))
         return SD::MustWrap;
     if (is_else_keyword(R)) {
-        if (L.kind == TokenKind::EndKeyword)
+        if (tok_kind(L) == TokenKind::EndKeyword)
             return opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
-        if (L.kind == TokenKind::CloseBrace)
+        if (tok_kind(L) == TokenKind::CloseBrace)
             return opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
         return SD::MustWrap;
     }
     if (is_else_keyword(L) &&
-        (is_begin_keyword(R) || R.kind == TokenKind::IfKeyword || R.kind == TokenKind::OpenBrace))
-        return (R.kind == TokenKind::OpenBrace && opts.statement.begin_newline) ? SD::MustWrap
+        (is_begin_keyword(R) || tok_kind(R) == TokenKind::IfKeyword || tok_kind(R) == TokenKind::OpenBrace))
+        return (tok_kind(R) == TokenKind::OpenBrace && opts.statement.begin_newline) ? SD::MustWrap
                                                                                 : SD::MustAppend;
-    if (L.kind == TokenKind::CloseParenthesis &&
-        (is_begin_keyword(R) || R.kind == TokenKind::OpenBrace))
+    if (tok_kind(L) == TokenKind::CloseParenthesis &&
+        (is_begin_keyword(R) || tok_kind(R) == TokenKind::OpenBrace))
         return opts.statement.begin_newline ? SD::MustWrap : SD::MustAppend;
     if (lx == "#")
         return SD::MustAppend;
@@ -1110,7 +981,6 @@ static void push_tok(std::vector<Tok>& toks, TokenKind kind, std::string text, i
     lex->directive_kind = directive_kind;
     Tok t;
     t.lex = std::move(lex);
-    t.kind = kind;
     toks.push_back(std::move(t));
 }
 
@@ -1348,12 +1218,6 @@ static std::string normalize_bracket_spacing(const std::string& text, const Form
 }
 
 static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
-    if (active_token_cache) {
-        auto it = active_token_cache->find(source);
-        if (it != active_token_cache->end())
-            return it->second;
-    }
-
     struct DefineRange {
         size_t start;
         size_t end;
@@ -1487,10 +1351,6 @@ static std::vector<Tok> collect_lexer_tokens(const std::string& source) {
     if (cursor < source.size())
         append_gap(cursor, source.size());
 
-    if (active_token_cache) {
-        auto [it, _] = active_token_cache->emplace(source, std::move(toks));
-        return it->second;
-    }
     return toks;
 }
 
@@ -1506,7 +1366,7 @@ static std::vector<Tok> significant_tokens(const std::string& text) {
 
 
 static bool tok_is(const Tok& tok, const std::string& text, TokenKind kind) {
-    return tok_text(tok) == text || tok.kind == kind;
+    return tok_text(tok) == text || tok_kind(tok) == kind;
 }
 
 static bool tok_contains(const Tok& tok, char ch) {
@@ -1551,7 +1411,7 @@ static TokenKind single_word_kind(const std::string& text) {
     auto toks = significant_tokens(text);
     if (toks.size() != 1)
         return TokenKind::Unknown;
-    return toks[0].kind;
+    return tok_kind(toks[0]);
 }
 
 
@@ -1810,7 +1670,7 @@ static bool token_range_has_pp_conditional(const std::vector<Tok>& tokens, size_
 static bool token_range_disabled_or_passthrough(const std::vector<Tok>& tokens, size_t first,
                                                 size_t end) {
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
-        if (!tok_whitespace(tokens[i]) && (tokens[i].fmt_disabled || tokens[i].fmt_passthrough))
+        if (!tok_whitespace(tokens[i]) && (tokens[i].in_disabled_region || tokens[i].fmt_passthrough))
             return true;
     }
     return false;
@@ -1885,11 +1745,11 @@ static void format_class_extends_parameter_pass(std::vector<Tok>& tokens,
             continue;
 
         auto sigs = code_sig_indices(tokens, line_start, line_end);
-        if (sigs.empty() || tokens[sigs[0]].kind != TokenKind::ClassKeyword)
+        if (sigs.empty() || tok_kind(tokens[sigs[0]]) != TokenKind::ClassKeyword)
             continue;
         bool has_extends = false;
         for (size_t idx : sigs)
-            has_extends = has_extends || tokens[idx].kind == TokenKind::ExtendsKeyword;
+            has_extends = has_extends || tok_kind(tokens[idx]) == TokenKind::ExtendsKeyword;
         if (!has_extends)
             continue;
 
@@ -2179,12 +2039,12 @@ static void align_header_ports_metadata(std::vector<Tok>& tokens,
 static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
-            tokens[i].fmt_disabled || tokens[i].fmt_passthrough)
+            tokens[i].in_disabled_region || tokens[i].fmt_passthrough)
             continue;
-        bool header_kw = tokens[i].kind == TokenKind::ModuleKeyword ||
-                         tokens[i].kind == TokenKind::MacromoduleKeyword ||
-                         tokens[i].kind == TokenKind::InterfaceKeyword ||
-                         tokens[i].kind == TokenKind::ProgramKeyword;
+        bool header_kw = tok_kind(tokens[i]) == TokenKind::ModuleKeyword ||
+                         tok_kind(tokens[i]) == TokenKind::MacromoduleKeyword ||
+                         tok_kind(tokens[i]) == TokenKind::InterfaceKeyword ||
+                         tok_kind(tokens[i]) == TokenKind::ProgramKeyword;
         if (!header_kw)
             continue;
 
@@ -2208,16 +2068,16 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
             else if (tok_is(tokens[j], ";", TokenKind::Semicolon) && paren == 0 && bracket == 0 && brace == 0) {
                 bool has_import = false;
                 for (size_t k = i; k < j; ++k)
-                    if (tokens[k].kind == TokenKind::ImportKeyword)
+                    if (tok_kind(tokens[k]) == TokenKind::ImportKeyword)
                         has_import = true;
                 size_t next = next_code_sig(tokens, j + 1, tokens.size());
                 if (!(has_import && next != SIZE_MAX &&
                       (tok_is(tokens[next], "(", TokenKind::OpenParenthesis) ||
                        tok_is(tokens[next], "#", TokenKind::Hash))))
                     break;
-            } else if ((tokens[j].kind == TokenKind::EndModuleKeyword ||
-                      tokens[j].kind == TokenKind::EndInterfaceKeyword ||
-                      tokens[j].kind == TokenKind::EndProgramKeyword) && paren == 0)
+            } else if ((tok_kind(tokens[j]) == TokenKind::EndModuleKeyword ||
+                      tok_kind(tokens[j]) == TokenKind::EndInterfaceKeyword ||
+                      tok_kind(tokens[j]) == TokenKind::EndProgramKeyword) && paren == 0)
                 break;
         }
         if (port_open == SIZE_MAX)
@@ -2503,7 +2363,7 @@ static void align_define_continuation_pass_v2(std::vector<Tok>& tokens,
         for (size_t j = s; j < e; ++j) {
             if (tok_whitespace(tokens[j]))
                 continue;
-            if (tokens[j].fmt_disabled) {
+            if (tokens[j].in_disabled_region) {
                 info.disabled = true;
                 break;
             }
@@ -2632,7 +2492,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
             const auto& tok = tokens[k];
             if (tok_whitespace(tok))
                 continue;
-            if (tok.fmt_disabled)
+            if (tok.in_disabled_region)
                 ln.disabled = true;
             if (tok_directive(tok) && is_pp_conditional(tok_directive_kind(tok)))
                 ln.has_pp_cond = true;
@@ -2703,7 +2563,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         // is_module_header_parameter check
         ln.is_module_header_param = false;
         if (ln.assign_op_idx != SIZE_MAX && !sig_indices.empty() &&
-            tokens[sig_indices[0]].kind == TokenKind::ParameterKeyword) {
+            tok_kind(tokens[sig_indices[0]]) == TokenKind::ParameterKeyword) {
             // Walk backward through previous lines
             for (int prev = (int)lines.size() - 1; prev >= 0; --prev) {
                 const auto& pl = lines[(size_t)prev];
@@ -2727,9 +2587,9 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
                         prev_sigs.push_back(k);
                 }
                 if (!prev_sigs.empty() &&
-                    (tokens[prev_sigs[0]].kind == TokenKind::ModuleKeyword ||
-                     tokens[prev_sigs[0]].kind == TokenKind::InterfaceKeyword ||
-                     tokens[prev_sigs[0]].kind == TokenKind::ProgramKeyword)) {
+                    (tok_kind(tokens[prev_sigs[0]]) == TokenKind::ModuleKeyword ||
+                     tok_kind(tokens[prev_sigs[0]]) == TokenKind::InterfaceKeyword ||
+                     tok_kind(tokens[prev_sigs[0]]) == TokenKind::ProgramKeyword)) {
                     for (size_t pi = 1; pi + 1 < prev_sigs.size(); ++pi) {
                         if (tok_is(tokens[prev_sigs[pi]], "#", TokenKind::Hash) &&
                             tok_is(tokens[prev_sigs[pi + 1]], "(", TokenKind::OpenParenthesis)) {
@@ -2760,7 +2620,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         ln.lhs_inline_width = 0;
         if (ln.assign_op_idx != SIZE_MAX) {
             bool first = true;
-            bool skip_next = tokens[ln.first_sig].kind == TokenKind::AssignKeyword;
+            bool skip_next = tok_kind(tokens[ln.first_sig]) == TokenKind::AssignKeyword;
             for (size_t k = ln.first_sig; k < ln.end; ++k) {
                 if (tok_whitespace(tokens[k]))
                     continue;
@@ -2804,7 +2664,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
         if (cur_line_first_sig == SIZE_MAX)
             cur_line_first_sig = i;
         // Track enum brace nesting so finalize_line can mark enum-body lines
-        if (tok.kind == TokenKind::EnumKeyword) {
+        if (tok_kind(tok) == TokenKind::EnumKeyword) {
             align_pending_enum_brace = true;
         } else if (tok_is(tok, "{", TokenKind::OpenBrace)) {
             align_brace_is_enum.push_back(align_pending_enum_brace);
@@ -2822,7 +2682,7 @@ static void align_assign_pass_v2(std::vector<Tok>& tokens, const FormatOptions& 
     for (size_t li = 1; li < lines.size(); ++li) {
         const auto& prev = lines[li - 1];
         if (!prev.empty && prev.first_sig != SIZE_MAX) {
-            lines[li].prev_starts_for = (tokens[prev.first_sig].kind == TokenKind::ForKeyword);
+            lines[li].prev_starts_for = (tok_kind(tokens[prev.first_sig]) == TokenKind::ForKeyword);
         }
     }
 
@@ -3195,7 +3055,7 @@ static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opt
 
         for (size_t k = cur_line_start; k < end_idx; ++k) {
             if (tok_whitespace(tokens[k])) continue;
-            if (tokens[k].fmt_disabled) ln.disabled = true;
+            if (tokens[k].in_disabled_region) ln.disabled = true;
             if (tok_directive(tokens[k]) && is_pp_conditional(tok_directive_kind(tokens[k])))
                 ln.has_pp_cond = true;
 
@@ -3485,14 +3345,13 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
     //   fmt_spaces_before   horizontal spacing before the token on the same line
     //   fmt_newline_before  whether render_tokens() should break before the token
     //   fmt_blank_lines     preserved/capped blank lines attached to that break
-    //   fmt_disabled        token belongs to a format-off region
+    //   in_disabled_region token belongs to a format-off region (set earlier)
     //   fmt_passthrough     token should be emitted exactly as collected
     //
     // Later passes can still adjust this metadata, but this pass establishes the
     // baseline line breaking and indentation by walking the token stream once and
     // maintaining lightweight parser state (indent stack, grouping depths, macro
     // roles, preprocessor conditionals, case labels, etc.).
-    auto disabled = find_disabled(input);
     const MacroClassifier macro_classifier(opts.macros);
 
     // Current logical indentation level.  indent_stack mirrors every construct
@@ -3543,11 +3402,9 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
     // passed through so macro/preprocessor spelling and spacing are preserved.
     bool in_pp_cond = false;
 
-    // Format-disabled regions are mostly passthrough.  after_dis bridges the
-    // transition back to normal formatting, while in_define_disabled keeps a
-    // multi-token `define inside a disabled region verbatim until its newline.
+    // Format-disabled regions are passthrough. after_dis bridges the transition
+    // back to normal formatting.
     bool after_dis = false;
-    bool in_define_disabled = false;
 
     // begin/end/fork labels are written as "begin : label".  This small state
     // machine detects the colon and the label token so the label stays attached
@@ -4005,27 +3862,14 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         }
 
         // --- A. Disabled region ---
-        if (in_disabled(tok_pos(tok), disabled)) {
-            // verilog_format:off regions are preserved.  Tokens that already
-            // carry source newlines (whitespace, preprocessor conditionals,
-            // multi-token defines) are passed through exactly; otherwise a token
-            // at the beginning of a disabled line can still receive current
-            // indentation so the transition into the disabled block is stable.
-            tok.fmt_disabled = true;
+        if (tok.in_disabled_region) {
+            // verilog_format/verilog-format:off regions are preserved exactly.
             apply_newline(i);
-            if (is_line_directive(tok) && tok_directive_kind(tok) == syntax::SyntaxKind::DefineDirective)
-                in_define_disabled = true;
-            if (tok_is_pp_conditional || in_define_disabled || !at_bol || tok_whitespace(tok)) {
-                tok.fmt_passthrough = true;
-            } else {
-                tok.fmt_indent = indent_level;
-                at_bol = false;
-            }
+            tok.fmt_passthrough = true;
             at_bol = !tok_text(tok).empty() && tok_text(tok).back() == '\n';
             after_dis = !at_bol;
             continue;
         }
-        in_define_disabled = false;
 
         // --- B. Whitespace tokens ---
         if (tok_whitespace(tok)) {
@@ -4169,12 +4013,12 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             is_user_type_packed_dimension_open(i)) {
             spaces = 1;
         }
-        if (prev_macro_role_valid && tok.kind == TokenKind::ElseKeyword &&
+        if (prev_macro_role_valid && tok_kind(tok) == TokenKind::ElseKeyword &&
             prev_macro_role == MacroRole::BlockEndLike)
             dec = opts.statement.wrap_end_else_clauses ? SD::MustWrap : SD::MustAppend;
         if (tok_is_macro && macro_force_own_line(tok_macro_class.role)) {
             if (tok_macro_class.role == MacroRole::BlockBeginLike && prev &&
-                prev->kind == TokenKind::CloseParenthesis) {
+                tok_kind(*prev) == TokenKind::CloseParenthesis) {
                 dec = opts.statement.begin_newline ? SD::MustWrap : SD::MustAppend;
             } else if (!at_bol) {
                 dec = SD::MustWrap;
@@ -4188,7 +4032,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         bool inline_comment = tok_comment(tok) && prev && !original_newline_before_token;
 
         do_while_tail = false;
-        if (prev && prev->kind == TokenKind::EndKeyword && tok.kind == TokenKind::WhileKeyword) {
+        if (prev && tok_kind(*prev) == TokenKind::EndKeyword && tok_kind(tok) == TokenKind::WhileKeyword) {
             if (do_depth > 0) {
                 dec = SD::MustAppend;
                 --do_depth;
@@ -4208,9 +4052,9 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             function_macro_newline_candidate = false;
             function_macro_newline_depth = -1;
         }
-        bool disable_target = prev && prev->kind == TokenKind::DisableKeyword;
-        bool wait_fork_target = prev && prev->kind == TokenKind::WaitKeyword &&
-                                tok.kind == TokenKind::ForkKeyword;
+        bool disable_target = prev && tok_kind(*prev) == TokenKind::DisableKeyword;
+        bool wait_fork_target = prev && tok_kind(*prev) == TokenKind::WaitKeyword &&
+                                tok_kind(tok) == TokenKind::ForkKeyword;
 
         // --- Block label ---
         if (block_label_state == 1 && !tok_whitespace(tok) && !tok_comment(tok)) {
@@ -4224,7 +4068,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         } else if (block_label_state == 2 && !tok_whitespace(tok) && !tok_comment(tok)) {
             dec = SD::MustAppend;
         }
-        if (case_label_pending_nl && tok.kind == TokenKind::BeginKeyword)
+        if (case_label_pending_nl && tok_kind(tok) == TokenKind::BeginKeyword)
             case_label_pending_nl = false;
 
         if (inline_comment && pending_nl) {
@@ -4275,7 +4119,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         if (single_stmt_pending && at_bol) {
             if (constraint_depth > 0 && tok_is(tok, "{", TokenKind::OpenBrace)) {
                 // constraint body brace — let brace handler below create the scope
-            } else if (tok.kind == TokenKind::BeginKeyword) {
+            } else if (tok_kind(tok) == TokenKind::BeginKeyword) {
                 single_stmt_pending = false;
             } else {
                 ++indent_level;
@@ -4293,8 +4137,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             if (!indent_stack.empty())
                 indent_stack.pop_back();
             indent_level = std::max(0, indent_level - delta);
-        } else if (is_indent_close(tok.kind)) {
-            if (tok.kind == TokenKind::EndCaseKeyword) {
+        } else if (is_indent_close(tok_kind(tok))) {
+            if (tok_kind(tok) == TokenKind::EndCaseKeyword) {
                 case_depth = std::max(0, case_depth - 1);
                 case_conditional_depth = 0;
             }
@@ -4347,8 +4191,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         else if (tok_is(tok, "(", TokenKind::OpenParenthesis)) {
             ++paren_depth;
             paren_stack.push_back(classify_paren_at(i, prev_at_procedural));
-            for_header_stack.push_back(prev && (prev->kind == TokenKind::ForKeyword ||
-                                                prev->kind == TokenKind::ForeachKeyword));
+            for_header_stack.push_back(prev && (tok_kind(*prev) == TokenKind::ForKeyword ||
+                                                tok_kind(*prev) == TokenKind::ForeachKeyword));
             if (!active_macros.empty() && active_macros.back().wait_open && prev &&
                 is_macro_usage(*prev)) {
                 active_macros.back().paren_depth = paren_depth;
@@ -4409,70 +4253,70 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 finish_macro_invocation(tok_macro_class);
             }
         } else if (is_keyword(tok)) {
-            if (tok.kind == TokenKind::DoKeyword)
+            if (tok_kind(tok) == TokenKind::DoKeyword)
                 ++do_depth;
 
-            if (tok.kind == TokenKind::ImportKeyword || tok.kind == TokenKind::ExportKeyword)
+            if (tok_kind(tok) == TokenKind::ImportKeyword || tok_kind(tok) == TokenKind::ExportKeyword)
                 in_import_export_decl = true;
-            if (tok.kind == TokenKind::ExternKeyword)
+            if (tok_kind(tok) == TokenKind::ExternKeyword)
                 in_extern_decl = true;
 
-            if (tok.kind == TokenKind::CaseKeyword || tok.kind == TokenKind::CaseXKeyword ||
-                tok.kind == TokenKind::CaseZKeyword) {
+            if (tok_kind(tok) == TokenKind::CaseKeyword || tok_kind(tok) == TokenKind::CaseXKeyword ||
+                tok_kind(tok) == TokenKind::CaseZKeyword) {
                 case_expr_pending = true;
                 ++case_depth;
                 case_conditional_depth = 0;
             }
 
-            if (tok.kind == TokenKind::IfKeyword || tok.kind == TokenKind::ForKeyword ||
-                tok.kind == TokenKind::ForeachKeyword ||
-                (tok.kind == TokenKind::WhileKeyword && !do_while_tail) ||
-                tok.kind == TokenKind::RepeatKeyword)
+            if (tok_kind(tok) == TokenKind::IfKeyword || tok_kind(tok) == TokenKind::ForKeyword ||
+                tok_kind(tok) == TokenKind::ForeachKeyword ||
+                (tok_kind(tok) == TokenKind::WhileKeyword && !do_while_tail) ||
+                tok_kind(tok) == TokenKind::RepeatKeyword)
                 control_expr_pending = true;
 
-            if (tok.kind == TokenKind::ElseKeyword) {
+            if (tok_kind(tok) == TokenKind::ElseKeyword) {
                 single_stmt_pending = true;
                 pending_nl = true;
             }
 
-            if (tok.kind == TokenKind::BeginKeyword)
+            if (tok_kind(tok) == TokenKind::BeginKeyword)
                 single_stmt_pending = false;
 
             if (is_constraint_keyword(tok))
                 constraint_pend = true;
 
             bool import_export_function_or_task = in_import_export_decl &&
-                                                  (tok.kind == TokenKind::FunctionKeyword ||
-                                                   tok.kind == TokenKind::TaskKeyword);
+                                                  (tok_kind(tok) == TokenKind::FunctionKeyword ||
+                                                   tok_kind(tok) == TokenKind::TaskKeyword);
             bool extern_function_or_task = in_extern_decl &&
-                                           (tok.kind == TokenKind::FunctionKeyword ||
-                                            tok.kind == TokenKind::TaskKeyword);
-            bool typedef_class_forward_decl = tok.kind == TokenKind::ClassKeyword && prev &&
-                                              prev->kind == TokenKind::TypedefKeyword;
-            if (is_indent_open(tok.kind) && !disable_target && !wait_fork_target &&
+                                           (tok_kind(tok) == TokenKind::FunctionKeyword ||
+                                            tok_kind(tok) == TokenKind::TaskKeyword);
+            bool typedef_class_forward_decl = tok_kind(tok) == TokenKind::ClassKeyword && prev &&
+                                              tok_kind(*prev) == TokenKind::TypedefKeyword;
+            if (is_indent_open(tok_kind(tok)) && !disable_target && !wait_fork_target &&
                 !import_export_function_or_task && !extern_function_or_task &&
                 !typedef_class_forward_decl) {
-                int delta = (tok.kind == TokenKind::ModuleKeyword ||
-                             tok.kind == TokenKind::MacromoduleKeyword ||
-                             tok.kind == TokenKind::InterfaceKeyword ||
-                             tok.kind == TokenKind::PackageKeyword)
+                int delta = (tok_kind(tok) == TokenKind::ModuleKeyword ||
+                             tok_kind(tok) == TokenKind::MacromoduleKeyword ||
+                             tok_kind(tok) == TokenKind::InterfaceKeyword ||
+                             tok_kind(tok) == TokenKind::PackageKeyword)
                                 ? opts.default_indent_level_inside_outmost_block
                                 : 1;
                 indent_level += delta;
                 indent_stack.push_back(delta);
-                if (is_block_open(tok.kind) && tok.kind != TokenKind::CaseKeyword &&
-                    tok.kind != TokenKind::CaseXKeyword && tok.kind != TokenKind::CaseZKeyword &&
-                    tok.kind != TokenKind::CoverGroupKeyword)
+                if (is_block_open(tok_kind(tok)) && tok_kind(tok) != TokenKind::CaseKeyword &&
+                    tok_kind(tok) != TokenKind::CaseXKeyword && tok_kind(tok) != TokenKind::CaseZKeyword &&
+                    tok_kind(tok) != TokenKind::CoverGroupKeyword)
                     pending_nl = true;
-            } else if (is_indent_close(tok.kind)) {
+            } else if (is_indent_close(tok_kind(tok))) {
                 pending_nl = true;
-            } else if (tok.kind == TokenKind::StructKeyword || tok.kind == TokenKind::UnionKeyword) {
+            } else if (tok_kind(tok) == TokenKind::StructKeyword || tok_kind(tok) == TokenKind::UnionKeyword) {
                 struct_pend = true;
-            } else if (tok.kind == TokenKind::EnumKeyword) {
+            } else if (tok_kind(tok) == TokenKind::EnumKeyword) {
                 enum_pend = true;
             } else if (tokens[i].in_covergroup &&
-                       (tok.kind == TokenKind::CoverPointKeyword ||
-                        tok.kind == TokenKind::CrossKeyword)) {
+                       (tok_kind(tok) == TokenKind::CoverPointKeyword ||
+                        tok_kind(tok) == TokenKind::CrossKeyword)) {
                 coverpoint_brace_pend = true;
             }
         } else if (is_open_group(tok) && tok_is(tok, "{", TokenKind::OpenBrace)) {
@@ -4555,7 +4399,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             if (i + 1 < tokens.size() && tok_whitespace(tokens[i + 1]) &&
                 tok_text(tokens[i + 1]).find('\n') != std::string::npos)
                 pending_nl = true;
-        } else if (tok.kind == TokenKind::Directive) {
+        } else if (tok_kind(tok) == TokenKind::Directive) {
             if (is_pp_cond_bare(tok_directive_kind(tok))) {
                 pending_nl = true;
                 in_pp_cond = false;
@@ -4591,7 +4435,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                 pending_nl = false;
                 case_label_pending_nl = true;
             }
-        } else if (tok_is(tok, ";", TokenKind::Semicolon) || tok.kind == TokenKind::EndCaseKeyword) {
+        } else if (tok_is(tok, ";", TokenKind::Semicolon) || tok_kind(tok) == TokenKind::EndCaseKeyword) {
             case_label_pending_nl = false;
             case_conditional_depth = 0;
         } else if (!tok_comment(tok) && !tok_whitespace(tok)) {
@@ -4607,8 +4451,8 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             block_label_state = 0;
         }
         if (!tok_whitespace(tok) && !tok_comment(tok) && is_keyword(tok) &&
-            (tok.kind == TokenKind::BeginKeyword || tok.kind == TokenKind::ForkKeyword ||
-             is_indent_close(tok.kind)) &&
+            (tok_kind(tok) == TokenKind::BeginKeyword || tok_kind(tok) == TokenKind::ForkKeyword ||
+             is_indent_close(tok_kind(tok))) &&
             !disable_target && !wait_fork_target) {
             block_label_state = 1;
         }
@@ -4666,7 +4510,7 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
     auto line_has_kind = [&](size_t s, size_t e, TokenKind kind) {
         for (size_t k = s; k < e && k < tokens.size(); ++k)
             if (!tok_whitespace(tokens[k]) && !tok_comment(tokens[k]) && !tok_directive(tokens[k]) &&
-                tokens[k].kind == kind)
+                tok_kind(tokens[k]) == kind)
                 return true;
         return false;
     };
@@ -4686,12 +4530,12 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
         size_t first = line_first_sig(s, e);
         if (first == SIZE_MAX)
             return false;
-        bool starts_header = tokens[first].kind == TokenKind::ModuleKeyword ||
-                             tokens[first].kind == TokenKind::MacromoduleKeyword ||
-                             tokens[first].kind == TokenKind::InterfaceKeyword ||
-                             tokens[first].kind == TokenKind::ProgramKeyword ||
-                             tokens[first].kind == TokenKind::TaskKeyword ||
-                             tokens[first].kind == TokenKind::FunctionKeyword;
+        bool starts_header = tok_kind(tokens[first]) == TokenKind::ModuleKeyword ||
+                             tok_kind(tokens[first]) == TokenKind::MacromoduleKeyword ||
+                             tok_kind(tokens[first]) == TokenKind::InterfaceKeyword ||
+                             tok_kind(tokens[first]) == TokenKind::ProgramKeyword ||
+                             tok_kind(tokens[first]) == TokenKind::TaskKeyword ||
+                             tok_kind(tokens[first]) == TokenKind::FunctionKeyword;
         if (!starts_header || line_has_header_end(s, e))
             return false;
         return line_has_kind(s, e, TokenKind::OpenParenthesis) ||
@@ -4802,7 +4646,7 @@ static void align_port_pass(std::vector<Tok>& tokens, const FormatOptions& opts)
             else if (tok_is(tokens[k], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
             else if (tok_is(tokens[k], "[", TokenKind::OpenBracket)) ++bracket;
             else if (tok_is(tokens[k], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
-            else if (tok_is(tokens[k], "{", TokenKind::OpenBrace) || tokens[k].kind == TokenKind::ApostropheOpenBrace) ++brace;
+            else if (tok_is(tokens[k], "{", TokenKind::OpenBrace) || tok_kind(tokens[k]) == TokenKind::ApostropheOpenBrace) ++brace;
             else if (tok_is(tokens[k], "}", TokenKind::CloseBrace) && brace > 0) --brace;
             else if (tok_is(tokens[k], ",", TokenKind::Comma) && paren == 0 && bracket == 0 && brace == 0) {
                 size_t end = prev_code_sig(tokens, range_start, k);
@@ -5086,7 +4930,7 @@ static std::vector<std::pair<size_t, size_t>> top_level_ranges_between(
         else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
         else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
         else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
-        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace) ++brace;
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
         else if (tok_is(tokens[i], ",", TokenKind::Comma) && paren == 0 && bracket == 0 && brace == 0) {
             size_t end = prev_code_sig(tokens, start, i);
@@ -5117,7 +4961,7 @@ static size_t find_top_level_token(const std::vector<Tok>& tokens, size_t first,
         else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
         else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
         else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
-        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace) ++brace;
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
     }
     return SIZE_MAX;
@@ -5139,7 +4983,7 @@ static size_t statement_end_semicolon(const std::vector<Tok>& tokens, size_t sta
         else if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && paren > 0) --paren;
         else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
         else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
-        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+        else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) || tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace) ++brace;
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
         else if (tok_is(tokens[i], ";", TokenKind::Semicolon) && paren == 0 && bracket == 0 && brace == 0)
             return i;
@@ -5163,6 +5007,8 @@ static size_t statement_end_semicolon(const std::vector<Tok>& tokens, size_t sta
 // (idempotency guarantee).
 static void normalization_pass(std::vector<Tok>& tokens) {
     for (auto& tok : tokens) {
+        if (tok.in_disabled_region)
+            continue;
         if (!tok_whitespace(tok))
             continue;
         const std::string& text = tok_text(tok);
@@ -5177,7 +5023,7 @@ static void normalization_pass(std::vector<Tok>& tokens) {
     }
 }
 
-static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
+static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     for (auto& tok : tokens) {
         tok.matching_token = SIZE_MAX;
         tok.stmt_end = SIZE_MAX;
@@ -5193,6 +5039,24 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
         tok.in_interface_header = false;
         tok.in_program_header = false;
         tok.in_class_decl = false;
+        tok.in_disabled_region = false;
+    }
+
+    std::regex format_off_regex(opts.format_off_comment_pattern, std::regex::icase);
+    std::regex format_on_regex(opts.format_on_comment_pattern, std::regex::icase);
+    bool disabled_region = false;
+    for (auto& tok : tokens) {
+        if (is_format_control_comment(tok, format_off_regex)) {
+            disabled_region = true;
+            tok.in_disabled_region = true;
+            continue;
+        }
+        if (is_format_control_comment(tok, format_on_regex)) {
+            tok.in_disabled_region = true;
+            disabled_region = false;
+            continue;
+        }
+        tok.in_disabled_region = disabled_region;
     }
 
     std::vector<size_t> parens;
@@ -5216,7 +5080,7 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
             tokens[open].matching_token = i;
             tokens[i].matching_token = open;
         } else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
-                   tokens[i].kind == TokenKind::ApostropheOpenBrace)
+                   tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace)
             braces.push_back(i);
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && !braces.empty()) {
             size_t open = braces.back();
@@ -5270,7 +5134,7 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
         else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
         else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
         else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
-                 tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+                 tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace) ++brace;
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
         else if (tok_is(tokens[i], ";", TokenKind::Semicolon) && paren == 0 &&
                  bracket == 0 && brace == 0) {
@@ -5285,7 +5149,7 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
     };
 
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].kind == TokenKind::ModPortKeyword) {
+        if (tok_kind(tokens[i]) == TokenKind::ModPortKeyword) {
             size_t semi = statement_end_semicolon(tokens, i);
             if (semi != SIZE_MAX) {
                 mark_range(i, semi, &Tok::in_modport);
@@ -5295,11 +5159,11 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
     }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].kind != TokenKind::CoverGroupKeyword)
+        if (tok_kind(tokens[i]) != TokenKind::CoverGroupKeyword)
             continue;
         size_t end = SIZE_MAX;
         for (size_t j = i + 1; j < tokens.size(); ++j) {
-            if (tokens[j].kind == TokenKind::EndGroupKeyword) {
+            if (tok_kind(tokens[j]) == TokenKind::EndGroupKeyword) {
                 end = j;
                 break;
             }
@@ -5315,23 +5179,23 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens) {
         if (semi == SIZE_MAX)
             continue;
 
-        if (tokens[i].kind == TokenKind::FunctionKeyword) {
+        if (tok_kind(tokens[i]) == TokenKind::FunctionKeyword) {
             mark_range(i, semi, &Tok::in_function_decl);
             i = semi;
-        } else if (tokens[i].kind == TokenKind::TaskKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::TaskKeyword) {
             mark_range(i, semi, &Tok::in_task_decl);
             i = semi;
-        } else if (tokens[i].kind == TokenKind::ModuleKeyword ||
-                   tokens[i].kind == TokenKind::MacromoduleKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::ModuleKeyword ||
+                   tok_kind(tokens[i]) == TokenKind::MacromoduleKeyword) {
             mark_range(i, semi, &Tok::in_module_header);
             i = semi;
-        } else if (tokens[i].kind == TokenKind::InterfaceKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::InterfaceKeyword) {
             mark_range(i, semi, &Tok::in_interface_header);
             i = semi;
-        } else if (tokens[i].kind == TokenKind::ProgramKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::ProgramKeyword) {
             mark_range(i, semi, &Tok::in_program_header);
             i = semi;
-        } else if (tokens[i].kind == TokenKind::ClassKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::ClassKeyword) {
             mark_range(i, semi, &Tok::in_class_decl);
             i = semi;
         }
@@ -5342,7 +5206,7 @@ static void format_enum_declaration_pass(std::vector<Tok>& tokens, const FormatO
     const auto& eo = opts.enum_declaration;
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
-            tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].kind != TokenKind::TypedefKeyword)
+            tokens[i].in_disabled_region || tokens[i].fmt_passthrough || tok_kind(tokens[i]) != TokenKind::TypedefKeyword)
             continue;
         size_t semi = tokens[i].stmt_end;
         if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
@@ -5350,7 +5214,7 @@ static void format_enum_declaration_pass(std::vector<Tok>& tokens, const FormatO
             continue;
         size_t enum_i = SIZE_MAX, open = SIZE_MAX;
         for (size_t j = i; j <= semi; ++j) {
-            if (tokens[j].kind == TokenKind::EnumKeyword)
+            if (tok_kind(tokens[j]) == TokenKind::EnumKeyword)
                 enum_i = j;
             if (enum_i != SIZE_MAX && tok_is(tokens[j], "{", TokenKind::OpenBrace)) { open = j; break; }
         }
@@ -5463,7 +5327,7 @@ static void format_modport_pass(std::vector<Tok>& tokens, const FormatOptions& o
     const auto& mo = opts.modport;
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
-            tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].kind != TokenKind::ModPortKeyword)
+            tokens[i].in_disabled_region || tokens[i].fmt_passthrough || tok_kind(tokens[i]) != TokenKind::ModPortKeyword)
             continue;
         size_t semi = tokens[i].stmt_end;
         if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
@@ -5487,7 +5351,7 @@ static void format_modport_pass(std::vector<Tok>& tokens, const FormatOptions& o
             int dir_width = tab_aligned_width(mo.direction_min_width, opts);
             int sig_width = tab_aligned_width(mo.signal_min_width, opts);
             for (auto item : items) {
-                if (!is_modport_dir_kind(tokens[item.first].kind))
+                if (!is_modport_dir_kind(tok_kind(tokens[item.first])))
                     continue;
                 dir_width = std::max(dir_width, (int)tok_text(tokens[item.first]).size() + 1);
                 if (mo.align && !mo.align_adaptive)
@@ -5536,7 +5400,7 @@ static void format_modport_pass(std::vector<Tok>& tokens, const FormatOptions& o
 static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]) ||
-            tokens[i].fmt_disabled || tokens[i].fmt_passthrough || !is_identifier(tokens[i]) ||
+            tokens[i].in_disabled_region || tokens[i].fmt_passthrough || !is_identifier(tokens[i]) ||
             tok_define_block(tokens[i]))
             continue;
         size_t mod = i;
@@ -5577,7 +5441,7 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         for (size_t k = i; k <= semi && k < tokens.size(); ++k) {
             if (tok_whitespace(tokens[k]))
                 continue;
-            if (tokens[k].fmt_disabled ||
+            if (tokens[k].in_disabled_region ||
                 (tokens[k].fmt_passthrough && !pp_conditional_line_token(k))) {
                 protected_range = true;
                 break;
@@ -5637,7 +5501,7 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
             else if (tok_is(tokens[k], "[", TokenKind::OpenBracket)) ++bracket_depth;
             else if (tok_is(tokens[k], "]", TokenKind::CloseBracket) && bracket_depth > 0) --bracket_depth;
             else if (tok_is(tokens[k], "{", TokenKind::OpenBrace) ||
-                     tokens[k].kind == TokenKind::ApostropheOpenBrace) ++brace;
+                     tok_kind(tokens[k]) == TokenKind::ApostropheOpenBrace) ++brace;
             else if (tok_is(tokens[k], "}", TokenKind::CloseBrace) && brace > 0) --brace;
             else if (tok_is(tokens[k], ",", TokenKind::Comma) && paren == 0 &&
                      bracket_depth == 0 && brace == 0) {
@@ -5807,7 +5671,7 @@ static std::vector<std::pair<size_t, size_t>> function_arg_ranges_between(
         else if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++bracket;
         else if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
         else if (tok_is(tokens[i], "{", TokenKind::OpenBrace) ||
-                 tokens[i].kind == TokenKind::ApostropheOpenBrace) ++brace;
+                 tok_kind(tokens[i]) == TokenKind::ApostropheOpenBrace) ++brace;
         else if (tok_is(tokens[i], "}", TokenKind::CloseBrace) && brace > 0) --brace;
         else if (tok_is(tokens[i], ",", TokenKind::Comma) && paren == 0 &&
                  bracket == 0 && brace == 0) {
@@ -5882,7 +5746,7 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
     //
     // because each physical line is scanned independently.
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].fmt_disabled || tokens[i].fmt_passthrough || tokens[i].in_modport ||
+        if (tokens[i].in_disabled_region || tokens[i].fmt_passthrough || tokens[i].in_modport ||
             tok_define_block(tokens[i]) || tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
             continue;
         size_t semi = tokens[i].stmt_end;
@@ -6001,7 +5865,7 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
             if (tok_is(tokens[j], ";", TokenKind::Semicolon) && paren == 0 &&
                 bracket == 0 && brace == 0)
                 return SIZE_MAX;
-            if (tokens[j].kind == TokenKind::EndGroupKeyword && paren == 0 &&
+            if (tok_kind(tokens[j]) == TokenKind::EndGroupKeyword && paren == 0 &&
                 bracket == 0 && brace == 0)
                 return SIZE_MAX;
             if (tok_is(tokens[j], "(", TokenKind::OpenParenthesis)) ++paren;
@@ -6009,7 +5873,7 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
             else if (tok_is(tokens[j], "[", TokenKind::OpenBracket)) ++bracket;
             else if (tok_is(tokens[j], "]", TokenKind::CloseBracket) && bracket > 0) --bracket;
             else if (tok_is(tokens[j], "{", TokenKind::OpenBrace) ||
-                     tokens[j].kind == TokenKind::ApostropheOpenBrace) {
+                     tok_kind(tokens[j]) == TokenKind::ApostropheOpenBrace) {
                 if (paren == 0 && bracket == 0 && brace == 0)
                     return j;
                 ++brace;
@@ -6033,9 +5897,9 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
         }
 
         for (size_t j = open + 1; j < close && j < tokens.size(); ++j) {
-            if (tokens[j].kind == TokenKind::BinsKeyword ||
-                tokens[j].kind == TokenKind::IllegalBinsKeyword ||
-                tokens[j].kind == TokenKind::IgnoreBinsKeyword) {
+            if (tok_kind(tokens[j]) == TokenKind::BinsKeyword ||
+                tok_kind(tokens[j]) == TokenKind::IllegalBinsKeyword ||
+                tok_kind(tokens[j]) == TokenKind::IgnoreBinsKeyword) {
                 tokens[j].fmt_newline_before = true;
                 tokens[j].fmt_blank_lines = 0;
                 tokens[j].fmt_indent = base + 1;
@@ -6063,8 +5927,8 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
         tokens[close].fmt_spaces_before = 0;
 
         size_t next = next_code_sig(tokens, close + 1, tokens.size());
-        if (next != SIZE_MAX && tokens[next].kind != TokenKind::Semicolon &&
-            tokens[next].kind != TokenKind::EndGroupKeyword) {
+        if (next != SIZE_MAX && tok_kind(tokens[next]) != TokenKind::Semicolon &&
+            tok_kind(tokens[next]) != TokenKind::EndGroupKeyword) {
             tokens[next].fmt_newline_before = true;
             tokens[next].fmt_blank_lines = 0;
             tokens[next].fmt_indent = base;
@@ -6075,7 +5939,7 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
             continue;
-        if (tokens[i].kind == TokenKind::CoverGroupKeyword) {
+        if (tok_kind(tokens[i]) == TokenKind::CoverGroupKeyword) {
             cover_base = tokens[i].fmt_indent;
             size_t semi = tokens[i].stmt_end;
             if (semi != SIZE_MAX) {
@@ -6089,13 +5953,13 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
                     }
                 }
             }
-        } else if (tokens[i].kind == TokenKind::EndGroupKeyword) {
+        } else if (tok_kind(tokens[i]) == TokenKind::EndGroupKeyword) {
             tokens[i].fmt_indent = cover_base;
             brace_depth = 0;
         } else if (tokens[i].in_covergroup &&
-                   (tokens[i].kind == TokenKind::CoverPointKeyword ||
-                    tokens[i].kind == TokenKind::CrossKeyword) &&
-                   !tokens[i].fmt_disabled && !tokens[i].fmt_passthrough) {
+                   (tok_kind(tokens[i]) == TokenKind::CoverPointKeyword ||
+                    tok_kind(tokens[i]) == TokenKind::CrossKeyword) &&
+                   !tokens[i].in_disabled_region && !tokens[i].fmt_passthrough) {
             size_t open = coverpoint_block_open(i, tokens.size());
             if (open != SIZE_MAX) {
                 size_t close = matching_close_token(tokens, open, tokens.size(), "{", "}",
@@ -6107,7 +5971,7 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
                     continue;
                 }
             }
-        } else if (tokens[i].in_covergroup && !tokens[i].fmt_disabled &&
+        } else if (tokens[i].in_covergroup && !tokens[i].in_disabled_region &&
                    !tokens[i].fmt_passthrough) {
             bool close_brace = tok_is(tokens[i], "}", TokenKind::CloseBrace);
             if (tokens[i].fmt_newline_before) {
@@ -6124,7 +5988,7 @@ static void format_covergroup_pass(std::vector<Tok>& tokens, const FormatOptions
 
 static void format_constraint_dist_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].kind != TokenKind::DistKeyword || tokens[i].fmt_disabled || tokens[i].fmt_passthrough)
+        if (tok_kind(tokens[i]) != TokenKind::DistKeyword || tokens[i].in_disabled_region || tokens[i].fmt_passthrough)
             continue;
         size_t open = next_code_sig(tokens, i + 1, tokens.size());
         if (open == SIZE_MAX || !tok_is(tokens[open], "{", TokenKind::OpenBrace))
@@ -6165,7 +6029,7 @@ static void format_function_declaration_pass(std::vector<Tok>& tokens, const For
     for (size_t li = 0; li < starts.size(); ++li) {
         size_t s = starts[li], e = (li + 1 < starts.size()) ? starts[li + 1] : tokens.size();
         size_t first = next_code_sig(tokens, s, e);
-        if (first == SIZE_MAX || (tokens[first].kind != TokenKind::FunctionKeyword && tokens[first].kind != TokenKind::TaskKeyword) ||
+        if (first == SIZE_MAX || (tok_kind(tokens[first]) != TokenKind::FunctionKeyword && tok_kind(tokens[first]) != TokenKind::TaskKeyword) ||
             token_range_disabled_or_passthrough(tokens, s, e) || token_range_has_pp_conditional(tokens, s, e))
             continue;
         size_t open = SIZE_MAX;
@@ -6193,16 +6057,14 @@ static void format_function_declaration_pass(std::vector<Tok>& tokens, const For
 // ---------------------------------------------------------------------------
 
 std::string format_source(const std::string& source, const FormatOptions& opts) {
-    ScopedTokenCache token_cache;
-
     const std::string& input = source;
     write_log(opts, "format_source_input.sv", input);
 
     auto tokens = collect_lexer_tokens(input);
     write_log(opts, "00_input.sv", input);
+    populate_nonrender_metadata_pass(tokens, opts);
     normalization_pass(tokens);
     write_log(opts, "01_normalization_pass.sv", render_tokens(tokens, opts));
-    populate_nonrender_metadata_pass(tokens);
     basic_formatting(tokens, input, opts);
     write_log(opts, "02_basic_formatting.sv", render_tokens(tokens, opts));
 
