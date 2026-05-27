@@ -5765,13 +5765,14 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
         for (size_t k = open + 1; k < close; ++k)
             has_macro = has_macro || tok_text(tokens[k]).find('`') != std::string::npos;
         auto args = function_arg_ranges_between(tokens, open + 1, close);
+        // Decide from the current normalized/rendered layout only.  Do not
+        // inspect whitespace token text here: whitespace tokens preserve source
+        // tokenization details that render_tokens() ignores, so using them makes
+        // this pass depend on pre-format history even when the rendered input to
+        // the pass is identical.
         bool already_multiline = tokens[close].fmt_newline_before;
         for (auto r : args)
             already_multiline = already_multiline || tokens[r.first].fmt_newline_before;
-        for (size_t k = open + 1; k < close && k < tokens.size(); ++k)
-            already_multiline = already_multiline ||
-                                (tok_whitespace(tokens[k]) &&
-                                 tok_text(tokens[k]).find('\n') != std::string::npos);
         if ((!has_macro && !already_multiline) || args.size() <= 1)
             continue;
         bool do_break = false;
