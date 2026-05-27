@@ -1733,6 +1733,20 @@ static bool token_range_disabled_or_passthrough(const std::vector<Tok>& tokens, 
     return false;
 }
 
+static bool token_range_disabled_or_non_pp_passthrough(const std::vector<Tok>& tokens,
+                                                       size_t first, size_t end) {
+    for (size_t i = first; i < end && i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]))
+            continue;
+        if (tokens[i].in_disabled_region)
+            return true;
+        if (tokens[i].fmt_passthrough && !tokens[i].is_pp_conditional_directive &&
+            !tokens[i].in_pp_conditional_line_tail)
+            return true;
+    }
+    return false;
+}
+
 static bool token_range_has_define_block(const std::vector<Tok>& tokens, size_t first,
                                          size_t end) {
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
@@ -5733,7 +5747,9 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
 }
 
 static bool function_arg_skip_token(const Tok& tok) {
-    return tok_whitespace(tok) || tok_comment(tok) || (tok_directive(tok) && !is_macro_usage(tok));
+    return tok_whitespace(tok) || tok_comment(tok) ||
+           tok.is_pp_conditional_directive || tok.in_pp_conditional_line_tail ||
+           (tok_directive(tok) && !is_macro_usage(tok));
 }
 
 static size_t next_function_arg_sig(const std::vector<Tok>& tokens, size_t first,
@@ -5849,8 +5865,8 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
             tok_define_block(tokens[i]) || tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
             continue;
         size_t semi = tokens[i].stmt_end;
-        if (semi == SIZE_MAX || tokens[i].stmt_has_pp_conditional ||
-            token_range_disabled_or_passthrough(tokens, i, semi + 1) ||
+        if (semi == SIZE_MAX ||
+            token_range_disabled_or_non_pp_passthrough(tokens, i, semi + 1) ||
             tokens[i].stmt_has_define_block)
             continue;
         size_t name, open, close;
@@ -5864,7 +5880,8 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
             continue;
         bool has_macro = false;
         for (size_t k = open + 1; k < close; ++k)
-            has_macro = has_macro || tok_text(tokens[k]).find('`') != std::string::npos;
+            if (!tokens[k].is_pp_conditional_directive && !tokens[k].in_pp_conditional_line_tail)
+                has_macro = has_macro || tok_text(tokens[k]).find('`') != std::string::npos;
         if (has_macro)
             continue;
         auto args = function_arg_ranges_between(tokens, open + 1, close);
