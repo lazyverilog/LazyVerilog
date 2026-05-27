@@ -1857,7 +1857,7 @@ TEST_CASE("formatter: tab_align snaps enum and modport columns", "[formatter]") 
                         "endinterface\n",
                         opts) == "interface i;\n"
                                  "typedef enum {\n"
-                                 "    A       = 1 ,\n"
+                                 "    A       = 1    ,\n"
                                  "    LONG    = 22\n"
                                  "} e_t;\n"
                                  "modport m (\n"
