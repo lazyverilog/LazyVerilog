@@ -5453,27 +5453,33 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens, const For
     }
 
     for (size_t i = 0; i < tokens.size(); ++i) {
+        TokenKind kind = tok_kind(tokens[i]);
+        if (kind != TokenKind::FunctionKeyword && kind != TokenKind::TaskKeyword &&
+            kind != TokenKind::ModuleKeyword && kind != TokenKind::MacromoduleKeyword &&
+            kind != TokenKind::InterfaceKeyword && kind != TokenKind::ProgramKeyword &&
+            kind != TokenKind::ClassKeyword)
+            continue;
+
         size_t semi = statement_end_semicolon(tokens, i);
         if (semi == SIZE_MAX)
             continue;
 
-        if (tok_kind(tokens[i]) == TokenKind::FunctionKeyword) {
+        if (kind == TokenKind::FunctionKeyword) {
             mark_range(i, semi, &Tok::in_function_decl);
             i = semi;
-        } else if (tok_kind(tokens[i]) == TokenKind::TaskKeyword) {
+        } else if (kind == TokenKind::TaskKeyword) {
             mark_range(i, semi, &Tok::in_task_decl);
             i = semi;
-        } else if (tok_kind(tokens[i]) == TokenKind::ModuleKeyword ||
-                   tok_kind(tokens[i]) == TokenKind::MacromoduleKeyword) {
+        } else if (kind == TokenKind::ModuleKeyword || kind == TokenKind::MacromoduleKeyword) {
             mark_range(i, semi, &Tok::in_module_header);
             i = semi;
-        } else if (tok_kind(tokens[i]) == TokenKind::InterfaceKeyword) {
+        } else if (kind == TokenKind::InterfaceKeyword) {
             mark_range(i, semi, &Tok::in_interface_header);
             i = semi;
-        } else if (tok_kind(tokens[i]) == TokenKind::ProgramKeyword) {
+        } else if (kind == TokenKind::ProgramKeyword) {
             mark_range(i, semi, &Tok::in_program_header);
             i = semi;
-        } else if (tok_kind(tokens[i]) == TokenKind::ClassKeyword) {
+        } else if (kind == TokenKind::ClassKeyword) {
             mark_range(i, semi, &Tok::in_class_decl);
             i = semi;
         }
