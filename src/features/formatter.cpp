@@ -4173,19 +4173,6 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             function_macro_newline_candidate = false;
             function_macro_newline_depth = -1;
         }
-        if (prev && tok_block_comment(*prev) && original_newline_before_token &&
-            paren_depth > 0) {
-            // A formatter-inserted newline between a trailing block comment
-            // argument marker (for example /*num=*/) and the next argument
-            // token should not become part of basic_formatting's baseline.
-            // Later function-call passes decide whether the call is multiline
-            // from the rendered token layout.
-            dec = SD::MustAppend;
-            if (tok_is(tok, ")", TokenKind::CloseParenthesis))
-                spaces = 0;
-            else
-                spaces = std::max(spaces, 1);
-        }
         bool disable_target = prev && tok_kind(*prev) == TokenKind::DisableKeyword;
         bool wait_fork_target = prev && tok_kind(*prev) == TokenKind::WaitKeyword &&
                                 tok_kind(tok) == TokenKind::ForkKeyword;
