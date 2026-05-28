@@ -2665,20 +2665,51 @@ TEST_CASE("formatter: non-ANSI module ports can wrap by max line length", "[form
 
 TEST_CASE("formatter: non-ANSI module port wrapping applies count and max length", "[formatter][options]") {
     FormatOptions opts;
+    opts.safe_mode = true;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.module.non_ansi_port_per_line_enabled = true;
     opts.module.non_ansi_port_per_line = 2;
     opts.module.non_ansi_port_max_line_length_enabled = true;
-    opts.module.non_ansi_port_max_line_length = 16;
+    opts.module.non_ansi_port_max_line_length = 24;
 
-    CHECK(format_source("module top(a, b, cdefghij, d, e);\nendmodule\n", opts) ==
-          "module top(\n"
-          "    a, b,\n"
-          "    cdefghij, d,\n"
-          "    e\n"
-          ");\n"
-          "endmodule\n");
+    const std::string input =
+        "module top(a, b, /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port\n"
+        "long_port_name, d, e); /* header done */\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top(\n"
+        "    a, b,\n"
+        "    /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port\n"
+        "    long_port_name, d,\n"
+        "    e\n"
+        "); /* header done */\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
+    CHECK(formatted == expected);
+    CHECK(format_source(formatted, opts) == formatted);
+
+    const std::string pp_input =
+        "module top(a, b,\n"
+        "`ifdef USE_EXTRA\n"
+        "extra_long_port_name, // conditional port\n"
+        "`else\n"
+        "fallback,\n"
+        "`endif\n"
+        "d, e);\n"
+        "endmodule\n";
+
+    std::string pp_formatted;
+    REQUIRE_NOTHROW(pp_formatted = format_source(pp_input, opts));
+    CHECK(pp_formatted.find("`ifdef USE_EXTRA\n") != std::string::npos);
+    CHECK(pp_formatted.find("extra_long_port_name, // conditional port\n") != std::string::npos);
+    CHECK(pp_formatted.find("`else\n") != std::string::npos);
+    CHECK(pp_formatted.find("fallback,\n") != std::string::npos);
+    CHECK(pp_formatted.find("`endif\n") != std::string::npos);
+    CHECK(format_source(pp_formatted, opts) == pp_formatted);
 }
 
 TEST_CASE("formatter: statement alignment strict versus adaptive", "[formatter][options]") {
