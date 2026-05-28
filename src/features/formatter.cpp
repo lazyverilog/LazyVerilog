@@ -1787,6 +1787,18 @@ static bool token_range_has_pp_conditional(const std::vector<Tok>& tokens, size_
     return false;
 }
 
+
+static bool token_range_has_line_directive(const std::vector<Tok>& tokens, size_t first,
+                                           size_t end) {
+    for (size_t i = first; i < end && i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]))
+            continue;
+        if (is_line_directive(tokens[i]))
+            return true;
+    }
+    return false;
+}
+
 static bool token_range_disabled_or_passthrough(const std::vector<Tok>& tokens, size_t first,
                                                 size_t end) {
     for (size_t i = first; i < end && i < tokens.size(); ++i) {
@@ -1803,7 +1815,8 @@ static bool token_range_disabled_or_non_pp_passthrough(const std::vector<Tok>& t
             continue;
         if (tokens[i].in_disabled_region)
             return true;
-        if (tokens[i].fmt_passthrough && !tokens[i].is_pp_conditional_directive &&
+        if (tokens[i].fmt_passthrough && !is_line_directive(tokens[i]) &&
+            !tokens[i].is_pp_conditional_directive &&
             !tokens[i].in_pp_conditional_line_tail)
             return true;
     }
@@ -1889,7 +1902,7 @@ static void format_class_extends_parameter_pass(std::vector<Tok>& tokens,
 
         size_t hash_idx = SIZE_MAX, open_idx = SIZE_MAX;
         for (size_t si = 0; si + 1 < sigs.size(); ++si) {
-            if (tok_is(tokens[sigs[si]], "#", TokenKind::Hash) &&
+            if (tok_text(tokens[sigs[si]]) == "#" &&
                 tok_is(tokens[sigs[si + 1]], "(", TokenKind::OpenParenthesis)) {
                 hash_idx = sigs[si];
                 open_idx = sigs[si + 1];
@@ -2192,6 +2205,43 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
         if (tokens[i].layout_owner != LayoutOwner::Comment) continue;
         auto& ctok = tokens[i];
 
+        bool source_newline_before_comment = false;
+        for (size_t j = i; j > 0; --j) {
+            if (!tok_whitespace(tokens[j - 1])) break;
+            if (tok_text(tokens[j - 1]).find('\n') != std::string::npos) {
+                source_newline_before_comment = true;
+                break;
+            }
+        }
+        if (tok_block_comment(ctok) && source_newline_before_comment) {
+            ctok.fmt_newline_before = true;
+            ctok.fmt_blank_lines = 0;
+            ctok.fmt_spaces_before = 0;
+        }
+
+        if (tok_block_comment(ctok) && tok_text(ctok).find('\n') != std::string::npos) {
+            // Multi-line block comments are whitespace-sensitive inside the
+            // token.  Leave their text intact so a second format does not
+            // reclassify/reflow their continuation lines.  If the previous
+            // significant token is a line comment, force a new line; otherwise
+            // the block opener would be swallowed by the line comment and the
+            // block's continuation text would be lexed as code on pass two.
+            size_t prev_sig = SIZE_MAX;
+            for (size_t j = i; j > 0; --j) {
+                if (tok_whitespace(tokens[j - 1]))
+                    continue;
+                prev_sig = j - 1;
+                break;
+            }
+            if (prev_sig != SIZE_MAX && tok_line_comment(tokens[prev_sig])) {
+                ctok.fmt_newline_before = true;
+                ctok.fmt_blank_lines = 0;
+                ctok.fmt_spaces_before = 0;
+            }
+            ctok.fmt_passthrough = true;
+            continue;
+        }
+
         if (comment_role_inline_rendered(ctok.comment_role)) {
             ctok.fmt_newline_before = false;
             ctok.fmt_blank_lines   = 0;
@@ -2212,13 +2262,25 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
             }
             ctok.fmt_indent = indent;
 
-            // Preserve blank lines visible in the source whitespace before this comment.
-            int blank = 0;
+            // Preserve blank lines visible in the source whitespace before this comment,
+            // except at file start.  Leading file whitespace is intentionally
+            // normalized away; preserving it on the first formatting pass but not
+            // on the second makes files that start with blank lines non-idempotent.
+            bool has_prev_non_ws = false;
             for (size_t j = i; j > 0; --j) {
-                if (!tok_whitespace(tokens[j - 1])) break;
-                int nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
-                                          tok_text(tokens[j - 1]).end(), '\n');
-                blank = std::max(0, nl - 1);
+                if (!tok_whitespace(tokens[j - 1])) {
+                    has_prev_non_ws = true;
+                    break;
+                }
+            }
+            int blank = 0;
+            if (has_prev_non_ws) {
+                for (size_t j = i; j > 0; --j) {
+                    if (!tok_whitespace(tokens[j - 1])) break;
+                    int nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
+                                              tok_text(tokens[j - 1]).end(), '\n');
+                    blank = std::max(0, nl - 1);
+                }
             }
             ctok.fmt_blank_lines = std::min(blank, opts.blank_lines_between_items);
         }
@@ -2244,7 +2306,7 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
                 continue;
             if (tok_is(tokens[j], "(", TokenKind::OpenParenthesis)) {
                 size_t prev = prev_code_sig(tokens, i, j);
-                if (paren == 0 && !(prev != SIZE_MAX && tok_is(tokens[prev], "#", TokenKind::Hash))) {
+                if (paren == 0 && !(prev != SIZE_MAX && tok_text(tokens[prev]) == "#")) {
                     port_open = j;
                     break;
                 }
@@ -2280,27 +2342,61 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
             continue;
 
         int base_indent = tokens[i].fmt_indent;
-        for (size_t j = port_open + 1; j < port_close; ++j) {
-            if (!tok_comment(tokens[j]) || tokens[j].layout_owner != LayoutOwner::Comment)
-                continue;
-            if (comment_role_own_line_rendered(tokens[j].comment_role)) {
-                tokens[j].fmt_newline_before = true;
-                tokens[j].fmt_blank_lines = 0;
-                tokens[j].fmt_indent = base_indent + 1;
-                tokens[j].fmt_spaces_before = 0;
-            } else if (comment_role_inline_rendered(tokens[j].comment_role)) {
-                tokens[j].fmt_newline_before = false;
-                tokens[j].fmt_spaces_before = 1;
-            } else {
-                if (tokens[j].fmt_newline_before) {
+
+        auto format_header_list_comments = [&](size_t open_idx, size_t close_idx) {
+            for (size_t j = open_idx + 1; j < close_idx; ++j) {
+                if (!tok_comment(tokens[j]) || tokens[j].layout_owner != LayoutOwner::Comment)
+                    continue;
+                if (tok_block_comment(tokens[j]) &&
+                    tok_text(tokens[j]).find('\n') != std::string::npos) {
+                    tokens[j].fmt_newline_before = true;
                     tokens[j].fmt_blank_lines = 0;
                     tokens[j].fmt_indent = base_indent + 1;
                     tokens[j].fmt_spaces_before = 0;
-                } else {
+                    tokens[j].fmt_passthrough = true;
+                    continue;
+                }
+                if (comment_role_own_line_rendered(tokens[j].comment_role)) {
+                    tokens[j].fmt_newline_before = true;
+                    tokens[j].fmt_blank_lines = 0;
+                    tokens[j].fmt_indent = base_indent + 1;
+                    tokens[j].fmt_spaces_before = 0;
+                } else if (comment_role_inline_rendered(tokens[j].comment_role)) {
+                    tokens[j].fmt_newline_before = false;
                     tokens[j].fmt_spaces_before = 1;
+                } else {
+                    if (tokens[j].fmt_newline_before) {
+                        tokens[j].fmt_blank_lines = 0;
+                        tokens[j].fmt_indent = base_indent + 1;
+                        tokens[j].fmt_spaces_before = 0;
+                    } else {
+                        tokens[j].fmt_spaces_before = 1;
+                    }
+                }
+            }
+        };
+
+        // Comments in both the optional module-header parameter block and the
+        // port list need stable own-line indentation.  If parameter comments are
+        // left to the generic comment pass, leading-comma parameter style can
+        // render a comma after a line comment; the second format then lexes that
+        // comma as comment text and changes the output.
+        size_t param_open = SIZE_MAX, param_close = SIZE_MAX;
+        for (size_t j = i + 1; j < port_open; ++j) {
+            if (tok_whitespace(tokens[j]) || tok_comment(tokens[j]) || tok_directive(tokens[j]))
+                continue;
+            if (tok_text(tokens[j]) == "#") {
+                size_t n = next_code_sig(tokens, j + 1, port_open);
+                if (n != SIZE_MAX && tok_is(tokens[n], "(", TokenKind::OpenParenthesis)) {
+                    param_open = n;
+                    param_close = matching_close_paren(tokens, param_open, port_open);
+                    break;
                 }
             }
         }
+        if (param_open != SIZE_MAX && param_close != SIZE_MAX)
+            format_header_list_comments(param_open, param_close);
+        format_header_list_comments(port_open, port_close);
         i = semi;
     }
 }
@@ -2324,7 +2420,7 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 continue;
             if (tok_is(tokens[j], "(", TokenKind::OpenParenthesis)) {
                 size_t prev = prev_code_sig(tokens, i, j);
-                if (paren == 0 && !(prev != SIZE_MAX && tok_is(tokens[prev], "#", TokenKind::Hash))) {
+                if (paren == 0 && !(prev != SIZE_MAX && tok_text(tokens[prev]) == "#")) {
                     port_open = j;
                     break;
                 }
@@ -2358,7 +2454,8 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
         if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon))
             continue;
         if (token_range_has_pp_conditional(tokens, i, semi + 1) ||
-            token_range_disabled_or_passthrough(tokens, i, semi + 1))
+            token_range_has_line_directive(tokens, i, semi + 1) ||
+            token_range_disabled_or_non_pp_passthrough(tokens, i, semi + 1))
             continue;
 
         std::vector<size_t> sigs = code_sig_indices(tokens, i, semi + 1);
@@ -2369,7 +2466,7 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
         for (size_t si = 0; si + 1 < sigs.size(); ++si) {
             if (sigs[si] >= port_open)
                 break;
-            if (tok_is(tokens[sigs[si]], "#", TokenKind::Hash) &&
+            if (tok_text(tokens[sigs[si]]) == "#" &&
                 tok_is(tokens[sigs[si + 1]], "(", TokenKind::OpenParenthesis)) {
                 hash_idx = sigs[si];
                 param_open = sigs[si + 1];
@@ -2393,9 +2490,26 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 else if (tok_contains(tokens[j], '{')) ++p_brace;
                 else if (tok_contains(tokens[j], '}') && p_brace > 0) --p_brace;
                 else if (tok_is(tokens[j], ",", TokenKind::Comma) && p_paren == 0 && p_bracket == 0 && p_brace == 0) {
-                    size_t n = next_code_sig(tokens, j + 1, param_close);
-                    if (n != SIZE_MAX)
-                        params.push_back(n);
+                    bool comma_after_own_line_comment = false;
+                    if (!params.empty())
+                        comma_after_own_line_comment =
+                            range_has_port_separator_comment_barrier(tokens, params.back() + 1, j);
+                    if (comma_after_own_line_comment) {
+                        // Leading-comma parameter style after an own-line comment:
+                        //
+                        //   parameter A = 1
+                        //   // comment
+                        //   , parameter B = 2
+                        //
+                        // Keep the comma as the line-start token for the next
+                        // parameter.  Rendering it after the line comment makes
+                        // the comma part of the comment on the next formatter pass.
+                        params.push_back(j);
+                    } else {
+                        size_t n = next_code_sig(tokens, j + 1, param_close);
+                        if (n != SIZE_MAX)
+                            params.push_back(n);
+                    }
                 }
             }
             tokens[hash_idx].fmt_spaces_before = 1;
@@ -2406,6 +2520,13 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                     tokens[pidx].fmt_blank_lines = 0;
                     tokens[pidx].fmt_indent = base_indent + 1;
                     tokens[pidx].fmt_spaces_before = 0;
+                    if (tok_is(tokens[pidx], ",", TokenKind::Comma)) {
+                        size_t n = next_code_sig(tokens, pidx + 1, param_close);
+                        if (n != SIZE_MAX) {
+                            tokens[n].fmt_newline_before = false;
+                            tokens[n].fmt_spaces_before = 1;
+                        }
+                    }
                 }
                 tokens[param_close].fmt_newline_before = true;
                 tokens[param_close].fmt_blank_lines = 0;
@@ -2558,8 +2679,9 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 prev_sig = &tokens[j];
             }
         };
-        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX)
+        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX) {
             apply_intra_spacing(hash_idx, param_close);
+        }
         apply_intra_spacing(port_open, port_close);
 
         if (ansi && opts.port_declaration.align)
@@ -3623,6 +3745,11 @@ static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opt
 // ---------------------------------------------------------------------------
 // render_tokens — build output string from metadata-annotated tokens
 // ---------------------------------------------------------------------------
+static bool render_needs_lexical_space(const Tok& L, const Tok& R) {
+    auto wordlike = [](const Tok& t) { return is_identifier(t) || is_keyword(t) || is_numeric(t); };
+    return wordlike(L) && wordlike(R);
+}
+
 static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOptions& opts) {
     std::string out;
     size_t total_len = 0;
@@ -3631,20 +3758,35 @@ static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOpt
 
     const std::string indent_unit(opts.indent_size, ' ');
     bool at_bol = true;
+    bool line_comment_open = false;
+    const Tok* prev_rendered = nullptr;
 
     for (const auto& tok : tokens) {
         if (tok.fmt_passthrough) {
+            if (!at_bol && line_comment_open && !tok_whitespace(tok)) {
+                out += '\n';
+                at_bol = true;
+                line_comment_open = false;
+            }
             if (tok.fmt_newline_before) {
                 if (!at_bol) out += '\n';
                 for (int k = 0; k < tok.fmt_blank_lines; ++k)
                     out += '\n';
                 at_bol = true;
+                line_comment_open = false;
             }
             if (!at_bol && tok.fmt_spaces_before > 0)
                 out.append(tok.fmt_spaces_before, ' ');
             out += tok.fmt_text_before;
             out += tok_text(tok);
+            if (tok_text(tok).find('\n') != std::string::npos)
+                line_comment_open = false;
             at_bol = !tok_text(tok).empty() && tok_text(tok).back() == '\n';
+            if (!tok_whitespace(tok)) {
+                prev_rendered = &tok;
+                line_comment_open = tok_line_comment(tok) &&
+                                    tok_text(tok).find('\n') == std::string::npos;
+            }
             continue;
         }
         if (tok_whitespace(tok)) continue;
@@ -3654,22 +3796,43 @@ static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOpt
             for (int k = 0; k < tok.fmt_blank_lines; ++k)
                 out += '\n';
             at_bol = true;
+            line_comment_open = false;
+        }
+
+        if (!at_bol && line_comment_open) {
+            out += '\n';
+            at_bol = true;
+            line_comment_open = false;
+        }
+
+        int spaces_before = tok.fmt_spaces_before;
+        if (!at_bol && spaces_before == 0 && prev_rendered != nullptr) {
+            if (render_needs_lexical_space(*prev_rendered, tok))
+                spaces_before = 1;
+            else if (is_assignment_op(tok, true))
+                spaces_before = binary_space_before(opts.spacing.assignment_operator_spacing) ? 1 : 0;
+            else if (is_assignment_op(*prev_rendered, true))
+                spaces_before = binary_space_after(opts.spacing.assignment_operator_spacing) ? 1 : 0;
         }
 
         if (at_bol && !tok_text(tok).empty()) {
             for (int k = 0; k < tok.fmt_indent; ++k)
                 out += indent_unit;
-            if (tok.fmt_spaces_before > 0)
-                out.append(tok.fmt_spaces_before, ' ');
+            if (spaces_before > 0)
+                out.append(spaces_before, ' ');
             at_bol = false;
-        } else if (!at_bol && tok.fmt_spaces_before > 0) {
-            out.append(tok.fmt_spaces_before, ' ');
+        } else if (!at_bol && spaces_before > 0) {
+            out.append(spaces_before, ' ');
         }
 
         out += tok.fmt_text_before;
         out += tok_text(tok);
+        if (tok_text(tok).find('\n') != std::string::npos)
+            line_comment_open = false;
         if (!tok_text(tok).empty() && tok_text(tok).back() == '\n')
             at_bol = true;
+        prev_rendered = &tok;
+        line_comment_open = tok_line_comment(tok) && tok_text(tok).find('\n') == std::string::npos;
     }
 
     return out;
@@ -4344,6 +4507,16 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         if (prev) {
             spaces = spaces_req(*prev, tok, opts, in_dim, in_for_header, !paren_stack.empty(),
                                 paren_kind, procedural_at);
+            // Keep ternary question-mark spacing controlled solely by the binary
+            // operator spacing option.  Without this explicit normalization, a
+            // formatted token sequence like ?$clog2(...) can be re-lexed and the
+            // second pass may add a space before the system function, causing an
+            // idempotency failure.
+            if (tok_text(*prev) == "?")
+                spaces = binary_space_after(opts.spacing.binary_operator_spacing) ? 1 : 0;
+            else if (tok_text(tok) == "?")
+                spaces = is_numeric(*prev) ? 1 :
+                    (binary_space_before(opts.spacing.binary_operator_spacing) ? 1 : 0);
             dec = break_dec(*prev, tok, opts, in_dim);
         }
         if (paren_kind == ParenKind::InstantiationPortList && prev &&
@@ -4797,15 +4970,15 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             if (is_pp_cond_bare(tok_directive_kind(tok)) || is_pp_cond_with(tok_directive_kind(tok)))
                 in_pp_cond = false;
         } else if (tok_comment(tok)) {
-            // Use stable comment_role to decide whether the token after this
-            // comment should start a new line.  LeadingStatement and
-            // OwnLineInterstitial comments always need a line break after them;
-            // same-line trailing/leading/inline comments do not drive
-            // pending_nl (the following code token will break from its own
-            // structural rules).  Fall back to whitespace inspection only for
-            // comments that weren't classified (disabled regions etc.).
-            if (tok.comment_role == CommentRole::LeadingStatement ||
-                tok.comment_role == CommentRole::OwnLineInterstitial) {
+            // A line comment consumes the rest of its physical line, so any
+            // following token must render on a new line even if the original
+            // formatter classification considered the comment trailing/inline.
+            // Otherwise the next token can become part of the comment on the
+            // second formatter pass.
+            if (tok_line_comment(tok)) {
+                pending_nl = true;
+            } else if (tok.comment_role == CommentRole::LeadingStatement ||
+                       tok.comment_role == CommentRole::OwnLineInterstitial) {
                 pending_nl = true;
             } else if (tok.comment_role == CommentRole::None) {
                 if (i + 1 < tokens.size() && tok_whitespace(tokens[i + 1]) &&
@@ -4839,7 +5012,7 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         // Within case items, ':' can mean either a case-label separator or the
         // false branch of a ternary expression.  Track '?' nesting so only label
         // colons suppress the pending newline before the item body.
-        if (tok_is(tok, "?", TokenKind::Question) && case_depth > 0 && dim_depth == 0)
+        if (tok_text(tok) == "?" && case_depth > 0 && dim_depth == 0)
             ++case_conditional_depth;
         else if (tok_is(tok, ":", TokenKind::Colon) && case_depth > 0 && dim_depth == 0) {
             if (case_conditional_depth > 0) {
@@ -4880,6 +5053,37 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         prev = &tok;
         original_newline_before_token = false;
     } // end pass0 main token loop
+
+    // Normalize leading file whitespace away for Basic-owned first tokens.
+    // Otherwise the first pass can preserve an input-only leading blank that the
+    // second pass no longer sees.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]))
+            continue;
+        if (tokens[i].layout_owner == LayoutOwner::Basic) {
+            tokens[i].fmt_newline_before = false;
+            tokens[i].fmt_blank_lines = 0;
+        }
+        break;
+    }
+
+    // Final pairwise cleanup for ternary question tokens.  This pass is kept
+    // local to Basic-owned tokens so layout-owner assertions still catch any
+    // accidental cross-pass mutation.
+    size_t prev_sig_idx = SIZE_MAX;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tok_whitespace(tokens[i]) || tok_comment(tokens[i]) || tok_directive(tokens[i]))
+            continue;
+        if (prev_sig_idx != SIZE_MAX && tokens[i].layout_owner == LayoutOwner::Basic) {
+            if (tok_text(tokens[prev_sig_idx]) == "?")
+                tokens[i].fmt_spaces_before =
+                    binary_space_after(opts.spacing.binary_operator_spacing) ? 1 : 0;
+            else if (tok_text(tokens[i]) == "?")
+                tokens[i].fmt_spaces_before = is_numeric(tokens[prev_sig_idx]) ? 1 :
+                    (binary_space_before(opts.spacing.binary_operator_spacing) ? 1 : 0);
+        }
+        prev_sig_idx = i;
+    }
 }
 
 
@@ -5637,7 +5841,7 @@ static void assign_layout_owners_pass(std::vector<Tok>& tokens) {
                 continue;
             if (tok_is(tokens[j], "(", TokenKind::OpenParenthesis)) {
                 size_t prev = prev_code_sig(tokens, i, j);
-                if (paren == 0 && !(prev != SIZE_MAX && tok_is(tokens[prev], "#", TokenKind::Hash))) {
+                if (paren == 0 && !(prev != SIZE_MAX && tok_text(tokens[prev]) == "#")) {
                     port_open = j;
                     break;
                 }
@@ -5676,7 +5880,7 @@ static void assign_layout_owners_pass(std::vector<Tok>& tokens) {
         for (size_t j = i + 1; j < port_open; ++j) {
             if (tok_whitespace(tokens[j]) || tok_comment(tokens[j]) || tok_directive(tokens[j]))
                 continue;
-            if (tok_is(tokens[j], "#", TokenKind::Hash)) {
+            if (tok_text(tokens[j]) == "#") {
                 size_t n = next_code_sig(tokens, j + 1, port_open);
                 if (n != SIZE_MAX && tok_is(tokens[n], "(", TokenKind::OpenParenthesis)) {
                     hash_idx = j;
@@ -5691,6 +5895,7 @@ static void assign_layout_owners_pass(std::vector<Tok>& tokens) {
         // skips those headers, so their tokens stay Basic and basic_formatting
         // handles them (including the in_pp_cond passthrough paths).
         if (!token_range_has_pp_conditional(tokens, i, semi + 1) &&
+            !token_range_has_line_directive(tokens, i, semi + 1) &&
             !token_range_disabled_or_passthrough(tokens, i, semi + 1)) {
             if (hash_idx != SIZE_MAX && param_close != SIZE_MAX)
                 set_layout_owner_if_unowned(tokens, hash_idx, param_close + 1,
@@ -6187,7 +6392,7 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
         if (is_keyword(tokens[mod]))
             continue;
         size_t j = next_code_sig(tokens, mod + 1, tokens.size());
-        if (j != SIZE_MAX && tok_is(tokens[j], "#", TokenKind::Hash)) {
+        if (j != SIZE_MAX && tok_text(tokens[j]) == "#") {
             size_t po = next_code_sig(tokens, j + 1, tokens.size());
             if (po == SIZE_MAX || !tok_is(tokens[po], "(", TokenKind::OpenParenthesis))
                 continue;
