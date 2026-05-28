@@ -125,6 +125,7 @@ struct Tok {
     int fmt_spaces_before{0};     // spaces before this token (within a line)
     std::string fmt_text_before;   // synthetic text emitted immediately before this token
     bool fmt_newline_before{false}; // emit newline before this token
+    bool fmt_newline_after{false};  // emit newline immediately after this token's text
     int fmt_blank_lines{0};       // blank lines before this token (after newline)
     bool fmt_passthrough{false};  // whitespace-sensitive macro (verbatim)
 
@@ -790,7 +791,8 @@ enum class ParenKind {
     InstantiationParamList,
     InstantiationParamConnection,
     InstantiationPortList,
-    InstantiationPortConnection
+    InstantiationPortConnection,
+    ModuleHeaderPortList
 };
 
 static ParenKind classify_paren(const Tok& L, bool procedural_at = false) {
@@ -2205,6 +2207,7 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
         if (tokens[i].layout_owner != LayoutOwner::Comment) continue;
         auto& ctok = tokens[i];
 
+        // Scan backward through whitespace to detect a newline before this comment.
         bool source_newline_before_comment = false;
         for (size_t j = i; j > 0; --j) {
             if (!tok_whitespace(tokens[j - 1])) break;
@@ -2213,19 +2216,10 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
                 break;
             }
         }
-        if (tok_block_comment(ctok) && source_newline_before_comment) {
-            ctok.fmt_newline_before = true;
-            ctok.fmt_blank_lines = 0;
-            ctok.fmt_spaces_before = 0;
-        }
 
+        // Multi-line block comments: if preceded by a line comment, force a new
+        // line so the block opener is not swallowed by the line comment.
         if (tok_block_comment(ctok) && tok_text(ctok).find('\n') != std::string::npos) {
-            // Multi-line block comments are whitespace-sensitive inside the
-            // token.  Leave their text intact so a second format does not
-            // reclassify/reflow their continuation lines.  If the previous
-            // significant token is a line comment, force a new line; otherwise
-            // the block opener would be swallowed by the line comment and the
-            // block's continuation text would be lexed as code on pass two.
             size_t prev_sig = SIZE_MAX;
             for (size_t j = i; j > 0; --j) {
                 if (tok_whitespace(tokens[j - 1]))
@@ -2238,51 +2232,91 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
                 ctok.fmt_blank_lines = 0;
                 ctok.fmt_spaces_before = 0;
             }
-            ctok.fmt_passthrough = true;
-            continue;
+            // Fall through to role-based handling below (no fmt_passthrough).
         }
 
-        if (comment_role_inline_rendered(ctok.comment_role)) {
-            ctok.fmt_newline_before = false;
-            ctok.fmt_blank_lines   = 0;
-            ctok.fmt_spaces_before = 1;
-            ctok.fmt_indent        = 0;
-        } else {
-            // Own-line (standalone) comment: indent to match the next Basic token.
-            ctok.fmt_newline_before = true;
-            ctok.fmt_spaces_before  = 0;
-
-            int indent = 0;
+        // Helper: indent from next Basic token.
+        auto indent_from_next_basic = [&]() -> int {
             for (size_t j = i + 1; j < tokens.size(); ++j) {
                 if (tok_whitespace(tokens[j])) continue;
-                if (tokens[j].layout_owner == LayoutOwner::Basic) {
-                    indent = tokens[j].fmt_indent;
-                    break;
-                }
+                if (tokens[j].layout_owner == LayoutOwner::Basic)
+                    return tokens[j].fmt_indent;
             }
-            ctok.fmt_indent = indent;
+            return 0;
+        };
 
-            // Preserve blank lines visible in the source whitespace before this comment,
-            // except at file start.  Leading file whitespace is intentionally
-            // normalized away; preserving it on the first formatting pass but not
-            // on the second makes files that start with blank lines non-idempotent.
+        // Helper: count blank lines from source whitespace before this comment.
+        auto blank_lines_from_source = [&]() -> int {
             bool has_prev_non_ws = false;
             for (size_t j = i; j > 0; --j) {
-                if (!tok_whitespace(tokens[j - 1])) {
-                    has_prev_non_ws = true;
-                    break;
-                }
+                if (!tok_whitespace(tokens[j - 1])) { has_prev_non_ws = true; break; }
             }
+            if (!has_prev_non_ws) return 0;
             int blank = 0;
-            if (has_prev_non_ws) {
-                for (size_t j = i; j > 0; --j) {
-                    if (!tok_whitespace(tokens[j - 1])) break;
-                    int nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
-                                              tok_text(tokens[j - 1]).end(), '\n');
-                    blank = std::max(0, nl - 1);
-                }
+            for (size_t j = i; j > 0; --j) {
+                if (!tok_whitespace(tokens[j - 1])) break;
+                int nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
+                                         tok_text(tokens[j - 1]).end(), '\n');
+                blank = std::max(0, nl - 1);
             }
-            ctok.fmt_blank_lines = std::min(blank, opts.blank_lines_between_items);
+            return std::min(blank, opts.blank_lines_between_items);
+        };
+
+        switch (ctok.comment_role) {
+        case CommentRole::LeadingStatement:
+            ctok.fmt_newline_before = true;
+            ctok.fmt_newline_after  = false;
+            ctok.fmt_spaces_before  = 0;
+            ctok.fmt_indent         = indent_from_next_basic();
+            ctok.fmt_blank_lines    = blank_lines_from_source();
+            break;
+        case CommentRole::OwnLineInterstitial:
+            ctok.fmt_newline_before = true;
+            ctok.fmt_newline_after  = true;
+            ctok.fmt_spaces_before  = 0;
+            ctok.fmt_indent         = indent_from_next_basic();
+            ctok.fmt_blank_lines    = blank_lines_from_source();
+            break;
+        case CommentRole::TrailingStatement:
+            ctok.fmt_newline_before = false;
+            ctok.fmt_newline_after  = true;
+            ctok.fmt_spaces_before  = 1;
+            ctok.fmt_blank_lines    = 0;
+            ctok.fmt_indent         = 0;
+            break;
+        case CommentRole::TrailingInterstitial:
+            ctok.fmt_newline_before = false;
+            ctok.fmt_newline_after  = true;
+            ctok.fmt_spaces_before  = 1;
+            ctok.fmt_blank_lines    = 0;
+            ctok.fmt_indent         = 0;
+            break;
+        case CommentRole::LeadingInterstitial:
+            ctok.fmt_newline_before = source_newline_before_comment;
+            ctok.fmt_newline_after  = false;
+            ctok.fmt_spaces_before  = source_newline_before_comment ? 0 : 1;
+            ctok.fmt_blank_lines    = 0;
+            ctok.fmt_indent         = source_newline_before_comment ? indent_from_next_basic() : 0;
+            break;
+        case CommentRole::InlineInterstitial:
+            ctok.fmt_newline_before = false;
+            ctok.fmt_newline_after  = false;
+            ctok.fmt_spaces_before  = 1;
+            ctok.fmt_blank_lines    = 0;
+            ctok.fmt_indent         = 0;
+            break;
+        case CommentRole::None:
+        default:
+            // Fallback for line comments with no stable role (e.g. in disabled regions).
+            if (tok_line_comment(ctok)) {
+                // Use source position to decide standalone vs. inline.
+                // (These are typically in passthrough/disabled regions.)
+                ctok.fmt_newline_before = source_newline_before_comment;
+                ctok.fmt_spaces_before  = source_newline_before_comment ? 0 : 1;
+                ctok.fmt_blank_lines    = 0;
+                ctok.fmt_indent         = source_newline_before_comment ? indent_from_next_basic() : 0;
+            }
+            break;
         }
     }
 
@@ -2347,24 +2381,35 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
             for (size_t j = open_idx + 1; j < close_idx; ++j) {
                 if (!tok_comment(tokens[j]) || tokens[j].layout_owner != LayoutOwner::Comment)
                     continue;
-                if (tok_block_comment(tokens[j]) &&
-                    tok_text(tokens[j]).find('\n') != std::string::npos) {
-                    tokens[j].fmt_newline_before = true;
-                    tokens[j].fmt_blank_lines = 0;
-                    tokens[j].fmt_indent = base_indent + 1;
-                    tokens[j].fmt_spaces_before = 0;
-                    tokens[j].fmt_passthrough = true;
-                    continue;
-                }
-                if (comment_role_own_line_rendered(tokens[j].comment_role)) {
-                    tokens[j].fmt_newline_before = true;
-                    tokens[j].fmt_blank_lines = 0;
-                    tokens[j].fmt_indent = base_indent + 1;
-                    tokens[j].fmt_spaces_before = 0;
+                if (tokens[j].comment_role == CommentRole::LeadingInterstitial &&
+                    tok_block_comment(tokens[j])) {
+                    // Find what precedes this comment in the port range.
+                    size_t prev_sig = prev_code_sig(tokens, open_idx + 1, j);
+                    bool after_sep = prev_sig != SIZE_MAX &&
+                                     tok_is(tokens[prev_sig], ",", TokenKind::Comma);
+                    size_t owner_idx = tokens[j].comment_owner;
+                    if (after_sep && owner_idx != SIZE_MAX && owner_idx < tokens.size() &&
+                        tokens[owner_idx].fmt_newline_before) {
+                        // Comment between ports where next port starts a new line:
+                        // move comment to that new line and keep port on same line after it.
+                        tokens[j].fmt_newline_before = true;
+                        tokens[j].fmt_blank_lines = 0;
+                        tokens[j].fmt_indent = base_indent + 1;
+                        tokens[j].fmt_spaces_before = 0;
+                        tokens[j].fmt_newline_after = false;
+                        tokens[owner_idx].fmt_newline_before = false;
+                        tokens[owner_idx].fmt_spaces_before = 1;
+                    } else {
+                        tokens[j].fmt_newline_before = false;
+                        tokens[j].fmt_spaces_before = 1;
+                        tokens[j].fmt_newline_after = false;
+                    }
                 } else if (comment_role_inline_rendered(tokens[j].comment_role)) {
                     tokens[j].fmt_newline_before = false;
                     tokens[j].fmt_spaces_before = 1;
+                    tokens[j].fmt_newline_after = false;
                 } else {
+                    // Own-line or unclassified: fix up to port-list indent.
                     if (tokens[j].fmt_newline_before) {
                         tokens[j].fmt_blank_lines = 0;
                         tokens[j].fmt_indent = base_indent + 1;
@@ -2394,9 +2439,11 @@ static void format_comment_layout_pass(std::vector<Tok>& tokens, const FormatOpt
                 }
             }
         }
-        if (param_open != SIZE_MAX && param_close != SIZE_MAX)
+        if (param_open != SIZE_MAX && param_close != SIZE_MAX &&
+            tokens[param_open].layout_owner == LayoutOwner::ModuleHeaderParameterList)
             format_header_list_comments(param_open, param_close);
-        format_header_list_comments(port_open, port_close);
+        if (tokens[port_open].layout_owner == LayoutOwner::ModuleHeaderPortList)
+            format_header_list_comments(port_open, port_close);
         i = semi;
     }
 }
@@ -2454,7 +2501,7 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
         if (semi == SIZE_MAX || !tok_is(tokens[semi], ";", TokenKind::Semicolon))
             continue;
         if (token_range_has_pp_conditional(tokens, i, semi + 1) ||
-            token_range_has_line_directive(tokens, i, semi + 1) ||
+            token_range_has_line_directive(tokens, port_open, port_close + 1) ||
             token_range_disabled_or_non_pp_passthrough(tokens, i, semi + 1))
             continue;
 
@@ -2474,7 +2521,8 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 break;
             }
         }
-        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX) {
+        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX &&
+            !token_range_has_line_directive(tokens, hash_idx, param_close + 1)) {
             std::vector<size_t> params;
             size_t first_param = next_code_sig(tokens, param_open + 1, param_close);
             if (first_param != SIZE_MAX)
@@ -2656,6 +2704,12 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 }
             }
             size_t line_start = e.leading_comma != SIZE_MAX ? e.leading_comma : e.start;
+            // When putting a newline before this non-ANSI entry, any inline
+            // block comment between the previous comma and this entry should
+            // start the new line rather than trail the previous one.
+            // E.g. "a, b, /* cfg */ cdefghij" should wrap as:
+            //   a, b,
+            //   /* cfg */ cdefghij
             tokens[line_start].fmt_newline_before = put_newline;
             tokens[line_start].fmt_blank_lines = 0;
             tokens[line_start].fmt_indent = base_indent + 1;
@@ -2705,7 +2759,8 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
                 prev_sig = &tokens[j];
             }
         };
-        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX) {
+        if (hash_idx != SIZE_MAX && param_close != SIZE_MAX &&
+            !token_range_has_line_directive(tokens, hash_idx, param_close + 1)) {
             apply_intra_spacing(hash_idx, param_close);
         }
         apply_intra_spacing(port_open, port_close);
@@ -3726,33 +3781,34 @@ static void align_var_pass_v2(std::vector<Tok>& tokens, const FormatOptions& opt
             for (size_t k = 0; k < nd; ++k) {
                 bool is_last = (k == nd - 1);
                 const auto& decl = vp.declarators[k];
+                int id_w = (k < line_id_widths.size()) ? line_id_widths[k]
+                                                       : (int)decl.name_str.size() + 1;
+                int trail_w = (k < line_trail_widths.size()) ? line_trail_widths[k] : 0;
 
-                // Name width padding: for non-last declarators and last one if id_widths available
-                if (k < line_id_widths.size() && !decl.trail_str.empty()) {
-                    // Need to set spacing on trail_start token
-                    if (decl.trail_start != decl.trail_end && decl.trail_start < tokens.size()) {
-                        int name_pad = std::max(1, line_id_widths[k] - (int)decl.name_str.size());
-                        tokens[decl.trail_start].fmt_spaces_before = name_pad;
-                    }
-                } else if (k < line_id_widths.size() && decl.trail_str.empty()) {
-                    // No trailing: for non-last, need to pad name to id_width + trail_width before comma
-                    // The comma/semicolon spacing is handled differently
+                // Set spacing between name and trail (section3 → section4)
+                if (!decl.trail_str.empty() &&
+                    decl.trail_start != decl.trail_end && decl.trail_start < tokens.size()) {
+                    int name_pad = std::max(1, id_w - (int)decl.name_str.size());
+                    tokens[decl.trail_start].fmt_spaces_before = name_pad;
                 }
 
                 if (!is_last) {
-                    // After trail, there's a comma — find it and set spacing for next decl name
-                    // The comma token is between this decl's trail_end and next decl's name_idx
-                    if (k + 1 < nd) {
-                        // Set spacing before next declarator's name
-                        // (accounts for ", " between declarators)
+                    // Comma token is at decl.trail_end; pad it to end of section3+section4
+                    if (decl.trail_end < tokens.size()) {
+                        int pad;
+                        if (decl.trail_str.empty())
+                            pad = std::max(1, id_w - (int)decl.name_str.size() + trail_w);
+                        else
+                            pad = std::max(1, trail_w - (int)decl.trail_str.size());
+                        tokens[decl.trail_end].fmt_spaces_before = pad;
                     }
+                    // One space after comma before next declarator name
+                    if (k + 1 < nd)
+                        tokens[vp.declarators[k + 1].name_idx].fmt_spaces_before = 1;
                 } else {
                     // Last declarator: align the semicolon as the end of section 4.
                     if (vp.semicolon_idx < tokens.size()) {
-                        int id_w = (k < line_id_widths.size()) ? line_id_widths[k]
-                                                               : (int)decl.name_str.size() + 1;
-                        int trail_w = (k < line_trail_widths.size()) ? line_trail_widths[k] : 0;
-                        int pad = 1;
+                        int pad;
                         if (decl.trail_str.empty())
                             pad = std::max(1, id_w - (int)decl.name_str.size() + trail_w);
                         else
@@ -3859,6 +3915,11 @@ static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOpt
             at_bol = true;
         prev_rendered = &tok;
         line_comment_open = tok_line_comment(tok) && tok_text(tok).find('\n') == std::string::npos;
+        if (tok.fmt_newline_after && !at_bol) {
+            out += '\n';
+            at_bol = true;
+            line_comment_open = false;
+        }
     }
 
     return out;
@@ -3873,6 +3934,7 @@ struct FormatMetadataSnapshot {
     int fmt_spaces_before{0};
     std::string fmt_text_before;
     bool fmt_newline_before{false};
+    bool fmt_newline_after{false};
     int fmt_blank_lines{0};
     bool fmt_passthrough{false};
 };
@@ -3882,6 +3944,7 @@ static FormatMetadataSnapshot snapshot_format_metadata(const Tok& tok) {
             tok.fmt_spaces_before,
             tok.fmt_text_before,
             tok.fmt_newline_before,
+            tok.fmt_newline_after,
             tok.fmt_blank_lines,
             tok.fmt_passthrough};
 }
@@ -3892,6 +3955,7 @@ static bool format_metadata_changed(const Tok& tok, const FormatMetadataSnapshot
            tok.fmt_spaces_before != before.fmt_spaces_before ||
            tok.fmt_text_before != before.fmt_text_before ||
            tok.fmt_newline_before != before.fmt_newline_before ||
+           tok.fmt_newline_after != before.fmt_newline_after ||
            tok.fmt_blank_lines != before.fmt_blank_lines ||
            tok.fmt_passthrough != before.fmt_passthrough;
 }
@@ -4282,6 +4346,65 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
                     return ParenKind::InstantiationPortConnection;
             }
         }
+        // Check if this is a module/interface/program declaration port list.
+        // Pattern: module [import ...] [#(...)] (ports) ;
+        // Only at top paren level; and only when preceded by ) from #(...) or an
+        // identifier — not by keywords like wait/if/while which are never module names.
+        // Guard: left must be ) (param list close) to avoid false-positives on
+        // wait(done), if(...), etc. inside module bodies.
+        if (paren_stack.empty() &&
+            tok_is(left, ")", TokenKind::CloseParenthesis)) {
+            size_t close_idx = matching_close_paren(tokens, open_idx, tokens.size());
+            if (close_idx != SIZE_MAX) {
+                size_t semi = next_code_sig(tokens, close_idx + 1, tokens.size());
+                if (semi != SIZE_MAX && tok_is(tokens[semi], ";", TokenKind::Semicolon)) {
+                    bool found_module = false;
+                    size_t scan_limit = open_idx > 1000 ? open_idx - 1000 : 0;
+                    size_t k = open_idx;
+                    while (k > scan_limit) {
+                        --k;
+                        const auto& tk = tokens[k];
+                        if (tok_whitespace(tk) || tok_comment(tk) || tok_directive(tk)) continue;
+                        // Jump over matching parens (e.g. #(...) parameter list)
+                        if (tok_is(tk, ")", TokenKind::CloseParenthesis)) {
+                            size_t po = matching_open_paren(k);
+                            if (po == SIZE_MAX) break;
+                            k = po;
+                            continue;
+                        }
+                        TokenKind knd = tok_kind(tk);
+                        if (knd == TokenKind::ModuleKeyword ||
+                            knd == TokenKind::MacromoduleKeyword ||
+                            knd == TokenKind::InterfaceKeyword ||
+                            knd == TokenKind::ProgramKeyword) {
+                            found_module = true;
+                            break;
+                        }
+                        // Stop at tokens that cannot appear in a module header prefix
+                        if (knd == TokenKind::EndModuleKeyword ||
+                            knd == TokenKind::EndInterfaceKeyword ||
+                            knd == TokenKind::EndProgramKeyword ||
+                            knd == TokenKind::BeginKeyword ||
+                            knd == TokenKind::EndKeyword ||
+                            knd == TokenKind::AlwaysKeyword ||
+                            knd == TokenKind::AlwaysCombKeyword ||
+                            knd == TokenKind::AlwaysFFKeyword ||
+                            knd == TokenKind::AlwaysLatchKeyword ||
+                            knd == TokenKind::InitialKeyword ||
+                            knd == TokenKind::TaskKeyword ||
+                            knd == TokenKind::FunctionKeyword ||
+                            knd == TokenKind::ClassKeyword ||
+                            tok_is(tk, "{", TokenKind::OpenBrace) ||
+                            tok_is(tk, "}", TokenKind::CloseBrace) ||
+                            tok_is(tk, "=", TokenKind::Equals) ||
+                            tok_is(tk, "<=", TokenKind::LessThanEquals))
+                            break;
+                    }
+                    if (found_module)
+                        return ParenKind::ModuleHeaderPortList;
+                }
+            }
+        }
         return classify_paren(left, procedural_at_context);
     };
     auto is_user_type_packed_dimension_open = [&](size_t open_idx) -> bool {
@@ -4441,8 +4564,15 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             if (after_dis && nl >= 1)
                 pending_nl = true;
             after_dis = false;
-            if (nl > 0 && paren_depth > 0)
-                continue;
+            if (nl > 0 && paren_depth > 0) {
+                bool in_module_port_list = paren_depth == 1 && !paren_stack.empty() &&
+                                           paren_stack.back() == ParenKind::ModuleHeaderPortList;
+                if (!in_module_port_list)
+                    continue;
+                // Inside a module header port list: treat newlines as significant
+                // so each port appears on its own line.
+                pending_nl = true;
+            }
             int blank_nl = (prev && tok_define_block(*prev)) ? nl : (nl - 1);
             if (blank_nl > 0) {
                 int extra = std::min(blank_nl, opts.blank_lines_between_items);
@@ -4606,13 +4736,13 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             dec = SD::MustWrap;
         }
 
-        // --- D. Inline-comment suppression ---
-        // Use the pre-classified comment_role (set once by classify_comments_pass
-        // from original source positions) instead of re-deriving attachment from
-        // the current-pass whitespace.  This prevents oscillation when formatted
-        // output has different spacing than the input.
-        bool inline_comment = tok_comment(tok) &&
-                              comment_role_inline_rendered(tok.comment_role);
+        // --- D. Comment tokens are entirely owned by format_comment_layout_pass.
+        // Let pending_nl and blank_pend flow to the next Basic token.
+        if (tok_comment(tok)) {
+            prev = &tok;
+            original_newline_before_token = false;
+            continue;
+        }
 
         do_while_tail = false;
         if (prev && tok_kind(*prev) == TokenKind::EndKeyword && tok_kind(tok) == TokenKind::WhileKeyword) {
@@ -4653,31 +4783,6 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         }
         if (case_label_pending_nl && tok_kind(tok) == TokenKind::BeginKeyword)
             case_label_pending_nl = false;
-
-        if (inline_comment && pending_nl) {
-            if (!case_label_pending_nl)
-                pending_nl = false;
-        } else if (tok_comment(tok) &&
-                   (tok.comment_role == CommentRole::LeadingStatement ||
-                    tok.comment_role == CommentRole::OwnLineInterstitial)) {
-            dec = SD::MustWrap;
-        } else if (tok_line_comment(tok) && tok.comment_role == CommentRole::None) {
-            // Fallback only for comments intentionally excluded from stable
-            // classification, such as disabled/passthrough regions. Classified
-            // comments must be formatted by CommentRole, not by re-reading
-            // original source line position.
-            size_t line_start = input.rfind('\n', (size_t)tok_pos(tok));
-            line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
-            bool standalone_comment = true;
-            for (size_t p = line_start; p < (size_t)tok_pos(tok); ++p) {
-                if (input[p] != ' ' && input[p] != '\t') {
-                    standalone_comment = false;
-                    break;
-                }
-            }
-            if (standalone_comment)
-                dec = SD::MustWrap;
-        }
 
         // --- E. Emit newline / spacing based on break decision ---
         // dec chooses between three behaviors:
@@ -5804,14 +5909,24 @@ static void passthrough_regions_pass(std::vector<Tok>& tokens, const FormatOptio
         tok.fmt_passthrough = true;
         if (!in_passthrough) {
             tok.fmt_newline_before = true;
-            // Count blank lines from preceding whitespace
+            // Count blank lines from preceding whitespace.
+            // When the nearest non-whitespace predecessor is a define-block token
+            // its text already ends with '\n', so every whitespace newline between
+            // the two blocks is a blank line (no -1 adjustment needed).
             int blank = 0;
+            int last_ws_nl = 0;
+            bool prev_nonws_is_define = false;
             for (size_t j = i; j > 0; --j) {
-                if (!tok_whitespace(tokens[j - 1])) break;
-                int nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
-                                         tok_text(tokens[j - 1]).end(), '\n');
-                blank = std::max(0, nl - 1);
+                if (!tok_whitespace(tokens[j - 1])) {
+                    prev_nonws_is_define = tok_define_block(tokens[j - 1]);
+                    break;
+                }
+                last_ws_nl = (int)std::count(tok_text(tokens[j - 1]).begin(),
+                                             tok_text(tokens[j - 1]).end(), '\n');
+                blank = std::max(0, last_ws_nl - 1);
             }
+            if (prev_nonws_is_define)
+                blank = last_ws_nl;
             tok.fmt_blank_lines = std::min(blank, opts.blank_lines_between_items);
         }
         in_passthrough = true;
@@ -5916,19 +6031,23 @@ static void assign_layout_owners_pass(std::vector<Tok>& tokens) {
                 }
             }
         }
-        // Skip PortList/ParameterList ownership when the header contains PP
-        // conditionals or passthrough regions — format_portlist_pass already
-        // skips those headers, so their tokens stay Basic and basic_formatting
-        // handles them (including the in_pp_cond passthrough paths).
-        if (!token_range_has_pp_conditional(tokens, i, semi + 1) &&
-            !token_range_has_line_directive(tokens, i, semi + 1) &&
-            !token_range_disabled_or_passthrough(tokens, i, semi + 1)) {
-            if (hash_idx != SIZE_MAX && param_close != SIZE_MAX)
-                set_layout_owner_if_unowned(tokens, hash_idx, param_close + 1,
-                                            LayoutOwner::ModuleHeaderParameterList);
+        // Set ParameterList/PortList ownership per-subrange so that a line
+        // directive in the parameter list (e.g. `include) does not prevent the
+        // port list from being formatted by format_portlist_pass.
+        bool param_range_ok = hash_idx != SIZE_MAX && param_close != SIZE_MAX &&
+            !token_range_has_pp_conditional(tokens, hash_idx, param_close + 1) &&
+            !token_range_has_line_directive(tokens, hash_idx, param_close + 1) &&
+            !token_range_disabled_or_passthrough(tokens, hash_idx, param_close + 1);
+        bool port_range_ok =
+            !token_range_has_pp_conditional(tokens, port_open, port_close + 1) &&
+            !token_range_has_line_directive(tokens, port_open, port_close + 1) &&
+            !token_range_disabled_or_passthrough(tokens, port_open, port_close + 1);
+        if (param_range_ok)
+            set_layout_owner_if_unowned(tokens, hash_idx, param_close + 1,
+                                        LayoutOwner::ModuleHeaderParameterList);
+        if (port_range_ok)
             set_layout_owner_if_unowned(tokens, port_open, port_close + 1,
                                         LayoutOwner::ModuleHeaderPortList);
-        }
         set_layout_owner_if_unowned(tokens, i, semi + 1, LayoutOwner::Basic);
         i = semi;
     }
@@ -7199,20 +7318,22 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
                           [&] { basic_formatting(tokens, input, opts); });
     write_log(opts, "02_basic_formatting.sv", render_tokens(tokens, opts));
 
-    run_layout_owned_pass("format_comment_layout_pass", tokens,
-                          {LayoutOwner::Comment},
-                          [&] { format_comment_layout_pass(tokens, opts); });
-    write_log(opts, "03_format_comment_layout_pass.sv", render_tokens(tokens, opts));
-    // Module-header reflow mutates token metadata directly.
-    run_layout_owned_pass("format_class_extends_parameter_pass", tokens,
-                          {LayoutOwner::Basic},
-                          [&] { format_class_extends_parameter_pass(tokens, opts); });
-    write_log(opts, "04_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
     run_layout_owned_pass("format_portlist_pass", tokens,
                           {LayoutOwner::ModuleHeaderParameterList,
                            LayoutOwner::ModuleHeaderPortList},
                           [&] { format_portlist_pass(tokens, opts); });
-    write_log(opts, "05_format_portlist_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "03_format_portlist_pass.sv", render_tokens(tokens, opts));
+    run_layout_owned_pass("format_comment_layout_pass", tokens,
+                          {LayoutOwner::Comment,
+                           LayoutOwner::ModuleHeaderPortList,
+                           LayoutOwner::ModuleHeaderParameterList},
+                          [&] { format_comment_layout_pass(tokens, opts); });
+    write_log(opts, "04_format_comment_layout_pass.sv", render_tokens(tokens, opts));
+    // Module-header reflow mutates token metadata directly.
+    run_layout_owned_pass("format_class_extends_parameter_pass", tokens,
+                          {LayoutOwner::Basic},
+                          [&] { format_class_extends_parameter_pass(tokens, opts); });
+    write_log(opts, "05_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
 
     if (opts.statement.align) {
         run_layout_owned_pass("align_assign_pass", tokens,
