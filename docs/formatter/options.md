@@ -1018,7 +1018,10 @@ module m_top(
 
 ### `non_ansi_port_max_line_length_enabled` / `non_ansi_port_max_line_length`
 
-When enabled, non-ANSI port lists are wrapped based on maximum line length instead of a fixed port count. Mutually exclusive with `non_ansi_port_per_line` — if both are enabled, `non_ansi_port_per_line` takes priority.
+When enabled, non-ANSI port lists are wrapped based on maximum line length.
+If both `non_ansi_port_per_line_enabled` and `non_ansi_port_max_line_length_enabled` are enabled,
+both constraints are applied: a line break is inserted when either the fixed port count is reached
+or adding the next port would exceed the maximum line length.
 
 ```toml
 [format.module]

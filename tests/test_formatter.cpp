@@ -1065,6 +1065,77 @@ TEST_CASE("formatter: inline block comments stay on their original line", "[form
                                  "endmodule\n");
 }
 
+TEST_CASE("formatter: embedded expression block comment remains inline and idempotent",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string once = format_source("module top;\n"
+                                           "assign x = a + /* delay */ b;\n"
+                                           "endmodule\n",
+                                           opts);
+    CHECK(once == "module top;\n"
+                  "assign x = a + /* delay */ b;\n"
+                  "endmodule\n");
+    CHECK(format_source(once, opts) == once);
+}
+
+TEST_CASE("formatter: leading interstitial call comment moves with argument",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.function.break_policy = "always";
+    opts.function.layout = "block";
+
+    const std::string once = format_source("module top;\n"
+                                           "initial foo(a, /*test*/ b, c);\n"
+                                           "endmodule\n",
+                                           opts);
+    CHECK(once == "module top;\n"
+                  "initial foo(\n"
+                  "            a,\n"
+                  "            /*test*/ b,\n"
+                  "            c\n"
+                  "        );\n"
+                  "endmodule\n");
+    CHECK(format_source(once, opts) == once);
+}
+
+TEST_CASE("formatter: mixed trailing and own-line interstitial call comments stay stable",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.function.break_policy = "always";
+    opts.function.layout = "block";
+
+    const std::string once = format_source("module top;\n"
+                                           "always_comb begin\n"
+                                           "    add_number(\n"
+                                           "        .a(a), /* hi */\n"
+                                           "    // hi\n"
+                                           "        .b(b),\n"
+                                           "    // hi\n"
+                                           "        .result(result)\n"
+                                           "    );\n"
+                                           "end\n"
+                                           "endmodule\n",
+                                           opts);
+    CHECK(once == "module top;\n"
+                  "always_comb begin\n"
+                  "    add_number(\n"
+                  "        .a(a), /* hi */\n"
+                  "        // hi\n"
+                  "        .b(b),\n"
+                  "        // hi\n"
+                  "        .result(result)\n"
+                  "    );\n"
+                  "end\n"
+                  "endmodule\n");
+    CHECK(format_source(once, opts) == once);
+}
+
 TEST_CASE("formatter: block function call after inline block comment indents from call",
           "[formatter]") {
     FormatOptions opts;
@@ -1080,11 +1151,12 @@ TEST_CASE("formatter: block function call after inline block comment indents fro
                         "endmodule\n",
                         opts) == "module top;\n"
                                  "always_comb begin\n"
-                                 "    /**/ add_number(\n"
-                                 "             .a(a3),\n"
-                                 "             .b(b),\n"
-                                 "             .result(result)\n"
-                                 "         );\n"
+                                 "    /**/\n"
+                                 "    add_number(\n"
+                                 "        .a(a3),\n"
+                                 "        .b(b),\n"
+                                 "        .result(result)\n"
+                                 "    );\n"
                                  "end\n"
                                  "endmodule\n");
 }
@@ -2216,18 +2288,18 @@ TEST_CASE("formatter: instance port alignment crosses preprocessor conditionals"
         "module top;\n"
         "memory u_mem5 ( //test\n"
         "    // input\n"
-        "    .i_clk    (i_clk     ), // input\n"
-        "    .address  (addr      ), // output() .data_in  (data_in   ),\n"
+        "    .i_clk     (i_clk     ), // input\n"
+        "    .address   (addr      ), // output() .data_in  (data_in   ),\n"
         "`ifdef A\n"
-        "    .data_out (kj        ), // test\n"
+        "    .data_out  (kj        ), // test\n"
         "`elsif B\n"
         "    .read_write (read_write),\n"
         "`endif\n"
-        "    .chip_en  (chip_en   ),\n"
-        "    .www333   (www333    ),\n"
-        "    .www333   (www333    ),\n"
-        "    .zzfuk    (zzfuk     ),\n"
-        "    .zzfuk    (zzfuk     )\n"
+        "    .chip_en   (chip_en   ),\n"
+        "    .www333    (www333    ),\n"
+        "    .www333    (www333    ),\n"
+        "    .zzfuk     (zzfuk     ),\n"
+        "    .zzfuk     (zzfuk     )\n"
         ");\n"
         "endmodule\n";
 
@@ -2357,4 +2429,314 @@ TEST_CASE("formatter: class extends parameter layout uses parameter layout", "[f
     CHECK(formatted.find(".CFG_T(dma_env_cfg),\n") != std::string::npos);
     CHECK(formatted.find(".RAL_T(dma_reg_block),\n") != std::string::npos);
     CHECK(format_source(formatted, cfg.format) == formatted);
+}
+
+TEST_CASE("formatter: own-line block pragmas in ANSI port list stay idempotent", "[formatter]") {
+    Config cfg = load_config(".");
+    std::string input = "module top (\n"
+                        "/*pragma coverage off*/\n"
+                        "input logic scan_mode\n"
+                        "/*pragma coverage on*/\n"
+                        ");\n"
+                        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
+    CHECK(format_source(formatted, cfg.format) == formatted);
+    CHECK(formatted.find("/*pragma coverage off*/ input") == std::string::npos);
+    CHECK(formatted.find("scan_mode /*pragma coverage on*/") == std::string::npos);
+    CHECK(formatted.find("/*pragma coverage on*/\n);") != std::string::npos);
+}
+
+TEST_CASE("formatter: ANSI port-list comments before leading commas stay idempotent",
+          "[formatter]") {
+    Config cfg = load_config(".");
+    std::string input = "module top (\n"
+                        "    input clk_i\n"
+                        "    // request channel\n"
+                        "    , input req_i\n"
+                        "    , input [3:0] len_i // Must remain constant\n"
+                        "    , output ready_o\n"
+                        ");\n"
+                        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
+    CHECK(format_source(formatted, cfg.format) == formatted);
+    CHECK(formatted.find("// request channel,") == std::string::npos);
+    CHECK(formatted.find("// Must remain constant,") == std::string::npos);
+    CHECK(formatted.find("// request channel\n") != std::string::npos);
+}
+
+TEST_CASE("formatter: blank line preservation limit is configurable", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.blank_lines_between_items = 0;
+
+    CHECK(format_source("module top;\n"
+                        "assign a = b;\n"
+                        "\n"
+                        "\n"
+                        "assign c = d;\n"
+                        "endmodule\n",
+                        opts) == "module top;\n"
+                                 "assign a = b;\n"
+                                 "assign c = d;\n"
+                                 "endmodule\n");
+
+    opts.blank_lines_between_items = 2;
+    CHECK(format_source("module top;\n"
+                        "assign a = b;\n"
+                        "\n"
+                        "\n"
+                        "\n"
+                        "assign c = d;\n"
+                        "endmodule\n",
+                        opts) == "module top;\n"
+                                 "assign a = b;\n"
+                                 "\n"
+                                 "\n"
+                                 "assign c = d;\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: assignment operator spacing supports every mode", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    opts.spacing.assignment_operator_spacing = "none";
+    CHECK(format_source("module top;\nassign a = b;\nalways_ff q <= d;\nendmodule\n", opts) ==
+          "module top;\nassign a=b;\nalways_ff q<=d;\nendmodule\n");
+
+    opts.spacing.assignment_operator_spacing = "before";
+    CHECK(format_source("module top;\nassign a = b;\nalways_ff q <= d;\nendmodule\n", opts) ==
+          "module top;\nassign a =b;\nalways_ff q <=d;\nendmodule\n");
+
+    opts.spacing.assignment_operator_spacing = "after";
+    CHECK(format_source("module top;\nassign a = b;\nalways_ff q <= d;\nendmodule\n", opts) ==
+          "module top;\nassign a= b;\nalways_ff q<= d;\nendmodule\n");
+
+    opts.spacing.assignment_operator_spacing = "both";
+    CHECK(format_source("module top;\nassign a=b;\nalways_ff q<=d;\nendmodule\n", opts) ==
+          "module top;\nassign a = b;\nalways_ff q <= d;\nendmodule\n");
+}
+
+TEST_CASE("formatter: binary operator spacing supports every mode", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    opts.spacing.binary_operator_spacing = "none";
+    CHECK(format_source("module top;\nassign y = a + b * c == d;\nendmodule\n", opts) ==
+          "module top;\nassign y = a+b*c==d;\nendmodule\n");
+
+    opts.spacing.binary_operator_spacing = "before";
+    CHECK(format_source("module top;\nassign y = a + b * c == d;\nendmodule\n", opts) ==
+          "module top;\nassign y = a +b *c ==d;\nendmodule\n");
+
+    opts.spacing.binary_operator_spacing = "after";
+    CHECK(format_source("module top;\nassign y = a + b * c == d;\nendmodule\n", opts) ==
+          "module top;\nassign y = a+ b* c== d;\nendmodule\n");
+
+    opts.spacing.binary_operator_spacing = "both";
+    CHECK(format_source("module top;\nassign y=a+b*c==d;\nendmodule\n", opts) ==
+          "module top;\nassign y = a + b * c == d;\nendmodule\n");
+}
+
+TEST_CASE("formatter: dimension operator and range spacing modes combine independently", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.spacing.dimension_binary_operator_spacing = "both";
+    opts.spacing.range_colon_spacing = "after";
+    opts.spacing.indexed_part_select_spacing = "before";
+
+    CHECK(format_source("module top;\nlogic [WIDTH-1:0] data;\nassign y = data[base+:WIDTH];\nendmodule\n", opts) ==
+          "module top;\nlogic [WIDTH - 1: 0] data;\nassign y = data[base +:WIDTH];\nendmodule\n");
+
+    opts.spacing.dimension_binary_operator_spacing = "after";
+    opts.spacing.range_colon_spacing = "before";
+    opts.spacing.indexed_part_select_spacing = "after";
+    CHECK(format_source("module top;\nlogic [WIDTH-1:0] data;\nassign y = data[base+:WIDTH];\nendmodule\n", opts) ==
+          "module top;\nlogic [WIDTH- 1 :0] data;\nassign y = data[base+: WIDTH];\nendmodule\n");
+}
+
+TEST_CASE("formatter: for semicolon spacing supports all documented modes", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    opts.spacing.semicolon_spacing = "none";
+    CHECK(format_source("module top;\nfor (i = 0; i < N; i++) a = b;\nendmodule\n", opts) ==
+          "module top;\nfor (i = 0;i < N;i++)\n  a = b;\nendmodule\n");
+
+    opts.spacing.semicolon_spacing = "before";
+    CHECK(format_source("module top;\nfor (i = 0; i < N; i++) a = b;\nendmodule\n", opts) ==
+          "module top;\nfor (i = 0 ;i < N ;i++)\n  a = b;\nendmodule\n");
+
+    opts.spacing.semicolon_spacing = "after";
+    CHECK(format_source("module top;\nfor (i = 0;i < N;i++) a = b;\nendmodule\n", opts) ==
+          "module top;\nfor (i = 0; i < N; i++)\n  a = b;\nendmodule\n");
+
+    opts.spacing.semicolon_spacing = "both";
+    CHECK(format_source("module top;\nfor (i = 0;i < N;i++) a = b;\nendmodule\n", opts) ==
+          "module top;\nfor (i = 0 ; i < N ; i++)\n  a = b;\nendmodule\n");
+}
+
+TEST_CASE("formatter: procedural event control at spacing supports all modes", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    opts.spacing.procedural_event_control_at_spacing = "none";
+    CHECK(format_source("module top;\nalways @ (posedge clk) q <= d;\nendmodule\n", opts) ==
+          "module top;\nalways@(posedge clk) q <= d;\nendmodule\n");
+
+    opts.spacing.procedural_event_control_at_spacing = "after";
+    CHECK(format_source("module top;\nalways@(posedge clk) q <= d;\nendmodule\n", opts) ==
+          "module top;\nalways@ (posedge clk) q <= d;\nendmodule\n");
+
+    opts.spacing.procedural_event_control_at_spacing = "before";
+    CHECK(format_source("module top;\nalways@(posedge clk) q <= d;\nendmodule\n", opts) ==
+          "module top;\nalways @(posedge clk) q <= d;\nendmodule\n");
+
+    opts.spacing.procedural_event_control_at_spacing = "both";
+    CHECK(format_source("module top;\nalways@(posedge clk) q <= d;\nendmodule\n", opts) ==
+          "module top;\nalways @ (posedge clk) q <= d;\nendmodule\n");
+}
+
+TEST_CASE("formatter: function call spacing options work without forced line breaks", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.function.break_policy = "never";
+    opts.function.space_before_paren = true;
+    opts.function.space_inside_paren = true;
+
+    CHECK(format_source("module top;\ninitial begin\nresult = foo(a,b,c);\nobj.bar(x);\nend\nendmodule\n", opts) ==
+          "module top;\ninitial begin\n  result = foo ( a, b, c );\n  obj.bar ( x );\nend\nendmodule\n");
+}
+
+TEST_CASE("formatter: function call auto policy breaks by line length and arg count", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.function.break_policy = "auto";
+    opts.function.layout = "block";
+    opts.function.arg_count = -1;
+    opts.function.line_length = 24;
+
+    CHECK(format_source("module top;\ninitial result = very_long_function_name(alpha, beta);\nendmodule\n", opts) ==
+          "module top;\ninitial result = very_long_function_name(\n                     alpha,\n                     beta\n                 );\nendmodule\n");
+
+    opts.function.line_length = 200;
+    opts.function.arg_count = 3;
+    CHECK(format_source("module top;\ninitial result = short_name(a, b, c);\nendmodule\n", opts) ==
+          "module top;\ninitial result = short_name(\n                     a,\n                     b,\n                     c\n                 );\nendmodule\n");
+}
+
+TEST_CASE("formatter: function declaration block and hanging layouts", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.function_declaration.line_length = 40;
+
+    opts.function_declaration.layout = "block";
+    CHECK(format_source("class c;\nfunction automatic int add(input int a, input int b, input int c);\nendfunction\nendclass\n", opts) ==
+          "class c;\n    function automatic int add(\n        input int a,\n        input int b,\n        input int c\n    );\n    endfunction\nendclass\n");
+
+    opts.function_declaration.layout = "hanging";
+    CHECK(format_source("class c;\nfunction automatic int add(input int a, input int b, input int c);\nendfunction\nendclass\n", opts) ==
+          "class c;\n    function automatic int add(input int a,\n                               input int b,\n                               input int c);\n    endfunction\nendclass\n");
+}
+
+TEST_CASE("formatter: non-ANSI module ports can wrap by max line length", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.non_ansi_port_max_line_length_enabled = true;
+    opts.module.non_ansi_port_max_line_length = 24;
+
+    CHECK(format_source("module top(clk, rst_n, request_valid, request_ready, response_valid);\nendmodule\n", opts) ==
+          "module top(\n"
+          "    clk, rst_n,\n"
+          "    request_valid,\n"
+          "    request_ready,\n"
+          "    response_valid\n"
+          ");\n"
+          "endmodule\n");
+}
+
+
+TEST_CASE("formatter: non-ANSI module port wrapping applies count and max length", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 2;
+    opts.module.non_ansi_port_max_line_length_enabled = true;
+    opts.module.non_ansi_port_max_line_length = 16;
+
+    CHECK(format_source("module top(a, b, cdefghij, d, e);\nendmodule\n", opts) ==
+          "module top(\n"
+          "    a, b,\n"
+          "    cdefghij, d,\n"
+          "    e\n"
+          ");\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: statement alignment strict versus adaptive", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 8;
+
+    opts.statement.align_adaptive = false;
+    CHECK(format_source("module top;\na = 1;\nlong_name = 2;\nendmodule\n", opts) ==
+          "module top;\na         = 1;\nlong_name = 2;\nendmodule\n");
+
+    opts.statement.align_adaptive = true;
+    CHECK(format_source("module top;\na = 1;\nlong_name = 2;\nendmodule\n", opts) ==
+          "module top;\na        = 1;\nlong_name = 2;\nendmodule\n");
+}
+
+TEST_CASE("formatter: declaration alignment disabled keeps compact declarations", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.port_declaration.align = false;
+    opts.var_declaration.align = false;
+
+    CHECK(format_source("module top(input logic [7:0] data, output logic valid);\nlogic [3:0] count;\nwire done;\nendmodule\n", opts) ==
+          "module top(\n"
+          "  input logic [7:0] data,\n"
+          "  output logic valid\n"
+          ");\n"
+          "logic [3:0] count;\n"
+          "wire done;\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: instance alignment strict versus adaptive", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.instance.align = true;
+    opts.instance.instance_port_name_width = 8;
+    opts.instance.instance_port_between_paren_width = 8;
+
+    opts.instance.align_adaptive = false;
+    CHECK(format_source("module top;\nchild u(.a(a), .long_port(long_signal), .z(z));\nendmodule\n", opts) ==
+          "module top;\n"
+          "child u (\n"
+          "    .a         (a          ),\n"
+          "    .long_port (long_signal),\n"
+          "    .z         (z          )\n"
+          ");\n"
+          "endmodule\n");
+
+    opts.instance.align_adaptive = true;
+    CHECK(format_source("module top;\nchild u(.a(a), .long_port(long_signal), .z(z));\nendmodule\n", opts) ==
+          "module top;\n"
+          "child u (\n"
+          "    .a       (a       ),\n"
+          "    .long_port (long_signal),\n"
+          "    .z       (z       )\n"
+          ");\n"
+          "endmodule\n");
 }

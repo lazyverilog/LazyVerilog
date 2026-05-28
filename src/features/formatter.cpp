@@ -2625,20 +2625,46 @@ static void format_portlist_pass(std::vector<Tok>& tokens, const FormatOptions& 
             if (prev_sig != SIZE_MAX && tok_is(tokens[prev_sig], ";", TokenKind::Semicolon))
                 tokens[port_open].fmt_newline_before = true;
         }
+        int non_ansi_line_len = 0;
         for (size_t ei = 0; ei < entries.size(); ++ei) {
             auto& e = entries[ei];
             if (!e.valid)
                 continue;
             bool put_newline = true;
-            if (!ansi && opts.module.non_ansi_port_per_line_enabled &&
-                opts.module.non_ansi_port_per_line > 1) {
-                put_newline = (ei % (size_t)opts.module.non_ansi_port_per_line) == 0;
+            int entry_width = 0;
+            if (!ansi && opts.module.non_ansi_port_max_line_length_enabled) {
+                entry_width = (int)token_join_compact(tokens, e.start, e.end).size();
+                if (e.comma != SIZE_MAX)
+                    ++entry_width;
+                if (e.leading_comma != SIZE_MAX)
+                    ++entry_width;
+            }
+            if (!ansi) {
+                bool per_line_break =
+                    opts.module.non_ansi_port_per_line_enabled &&
+                    opts.module.non_ansi_port_per_line > 0 &&
+                    (ei % (size_t)opts.module.non_ansi_port_per_line) == 0;
+                bool max_len_break = false;
+                if (opts.module.non_ansi_port_max_line_length_enabled && ei > 0) {
+                    int candidate = non_ansi_line_len + 1 + entry_width;
+                    max_len_break = candidate > opts.module.non_ansi_port_max_line_length;
+                }
+                if ((opts.module.non_ansi_port_per_line_enabled &&
+                     opts.module.non_ansi_port_per_line > 0) ||
+                    opts.module.non_ansi_port_max_line_length_enabled) {
+                    put_newline = (ei == 0) || per_line_break || max_len_break;
+                }
             }
             size_t line_start = e.leading_comma != SIZE_MAX ? e.leading_comma : e.start;
             tokens[line_start].fmt_newline_before = put_newline;
             tokens[line_start].fmt_blank_lines = 0;
             tokens[line_start].fmt_indent = base_indent + 1;
             tokens[line_start].fmt_spaces_before = put_newline ? 0 : 1;
+            if (!ansi && opts.module.non_ansi_port_max_line_length_enabled) {
+                int indent_cols = (base_indent + 1) * std::max(0, opts.indent_size);
+                non_ansi_line_len = put_newline ? indent_cols + entry_width
+                                                : non_ansi_line_len + 1 + entry_width;
+            }
             if (e.leading_comma != SIZE_MAX) {
                 tokens[e.start].fmt_newline_before = false;
                 tokens[e.start].fmt_spaces_before = 1;
@@ -6536,7 +6562,7 @@ static void expand_instances_pass(std::vector<Tok>& tokens, const FormatOptions&
             tokens[p.dot].fmt_indent = base + port_indent;
             tokens[p.dot].fmt_spaces_before = 0;
             tokens[p.name].fmt_spaces_before = 0;
-            int before = opts.instance.align_adaptive ? std::max(1, name_field_width - (int)tok_text(tokens[p.name]).size() - 1) : eff_before + (max_port - (int)tok_text(tokens[p.name]).size());
+            int before = opts.instance.align_adaptive ? std::max(1, name_field_width - (int)tok_text(tokens[p.name]).size()) : eff_before + (max_port - (int)tok_text(tokens[p.name]).size());
             tokens[p.op].fmt_spaces_before = before;
             int inside = opts.instance.align_adaptive ? std::max(0, opts.instance.instance_port_between_paren_width - p.sigw) : eff_inside + (max_sig - p.sigw);
             tokens[p.cl].fmt_spaces_before = inside;
@@ -6867,9 +6893,15 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
             i = name;
             continue;
         }
+        auto auto_line_too_long = [&]() {
+            return fo.line_length > 0 &&
+                   rendered_column_after_token(tokens, i, close, opts) > fo.line_length;
+        };
         bool do_break = false;
         if (fo.break_policy == "always") do_break = true;
-        else if (fo.break_policy == "auto") do_break = fo.arg_count >= 0 && (int)args.size() >= fo.arg_count;
+        else if (fo.break_policy == "auto")
+            do_break = (fo.arg_count >= 0 && (int)args.size() >= fo.arg_count) ||
+                       auto_line_too_long();
         tokens[open].fmt_spaces_before = fo.space_before_paren ? 1 : 0;
         if (!do_break || fo.break_policy == "never") {
             if (!args.empty() && fo.space_inside_paren)
@@ -6915,9 +6947,15 @@ static void format_function_calls_pass(std::vector<Tok>& tokens, const FormatOpt
         auto args = function_arg_ranges_between(tokens, open + 1, close);
         if (has_unsafe_macro_call_argument(tokens, open + 1, close, macro_classifier))
             continue;
+        auto auto_line_too_long = [&]() {
+            return fo.line_length > 0 &&
+                   rendered_column_after_token(tokens, s, close, opts) > fo.line_length;
+        };
         bool do_break = false;
         if (fo.break_policy == "always") do_break = !args.empty();
-        else if (fo.break_policy == "auto") do_break = fo.arg_count >= 0 && (int)args.size() >= fo.arg_count;
+        else if (fo.break_policy == "auto")
+            do_break = (fo.arg_count >= 0 && (int)args.size() >= fo.arg_count) ||
+                       auto_line_too_long();
         tokens[open].fmt_spaces_before = fo.space_before_paren ? 1 : 0;
         if (!do_break || fo.break_policy == "never") {
             if (!args.empty() && fo.space_inside_paren)
@@ -7123,7 +7161,13 @@ static void format_function_declaration_pass(std::vector<Tok>& tokens, const For
         if (approx_len <= fd.line_length)
             continue;
         tokens[open].fmt_spaces_before = 0;
-        format_arg_list_metadata(tokens, open, close, tokens[first].fmt_indent, tokens[first].fmt_indent, fd.layout == "hanging");
+        int hang = tokens[first].fmt_indent;
+        int hang_spaces = 0;
+        if (fd.layout == "hanging")
+            column_to_indent_spaces(rendered_column_after_token(tokens, s, open, opts), opts,
+                                    hang, hang_spaces);
+        format_arg_list_metadata(tokens, open, close, tokens[first].fmt_indent, hang,
+                                 fd.layout == "hanging", hang_spaces);
     }
 }
 
