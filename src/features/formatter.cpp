@@ -7202,37 +7202,37 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     run_layout_owned_pass("format_comment_layout_pass", tokens,
                           {LayoutOwner::Comment},
                           [&] { format_comment_layout_pass(tokens, opts); });
-
+    write_log(opts, "03_format_comment_layout_pass.sv", render_tokens(tokens, opts));
     // Module-header reflow mutates token metadata directly.
     run_layout_owned_pass("format_class_extends_parameter_pass", tokens,
                           {LayoutOwner::Basic},
                           [&] { format_class_extends_parameter_pass(tokens, opts); });
-    write_log(opts, "03_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "04_format_class_extends_parameter_pass.sv", render_tokens(tokens, opts));
     run_layout_owned_pass("format_portlist_pass", tokens,
                           {LayoutOwner::ModuleHeaderParameterList,
                            LayoutOwner::ModuleHeaderPortList},
                           [&] { format_portlist_pass(tokens, opts); });
-    write_log(opts, "04_format_portlist_pass.sv", render_tokens(tokens, opts));
+    write_log(opts, "05_format_portlist_pass.sv", render_tokens(tokens, opts));
 
     if (opts.statement.align) {
         run_layout_owned_pass("align_assign_pass", tokens,
                               {LayoutOwner::Basic, LayoutOwner::Comment,
                                LayoutOwner::ModuleHeaderParameterList},
                               [&] { align_assign_pass(tokens, opts); });
-        write_log(opts, "05_align_assign_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "06_align_assign_pass.sv", render_tokens(tokens, opts));
     }
     if (opts.var_declaration.align) {
         run_layout_owned_pass("align_var_pass", tokens,
                               {LayoutOwner::Basic, LayoutOwner::Comment},
                               [&] { align_var_pass(tokens, opts); });
-        write_log(opts, "06_align_var_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "07_align_var_pass.sv", render_tokens(tokens, opts));
     }
     if (opts.port_declaration.align) {
         run_layout_owned_pass("align_port_pass", tokens,
                               {LayoutOwner::Basic, LayoutOwner::Comment,
                                LayoutOwner::ModuleHeaderPortList},
                               [&] { align_port_pass(tokens, opts); });
-        write_log(opts, "07_align_port_pass.sv", render_tokens(tokens, opts));
+        write_log(opts, "08_align_port_pass.sv", render_tokens(tokens, opts));
     }
     // Must run after all alignment passes so fmt_spaces_before for define-block tokens
     // reflects the final aligned spacing, giving a stable content_col for \ placement.
