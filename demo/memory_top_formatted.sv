@@ -98,7 +98,8 @@ packet_ttttttttttteeettt [1:0]          dp                                  ;
 // test
 logic               [2:0]               a, b                                   ;
 //dd
-/* ehlo */ // a, b, c
+/* ehlo */
+// a, b, c
 //
 //
 //
@@ -109,7 +110,8 @@ reg signed          [7:0]               kj                                  ;
 // logic                                               c                           ;
 
 // b
-/* ehlo */ // logic           [2:0]                   d                           ;
+/* ehlo */
+// logic           [2:0]                   d                           ;
 
 automatic int       [3:0]               b                                   ;
 
@@ -264,8 +266,16 @@ always_comb begin
 
     // Whitespace-sensitive macro invocation: formatter should preserve the
     // original spacing and nested call layout inside the macro arguments.
-    `print_bytes(data_out, 0, add_number(1, 2, 3))
-    `print_bytes(1, 2, 3)
+    `print_bytes(
+        data_out,
+        0,
+        add_number(1, 2, 3)
+    )
+    `print_bytes(
+        1,
+        2,
+        3
+    )
 
     forever begin
         #10;
@@ -302,8 +312,11 @@ always_comb begin
     // Multiline function call with a macro argument: exercises
     // format_multiline_macro_arg_calls_pass before the line-based function
     // call formatter sees each physical line separately.
-    add_number(a,
-    `WIDTH, c);
+    add_number(
+        a,
+        `WIDTH,
+        c
+    );
 
     if (add_number(
             .a(a),
