@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: $(basename "$0") <file.sv>" >&2
+}
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 2
+fi
+
+input=$1
+if [[ ! -f "$input" ]]; then
+  echo "error: file not found: $input" >&2
+  exit 1
+fi
+
+if [[ -n "${LAZYVERILOG_FMT:-}" ]]; then
+  fmt=$LAZYVERILOG_FMT
+elif [[ -x ./build/lazyverilog-fmt ]]; then
+  fmt=./build/lazyverilog-fmt
+else
+  fmt=lazyverilog-fmt
+fi
+
+case "$input" in
+  */*) dir=${input%/*}; file=${input##*/} ;;
+  *) dir=.; file=$input ;;
+esac
+
+if [[ "$file" == *.* ]]; then
+  stem=${file%.*}
+  ext=.${file##*.}
+else
+  stem=$file
+  ext=
+fi
+
+once=$dir/${stem}_1${ext}
+twice=$dir/${stem}_2${ext}
+org_log=org_log
+once_log=once_log
+
+if [[ "$once" == "$input" || "$twice" == "$input" || "$once" == "$twice" ]]; then
+  echo "error: derived filenames collide" >&2
+  exit 1
+fi
+
+rm -rf -- "$org_log" "$once_log"
+
+cp -- "$input" "$once"
+"$fmt" -i "$once"
+cp -- "$once" "$twice"
+"$fmt" -i "$twice"
+
+"$fmt" --log "$org_log" "$input" >/dev/null
+"$fmt" --log "$once_log" "$once" >/dev/null
+
+first_diff=
+while IFS= read -r rel; do
+  left=$org_log/$rel
+  right=$once_log/$rel
+  if [[ ! -e "$right" ]]; then
+    first_diff=$rel
+    break
+  fi
+  if ! cmp -s -- "$left" "$right"; then
+    first_diff=$rel
+    break
+  fi
+done < <(cd "$org_log" && find . -type f -name '[0-9][0-9]_*.sv' ! -name '00_input.sv' | sed 's#^./##' | sort)
+
+if [[ -z "$first_diff" ]]; then
+  while IFS= read -r rel; do
+    if [[ ! -e "$org_log/$rel" ]]; then
+      first_diff=$rel
+      break
+    fi
+  done < <(cd "$once_log" && find . -type f -name '[0-9][0-9]_*.sv' ! -name '00_input.sv' | sed 's#^./##' | sort)
+fi
+
+if [[ -n "$first_diff" ]]; then
+  echo "first differing pass: $first_diff"
+  echo "  $org_log/$first_diff"
+  echo "  $once_log/$first_diff"
+  exit 1
+fi
+
+echo "no differing pass outputs found"
