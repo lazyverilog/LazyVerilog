@@ -6,11 +6,7 @@
             display("\n");                                   \
         $display("0x%x ", ARR[ii]);                          \
     end
-
-function packet_t foo(
-    input packet_t i_a,
-    input i_b
-);
+function packet_t foo(input packet_t i_a, input i_b);
     return packet_t'(i_a+i_b);
 endfunction
 
@@ -268,27 +264,15 @@ always_comb begin
 
     // Whitespace-sensitive macro invocation: formatter should preserve the
     // original spacing and nested call layout inside the macro arguments.
-    `print_bytes(
-        data_out,
-        0,
-        add_number(
-            1,
-            2,
-            3
-        )
-    )
-    `print_bytes(
-        1,
-        2,
-        3
-    )
+    `print_bytes(data_out, 0, add_number(1, 2, 3))
+    `print_bytes(1, 2, 3)
 
     forever begin
         #10;
         $display("Tick at time %0t", $time);
     end
 
-    // verilog_format: off
+// verilog_format: off
         sum(.i_a(i_a2),
         .i_b(i_b));
     // verilog_format: on
@@ -306,20 +290,20 @@ always_comb begin
     );
     add_number(
         a,
-        add_number(
-            a,
-            b,
-            c
-        ),
+        add_number(a, b, c),
         c
     );
 
+    add_numbe(
+        a,
+        b,
+        c
+    );
     // Multiline function call with a macro argument: exercises
     // format_multiline_macro_arg_calls_pass before the line-based function
     // call formatter sees each physical line separately.
     add_number(a,
-               `WIDTH,
-               c);
+    `WIDTH, c);
 
     if (add_number(
             .a(a),
@@ -394,7 +378,6 @@ class memory_format_demo_item;
             [5:8] := 5
         };
     }
-
     covergroup cg @(posedge sample_clk);
         option.per_instance = 1;
         op_cp: coverpoint op {

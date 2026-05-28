@@ -6,11 +6,7 @@
             display("\n");                                   \
         $display("0x%x ", ARR[ii]);                          \
     end
-
-function packet_t foo(
-    input packet_t i_a,
-    input i_b
-);
+function packet_t foo(input packet_t i_a, input i_b);
     return packet_t'(i_a+i_b);
 endfunction
 
@@ -136,8 +132,8 @@ logic                                   d                                   ;
 logic               [7:0]               intercontest                        ;
 logic               [7+:1]              intercontest                        ;
 
-assign d      = a+2;
-assign daaa   = a+2;
+assign d          = a+2;
+assign daaa       = a+2;
 assign very_long_text = a+2;
 
 memory #(.MEM_SIZE(3) /*testtest*/) u_memory ( /*autoinst*/
@@ -214,17 +210,17 @@ inv u_intq (
 
 always @ ( * ) begin
     if (a) begin
-        a2     <= 3; /* ttt*/
+        a2         <= 3; /* ttt*/
     end
 end
 
 always_comb begin
     // tte
-    a      <= 3;
-    very_long <= 3;
+    a          <= 3;
+    very_long  <= 3;
 
     if (a==3) begin
-        a      += 1;
+        a          += 1;
         //test
     end
 
@@ -268,27 +264,15 @@ always_comb begin
 
     // Whitespace-sensitive macro invocation: formatter should preserve the
     // original spacing and nested call layout inside the macro arguments.
-    `print_bytes(
-        data_out,
-        0,
-        add_number(
-            1,
-            2,
-            3
-        )
-    )
-    `print_bytes(
-        1,
-        2,
-        3
-    )
+    `print_bytes(data_out, 0, add_number(1, 2, 3))
+    `print_bytes(1, 2, 3)
 
     forever begin
         #10;
         $display("Tick at time %0t", $time);
     end
 
-    // verilog_format: off
+// verilog_format: off
         sum(.i_a(i_a2),
         .i_b(i_b));
     // verilog_format: on
@@ -300,17 +284,14 @@ always_comb begin
     sum(1, 2);
     /**/
     add_number(
-        .a(a3),
-        .b(b),
-        .result(result)
-    );
+`ifdef HI
+    .a(a3),
+`endif
+    .b(b), .result(result));
+
     add_number(
         a,
-        add_number(
-            a,
-            b,
-            c
-        ),
+        add_number(a, b, c),
         c
     );
 
@@ -318,16 +299,15 @@ always_comb begin
     // format_multiline_macro_arg_calls_pass before the line-based function
     // call formatter sees each physical line separately.
     add_number(a,
-               `WIDTH,
-               c);
+    `WIDTH, c);
 
     if (add_number(
             .a(a),
             .b(b),
             .result(result)
         )) begin
-        a      = 3;
-        b      = 7+1;
+        a          = 3;
+        b          = 7+1;
     end
 
     if (add_number(
@@ -335,10 +315,10 @@ always_comb begin
             .b(b),
             .result(result)
         ))
-        a      = 3;
-    b      = 3;
+        a          = 3;
+    b          = 3;
 
-    b      = 7;
+    b          = 7;
     add_number(
         .a(a),
         .b(b),
@@ -354,12 +334,12 @@ end
 // Standard D-FF with synchronous active-low reset
 always_ff @ ( posedge i_clk or negedge i_rst_n ) begin
     if (!i_rst_n) begin
-        data   <= 32'b0;
-        r_test <= '0;
+        data       <= 32'b0;
+        r_test     <= '0;
     end
     else begin
-        data   <= d;
-        r_test <= test;
+        data       <= d;
+        r_test     <= test;
     end
 end
 
@@ -383,23 +363,26 @@ endclass
 
 // Test format_covergroup_pass and format_constraint_dist_pass.
 class memory_format_demo_item;
-    bit sample_clk;
+    bit                 sample_clk                          ;
     rand int unsigned burst_len;
     rand bit [1:0] op;
 
     constraint burst_dist_c {
-        burst_len dist {1 := 10, [2:4] := 20, [5:8] := 5};
+        burst_len dist {
+            1 := 10,
+            [2:4] := 20,
+            [5:8] := 5
+        };
     }
-
     covergroup cg @(posedge sample_clk);
         option.per_instance = 1;
         op_cp: coverpoint op {
             bins read_write[] = {[0:1]};
-            bins idle = {2};
+            bins idle  = {2};
         }
         burst_cp: coverpoint burst_len {
             bins short = {[1:4]};
-            bins long = {[5:8]};
+            bins long  = {[5:8]};
         }
     endgroup
 endclass
@@ -416,7 +399,7 @@ logic               i_e                                 ;
 input     fifo_entry_t [3:0]     i_a                        ;
 output    fifo_entry_t [3:0]     o_d                        ;
 
-assign i_d    = ~i_a;
-assign i_e    = i_a;
+assign i_d        = ~i_a;
+assign i_e        = i_a;
 
 endmodule
