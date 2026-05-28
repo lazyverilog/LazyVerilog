@@ -56,6 +56,21 @@ enum class CommentKind {
     Block,
 };
 
+// Stable, pre-pass comment classification.  Computed once in
+// classify_comments_pass() from original source positions and stored
+// immutably on each comment token.  All subsequent passes read this field
+// instead of re-deriving attachment from whitespace (which would oscillate
+// when formatted output has different spacing than the input).
+enum class CommentRole {
+    None,                  // not a comment, or inside a disabled/define region
+    LeadingStatement,      // own-line comment logically attached to next syntax object
+    TrailingStatement,     // true statement/construct-tail comment on same source line
+    OwnLineInterstitial,   // own-line comment inside an expression/list/group
+    TrailingInterstitial,  // same-line comment attached to previous list/expression element
+    LeadingInterstitial,   // same-line comment attached to following list/expression element
+    InlineInterstitial,    // embedded comment with syntax on both sides in same element
+};
+
 struct TokLexeme {
     TokenKind kind{TokenKind::Unknown};
     std::string text;
@@ -100,6 +115,16 @@ struct Tok {
     bool fmt_newline_before{false}; // emit newline before this token
     int fmt_blank_lines{0};       // blank lines before this token (after newline)
     bool fmt_passthrough{false};  // whitespace-sensitive macro (verbatim)
+
+    // Pre-computed nesting depths at this token position (set by
+    // populate_nonrender_metadata_pass, used by classify_comments_pass).
+    int paren_depth{0};  // ( ) nesting depth
+    int dim_depth{0};    // [ ] nesting depth
+
+    // Stable comment classification (set by classify_comments_pass, read-only
+    // for all subsequent passes).
+    CommentRole comment_role{CommentRole::None};
+    size_t      comment_owner{SIZE_MAX}; // token index of the anchor token
 };
 
 static const std::string& tok_text(const Tok& tok) {
@@ -115,6 +140,20 @@ static bool tok_block_comment(const Tok& tok) { return tok.lex->comment_kind == 
 static bool tok_directive(const Tok& tok) { return tok.lex->directive; }
 static bool tok_define_block(const Tok& tok) { return tok.lex->define_block; }
 static syntax::SyntaxKind tok_directive_kind(const Tok& tok) { return tok.lex->directive_kind; }
+
+static bool comment_role_interstitial(CommentRole role) {
+    return role == CommentRole::OwnLineInterstitial ||
+           role == CommentRole::TrailingInterstitial ||
+           role == CommentRole::LeadingInterstitial ||
+           role == CommentRole::InlineInterstitial;
+}
+
+static bool comment_role_inline_rendered(CommentRole role) {
+    return role == CommentRole::TrailingStatement ||
+           role == CommentRole::TrailingInterstitial ||
+           role == CommentRole::LeadingInterstitial ||
+           role == CommentRole::InlineInterstitial;
+}
 
 static std::vector<Tok> collect_lexer_tokens(const std::string& source);
 static std::string render_tokens(const std::vector<Tok>& tokens, const FormatOptions& opts);
@@ -943,7 +982,12 @@ static SD break_dec(const Tok& L, const Tok& R, const FormatOptions& opts, bool 
         return SD::Preserve;
     if (is_line_directive(R) || is_line_directive(L))
         return SD::MustWrap;
-    if (tok_comment(L) && tok_text(L).find('\n') != std::string::npos)
+    // A multiline block comment forces a wrap unless it is interstitial (inside
+    // parens/brackets), where inline placement is valid.  The old check tested
+    // whether R was a block comment — a right-neighbor heuristic that could
+    // produce different results depending on what followed across passes.
+    if (tok_block_comment(L) && tok_text(L).find('\n') != std::string::npos &&
+        !comment_role_interstitial(L.comment_role))
         return SD::MustWrap;
     if (tok_line_comment(L))
         return SD::MustWrap;
@@ -3947,8 +3991,9 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             after_dis = false;
             if (nl > 0 && paren_depth > 0)
                 continue;
-            if (nl > 1) {
-                int extra = std::min(nl - 1, opts.blank_lines_between_items);
+            int blank_nl = (prev && tok_define_block(*prev)) ? nl : (nl - 1);
+            if (blank_nl > 0) {
+                int extra = std::min(blank_nl, opts.blank_lines_between_items);
                 blank_pend = std::max(blank_pend, extra);
             }
             continue;
@@ -4100,10 +4145,12 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         }
 
         // --- D. Inline-comment suppression ---
-        // If a line comment was originally inline, do not let a pending newline
-        // from the previous token move it to its own line.  Standalone comments
-        // are detected from the original input and forced to start a line.
-        bool inline_comment = tok_comment(tok) && prev && !original_newline_before_token;
+        // Use the pre-classified comment_role (set once by classify_comments_pass
+        // from original source positions) instead of re-deriving attachment from
+        // the current-pass whitespace.  This prevents oscillation when formatted
+        // output has different spacing than the input.
+        bool inline_comment = tok_comment(tok) &&
+                              comment_role_inline_rendered(tok.comment_role);
 
         do_while_tail = false;
         if (prev && tok_kind(*prev) == TokenKind::EndKeyword && tok_kind(tok) == TokenKind::WhileKeyword) {
@@ -4161,6 +4208,10 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
         if (inline_comment && pending_nl) {
             if (!case_label_pending_nl)
                 pending_nl = false;
+        } else if (tok_comment(tok) &&
+                   (tok.comment_role == CommentRole::LeadingStatement ||
+                    tok.comment_role == CommentRole::OwnLineInterstitial)) {
+            dec = SD::MustWrap;
         } else if (tok_line_comment(tok)) {
             size_t line_start = input.rfind('\n', (size_t)tok_pos(tok));
             line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
@@ -4485,9 +4536,21 @@ static void basic_formatting(std::vector<Tok>& tokens, const std::string& input,
             if (is_pp_cond_bare(tok_directive_kind(tok)) || is_pp_cond_with(tok_directive_kind(tok)))
                 in_pp_cond = false;
         } else if (tok_comment(tok)) {
-            if (i + 1 < tokens.size() && tok_whitespace(tokens[i + 1]) &&
-                tok_text(tokens[i + 1]).find('\n') != std::string::npos)
+            // Use stable comment_role to decide whether the token after this
+            // comment should start a new line.  LeadingStatement and
+            // OwnLineInterstitial comments always need a line break after them;
+            // same-line trailing/leading/inline comments do not drive
+            // pending_nl (the following code token will break from its own
+            // structural rules).  Fall back to whitespace inspection only for
+            // comments that weren't classified (disabled regions etc.).
+            if (tok.comment_role == CommentRole::LeadingStatement ||
+                tok.comment_role == CommentRole::OwnLineInterstitial) {
                 pending_nl = true;
+            } else if (tok.comment_role == CommentRole::None) {
+                if (i + 1 < tokens.size() && tok_whitespace(tokens[i + 1]) &&
+                    tok_text(tokens[i + 1]).find('\n') != std::string::npos)
+                    pending_nl = true;
+            }
         } else if (tok_kind(tok) == TokenKind::Directive) {
             if (is_pp_cond_bare(tok_directive_kind(tok))) {
                 pending_nl = true;
@@ -5112,6 +5175,115 @@ static void normalization_pass(std::vector<Tok>& tokens) {
     }
 }
 
+static bool comment_has_newline_between(const std::vector<Tok>& tokens, size_t first, size_t last) {
+    for (size_t k = first; k < last && k < tokens.size(); ++k)
+        if (tok_whitespace(tokens[k]) && tok_text(tokens[k]).find('\n') != std::string::npos)
+            return true;
+    return false;
+}
+
+static bool is_comment_list_leader_token(const Tok& tok) {
+    return tok_is(tok, ",", TokenKind::Comma) ||
+           tok_is(tok, "(", TokenKind::OpenParenthesis) ||
+           tok_is(tok, "[", TokenKind::OpenBracket) ||
+           tok_is(tok, "{", TokenKind::OpenBrace) ||
+           tok_kind(tok) == TokenKind::ApostropheOpenBrace;
+}
+
+static bool is_statement_tail_comment_owner(const Tok& tok) {
+    return tok_is(tok, ";", TokenKind::Semicolon) ||
+           is_indent_close(tok_kind(tok));
+}
+
+// Classify every comment token with a stable CommentRole based on its
+// structural position in the original source.  Must run AFTER
+// populate_nonrender_metadata_pass (which stamps paren_depth/dim_depth and
+// stmt_end) and BEFORE basic_formatting (which consumes comment_role).
+//
+// The central policy is that "trailing" is a statement-tail property, not
+// merely "there was code earlier on the same line".  Embedded comments are
+// classified as interstitial and then refined by their physical relation to
+// neighboring syntax:
+//   OwnLineInterstitial   newline -> comment -> newline
+//   TrailingInterstitial  element -> comment -> newline
+//   LeadingInterstitial   separator/newline -> comment -> element
+//   InlineInterstitial    token -> comment -> token within the same element
+//
+// disabled-region and define-block comments keep CommentRole::None and are
+// handled verbatim by basic_formatting before reaching any role-sensitive path.
+static void classify_comments_pass(std::vector<Tok>& tokens) {
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!tok_comment(tokens[i]))
+            continue;
+        // Disabled regions and define blocks are handled as passthrough;
+        // do not classify them so basic_formatting's early-continue paths
+        // remain authoritative.
+        if (tokens[i].in_disabled_region || tok_define_block(tokens[i]))
+            continue;
+
+        size_t prev_code = SIZE_MAX;
+        for (size_t j = i; j-- > 0; ) {
+            if (tok_whitespace(tokens[j]) || tok_comment(tokens[j]))
+                continue;
+            prev_code = j;
+            break;
+        }
+
+        // Find the next non-whitespace, non-comment code token.
+        size_t next_code = SIZE_MAX;
+        for (size_t j = i + 1; j < tokens.size(); ++j) {
+            if (tok_whitespace(tokens[j]) || tok_comment(tokens[j]))
+                continue;
+            next_code = j;
+            break;
+        }
+
+        bool code_before_same_line =
+            prev_code != SIZE_MAX && !comment_has_newline_between(tokens, prev_code + 1, i);
+        bool code_after_same_line =
+            next_code != SIZE_MAX && !comment_has_newline_between(tokens, i + 1, next_code);
+
+        // --- TrailingStatement: true statement/construct tail only ---
+        if (code_before_same_line && prev_code != SIZE_MAX &&
+            is_statement_tail_comment_owner(tokens[prev_code])) {
+            tokens[i].comment_role  = CommentRole::TrailingStatement;
+            tokens[i].comment_owner = prev_code;
+            continue;
+        }
+
+        bool embedded = tokens[i].paren_depth > 0 || tokens[i].dim_depth > 0 ||
+                        (prev_code != SIZE_MAX && next_code != SIZE_MAX &&
+                         tokens[prev_code].stmt_end != SIZE_MAX &&
+                         tokens[prev_code].stmt_end == tokens[next_code].stmt_end &&
+                         !is_indent_open(tok_kind(tokens[prev_code])));
+
+        if (embedded) {
+            if (!code_before_same_line && !code_after_same_line) {
+                tokens[i].comment_role = CommentRole::OwnLineInterstitial;
+                tokens[i].comment_owner = next_code;
+            } else if (code_before_same_line && !code_after_same_line) {
+                tokens[i].comment_role = CommentRole::TrailingInterstitial;
+                tokens[i].comment_owner = prev_code;
+            } else if (!code_before_same_line ||
+                       (prev_code != SIZE_MAX && is_comment_list_leader_token(tokens[prev_code]))) {
+                tokens[i].comment_role = CommentRole::LeadingInterstitial;
+                tokens[i].comment_owner = next_code;
+            } else {
+                tokens[i].comment_role = CommentRole::InlineInterstitial;
+                tokens[i].comment_owner = prev_code;
+            }
+            continue;
+        }
+
+        // --- LeadingStatement: own-line comment with following code ---
+        if (next_code != SIZE_MAX) {
+            tokens[i].comment_role  = CommentRole::LeadingStatement;
+            tokens[i].comment_owner = next_code;
+        }
+        // else: end-of-file comment stays CommentRole::None (no owner)
+    }
+}
+
 static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens, const FormatOptions& opts) {
     for (auto& tok : tokens) {
         tok.matching_token = SIZE_MAX;
@@ -5176,6 +5348,23 @@ static void populate_nonrender_metadata_pass(std::vector<Tok>& tokens, const For
             braces.pop_back();
             tokens[open].matching_token = i;
             tokens[i].matching_token = open;
+        }
+    }
+
+    // Stamp paren_depth and dim_depth on every token (including whitespace and
+    // comments) so classify_comments_pass can detect interstitial comments
+    // without re-scanning brackets.  Depth is the nesting level at entry to each
+    // token: open brackets increment AFTER stamping, close brackets decrement
+    // BEFORE stamping, so tokens strictly between a pair have depth > 0.
+    {
+        int pd = 0, dd = 0;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (tok_is(tokens[i], ")", TokenKind::CloseParenthesis) && pd > 0) --pd;
+            if (tok_is(tokens[i], "]", TokenKind::CloseBracket) && dd > 0) --dd;
+            tokens[i].paren_depth = pd;
+            tokens[i].dim_depth   = dd;
+            if (tok_is(tokens[i], "(", TokenKind::OpenParenthesis)) ++pd;
+            if (tok_is(tokens[i], "[", TokenKind::OpenBracket)) ++dd;
         }
     }
 
@@ -5719,6 +5908,53 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
     auto args = function_arg_ranges_between(tokens, open + 1, close);
     if (args.empty())
         return;
+    auto first_arg_code = [&](size_t first, size_t end) {
+        for (size_t k = first; k < end && k < tokens.size(); ++k) {
+            if (!tok_whitespace(tokens[k]) && !tok_comment(tokens[k]) &&
+                (!tok_directive(tokens[k]) || is_macro_usage(tokens[k])))
+                return k;
+        }
+        return SIZE_MAX;
+    };
+    auto place_arg_start = [&](std::pair<size_t, size_t> r, bool newline, int indent,
+                               int spaces) {
+        tokens[r.first].fmt_newline_before = newline;
+        tokens[r.first].fmt_blank_lines = 0;
+        tokens[r.first].fmt_indent = indent;
+        tokens[r.first].fmt_spaces_before = spaces;
+
+        if (!tok_comment(tokens[r.first]))
+            return;
+
+        size_t code = first_arg_code(r.first + 1, r.second);
+        if (code == SIZE_MAX)
+            return;
+
+        if (tokens[r.first].comment_role == CommentRole::OwnLineInterstitial) {
+            tokens[code].fmt_newline_before = true;
+            tokens[code].fmt_blank_lines = 0;
+            tokens[code].fmt_indent = indent;
+            tokens[code].fmt_spaces_before = spaces;
+        } else if (tokens[r.first].comment_role == CommentRole::LeadingInterstitial) {
+            tokens[code].fmt_newline_before = false;
+            tokens[code].fmt_spaces_before = 1;
+        }
+    };
+    auto place_gap_comments = [&](int indent, int spaces) {
+        for (size_t k = open + 1; k < close && k < tokens.size(); ++k) {
+            if (!tok_comment(tokens[k]))
+                continue;
+            if (tokens[k].comment_role == CommentRole::TrailingInterstitial) {
+                tokens[k].fmt_newline_before = false;
+                tokens[k].fmt_spaces_before = 1;
+            } else if (tokens[k].comment_role == CommentRole::OwnLineInterstitial) {
+                tokens[k].fmt_newline_before = true;
+                tokens[k].fmt_blank_lines = 0;
+                tokens[k].fmt_indent = indent;
+                tokens[k].fmt_spaces_before = spaces;
+            }
+        }
+    };
     bool trailing_line_comment = false;
     for (size_t k = args.back().second; k < close && k < tokens.size(); ++k) {
         if (tok_line_comment(tokens[k])) {
@@ -5728,6 +5964,10 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
     }
     if (hanging) {
         bool leading_line_comment = false;
+        if (tok_line_comment(tokens[args[0].first]) &&
+            (tokens[args[0].first].comment_role == CommentRole::OwnLineInterstitial ||
+             tokens[args[0].first].comment_role == CommentRole::LeadingInterstitial))
+            leading_line_comment = true;
         for (size_t k = open + 1; k < args[0].first && k < tokens.size(); ++k) {
             if (tok_line_comment(tokens[k])) {
                 leading_line_comment = true;
@@ -5739,19 +5979,12 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
             // That would make the argument part of the comment text on the next
             // formatter run, changing the token stream even when the rendered
             // normalized layout looked identical.
-            tokens[args[0].first].fmt_newline_before = true;
-            tokens[args[0].first].fmt_blank_lines = 0;
-            tokens[args[0].first].fmt_indent = hanging_indent;
-            tokens[args[0].first].fmt_spaces_before = hanging_spaces;
+            place_arg_start(args[0], true, hanging_indent, hanging_spaces);
         } else {
-            tokens[args[0].first].fmt_newline_before = false;
-            tokens[args[0].first].fmt_spaces_before = 0;
+            place_arg_start(args[0], false, hanging_indent, 0);
         }
         for (size_t k = 1; k < args.size(); ++k) {
-            tokens[args[k].first].fmt_newline_before = true;
-            tokens[args[k].first].fmt_blank_lines = 0;
-            tokens[args[k].first].fmt_indent = hanging_indent;
-            tokens[args[k].first].fmt_spaces_before = hanging_spaces;
+            place_arg_start(args[k], true, hanging_indent, hanging_spaces);
         }
         tokens[close].fmt_newline_before = trailing_line_comment;
         tokens[close].fmt_blank_lines = 0;
@@ -5759,16 +5992,15 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
         tokens[close].fmt_spaces_before = 0;
     } else {
         for (auto r : args) {
-            tokens[r.first].fmt_newline_before = true;
-            tokens[r.first].fmt_blank_lines = 0;
-            tokens[r.first].fmt_indent = base_indent + 1;
-            tokens[r.first].fmt_spaces_before = block_base_spaces;
+            place_arg_start(r, true, base_indent + 1, block_base_spaces);
         }
         tokens[close].fmt_newline_before = true;
         tokens[close].fmt_blank_lines = 0;
         tokens[close].fmt_indent = base_indent;
         tokens[close].fmt_spaces_before = block_base_spaces;
     }
+    place_gap_comments(hanging ? hanging_indent : base_indent + 1,
+                       hanging ? hanging_spaces : block_base_spaces);
     for (auto r : args) {
         size_t comma = find_top_level_token(tokens, r.second, close, ",", TokenKind::Comma);
         if (comma != SIZE_MAX)
@@ -5777,7 +6009,11 @@ static void format_arg_list_metadata(std::vector<Tok>& tokens, size_t open, size
 }
 
 static bool function_arg_skip_token(const Tok& tok) {
-    return tok_whitespace(tok) || tok_comment(tok) ||
+    bool structural_arg_comment =
+        tok_comment(tok) &&
+        (tok.comment_role == CommentRole::OwnLineInterstitial ||
+         tok.comment_role == CommentRole::LeadingInterstitial);
+    return tok_whitespace(tok) || (tok_comment(tok) && !structural_arg_comment) ||
            tok.is_pp_conditional_directive || tok.in_pp_conditional_line_tail ||
            (tok_directive(tok) && !is_macro_usage(tok));
 }
@@ -6224,6 +6460,11 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     auto tokens = collect_lexer_tokens(input);
     write_log(opts, "00_input.sv", input);
     populate_nonrender_metadata_pass(tokens, opts);
+    // classify_comments_pass runs after populate (paren_depth/dim_depth ready)
+    // and before normalization so it sees original source newlines in whitespace
+    // token text.  The result is stored in comment_role/comment_owner and is
+    // never recomputed — all subsequent passes treat it as read-only.
+    classify_comments_pass(tokens);
     normalization_pass(tokens);
     write_log(opts, "01_normalization_pass.sv", render_tokens(tokens, opts));
     basic_formatting(tokens, input, opts);
