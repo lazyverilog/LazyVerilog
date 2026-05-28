@@ -1188,3 +1188,47 @@ The formatter respects inline disable comments. Everything between `// verilog_f
 assign weird_spacing   =    preserved;
 // verilog_format: on
 ```
+
+---
+
+## Comments, macros, and preprocessor conditionals
+
+Comments are classified by their structural position before formatting starts.
+The formatter keeps that classification stable across passes:
+
+- Statement-tail comments stay on the same line as the statement or construct they follow.
+- Own-line comments inside lists or expressions stay on their own line.
+- Leading interstitial comments inside lists stay attached to the following item.
+- Inline block comments inside an item stay inline with that item when possible.
+
+Example:
+
+```systemverilog
+// input
+module top(a, b, /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port
+           long_port_name);
+endmodule
+```
+
+With non-ANSI port wrapping enabled, `/* cfg */` is treated as a leading comment
+for `cdefghij`, while the line comment remains attached to the macro port:
+
+```systemverilog
+module top(
+  a, b,
+  /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port
+  long_port_name
+);
+endmodule
+```
+
+Function-like macro uses in lists are treated as list items when they are not
+classified as whitespace-sensitive or statement/declaration/control-flow macros.
+Object-like macro uses are preserved as ordinary tokens. `` `define `` macro
+bodies are passed through unchanged because their whitespace can be semantic.
+
+Preprocessor conditional directives such as `` `ifdef ``, `` `else ``, and
+`` `endif `` are preserved on their own lines. For safety, formatter passes that
+cannot safely reason across conditional branches avoid restructuring the
+surrounding range; existing conditional content is preserved and formatting is
+kept idempotent.
