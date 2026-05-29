@@ -3090,6 +3090,43 @@ TEST_CASE("formatter: memory_top regression inv ports and assigns", "[formatter]
     CHECK(fmt.find("assign i_e        = i_a;") != std::string::npos);
 }
 
+TEST_CASE("formatter: forever statement bodies wrap and align like other controls", "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.statement.align = true;
+    opts.statement.align_adaptive = true;
+    opts.statement.lhs_min_width = 10;
+    opts.spacing.assignment_operator_spacing = "both";
+
+    // `forever begin ... end` is a normal procedural block.  It must not be
+    // treated as a generated-loop alignment-suppression scope; assignments in
+    // that block still get the configured lhs_min_width.
+    CHECK(format_source("module top;\nalways_comb begin\nforever begin\n#5 clk = ~clk;\na = b;\nend\nend\nendmodule\n", opts) ==
+          "module top;\n"
+          "always_comb begin\n"
+          "    forever begin\n"
+          "        #5 clk     = ~clk;\n"
+          "        a          = b;\n"
+          "    end\n"
+          "end\n"
+          "endmodule\n");
+
+    // `if` / `for` / `while` / `repeat` / `forever` all use the
+    // SystemVerilog `statement_or_null` body form.  Without begin/end, the
+    // controlled statement is rendered on the next indentation level.  This
+    // also applies when such a control statement is the body of `else`.
+    CHECK(format_source("module top;\nalways_comb\nif (a == 3)\nb = 3;\nelse forever\n#5 clk = ~clk;\nendmodule\n", opts) ==
+          "module top;\n"
+          "always_comb\n"
+          "    if (a == 3)\n"
+          "        b          = 3;\n"
+          "    else\n"
+          "        forever\n"
+          "            #5 clk     = ~clk;\n"
+          "endmodule\n");
+}
+
 TEST_CASE("formatter: preserves EOF trailing endmodule comments", "[formatter][safe_mode]") {
     FormatOptions opts;
     opts.safe_mode = true;

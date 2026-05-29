@@ -77,7 +77,7 @@ inline bool wants_after(const std::string& mode) { return mode == "after" || mod
 
 inline bool is_single_stmt_control(TK k) {
     return k == TK::IfKeyword || k == TK::ForKeyword || k == TK::ForeachKeyword ||
-           k == TK::WhileKeyword || k == TK::RepeatKeyword;
+           k == TK::WhileKeyword || k == TK::RepeatKeyword || k == TK::ForeverKeyword;
 }
 inline bool is_procedural_block_keyword(TK k) {
     return k == TK::InitialKeyword || k == TK::FinalKeyword ||
@@ -253,6 +253,36 @@ inline size_t procedural_body_start(const TokenStream& tokens, size_t proc) {
 
 inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body);
 
+inline size_t single_statement_control_body_start(const TokenStream& tokens, size_t control) {
+    if (control == npos || control >= tokens.size() ||
+        !is_single_stmt_control(tokens[control].lex->kind))
+        return npos;
+
+    // `forever` is the one procedural control in this family that has no
+    // parenthesized control expression:
+    //
+    //   forever statement_or_null
+    //
+    // The controlled statement begins immediately after the keyword.  Timing
+    // controls (`forever #5 clk = ~clk;`) remain part of the statement body and
+    // are intentionally returned as the body start so wrapping can place them
+    // on their own indented line.
+    if (kind_is(tokens[control], TK::ForeverKeyword))
+        return next_code(tokens, control + 1, tokens.size());
+
+    // `if`, `for`, `foreach`, `while`, and `repeat` all have a parenthesized
+    // header before their `statement_or_null` body.  This token-level formatter
+    // should not infer the body by looking for a semicolon in the header; the
+    // header may contain declarations, assignments, calls, and nested
+    // parentheses.  Use SyntaxPass' matching-parenthesis metadata instead.
+    size_t open = next_code(tokens, control + 1, tokens.size());
+    if (open == npos || !kind_is(tokens[open], TK::OpenParenthesis) ||
+        tokens[open].immutable.syntax.matching_token == npos)
+        return npos;
+    return next_code(tokens, tokens[open].immutable.syntax.matching_token + 1,
+                     tokens.size());
+}
+
 inline size_t begin_end_statement_end_from(const TokenStream& tokens, size_t begin_idx) {
     int depth = 0;
     for (size_t i = begin_idx; i < tokens.size(); ++i) {
@@ -315,8 +345,20 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
         return then_end;
     }
 
-    if (kind_is(tokens[body], TK::ForeverKeyword)) {
-        size_t nested = skip_leading_timing_control(tokens, next_code(tokens, body + 1, tokens.size()));
+    if (is_single_stmt_control(tokens[body].lex->kind)) {
+        // SystemVerilog uses the same `statement_or_null` body shape for
+        // if/for/foreach/while/repeat/forever.  Find that body syntactically
+        // and recurse so nested single-statement controls are treated as one
+        // statement by callers such as the `else` and procedural-block indent
+        // logic.
+        //
+        // Examples:
+        //   else forever #5 clk = ~clk;        ends at the assignment ';'
+        //   else for (...) begin a = b; end    ends at the matching `end`
+        //   initial if (a) b = c; else d = e;  ends after the else body
+        size_t nested = single_statement_control_body_start(tokens, body);
+        if (kind_is(tokens[body], TK::ForeverKeyword))
+            nested = skip_leading_timing_control(tokens, nested);
         return nested == npos ? npos : simple_statement_end_from(tokens, nested);
     }
 
@@ -1377,6 +1419,26 @@ private:
             else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0)
                 --paren_depth;
 
+            if (kind_is(t, TK::ForeverKeyword)) {
+                size_t body = next_code(tokens, i + 1, tokens.size());
+                if (body != npos &&
+                    !kind_is(tokens[body], TK::BeginKeyword) &&
+                    !kind_is(tokens[body], TK::ForkKeyword) &&
+                    !kind_is(tokens[body], TK::OpenBrace))
+                    tokens[body].mutable_.wrap.must_break_before = true;
+                continue;
+            }
+
+            if (kind_is(t, TK::ElseKeyword)) {
+                size_t body = next_code(tokens, i + 1, tokens.size());
+                if (body != npos &&
+                    !kind_is(tokens[body], TK::BeginKeyword) &&
+                    !kind_is(tokens[body], TK::ForkKeyword) &&
+                    !kind_is(tokens[body], TK::OpenBrace))
+                    tokens[body].mutable_.wrap.must_break_before = true;
+                continue;
+            }
+
             if (is_single_stmt_control(t.lex->kind))
                 ctrl_expr_pending = true;
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
@@ -1442,19 +1504,53 @@ public:
 
         bool ctrl_just_closed = false; // defers single_stmt_pending resolution by one token
         std::vector<size_t> procedural_body_end(tokens.size(), npos);
+        std::vector<size_t> else_body_end(tokens.size(), npos);
+        std::vector<size_t> forever_body_end(tokens.size(), npos);
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (!is_procedural_block_keyword(tokens[i].lex->kind))
                 continue;
             size_t body = procedural_body_start(tokens, i);
             if (body == npos || body >= tokens.size())
                 continue;
-            if (kind_is(tokens[body], TK::BeginKeyword) || kind_is(tokens[body], TK::ForkKeyword))
+            if (kind_is(tokens[body], TK::BeginKeyword) ||
+                kind_is(tokens[body], TK::ForkKeyword) ||
+                kind_is(tokens[body], TK::OpenBrace))
                 continue;
             size_t body_end = simple_statement_end_from(tokens, body);
             procedural_body_end[body] = body_end == npos ? tokens[i].immutable.syntax.stmt_end : body_end;
         }
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::ElseKeyword))
+                continue;
+            size_t body = next_code(tokens, i + 1, tokens.size());
+            if (body == npos || body >= tokens.size())
+                continue;
+            if (kind_is(tokens[body], TK::BeginKeyword) ||
+                kind_is(tokens[body], TK::ForkKeyword) ||
+                kind_is(tokens[body], TK::OpenBrace))
+                continue;
+            size_t body_end = simple_statement_end_from(tokens, body);
+            if (body_end != npos)
+                else_body_end[body] = body_end;
+        }
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::ForeverKeyword))
+                continue;
+            size_t body = next_code(tokens, i + 1, tokens.size());
+            if (body == npos || body >= tokens.size())
+                continue;
+            if (kind_is(tokens[body], TK::BeginKeyword) || kind_is(tokens[body], TK::ForkKeyword))
+                continue;
+            size_t body_end = simple_statement_end_from(tokens, i);
+            if (body_end != npos)
+                forever_body_end[body] = body_end;
+        }
         bool procedural_body_active = false;
         size_t procedural_body_stmt_end = npos;
+        bool else_body_active = false;
+        size_t else_body_stmt_end = npos;
+        bool forever_body_active = false;
+        size_t forever_body_stmt_end = npos;
 
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
@@ -1465,7 +1561,7 @@ public:
             else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0) --paren_depth;
 
             // Detect control expression start
-            if (is_single_stmt_control(t.lex->kind)) {
+            if (is_single_stmt_control(t.lex->kind) && !kind_is(t, TK::ForeverKeyword)) {
                 ctrl_expr_pending = true;
             }
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
@@ -1515,6 +1611,16 @@ public:
                 procedural_body_active = true;
                 procedural_body_stmt_end = procedural_body_end[i];
             }
+            if (i < else_body_end.size() && else_body_end[i] != npos) {
+                ++level;
+                else_body_active = true;
+                else_body_stmt_end = else_body_end[i];
+            }
+            if (i < forever_body_end.size() && forever_body_end[i] != npos) {
+                ++level;
+                forever_body_active = true;
+                forever_body_stmt_end = forever_body_end[i];
+            }
 
             t.mutable_.indent.base_indent = level * opts_.indent_size;
             if (is_outer_close(t.lex->kind))
@@ -1549,6 +1655,16 @@ public:
                 level = std::max(0, level - 1);
                 procedural_body_active = false;
                 procedural_body_stmt_end = npos;
+            }
+            if (else_body_active && i == else_body_stmt_end) {
+                level = std::max(0, level - 1);
+                else_body_active = false;
+                else_body_stmt_end = npos;
+            }
+            if (forever_body_active && i == forever_body_stmt_end) {
+                level = std::max(0, level - 1);
+                forever_body_active = false;
+                forever_body_stmt_end = npos;
             }
         }
 
