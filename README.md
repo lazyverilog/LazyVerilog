@@ -68,6 +68,9 @@ Using `lazy.nvim`:
 ```lua
 {
   "hxxdev/lazyverilog",
+  -- The repository contains large RTL test corpora as submodules; users do not
+  -- need them for the editor plugin.
+  submodules = false,
   ft = { "systemverilog", "verilog" },
   config = function()
     require("lazyverilog").setup()

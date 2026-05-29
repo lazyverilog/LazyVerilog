@@ -12,7 +12,7 @@ implementation of LazyVerilog.
 ## Scope
 
 These docs describe the options implemented in this repository today. They use
-LazyVerilogPy's docs as a reference baseline, but are intentionally limited to
+earlier LazyVerilog documentation as a reference baseline, but are intentionally limited to
 the features and option names supported by this codebase.
 
 Notable difference from older examples:
