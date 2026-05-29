@@ -44,11 +44,22 @@ inline std::string render_tokens(const TokenStream& tokens) {
         // regions and whitespace-sensitive macro bodies.  The renderer still
         // owns the surrounding newline decision.
         if (d.passthrough) {
-            if (!at_line_start) { trim_trailing_spaces(out); out.push_back('\n'); }
-            for (int b = 0; b < d.blank_lines; ++b) out.push_back('\n');
-            out += tok.lex->text;
-            col = static_cast<int>(tok.lex->text.size());
-            at_line_start = false;
+            std::string_view text(tok.lex->text);
+            bool after_format_off_comment =
+                i > 0 && tokens[i - 1].lex->is_comment &&
+                tokens[i - 1].lex->text.find("off") != std::string::npos;
+            if (after_format_off_comment && at_line_start && !text.empty() && text.front() == '\n' &&
+                (text.size() == 1 || text[1] != '\n'))
+                text.remove_prefix(1);
+            out.append(text.data(), text.size());
+            size_t last_nl = text.rfind('\n');
+            if (last_nl == std::string::npos) {
+                col += static_cast<int>(text.size());
+                at_line_start = false;
+            } else {
+                col = static_cast<int>(text.size() - last_nl - 1);
+                at_line_start = col == 0;
+            }
             continue;
         }
 

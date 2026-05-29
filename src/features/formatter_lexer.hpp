@@ -152,6 +152,21 @@ private:
         std::string_view raw = trivia.getRawText();
         if (raw.empty()) return;
         size_t pos = find_from_cursor(raw);
+
+        if (disabled_) {
+            size_t end = pos + raw.size();
+            std::string_view raw_chunk(source_.data() + cursor_, end - cursor_);
+            add_token(TK::Unknown, raw_chunk, cursor_,
+                      trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment,
+                      false, true);
+            if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
+                if (is_format_marker(raw, opts_.format_on_comment_pattern))
+                    disabled_ = false;
+            }
+            consume_text(raw_chunk, false);
+            return;
+        }
+
         consume_gap_to(pos);
 
         if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
@@ -244,9 +259,13 @@ private:
     void add_raw_until_token(const slang::parsing::Token& token) {
         std::string_view raw = token.rawText();
         size_t pos = token.location().valid() ? token.location().offset() : find_from_cursor(raw);
-        consume_gap_to(pos);
-        add_token(token.kind, raw, pos, false, token.kind == slang::parsing::TokenKind::Directive, true);
-        consume_text(raw, false);
+        size_t end = pos + raw.size();
+        if (end < cursor_)
+            return;
+        std::string_view raw_chunk(source_.data() + cursor_, end - cursor_);
+        add_token(token.kind, raw_chunk, cursor_, false,
+                  token.kind == slang::parsing::TokenKind::Directive, true);
+        consume_text(raw_chunk, false);
     }
 };
 
