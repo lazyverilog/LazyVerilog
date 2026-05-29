@@ -135,6 +135,54 @@ vim.fn.mkdir(vim.opt.undodir:get()[1], "p")
 --   2. stdpath("data") .. "/lazyverilog/bin/lazyverilog-lsp"
 --   3. release-binary auto-download
 local lazyverilog_setup = {}
+
+-- A clean Neovim profile intentionally does not load the user's normal
+-- keymaps.  Mirror the LSP mappings from:
+--   /home/hxxdev/dotfiles/nvim/.config/nvim/lua/plugins/lsp.lua
+--
+-- The dotfiles use Telescope for some picker-style LSP navigation, but this
+-- clean profile intentionally uses only Neovim built-ins so it stays minimal
+-- and tests LazyVerilog without extra plugin dependencies.
+lazyverilog_setup.on_attach = function(_, bufnr)
+  local function map(keys, func, desc, mode)
+    mode = mode or "n"
+    vim.keymap.set(mode, keys, func, { buffer = bufnr, desc = "LSP: " .. desc })
+  end
+
+  -- Rename the variable under your cursor.
+  map("grn", vim.lsp.buf.rename, "[R]e[n]ame")
+
+  -- Execute a code action in normal or visual mode.
+  map("gra", vim.lsp.buf.code_action, "[G]oto Code [A]ction", { "n", "x" })
+
+  -- Find references for the word under your cursor.
+  map("grr", vim.lsp.buf.references, "[G]oto [R]eferences")
+
+  -- Jump to implementation.
+  map("gri", vim.lsp.buf.implementation, "[G]oto [I]mplementation")
+
+  -- Jump to definition.  This overrides Vim's built-in text-only `gd`.
+  map("gd", vim.lsp.buf.definition, "[G]oto [D]efinition")
+
+  -- Jump to declaration.
+  map("gD", vim.lsp.buf.declaration, "[G]oto [D]eclaration")
+
+  -- List document symbols.
+  map("gO", vim.lsp.buf.document_symbol, "Open Document Symbols")
+
+  -- List workspace symbols.
+  map("gW", vim.lsp.buf.workspace_symbol, "Open Workspace Symbols")
+
+  -- Jump to type definition.
+  map("grt", vim.lsp.buf.type_definition, "[G]oto [T]ype Definition")
+
+  -- Toggle inlay hints.
+  if vim.lsp.inlay_hint then
+    map("<leader>th", function()
+      vim.lsp.inlay_hint.enable(not vim.lsp.inlay_hint.is_enabled({ bufnr = bufnr }), { bufnr = bufnr })
+    end, "[T]oggle Inlay [H]ints")
+  end
+end
 LUA
 
 if [[ -n "${LAZYVERILOG_LSP:-}" ]]; then
