@@ -1,0 +1,21 @@
+[submodule "tests/rtl/Cores-VeeR-EL2"]
+	path = tests/rtl/Cores-VeeR-EL2
+	url = https://github.com/chipsalliance/Cores-VeeR-EL2.git
+[submodule "tests/rtl/black-parrot"]
+	path = tests/rtl/black-parrot
+	url = https://github.com/black-parrot/black-parrot.git
+[submodule "tests/rtl/caliptra-rtl"]
+	path = tests/rtl/caliptra-rtl
+	url = https://github.com/chipsalliance/caliptra-rtl.git
+[submodule "tests/rtl/cv32e40p"]
+	path = tests/rtl/cv32e40p
+	url = https://github.com/openhwgroup/cv32e40p.git
+[submodule "tests/rtl/cva6"]
+	path = tests/rtl/cva6
+	url = https://github.com/openhwgroup/cva6.git
+[submodule "tests/rtl/ibex"]
+	path = tests/rtl/ibex
+	url = https://github.com/lowRISC/ibex.git
+[submodule "tests/rtl/opentitan"]
+	path = tests/rtl/opentitan
+	url = https://github.com/lowRISC/opentitan.git
