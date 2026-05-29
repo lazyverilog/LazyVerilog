@@ -3,6 +3,7 @@
 #include "formatter_token.hpp"
 #include <algorithm>
 #include <cctype>
+#include <regex>
 #include <string_view>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Lexer.h>
@@ -25,35 +26,15 @@ inline std::string lower_ascii(std::string_view text) {
     return out;
 }
 
-// Pattern matching is deliberately implemented as deterministic text scanning.
-// The documented defaults are pattern-like strings, but this lexer never invokes
-// a pattern engine.  Standard markers are recognized directly, and simple
-// literal custom patterns are honored by stripping common escaping punctuation.
-inline std::string simplified_marker_pattern(std::string_view pattern) {
-    std::string out;
-    bool escape = false;
-    for (char c : pattern) {
-        if (escape) {
-            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ':' || c == '/') out.push_back(c);
-            escape = false;
-            continue;
-        }
-        if (c == '\\') { escape = true; continue; }
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == ':' || c == '/') out.push_back(c);
+inline bool is_format_marker(std::string_view comment, const std::string& configured_pattern) {
+    if (configured_pattern.empty()) return false;
+    try {
+        std::regex re(configured_pattern, std::regex::ECMAScript | std::regex::icase);
+        return std::regex_search(std::string(comment), re);
+    } catch (const std::regex_error&) {
+        // Malformed pattern — fall back to literal substring search
+        return std::string(comment).find(configured_pattern) != std::string::npos;
     }
-    return lower_ascii(out);
-}
-
-inline bool contains_simple_pattern(std::string_view comment, std::string_view pattern) {
-    std::string pat = simplified_marker_pattern(pattern);
-    if (pat.empty()) return false;
-    return lower_ascii(comment).find(pat) != std::string::npos;
-}
-
-inline bool is_format_marker(std::string_view comment, std::string_view configured_pattern) {
-    const std::string c = lower_ascii(comment);
-    if (contains_simple_pattern(comment, configured_pattern)) return true;
-    return false;
 }
 
 class TokenCollector {
@@ -71,6 +52,12 @@ public:
             slang::parsing::Token token = lexer.lex();
             if (token.kind == slang::parsing::TokenKind::EndOfFile)
                 break;
+
+            // Skip tokens that are inside a multiline define block already
+            // consumed as a single passthrough token.
+            if (token.location().valid() &&
+                token.location().offset() < passthrough_end_)
+                continue;
 
             // Slang comments and preprocessor directives can arrive as leading
             // trivia.  Promote comments to ordinary formatter tokens so every
@@ -93,10 +80,7 @@ private:
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
-<<<<<<< HEAD
-=======
-
->>>>>>> fdf6ad2 (rewrite formatter)
+    size_t passthrough_end_{0}; // end of a frozen multiline define block
     int line_{0};
     int col_{0};
     int pending_spaces_{0};
@@ -180,12 +164,64 @@ private:
         consume_text(raw, true);
     }
 
+    // Returns the source offset one-past-the-end of a multiline `define block
+    // that starts at 'start', or 0 if the define is a single-line define.
+    size_t find_multiline_define_end(size_t start) const {
+        size_t src_size = source_.size();
+        // Find end of first line and check for backslash continuation.
+        size_t eol = source_.find('\n', start);
+        if (eol == std::string::npos) return 0;
+        size_t check = eol;
+        while (check > start && (source_[check - 1] == ' ' || source_[check - 1] == '\t'))
+            --check;
+        if (check == start || source_[check - 1] != '\\') return 0;
+
+        // Walk continuation lines.
+        size_t pos = eol + 1;
+        while (pos < src_size) {
+            size_t next_eol = source_.find('\n', pos);
+            size_t line_end = (next_eol == std::string::npos) ? src_size : next_eol;
+            size_t chk = line_end;
+            while (chk > pos && (source_[chk - 1] == ' ' || source_[chk - 1] == '\t'))
+                --chk;
+            bool has_cont = (chk > pos && source_[chk - 1] == '\\');
+            pos = (next_eol == std::string::npos) ? src_size : next_eol + 1;
+            if (!has_cont) break;
+        }
+        return pos;
+    }
+
     void add_slang_token(const slang::parsing::Token& token) {
         std::string_view raw = token.rawText();
         size_t pos = token.location().valid() ? token.location().offset() : find_from_cursor(raw);
         consume_gap_to(pos);
-        bool directive = token.kind == slang::parsing::TokenKind::Directive;
-        add_token(token.kind, raw, pos, false, directive, false);
+
+        slang::parsing::TokenKind kind = token.kind;
+        bool directive = (kind == slang::parsing::TokenKind::Directive);
+
+        // Freeze multiline `define blocks as a single passthrough token so
+        // no formatting pass can rewrite internal spacing or newlines.
+        if (directive && token.directiveKind() == slang::syntax::SyntaxKind::DefineDirective) {
+            size_t define_end = find_multiline_define_end(pos);
+            if (define_end > pos) {
+                std::string_view define_raw(source_.data() + pos, define_end - pos);
+                add_token(slang::parsing::TokenKind::Directive, define_raw, pos,
+                          false, true, /*whitespace_sensitive=*/true);
+                consume_text(define_raw, false);
+                passthrough_end_ = define_end;
+                return;
+            }
+        }
+
+        // Remap user macro invocations (kind==Directive, directiveKind==MacroUsage) to
+        // TokenKind::MacroUsage so downstream passes can distinguish them from PP
+        // directives (ifdef/endif/else/define/…) that must stay on their own line.
+        if (directive && token.directiveKind() == slang::syntax::SyntaxKind::MacroUsage) {
+            kind = slang::parsing::TokenKind::MacroUsage;
+            directive = false;
+        }
+
+        add_token(kind, raw, pos, false, directive, false);
         consume_text(raw, false);
     }
 

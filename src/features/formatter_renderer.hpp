@@ -52,12 +52,20 @@ inline std::string render_tokens(const TokenStream& tokens) {
             continue;
         }
 
-        if (i > 0 && (d.newline_before || d.blank_lines > 0) && !at_line_start) {
+        if (i > 0 && d.newline_before && !at_line_start) {
             trim_trailing_spaces(out);
             out.push_back('\n');
-            for (int b = 0; b < d.blank_lines; ++b) out.push_back('\n');
             col = 0;
             at_line_start = true;
+        }
+        if (i > 0 && d.blank_lines > 0) {
+            if (!at_line_start) {
+                trim_trailing_spaces(out);
+                out.push_back('\n');
+                col = 0;
+                at_line_start = true;
+            }
+            for (int b = 0; b < d.blank_lines; ++b) out.push_back('\n');
         }
 
         if (at_line_start) {

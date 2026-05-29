@@ -117,8 +117,17 @@ struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment
 struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
 struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
 struct BlankLineMetadata { int before{0}; int after{0}; };
-struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; };
-struct MutableData { WrapMetadata wrap; IndentMetadata indent; AlignMetadata align; SpaceMetadata space; CommentMetadata comment; BlankLineMetadata blank; MacroMetadata macro; };
+struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; };
+
+struct MutableData {
+    WrapMetadata wrap;
+    IndentMetadata indent;
+    AlignMetadata align;
+    SpaceMetadata space;
+    CommentMetadata comment;
+    BlankLineMetadata blank;
+    MacroMetadata macro;
+};
 
 // One immutable aggregate keeps the formatter's fact model explicit: these
 // fields describe what the input is, not what the formatter decided to do.

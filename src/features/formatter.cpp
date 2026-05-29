@@ -24,7 +24,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     // Required pass DAG.  Each pass has exclusive write ownership of one
     // metadata family and may only read lexemes plus upstream metadata.
     svfmt::SyntaxPass syntax; syntax.run(tokens);
-    svfmt::MacroPass macro; macro.run(tokens);
+    svfmt::MacroPass macro(opts); macro.run(tokens);
     svfmt::WrapPass wrap(opts); wrap.run(tokens);
     svfmt::IndentPass indent(opts); indent.run(tokens);
     svfmt::AlignPass align(opts); align.run(tokens);
