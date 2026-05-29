@@ -24,6 +24,12 @@ static constexpr size_t npos = static_cast<size_t>(-1);
 // 1. LexemeFacts: pure lexer output / lexical identity.  This replaces the old
 // previous flat lexeme holder because these fields are immutable facts about
 // the lexeme itself.
+enum class CommentLexemeKind {
+    None,
+    Line,
+    Block,
+};
+
 struct LexemeFacts {
     slang::parsing::TokenKind kind{slang::parsing::TokenKind::Unknown};
 
@@ -35,6 +41,17 @@ struct LexemeFacts {
     bool is_comment{false};
     bool is_directive{false};
     bool is_whitespace_sensitive{false};
+
+    // Comment spelling is a lexical fact.  Formatting passes should not peek at
+    // token text to distinguish `//` from `/* ... */`; doing so couples policy
+    // to source spelling and has caused non-idempotent comment handling bugs.
+    CommentLexemeKind comment_kind{CommentLexemeKind::None};
+
+    // Format on/off markers are also lexical facts collected at the same place
+    // that recognizes the configured marker comments.  Downstream layers should
+    // not re-run regex/string matching over immutable token text.
+    bool is_format_off_marker{false};
+    bool is_format_on_marker{false};
 };
 
 // 2. SyntaxFacts: parser-ish truth.  These are not formatting policy; matching

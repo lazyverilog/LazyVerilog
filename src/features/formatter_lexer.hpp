@@ -14,10 +14,6 @@
 
 namespace svfmt {
 
-inline bool starts_with(std::string_view s, std::string_view prefix) {
-    return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
-}
-
 inline std::string lower_ascii(std::string_view text) {
     std::string out;
     out.reserve(text.size());
@@ -117,6 +113,7 @@ private:
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
+    bool just_entered_disabled_region_{false};
     size_t passthrough_end_{0}; // end of a frozen multiline define block
     int line_{0};
     int col_{0};
@@ -158,7 +155,10 @@ private:
     }
 
     void add_token(slang::parsing::TokenKind kind, std::string_view text, size_t pos,
-                   bool is_comment, bool is_directive, bool whitespace_sensitive) {
+                   bool is_comment, bool is_directive, bool whitespace_sensitive,
+                   CommentLexemeKind comment_kind = CommentLexemeKind::None,
+                   bool is_format_off_marker = false,
+                   bool is_format_on_marker = false) {
         auto lex = std::make_shared<LexemeFacts>();
         lex->kind = kind;
         lex->text.assign(text);
@@ -168,6 +168,9 @@ private:
         lex->is_comment = is_comment;
         lex->is_directive = is_directive;
         lex->is_whitespace_sensitive = whitespace_sensitive;
+        lex->comment_kind = comment_kind;
+        lex->is_format_off_marker = is_format_off_marker;
+        lex->is_format_on_marker = is_format_on_marker;
 
         Tok tok;
         tok.lex = std::move(lex);
@@ -198,12 +201,19 @@ private:
 
         if (disabled_) {
             size_t end = pos + raw.size();
+            consume_disabled_region_boundary_newline(end);
             std::string_view raw_chunk(source_.data() + cursor_, end - cursor_);
-            add_token(TK::Unknown, raw_chunk, cursor_,
-                      trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment,
-                      false, true);
+            const bool is_comment = trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment;
+            const CommentLexemeKind comment_kind =
+                trivia.kind == TV::LineComment ? CommentLexemeKind::Line :
+                trivia.kind == TV::BlockComment ? CommentLexemeKind::Block :
+                CommentLexemeKind::None;
+            const bool format_on = is_comment && is_format_marker(raw, opts_.format_on_comment_pattern);
+            if (!raw_chunk.empty())
+                add_token(TK::Unknown, raw_chunk, cursor_, is_comment, false, true,
+                          comment_kind, false, format_on);
             if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
-                if (is_format_marker(raw, opts_.format_on_comment_pattern))
+                if (format_on)
                     disabled_ = false;
             }
             consume_text(raw_chunk, false);
@@ -215,8 +225,14 @@ private:
         if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
             bool format_off = is_format_marker(raw, opts_.format_off_comment_pattern);
             bool format_on = is_format_marker(raw, opts_.format_on_comment_pattern);
-            add_token(TK::Unknown, raw, pos, true, false, disabled_ || format_off || format_on);
-            if (format_off) disabled_ = true;
+            const CommentLexemeKind comment_kind =
+                trivia.kind == TV::LineComment ? CommentLexemeKind::Line : CommentLexemeKind::Block;
+            add_token(TK::Unknown, raw, pos, true, false, disabled_ || format_off || format_on,
+                      comment_kind, format_off, format_on);
+            if (format_off) {
+                disabled_ = true;
+                just_entered_disabled_region_ = true;
+            }
             if (format_on) disabled_ = false;
         }
         // Whitespace trivia is not a token.  It only contributes immutable source
@@ -307,10 +323,32 @@ private:
         size_t end = pos + raw.size();
         if (end < cursor_)
             return;
+        consume_disabled_region_boundary_newline(end);
         std::string_view raw_chunk(source_.data() + cursor_, end - cursor_);
+        if (raw_chunk.empty())
+            return;
         add_token(token.kind, raw_chunk, cursor_, false,
                   token.kind == slang::parsing::TokenKind::Directive, true);
         consume_text(raw_chunk, false);
+    }
+
+    void consume_disabled_region_boundary_newline(size_t end) {
+        if (!just_entered_disabled_region_ || cursor_ >= end)
+            return;
+
+        // The format-off marker comment itself is still formatted normally and
+        // WrapPass emits the line break after that comment.  The disabled raw
+        // passthrough region starts immediately after the marker's source text,
+        // so the first physical line ending belongs to the marker/region
+        // boundary rather than to the raw disabled payload.  Consume exactly one
+        // such boundary newline here, at collection time, instead of teaching
+        // the renderer to inspect neighboring token semantics and delete bytes
+        // from immutable token text.
+        if (source_[cursor_] == '\r' && cursor_ + 1 < end && source_[cursor_ + 1] == '\n')
+            consume_text(std::string_view(source_).substr(cursor_, 2), false);
+        else if (source_[cursor_] == '\n')
+            consume_text(std::string_view(source_).substr(cursor_, 1), false);
+        just_entered_disabled_region_ = false;
     }
 };
 

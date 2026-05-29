@@ -32,6 +32,13 @@ inline void trim_trailing_spaces(std::string& out) {
     while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
 }
 
+inline size_t last_newline_offset(std::string_view text) {
+    for (size_t n = text.size(); n > 0; --n)
+        if (text[n - 1] == '\n')
+            return n - 1;
+    return std::string_view::npos;
+}
+
 inline std::string render_tokens(const TokenStream& tokens) {
     std::string out;
     int col = 0;
@@ -61,19 +68,20 @@ inline std::string render_tokens(const TokenStream& tokens) {
         // owns the surrounding newline decision.
         if (d.passthrough) {
             std::string_view text(tok.lex->text);
-            bool after_format_off_comment =
-                i > 0 && tokens[i - 1].lex->is_comment && d.passthrough;
-            if (after_format_off_comment && at_line_start && !text.empty() && text.front() == '\n' &&
-                (text.size() == 1 || text[1] != '\n'))
-                text.remove_prefix(1);
             out.append(text.data(), text.size());
-            size_t last_nl = text.rfind('\n');
+            size_t last_nl = last_newline_offset(text);
             if (last_nl == std::string::npos) {
                 col += static_cast<int>(text.size());
                 at_line_start = false;
             } else {
                 col = static_cast<int>(text.size() - last_nl - 1);
                 at_line_start = col == 0;
+            }
+            if (tok.mutable_.wrap.must_break_after && !at_line_start) {
+                trim_trailing_spaces(out);
+                out.push_back('\n');
+                col = 0;
+                at_line_start = true;
             }
             continue;
         }

@@ -11,7 +11,6 @@ namespace svfmt {
 
 using TK = slang::parsing::TokenKind;
 
-inline bool text_is(const Tok& t, const char* s) { return t.lex->text == s; }
 inline bool kind_is(const Tok& t, TK k) { return t.lex->kind == k; }
 inline bool is_passthrough(const Tok& t) { return t.mutable_.macro.passthrough || t.lex->is_whitespace_sensitive; }
 inline int token_width(const Tok& t) { return static_cast<int>(t.lex->text.size()); }
@@ -83,6 +82,21 @@ inline bool is_single_stmt_control(TK k) {
 inline bool is_unary_op(TK k) {
     return k == TK::Tilde || k == TK::Exclamation ||
            k == TK::TildeAnd || k == TK::TildeOr || k == TK::TildeXor || k == TK::XorTilde ||
+           k == TK::DoublePlus || k == TK::DoubleMinus;
+}
+
+inline bool can_begin_unary_expression(TK k) {
+    // SystemVerilog unary operators include the arithmetic signs, logical and
+    // bitwise negation, and reduction operators.  Some of these tokens are also
+    // binary operators (`+`, `-`, `&`, `|`, `^`), so `is_unary_op` deliberately
+    // does not classify them globally as unary.  This helper is used only in
+    // the syntactic slot immediately after a binary operator, where another
+    // expression operand is expected and these tokens can start that operand.
+    return k == TK::Plus || k == TK::Minus ||
+           k == TK::And || k == TK::Or || k == TK::Xor ||
+           k == TK::Tilde || k == TK::Exclamation ||
+           k == TK::TildeAnd || k == TK::TildeOr ||
+           k == TK::TildeXor || k == TK::XorTilde ||
            k == TK::DoublePlus || k == TK::DoubleMinus;
 }
 inline bool is_type_keyword(TK k) {
@@ -462,7 +476,7 @@ public:
             // Freeze input-line topology before any wrap decision exists.
             t.immutable.topology.begins_line_construct = t.immutable.input_trivia.starts_original_line;
             t.immutable.topology.ends_line_construct = kind_is(t, TK::Semicolon) || kind_is(t, TK::Comma) ||
-                                             (t.lex->is_comment && t.lex->text.rfind("//", 0) == 0);
+                                             (t.lex->comment_kind == CommentLexemeKind::Line);
             t.immutable.topology.opens_indent_scope = is_open_block(t.lex->kind) || is_outer_open(t.lex->kind);
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind);
 
@@ -483,7 +497,7 @@ public:
             if (t.lex->is_comment) {
                 bool comma_interstitial_block = false;
                 if (t.immutable.input_trivia.starts_original_line &&
-                    t.lex->text.rfind("/*", 0) == 0) {
+                    t.lex->comment_kind == CommentLexemeKind::Block) {
                     size_t p = prev_code(tokens, i);
                     size_t nx = next_code(tokens, i + 1, tokens.size());
                     comma_interstitial_block =
@@ -620,10 +634,16 @@ struct MacroClassifier {
 };
 
 inline std::string extract_define_name(const std::string& raw_text) {
-    constexpr std::string_view define_prefix = "`define";
-    if (raw_text.rfind(define_prefix, 0) != 0)
+    constexpr std::string_view define_keyword = "define";
+    size_t pos = 0;
+    if (pos >= raw_text.size() || raw_text[pos] != '`')
         return {};
-    size_t pos = define_prefix.size();
+    ++pos;
+    for (char expected : define_keyword) {
+        if (pos >= raw_text.size() || raw_text[pos] != expected)
+            return {};
+        ++pos;
+    }
     while (pos < raw_text.size() && std::isspace(static_cast<unsigned char>(raw_text[pos])))
         ++pos;
     if (pos >= raw_text.size())
@@ -719,12 +739,17 @@ public:
         int group = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
-            if (t.mutable_.macro.suppress_wrapping) continue;
-            t.mutable_.wrap.wrap_group = group;
             if (i == 0)
                 t.mutable_.wrap.must_break_before = true;
             if (t.lex->is_comment && t.immutable.comment.role == CommentRole::OwnLine) {
                 t.mutable_.wrap.must_break_before = true;
+                t.mutable_.wrap.must_break_after = true;
+            } else if (t.immutable.comment.role == CommentRole::Trailing &&
+                       t.lex->comment_kind == CommentLexemeKind::Line) {
+                // A trailing line comment consumes the rest of the physical
+                // line.  Treat it as a hard line boundary in the wrap layer so
+                // later packing/alignment decisions cannot place the following
+                // token into the comment text on the next formatting pass.
                 t.mutable_.wrap.must_break_after = true;
             }
             // PP directives (ifdef/endif/else/define/…) are always on their own line.
@@ -732,6 +757,8 @@ public:
                 t.mutable_.wrap.must_break_before = true;
                 t.mutable_.wrap.must_break_after = true;
             }
+            if (t.mutable_.macro.suppress_wrapping) continue;
+            t.mutable_.wrap.wrap_group = group;
             // Force line break after statement-/declaration-/block-like macro invocations.
             // If the macro is followed by '(args)', break after the matching ')'; otherwise
             // break after the macro token itself.
@@ -759,7 +786,10 @@ public:
                         tokens[close].mutable_.wrap.must_break_after = true;
                 }
             }
-            if (i > 0 && tokens[i - 1].lex->is_comment && tokens[i - 1].lex->text.rfind("//", 0) == 0) t.mutable_.wrap.must_break_before = true;
+            if (i > 0 &&
+                tokens[i - 1].immutable.comment.role == CommentRole::Trailing &&
+                tokens[i - 1].lex->comment_kind == CommentLexemeKind::Line)
+                t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) {
                 size_t next = next_code(tokens, i + 1, tokens.size());
                 t.mutable_.wrap.must_break_after = !(next != npos && kind_is(tokens[next], TK::Hash));
@@ -907,8 +937,7 @@ public:
                 if (n > 0 && kind != WrapListKind::InstancePorts) {
                     for (size_t c = item.first; c > open + 1; --c) {
                         size_t p = c - 1;
-                        if (tokens[p].lex->is_comment &&
-                            tokens[p].lex->text.rfind("/*", 0) == 0) {
+                        if (tokens[p].lex->comment_kind == CommentLexemeKind::Block) {
                             if (!(p + 1 < tokens.size() && tokens[p + 1].lex->is_comment &&
                                   tokens[p + 1].immutable.comment.role == CommentRole::OwnLine))
                                 leading_block_comment = p;
@@ -950,7 +979,7 @@ public:
                         if (tokens[c].lex->is_comment &&
                             tokens[c].immutable.comment.role == CommentRole::Trailing &&
                             (kind == WrapListKind::InstancePorts ||
-                             tokens[c].lex->text.rfind("//", 0) == 0 ||
+                             tokens[c].lex->comment_kind == CommentLexemeKind::Line ||
                              (c + 1 < tokens.size() && tokens[c + 1].lex->is_comment &&
                               tokens[c + 1].immutable.comment.role == CommentRole::OwnLine))) {
                             break_token = c;
@@ -1142,8 +1171,81 @@ public:
                 }
             }
         }
+
+        apply_single_statement_control_wrap(tokens);
+
+        // Final comment line-boundary normalization belongs in WrapPass, not
+        // CommentPass: it writes only WrapMetadata and runs after all list
+        // packing helpers that may have cleared comma/comment breaks to keep
+        // short port lists on one physical line.  A `//` comment is a lexical
+        // line terminator in SystemVerilog; allowing any later token to render
+        // after it changes that token into comment text on the next pass.
+        for (auto& t : tokens) {
+            if (!t.lex->is_comment)
+                continue;
+            if (t.immutable.comment.role == CommentRole::OwnLine) {
+                t.mutable_.wrap.must_break_before = true;
+                t.mutable_.wrap.must_break_after = true;
+            } else if (t.immutable.comment.role == CommentRole::Trailing &&
+                       t.lex->comment_kind == CommentLexemeKind::Line) {
+                t.mutable_.wrap.must_break_after = true;
+            }
+        }
     }
-private: const FormatOptions& opts_;
+private:
+    static void apply_single_statement_control_wrap(TokenStream& tokens) {
+        bool ctrl_expr_pending = false;
+        int ctrl_paren_open = 0;
+        bool single_stmt_pending = false;
+        int paren_depth = 0;
+        bool ctrl_just_closed = false;
+
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& t = tokens[i];
+            if (is_passthrough(t))
+                continue;
+
+            if (kind_is(t, TK::OpenParenthesis))
+                ++paren_depth;
+            else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0)
+                --paren_depth;
+
+            if (is_single_stmt_control(t.lex->kind))
+                ctrl_expr_pending = true;
+            if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
+                ctrl_expr_pending = false;
+                ctrl_paren_open = paren_depth;
+            }
+
+            if (kind_is(t, TK::CloseParenthesis) &&
+                ctrl_paren_open > 0 &&
+                paren_depth == ctrl_paren_open - 1) {
+                ctrl_paren_open = 0;
+                bool do_while_tail = false;
+                if (t.immutable.syntax.matching_token != npos) {
+                    size_t control = prev_code(tokens, t.immutable.syntax.matching_token);
+                    size_t before_control = control == npos ? npos : prev_code(tokens, control);
+                    do_while_tail = control != npos && before_control != npos &&
+                        kind_is(tokens[control], TK::WhileKeyword) &&
+                        kind_is(tokens[before_control], TK::EndKeyword);
+                }
+                single_stmt_pending = !do_while_tail;
+                ctrl_just_closed = true;
+            }
+
+            if (single_stmt_pending && !ctrl_just_closed && !t.lex->is_comment) {
+                single_stmt_pending = false;
+                const bool is_block = kind_is(t, TK::BeginKeyword) || kind_is(t, TK::OpenBrace);
+                const bool closes = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind) ||
+                                    t.mutable_.macro.closes_indent_scope;
+                if (!is_block && !closes)
+                    t.mutable_.wrap.must_break_before = true;
+            }
+            ctrl_just_closed = false;
+        }
+    }
+
+    const FormatOptions& opts_;
 };
 
 // IndentPass owns IndentMetadata and reads wrap/source facts.  The level is a
@@ -1223,7 +1325,6 @@ public:
                     level++;
                     single_stmt_active = true;
                     single_stmt_paren_depth = paren_depth;
-                    t.mutable_.wrap.must_break_before = true;
                 }
             }
             ctrl_just_closed = false;
@@ -2297,9 +2398,12 @@ class CommentPass final : public IFormatPass {
 public:
     const char* name() const override { return "comment"; }
     void run(TokenStream& tokens) override {
-        for (auto& t : tokens)
-            if (t.lex->is_comment && t.immutable.comment.role == CommentRole::OwnLine)
+        for (auto& t : tokens) {
+            if (!t.lex->is_comment)
+                continue;
+            if (t.immutable.comment.role == CommentRole::OwnLine)
                 t.mutable_.comment.force_own_line = true;
+        }
     }
 };
 
@@ -2410,8 +2514,8 @@ public:
 
             // Apostrophe / cast: no space
             if (kind_is(t, TK::Apostrophe) || kind_is(L, TK::Apostrophe)) spaces = 0;
-            // '{ casts (text starts with ')
-            if (!t.lex->text.empty() && t.lex->text[0] == '\'') spaces = 0;
+            // Apostrophe-open-brace assignment patterns / casts.
+            if (kind_is(t, TK::ApostropheOpenBrace)) spaces = 0;
 
             // Postfix ++ / --: no space before when attached to an identifier, ], or )
             if ((kind_is(t, TK::DoublePlus) || kind_is(t, TK::DoubleMinus)) &&
@@ -2439,6 +2543,22 @@ public:
                 spaces = wants_before(bop_mode) ? 1 : 0;
             if (is_binary_op(L.lex->kind) && !is_assign(L))
                 spaces = wants_after(bop_mode) ? 1 : 0;
+            if (is_binary_op(L.lex->kind) && !is_assign(L) &&
+                can_begin_unary_expression(t.lex->kind)) {
+                // Do not concatenate a binary operator with the unary operator
+                // that starts its right-hand operand.  SystemVerilog has many
+                // multi-character operator tokens, so removing this separator
+                // can change the token stream on the next pass:
+                //
+                //   a && &b  -> a&&&b  // lexes as the single &&& token
+                //   a + +b   -> a++b   // prefix/postfix increment ambiguity
+                //   a - -b   -> a--b   // decrement ambiguity
+                //   a ^ ~b   -> a^~b   // xnor token
+                //
+                // Keep one syntactic separator independent of the configured
+                // binary_operator_spacing style.
+                spaces = std::max(spaces, 1);
+            }
             // `inside` is a keyword operator — always needs spaces regardless of bop_mode
             if (kind_is(t, TK::InsideKeyword)) spaces = 1;
             if (kind_is(L, TK::InsideKeyword)) spaces = 1;
@@ -2539,13 +2659,43 @@ public:
     explicit BlankLinePass(const FormatOptions& opts) : opts_(opts) {}
     const char* name() const override { return "blank_line"; }
     void run(TokenStream& tokens) override {
-        for (auto& t : tokens)
-            if (t.immutable.input_trivia.original_newlines_before > 1 &&
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& t = tokens[i];
+            int boundary_newlines = t.immutable.input_trivia.original_newlines_before;
+
+            // Passthrough tokens are rendered verbatim, so a physical item
+            // boundary can be split across the previous token's immutable text
+            // and this token's ordinary leading trivia.  This happens for
+            // multiline macro definitions frozen as one whitespace-sensitive
+            // directive:
+            //
+            //   `define FOO \
+            //     foo();\n
+            //   \n
+            //   `define BAR ...
+            //
+            // The first newline is part of the raw `define token; the second
+            // is the gap before `define BAR.  Together they represent one
+            // blank separator line.  Keep this policy in BlankLinePass rather
+            // than inventing lexer-side pending trivia after a token has
+            // already been emitted.
+            if (i > 0 && passthrough_text_ends_with_newline(tokens[i - 1]))
+                boundary_newlines += 1;
+
+            if (boundary_newlines > 1 &&
                 t.immutable.syntax.paren_depth == 0 &&
                 t.immutable.syntax.brace_depth == 0)
                 t.mutable_.blank.before = std::max(0, opts_.blank_lines_between_items);
+        }
     }
-private: const FormatOptions& opts_;
+private:
+    static bool passthrough_text_ends_with_newline(const Tok& tok) {
+        return is_passthrough(tok) &&
+               !tok.lex->text.empty() &&
+               tok.lex->text.back() == '\n';
+    }
+
+    const FormatOptions& opts_;
 };
 
 } // namespace svfmt

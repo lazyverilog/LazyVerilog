@@ -3160,3 +3160,78 @@ TEST_CASE("formatter: named generate block instantiation keeps pp conditionals",
     CHECK(formatted.find("`endif") != std::string::npos);
     CHECK(format_source(formatted, opts) == formatted);
 }
+
+TEST_CASE("formatter: trailing line comments are hard line barriers", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.module.non_ansi_port_per_line_enabled = false;
+    opts.module.non_ansi_port_max_line_length_enabled = true;
+    opts.module.non_ansi_port_max_line_length = 120;
+
+    const std::string src =
+        "module top(\n"
+        "input logic a, // a comment\n"
+        "input logic b,\n"
+        "input logic c\n"
+        ");\n"
+        "endmodule\n";
+
+    std::string formatted = format_source(src, opts);
+    CHECK(formatted.find("// a comment input") == std::string::npos);
+    CHECK(formatted.find("// a comment\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: multiline define preserves following blank and line boundaries", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.blank_lines_between_items = 1;
+
+    const std::string src =
+        "`define FOO \\\n"
+        "  foo();\n"
+        "\n"
+        "// describe BAR\n"
+        "`define BAR \\\n"
+        "  bar();\n"
+        "`ifndef BAZ\n"
+        "`define BAZ \\\n"
+        "  baz();\n"
+        "`endif\n";
+
+    std::string formatted = format_source(src, opts);
+    INFO("formatted once:\n" << formatted);
+    CHECK(formatted.find("foo();\n\n// describe BAR\n`define BAR") != std::string::npos);
+    CHECK(formatted.find("// describe BAR`define") == std::string::npos);
+    CHECK(formatted.find("`ifndef BAZ\n`define BAZ") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: binary operator followed by unary operand keeps token separator", "[formatter][spacing]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.spacing.binary_operator_spacing = "none";
+
+    const std::string src =
+        "module top;\n"
+        "assign dv = txn_active && &dp_rready[C_LAT:0];\n"
+        "assign plus_test = a + +b;\n"
+        "assign minus_test = a - -b;\n"
+        "assign and_test = a & &b;\n"
+        "assign or_test = a | |b;\n"
+        "assign xnor_test = a ^ ~b;\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top;\n"
+        "assign dv = txn_active&& &dp_rready[C_LAT:0];\n"
+        "assign plus_test = a+ +b;\n"
+        "assign minus_test = a- -b;\n"
+        "assign and_test = a& &b;\n"
+        "assign or_test = a| |b;\n"
+        "assign xnor_test = a^ ~b;\n"
+        "endmodule\n";
+
+    CHECK(format_source(src, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
+}
