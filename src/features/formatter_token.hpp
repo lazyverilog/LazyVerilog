@@ -52,6 +52,12 @@ struct LexemeFacts {
     // not re-run regex/string matching over immutable token text.
     bool is_format_off_marker{false};
     bool is_format_on_marker{false};
+
+    // Raw body between a format-off marker and the matching format-on marker.
+    // This is stronger than ordinary whitespace-sensitive macro text: the
+    // formatter must not interpret comments, directives, macro calls, or blank
+    // lines inside this region at all.  The renderer emits this token verbatim.
+    bool is_disabled_region_body{false};
 };
 
 // 2. SyntaxFacts: parser-ish truth.  These are not formatting policy; matching

@@ -586,6 +586,8 @@ inline bool is_multiline_brace_construct(const TokenStream& tokens, size_t brace
 enum class MacroRole { ObjectLikeExpr, FunctionLikeExpr, StatementLike, DeclarationLike, ControlFlowLike, BlockBeginLike, BlockEndLike };
 
 struct MacroClassifier {
+    std::unordered_set<std::string> object_like_expr;
+    std::unordered_set<std::string> function_like_expr;
     std::unordered_set<std::string> statement_like;
     std::unordered_set<std::string> declaration_like;
     std::unordered_set<std::string> control_flow_like;
@@ -601,6 +603,8 @@ struct MacroClassifier {
                 dst.insert(s);
             }
         };
+        add(object_like_expr,  m.object_like_expr);
+        add(function_like_expr, m.function_like_expr);
         add(statement_like,    m.statement_like);
         add(declaration_like,  m.declaration_like);
         add(control_flow_like, m.control_flow_like);
@@ -620,6 +624,8 @@ struct MacroClassifier {
 
     MacroRole classify(const std::string& raw_text) const {
         std::string name = extract_name(raw_text);
+        if (function_like_expr.count(name)) return MacroRole::FunctionLikeExpr;
+        if (object_like_expr.count(name))   return MacroRole::ObjectLikeExpr;
         if (block_end_like.count(name))    return MacroRole::BlockEndLike;
         if (block_begin_like.count(name))  return MacroRole::BlockBeginLike;
         if (control_flow_like.count(name)) return MacroRole::ControlFlowLike;

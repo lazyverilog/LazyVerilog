@@ -98,6 +98,15 @@ public:
                 trivia_pos += trivia.getRawText().size();
             }
 
+            // A format-off marker can be leading trivia on the current slang
+            // token.  In that case collect_trivia() may have just consumed a
+            // whole disabled region, including this token, as one immutable raw
+            // passthrough body.  Re-check the token offset after trivia
+            // promotion so we do not append the same token a second time.
+            if (token.location().valid() &&
+                token.location().offset() < passthrough_end_)
+                continue;
+
             if (disabled_) {
                 add_raw_until_token(token);
             } else {
@@ -158,7 +167,8 @@ private:
                    bool is_comment, bool is_directive, bool whitespace_sensitive,
                    CommentLexemeKind comment_kind = CommentLexemeKind::None,
                    bool is_format_off_marker = false,
-                   bool is_format_on_marker = false) {
+                   bool is_format_on_marker = false,
+                   bool is_disabled_region_body = false) {
         auto lex = std::make_shared<LexemeFacts>();
         lex->kind = kind;
         lex->text.assign(text);
@@ -171,6 +181,7 @@ private:
         lex->comment_kind = comment_kind;
         lex->is_format_off_marker = is_format_off_marker;
         lex->is_format_on_marker = is_format_on_marker;
+        lex->is_disabled_region_body = is_disabled_region_body;
 
         Tok tok;
         tok.lex = std::move(lex);
@@ -232,6 +243,9 @@ private:
             if (format_off) {
                 disabled_ = true;
                 just_entered_disabled_region_ = true;
+                consume_text(raw, true);
+                collect_disabled_region_body();
+                return;
             }
             if (format_on) disabled_ = false;
         }
@@ -330,6 +344,93 @@ private:
         add_token(token.kind, raw_chunk, cursor_, false,
                   token.kind == slang::parsing::TokenKind::Directive, true);
         consume_text(raw_chunk, false);
+    }
+
+    bool is_escaped_in_string(size_t pos) const {
+        size_t slash_count = 0;
+        while (pos > 0 && source_[pos - 1] == '\\') {
+            --pos;
+            ++slash_count;
+        }
+        return (slash_count % 2) != 0;
+    }
+
+    size_t line_end_after(size_t pos) const {
+        while (pos < source_.size() && source_[pos] != '\n')
+            ++pos;
+        if (pos < source_.size())
+            ++pos;
+        return pos;
+    }
+
+    size_t block_comment_end_after(size_t pos) const {
+        // pos points just after the opening "/*".
+        while (pos + 1 < source_.size()) {
+            if (source_[pos] == '*' && source_[pos + 1] == '/')
+                return pos + 2;
+            ++pos;
+        }
+        return source_.size();
+    }
+
+    size_t find_format_on_region_end(size_t start) const {
+        bool in_string = false;
+        for (size_t pos = start; pos < source_.size(); ++pos) {
+            const char c = source_[pos];
+            if (in_string) {
+                if (c == '"' && !is_escaped_in_string(pos))
+                    in_string = false;
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                continue;
+            }
+            if (c != '/' || pos + 1 >= source_.size())
+                continue;
+
+            if (source_[pos + 1] == '/') {
+                const size_t end = line_end_after(pos + 2);
+                const size_t comment_end = (end > pos && source_[end - 1] == '\n') ? end - 1 : end;
+                std::string_view comment(source_.data() + pos, comment_end - pos);
+                if (is_format_marker(comment, opts_.format_on_comment_pattern))
+                    return end;
+                pos = end == 0 ? pos : end - 1;
+                continue;
+            }
+
+            if (source_[pos + 1] == '*') {
+                const size_t comment_end = block_comment_end_after(pos + 2);
+                std::string_view comment(source_.data() + pos, comment_end - pos);
+                if (is_format_marker(comment, opts_.format_on_comment_pattern)) {
+                    size_t end = comment_end;
+                    if (end < source_.size() && source_[end] == '\r' &&
+                        end + 1 < source_.size() && source_[end + 1] == '\n')
+                        end += 2;
+                    else if (end < source_.size() && source_[end] == '\n')
+                        ++end;
+                    return end;
+                }
+                pos = comment_end == 0 ? pos : comment_end - 1;
+            }
+        }
+        return source_.size();
+    }
+
+    void collect_disabled_region_body() {
+        consume_disabled_region_boundary_newline(source_.size());
+        const size_t body_start = cursor_;
+        const size_t body_end = find_format_on_region_end(body_start);
+        if (body_end > body_start) {
+            std::string_view raw_body(source_.data() + body_start, body_end - body_start);
+            add_token(slang::parsing::TokenKind::Unknown, raw_body, body_start,
+                      false, false, true, CommentLexemeKind::None,
+                      false, false, true);
+            consume_text(raw_body, false);
+        }
+        passthrough_end_ = std::max(passthrough_end_, body_end);
+        disabled_ = false;
+        just_entered_disabled_region_ = false;
     }
 
     void consume_disabled_region_boundary_newline(size_t end) {
