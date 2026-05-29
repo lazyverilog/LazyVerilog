@@ -191,9 +191,11 @@ private:
         consume_gap_to(pos);
 
         if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
-            add_token(TK::Unknown, raw, pos, true, false, disabled_);
-            if (is_format_marker(raw, opts_.format_off_comment_pattern)) disabled_ = true;
-            if (is_format_marker(raw, opts_.format_on_comment_pattern)) disabled_ = false;
+            bool format_off = is_format_marker(raw, opts_.format_off_comment_pattern);
+            bool format_on = is_format_marker(raw, opts_.format_on_comment_pattern);
+            add_token(TK::Unknown, raw, pos, true, false, disabled_ || format_off || format_on);
+            if (format_off) disabled_ = true;
+            if (format_on) disabled_ = false;
         }
         // Whitespace trivia is not a token.  It only contributes immutable source
         // layout facts used by passes such as WrapPass and BlankLinePass.

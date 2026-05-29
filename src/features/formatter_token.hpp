@@ -122,6 +122,7 @@ enum class WrapListKind {
     FunctionDeclBlock,
     FunctionDeclHanging,
     EnumBody,
+    BraceBlock,
     ModportBody,
 };
 

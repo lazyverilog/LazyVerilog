@@ -1395,6 +1395,167 @@ TEST_CASE("formatter: non-ANSI port declarations keep five-section alignment", "
     CHECK(format_source(formatted, opts) == formatted);
 }
 
+TEST_CASE("formatter: variable declarations support user types automatic and comma declarators", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+
+    CHECK(format_source("module m;\n"
+                        "packet_t [1:0] test_init = 8'hFF;\n"
+                        "packet_t test_init2 = 8'hFF;\n"
+                        "logic [2:0] a, b;\n"
+                        "automatic int [3:0] c;\n"
+                        "endmodule\n",
+                        opts) ==
+          "module m;\n"
+          "packet_t            [1:0]               test_init           = 8'hFF         ;\n"
+          "packet_t                                test_init2          = 8'hFF         ;\n"
+          "logic               [2:0]               a                                   , b                                   ;\n"
+          "automatic int       [3:0]               c                                   ;\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: instance port name width is dot-to-paren field width", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+
+    CHECK(format_source("module m;\n"
+                        "mem u_mem(.address(addr), .read_write(rw));\n"
+                        "endmodule\n",
+                        opts) ==
+          "module m;\n"
+          "mem u_mem (\n"
+          "    .address  (addr      ),\n"
+          "    .read_write (rw        )\n"
+          ");\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: zero-port instance is not variable declaration aligned", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    opts.instance.align = true;
+
+    CHECK(format_source("module m;\n"
+                        "packet_t value;\n"
+                        "memory u_mem4();\n"
+                        "endmodule\n",
+                        opts) ==
+          "module m;\n"
+          "packet_t            value                               ;\n"
+          "memory u_mem4();\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: do while condition stays attached to loop end", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.spacing.control_keyword_space = true;
+    opts.spacing.binary_operator_spacing = "none";
+
+    CHECK(format_source("module m;\n"
+                        "initial begin\n"
+                        "do begin\n"
+                        "i++;\n"
+                        "end while(i<5);\n"
+                        "end\n"
+                        "endmodule\n",
+                        opts) ==
+          "module m;\n"
+          "initial begin\n"
+          "    do begin\n"
+          "        i++;\n"
+          "    end while (i<5);\n"
+          "end\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: format off marker keeps original column and body verbatim", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("module m;\n"
+                        "initial begin\n"
+                        "// verilog_format: off\n"
+                        "        sum(.i_a(i_a2),\n"
+                        "        .i_b(i_b));\n"
+                        "    // verilog_format: on\n"
+                        "end\n"
+                        "endmodule\n",
+                        opts) ==
+          "module m;\n"
+          "initial begin\n"
+          "// verilog_format: off\n"
+          "        sum(.i_a(i_a2),\n"
+          "        .i_b(i_b));\n"
+          "    // verilog_format: on\n"
+          "end\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: constraint dist list stays item-per-line with attached semicolon", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("class c;\n"
+                        "constraint burst_dist_c { burst_len dist { 1 := 10, [2:4] := 20, [5:8] := 5 }; }\n"
+                        "endclass\n",
+                        opts) ==
+          "class c;\n"
+          "    constraint burst_dist_c {\n"
+          "        burst_len dist {\n"
+          "            1 := 10,\n"
+          "            [2:4] := 20,\n"
+          "            [5:8] := 5\n"
+          "        };\n"
+          "    }\n"
+          "endclass\n");
+}
+
+TEST_CASE("formatter: covergroup event control is not procedural event spacing", "[formatter]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.spacing.procedural_event_control_at_spacing = "both";
+    opts.spacing.space_inside_event_control_parens = true;
+
+    CHECK(format_source("class c;\n"
+                        "covergroup cg @(posedge sample_clk);\n"
+                        "endgroup\n"
+                        "endclass\n",
+                        opts) ==
+          "class c;\n"
+          "    covergroup cg@(posedge sample_clk);\n"
+          "    endgroup\n"
+          "endclass\n");
+}
+
 TEST_CASE("formatter: var declarations inside typedef struct are aligned", "[formatter]") {
     FormatOptions opts;
     opts.var_declaration.align = true;
@@ -2341,18 +2502,18 @@ TEST_CASE("formatter: instance port alignment crosses preprocessor conditionals"
         "module top;\n"
         "memory u_mem5 ( //test\n"
         "    // input\n"
-        "    .i_clk     (i_clk     ), // input\n"
-        "    .address   (addr      ), // output() .data_in  (data_in   ),\n"
+        "    .i_clk    (i_clk     ), // input\n"
+        "    .address  (addr      ), // output() .data_in  (data_in   ),\n"
         "`ifdef A\n"
-        "    .data_out  (kj        ), // test\n"
+        "    .data_out (kj        ), // test\n"
         "`elsif B\n"
         "    .read_write (read_write),\n"
         "`endif\n"
-        "    .chip_en   (chip_en   ),\n"
-        "    .www333    (www333    ),\n"
-        "    .www333    (www333    ),\n"
-        "    .zzfuk     (zzfuk     ),\n"
-        "    .zzfuk     (zzfuk     )\n"
+        "    .chip_en  (chip_en   ),\n"
+        "    .www333   (www333    ),\n"
+        "    .www333   (www333    ),\n"
+        "    .zzfuk    (zzfuk     ),\n"
+        "    .zzfuk    (zzfuk     )\n"
         ");\n"
         "endmodule\n";
 
@@ -2430,7 +2591,7 @@ TEST_CASE("formatter: coverpoint blocks follow statement begin_newline option",
                         "endgroup\n";
 
     opts.statement.begin_newline = true;
-    CHECK(format_source(input, opts) == "covergroup cg @(posedge clk);\n"
+    CHECK(format_source(input, opts) == "covergroup cg@(posedge clk);\n"
                                        "    op_cp: coverpoint op\n"
                                        "    {\n"
                                        "        bins read_write[] = {[0:1]};\n"
@@ -2443,7 +2604,7 @@ TEST_CASE("formatter: coverpoint blocks follow statement begin_newline option",
                                        "endgroup\n");
 
     opts.statement.begin_newline = false;
-    CHECK(format_source(input, opts) == "covergroup cg @(posedge clk);\n"
+    CHECK(format_source(input, opts) == "covergroup cg@(posedge clk);\n"
                                         "    op_cp: coverpoint op {\n"
                                         "        bins read_write[] = {[0:1]};\n"
                                         "        bins idle = {2};\n"
@@ -2808,9 +2969,9 @@ TEST_CASE("formatter: instance alignment strict versus adaptive", "[formatter][o
     CHECK(format_source("module top;\nchild u(.a(a), .long_port(long_signal), .z(z));\nendmodule\n", opts) ==
           "module top;\n"
           "child u (\n"
-          "    .a         (a          ),\n"
+          "    .a       (a          ),\n"
           "    .long_port (long_signal),\n"
-          "    .z         (z          )\n"
+          "    .z       (z          )\n"
           ");\n"
           "endmodule\n");
 
@@ -2818,9 +2979,9 @@ TEST_CASE("formatter: instance alignment strict versus adaptive", "[formatter][o
     CHECK(format_source("module top;\nchild u(.a(a), .long_port(long_signal), .z(z));\nendmodule\n", opts) ==
           "module top;\n"
           "child u (\n"
-          "    .a       (a       ),\n"
+          "    .a      (a       ),\n"
           "    .long_port (long_signal),\n"
-          "    .z       (z       )\n"
+          "    .z      (z       )\n"
           ");\n"
           "endmodule\n");
 }
