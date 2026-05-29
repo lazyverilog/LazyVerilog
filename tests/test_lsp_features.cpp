@@ -27,6 +27,140 @@ endmodule
     CHECK(hover->contents.second->value.find("input logic [3:0]") != std::string::npos);
 }
 
+TEST_CASE("hover: includes unpacked dimensions on ports", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_port_dimensions.sv";
+    const std::string text = R"(
+`define WIDTH 8
+`define DEPTH 4
+module ansi_top(
+    input logic [1:0] ansi_data [7:0],
+    output wire [3:0] ansi_net [2],
+    input logic [`WIDTH-1:0] ansi_macro_data [`DEPTH]
+);
+endmodule
+
+module non_ansi_top(
+    non_ansi_data,
+    non_ansi_b,
+    non_ansi_macro
+);
+input logic [1:0] non_ansi_data [7:0];
+input logic [1:0] non_ansi_b [3:0];
+input logic [`WIDTH-1:0] non_ansi_macro [`DEPTH];
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    auto position_of = [&](std::string_view needle) {
+        const auto offset = text.find(needle);
+        REQUIRE(offset != std::string::npos);
+
+        int line = 0;
+        int col = 0;
+        for (size_t i = 0; i < offset; ++i) {
+            if (text[i] == '\n') {
+                ++line;
+                col = 0;
+            } else {
+                ++col;
+            }
+        }
+        return lsPosition(line, col);
+    };
+
+    auto hover_on = [&](std::string_view needle) {
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = position_of(needle);
+        return provide_hover(analyzer, params);
+    };
+
+    auto ansi_data_hover = hover_on("ansi_data");
+    REQUIRE(ansi_data_hover.has_value());
+    REQUIRE(ansi_data_hover->contents.second.has_value());
+    CHECK(ansi_data_hover->contents.second->value ==
+          "**ansi_data** — *port*\n\n---\n\n```\ninput logic [1:0] [7:0]\n```");
+
+    auto ansi_net_hover = hover_on("ansi_net");
+    REQUIRE(ansi_net_hover.has_value());
+    REQUIRE(ansi_net_hover->contents.second.has_value());
+    CHECK(ansi_net_hover->contents.second->value ==
+          "**ansi_net** — *port*\n\n---\n\n```\noutput [3:0] [2]\n```");
+
+    auto non_ansi_data_hover = hover_on("non_ansi_data [7:0]");
+    REQUIRE(non_ansi_data_hover.has_value());
+    REQUIRE(non_ansi_data_hover->contents.second.has_value());
+    CHECK(non_ansi_data_hover->contents.second->value ==
+          "**non_ansi_data** — *port*\n\n---\n\n```\ninput logic [1:0] [7:0]\n```");
+
+    auto non_ansi_b_hover = hover_on("non_ansi_b [3:0]");
+    REQUIRE(non_ansi_b_hover.has_value());
+    REQUIRE(non_ansi_b_hover->contents.second.has_value());
+    CHECK(non_ansi_b_hover->contents.second->value ==
+          "**non_ansi_b** — *port*\n\n---\n\n```\ninput logic [1:0] [3:0]\n```");
+
+    auto ansi_macro_hover = hover_on("ansi_macro_data");
+    REQUIRE(ansi_macro_hover.has_value());
+    REQUIRE(ansi_macro_hover->contents.second.has_value());
+    CHECK(ansi_macro_hover->contents.second->value ==
+          "**ansi_macro_data** — *port*\n\n---\n\n```\ninput logic [`WIDTH-1:0] [`DEPTH]\n```");
+
+    auto non_ansi_macro_hover = hover_on("non_ansi_macro [`DEPTH]");
+    REQUIRE(non_ansi_macro_hover.has_value());
+    REQUIRE(non_ansi_macro_hover->contents.second.has_value());
+    CHECK(non_ansi_macro_hover->contents.second->value ==
+          "**non_ansi_macro** — *port*\n\n---\n\n```\ninput logic [`WIDTH-1:0] [`DEPTH]\n```");
+}
+
+TEST_CASE("hover: memory_top style non-ANSI port declaration keeps full dimensions", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_memory_top_style_port.sv";
+    const std::string text = R"(
+module memory_top(
+    i_data
+);
+input     logic      [1:0]       i_data            [7:0]         ; // input
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto offset = text.find("i_data            [7:0]");
+    REQUIRE(offset != std::string::npos);
+
+    int line = 0;
+    int col = 0;
+    for (size_t i = 0; i < offset; ++i) {
+        if (text[i] == '\n') {
+            ++line;
+            col = 0;
+        } else {
+            ++col;
+        }
+    }
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+
+    // Regression for the original demo/memory_top.sv report:
+    //
+    //     input logic [1:0] i_data [7:0];
+    //
+    // Hover used to show only the direction and packed range:
+    //
+    //     input logic [1:0]
+    //
+    // The unpacked [7:0] dimension is attached to the declarator, not the port
+    // header, so the hover renderer and SyntaxIndex must both append it.
+    CHECK(hover->contents.second->value ==
+          "**i_data** — *port*\n\n---\n\n```\ninput logic [1:0] [7:0]\n```");
+}
+
 TEST_CASE("hover: resolves instance module names through extra files", "[hover]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_child.sv";
     {
@@ -138,7 +272,8 @@ endmodule
     auto variable_hover = hover_at(11, 10);
     REQUIRE(variable_hover.has_value());
     REQUIRE(variable_hover->contents.second.has_value());
-    CHECK(variable_hover->contents.second->value == "**value** — *variable*");
+    CHECK(variable_hover->contents.second->value ==
+          "**value** — *variable*\n\n---\n\n```\nlogic [2:0]\n```");
 
     auto function_hover = hover_at(11, 18);
     REQUIRE(function_hover.has_value());
@@ -152,6 +287,111 @@ endmodule
     REQUIRE(task_hover->contents.second.has_value());
     CHECK(task_hover->contents.second->value ==
           "**run** — *task*\n\n---\n\n```\ntask run(input int a)\n```");
+}
+
+TEST_CASE("hover: shows data types for module and local variables", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_variable_types.sv";
+    const std::string text = R"(
+`define WIDTH 32
+`define WIDTH123 7
+module top;
+    typedef struct {
+        logic [7:0] struct_addr;
+        logic       valid;
+    } packet_wo_data_t;
+
+    logic /* packed comment must not leak into hover */ [32-1:0] data;
+    logic [`WIDTH123:0] macro_addr;
+    logic [`WIDTH-1:0] macro_wdata;
+    int queue [4];
+    logic [8-1:0] wider;
+
+    initial begin
+        automatic bit flag;
+        data = queue[0];
+        flag = wider[0];
+    end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    auto hover_at = [&](int line, int col) {
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(line, col);
+        return provide_hover(analyzer, params);
+    };
+
+    auto position_of = [&](std::string_view needle) {
+        const auto offset = text.find(needle);
+        REQUIRE(offset != std::string::npos);
+
+        int line = 0;
+        int col = 0;
+        for (size_t i = 0; i < offset; ++i) {
+            if (text[i] == '\n') {
+                ++line;
+                col = 0;
+            } else {
+                ++col;
+            }
+        }
+        return lsPosition(line, col);
+    };
+
+    auto hover_on = [&](std::string_view needle) {
+        auto pos = position_of(needle);
+        return hover_at(pos.line, pos.character);
+    };
+
+    auto struct_addr_hover = hover_on("struct_addr");
+    REQUIRE(struct_addr_hover.has_value());
+    REQUIRE(struct_addr_hover->contents.second.has_value());
+    CHECK(struct_addr_hover->contents.second->value ==
+          "**struct_addr** — *variable*\n\n---\n\n```\nlogic [7:0]\n```");
+
+    auto valid_hover = hover_on("valid");
+    REQUIRE(valid_hover.has_value());
+    REQUIRE(valid_hover->contents.second.has_value());
+    CHECK(valid_hover->contents.second->value ==
+          "**valid** — *variable*\n\n---\n\n```\nlogic\n```");
+
+    auto data_hover = hover_on("data;");
+    REQUIRE(data_hover.has_value());
+    REQUIRE(data_hover->contents.second.has_value());
+    CHECK(data_hover->contents.second->value ==
+          "**data** — *variable*\n\n---\n\n```\nlogic [32-1:0]\n```");
+
+    auto macro_addr_hover = hover_on("macro_addr");
+    REQUIRE(macro_addr_hover.has_value());
+    REQUIRE(macro_addr_hover->contents.second.has_value());
+    CHECK(macro_addr_hover->contents.second->value ==
+          "**macro_addr** — *variable*\n\n---\n\n```\nlogic [`WIDTH123:0]\n```");
+
+    auto macro_wdata_hover = hover_on("macro_wdata");
+    REQUIRE(macro_wdata_hover.has_value());
+    REQUIRE(macro_wdata_hover->contents.second.has_value());
+    CHECK(macro_wdata_hover->contents.second->value ==
+          "**macro_wdata** — *variable*\n\n---\n\n```\nlogic [`WIDTH-1:0]\n```");
+
+    auto queue_hover = hover_on("queue");
+    REQUIRE(queue_hover.has_value());
+    REQUIRE(queue_hover->contents.second.has_value());
+    CHECK(queue_hover->contents.second->value ==
+          "**queue** — *variable*\n\n---\n\n```\nint [4]\n```");
+
+    auto wider_hover = hover_on("wider");
+    REQUIRE(wider_hover.has_value());
+    REQUIRE(wider_hover->contents.second.has_value());
+    CHECK(wider_hover->contents.second->value ==
+          "**wider** — *variable*\n\n---\n\n```\nlogic [8-1:0]\n```");
+
+    auto flag_hover = hover_on("flag");
+    REQUIRE(flag_hover.has_value());
+    REQUIRE(flag_hover->contents.second.has_value());
+    CHECK(flag_hover->contents.second->value ==
+          "**flag** — *variable*\n\n---\n\n```\nbit\n```");
 }
 
 TEST_CASE("hover: shows parameter values and macro bodies", "[hover]") {

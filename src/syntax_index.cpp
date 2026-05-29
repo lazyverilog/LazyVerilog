@@ -1,6 +1,7 @@
 #include "syntax_index.hpp"
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
@@ -22,6 +23,100 @@ static std::string trim_copy(std::string text) {
     if (first >= last)
         return {};
     return std::string(first, last);
+}
+
+static bool index_fragment_edge_is_wordlike(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
+}
+
+static bool index_needs_space_between_fragments(std::string_view previous,
+                                                std::string_view next) {
+    if (previous.empty() || next.empty())
+        return false;
+
+    const char prev = previous.back();
+    const char curr = next.front();
+
+    // SyntaxTree::toString() is convenient, but it can render tokens after
+    // preprocessing.  The syntax index feeds hover, so it should preserve the
+    // user's spelling for declarations such as:
+    //
+    //     input logic [`WIDTH-1:0] data [DEPTH]
+    //
+    // To do that we concatenate raw syntax tokens, which means we must restore
+    // a few human-readable separators that trivia removal would otherwise
+    // collapse ("logic[3:0]" -> "logic [3:0]", "bitsigned" -> "bit signed").
+    if (index_fragment_edge_is_wordlike(prev) && index_fragment_edge_is_wordlike(curr))
+        return true;
+    if (index_fragment_edge_is_wordlike(prev) && (curr == '[' || curr == '{'))
+        return true;
+    if (prev == ',')
+        return true;
+    return false;
+}
+
+static std::optional<std::string> source_text_for_index_range(const slang::SourceManager& sm,
+                                                              slang::SourceRange range) {
+    if (!range.start().valid() || !range.end().valid())
+        return std::nullopt;
+    if (range.start().buffer() != range.end().buffer())
+        return std::nullopt;
+
+    const auto source = sm.getSourceText(range.start().buffer());
+    const size_t begin = range.start().offset();
+    const size_t end = range.end().offset();
+    if (begin > end || end > source.size())
+        return std::nullopt;
+
+    return std::string(source.substr(begin, end - begin));
+}
+
+static bool same_index_source_range(slang::SourceRange lhs, slang::SourceRange rhs) {
+    return lhs.start() == rhs.start() && lhs.end() == rhs.end();
+}
+
+static std::string render_index_token_text(
+    const slang::SourceManager& sm, const slang::parsing::Token& token,
+    std::optional<slang::SourceRange>& last_macro_range) {
+    if (sm.isMacroLoc(token.location())) {
+        const auto expansion_range = sm.getExpansionRange(token.location());
+
+        // One macro invocation can produce multiple parser tokens.  Emitting
+        // the expansion range once preserves exactly what the user wrote while
+        // avoiding duplicates:
+        //
+        //     [`WIDTH-1:0]   -> one source slice, not repeated raw expansion
+        if (last_macro_range && same_index_source_range(*last_macro_range, expansion_range))
+            return {};
+        last_macro_range = expansion_range;
+
+        if (auto text = source_text_for_index_range(sm, expansion_range))
+            return *text;
+    } else {
+        last_macro_range.reset();
+    }
+
+    return std::string(token.rawText());
+}
+
+static std::string render_index_syntax_text(const slang::SourceManager& sm,
+                                            const slang::syntax::SyntaxNode& node) {
+    std::string text;
+    std::optional<slang::SourceRange> last_macro_range;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (!token || token.isMissing())
+            continue;
+
+        const auto fragment = render_index_token_text(sm, token, last_macro_range);
+        if (fragment.empty())
+            continue;
+
+        if (index_needs_space_between_fragments(text, fragment))
+            text += ' ';
+        text += fragment;
+    }
+    return trim_copy(std::move(text));
 }
 
 static std::string simple_identifier_from_expr(const PropertyExprSyntax* expr) {
@@ -53,12 +148,36 @@ static std::string direction_of(const PortHeaderSyntax& header) {
     return "unknown";
 }
 
-static std::string type_of(const PortHeaderSyntax& header) {
+static std::string type_of(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return trim_copy(variable->dataType->toString());
+        return render_index_syntax_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
-        return trim_copy(net->dataType->toString());
+        return render_index_syntax_text(sm, *net->dataType);
     return {};
+}
+
+static std::string with_declarator_dimensions(const slang::SourceManager& sm, std::string type,
+                                              const DeclaratorSyntax& declarator) {
+    // A port header owns the shared packed type while each declarator owns its
+    // unpacked dimensions:
+    //
+    //     input logic [1:0] a [7:0], b [3:0];
+    //           ^^^^^^^^^^^ shared header type
+    //                         ^^^^^  ^^^^^ per-declarator dimensions
+    //
+    // The syntax index is used by hover's fast path, so it must retain those
+    // dimensions; otherwise hover only shows "input logic [1:0]".
+    for (const auto* dimension : declarator.dimensions) {
+        if (!dimension)
+            continue;
+
+        const auto rendered = render_index_syntax_text(sm, *dimension);
+        if (rendered.empty())
+            continue;
+
+        type += (type.empty() ? "" : " ") + rendered;
+    }
+    return type;
 }
 
 static void add_port(std::vector<PortEntry>& ports, const slang::SourceManager& sm,
@@ -84,7 +203,8 @@ static void extract_ansi_ports(const AnsiPortListSyntax& port_list, std::vector<
 
         if (const auto* implicit = member->as_if<ImplicitAnsiPortSyntax>()) {
             add_port(ports, sm, implicit->declarator->name, direction_of(*implicit->header),
-                     type_of(*implicit->header));
+                     with_declarator_dimensions(sm, type_of(sm, *implicit->header),
+                                                *implicit->declarator));
         } else if (const auto* explicit_port = member->as_if<ExplicitAnsiPortSyntax>()) {
             auto direction = tok_str(explicit_port->direction);
             add_port(ports, sm, explicit_port->name,
@@ -104,10 +224,11 @@ static void extract_port_declarations(const SyntaxList<MemberSyntax>& members,
             continue;
 
         const auto direction = direction_of(*declaration->header);
-        const auto type = type_of(*declaration->header);
+        const auto type = type_of(sm, *declaration->header);
         for (const auto* declarator : declaration->declarators) {
             if (declarator)
-                add_port(ports, sm, declarator->name, direction, type);
+                add_port(ports, sm, declarator->name, direction,
+                         with_declarator_dimensions(sm, type, *declarator));
         }
     }
 }

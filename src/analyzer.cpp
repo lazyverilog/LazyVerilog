@@ -339,6 +339,142 @@ static std::string trim_copy(std::string text) {
     return std::string(first, last);
 }
 
+static bool hover_fragment_edge_is_wordlike(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
+}
+
+static bool hover_needs_space_between_fragments(std::string_view previous,
+                                                std::string_view next) {
+    if (previous.empty() || next.empty())
+        return false;
+
+    const char prev = previous.back();
+    const char curr = next.front();
+
+    // Keep adjacent identifiers / keywords / literals readable:
+    //
+    //     bit signed
+    //     virtual interface axi_if
+    //     struct packed
+    //
+    // Without this, a trivia-free token stream would become "bitsigned" or
+    // "virtualinterface".
+    if (hover_fragment_edge_is_wordlike(prev) && hover_fragment_edge_is_wordlike(curr))
+        return true;
+
+    // Packed and unpacked dimensions are syntactically bracketed, but hover is
+    // documentation for humans.  Prefer "logic [31:0]" over "logic[31:0]".
+    if (hover_fragment_edge_is_wordlike(prev) && curr == '[')
+        return true;
+
+    // Struct / union / enum bodies are easier to read with a separator:
+    // "struct packed { ... }" instead of "struct packed{ ... }".
+    if (hover_fragment_edge_is_wordlike(prev) && curr == '{')
+        return true;
+
+    // Lists should not collapse after commas when comments/trivia are stripped.
+    if (prev == ',')
+        return true;
+
+    return false;
+}
+
+static std::optional<std::string>
+source_text_for_hover_range(const slang::SourceManager& sm, slang::SourceRange range) {
+    if (!range.start().valid() || !range.end().valid())
+        return std::nullopt;
+    if (range.start().buffer() != range.end().buffer())
+        return std::nullopt;
+
+    const auto source = sm.getSourceText(range.start().buffer());
+    const size_t begin = range.start().offset();
+    const size_t end = range.end().offset();
+    if (begin > end || end > source.size())
+        return std::nullopt;
+
+    return std::string(source.substr(begin, end - begin));
+}
+
+static bool same_source_range(slang::SourceRange lhs, slang::SourceRange rhs) {
+    return lhs.start() == rhs.start() && lhs.end() == rhs.end();
+}
+
+static std::string render_hover_token_text(const slang::SourceManager& sm,
+                                           const slang::parsing::Token& token,
+                                           std::optional<slang::SourceRange>& last_macro_range) {
+    if (sm.isMacroLoc(token.location())) {
+        const auto expansion_range = sm.getExpansionRange(token.location());
+
+        // A single macro invocation can expand to several syntax tokens.  Those
+        // tokens all point back to the same invocation range in the user's
+        // source.  Hover should show the invocation once:
+        //
+        //     logic [`RANGE] value;   // `RANGE might expand to 7:0
+        //            ^^^^^^          // show `RANGE, not `RANGE`RANGE`RANGE
+        //
+        // For ordinary macro constants used as part of a larger range, this
+        // still preserves the exact source spelling:
+        //
+        //     logic [`WIDTH-1:0] value;  // show `WIDTH-1:0, not 32-1:0
+        if (last_macro_range && same_source_range(*last_macro_range, expansion_range))
+            return {};
+        last_macro_range = expansion_range;
+
+        if (auto text = source_text_for_hover_range(sm, expansion_range))
+            return *text;
+    } else {
+        last_macro_range.reset();
+    }
+
+    return std::string(token.rawText());
+}
+
+static std::string render_hover_syntax_text(const slang::SourceManager& sm,
+                                            const slang::syntax::SyntaxNode& node) {
+    std::string text;
+    std::optional<slang::SourceRange> last_macro_range;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (!token || token.isMissing())
+            continue;
+
+        const auto fragment = render_hover_token_text(sm, token, last_macro_range);
+        if (fragment.empty())
+            continue;
+
+        if (hover_needs_space_between_fragments(text, fragment))
+            text += ' ';
+        text += fragment;
+    }
+    return trim_copy(std::move(text));
+}
+
+static std::string render_hover_dimensions(
+    const slang::SourceManager& sm,
+    const slang::syntax::SyntaxList<slang::syntax::VariableDimensionSyntax>& dimensions) {
+    std::string text;
+    for (const auto* dimension : dimensions) {
+        if (!dimension)
+            continue;
+
+        const auto rendered = render_hover_syntax_text(sm, *dimension);
+        if (rendered.empty())
+            continue;
+
+        if (hover_needs_space_between_fragments(text, rendered))
+            text += ' ';
+        text += rendered;
+    }
+    return text;
+}
+
+static std::string append_hover_suffix(std::string base, const std::string& suffix) {
+    if (suffix.empty())
+        return base;
+    base += (base.empty() ? "" : " ") + suffix;
+    return base;
+}
+
 static std::string format_ports_doc(const std::string& ports_text) {
     auto text = trim_copy(ports_text);
     if (text.size() < 2 || text.front() != '(' || text.back() != ')')
@@ -552,7 +688,10 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         visitDefault(node);
     }
 
-    void handle(const slang::syntax::TypedefDeclarationSyntax& node) { maybe_set(node.name); }
+    void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
+        maybe_set(node.name);
+        visitDefault(node);
+    }
 };
 
 static std::optional<Location> find_generic_definition(const slang::syntax::SyntaxTree& tree,
@@ -653,17 +792,29 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 if (const auto* variable =
                         node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                     detail = token_text(variable->direction);
-                    auto type = trim_copy(variable->dataType->toString());
+                    auto type = render_hover_syntax_text(sm, *variable->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 } else if (const auto* net =
                                node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                     detail = token_text(net->direction);
-                    auto type = trim_copy(net->dataType->toString());
+                    auto type = render_hover_syntax_text(sm, *net->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 }
             }
+
+            // ANSI ports have the same split-type shape as ordinary
+            // declarations: the header owns the direction and shared packed
+            // type, while the declarator owns any unpacked dimensions.
+            //
+            //     module m(input logic [1:0] i_data [7:0]);
+            //              ^^^^^^^^^^^^^^^^^ shared header type
+            //                                      ^^^^^ declarator dimension
+            //
+            // Hover should show the full object type, not just the header type.
+            detail = append_hover_suffix(detail,
+                                         render_hover_dimensions(sm, node.declarator->dimensions));
             set_from_token(node.declarator->name, "port", detail);
         }
 
@@ -676,48 +827,125 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             if (const auto* variable =
                     node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                 detail = token_text(variable->direction);
-                auto type = trim_copy(variable->dataType->toString());
+                auto type = render_hover_syntax_text(sm, *variable->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             } else if (const auto* net = node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                 detail = token_text(net->direction);
-                auto type = trim_copy(net->dataType->toString());
+                auto type = render_hover_syntax_text(sm, *net->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }
             for (const auto* declarator : node.declarators) {
-                if (declarator)
-                    set_from_token(declarator->name, "port", detail);
+                if (!declarator)
+                    continue;
+
+                // Non-ANSI port declarations can also place unpacked
+                // dimensions on individual declarators:
+                //
+                //     input logic [1:0] a [7:0], b [3:0];
+                //
+                // The header detail is shared, so copy it before appending each
+                // declarator's dimensions.
+                auto port_detail = detail;
+                port_detail =
+                    append_hover_suffix(port_detail,
+                                        render_hover_dimensions(sm, declarator->dimensions));
+                set_from_token(declarator->name, "port", port_detail);
             }
         }
 
         void handle(const slang::syntax::DataDeclarationSyntax& node) {
+            // A data declaration's syntactic data type is shared by every
+            // declarator in the declaration:
+            //
+            //     logic [7:0] a, b [4];
+            //     ^^^^^^^^^^^ shared DataDeclarationSyntax::type
+            //
+            // SystemVerilog also allows each declarator to carry unpacked
+            // dimensions.  Those dimensions are part of the declared object's
+            // full type even though they are syntactically attached to the
+            // declarator instead of the shared data type.  Hover should
+            // therefore show:
+            //
+            //     a -> logic [7:0]
+            //     b -> logic [7:0] [4]
+            //
+            // rather than the previous empty detail string, which made a
+            // variable hover display only "**name** — *variable*".
+            auto base_type = render_hover_syntax_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
-                if (declarator)
-                    set_from_token(declarator->name, "variable", "");
+                if (!declarator)
+                    continue;
+
+                auto detail = base_type;
+                detail = append_hover_suffix(detail,
+                                             render_hover_dimensions(sm, declarator->dimensions));
+                set_from_token(declarator->name, "variable", detail);
             }
         }
 
         void handle(const slang::syntax::NetDeclarationSyntax& node) {
             auto detail = token_text(node.netType);
-            auto type = trim_copy(node.type->toString());
+            auto type = render_hover_syntax_text(sm, *node.type);
             if (!type.empty())
                 detail += (detail.empty() ? "" : " ") + type;
             for (const auto* declarator : node.declarators) {
-                if (declarator)
-                    set_from_token(declarator->name, "net", detail);
+                if (!declarator)
+                    continue;
+
+                auto net_detail = detail;
+                net_detail = append_hover_suffix(net_detail,
+                                                 render_hover_dimensions(sm, declarator->dimensions));
+                set_from_token(declarator->name, "net", net_detail);
+            }
+        }
+
+        void handle(const slang::syntax::StructUnionMemberSyntax& node) {
+            // Struct / union fields are not DataDeclarationSyntax nodes.  They
+            // have their own StructUnionMemberSyntax shape:
+            //
+            //     typedef struct {
+            //         logic [7:0] addr;
+            //         logic       valid;
+            //     } packet_t;
+            //
+            // Generic definition lookup can correctly land on the field's
+            // DeclaratorSyntax, but hover must still reconstruct the field's
+            // declaration type from StructUnionMemberSyntax::type plus any
+            // declarator-local unpacked dimensions.
+            auto base_type = render_hover_syntax_text(sm, *node.type);
+            for (const auto* declarator : node.declarators) {
+                if (!declarator)
+                    continue;
+
+                auto detail = base_type;
+                detail = append_hover_suffix(detail,
+                                             render_hover_dimensions(sm, declarator->dimensions));
+                set_from_token(declarator->name, "variable", detail);
             }
         }
 
         void handle(const slang::syntax::LocalVariableDeclarationSyntax& node) {
+            // Local declarations use a different syntax node from module/class
+            // data declarations, but the hover policy is the same: show the
+            // variable kind plus the declared data type.  Keep this in the
+            // definition-to-symbol layer instead of the hover renderer so hover
+            // formatting remains a pure presentation step over SymbolInfo.
+            auto base_type = render_hover_syntax_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
-                if (declarator)
-                    set_from_token(declarator->name, "variable", "");
+                if (!declarator)
+                    continue;
+
+                auto detail = base_type;
+                detail = append_hover_suffix(detail,
+                                             render_hover_dimensions(sm, declarator->dimensions));
+                set_from_token(declarator->name, "variable", detail);
             }
         }
 
         void handle(const slang::syntax::ParameterDeclarationSyntax& node) {
-            auto detail = trim_copy(node.type->toString());
+            auto detail = render_hover_syntax_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -732,10 +960,12 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::FunctionPortSyntax& node) {
             auto detail = token_text(node.direction);
             if (node.dataType) {
-                auto type = trim_copy(node.dataType->toString());
+                auto type = render_hover_syntax_text(sm, *node.dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }
+            detail = append_hover_suffix(detail,
+                                         render_hover_dimensions(sm, node.declarator->dimensions));
             set_from_token(node.declarator->name, "argument", detail);
         }
 
@@ -751,7 +981,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                         node.prototype->portList ? node.prototype->portList->toString() : "";
                     doc = "```\ntask " + name + format_ports_doc(ports) + "\n```";
                 } else {
-                    auto return_type = trim_copy(node.prototype->returnType->toString());
+                    auto return_type = render_hover_syntax_text(sm, *node.prototype->returnType);
                     auto ports =
                         node.prototype->portList ? node.prototype->portList->toString() : "";
                     doc = "```\nfunction " + return_type + " " + name + format_ports_doc(ports) +
@@ -772,7 +1002,9 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
-            set_from_token(node.name, "typedef", trim_copy(node.type->toString()));
+            set_from_token(node.name, "typedef", render_hover_syntax_text(sm, *node.type));
+            if (!result)
+                visitDefault(node);
         }
     };
 
