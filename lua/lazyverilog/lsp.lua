@@ -168,14 +168,14 @@ local function _default_on_attach(client, bufnr)
 	end
 end
 
-local function start_lsp(cfg, cmd)
+local function start_lsp(cfg, cmd, bufnr)
 	local ok, err = validate_cmd(cmd)
 	if not ok then
 		vim.notify("[LazyVerilog] Invalid cmd: " .. err, vim.log.levels.ERROR)
 		return
 	end
 
-	local bufnr          = vim.api.nvim_get_current_buf()
+	bufnr                = bufnr or vim.api.nvim_get_current_buf()
 	local root           = find_root(bufnr, cfg.root_markers)
 
 	-- Wrap user on_attach with our defaults
@@ -224,6 +224,8 @@ local function start_lsp(cfg, cmd)
 		flags        = {
 			debounce_text_changes = 150,
 		},
+	}, {
+		bufnr = bufnr,
 	})
 end
 
@@ -231,14 +233,14 @@ end
 -- Public API
 -- ---------------------------------------------------------------------------
 
-function M.start(cfg)
+function M.start(cfg, bufnr)
 	local cmd = resolve_cmd(cfg)
 
 	if cmd then
-		start_lsp(cfg, cmd)
+		start_lsp(cfg, cmd, bufnr)
 	else
 		_auto_install(function(bin_path)
-			start_lsp(cfg, { bin_path }) -- guaranteed flat
+			start_lsp(cfg, { bin_path }, bufnr) -- guaranteed flat
 		end)
 	end
 end

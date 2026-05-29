@@ -186,6 +186,69 @@ end
 function M.setup(user_config)
 	_cfg = config.resolve(user_config)
 
+	-- A user may install LazyVerilog as an ft-lazy plugin:
+	--
+	--   {
+	--     "hxxdev/lazyverilog",
+	--     ft = { "systemverilog", "verilog" },
+	--     config = function() require("lazyverilog").setup() end,
+	--   }
+	--
+	-- In that setup, lazy.nvim loads this module *because* the current buffer's
+	-- FileType event already fired.  Therefore it is not enough to only register
+	-- a future FileType autocmd below; setup() must also attach the LSP to any
+	-- already-open matching buffers.  Keep the extension mapping here as well so
+	-- a clean Neovim profile that has no SystemVerilog filetype rules still gets
+	-- a usable filetype before the LazyVerilog autocmds run.
+	vim.filetype.add({
+		extension = {
+			sv  = "systemverilog",
+			svh = "systemverilog",
+			v   = "verilog",
+			vh  = "verilog",
+		},
+	})
+
+	local function is_lazyverilog_filetype(ft)
+		for _, configured in ipairs(_cfg.filetypes or {}) do
+			if ft == configured then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function start_for_buffer(bufnr)
+		if not vim.api.nvim_buf_is_valid(bufnr) then
+			return
+		end
+		if not vim.api.nvim_buf_is_loaded(bufnr) then
+			return
+		end
+		local name = vim.api.nvim_buf_get_name(bufnr)
+		if name == "" then
+			return
+		end
+
+		-- If setup() runs before filetype detection has populated the buffer, ask
+		-- Neovim to detect it now from the filename.  Passing the filename is more
+		-- reliable than passing only the buffer in a minimal clean profile where
+		-- normal filetype detection has not run yet.
+		if vim.bo[bufnr].filetype == "" then
+			local detected = vim.filetype.match({ filename = name, buf = bufnr })
+			if detected then
+				vim.bo[bufnr].filetype = detected
+			end
+		end
+
+		if not is_lazyverilog_filetype(vim.bo[bufnr].filetype) then
+			return
+		end
+		if not vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })[1] then
+			lsp.start(_cfg, bufnr)
+		end
+	end
+
 	-- Register an autocommand that starts the server when a SV/V file is opened.
 	vim.api.nvim_create_augroup("LazyVerilog", { clear = true })
 	vim.api.nvim_create_autocmd("FileType", {
@@ -196,12 +259,29 @@ function M.setup(user_config)
 			-- name and root_dir, and attaches it to the current buffer.  We must call
 			-- it for EVERY matching buffer so that files opened later (e.g. via netrw)
 			-- also get didOpen / didChange / didSave events sent to the server.
-			if not vim.lsp.get_clients({ bufnr = ev.buf, name = "lazyverilog" })[1] then
-				lsp.start(_cfg)
-			end
+			start_for_buffer(ev.buf)
 		end,
 		desc     = "Start lazyverilog LSP server",
 	})
+
+	vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile", "BufWinEnter" }, {
+		group    = "LazyVerilog",
+		pattern  = { "*.sv", "*.svh", "*.v", "*.vh" },
+		callback = function(ev)
+			-- A completely clean Neovim profile may not have filetype detection turned
+			-- on yet.  Start from the filename as a fallback so release smoke tests and
+			-- minimal user configs still attach the LSP.
+			start_for_buffer(ev.buf)
+		end,
+		desc     = "Start lazyverilog LSP server for SV/V filenames",
+	})
+
+	-- Attach immediately to buffers whose FileType event already fired before this
+	-- plugin was loaded.  This is the normal path when lazy.nvim loads the plugin
+	-- from an `ft = ...` specification.
+	for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+		start_for_buffer(bufnr)
+	end
 
 	-- Ask lazyverilog to format before saving.  The server decides whether to
 	-- return edits based on [format].enable_format_on_save in lazyverilog.toml.
@@ -509,7 +589,7 @@ local function _rtltree_request(source_buf, command, retries)
 
 	if not client then
 		if retries > 0 then
-			if _cfg then lsp.start(_cfg) end
+			if _cfg then lsp.start(_cfg, bufnr) end
 			vim.defer_fn(function()
 				_rtltree_request(source_buf, command, retries - 1)
 			end, 500)
@@ -1053,7 +1133,7 @@ _interface_request = function(bufnr, uri, inst1_name, inst2_name, retries)
 	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
-			if _cfg then lsp.start(_cfg) end
+			if _cfg then lsp.start(_cfg, bufnr) end
 			vim.defer_fn(function()
 				_interface_request(bufnr, uri, inst1_name, inst2_name, retries - 1)
 			end, 500)
@@ -1293,7 +1373,7 @@ _single_interface_request = function(bufnr, uri, inst_name, retries)
 	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
-			if _cfg then lsp.start(_cfg) end
+			if _cfg then lsp.start(_cfg, bufnr) end
 			vim.defer_fn(function()
 				_single_interface_request(bufnr, uri, inst_name, retries - 1)
 			end, 500)
@@ -1339,7 +1419,7 @@ local function _autowire_request(bufnr, command, label, retries, line, callback)
 	local clients = vim.lsp.get_clients({ bufnr = bufnr, name = "lazyverilog" })
 	if #clients == 0 then
 		if retries > 0 then
-			if _cfg then lsp.start(_cfg) end
+			if _cfg then lsp.start(_cfg, bufnr) end
 			vim.defer_fn(function()
 				_autowire_request(bufnr, command, label, retries - 1, line, callback)
 			end, 500)
@@ -1633,7 +1713,7 @@ function M.connect(module1, module2)
 		local client = vim.tbl_filter(function(c) return c.name == "lazyverilog" end, clients)[1]
 		if not client then
 			if retries > 0 then
-				if _cfg then lsp.start(_cfg) end
+				if _cfg then lsp.start(_cfg, bufnr) end
 				vim.defer_fn(function() _try_connect(retries - 1) end, 500)
 			else
 				vim.notify("[LazyVerilog] no LSP client attached", vim.log.levels.WARN)
