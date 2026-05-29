@@ -6,6 +6,8 @@
 #include <string_view>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Lexer.h>
+#include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxKind.h>
 #include <slang/text/SourceManager.h>
 #include <slang/util/BumpAllocator.h>
 
@@ -91,6 +93,10 @@ private:
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
+<<<<<<< HEAD
+=======
+
+>>>>>>> fdf6ad2 (rewrite formatter)
     int line_{0};
     int col_{0};
     int pending_spaces_{0};
