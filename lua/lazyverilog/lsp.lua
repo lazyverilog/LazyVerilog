@@ -47,10 +47,43 @@ end
 -- Auto install
 -- ---------------------------------------------------------------------------
 
+-- Several startup events can try to start the LSP at almost the same time:
+-- setup() scans existing buffers, BufReadPost / BufWinEnter may fire, and a
+-- FileType event may also arrive.  Before the server binary exists, each of
+-- those paths would otherwise conclude "no LSP client is attached" and launch
+-- its own curl process.  Keep auto-install as a single-flight operation: the
+-- first caller starts the download, later callers enqueue callbacks and reuse
+-- the same installed binary when it finishes.
+local install_in_progress = false
+local install_waiters = {}
+
+local function _flush_install_waiters(bin_path)
+	local waiters = install_waiters
+	install_waiters = {}
+	for _, waiter in ipairs(waiters) do
+		waiter(bin_path)
+	end
+end
+
+local function _fail_install_waiters(message)
+	install_in_progress = false
+	install_waiters = {}
+	vim.schedule(function()
+		vim.notify(message, vim.log.levels.ERROR)
+	end)
+end
+
 local function _auto_install(on_done)
+	table.insert(install_waiters, on_done)
+
+	if install_in_progress then
+		return
+	end
+	install_in_progress = true
+
 	local platform = _platform()
 	if not platform then
-		vim.notify("[LazyVerilog] unsupported platform", vim.log.levels.ERROR)
+		_fail_install_waiters("[LazyVerilog] unsupported platform")
 		return
 	end
 
@@ -63,23 +96,22 @@ local function _auto_install(on_done)
 	vim.notify("[LazyVerilog] downloading server binary…", vim.log.levels.INFO)
 	vim.system({ "curl", "-fsSL", "-o", bin_path, url }, {}, function(dl)
 		if dl.code ~= 0 then
-			vim.schedule(function()
-				vim.notify(
-					"[LazyVerilog] download failed: " .. (dl.stderr or "unknown error"),
-					vim.log.levels.ERROR
-				)
-			end)
+			_fail_install_waiters(
+				"[LazyVerilog] download failed: " .. (dl.stderr or "unknown error")
+			)
 			return
 		end
 
 		vim.system({ "chmod", "+x", bin_path }, {}, function(ch)
+			if ch.code ~= 0 then
+				_fail_install_waiters("[LazyVerilog] chmod +x failed")
+				return
+			end
+
+			install_in_progress = false
 			vim.schedule(function()
-				if ch.code ~= 0 then
-					vim.notify("[LazyVerilog] chmod +x failed", vim.log.levels.ERROR)
-					return
-				end
 				vim.notify("[LazyVerilog] server installed", vim.log.levels.INFO)
-				on_done(bin_path)
+				_flush_install_waiters(bin_path)
 			end)
 		end)
 	end)
