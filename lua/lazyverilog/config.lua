@@ -1,4 +1,4 @@
---- Default configuration for LazyVerilogPy.
+--- Default configuration for LazyVerilog.
 --- Users override these via require('lazyverilog').setup({ … })
 
 local M = {}
@@ -17,7 +17,7 @@ M.defaults = {
 	-- Root directory markers used to detect the project root.
 	root_markers = { ".git", "lazyverilog.toml" },
 
-	-- Formatting options forwarded to the Python server.
+	-- Formatting options forwarded to the LazyVerilog server.
 	-- All fields are optional; unset fields use server defaults.
 	format = {
 		-- indent_size          = 4,

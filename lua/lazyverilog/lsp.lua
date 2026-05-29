@@ -1,9 +1,9 @@
--- LSP client setup — starts the Python server and attaches it to buffers.
+-- LSP client setup — starts the LazyVerilog server and attaches it to buffers.
 
 local M = {}
 
 local RELEASE_VERSION = require("lazyverilog.version")
-local RELEASE_BASE_URL = "https://github.com/hxxdev/LazyVerilogPy/releases/download"
+local RELEASE_BASE_URL = "https://github.com/hxxdev/LazyVerilog/releases/download"
 
 -- ---------------------------------------------------------------------------
 -- Binary helpers
@@ -50,7 +50,7 @@ end
 local function _auto_install(on_done)
 	local platform = _platform()
 	if not platform then
-		vim.notify("[LazyVerilogPy] unsupported platform", vim.log.levels.ERROR)
+		vim.notify("[LazyVerilog] unsupported platform", vim.log.levels.ERROR)
 		return
 	end
 
@@ -60,12 +60,12 @@ local function _auto_install(on_done)
 	local url      = RELEASE_BASE_URL .. "/" .. RELEASE_VERSION .. "/" .. asset
 
 	vim.fn.mkdir(bin_dir, "p")
-	vim.notify("[LazyVerilogPy] downloading server binary…", vim.log.levels.INFO)
+	vim.notify("[LazyVerilog] downloading server binary…", vim.log.levels.INFO)
 	vim.system({ "curl", "-fsSL", "-o", bin_path, url }, {}, function(dl)
 		if dl.code ~= 0 then
 			vim.schedule(function()
 				vim.notify(
-					"[LazyVerilogPy] download failed: " .. (dl.stderr or "unknown error"),
+					"[LazyVerilog] download failed: " .. (dl.stderr or "unknown error"),
 					vim.log.levels.ERROR
 				)
 			end)
@@ -75,10 +75,10 @@ local function _auto_install(on_done)
 		vim.system({ "chmod", "+x", bin_path }, {}, function(ch)
 			vim.schedule(function()
 				if ch.code ~= 0 then
-					vim.notify("[LazyVerilogPy] chmod +x failed", vim.log.levels.ERROR)
+					vim.notify("[LazyVerilog] chmod +x failed", vim.log.levels.ERROR)
 					return
 				end
-				vim.notify("[LazyVerilogPy] server installed", vim.log.levels.INFO)
+				vim.notify("[LazyVerilog] server installed", vim.log.levels.INFO)
 				on_done(bin_path)
 			end)
 		end)
@@ -171,7 +171,7 @@ end
 local function start_lsp(cfg, cmd)
 	local ok, err = validate_cmd(cmd)
 	if not ok then
-		vim.notify("[LazyVerilogPy] Invalid cmd: " .. err, vim.log.levels.ERROR)
+		vim.notify("[LazyVerilog] Invalid cmd: " .. err, vim.log.levels.ERROR)
 		return
 	end
 

@@ -78,6 +78,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(LspCpp)
 
+# LspCpp vendors network-uri and enables -Werror inside that third-party
+# project.  GCC's optimized Release builds can emit a false-positive
+# -Wmaybe-uninitialized warning in network::detail::uri_part::empty() after
+# inlining optional<uri_part> code.  Because the warning originates in vendored
+# code, keep LazyVerilog warnings strict but prevent this dependency from
+# turning that diagnostic into a release-build failure.  Place this after
+# FetchContent_MakeAvailable(LspCpp) so the vendored target already exists.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND TARGET network-uri)
+    target_compile_options(network-uri PRIVATE -Wno-error=maybe-uninitialized)
+endif()
+
 # Patch: LspCpp's lsServerCapabilities MAKE_REFLECT_STRUCT omits inlayHintProvider,
 # so the field is never serialized in the initialize response and clients never see
 # the capability. Apply an idempotent string replacement after every cmake run.
