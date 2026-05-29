@@ -51,6 +51,32 @@ ctest --test-dir build                          # all tests
 - Config loaded from `lazyverilog.toml`, walked up from the opened file's directory
 - JSON-RPC over stdin/stdout
 
+### Formatter Pass Ownership and Idempotency
+- Formatter flow is: lexer lexes source into Tokenflow, then `SyntaxPass`,
+  `MacroPass`, `WrapPass`, `IndentPass`, `AlignPass`, `CommentPass`,
+  `SpacingPass`, `BlankLinePass`, then rendering.
+- Token data is split into immutable facts and mutable formatting metadata.
+- Each pass has exclusive write ownership of its metadata family:
+  - `SyntaxPass` writes `ImmutableData`
+  - `MacroPass` writes `MacroMetadata`
+  - `WrapPass` writes `WrapMetadata`
+  - `IndentPass` writes `IndentMetadata`
+  - `AlignPass` writes `AlignMetadata`
+  - `CommentPass` writes `CommentMetadata`
+  - `SpacingPass` writes `SpaceMetadata`
+  - `BlankLinePass` writes `BlankLineMetadata`
+- Prevent non-idempotency:
+  - Prefer `slang::parsing::TokenKind` facts from the lexer.
+  - Do not use regex, string search, or string comparison for syntax decisions
+    when a `TokenKind`-based check is available.
+  - Do not write formatter pass logic that depends on how the original source
+    looked. Referencing `input_trivia` inside a pass is not desired because it
+    can make formatting depend on pre-format whitespace.
+  - Exception: comment role classification may reference original source
+    positioning. This is unavoidable for distinguishing own-line comments from
+    trailing comments, and must be handled carefully so it does not create
+    non-idempotent formatting behavior.
+
 ## Dependencies
 
 ### External
