@@ -130,8 +130,11 @@ TEST_CASE("formatter: pp conditional function call formats all argument segments
           "                .lsb_pos(4),\n"
           "                .access(\"RO\"),\n"
           "                .volatile(0),\n"
+          "`ifdef USE_DMI_INTERFACE\n"
           "                .reset(32'h10),\n"
+          "`else\n"
           "                .reset(32'h07),\n"
+          "`endif\n"
           "                .has_reset(1),\n"
           "                .is_rand(1));\n");
 }
@@ -3028,7 +3031,8 @@ TEST_CASE("formatter: memory_top regression function-call wrapping boundaries", 
 
     std::string pp_fmt = format_source(
         "module top;\ninitial begin\nadd_number(\n`ifdef HI\n.a(a3),\n`endif\n.b(b), .result(result));\nend\nendmodule\n", opts);
-    CHECK(pp_fmt.find("`ifdef") == std::string::npos);
+    CHECK(pp_fmt.find("`ifdef HI") != std::string::npos);
+    CHECK(pp_fmt.find("`endif") != std::string::npos);
     CHECK(pp_fmt.find(".a(a3),") != std::string::npos);
 
     std::string present_fmt = format_source(
@@ -3082,4 +3086,77 @@ TEST_CASE("formatter: memory_top regression inv ports and assigns", "[formatter]
     CHECK(fmt.find("input     fifo_entry_t [3:0]     i_a") != std::string::npos);
     CHECK(fmt.find("assign i_d        = ~i_a;") != std::string::npos);
     CHECK(fmt.find("assign i_e        = i_a;") != std::string::npos);
+}
+
+TEST_CASE("formatter: preserves EOF trailing endmodule comments", "[formatter][safe_mode]") {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string src = "module top;\nendmodule  // top\n";
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == "module top;\nendmodule // top\n");
+}
+
+TEST_CASE("formatter: preserves slang-split based literal chunks", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string src =
+        "module top;\n"
+        "assign a = 12'h7c4;\n"
+        "assign b = 8'hff;\n"
+        "assign c = 32'hdead_beef;\n"
+        "assign d = 4'b10xz;\n"
+        "assign e = 16'd1234;\n"
+        "assign f = 'h7c4;\n"
+        "assign g = 12'h7_c4;\n"
+        "endmodule\n";
+
+    CHECK(format_source(src, opts) ==
+          "module top;\n"
+          "assign a = 12'h7c4;\n"
+          "assign b = 8'hff;\n"
+          "assign c = 32'hdead_beef;\n"
+          "assign d = 4'b10xz;\n"
+          "assign e = 16'd1234;\n"
+          "assign f = 'h7c4;\n"
+          "assign g = 12'h7_c4;\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter: named generate block instantiation keeps pp conditionals", "[formatter]" ) {
+    FormatOptions opts;
+    opts.safe_mode = true;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 10;
+    opts.instance.instance_port_between_paren_width = 10;
+
+    const std::string src =
+        "module top;\n"
+        "for (genvar i = 0; i < N; i++) begin : gen_pwm_if_conn\n"
+        "pwm_if pwm_if(\n"
+        "`ifdef GATE_LEVEL\n"
+        ".clk(0),\n"
+        ".rst_n(1),\n"
+        "`else\n"
+        ".clk(clk_aon),\n"
+        ".rst_n(rst_n),\n"
+        "`endif\n"
+        ".start_cntr(clr_phase_cntr),\n"
+        ".pwm(pwm)\n"
+        ");\n"
+        "end\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("pwm_if pwm_if (") != std::string::npos);
+    CHECK(formatted.find("`ifdef GATE_LEVEL") != std::string::npos);
+    CHECK(formatted.find("`else") != std::string::npos);
+    CHECK(formatted.find("`endif") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
 }
