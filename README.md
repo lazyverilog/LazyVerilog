@@ -152,12 +152,7 @@ require("lazyverilog").setup()
 
 -- Use a local build explicitly.
 require("lazyverilog").setup({
-  cmd = "/home/me/src/lazyverilog/build/lazyverilog-lsp",
-})
-
--- Use a full command array.
-require("lazyverilog").setup({
-  cmd = { "/home/me/bin/lazyverilog-lsp" },
+  cmd = "/path/to/lazyverilog-lsp",
 })
 ```
 
