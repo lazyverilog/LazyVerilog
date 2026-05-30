@@ -17,5 +17,7 @@ struct AutoargResult {
 std::optional<AutoargResult> autoarg_impl(
     const DocumentState& state, int line, int col);
 
+std::vector<AutoargResult> autoarg_all_modules(const DocumentState& state);
+
 std::string format_autoarg(
     const AutoargResult& result, const AutoargOptions& options, const FormatOptions& format_options);

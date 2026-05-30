@@ -665,15 +665,34 @@ void LazyVerilogServer::register_handlers() {
         td_formatting::response rsp;
         rsp.id = req.id;
         try {
-            if (config_.format.enable_format_on_save) {
-                const auto& uri = req.params.textDocument.uri.raw_uri_;
-                auto state = analyzer_.get_state(uri);
-                if (state) {
-                    std::string formatted = format_source(state->text, config_.format);
-                    if (formatted != state->text) {
-                        rsp.result.push_back(whole_document_edit(state->text, formatted));
+            const auto& uri = req.params.textDocument.uri.raw_uri_;
+            auto state = analyzer_.get_state(uri);
+            if (state) {
+                std::string text = state->text;
+
+                if (config_.autoarg.autoarg_on_save && state->tree) {
+                    auto results = autoarg_all_modules(*state);
+                    // apply back-to-front so earlier offsets stay valid
+                    std::sort(results.begin(), results.end(),
+                              [](const AutoargResult& a, const AutoargResult& b) {
+                                  return a.open_line > b.open_line;
+                              });
+                    for (const auto& result : results) {
+                        size_t line_start = lsp_offset(text, result.open_line, 0);
+                        size_t open = lsp_offset(text, result.open_line, result.open_col);
+                        std::string line_prefix = text.substr(line_start, open - line_start);
+                        std::string replacement =
+                            line_prefix + format_autoarg(result, config_.autoarg, config_.format);
+                        size_t end = lsp_offset(text, result.end_line, result.end_col);
+                        text.replace(line_start, end - line_start, replacement);
                     }
                 }
+
+                if (config_.format.enable_format_on_save)
+                    text = format_source(text, config_.format);
+
+                if (text != state->text)
+                    rsp.result.push_back(whole_document_edit(state->text, text));
             }
         } catch (const SafeModeError& e) {
             show_warning(e.what());
