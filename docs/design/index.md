@@ -15,10 +15,8 @@ define = ["RTL_SIM"]
 
 ## Filelist format
 
-One file path per line. Paths are relative to the filelist file's directory. Lines starting with `//` are comments.
-
+One file path per line. Paths are relative to `.f` file's directory.
 ```
-// filelist for the alu design
 rtl/m_alu.sv
 rtl/m_adder.sv
 rtl/m_multiplier.sv
