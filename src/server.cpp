@@ -173,14 +173,18 @@ static std::string workspace_edit_json(const std::string& uri, const lsTextEdit&
            "}},\"newText\":" + json_string(edit.newText) + "}]}}";
 }
 
-static std::string rtl_tree_json(const RtlTreeNode& node) {
-    std::string out = "{\"name\":" + json_string(node.name) +
-                      ",\"inst\":" + json_string(node.inst) +
-                      ",\"file\":" + json_string(node.file) + ",\"children\":[";
+static std::string rtl_tree_json(const RtlTreeNode& node, bool show_file,
+                                 bool show_instance_name) {
+    std::string out = "{\"name\":" + json_string(node.name);
+    if (show_instance_name)
+        out += ",\"inst\":" + json_string(node.inst);
+    if (show_file)
+        out += ",\"file\":" + json_string(node.file);
+    out += ",\"children\":[";
     for (size_t i = 0; i < node.children.size(); ++i) {
         if (i > 0)
             out += ",";
-        out += rtl_tree_json(node.children[i]);
+        out += rtl_tree_json(node.children[i], show_file, show_instance_name);
     }
     out += "]";
     if (node.recursive)
@@ -1029,12 +1033,12 @@ void LazyVerilogServer::register_handlers() {
             } else if (cmd == "lazyverilog.rtlTree") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree), lsp::Any::kObjectType);
+                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.rtlTreeReverse") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree), lsp::Any::kObjectType);
+                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);
