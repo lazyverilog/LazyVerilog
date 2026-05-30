@@ -161,39 +161,19 @@ require("lazyverilog").setup({
 })
 ```
 
-### 📥 Manual binary installation
-
-Download `lazyverilog-lsp` from <a href="https://github.com/hxxdev/LazyVerilog/releases">GitHub Releases</a>, make it executable, and place it on `$PATH`:
-
-```bash
-chmod +x lazyverilog-lsp
-mkdir -p ~/.local/bin
-mv lazyverilog-lsp ~/.local/bin/
-```
-
-Confirm your editor can find it:
-
-```bash
-lazyverilog-lsp
-```
-
-### 🧱 From source
-
-```bash
-cmake -B build
-cmake --build build -j$(nproc)
-./build/lazyverilog-lsp
-```
-
-&nbsp;
-
 ## 🏗️ Build
 
 ### ✅ Requirements
 
 - CMake
 - C++20-capable compiler
-- Git
+
+### 🧱 How to build
+
+```bash
+cmake -B build
+cmake --build build -j$(nproc) --target lazyverilog-lsp
+```
 
 ## ⚙️ Configuration
 
@@ -223,10 +203,31 @@ enable = true
 ## 📚 Documentation
 
 - [`lazyverilog.toml`](lazyverilog.toml) — complete example configuration.
+- [`docs/features.md`](docs/features.md) — all features at a glance.
+
+**Project**
+- [`docs/design/index.md`](docs/design/index.md) — design filelist and preprocessor defines.
+
+**LSP & Editor**
+- [`docs/lsp/index.md`](docs/lsp/index.md) — hover, definition, references, rename, completion, signature help, inlay hints, workspace symbols.
+
+**Formatter**
 - [`docs/formatter/options.md`](docs/formatter/options.md) — formatter options.
 - [`docs/formatter/macros.md`](docs/formatter/macros.md) — macro formatting policy.
-- [`docs/linter/options.md`](docs/linter/options.md) — linter options.
+
+**Linter**
+- [`docs/linter/options.md`](docs/linter/options.md) — linter options with RTL examples.
+
+**Semantic Diagnostics**
 - [`docs/diagnostics/background-compilation.md`](docs/diagnostics/background-compilation.md) — background semantic diagnostics.
+
+**Auto Features**
+- [`docs/autoarg/index.md`](docs/autoarg/index.md) — generate non-ANSI module port list.
+- [`docs/autoinst/index.md`](docs/autoinst/index.md) — generate module instantiation port connections.
+- [`docs/autowire/index.md`](docs/autowire/index.md) — generate missing signal declarations.
+- [`docs/autofunc/index.md`](docs/autofunc/index.md) — generate function/task call arguments.
+- [`docs/autoff/index.md`](docs/autoff/index.md) — generate always_ff blocks for registers.
+- [`docs/rtl-tree/index.md`](docs/rtl-tree/index.md) — module instantiation hierarchy viewer.
 
 &nbsp;
 
