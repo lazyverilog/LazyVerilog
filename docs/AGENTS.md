@@ -19,6 +19,7 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 |-----------|---------|
 | `formatter/` | Formatter-specific docs (see `formatter/AGENTS.md`) |
 | `diagnostics/` | Diagnostics and background compilation docs (see `diagnostics/AGENTS.md`) |
+| `linter/` | Linter-specific docs (see `linter/AGENTS.md`) |
 
 ## For AI Agents
 

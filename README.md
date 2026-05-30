@@ -1,7 +1,7 @@
 <h1 align="center">⚡ LazyVerilog</h1>
 
 <p align="center">
-  <b>A fast, practical SystemVerilog LSP for everyday RTL editing.</b>
+  <b>A fast, practical SystemVerilog LSP for everyday RTL coding.</b>
 </p>
 
 <p align="center">
@@ -220,11 +220,12 @@ enable = true
 
 </details>
 
-### 📚 More docs
+## 📚 Documentation
 
 - [`lazyverilog.toml`](lazyverilog.toml) — complete example configuration.
 - [`docs/formatter/options.md`](docs/formatter/options.md) — formatter options.
 - [`docs/formatter/macros.md`](docs/formatter/macros.md) — macro formatting policy.
+- [`docs/linter/options.md`](docs/linter/options.md) — linter options.
 - [`docs/diagnostics/background-compilation.md`](docs/diagnostics/background-compilation.md) — background semantic diagnostics.
 
 &nbsp;
