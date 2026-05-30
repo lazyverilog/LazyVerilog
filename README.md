@@ -40,46 +40,61 @@
 
 ## 🎬 Demo
 
-<!-- TODO: add demo GIF. -->
+<details>
+<summary><b>🎨 Formatting</b></summary>
 
-&nbsp;
+<video src="demo/videos/%3AFormat.webm" width="100%" autoplay loop muted playsinline></video>
 
-## 🖼️ Screenshots
+</details>
 
-<table>
-  <tr>
-    <td><b>🎨 Formatting</b></td>
-    <td><b>🚨 Lint diagnostics</b></td>
-  </tr>
-  <tr>
-    <td><!-- TODO: add screenshot. --></td>
-    <td><!-- TODO: add screenshot. --></td>
-  </tr>
-  <tr>
-    <td><b>🌳 RTL tree</b></td>
-    <td><b>🧭 Go to definition / references / rename</b></td>
-  </tr>
-  <tr>
-    <td><!-- TODO: add screenshot. --></td>
-    <td><!-- TODO: add screenshot. --></td>
-  </tr>
-  <tr>
-    <td><b>🧩 Auto-instantiation</b></td>
-    <td><b>🔌 Auto-wire / connect helpers</b></td>
-  </tr>
-  <tr>
-    <td><!-- TODO: add screenshot. --></td>
-    <td><!-- TODO: add screenshot. --></td>
-  </tr>
-  <tr>
-    <td><b>💡 Inlay hints / completion / hover</b></td>
-    <td><b>🛠️ Code actions</b></td>
-  </tr>
-  <tr>
-    <td><!-- TODO: add screenshot. --></td>
-    <td><!-- TODO: add screenshot. --></td>
-  </tr>
-</table>
+<details>
+<summary><b>🚨 Lint diagnostics</b></summary>
+
+<!-- TODO -->
+
+</details>
+
+<details>
+<summary><b>🌳 RTL tree</b></summary>
+
+<video src="demo/videos/%3ARtlTree.webm" width="100%" autoplay loop muted playsinline></video>
+
+</details>
+
+<details>
+<summary><b>🧭 Go to definition</b></summary>
+
+<video src="demo/videos/GoToDef.webm" width="100%" autoplay loop muted playsinline></video>
+
+</details>
+
+<details>
+<summary><b>🧩 Auto-instantiation</b></summary>
+
+<video src="demo/videos/AutoInst.webm" width="100%" autoplay loop muted playsinline></video>
+
+</details>
+
+<details>
+<summary><b>🔌 Auto-wire</b></summary>
+
+<video src="demo/videos/AutoWire.webm" width="100%" autoplay loop muted playsinline></video>
+
+</details>
+
+<details>
+<summary><b>🛠️ Auto-arg</b></summary>
+
+<video src="demo/videos/AutoArg.webm" width="100%" autoplay loop muted playsinline></video>
+
+</details>
+
+<details>
+<summary><b>💡 Inlay hints / completion / hover</b></summary>
+
+<!-- TODO -->
+
+</details>
 
 &nbsp;
 
