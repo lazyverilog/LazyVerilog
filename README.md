@@ -157,32 +157,26 @@
 
 ## 📊 Feature matrix
 
-LazyVerilog is designed as a fast, feature-rich SystemVerilog LSP for day-to-day RTL editing.
-The table below is intentionally high-level: exact support can vary by editor setup, project configuration,
-and tool version.
+What LazyVerilog currently supports. Coverage varies by construct and project setup — if something
+doesn't work for your codebase, bug reports are welcome.
 
-| Capability | LazyVerilog | Verible | svls |
-|------------|-------------|---------|------|
-| Primary focus | Interactive RTL language server + automation | Formatter, linter, parser tooling | Lightweight SystemVerilog LSP |
-| Performance model | Fast native C++ LSP designed for editor responsiveness | Fast CLI tools, usually invoked per command or editor integration | Lightweight server |
-| SystemVerilog parsing | ✅ slang-based parsing | ✅ Native parser | ⚠️ Limited/varies by construct |
-| Formatting | ✅ Configurable formatter | ✅ Strong formatter | ❌/limited |
-| Lint diagnostics | ✅ Configurable RTL/style diagnostics | ✅ Strong lint rules | ⚠️ Limited |
-| Go to definition | ✅ | ⚠️ Not the main focus | ✅/limited |
-| Find references | ✅ | ⚠️ Not the main focus | ✅/limited |
-| Rename symbol | ✅ | ❌/limited | ❌/limited |
-| Hover / completion / signature help | ✅ | ❌/limited | ✅/limited |
-| Inlay hints | ✅ | ❌ | ❌/limited |
-| RTL tree | ✅ | ❌ | ❌ |
-| Auto-instantiation | ✅ | ❌ | ❌ |
-| Auto-wire | ✅ | ❌ | ❌ |
-| Auto-arg / auto-function / auto-FF helpers | ✅ | ❌ | ❌ |
-| Project-local config | ✅ `lazyverilog.toml` | ✅ config files / flags | ⚠️ Varies |
-| Neovim-first workflow | ✅ Companion plugin | ⚠️ Via external integrations | ✅ LSP integration |
-
-**Why choose LazyVerilog?** Use it when you want one fast editor-native tool that combines
-formatting, linting, semantic navigation, and practical RTL code generation helpers instead of stitching
-together several separate tools.
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Formatting | ✅ | Configurable via `lazyverilog.toml` |
+| Lint diagnostics | ✅ | Subset of slang diagnostics, configurable |
+| Go to definition | ✅ | Modules, ports, signals, parameters, macros |
+| Find references | ✅ | Within open project files |
+| Rename symbol | ✅ | Best-effort across project files |
+| Hover | ✅ | Types, ports, macros, module docs |
+| Completion | ⚠️ | Basic; not context-aware for all constructs |
+| Signature help | ✅ | Functions and tasks |
+| Inlay hints | ✅ | Port names on instantiation |
+| Workspace symbols | ✅ | Modules, functions, tasks |
+| RTL tree | ✅ | Module instantiation hierarchy |
+| Auto-instantiation | ✅ | |
+| Auto-wire | ✅ | |
+| Auto-arg / auto-function / auto-FF | ✅ | |
+| Project-local config | ✅ | `lazyverilog.toml` walked up from file |
 
 &nbsp;
 
