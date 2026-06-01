@@ -13,6 +13,14 @@ struct PortEntry {
     std::string name;
     std::string direction; // input/output/inout/ref
     std::string type;
+    // Complete datatype / net declaration prefix for command/UI metadata. This
+    // may include a net kind that `type` omits for display compatibility, for
+    // example `wire [5:0]` for `input wire [5:0] a`.
+    std::string decl_type;
+    // Datatype to use when synthesizing an internal bridge signal. This is
+    // derived from slang syntax facts, not from string inspection. Net ports
+    // become variables, for example `output wire [5:0] o` -> `logic [5:0] s`.
+    std::string signal_decl_type;
     int line{0}; // 1-based, 0 if unknown
     int col{0};  // 0-based
 };

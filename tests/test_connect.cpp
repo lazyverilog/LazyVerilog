@@ -76,3 +76,63 @@ endmodule
     CHECK(edit.find(".ready(ready2_w)") != std::string::npos);
     CHECK(edit.find("logic ready2_w;") != std::string::npos);
 }
+
+TEST_CASE("interface: declares complete net port types and preserves symbolic dimensions", "[connect][interface]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/interface_type_fixture.sv";
+    analyzer.open(uri, R"(
+`define BUS_W 6
+typedef struct packed { logic valid; } payload_t;
+module memory(input wire [5:0] i_data, output wire [5:0] o_data);
+endmodule
+module typed_source(output payload_t [`BUS_W-1:0] payload);
+endmodule
+module typed_sink(input payload_t [DEPTH-1:0] payload);
+endmodule
+module top;
+    memory u_mem2 (.i_data(), .o_data());
+    memory u_mem3 (.i_data(), .o_data());
+    typed_source u_src (.payload());
+    typed_sink u_dst (.payload());
+endmodule
+)");
+
+    const auto iface = interface_json(analyzer, uri, "u_mem2", "u_mem3");
+    CHECK(iface.find("\"type\":\"wire [5:0]\"") != std::string::npos);
+
+    const auto net_edit = interface_connect_edit_json(analyzer, uri, "u_mem2", "u_mem3",
+                                                      "o_data", "i_data", "data32", "wire [5:0]");
+    CHECK(net_edit.find("logic [5:0] data32;") != std::string::npos);
+
+    const auto reverse_order_edit = interface_connect_edit_json(analyzer, uri, "u_mem3", "u_mem2",
+                                                               "i_data", "o_data", "data33", "wire [5:0]");
+    CHECK(reverse_order_edit.find("logic [5:0] data33;") != std::string::npos);
+
+    const auto typed = interface_json(analyzer, uri, "u_src", "u_dst");
+    CHECK(typed.find("payload_t [`BUS_W-1:0]") != std::string::npos);
+    CHECK(typed.find("payload_t [DEPTH-1:0]") != std::string::npos);
+
+    const auto typed_edit = interface_connect_edit_json(analyzer, uri, "u_src", "u_dst",
+                                                        "payload", "payload", "payload_w",
+                                                        "payload_t [`BUS_W-1:0]");
+    CHECK(typed_edit.find("payload_t [`BUS_W-1:0] payload_w;") != std::string::npos);
+}
+
+TEST_CASE("interface: falls back when UI supplies only packed dimensions", "[connect][interface]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/interface_dimension_only_fixture.sv";
+    analyzer.open(uri, R"(
+module producer(output wire [WIDTH-1:0] data);
+endmodule
+module consumer(input wire [WIDTH-1:0] data);
+endmodule
+module top;
+    producer u_prod (.data());
+    consumer u_cons (.data());
+endmodule
+)");
+
+    const auto edit = interface_connect_edit_json(analyzer, uri, "u_prod", "u_cons",
+                                                  "data", "data", "data_w", "[WIDTH-1:0]");
+    CHECK(edit.find("logic [WIDTH-1:0] data_w;") != std::string::npos);
+}

@@ -205,6 +205,18 @@ static std::optional<PortEntry> port_on_module(const std::vector<FileView>& file
     return std::nullopt;
 }
 
+static std::string decl_type_for_port(const PortEntry& port) {
+    return port.decl_type.empty() ? port.type : port.decl_type;
+}
+
+static std::string signal_decl_type_for_port(const PortEntry& port) {
+    // This is precomputed by SyntaxIndex from slang syntax node kinds.  Do not
+    // infer net-vs-variable from textual prefixes here: `wire`, dimensions,
+    // typedef names, and macros are source text, while the choice to generate a
+    // variable bridge signal is a syntax fact.
+    return port.signal_decl_type.empty() ? decl_type_for_port(port) : port.signal_decl_type;
+}
+
 static std::optional<NamedPortConn> connection_for(const InstanceEntry& inst,
                                                    const std::string& port_name) {
     for (const auto& conn : inst.connections) {
@@ -318,11 +330,21 @@ static std::string type_for_decl(std::string type) {
     type = trim(type);
     if (type.empty())
         return "logic";
-    // slang / Python can qualify typedefs as module.type. For declarations in
-    // the target module, keep only the type identifier portion.
-    const auto dot = type.find('.');
-    if (dot != std::string::npos)
-        type.erase(0, dot + 1);
+
+    // Be tolerant of older callers / cached UI rows that carried only a packed
+    // dimension (for example "[5:0]") instead of a complete declaration type.
+    // Emitting the raw dimension before the name is not valid SV: declarations
+    // need a data object kind or datatype first.  Keep arbitrary dimension text
+    // intact so parameterized and macro-based ranges survive:
+    //
+    //     [DEPTH-1:0]     -> logic [DEPTH-1:0]
+    //     [`WIDTH-1:0]    -> logic [`WIDTH-1:0]
+    if (!type.empty() && type.front() == '[')
+        return "logic " + type;
+
+    // Do not split or rewrite user-defined datatypes.  Package scopes and
+    // typedef names (my_pkg::payload_t, payload_t) and syntactic dimensions
+    // must remain exactly as indexed / supplied by the UI.
     return type;
 }
 
@@ -476,9 +498,9 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     if (!dp) { r.error = "port '" + dest_port + "' not found"; return r; }
     if (sp->direction != "output") { r.error = "port '" + source_port + "' is not an output port"; return r; }
     if (dp->direction != "input") { r.error = "port '" + dest_port + "' is not an input port"; return r; }
-    r.wire_type = sp->type.empty() ? "logic" : sp->type;
-    if (sp->type != dp->type)
-        r.warnings.push_back("type mismatch: source port '" + sp->type + "' vs dest port '" + dp->type + "' — using source type");
+    r.wire_type = signal_decl_type_for_port(*sp).empty() ? "logic" : signal_decl_type_for_port(*sp);
+    if (decl_type_for_port(*sp) != decl_type_for_port(*dp))
+        r.warnings.push_back("type mismatch: source port '" + decl_type_for_port(*sp) + "' vs dest port '" + decl_type_for_port(*dp) + "' — using source type");
     const std::string lca = lca_path(source_path, dest_path);
     if (lca.empty()) { r.error = "no common ancestor found"; return r; }
     const auto root_mod = lca.substr(lca.find_last_of('.') == std::string::npos ? 0 : lca.find_last_of('.') + 1);
@@ -554,7 +576,7 @@ static std::string module_ports_json(const ModuleEntry& module, bool type_key_st
             out += ",";
         const auto& p = module.ports[i];
         out += "{\"name\":" + q(p.name) + ",\"direction\":" + q(p.direction) +
-               (type_key_str ? ",\"type_str\":" : ",\"type\":") + q(p.type) + "}";
+               (type_key_str ? ",\"type_str\":" : ",\"type\":") + q(decl_type_for_port(p)) + "}";
     }
     out += "]";
     return out;
@@ -716,7 +738,7 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
                 auto pit = omod->port_by_name.find(c.port_name);
                 if (pit != omod->port_by_name.end()) {
                     dir = omod->ports[pit->second].direction;
-                    typ = omod->ports[pit->second].type;
+                    typ = decl_type_for_port(omod->ports[pit->second]);
                 }
             }
             others.emplace(c.signal_name, std::make_tuple(other.instance_name, c.port_name, dir, typ));
@@ -731,14 +753,14 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
         bool any = sig.empty() ? false : range.first != range.second;
         if (!any) {
             if (!first) out += ","; first = false;
-            out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(p.type) + ",\"port_dir\":" + q(p.direction) +
+            out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(decl_type_for_port(p)) + ",\"port_dir\":" + q(p.direction) +
                    ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_text(file.text, sig)) +
                    ",\"other_inst\":\"\",\"other_port\":\"\",\"other_dir\":\"\",\"other_type\":\"\"}";
         } else {
             for (auto it = range.first; it != range.second; ++it) {
                 const auto& [oi, op, od, ot] = it->second;
                 if (!first) out += ","; first = false;
-                out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(p.type) + ",\"port_dir\":" + q(p.direction) +
+                out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(decl_type_for_port(p)) + ",\"port_dir\":" + q(p.direction) +
                        ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_text(file.text, sig)) +
                        ",\"other_inst\":" + q(oi) + ",\"other_port\":" + q(op) + ",\"other_dir\":" + q(od) +
                        ",\"other_type\":" + q(ot) + "}";
@@ -761,10 +783,32 @@ std::string interface_connect_edit_json(const Analyzer& analyzer, const std::str
     auto b = find_current_file_instance(files, uri, inst2_name);
     if (!a || !b)
         return "null";
+
+    // The UI sends a wire_type string from the selected row, but the row can
+    // represent either side of the connection.  Declarations must follow the
+    // driving side, so derive the declaration datatype from the selected output
+    // port rather than trusting the caller-provided type.  If port metadata is
+    // unavailable, keep the caller type as a compatibility fallback.
+    std::string declaration_type = wire_type;
+    const auto* mod1 = find_module(files, a->second->module_name);
+    const auto* mod2 = find_module(files, b->second->module_name);
+    auto choose_output_type = [&](const ModuleEntry* module, const std::string& port_name) {
+        if (!module)
+            return;
+        const auto it = module->port_by_name.find(port_name);
+        if (it == module->port_by_name.end())
+            return;
+        const auto& port = module->ports[it->second];
+        if (port.direction == "output")
+            declaration_type = signal_decl_type_for_port(port);
+    };
+    choose_output_type(mod1, inst1_port);
+    choose_output_type(mod2, inst2_port);
+
     std::vector<TextEdit> edits;
     if (auto e = replace_or_add_connection(*a->first, *a->second, inst1_port, wire_name)) edits.push_back(*e);
     if (auto e = replace_or_add_connection(*b->first, *b->second, inst2_port, wire_name)) edits.push_back(*e);
-    if (auto e = add_wire_decl(*a->first, wire_name, wire_type)) edits.push_back(*e);
+    if (auto e = add_wire_decl(*a->first, wire_name, declaration_type)) edits.push_back(*e);
     return workspace_edit_json(edits);
 }
 

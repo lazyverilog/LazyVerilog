@@ -938,9 +938,19 @@ local function _interface_show(data, src_bufnr, uri)
 	local n_rows = #rows
 	local w_num  = math.max(2, #tostring(n_rows))
 
-	local w1t    = 1; local w1n = 1
-	local w2t    = 1; local w2n = 1
-	local w3t    = 1; local w3n = 1
+	-- Seed each width with the visible sub-header labels.  When two instances
+	-- have no shared connections, the middle signal column has no data rows, but
+	-- fmt_subhdr() still prints "type name" there.  Starting from width 1 made
+	-- col2_w smaller than its own header, so the row separators after the middle
+	-- column appeared shifted:
+	--
+	--     | type name |   -- header uses 9 cells
+	--     |     |        -- data column was only 3 cells
+	--
+	-- Keep all three columns at least as wide as their displayed headers.
+	local w1t    = #"type"; local w1n = #"name"
+	local w2t    = #"type"; local w2n = #"name"
+	local w3t    = #"type"; local w3n = #"name"
 
 	for _, r in ipairs(rows) do
 		if #r.c1t > w1t then w1t = #r.c1t end

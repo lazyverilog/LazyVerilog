@@ -5,6 +5,10 @@ implementation of LazyVerilog.
 
 ## Files
 
+- [Features](features.md): index of user-visible features.
+- [Connect](connect.md): interactive instance-to-instance wiring.
+- [Interface](interface.md): two-instance and single-instance interface views.
+- [Disconnect](disconnect.md): clearing Interface connections.
 - `format-options.md`: formatter-related `lazyverilog.toml` options, including
   declaration alignment, spacing controls, instance formatting, and
   function/task-call formatting.
