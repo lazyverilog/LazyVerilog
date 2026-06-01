@@ -163,12 +163,12 @@ doesn't work for your codebase, bug reports are welcome.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Formatting | ✅ | Configurable via `lazyverilog.toml` |
-| Lint diagnostics | ✅ | Subset of slang diagnostics, configurable |
-| Go to definition | ✅ | Modules, ports, signals, parameters, macros |
-| Find references | ✅ | Within open project files |
+| Lint diagnostics | ✅ | Parse diagnostics, optional semantic diagnostics, and configurable lint/style rules |
+| Go to definition | ✅ | Modules, instances, ports, named arguments, symbols, and macros |
+| Find references | ✅ | Across open files and configured project files |
 | Rename symbol | ✅ | Best-effort across project files |
-| Hover | ✅ | Types, ports, macros, module docs |
-| Completion | ⚠️ | Basic; not context-aware for all constructs |
+| Hover | ✅ | Symbol details for modules, ports, signals, parameters, typedefs, subroutines, and macros |
+| Completion | ⚠️ | SV keywords plus current-file module and port names; not fully context-aware |
 | Signature help | ✅ | Functions and tasks |
 | Inlay hints | ✅ | Port names on instantiation |
 | Workspace symbols | ✅ | Modules, functions, tasks |
