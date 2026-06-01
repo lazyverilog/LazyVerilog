@@ -21,3 +21,8 @@ Notable difference from older examples:
 - The legacy name `align_instance_port_adaptive` is still accepted by the
   config loader for compatibility, but new configs should use
   `align_adaptive`.
+
+## Developer
+
+- [Build and tests](dev/test.md)
+- [Design filelist cache](dev/files.md)
