@@ -24,6 +24,8 @@
   ·
   <a href="#-why-lazyverilog">Why</a>
   ·
+  <a href="#-feature-matrix">Feature matrix</a>
+  ·
   <a href="#-installation">Installation</a>
   ·
   <a href="#-configuration">Configuration</a>
@@ -150,6 +152,37 @@
     <td>Project-local behavior through <code>lazyverilog.toml</code>.</td>
   </tr>
 </table>
+
+&nbsp;
+
+## 📊 Feature matrix
+
+LazyVerilog is designed as a fast, feature-rich SystemVerilog LSP for day-to-day RTL editing.
+The table below is intentionally high-level: exact support can vary by editor setup, project configuration,
+and tool version.
+
+| Capability | LazyVerilog | Verible | svls |
+|------------|-------------|---------|------|
+| Primary focus | Interactive RTL language server + automation | Formatter, linter, parser tooling | Lightweight SystemVerilog LSP |
+| Performance model | Fast native C++ LSP designed for editor responsiveness | Fast CLI tools, usually invoked per command or editor integration | Lightweight server |
+| SystemVerilog parsing | ✅ slang-based parsing | ✅ Native parser | ⚠️ Limited/varies by construct |
+| Formatting | ✅ Configurable formatter | ✅ Strong formatter | ❌/limited |
+| Lint diagnostics | ✅ Configurable RTL/style diagnostics | ✅ Strong lint rules | ⚠️ Limited |
+| Go to definition | ✅ | ⚠️ Not the main focus | ✅/limited |
+| Find references | ✅ | ⚠️ Not the main focus | ✅/limited |
+| Rename symbol | ✅ | ❌/limited | ❌/limited |
+| Hover / completion / signature help | ✅ | ❌/limited | ✅/limited |
+| Inlay hints | ✅ | ❌ | ❌/limited |
+| RTL tree | ✅ | ❌ | ❌ |
+| Auto-instantiation | ✅ | ❌ | ❌ |
+| Auto-wire | ✅ | ❌ | ❌ |
+| Auto-arg / auto-function / auto-FF helpers | ✅ | ❌ | ❌ |
+| Project-local config | ✅ `lazyverilog.toml` | ✅ config files / flags | ⚠️ Varies |
+| Neovim-first workflow | ✅ Companion plugin | ⚠️ Via external integrations | ✅ LSP integration |
+
+**Why choose LazyVerilog?** Use it when you want one fast editor-native tool that combines
+formatting, linting, semantic navigation, and practical RTL code generation helpers instead of stitching
+together several separate tools.
 
 &nbsp;
 
