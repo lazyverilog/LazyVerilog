@@ -10,6 +10,6 @@
 | [AutoInst](autoinst/index.md) | Generate module instantiation port connections |
 | [AutoWire](autowire/index.md) | Generate missing signal declarations |
 | [AutoFunc](autofunc/index.md) | Generate function/task call arguments |
-| [AutoFF](autoff/index.md) | Generate always_ff blocks for registers |
+| [AutoFF](autoff/index.md) | Insert reset/capture assignments into existing always_ff blocks |
 | [RTL Tree](rtl-tree/index.md) | Module instantiation hierarchy viewer |
 | [Design & Filelist](design/index.md) | Design index and preprocessor defines |

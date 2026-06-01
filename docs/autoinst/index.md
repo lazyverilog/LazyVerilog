@@ -17,8 +17,8 @@ m_fifo u_fifo (
 );
 ```
 
-Requires the instantiated module to be present in the design index (`design.vcode`).
+Requires the instantiated module definition to be available from the current file or the design filelist (`design.vcode`).
 
-Port connection style follows `[lint.module] module_instantiation_style`.
+AutoInst currently emits named `.port(signal)` connections.
 
 No dedicated configuration.

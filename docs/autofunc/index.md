@@ -20,9 +20,11 @@ clamp(val, limit)
 
 ```toml
 [autofunc]
+indent_size = 4
 use_named_arguments = true
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `indent_size` | int | `4` | Indentation used for multiline generated argument lists |
 | `use_named_arguments` | bool | `true` | Generate `.arg(value)` named style instead of positional |

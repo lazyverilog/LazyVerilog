@@ -144,7 +144,7 @@
   <tr>
     <td>⚙️</td>
     <td><b>RTL automation</b></td>
-    <td>Auto-arg, auto-function, auto-wire, auto-FF, auto-instantiation, connect/interface helpers.</td>
+    <td>Auto-arg, auto-function, auto-wire, auto-FF, and auto-instantiation.</td>
   </tr>
   <tr>
     <td>🧰</td>
@@ -168,10 +168,10 @@ doesn't work for your codebase, bug reports are welcome.
 | Find references | ✅ | Across open files and configured project files |
 | Rename symbol | ✅ | Best-effort across project files |
 | Hover | ✅ | Symbol details for modules, ports, signals, parameters, typedefs, subroutines, and macros |
-| Completion | ⚠️ | Very limited; Still working on it. |
+| Completion | ⚠️ | Fixed keywords plus current-file module/port names; not context-aware |
 | Signature help | ✅ | Functions and tasks |
 | Inlay hints | ✅ | Port names on instantiation |
-| Workspace symbols | ✅ | Modules, functions, tasks |
+| Workspace symbols | ✅ | Modules and classes from indexed design files |
 | RTL tree | ✅ | Module instantiation hierarchy |
 | Auto-instantiation | ✅ | |
 | Auto-wire | ✅ | |
@@ -262,7 +262,7 @@ enable = true
 - [`docs/lsp/index.md`](docs/lsp/index.md) — hover, definition, references, rename, completion, signature help, inlay hints, workspace symbols.
 
 **Formatter**
-- [`docs/formatter/usage.md`](docs/formatter/usage.md) — CLI usage and build instructions.
+- [`docs/formatter/cli.md`](docs/formatter/cli.md) — CLI usage and build instructions.
 - [`docs/formatter/options.md`](docs/formatter/options.md) — formatter options.
 - [`docs/formatter/macros.md`](docs/formatter/macros.md) — macro formatting policy.
 
@@ -277,7 +277,7 @@ enable = true
 - [`docs/autoinst/index.md`](docs/autoinst/index.md) — generate module instantiation port connections.
 - [`docs/autowire/index.md`](docs/autowire/index.md) — generate missing signal declarations.
 - [`docs/autofunc/index.md`](docs/autofunc/index.md) — generate function/task call arguments.
-- [`docs/autoff/index.md`](docs/autoff/index.md) — generate always_ff blocks for registers.
+- [`docs/autoff/index.md`](docs/autoff/index.md) — insert reset/capture assignments into existing always_ff blocks.
 - [`docs/rtl-tree/index.md`](docs/rtl-tree/index.md) — module instantiation hierarchy viewer.
 
 **For Developers**

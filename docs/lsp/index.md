@@ -48,9 +48,9 @@ No configuration.
 
 **LSP:** `textDocument/completion`
 
-**Trigger characters:** `.` `,`
+**Trigger characters:** `.` `$`
 
-Offers completions for SystemVerilog keywords, module names, and port names from the design index.
+Offers very limited completions: fixed SystemVerilog keywords plus module and port names indexed from the current file.
 
 No configuration.
 
@@ -72,7 +72,7 @@ No configuration.
 
 **LSP:** `workspace/symbol`
 
-Searches modules, interfaces, packages, and classes across the design library. Case-insensitive prefix matching.
+Searches modules and classes from indexed design files. Matching is case-insensitive substring matching.
 
 Requires the design index to be populated via `design.vcode`. See [design](../design/index.md).
 

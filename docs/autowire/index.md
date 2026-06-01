@@ -2,7 +2,7 @@
 
 **Commands:** `lazyverilog.autowire`, `lazyverilog.autowirepreview`
 
-Generates missing `logic` declarations for signals referenced in module instantiation port connections but not yet declared in the enclosing module.
+Generates missing `logic` declarations for undeclared signals in the enclosing module. It uses output/inout module-instantiation port connections, continuous-assignment left-hand sides, and `always_comb` assignment left-hand sides as declaration sources.
 
 ```systemverilog
 // instantiation references s_data and s_valid, but they are not declared
@@ -27,4 +27,4 @@ sort_by_name = true
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `group_by_instance` | bool | `false` | Group generated declarations by the instance they come from |
-| `sort_by_name` | bool | `true` | Sort generated declarations alphabetically |
+| `sort_by_name` | bool | `false` | Sort generated declarations alphabetically |

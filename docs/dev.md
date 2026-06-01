@@ -51,7 +51,7 @@ Run a single named test:
 | `test_inlay_hints.cpp` | `[inlay]` | Inlay hints — port coverage counts, per-port metadata, visible-range filtering, cross-file module resolution, non-ANSI ports |
 | `test_document_sync.cpp` | `[sync]` | Document sync — open/change/close lifecycle, incremental update, concurrent read safety |
 | `test_syntax_index.cpp` | `[index]` | Syntax index — module and port discovery, instantiation lookup |
-| `test_autoff.cpp` | `[autoff]` `[autowire]` | AutoFF stub; AutoWire — cached extra-file modules, scoping across multiple modules |
+| `test_autoff.cpp` | `[autoff]` `[autowire]` | AutoFF assignment insertion; AutoWire — cached extra-file modules, scoping across multiple modules |
 | `test_config.cpp` | `[config]` | Config parsing — defaults, unknown keys, all sections, malformed TOML, macro role conflict reporting |
 
 ---
