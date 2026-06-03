@@ -11,6 +11,7 @@
 #include <slang/syntax/SyntaxVisitor.h>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
@@ -321,6 +322,62 @@ static std::string infer_current_scope(const SyntaxIndex& index, int line) {
     return best;
 }
 
+static bool range_contains_offset(const slang::SourceRange& range, size_t offset) {
+    if (!range.start().valid() || !range.end().valid())
+        return false;
+    return range.start().offset() <= offset && offset <= range.end().offset();
+}
+
+static KeywordContextKind infer_keyword_context(const DocumentState& state, size_t offset) {
+    if (!state.tree)
+        return KeywordContextKind::General;
+
+    using namespace slang::syntax;
+
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        size_t offset;
+        KeywordContextKind result{KeywordContextKind::General};
+        size_t best_width{SIZE_MAX};
+
+        explicit Visitor(size_t offset) : offset(offset) {}
+
+        void consider(const SyntaxNode& node, KeywordContextKind kind) {
+            const auto range = node.sourceRange();
+            if (!range_contains_offset(range, offset))
+                return;
+            const size_t width = range.end().offset() - range.start().offset();
+            if (width <= best_width) {
+                best_width = width;
+                result = kind;
+            }
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            consider(node, KeywordContextKind::Class);
+            visitDefault(node);
+        }
+
+        void handle(const CovergroupDeclarationSyntax& node) {
+            consider(node, KeywordContextKind::Covergroup);
+            visitDefault(node);
+        }
+
+        void handle(const StatementSyntax& node) {
+            consider(node, KeywordContextKind::Procedural);
+            visitDefault(node);
+        }
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            consider(node, KeywordContextKind::ModuleItem);
+            visitDefault(node);
+        }
+    };
+
+    Visitor visitor(offset);
+    state.tree->root().visit(visitor);
+    return visitor.result;
+}
+
 static std::optional<std::string> type_of_value(const SyntaxIndex& index,
                                                  const std::string& scope,
                                                  const std::string& name) {
@@ -439,65 +496,70 @@ class KeywordProvider : public CompletionProvider {
                ctx.kind == CompletionContextKind::Unknown;
     }
 
-    std::vector<lsCompletionItem> provide(const CompletionContext& /*ctx*/,
+    std::vector<lsCompletionItem> provide(const CompletionContext& ctx,
                                            const SyntaxIndex& /*index*/,
                                            const CancellationToken& /*tok*/) const override {
         // clang-format off
-        static const char* kKeywords[] = {
-            // structural
-            "module","endmodule","interface","endinterface",
-            "package","endpackage","class","endclass",
-            "function","endfunction","task","endtask",
-            "covergroup","endgroup","property","endproperty",
-            "sequence","endsequence","clocking","endclocking",
-            "program","endprogram","primitive","endprimitive",
-            // port directions / types
-            "input","output","inout","ref",
-            "logic","wire","reg","bit","byte","shortint","int",
-            "longint","integer","real","realtime","time","shortreal",
-            "string","chandle","event","void",
-            "signed","unsigned","packed","unpacked",
-            // declarations
-            "assign","force","release",
-            "always_ff","always_comb","always_latch","always",
-            "initial","final",
-            "parameter","localparam","defparam",
-            "typedef","struct","union","enum",
-            "genvar","generate","endgenerate",
-            "import","export","automatic","static",
-            // OOP
-            "rand","randc","virtual","local","protected","extern",
-            "pure","extends","implements",
-            "new","null","this","super",
-            // procedural
-            "if","else","case","casez","casex","endcase",
-            "unique","unique0","priority",
-            "for","foreach","while","do","repeat","forever",
-            "return","break","continue","disable",
-            "begin","end","fork","join","join_any","join_none",
-            // event / clocking
-            "posedge","negedge","edge",
-            // constraints / coverage
-            "constraint","solve","before","inside","dist","with",
+        static const char* kGeneral[] = {
+            "module","interface","package","class","program","primitive",
+            "typedef","struct","union","enum","import",
+            "logic","wire","reg","bit","byte","shortint","int","longint",
+            "integer","real","realtime","time","shortreal","string","chandle",
+            "event","void","signed","unsigned","packed","unpacked",
+            nullptr
+        };
+        static const char* kModuleItem[] = {
+            "assign","always_comb","always_ff","always_latch","always",
+            "initial","final","generate","endgenerate","endmodule",
+            "function","task","typedef","class","covergroup","property",
+            "sequence","clocking","parameter","localparam","genvar",
+            "logic","wire","import","export",
+            nullptr
+        };
+        static const char* kProcedural[] = {
+            "if","else","case","casez","casex","endcase","unique","unique0",
+            "priority","for","foreach","while","do","repeat","forever",
+            "return","break","continue","disable","begin","end","fork",
+            "join","join_any","join_none","assert","assume","cover",
+            "wait","@(posedge","@(negedge",
+            "$display","$write","$finish","$stop","$fatal","$error",
+            "$warning","$info","$cast","$bits","$size","$signed","$unsigned",
+            nullptr
+        };
+        static const char* kClass[] = {
+            "function","task","constraint","covergroup","rand","randc",
+            "static","virtual","local","protected","extern","pure",
+            "typedef","class","extends","implements","new","this","super",
+            "endclass",
+            nullptr
+        };
+        static const char* kCovergroup[] = {
             "coverpoint","cross","bins","illegal_bins","ignore_bins",
-            "option","type_option",
-            // assertions
-            "assert","assume","cover","restrict",
-            // system tasks / functions (common)
-            "$display","$write","$writememh","$writememb",
-            "$readmemh","$readmemb",
-            "$finish","$stop","$fatal","$error","$warning","$info",
-            "$cast","$bits","$size","$left","$right",
-            "$high","$low","$increment",
-            "$signed","$unsigned","$isunknown","$onehot","$onehot0",
-            "$countones","$random","$urandom","$urandom_range",
-            "$realtime","$time","$stime",
+            "option","type_option","with","iff","endgroup",
             nullptr
         };
         // clang-format on
+        const char** keywords = kGeneral;
+        switch (ctx.keyword_context) {
+        case KeywordContextKind::ModuleItem:
+            keywords = kModuleItem;
+            break;
+        case KeywordContextKind::Procedural:
+            keywords = kProcedural;
+            break;
+        case KeywordContextKind::Class:
+            keywords = kClass;
+            break;
+        case KeywordContextKind::Covergroup:
+            keywords = kCovergroup;
+            break;
+        case KeywordContextKind::General:
+            keywords = kGeneral;
+            break;
+        }
         std::vector<lsCompletionItem> items;
-        for (int i = 0; kKeywords[i]; ++i)
-            items.push_back(make_item(kKeywords[i], lsCompletionItemKind::Keyword));
+        for (int i = 0; keywords[i]; ++i)
+            items.push_back(make_item(keywords[i], lsCompletionItemKind::Keyword));
         return items;
     }
 };
@@ -1069,6 +1131,7 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
 
     const size_t offset = position_to_offset(text, line, col);
     ctx.current_scope_name = infer_current_scope(index, line);
+    ctx.keyword_context = infer_keyword_context(state, offset);
 
     // Step 1: read the prefix (identifier chars already typed after trigger)
     size_t pos = offset;

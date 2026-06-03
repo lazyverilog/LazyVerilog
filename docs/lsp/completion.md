@@ -8,6 +8,28 @@ Context-aware completion for SystemVerilog. Suggestions vary by what the cursor 
 
 ## Contexts
 
+
+### Keywords
+
+Triggered in general identifier positions. Keyword suggestions are narrowed by the nearest enclosing SyntaxTree node:
+
+| SyntaxTree context | Example suggestions |
+|---|---|
+| module/interface item | `assign`, `always_comb`, `always_ff`, `initial`, `generate`, `endmodule` |
+| procedural statement/block | `if`, `case`, `for`, `foreach`, `while`, `return`, `break`, `continue`, `begin`, `end` |
+| class body | `function`, `task`, `constraint`, `covergroup`, `rand`, `randc`, `static`, `virtual`, `local`, `protected` |
+| covergroup body | `coverpoint`, `cross`, `bins`, `illegal_bins`, `ignore_bins`, `option`, `type_option` |
+
+```systemverilog
+module top;
+  always_comb begin
+    |  // procedural keywords
+  end
+endmodule
+```
+
+The context decision is SyntaxTree-based; raw source text scanning is not used to classify SystemVerilog keyword context.
+
 ### Named port connections
 
 Triggered by `.` inside a module instantiation argument list.

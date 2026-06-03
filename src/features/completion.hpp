@@ -24,12 +24,21 @@ enum class CompletionContextKind {
     Unknown,      // fallback — treated as Identifier
 };
 
+enum class KeywordContextKind {
+    General,
+    ModuleItem,
+    Procedural,
+    Class,
+    Covergroup,
+};
+
 struct CompletionContext {
     CompletionContextKind kind{CompletionContextKind::Unknown};
     std::string prefix;     // text already typed (for prefix/fuzzy matching)
     std::string scope_name; // LHS of . or :: (MemberAccess / PackageScope)
     std::string current_scope_name; // best-effort enclosing module/interface/package
     std::string expected_type; // best-effort RHS expected type, e.g. enum typedef on assignment
+    KeywordContextKind keyword_context{KeywordContextKind::General};
     int line{0};            // 0-based cursor line
     int col{0};             // 0-based cursor column
     // Port/parameter names already wired in the current instantiation (NamedPort / Parameter)

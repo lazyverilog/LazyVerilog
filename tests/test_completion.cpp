@@ -49,17 +49,62 @@ static CompletionList complete_at(CompletionEngine& engine, Analyzer& analyzer,
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-TEST_CASE("completion: keywords present in general identifier context", "[completion]") {
+TEST_CASE("completion: keywords present in module-item context", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
     const std::string uri = "file:///tmp/completion_kw.sv";
     analyzer.open(uri, "module top;\nendmodule\n");
 
-    // Cursor at start of line 0, column 0 — identifier context
+    auto result = complete_at(engine, analyzer, uri, 1, 0);
+    CHECK(has_label(result, "always_ff"));
+    CHECK(has_label(result, "assign"));
+    CHECK_FALSE(has_label(result, "break"));
+}
+
+TEST_CASE("completion: keywords present in general identifier context", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_kw_general.sv";
+    analyzer.open(uri, "");
+
     auto result = complete_at(engine, analyzer, uri, 0, 0);
     CHECK(has_label(result, "module"));
-    CHECK(has_label(result, "always_ff"));
-    CHECK(has_label(result, "input"));
+    CHECK(has_label(result, "interface"));
+    CHECK_FALSE(has_label(result, "assign"));
+}
+
+TEST_CASE("completion: keywords are context-aware", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_kw_context.sv";
+    const std::string text =
+        "module top;\n"
+        "    always_comb begin\n"
+        "        \n"
+        "    end\n"
+        "    class packet;\n"
+        "        \n"
+        "    endclass\n"
+        "    covergroup cg;\n"
+        "        \n"
+        "    endgroup\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto procedural = complete_at(engine, analyzer, uri, 2, 8);
+    CHECK(has_label(procedural, "if"));
+    CHECK(has_label(procedural, "case"));
+    CHECK_FALSE(has_label(procedural, "endmodule"));
+
+    auto cls = complete_at(engine, analyzer, uri, 5, 8);
+    CHECK(has_label(cls, "function"));
+    CHECK(has_label(cls, "constraint"));
+    CHECK_FALSE(has_label(cls, "assign"));
+
+    auto covergroup = complete_at(engine, analyzer, uri, 8, 8);
+    CHECK(has_label(covergroup, "coverpoint"));
+    CHECK(has_label(covergroup, "bins"));
+    CHECK_FALSE(has_label(covergroup, "assign"));
 }
 
 TEST_CASE("completion: module defined in same file appears as identifier", "[completion]") {

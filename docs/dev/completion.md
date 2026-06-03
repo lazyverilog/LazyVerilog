@@ -258,7 +258,7 @@ Maintains a static table of context → keyword list:
   "option", "type_option", ... }
 ```
 
-Context (module-level vs. procedural vs. class body) is determined by scanning backwards for the nearest enclosing block keyword (`module`, `class`, `always_*`, `function`, `task`, `covergroup`).
+Context (module item vs. procedural vs. class body vs. covergroup body) is determined by walking the parsed `slang::syntax::SyntaxTree` and selecting the smallest enclosing syntax node at the cursor. The implementation uses node types such as `ModuleDeclarationSyntax`, `StatementSyntax`, `ClassDeclarationSyntax`, and `CovergroupDeclarationSyntax`; it does not scan raw SystemVerilog text for block keywords.
 
 Returns `lsCompletionItemKind::Keyword`. No snippets — SnippetProvider handles those.
 
