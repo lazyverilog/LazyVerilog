@@ -1050,6 +1050,8 @@ class IdentifierProvider : public CompletionProvider {
 
         for (const auto& mac : index.macros) {
             if (tok.cancelled) throw CompletionCancelled{};
+            if (!ctx.visible_macros.count(mac.name))
+                continue;
             items.push_back(make_item("`" + mac.name,
                                        mac.is_function_like ? lsCompletionItemKind::Function
                                                             : lsCompletionItemKind::Constant));
@@ -1395,11 +1397,13 @@ class MacroProvider : public CompletionProvider {
         return ctx.kind == CompletionContextKind::Macro;
     }
 
-    std::vector<lsCompletionItem> provide(const CompletionContext& /*ctx*/,
+    std::vector<lsCompletionItem> provide(const CompletionContext& ctx,
                                            const SyntaxIndex& index,
                                            const CancellationToken& /*tok*/) const override {
         std::vector<lsCompletionItem> items;
         for (const auto& mac : index.macros) {
+            if (!ctx.visible_macros.count(mac.name))
+                continue;
             auto item = make_item(mac.name,
                                    mac.is_function_like ? lsCompletionItemKind::Function
                                                         : lsCompletionItemKind::Constant);
@@ -1769,6 +1773,8 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     } catch (...) {
         ctx.kind = CompletionContextKind::Identifier;
     }
+    for (const auto& mac : state.index.macros)
+        ctx.visible_macros.insert(mac.name);
 
     if (ctx.kind == CompletionContextKind::IncludeFile) {
         for (const auto& p : analyzer.extra_files()) {

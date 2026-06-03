@@ -43,6 +43,10 @@ struct CompletionContext {
     int col{0};             // 0-based cursor column
     // Port/parameter names already wired in the current instantiation (NamedPort / Parameter)
     std::unordered_set<std::string> connected_ports;
+    // Macro names visible from the current document's preprocessing context.
+    // Extra-file macros are intentionally not flattened into unrelated files;
+    // they appear here only when the current file itself defines/includes them.
+    std::unordered_set<std::string> visible_macros;
     // .svh/.vh paths from the design filelist (populated for IncludeFile context)
     std::vector<std::string> header_files;
 };

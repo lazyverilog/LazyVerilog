@@ -638,6 +638,34 @@ TEST_CASE("completion: Macro function-like gets snippet with params", "[completi
     CHECK(item->insertText->find("hi") != std::string::npos);
 }
 
+TEST_CASE("completion: macros from extra files do not leak into unrelated files", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto extra = std::filesystem::temp_directory_path() / "completion_extra_macro.sv";
+    {
+        std::ofstream out(extra);
+        REQUIRE(out.good());
+        out << "`define EXTRA_UVM_STYLE_MACRO 1\n"
+               "module extra_macro_owner;\n"
+               "endmodule\n";
+    }
+    analyzer.set_extra_files({extra.string()});
+
+    const std::string uri = "file:///tmp/completion_macro_no_leak.sv";
+    const std::string text =
+        "`define LOCAL_MACRO 1\n"
+        "module top;\n"
+        "    logic a = `\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 2, 15);
+
+    CHECK(has_label(result, "LOCAL_MACRO"));
+    CHECK_FALSE(has_label(result, "EXTRA_UVM_STYLE_MACRO"));
+}
+
 TEST_CASE("completion: PackageScope context returns package symbols", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
