@@ -204,6 +204,17 @@ TEST_CASE("definition: macro lookup uses cached extra files", "[definition]") {
     std::filesystem::remove(extra_path);
 }
 
+TEST_CASE("definition: slang built-in macro has no user-facing definition", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_builtin_macro_definition.sv";
+    analyzer.open(uri,
+                  "module top;\n"
+                  "    int value = `SV_COV_ERROR;\n"
+                  "endmodule\n");
+
+    CHECK_FALSE(analyzer.definition_of(uri, 1, 18).has_value());
+}
+
 TEST_CASE("definition: named subroutine argument lookup uses cached extra files", "[definition]") {
     Analyzer analyzer;
     const auto extra_path =

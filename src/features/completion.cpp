@@ -901,10 +901,23 @@ class KeywordProvider : public CompletionProvider {
     std::vector<lsCompletionItem> provide(const CompletionContext& ctx,
                                            const SyntaxIndex& /*index*/,
                                            const CancellationToken& /*tok*/) const override {
+        // Snippets must be context-aware just like keywords.  Editors usually
+        // render snippet labels in the same completion menu as keywords, so a
+        // context-insensitive snippet list makes class scope look as if it
+        // supports illegal module items:
+        //
+        //     class pkt;
+        //         |   // should suggest function/task/constraint-ish items,
+        //             // not always_comb / always_ff / generate.
+        //     endclass
+        //
+        // Keep the tables separate instead of filtering by string after the
+        // fact; this documents which structural templates are valid in each
+        // SyntaxTree-derived keyword context.
         // clang-format off
         static const char* kGeneral[] = {
             "module","interface","package","class","program","primitive",
-            "typedef","struct","union","enum","import",
+            "function","task","typedef","struct","union","enum","import",
             "logic","wire","reg","bit","byte","shortint","int","longint",
             "integer","real","realtime","time","shortreal","string","chandle",
             "event","void","signed","unsigned","packed","unpacked",
@@ -1491,7 +1504,7 @@ class SnippetProvider : public CompletionProvider {
                ctx.kind == CompletionContextKind::Unknown;
     }
 
-    std::vector<lsCompletionItem> provide(const CompletionContext& /*ctx*/,
+    std::vector<lsCompletionItem> provide(const CompletionContext& ctx,
                                            const SyntaxIndex& /*index*/,
                                            const CancellationToken& /*tok*/) const override {
         struct S {
@@ -1499,10 +1512,16 @@ class SnippetProvider : public CompletionProvider {
             const char* body;
         };
         // clang-format off
-        static const S kSnips[] = {
+        static const S kGeneralSnips[] = {
             {"module",       "module ${1:name} (\n    $0\n);\n\nendmodule"},
             {"interface",    "interface ${1:name} (\n    $0\n);\n\nendinterface"},
             {"package",      "package ${1:name};\n    $0\nendpackage"},
+            {"class",        "class ${1:name};\n    $0\nendclass"},
+            {"function",     "function ${1:void} ${2:name}($3);\n    $0\nendfunction"},
+            {"task",         "task ${1:name}($2);\n    $0\nendtask"},
+            {nullptr, nullptr}
+        };
+        static const S kModuleItemSnips[] = {
             {"class",        "class ${1:name};\n    $0\nendclass"},
             {"always_ff",    "always_ff @(posedge ${1:clk} or negedge ${2:rst_n}) begin\n    $0\nend"},
             {"always_comb",  "always_comb begin\n    $0\nend"},
@@ -1511,19 +1530,52 @@ class SnippetProvider : public CompletionProvider {
             {"task",         "task ${1:name}($2);\n    $0\nendtask"},
             {"covergroup",   "covergroup ${1:name};\n    $0\nendgroup"},
             {"generate",     "generate\n    $0\nendgenerate"},
+            {nullptr, nullptr}
+        };
+        static const S kProceduralSnips[] = {
             {"case",         "case (${1:expr})\n    default: $0\nendcase"},
             {"for",          "for (int ${1:i} = 0; ${1:i} < ${2:N}; ++${1:i}) begin\n    $0\nend"},
             {"foreach",      "foreach (${1:arr}[${2:i}]) begin\n    $0\nend"},
             {nullptr, nullptr}
         };
+        static const S kClassSnips[] = {
+            {"class",        "class ${1:name};\n    $0\nendclass"},
+            {"function",     "function ${1:void} ${2:name}($3);\n    $0\nendfunction"},
+            {"task",         "task ${1:name}($2);\n    $0\nendtask"},
+            {"covergroup",   "covergroup ${1:name};\n    $0\nendgroup"},
+            {nullptr, nullptr}
+        };
+        static const S kCovergroupSnips[] = {
+            {nullptr, nullptr}
+        };
         // clang-format on
+
+        const S* snippets = kGeneralSnips;
+        switch (ctx.keyword_context) {
+        case KeywordContextKind::ModuleItem:
+            snippets = kModuleItemSnips;
+            break;
+        case KeywordContextKind::Procedural:
+            snippets = kProceduralSnips;
+            break;
+        case KeywordContextKind::Class:
+            snippets = kClassSnips;
+            break;
+        case KeywordContextKind::Covergroup:
+            snippets = kCovergroupSnips;
+            break;
+        case KeywordContextKind::General:
+            snippets = kGeneralSnips;
+            break;
+        }
+
         std::vector<lsCompletionItem> items;
-        for (int i = 0; kSnips[i].label; ++i) {
+        for (int i = 0; snippets[i].label; ++i) {
             lsCompletionItem item;
-            item.label = kSnips[i].label;
+            item.label = snippets[i].label;
             item.kind = optional<lsCompletionItemKind>(lsCompletionItemKind::Snippet);
             item.detail = optional<std::string>("snippet");
-            item.insertText = optional<std::string>(kSnips[i].body);
+            item.insertText = optional<std::string>(snippets[i].body);
             item.insertTextFormat =
                 optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
             items.push_back(std::move(item));

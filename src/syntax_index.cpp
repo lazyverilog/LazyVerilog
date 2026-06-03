@@ -150,6 +150,34 @@ static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
     return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
 }
 
+static bool index_macro_has_user_source_location(const slang::SourceManager& sm,
+                                                 const slang::parsing::Token& name) {
+    // slang predefines a handful of implementation / SV coverage macros in the
+    // preprocessor itself.  Those names have SourceLocation::NoLocation because
+    // there is no user file to navigate to:
+    //
+    //     DEFINE("SV_COV_ERROR"sv, -1);
+    //
+    // LazyVerilog should not surface such parser implementation details as
+    // project macros.
+    return name && name.location().valid() && sm.isFileLoc(name.location());
+}
+
+static MacroEntry macro_entry_from_define(const slang::SourceManager& sm,
+                                          const DefineDirectiveSyntax& def) {
+    MacroEntry mac;
+    mac.name = std::string(def.name.valueText());
+    if (def.formalArguments) {
+        mac.is_function_like = true;
+        for (const auto* arg : def.formalArguments->args) {
+            if (arg)
+                mac.params.push_back(std::string(arg->name.valueText()));
+        }
+    }
+    mac.line = token_pos(sm, def.name).first;
+    return mac;
+}
+
 static std::string direction_of(const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
         return tok_str(variable->direction).empty() ? "unknown" : tok_str(variable->direction);
@@ -823,21 +851,22 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     collect_imports(root, index, sm);
 
     // Macros defined at the end of this file (preprocessor output).
+    //
+    // Note that slang also reports its built-in preprocessor macros here.
+    // Those built-ins have no source location, so indexing them would leak
+    // parser internals into completion and would make go-to-definition jump to
+    // a fallback location such as line 1 of the current file.  Skip them.
     for (const auto* def : tree.getDefinedMacros()) {
         if (!def)
             continue;
-        MacroEntry mac;
-        mac.name = std::string(def->name.valueText());
+
+        if (!index_macro_has_user_source_location(sm, def->name))
+            continue;
+
+        MacroEntry mac = macro_entry_from_define(sm, *def);
         if (mac.name.empty())
             continue;
-        if (def->formalArguments) {
-            mac.is_function_like = true;
-            for (const auto* arg : def->formalArguments->args) {
-                if (arg)
-                    mac.params.push_back(std::string(arg->name.valueText()));
-            }
-        }
-        mac.line = token_pos(sm, def->name).first;
+
         index.macros.push_back(std::move(mac));
     }
 

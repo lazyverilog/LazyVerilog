@@ -345,6 +345,16 @@ static Location location_from_token_actual_uri(const slang::SourceManager& sm,
     return loc;
 }
 
+static bool macro_has_user_source_location(const slang::SourceManager& sm,
+                                           const slang::parsing::Token& name) {
+    // slang built-in macros are represented with SourceLocation::NoLocation.
+    // Returning an LSP definition for those tokens forces us to invent a file
+    // and line, which is why `SV_COV_ERROR previously jumped to line 1 of the
+    // current buffer.  Treat no-location macros as invisible to user-facing
+    // LSP features.
+    return name && name.location().valid() && sm.isFileLoc(name.location());
+}
+
 static std::string read_file_text(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in)
@@ -583,9 +593,13 @@ static std::optional<Location> find_macro_definition(const slang::syntax::Syntax
                                                      const std::string& uri,
                                                      const std::string& name) {
     const auto& sm = tree.sourceManager();
+
     for (const auto* macro : tree.getDefinedMacros()) {
-        if (macro && macro->name.valueText() == name)
-            return location_from_token_actual_uri(sm, uri, macro->name);
+        if (!macro || macro->name.valueText() != name)
+            continue;
+        if (!macro_has_user_source_location(sm, macro->name))
+            continue;
+        return location_from_token_actual_uri(sm, uri, macro->name);
     }
     return std::nullopt;
 }
@@ -593,8 +607,11 @@ static std::optional<Location> find_macro_definition(const slang::syntax::Syntax
 static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree& tree,
                                                  const std::string& uri, const std::string& name) {
     const auto& sm = tree.sourceManager();
+
     for (const auto* macro : tree.getDefinedMacros()) {
         if (!macro || macro->name.valueText() != name)
+            continue;
+        if (!macro_has_user_source_location(sm, macro->name))
             continue;
 
         std::string body;

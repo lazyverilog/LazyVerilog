@@ -75,7 +75,10 @@ TEST_CASE("completion: keywords present in general identifier context", "[comple
     auto result = complete_at(engine, analyzer, uri, 0, 0);
     CHECK(has_label(result, "module"));
     CHECK(has_label(result, "interface"));
+    CHECK(has_label(result, "function"));
+    CHECK(has_label(result, "task"));
     CHECK_FALSE(has_label(result, "assign"));
+    CHECK_FALSE(has_label(result, "always_comb"));
 }
 
 TEST_CASE("completion: keywords are context-aware", "[completion]") {
@@ -105,11 +108,17 @@ TEST_CASE("completion: keywords are context-aware", "[completion]") {
     CHECK(has_label(cls, "function"));
     CHECK(has_label(cls, "constraint"));
     CHECK_FALSE(has_label(cls, "assign"));
+    // Snippets share labels with keywords in the UI.  Class scope must not get
+    // module/procedural structural snippets such as always_comb.
+    CHECK_FALSE(has_label(cls, "always_comb"));
+    CHECK_FALSE(has_label(cls, "always_ff"));
+    CHECK_FALSE(has_label(cls, "module"));
 
     auto covergroup = complete_at(engine, analyzer, uri, 8, 8);
     CHECK(has_label(covergroup, "coverpoint"));
     CHECK(has_label(covergroup, "bins"));
     CHECK_FALSE(has_label(covergroup, "assign"));
+    CHECK_FALSE(has_label(covergroup, "always_comb"));
 }
 
 TEST_CASE("completion: module defined in same file appears as identifier", "[completion]") {
@@ -699,6 +708,21 @@ TEST_CASE("completion: repeated visible macros are deduplicated", "[completion]"
 
     auto identifier_context = complete_at(engine, analyzer, uri, 3, 4);
     CHECK(count_label(identifier_context, "`DUPLICATE_VISIBLE_MACRO") == 1);
+}
+
+TEST_CASE("completion: slang built-in macros are hidden", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const std::string uri = "file:///tmp/completion_builtin_macro_hidden.sv";
+    analyzer.open(uri,
+                  "module top;\n"
+                  "    logic a = `\n"
+                  "endmodule\n");
+
+    auto without_user_define = complete_at(engine, analyzer, uri, 1, 15);
+    CHECK_FALSE(has_label(without_user_define, "SV_COV_ERROR"));
+    CHECK_FALSE(has_label(without_user_define, "`SV_COV_ERROR"));
 }
 
 TEST_CASE("completion: PackageScope context returns package symbols", "[completion]") {
