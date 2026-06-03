@@ -611,7 +611,7 @@ Build in this order to get value at each step:
 | 6 | `MemberProvider` (best-effort type resolution) | `obj.` completion |
 | 7 | `MacroProvider` | `` `macro `` completion |
 | 8 | `SnippetProvider` | Structural snippets |
-| 9 | `PackageScopeProvider` | `pkg::` completion |
+| 9 | `PackageScopeProvider` | `pkg::` completion filtered to symbols indexed under that package |
 | 10 | `ParameterProvider` | `#(.param` completion |
 | 11 | `EnumProvider` + type-aware ranking | `state <= IDLE` |
 | 12 | `FileProvider` | `` `include "`` |

@@ -682,6 +682,43 @@ TEST_CASE("completion: PackageScope context returns package classes", "[completi
     CHECK(has_label(result, "uvm_component"));
 }
 
+TEST_CASE("completion: PackageScope filters symbols by declaring package", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_pkgscope_filter.sv";
+    const std::string text =
+        "package pkg_a;\n"
+        "    typedef enum logic [1:0] { A_IDLE, A_DONE } a_state_t;\n"
+        "    class a_object;\n"
+        "    endclass\n"
+        "    int a_value;\n"
+        "endpackage\n"
+        "package pkg_b;\n"
+        "    typedef logic [7:0] b_byte_t;\n"
+        "    class b_object;\n"
+        "    endclass\n"
+        "    int b_value;\n"
+        "endpackage\n"
+        "module top;\n"
+        "    pkg_a::\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_of(text, "pkg_a::");
+    auto result = complete_at(engine, analyzer, uri, line,
+                              col + (int)std::string("pkg_a::").size());
+
+    CHECK(has_label(result, "a_state_t"));
+    CHECK(has_label(result, "A_IDLE"));
+    CHECK(has_label(result, "A_DONE"));
+    CHECK(has_label(result, "a_object"));
+    CHECK(has_label(result, "a_value"));
+
+    CHECK_FALSE(has_label(result, "b_byte_t"));
+    CHECK_FALSE(has_label(result, "b_object"));
+    CHECK_FALSE(has_label(result, "b_value"));
+}
+
 TEST_CASE("completion: package scope works inside procedural block", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;

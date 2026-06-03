@@ -1067,24 +1067,27 @@ class PackageScopeProvider : public CompletionProvider {
             }
         }
 
-        // Recovery for include-heavy packages.
+        // Package-membership recovery for include-heavy packages.
         //
-        // Some libraries, notably UVM, build a package by `include`-ing many
-        // class files.  Depending on how far the parser got through an
-        // incomplete editing snapshot, the package declaration can be known
-        // while the package-symbol list is temporarily sparse.  Returning no
-        // completion after `uvm_pkg::` is worse than a slightly broad recovery
-        // list, so when the scope name is a known package we fall back to the
-        // indexed global symbols.  Symbols that explicitly record
-        // parent_scope == package still remain package-filtered; classes and
-        // typedefs currently do not store parent_scope, so they are included
-        // as best-effort package-visible candidates.
+        // Libraries such as UVM build package bodies by `include`-ing many
+        // files. SyntaxIndex records package membership while walking the
+        // package SyntaxTree, so this recovery remains package-filtered instead
+        // of falling back to every global class/typedef in the design.
         if (index.package_names.count(ctx.scope_name)) {
-            for (const auto& c : index.classes)
-                add_item(c.name, lsCompletionItemKind::Class);
-            for (const auto& t : index.typedefs)
+            for (const auto& c : index.classes) {
+                if (c.parent_scope == ctx.scope_name)
+                    add_item(c.name, lsCompletionItemKind::Class);
+            }
+            for (const auto& t : index.typedefs) {
+                if (t.parent_scope != ctx.scope_name)
+                    continue;
                 add_item(t.name, t.is_enum ? lsCompletionItemKind::Enum
                                             : lsCompletionItemKind::TypeParameter);
+                if (t.is_enum) {
+                    for (const auto& em : t.enum_members)
+                        add_item(em.name, lsCompletionItemKind::EnumMember);
+                }
+            }
             for (const auto& v : index.values) {
                 if (v.parent_scope != ctx.scope_name)
                     continue;

@@ -567,9 +567,10 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 // ── New extraction functions ──────────────────────────────────────────────────
 
 static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
-                           const slang::SourceManager& sm) {
+                           const slang::SourceManager& sm, std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = tok_str(cls.name);
+    entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos(sm, cls.name);
     entry.line = line;
     entry.col = col;
@@ -609,13 +610,14 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 }
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
-                             const slang::SourceManager& sm) {
+                             const slang::SourceManager& sm, std::string parent_scope = {}) {
     // Skip if already indexed (e.g., from a package member pass)
     if (index.typedef_by_name.count(tok_str(td.name)))
         return;
 
     TypedefEntry entry;
     entry.name = tok_str(td.name);
+    entry.parent_scope = std::move(parent_scope);
     entry.line = token_pos(sm, td.name).first;
 
     if (const auto* enum_type = td.type->as_if<EnumTypeSyntax>()) {
@@ -663,10 +665,16 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
             continue;
         if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             symbols.push_back(tok_str(td->name));
-            process_typedef(*td, index, sm);
+            process_typedef(*td, index, sm, pkg_name);
+            if (const auto* enum_type = td->type->as_if<EnumTypeSyntax>()) {
+                for (const auto* enum_member : enum_type->members) {
+                    if (enum_member)
+                        symbols.push_back(tok_str(enum_member->name));
+                }
+            }
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             symbols.push_back(tok_str(cls->name));
-            process_class(*cls, index, sm);
+            process_class(*cls, index, sm, pkg_name);
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             symbols.push_back(render_index_syntax_text(sm, *fn->prototype->name));
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {

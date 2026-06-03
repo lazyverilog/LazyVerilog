@@ -64,11 +64,29 @@ The member-access trigger itself is detected from the SyntaxTree dot token and i
 
 Triggered by `::`.
 
-Suggests symbol names exported by the named package.
+Suggests symbol names exported by the named package only. Completion is backed by
+the slang `SyntaxTree` index: classes, typedefs, enum literals, parameters,
+variables, functions, and tasks are tagged with their declaring package while the
+package tree is walked, then `pkg::` filters to that package membership. There is
+no fallback that returns unrelated global classes or typedefs.
 
 ```systemverilog
-uvm_pkg::   // lists uvm_pkg exports
+package pkg_a;
+    typedef enum { A_IDLE, A_DONE } a_state_t;
+    class a_object;
+    endclass
+endpackage
+
+package pkg_b;
+    class b_object;
+    endclass
+endpackage
+
+pkg_a::   // lists a_state_t, A_IDLE, A_DONE, a_object; not b_object
 ```
+
+Include-heavy packages such as UVM work the same way when the package source is
+listed in `vcode.f` and its headers are reachable through `+incdir+` entries.
 
 ### Parameter connections
 

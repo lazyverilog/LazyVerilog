@@ -81,6 +81,7 @@ struct MethodEntry {
 struct ClassEntry {
     std::string name;
     std::string base_class; // empty if no extends clause
+    std::string parent_scope; // package/class scope when known
     std::vector<FieldEntry> fields;
     std::vector<MethodEntry> methods;
     int line{0};
@@ -94,6 +95,7 @@ struct EnumMemberEntry {
 struct TypedefEntry {
     std::string name;
     std::string resolved; // best-effort one-step type name
+    std::string parent_scope; // package/class scope when known
     bool is_enum{false};
     bool is_struct{false};
     std::vector<EnumMemberEntry> enum_members;
