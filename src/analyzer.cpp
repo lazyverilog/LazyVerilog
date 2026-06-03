@@ -738,6 +738,19 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         current_module = std::move(previous_module);
     }
 
+    void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+        // Class names are ordinary type identifiers at use sites:
+        //
+        //     packet_cfg cfg;
+        //     ^^^^^^^^^^ should jump to: class packet_cfg;
+        //
+        // The token fallback in definition_target_at() can identify the use
+        // token, but the definition search still needs to expose the class
+        // declaration name as a generic definition candidate.
+        maybe_set(node.name, false);
+        visitDefault(node);
+    }
+
     void handle(const slang::syntax::ImplicitAnsiPortSyntax& node) {
         maybe_set(node.declarator->name);
     }
@@ -843,6 +856,22 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                                 .kind = "module",
                                 .detail = "module",
                                 .doc = std::move(doc),
+                                .line = definition.line,
+                                .col = definition.col};
+            if (!result)
+                visitDefault(node);
+        }
+
+        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+            if (result || node.name.valueText() != name ||
+                !token_at_location(sm, node.name, definition)) {
+                visitDefault(node);
+                return;
+            }
+
+            result = SymbolInfo{.name = name,
+                                .kind = "class",
+                                .detail = "class",
                                 .line = definition.line,
                                 .col = definition.col};
             if (!result)

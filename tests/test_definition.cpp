@@ -159,6 +159,25 @@ TEST_CASE("definition: typedef lookup resolves named type", "[definition]") {
     CHECK(loc->end_col == 10);
 }
 
+TEST_CASE("definition: class type lookup resolves class declaration", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_class_type.sv";
+    analyzer.open(uri,
+                  "class packet_cfg;\n"
+                  "endclass\n"
+                  "\n"
+                  "module top;\n"
+                  "    packet_cfg cfg;\n"
+                  "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 4, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri);
+    CHECK(loc->line == 0);
+    CHECK(loc->col == 6);
+    CHECK(loc->end_col == 16);
+}
+
 TEST_CASE("definition: variable lookup prefers same module scope", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
