@@ -104,7 +104,7 @@ Suggests macro names defined in the current file and all files in the design fil
 
 Triggered on any identifier position.
 
-Suggests module names, class names, interface names, typedef names, package names, and SystemVerilog keywords. Structural snippets (`module`, `class`, `always_ff`, `function`, etc.) are also included.
+Suggests visible identifiers from the current SyntaxTree scope plus global design symbols such as module, interface, class, typedef, and package names. Module ports and declarations from unrelated modules are not flattened into the current scope. Block-local declarations are visible only inside their enclosing block range. Structural snippets (`module`, `class`, `always_ff`, `function`, etc.) are also included.
 
 ---
 

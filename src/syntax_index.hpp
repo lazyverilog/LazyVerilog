@@ -106,6 +106,10 @@ struct ValueEntry {
     std::string type;
     std::string kind; // variable/net/function/task/parameter/localparam/port
     std::string parent_scope; // module/interface/package/class name when known
+    // 1-based lexical visibility range for block-local declarations.  A zero
+    // range means the symbol is visible throughout parent_scope.
+    int scope_start_line{0};
+    int scope_end_line{0};
     int line{0};
     int col{0};
 };

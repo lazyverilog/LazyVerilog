@@ -52,7 +52,7 @@ The engine is the only entry point. Providers never communicate with each other.
 
 ### SyntaxIndex Extension
 
-Current `SyntaxIndex` holds modules, ports, and instances. The rewrite requires extending it with richer symbol data. All fields must be populated during `SyntaxIndex::build()` from the `SyntaxTree` — never from string inspection.
+Current `SyntaxIndex` holds modules, ports, instances, and completion symbols. Scope-sensitive value data is populated during `SyntaxIndex::build()` from the `SyntaxTree` — never from raw source text inspection. Block-local declarations carry a SyntaxTree-derived visibility line range so identifier completion can hide locals outside their enclosing block.
 
 ```cpp
 // syntax_index.hpp additions

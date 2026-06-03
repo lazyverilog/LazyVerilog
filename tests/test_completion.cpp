@@ -143,6 +143,35 @@ TEST_CASE("completion: module-local variables appear as identifiers", "[completi
     CHECK(has_label(result, "data32"));
 }
 
+TEST_CASE("completion: identifier visibility respects lexical scope", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_scope_visibility.sv";
+    const std::string text =
+        "module other;\n"
+        "    logic hidden_other;\n"
+        "endmodule\n"
+        "module top;\n"
+        "    logic visible_top;\n"
+        "    always_comb begin\n"
+        "        logic visible_block;\n"
+        "        \n"
+        "    end\n"
+        "    \n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto in_block = complete_at(engine, analyzer, uri, 7, 8);
+    CHECK(has_label(in_block, "visible_top"));
+    CHECK(has_label(in_block, "visible_block"));
+    CHECK_FALSE(has_label(in_block, "hidden_other"));
+
+    auto after_block = complete_at(engine, analyzer, uri, 9, 4);
+    CHECK(has_label(after_block, "visible_top"));
+    CHECK_FALSE(has_label(after_block, "visible_block"));
+    CHECK_FALSE(has_label(after_block, "hidden_other"));
+}
+
 TEST_CASE("completion: enum assignment prioritizes matching enum literals", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;

@@ -4,6 +4,7 @@
 #include <optional>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
+#include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
 #include <string_view>
 
@@ -138,6 +139,15 @@ static std::pair<int, int> token_pos(const slang::SourceManager& sm,
     const auto line = sm.getLineNumber(token.location());
     const auto col = sm.getColumnNumber(token.location());
     return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
+}
+
+static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
+                                              slang::SourceRange range) {
+    if (!range.start().valid() || !range.end().valid())
+        return {0, 0};
+    const auto start = sm.getLineNumber(range.start());
+    const auto end = sm.getLineNumber(range.end());
+    return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
 }
 
 static std::string direction_of(const PortHeaderSyntax& header) {
@@ -457,6 +467,82 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             });
         }
     }
+
+    struct LocalVariableVisitor : public SyntaxVisitor<LocalVariableVisitor> {
+        SyntaxIndex& index;
+        const slang::SourceManager& sm;
+        const std::string& parent_scope;
+        std::vector<std::pair<int, int>> scope_stack;
+
+        LocalVariableVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
+                             const std::string& parent_scope, std::pair<int, int> module_range)
+            : index(index), sm(sm), parent_scope(parent_scope) {
+            scope_stack.push_back(module_range);
+        }
+
+        void handle(const ClassDeclarationSyntax& /*node*/) {
+            // A class nested in a module owns its own member/local namespace.
+            // Do not leak method-local variables from that class into the
+            // enclosing RTL module's identifier completions.
+        }
+
+        void handle(const BlockStatementSyntax& node) {
+            scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
+        void handle(const LocalVariableDeclarationSyntax& node) {
+            const auto type_text = render_index_syntax_text(sm, *node.type);
+            const auto [scope_start, scope_end] =
+                scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back();
+            for (const auto* decl : node.declarators) {
+                if (!decl)
+                    continue;
+                auto [vl, vc] = token_pos(sm, decl->name);
+                index.values.push_back(ValueEntry{
+                    .name = tok_str(decl->name),
+                    .type = with_declarator_dimensions(sm, type_text, *decl),
+                    .kind = "variable",
+                    .parent_scope = parent_scope,
+                    .scope_start_line = scope_start,
+                    .scope_end_line = scope_end,
+                    .line = vl,
+                    .col = vc,
+                });
+            }
+            visitDefault(node);
+        }
+
+        void handle(const DataDeclarationSyntax& node) {
+            if (scope_stack.size() <= 1) {
+                visitDefault(node);
+                return;
+            }
+
+            const auto type_text = render_index_syntax_text(sm, *node.type);
+            const auto [scope_start, scope_end] = scope_stack.back();
+            for (const auto* decl : node.declarators) {
+                if (!decl)
+                    continue;
+                auto [vl, vc] = token_pos(sm, decl->name);
+                index.values.push_back(ValueEntry{
+                    .name = tok_str(decl->name),
+                    .type = with_declarator_dimensions(sm, type_text, *decl),
+                    .kind = "variable",
+                    .parent_scope = parent_scope,
+                    .scope_start_line = scope_start,
+                    .scope_end_line = scope_end,
+                    .line = vl,
+                    .col = vc,
+                });
+            }
+            visitDefault(node);
+        }
+    };
+
+    LocalVariableVisitor locals(index, sm, entry.name, source_range_lines(sm, module.sourceRange()));
+    module.visit(locals);
 
     index.module_by_name.try_emplace(entry.name, index.modules.size());
     index.modules.push_back(std::move(entry));

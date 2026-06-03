@@ -309,7 +309,7 @@ static int prefix_score(std::string_view candidate, std::string_view pre) {
     return (pi == pre.size()) ? 30 : 0;
 }
 
-static std::string infer_current_scope(const SyntaxIndex& index, int line) {
+static std::string infer_current_scope_from_index(const SyntaxIndex& index, int line) {
     const int one_based = line + 1;
     std::string best;
     int best_line = -1;
@@ -326,6 +326,51 @@ static bool range_contains_offset(const slang::SourceRange& range, size_t offset
     if (!range.start().valid() || !range.end().valid())
         return false;
     return range.start().offset() <= offset && offset <= range.end().offset();
+}
+
+static std::string infer_current_scope(const DocumentState& state, const SyntaxIndex& index,
+                                       size_t offset, int line) {
+    if (!state.tree)
+        return infer_current_scope_from_index(index, line);
+
+    using namespace slang::syntax;
+
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        size_t offset;
+        std::string result;
+        size_t best_width{SIZE_MAX};
+
+        explicit Visitor(size_t offset) : offset(offset) {}
+
+        void consider(const SyntaxNode& node, std::string name) {
+            if (name.empty())
+                return;
+            const auto range = node.sourceRange();
+            if (!range_contains_offset(range, offset))
+                return;
+            const size_t width = range.end().offset() - range.start().offset();
+            if (width <= best_width) {
+                best_width = width;
+                result = std::move(name);
+            }
+        }
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            consider(node, std::string(node.header->name.valueText()));
+            visitDefault(node);
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            consider(node, std::string(node.name.valueText()));
+            visitDefault(node);
+        }
+    };
+
+    Visitor visitor(offset);
+    state.tree->root().visit(visitor);
+    if (!visitor.result.empty())
+        return visitor.result;
+    return infer_current_scope_from_index(index, line);
 }
 
 static KeywordContextKind infer_keyword_context(const DocumentState& state, size_t offset) {
@@ -477,6 +522,27 @@ static std::unordered_set<std::string> value_names_for_type(const SyntaxIndex& i
     return names;
 }
 
+static bool value_visible_in_context(const SyntaxIndex& index, const CompletionContext& ctx,
+                                     const ValueEntry& value) {
+    if (!ctx.current_scope_name.empty() && !value.parent_scope.empty() &&
+        value.parent_scope != ctx.current_scope_name) {
+        // Package values are visible in package-scope completion, but ordinary
+        // identifier completion should not flatten every package into every
+        // module/class scope. Import-aware visibility is handled separately as
+        // package-scope support is improved.
+        return false;
+    }
+
+    if (value.scope_start_line > 0 && value.scope_end_line > 0) {
+        const int one_based_line = ctx.line + 1;
+        if (one_based_line < value.scope_start_line || one_based_line > value.scope_end_line)
+            return false;
+    }
+
+    (void)index;
+    return true;
+}
+
 // ── Item construction helper ──────────────────────────────────────────────────
 
 static lsCompletionItem make_item(std::string label, lsCompletionItemKind kind) {
@@ -579,12 +645,7 @@ class IdentifierProvider : public CompletionProvider {
 
         for (const auto& v : index.values) {
             if (tok.cancelled) throw CompletionCancelled{};
-            // Best-effort visibility: prefer current lexical module/package
-            // symbols, but keep package/global values visible until full import
-            // and nested-scope resolution is implemented.
-            if (!ctx.current_scope_name.empty() && !v.parent_scope.empty() &&
-                v.parent_scope != ctx.current_scope_name &&
-                !index.package_names.count(v.parent_scope))
+            if (!value_visible_in_context(index, ctx, v))
                 continue;
 
             auto item = make_item(v.name,
@@ -611,6 +672,8 @@ class IdentifierProvider : public CompletionProvider {
                                                         : std::string("module"));
             items.push_back(std::move(it));
 
+            if (m.name != ctx.current_scope_name)
+                continue;
             for (const auto& p : m.ports) {
                 auto pi = make_item(p.name, lsCompletionItemKind::Variable);
                 if (!p.direction.empty() || !p.type.empty())
@@ -1130,7 +1193,7 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
     ctx.col = col;
 
     const size_t offset = position_to_offset(text, line, col);
-    ctx.current_scope_name = infer_current_scope(index, line);
+    ctx.current_scope_name = infer_current_scope(state, index, offset, line);
     ctx.keyword_context = infer_keyword_context(state, offset);
 
     // Step 1: read the prefix (identifier chars already typed after trigger)
