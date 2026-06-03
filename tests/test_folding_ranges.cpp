@@ -2,6 +2,8 @@
 #include "features/folding_range.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <map>
+#include <tuple>
 
 static FoldingRangeRequestParams make_params(const std::string& uri) {
     FoldingRangeRequestParams p;
@@ -13,6 +15,22 @@ static bool has_fold(const std::vector<FoldingRange>& folds, int start, int end)
     return std::any_of(folds.begin(), folds.end(), [&](const FoldingRange& r) {
         return r.startLine == start && r.endLine == end;
     });
+}
+
+static bool has_fold_kind(const std::vector<FoldingRange>& folds, int start, int end,
+                          const std::string& kind) {
+    return std::any_of(folds.begin(), folds.end(), [&](const FoldingRange& r) {
+        return r.startLine == start && r.endLine == end && r.kind == kind;
+    });
+}
+
+static bool has_exact_duplicate_fold(const std::vector<FoldingRange>& folds) {
+    std::map<std::tuple<int, int, std::string>, int> seen;
+    for (const auto& f : folds) {
+        auto key = std::make_tuple(f.startLine, f.endLine, f.kind);
+        if (++seen[key] > 1) return true;
+    }
+    return false;
 }
 
 // ── module body ───────────────────────────────────────────────────────────
@@ -167,5 +185,271 @@ endmodule
         CHECK(first[i].startLine == second[i].startLine);
         CHECK(first[i].endLine   == second[i].endLine);
         CHECK(first[i].kind      == second[i].kind);
+    }
+}
+
+// ── coverage gaps / regression tests ─────────────────────────────────────
+
+TEST_CASE("foldingRange: trailing comments do not start comment folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_trailing_comment.sv";
+    analyzer.open(uri, R"(module top;
+    assign a = b; // trailing comment belongs to code line
+    // own-line comment after a trailing comment
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,3]  module top ... endmodule
+    //
+    // There must not be a comment fold [1,2], because that would fold line 1:
+    //   assign a = b; // trailing comment belongs to code line
+    // together with the own-line comment on line 2.
+    CHECK(has_fold(folds, 0, 3));
+    CHECK_FALSE(has_fold_kind(folds, 1, 2, "comment"));
+}
+
+TEST_CASE("foldingRange: preprocessor ifdef else endif folds branches", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_ifdef_else.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef USE_A
+    assign y = a;
+`else
+    assign y = b;
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,6]  module top ... endmodule
+    //   region  [1,2]  `ifdef USE_A branch
+    //   region  [3,5]  `else branch, including closing `endif
+    CHECK(has_fold(folds, 0, 6));
+    CHECK(has_fold(folds, 1, 2));
+    CHECK(has_fold(folds, 3, 5));
+}
+
+TEST_CASE("foldingRange: preprocessor folds coexist with local structural RTL folds",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_ifdef_structural_priority.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef USE_REGISTERED_VALID
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        valid_out <= 1'b0;
+    end else begin
+        valid_out <= pipe_vld[0];
+    end
+end
+`else
+always_comb begin
+    valid_out = pipe_vld[0];
+end
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,14]  module top ... endmodule
+    //   region  [2,8]   always_ff begin ... end
+    //   region  [3,5]   inactive-branch if begin/end block, recovered from tokens
+    //   region  [9,13]  `else branch, including closing `endif
+    //   region  [10,12] always_comb begin ... end
+    //
+    // Important UX regression:
+    //   The `ifdef branch fold must exist so "za" on the directive line does
+    //   not fall through to the whole module.  Local structural folds must also
+    //   exist so inner always/if lines have nearby RTL folds available.
+    CHECK(has_fold(folds, 0, 14));
+    CHECK(has_fold(folds, 1, 8));
+    CHECK(has_fold(folds, 2, 8));
+    CHECK(has_fold(folds, 3, 5));
+    CHECK(has_fold(folds, 9, 13));
+    CHECK(has_fold(folds, 10, 12));
+}
+
+TEST_CASE("foldingRange: nested preprocessor conditionals fold independently", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_nested_ifdef.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef OUTER
+    assign outer = 1'b1;
+`ifdef INNER
+    assign inner = 1'b1;
+`endif
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,7]  module top ... endmodule
+    //   region  [1,6]  `ifdef OUTER branch, including outer `endif
+    //   region  [3,5]  `ifdef INNER branch, including inner `endif
+    CHECK(has_fold(folds, 0, 7));
+    CHECK(has_fold(folds, 1, 6));
+    CHECK(has_fold(folds, 3, 5));
+}
+
+TEST_CASE("foldingRange: celldefine block folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_celldefine.sv";
+    analyzer.open(uri, R"(`celldefine
+module cell_a;
+endmodule
+module cell_b;
+endmodule
+`endcelldefine
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,5]  `celldefine ... `endcelldefine
+    //   region  [1,2]  module cell_a ... endmodule
+    //   region  [3,4]  module cell_b ... endmodule
+    CHECK(has_fold(folds, 0, 5));
+    CHECK(has_fold(folds, 1, 2));
+    CHECK(has_fold(folds, 3, 4));
+}
+
+TEST_CASE("foldingRange: no exact duplicate folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_no_duplicates.sv";
+    analyzer.open(uri, R"(module top;
+    always_comb begin
+        case (sel)
+            1'b0: begin
+                a = 1'b0;
+            end
+            default: begin
+                a = 1'b1;
+            end
+        endcase
+    end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected property:
+    //   each exact tuple (startLine, endLine, kind) appears at most once.
+    CHECK_FALSE(has_exact_duplicate_fold(folds));
+}
+
+TEST_CASE("foldingRange: top-level package import run folds as imports", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_imports.sv";
+    analyzer.open(uri, R"(import pkg_a::*;
+import pkg_b::item_b;
+import pkg_c::*;
+
+module top;
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   imports [0,2]  three consecutive top-level package imports
+    //   region  [4,5]  module top ... endmodule
+    CHECK(has_fold_kind(folds, 0, 2, "imports"));
+    CHECK(has_fold(folds, 4, 5));
+}
+
+TEST_CASE("foldingRange: multiline module port list folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_port_list.sv";
+    analyzer.open(uri, R"(module top(
+    input  logic clk,
+    input  logic rst_n,
+    output logic done
+);
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,4]  ANSI port list
+    //   region  [0,5]  module top ... endmodule
+    CHECK(has_fold(folds, 0, 4));
+    CHECK(has_fold(folds, 0, 5));
+}
+
+TEST_CASE("foldingRange: function and task declarations fold", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_function_task.sv";
+    analyzer.open(uri, R"(module top;
+    function automatic logic calc(
+        input logic a,
+        input logic b
+    );
+        calc = a & b;
+    endfunction
+
+    task automatic drive;
+        done = 1'b1;
+    endtask
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,11]  module top ... endmodule
+    //   region  [1,6]   function automatic logic calc ... endfunction
+    //   region  [8,10]  task automatic drive ... endtask
+    CHECK(has_fold(folds, 0, 11));
+    CHECK(has_fold(folds, 1, 6));
+    CHECK(has_fold(folds, 8, 10));
+}
+
+TEST_CASE("foldingRange: class constraint and covergroup fold", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_class_constraint_covergroup.sv";
+    analyzer.open(uri, R"(class packet;
+    rand bit [7:0] addr;
+
+    constraint addr_c {
+        addr inside {[8'h10:8'h1f]};
+    }
+
+    covergroup addr_cg;
+        coverpoint addr {
+            bins low = {[8'h00:8'h0f]};
+        }
+    endgroup
+endclass
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,12]  class packet ... endclass
+    //   region  [3,5]   constraint addr_c { ... }
+    //   region  [7,11]  covergroup addr_cg ... endgroup
+    CHECK(has_fold(folds, 0, 12));
+    CHECK(has_fold(folds, 3, 5));
+    CHECK(has_fold(folds, 7, 11));
+}
+
+TEST_CASE("foldingRange: single-line constructs are excluded", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_single_line_constructs.sv";
+    analyzer.open(uri, R"(module top;
+    function logic pass(input logic a); pass = a; endfunction
+    always_comb begin a = b; end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region  [0,3]  module top ... endmodule
+    //
+    // Single-line function and begin/end constructs must not produce [1,1] or [2,2].
+    CHECK(has_fold(folds, 0, 3));
+    for (const auto& f : folds) {
+        CHECK_FALSE((f.startLine == 1 && f.endLine == 1));
+        CHECK_FALSE((f.startLine == 2 && f.endLine == 2));
     }
 }
