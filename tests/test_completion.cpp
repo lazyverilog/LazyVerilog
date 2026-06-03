@@ -24,6 +24,11 @@ static int index_of_label(const CompletionList& list, const std::string& lbl) {
     return -1;
 }
 
+static int count_label(const CompletionList& list, const std::string& lbl) {
+    return (int)std::count_if(list.items.begin(), list.items.end(),
+                              [&](const lsCompletionItem& it) { return it.label == lbl; });
+}
+
 // Return 0-based (line, col) of the first occurrence of needle in text.
 static std::pair<int, int> pos_of(const std::string& text, std::string_view needle) {
     const auto off = text.find(needle);
@@ -785,6 +790,65 @@ TEST_CASE("completion: identifier completion requires package import", "[complet
     CHECK(has_label(wildcard_import, "hidden_class"));
     CHECK(has_label(wildcard_import, "hidden_state_t"));
     CHECK(has_label(wildcard_import, "H_IDLE"));
+}
+
+TEST_CASE("completion: imports from extra files do not leak into current file", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto extra = std::filesystem::temp_directory_path() / "completion_extra_import.sv";
+    {
+        std::ofstream out(extra);
+        REQUIRE(out.good());
+        out << "package pkg_extra_import;\n"
+               "    typedef enum { EXTRA_IDLE, EXTRA_DONE } extra_state_t;\n"
+               "    parameter int EXTRA_PARAM = 1;\n"
+               "endpackage\n"
+               "import pkg_extra_import::*;\n"
+               "module extra_import_user;\n"
+               "endmodule\n";
+    }
+    analyzer.set_extra_files({extra.string()});
+
+    const std::string uri = "file:///tmp/completion_import_no_leak.sv";
+    const std::string text =
+        "module top_no_import;\n"
+        "    \n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 1, 4);
+
+    CHECK(has_label(result, "pkg_extra_import"));
+    CHECK_FALSE(has_label(result, "extra_state_t"));
+    CHECK_FALSE(has_label(result, "EXTRA_IDLE"));
+    CHECK_FALSE(has_label(result, "EXTRA_PARAM"));
+}
+
+TEST_CASE("completion: current file listed in extra files is not duplicated", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto path = std::filesystem::temp_directory_path() / "completion_no_self_merge.sv";
+    const std::string text =
+        "module top_no_self_merge;\n"
+        "    logic clk;\n"
+        "    \n"
+        "endmodule\n";
+    {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    }
+    analyzer.set_extra_files({path.string()});
+
+    const std::string uri = "file://" + path.string();
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 2, 4);
+
+    CHECK(count_label(result, "clk") == 1);
+    CHECK(count_label(result, "top_no_self_merge") == 1);
 }
 
 TEST_CASE("completion: module names are hidden in procedural context", "[completion]") {

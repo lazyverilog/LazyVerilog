@@ -809,7 +809,7 @@ static bool value_visible_in_context(const SyntaxIndex& index, const CompletionC
 
         const int one_based_line = ctx.line + 1;
         bool imported = false;
-        for (const auto& imp : index.imports) {
+        for (const auto& imp : ctx.visible_imports) {
             if (imp.package_name != value.parent_scope)
                 continue;
             if (!imp.parent_scope.empty() && imp.parent_scope != ctx.current_scope_name)
@@ -848,7 +848,7 @@ static bool package_symbol_visible_in_identifier_context(const SyntaxIndex& inde
         return true;
 
     const int one_based_line = ctx.line + 1;
-    for (const auto& imp : index.imports) {
+    for (const auto& imp : ctx.visible_imports) {
         if (imp.package_name != package_name)
             continue;
         if (!imp.parent_scope.empty() && imp.parent_scope != ctx.current_scope_name)
@@ -1754,7 +1754,15 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     // Build a merged index: current document + extra files from .f list
     SyntaxIndex merged = state.index;
-    analyzer.merge_extra_file_modules(merged);
+    for (const auto& extra : analyzer.extra_file_snapshots()) {
+        // If the current buffer is also listed in vcode.f, prefer the live
+        // buffer index we already copied into `merged`.  Merging the extra-file
+        // snapshot again duplicates local variables/ports in completion (for
+        // example demo/tmp fixtures listed in demo/vcode.f).
+        if (extra.uri == state.uri)
+            continue;
+        merged.merge(extra.index);
+    }
 
     // Collect symbol names declared in the current document for scope scoring.
     std::unordered_set<std::string> local_names;
@@ -1775,6 +1783,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     }
     for (const auto& mac : state.index.macros)
         ctx.visible_macros.insert(mac.name);
+    ctx.visible_imports = state.index.imports;
 
     if (ctx.kind == CompletionContextKind::IncludeFile) {
         for (const auto& p : analyzer.extra_files()) {

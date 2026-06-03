@@ -47,6 +47,11 @@ struct CompletionContext {
     // Extra-file macros are intentionally not flattened into unrelated files;
     // they appear here only when the current file itself defines/includes them.
     std::unordered_set<std::string> visible_macros;
+    // Package imports visible from the current document only.  Extra-file
+    // imports must not leak into unrelated buffers; otherwise one demo/test
+    // file with `import uvm_pkg::*` makes UVM package members appear
+    // everywhere in the merged design index.
+    std::vector<ImportEntry> visible_imports;
     // .svh/.vh paths from the design filelist (populated for IncludeFile context)
     std::vector<std::string> header_files;
 };
