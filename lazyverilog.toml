@@ -1,7 +1,6 @@
 [design]
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]   # preprocessor defines passed to slang for parsing
-include_dir = ["demo/uvm-core/src"] # directories used to resolve `include directives
 
 [compilation]
 background_compilation = false # run semantic compilation in background workers (slower, richer diagnostics)

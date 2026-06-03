@@ -240,27 +240,13 @@ static std::string resolve_vcode_path(const std::filesystem::path& root, const C
     return std::filesystem::absolute(filelist).lexically_normal().string();
 }
 
-static std::vector<std::string> resolve_include_dirs(const std::filesystem::path& root,
-                                                     const Config& config) {
-    std::vector<std::string> dirs;
-    dirs.reserve(config.design.include_dir.size());
-    for (const auto& configured : config.design.include_dir) {
-        if (configured.empty())
-            continue;
-        auto dir = std::filesystem::path(configured);
-        if (dir.is_relative())
-            dir = root / dir;
-        dirs.push_back(std::filesystem::absolute(dir).lexically_normal().string());
-    }
-    return dirs;
-}
-
 static std::string path_to_file_uri(const std::filesystem::path& path) {
     return "file://" + std::filesystem::absolute(path).lexically_normal().string();
 }
 
 struct VcodeResult {
     std::vector<std::string> files;
+    std::vector<std::string> include_dirs;
 };
 
 static VcodeResult load_vcode(const std::filesystem::path& root, const Config& config) {
@@ -287,24 +273,35 @@ static VcodeResult load_vcode(const std::filesystem::path& root, const Config& c
         if (item.empty())
             continue;
 
-        // LazyVerilog's filelist support is intentionally source-file based:
-        // every library that should contribute symbols to LSP features must be
-        // listed as an explicit source file.  We do not interpret simulator
-        // options such as +incdir+ here; those lines are skipped together with
-        // all other + / - options below.  This keeps UVM and every other
-        // dependency on the same path: add its package/source files to the
-        // filelist and let the normal syntax index discover package symbols,
-        // classes, macros, typedefs, etc. from those files.
+        // Recognize simulator-style include-directory entries in the filelist.
+        // The directory is not parsed as a source file; it is passed to slang's
+        // SourceManager so explicit source files can resolve `include "..."`.
         //
-        // Example:
-        //   +incdir+vendor/uvm/src        // ignored
-        //   vendor/uvm/src/uvm_pkg.sv    // indexed
-        //
-        // This is deliberately less simulator-like, but avoids maintaining a
-        // second "include search path" model that can diverge from the actual
-        // files LazyVerilog has parsed.
-        //
-        // Skip compiler options.
+        // Supported forms:
+        //   +incdir+rtl/include
+        //   +incdir+/abs/include
+        //   +incdir+dir_a+dir_b
+        if (item.starts_with("+incdir+")) {
+            std::string_view rest(item);
+            rest.remove_prefix(std::string_view("+incdir+").size());
+            while (!rest.empty()) {
+                const auto plus = rest.find('+');
+                auto dir_text = plus == std::string_view::npos ? rest : rest.substr(0, plus);
+                auto dir = std::filesystem::path(std::string(dir_text));
+                if (!dir.empty()) {
+                    if (dir.is_relative())
+                        dir = filelist_dir / dir;
+                    result.include_dirs.push_back(
+                        std::filesystem::absolute(dir).lexically_normal().string());
+                }
+                if (plus == std::string_view::npos)
+                    break;
+                rest.remove_prefix(plus + 1);
+            }
+            continue;
+        }
+
+        // Skip other compiler options / flags.
         if (item.starts_with("+") || item.starts_with("-"))
             continue;
 
@@ -343,8 +340,8 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
     analyzer_.set_defines(config_.design.define);
-    analyzer_.set_include_dirs(resolve_include_dirs(root_, config_));
     { auto vcode = load_vcode(root_, config_);
+      analyzer_.set_include_dirs(vcode.include_dirs);
       analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
     background_compiler_ =
         std::make_unique<BackgroundCompiler>([this](BackgroundCompileResult result) {
@@ -577,8 +574,8 @@ void LazyVerilogServer::register_handlers() {
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
                     analyzer_.set_defines(config_.design.define);
-                    analyzer_.set_include_dirs(resolve_include_dirs(root_, config_));
                     { auto vcode = load_vcode(root_, config_);
+                      analyzer_.set_include_dirs(vcode.include_dirs);
                       analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                     schedule_background_compilation();
@@ -594,8 +591,8 @@ void LazyVerilogServer::register_handlers() {
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
                     analyzer_.set_defines(config_.design.define);
-                    analyzer_.set_include_dirs(resolve_include_dirs(root_, config_));
                     { auto vcode = load_vcode(root_, config_);
+                      analyzer_.set_include_dirs(vcode.include_dirs);
                       analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                     schedule_background_compilation();
@@ -671,8 +668,8 @@ void LazyVerilogServer::register_handlers() {
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
                 analyzer_.set_defines(config_.design.define);
-                analyzer_.set_include_dirs(resolve_include_dirs(root_, config_));
                 { auto vcode = load_vcode(root_, config_);
+                  analyzer_.set_include_dirs(vcode.include_dirs);
                   analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
                 configure_background_compiler();
                 schedule_background_compilation();
@@ -701,8 +698,8 @@ void LazyVerilogServer::register_handlers() {
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
                     analyzer_.set_defines(config_.design.define);
-                    analyzer_.set_include_dirs(resolve_include_dirs(root_, config_));
                     { auto vcode = load_vcode(root_, config_);
+                      analyzer_.set_include_dirs(vcode.include_dirs);
                       analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                 }

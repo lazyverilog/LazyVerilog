@@ -20,7 +20,6 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     Config cfg = load_config(dir);
     CHECK(cfg.design.vcode.empty());
     CHECK(cfg.design.define.empty());
-    CHECK(cfg.design.include_dir.empty());
     CHECK(cfg.compilation.background_compilation == false);
     CHECK(cfg.compilation.background_compilation_threads == 1);
     CHECK(cfg.compilation.background_compilation_debounce_ms == 1500);
@@ -54,7 +53,6 @@ TEST_CASE("config: parse all sections correctly", "[config]") {
 [design]
 vcode = "my.f"
 define = ["RTL_SIM", "FAST_MODEL"]
-include_dir = ["vendor/uvm/src", "rtl/include"]
 
 [compilation]
 background_compilation = true
@@ -196,9 +194,6 @@ autoarg_on_save = true
     REQUIRE(cfg.design.define.size() == 2);
     CHECK(cfg.design.define[0] == "RTL_SIM");
     CHECK(cfg.design.define[1] == "FAST_MODEL");
-    REQUIRE(cfg.design.include_dir.size() == 2);
-    CHECK(cfg.design.include_dir[0] == "vendor/uvm/src");
-    CHECK(cfg.design.include_dir[1] == "rtl/include");
 
     CHECK(cfg.compilation.background_compilation == true);
     CHECK(cfg.compilation.background_compilation_threads == 2);

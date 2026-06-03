@@ -1,28 +1,27 @@
 # Design & Filelist
 
-Design-wide features (go-to-definition, find references, inlay hints, workspace symbols, AutoInst) require the full module set to be indexed. Provide a filelist to load the design.
+Design-wide features (go-to-definition, find references, inlay hints, workspace symbols, AutoInst, completion) require the relevant source files to be indexed. Provide a filelist to load the design.
 
 ```toml
 [design]
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]
-include_dir = ["vendor/uvm/src"]
 ```
 
 | Option | Type | Description |
 |--------|------|-------------|
 | `vcode` | string | Path to filelist (`.f`) relative to the `lazyverilog.toml` file |
 | `define` | string[] | Preprocessor defines passed to the parser for all design files |
-| `include_dir` | string[] | Include search directories, relative to `lazyverilog.toml`, used to resolve `` `include "..." `` directives |
 
 ## Filelist format
 
-One file path per line. Paths are relative to the `.f` file's directory.
+One source file path per line. Paths are relative to the `.f` file's directory.
 
-```
+```text
 rtl/m_alu.sv
 rtl/m_adder.sv
-rtl/m_multiplier.sv
++incdir+rtl/include
+vendor/uvm/src/uvm_pkg.sv
 ```
 
 Parsing rules:
@@ -31,37 +30,28 @@ Parsing rules:
 |--------|--------|
 | `// ...` | Line comment |
 | `# ...` | Line comment |
-| `+<option>` | Compiler options, including `+incdir+`, are silently ignored |
-| `-<flag>` | Compiler flags — silently ignored |
+| `+incdir+<dir>` | Add include search directory; `<dir>` is relative to the `.f` file |
+| `+incdir+<dir_a>+<dir_b>` | Add multiple include search directories |
+| `+<option>` | Other compiler options are silently ignored |
+| `-<flag>` | Compiler flags are silently ignored |
 
-LazyVerilog does not read include directories from `.f` files.  Simulator
-options such as `+incdir+vendor/uvm/src` are still ignored.  Use
-`[design].include_dir` in `lazyverilog.toml` instead.
+`+incdir+` entries are **not** parsed as source files. They are passed to slang's include resolver so explicit source files can resolve `` `include "..." `` directives.
 
-## Include directories
+## Include-heavy libraries
 
-`include_dir` lets a package/source file pull in headers without listing every
-header as an extra top-level file.  This is useful for libraries such as UVM:
-
-```toml
-[design]
-vcode = "demo/vcode.f"
-include_dir = ["demo/uvm-core/src"]
-```
+For libraries such as UVM, list the package/source file and use `+incdir+` for headers:
 
 ```text
 # demo/vcode.f
++incdir+./uvm-core/src
 ./uvm-core/src/uvm_pkg.sv
 ```
 
-With that setup, `uvm_pkg.sv` is the explicit indexed source file, and slang
-resolves lines such as:
+With that setup, `uvm_pkg.sv` is the explicit indexed source file, and slang resolves lines such as:
 
 ```systemverilog
 `include "base/uvm_base.svh"
 `include "comps/uvm_comps.svh"
 ```
 
-through the configured include directory.  This avoids parsing each UVM `.svh`
-as a separate filelist source while still allowing the package parse to discover
-classes, typedefs, methods, and macros for completion.
+through the configured include directory. This avoids parsing each UVM `.svh` as a separate filelist source while still allowing the package parse to discover classes, typedefs, methods, and macros for completion.

@@ -643,9 +643,10 @@ TEST_CASE("completion: demo UVM package scope returns indexed UVM symbols", "[co
     REQUIRE(std::filesystem::exists(vcode));
 
     // Mirror the real demo setup: UVM is intentionally treated like any other
-    // source library, so this test indexes the explicit source/header entries
-    // in demo/vcode.f instead of relying on hard-coded UVM knowledge.
+    // source library.  vcode.f lists uvm_pkg.sv as the explicit source and
+    // +incdir+ points slang at the headers included by that package.
     std::vector<std::string> files;
+    std::vector<std::string> include_dirs;
     std::ifstream filelist(vcode);
     REQUIRE(filelist.good());
     std::string filelist_line;
@@ -659,6 +660,26 @@ TEST_CASE("completion: demo UVM package scope returns indexed UVM symbols", "[co
             continue;
         auto last = filelist_line.find_last_not_of(" \t\r\n");
         auto item = filelist_line.substr(first, last - first + 1);
+        if (item.starts_with("+incdir+")) {
+            std::string rest = item.substr(std::string("+incdir+").size());
+            size_t start = 0;
+            while (start <= rest.size()) {
+                const size_t plus = rest.find('+', start);
+                auto dir_text = rest.substr(start, plus == std::string::npos
+                                                       ? std::string::npos
+                                                       : plus - start);
+                if (!dir_text.empty()) {
+                    auto dir = std::filesystem::path(dir_text);
+                    if (dir.is_relative())
+                        dir = vcode.parent_path() / dir;
+                    include_dirs.push_back(std::filesystem::absolute(dir).lexically_normal().string());
+                }
+                if (plus == std::string::npos)
+                    break;
+                start = plus + 1;
+            }
+            continue;
+        }
         if (item.starts_with("+") || item.starts_with("-"))
             continue;
         auto path = std::filesystem::path(item);
@@ -667,7 +688,8 @@ TEST_CASE("completion: demo UVM package scope returns indexed UVM symbols", "[co
         files.push_back(std::filesystem::absolute(path).lexically_normal().string());
     }
     REQUIRE(!files.empty());
-    analyzer.set_include_dirs({(root / "demo" / "uvm-core" / "src").string()});
+    REQUIRE(!include_dirs.empty());
+    analyzer.set_include_dirs(include_dirs);
     analyzer.set_extra_files(files);
 
     std::ifstream input(demo_file);

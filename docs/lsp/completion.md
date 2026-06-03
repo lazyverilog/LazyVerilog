@@ -64,8 +64,7 @@ m_fifo #(
 Triggered by `"` immediately after `` `include ``.
 
 Suggests `.svh` and `.vh` files listed in the design filelist (`.f` file configured under `[design]` in `lazyverilog.toml`).
-`[design].include_dir` is used for parser include resolution; it is not scanned
-as a file-completion directory yet.
+`+incdir+` entries in the design filelist are used for parser include resolution; those directories are not scanned as file-completion directories yet.
 
 ```systemverilog
 `include "|   // lists .svh/.vh files from the design filelist
@@ -77,7 +76,7 @@ Requires a filelist configured under `[design]` in `lazyverilog.toml`. See [Desi
 
 Triggered by `` ` ``.
 
-Suggests macro names defined in the current file and all files in the design filelist. If a listed source file includes headers through `[design].include_dir`, macros discovered during that parse are also available. Function-like macros insert a snippet with placeholders for each parameter. Object-like macros insert the name only.
+Suggests macro names defined in the current file and all files in the design filelist. If a listed source file includes headers through `+incdir+` resolution, macros discovered during that parse are also available. Function-like macros insert a snippet with placeholders for each parameter. Object-like macros insert the name only.
 
 ### General identifiers
 

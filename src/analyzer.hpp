@@ -106,10 +106,9 @@ class Analyzer {
 
     /// Set extra source files from the configured .f filelist.
     ///
-    /// LazyVerilog indexes only explicit source-file entries. Simulator-style
-    /// options such as +incdir+ are intentionally ignored by server.cpp before
-    /// this method is called, so libraries (including UVM) must appear as real
-    /// source paths in the filelist to contribute completion/index symbols.
+    /// LazyVerilog indexes only explicit source-file entries.  +incdir+
+    /// entries parsed from the same filelist are handled separately via
+    /// set_include_dirs(); they are include search paths, not source files.
     ///
     /// @param filelist_path  Resolved absolute path to the .f file itself (may be empty).
     ///                       Used to detect filelist changes with a single stat() per request
@@ -121,13 +120,11 @@ class Analyzer {
     /// Applied on every subsequent make_state call.
     void set_defines(const std::vector<std::string>& defines);
 
-    /// Set include directories (from config.design.include_dir).
+    /// Set include directories parsed from +incdir+ entries in the design filelist.
     ///
-    /// These are explicit LazyVerilog config paths, not simulator filelist
-    /// `+incdir+` entries.  They are given to slang's SourceManager so
-    /// `include "..." directives inside opened files and explicit filelist
-    /// sources can resolve library headers without parsing every header as a
-    /// separate top-level extra file.
+    /// They are given to slang's SourceManager so `include "..." directives
+    /// inside opened files and explicit filelist sources can resolve library
+    /// headers without parsing every header as a separate top-level extra file.
     void set_include_dirs(const std::vector<std::string>& include_dirs);
 
     /// Return extra files from .f filelist.

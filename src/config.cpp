@@ -129,13 +129,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                     }
                 });
             }
-            if (auto arr = (*d)["include_dir"].as_array()) {
-                arr->for_each([&](auto&& el) {
-                    if constexpr (toml::is_string<std::remove_cvref_t<decltype(el)>>) {
-                        cfg.design.include_dir.push_back(*el);
-                    }
-                });
-            }
         }
 
         // [compilation]

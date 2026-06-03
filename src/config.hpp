@@ -7,7 +7,6 @@
 struct DesignConfig {
     std::string vcode;               // .f filelist path
     std::vector<std::string> define; // preprocessor defines
-    std::vector<std::string> include_dir; // include directories for `include resolution
 };
 
 struct CompilationConfig {

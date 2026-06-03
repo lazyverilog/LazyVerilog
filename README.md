@@ -245,7 +245,6 @@ The config controls design inputs, semantic compilation, lint rules, formatter p
 [design]
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]
-include_dir = ["demo/uvm-core/src"]
 
 [format]
 enable_format_on_save = true
