@@ -24,6 +24,14 @@ static bool has_fold_kind(const std::vector<FoldingRange>& folds, int start, int
     });
 }
 
+static const FoldingRange* find_fold_kind(const std::vector<FoldingRange>& folds, int start,
+                                          int end, const std::string& kind) {
+    auto it = std::find_if(folds.begin(), folds.end(), [&](const FoldingRange& r) {
+        return r.startLine == start && r.endLine == end && r.kind == kind;
+    });
+    return it == folds.end() ? nullptr : &*it;
+}
+
 static bool has_exact_duplicate_fold(const std::vector<FoldingRange>& folds) {
     std::map<std::tuple<int, int, std::string>, int> seen;
     for (const auto& f : folds) {
@@ -470,4 +478,225 @@ endmodule
         CHECK_FALSE((f.startLine == 1 && f.endLine == 1));
         CHECK_FALSE((f.startLine == 2 && f.endLine == 2));
     }
+}
+
+TEST_CASE("foldingRange: imports separated by comments are not one import run",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_imports_comment_separator.sv";
+    analyzer.open(uri, R"(import pkg_a::*;
+
+// This comment documents why the next import is conditional or unusual.
+import pkg_b::*;
+
+module top;
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region [5,6] module top ... endmodule
+    //
+    // The two imports are not a visually consecutive import group: a blank line
+    // and an own-line comment separate them.  A single imports fold [0,3] would
+    // hide the separator comment and make two unrelated import groups look like
+    // one block.
+    CHECK_FALSE(has_fold_kind(folds, 0, 3, "imports"));
+}
+
+TEST_CASE("foldingRange: inactive branch recovers case folds from disabled tokens",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_inactive_case.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef NEVER_DEFINED_FOR_THIS_TEST
+always_comb begin
+    case (sel)
+        1'b0: begin
+            a = 1'b0;
+        end
+    endcase
+end
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Pretty expected fold map:
+    //   region [1,9] `ifdef NEVER_DEFINED_FOR_THIS_TEST ... `endif
+    //   region [2,8] inactive always_comb begin ... end, recovered from tokens
+    //   region [3,7] inactive case ... endcase, recovered from tokens
+    //   region [4,6] inactive case-item begin ... end, recovered from tokens
+    //
+    // Active code gets a CaseStatementSyntax fold.  Disabled code should expose
+    // an equivalent local fold so navigation does not degrade merely because the
+    // macro is currently undefined.
+    CHECK(has_fold(folds, 1, 9));
+    CHECK(has_fold(folds, 2, 8));
+    CHECK(has_fold(folds, 3, 7));
+    CHECK(has_fold(folds, 4, 6));
+}
+
+TEST_CASE("foldingRange: nested conditionals inside inactive branches fold independently",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_nested_inactive_ifdef.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef OUTER_DISABLED
+    `ifdef INNER_DISABLED
+        assign inner = 1'b1;
+    `endif
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // This guards the claim that nested directives inside disabled branches are
+    // still surfaced by slang as directive trivia and therefore do not require
+    // manual raw-source scanning.  If this fails, the inactive-token path must
+    // learn how to process directive tokens explicitly.
+    CHECK(has_fold(folds, 1, 5));
+    CHECK(has_fold(folds, 2, 4));
+}
+
+TEST_CASE("foldingRange: inactive branch recovers keyword-delimited regions",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_inactive_keyword_regions.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef DISABLED_REGIONS
+module inactive_mod;
+endmodule
+interface inactive_if;
+endinterface
+program inactive_prog;
+endprogram
+package inactive_pkg;
+endpackage
+class inactive_class;
+    function void inactive_func;
+    endfunction
+    task inactive_task;
+    endtask
+endclass
+checker inactive_checker;
+endchecker
+primitive inactive_udp(out, in);
+endprimitive
+config inactive_cfg;
+endconfig
+specify
+endspecify
+generate
+endgenerate
+property inactive_prop;
+endproperty
+sequence inactive_seq;
+endsequence
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Inactive code is not represented by the normal AST, so these folds must be
+    // recovered from slang disabled token kinds rather than raw source strings.
+    CHECK(has_fold(folds, 2, 3));   // module ... endmodule
+    CHECK(has_fold(folds, 4, 5));   // interface ... endinterface
+    CHECK(has_fold(folds, 6, 7));   // program ... endprogram
+    CHECK(has_fold(folds, 8, 9));   // package ... endpackage
+    CHECK(has_fold(folds, 10, 15)); // class ... endclass
+    CHECK(has_fold(folds, 11, 12)); // function ... endfunction
+    CHECK(has_fold(folds, 13, 14)); // task ... endtask
+    CHECK(has_fold(folds, 16, 17)); // checker ... endchecker
+    CHECK(has_fold(folds, 18, 19)); // primitive ... endprimitive
+    CHECK(has_fold(folds, 20, 21)); // config ... endconfig
+    CHECK(has_fold(folds, 22, 23)); // specify ... endspecify
+    CHECK(has_fold(folds, 24, 25)); // generate ... endgenerate
+    CHECK(has_fold(folds, 26, 27)); // property ... endproperty
+    CHECK(has_fold(folds, 28, 29)); // sequence ... endsequence
+}
+
+TEST_CASE("foldingRange: inactive branch recovers fork join variants",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_inactive_fork_regions.sv";
+    analyzer.open(uri, R"(module top;
+`ifdef DISABLED_FORKS
+fork
+join
+fork
+join_any
+fork
+join_none
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    CHECK(has_fold(folds, 2, 3)); // fork ... join
+    CHECK(has_fold(folds, 4, 5)); // fork ... join_any
+    CHECK(has_fold(folds, 6, 7)); // fork ... join_none
+}
+
+TEST_CASE("foldingRange: inactive branch recovers brace-delimited coverage regions",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_inactive_brace_regions.sv";
+    analyzer.open(uri, R"(class active_wrapper;
+`ifdef DISABLED_COVERAGE
+constraint inactive_c {
+    a inside {[0:3]};
+}
+covergroup inactive_cg;
+    coverpoint a {
+        bins low = {
+            [0:3]
+        };
+        illegal_bins bad = {
+            4
+        };
+    }
+    cross a, b {
+        ignore_bins selected = {
+            binsof(a)
+        };
+    }
+endgroup
+`endif
+endclass
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // The constraint / coverpoint / cross / bins folds are recovered with token
+    // kinds and brace-depth tracking.  Inner set-expression braces must not close
+    // the outer constraint fold early.
+    CHECK(has_fold(folds, 2, 4));   // constraint ... matching }
+    CHECK(has_fold(folds, 6, 13));  // coverpoint ... matching }
+    CHECK(has_fold(folds, 7, 9));   // bins ... matching }
+    CHECK(has_fold(folds, 10, 12)); // illegal_bins ... matching }
+    CHECK(has_fold(folds, 14, 18)); // cross ... matching }
+    CHECK(has_fold(folds, 15, 17)); // ignore_bins ... matching }
+}
+
+TEST_CASE("foldingRange: emitted character offsets describe real line columns",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_characters.sv";
+    analyzer.open(uri, R"(module top;
+    always_comb begin
+        a = b;
+    end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    const FoldingRange* module = find_fold_kind(folds, 0, 4, "region");
+    REQUIRE(module != nullptr);
+    CHECK(module->startCharacter == 0);
+    CHECK(module->endCharacter == 9); // strlen("endmodule")
+
+    const FoldingRange* always = find_fold_kind(folds, 1, 3, "region");
+    REQUIRE(always != nullptr);
+    CHECK(always->startCharacter == 4); // indentation before always_comb
+    CHECK(always->endCharacter == 7);   // four spaces + strlen("end")
 }
