@@ -45,6 +45,12 @@ static void backward_skip_ws(const std::string& text, size_t& pos) {
         --pos;
 }
 
+static std::string trim_completion_copy(std::string text);
+static std::optional<std::string> type_of_value(const SyntaxIndex& index,
+                                                 const std::string& scope,
+                                                 const std::string& name);
+static bool range_contains_offset(const slang::SourceRange& range, size_t offset);
+
 // Read the symbol that appears immediately before a SystemVerilog scope
 // operator (`::`).
 //
@@ -284,6 +290,260 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
     return DotCompletionSyntaxContext{.dot_offset = dots.best_start, .base_name = names.result};
 }
 
+static size_t token_start_offset(const slang::parsing::Token& token) {
+    if (!token || token.isMissing() || !token.location().valid())
+        return SIZE_MAX;
+    return token.location().offset();
+}
+
+static size_t token_end_offset(const slang::parsing::Token& token) {
+    const size_t start = token_start_offset(token);
+    if (start == SIZE_MAX)
+        return SIZE_MAX;
+    return start + token.rawText().size();
+}
+
+static bool token_delimited_region_contains(const slang::parsing::Token& open,
+                                            const slang::parsing::Token& close,
+                                            size_t offset) {
+    const size_t open_end = token_end_offset(open);
+    if (open_end == SIZE_MAX || open_end > offset)
+        return false;
+
+    const size_t close_start = token_start_offset(close);
+    if (close_start == SIZE_MAX)
+        return true;
+    return offset <= close_start;
+}
+
+static std::optional<std::string>
+simple_lhs_name_from_expression(const slang::syntax::ExpressionSyntax& expr) {
+    using namespace slang::syntax;
+
+    if (const auto* id = expr.as_if<IdentifierNameSyntax>())
+        return std::string(id->identifier.valueText());
+
+    // Common assignment LHS forms still have the assigned object as the left
+    // side of the expression:
+    //
+    //   arr[i] = |
+    //
+    // We return `arr`, letting the existing SyntaxIndex value-type lookup infer
+    // the element-compatible base type best-effort.
+    if (const auto* sel = expr.as_if<ElementSelectExpressionSyntax>())
+        return simple_lhs_name_from_expression(*sel->left);
+
+    return std::nullopt;
+}
+
+static bool is_assignment_expression_kind(slang::syntax::SyntaxKind kind) {
+    using slang::syntax::SyntaxKind;
+    switch (kind) {
+    case SyntaxKind::AssignmentExpression:
+    case SyntaxKind::NonblockingAssignmentExpression:
+    case SyntaxKind::AddAssignmentExpression:
+    case SyntaxKind::SubtractAssignmentExpression:
+    case SyntaxKind::MultiplyAssignmentExpression:
+    case SyntaxKind::DivideAssignmentExpression:
+    case SyntaxKind::ModAssignmentExpression:
+    case SyntaxKind::AndAssignmentExpression:
+    case SyntaxKind::OrAssignmentExpression:
+    case SyntaxKind::XorAssignmentExpression:
+    case SyntaxKind::LogicalLeftShiftAssignmentExpression:
+    case SyntaxKind::LogicalRightShiftAssignmentExpression:
+    case SyntaxKind::ArithmeticLeftShiftAssignmentExpression:
+    case SyntaxKind::ArithmeticRightShiftAssignmentExpression:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static std::string infer_assignment_lhs_type_from_syntax(
+    const slang::syntax::SyntaxTree& tree, size_t cursor_offset, const SyntaxIndex& index,
+    const std::string& current_scope) {
+    using namespace slang::syntax;
+
+    struct AssignmentVisitor : public SyntaxVisitor<AssignmentVisitor> {
+        size_t cursor_offset;
+        const SyntaxIndex& index;
+        const std::string& current_scope;
+        size_t best_operator_start{0};
+        std::string result;
+
+        AssignmentVisitor(size_t cursor_offset, const SyntaxIndex& index,
+                          const std::string& current_scope) :
+            cursor_offset(cursor_offset), index(index), current_scope(current_scope) {}
+
+        void handle(const BinaryExpressionSyntax& node) {
+            if (!is_assignment_expression_kind(node.kind)) {
+                visitDefault(node);
+                return;
+            }
+
+            const size_t op_start = token_start_offset(node.operatorToken);
+            const size_t op_end = token_end_offset(node.operatorToken);
+            if (op_start == SIZE_MAX || op_end == SIZE_MAX || op_end > cursor_offset) {
+                visitDefault(node);
+                return;
+            }
+
+            // Use token/node facts rather than scanning source text.  The
+            // cursor can be after a missing RHS (`state = |`), so we do not
+            // require the assignment expression's sourceRange to contain the
+            // cursor.  Instead, choose the nearest assignment operator before
+            // the cursor in the current SyntaxTree.
+            if (op_start < best_operator_start) {
+                visitDefault(node);
+                return;
+            }
+
+            if (auto lhs_name = simple_lhs_name_from_expression(*node.left)) {
+                if (auto lhs_type = type_of_value(index, current_scope, *lhs_name)) {
+                    best_operator_start = op_start;
+                    result = trim_completion_copy(*lhs_type);
+                }
+            }
+
+            visitDefault(node);
+        }
+    };
+
+    AssignmentVisitor visitor(cursor_offset, index, current_scope);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+struct NamedArgumentSyntaxContext {
+    CompletionContextKind kind{CompletionContextKind::Identifier};
+    std::string scope_name;
+    std::unordered_set<std::string> connected_names;
+};
+
+static void collect_named_params_before_dot(const slang::syntax::ParameterValueAssignmentSyntax& node,
+                                            size_t dot_offset,
+                                            std::unordered_set<std::string>& out) {
+    using namespace slang::syntax;
+    for (const auto* param : node.parameters) {
+        if (!param)
+            continue;
+        if (const auto* named = param->as_if<NamedParamAssignmentSyntax>()) {
+            const size_t named_dot = token_start_offset(named->dot);
+            if (named_dot != SIZE_MAX && named_dot < dot_offset && named->name &&
+                !named->name.isMissing()) {
+                out.insert(std::string(named->name.valueText()));
+            }
+        }
+    }
+}
+
+static void collect_named_ports_before_dot(const slang::syntax::HierarchicalInstanceSyntax& node,
+                                           size_t dot_offset,
+                                           std::unordered_set<std::string>& out) {
+    using namespace slang::syntax;
+    for (const auto* conn : node.connections) {
+        if (!conn)
+            continue;
+        if (const auto* named = conn->as_if<NamedPortConnectionSyntax>()) {
+            const size_t named_dot = token_start_offset(named->dot);
+            if (named_dot != SIZE_MAX && named_dot < dot_offset && named->name &&
+                !named->name.isMissing()) {
+                out.insert(std::string(named->name.valueText()));
+            }
+        }
+    }
+}
+
+static std::optional<NamedArgumentSyntaxContext>
+syntax_named_argument_context_at_dot(const slang::syntax::SyntaxTree& tree, size_t dot_offset) {
+    using namespace slang::syntax;
+
+    struct NamedArgVisitor : public SyntaxVisitor<NamedArgVisitor> {
+        size_t dot_offset;
+        std::optional<NamedArgumentSyntaxContext> result;
+        std::string current_instantiation_type;
+
+        explicit NamedArgVisitor(size_t dot_offset) : dot_offset(dot_offset) {}
+
+        bool done() const { return result.has_value(); }
+
+        void handle(const HierarchyInstantiationSyntax& node) {
+            if (done())
+                return;
+
+            const std::string saved_type = current_instantiation_type;
+            current_instantiation_type = std::string(node.type.valueText());
+
+            if (node.parameters) {
+                bool parameter_dot =
+                    token_delimited_region_contains(node.parameters->openParen,
+                                                    node.parameters->closeParen, dot_offset) ||
+                    range_contains_offset(node.parameters->sourceRange(), dot_offset);
+                for (const auto* param : node.parameters->parameters) {
+                    if (!param)
+                        continue;
+                    if (const auto* named = param->as_if<NamedParamAssignmentSyntax>()) {
+                        if (token_start_offset(named->dot) == dot_offset) {
+                            parameter_dot = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (parameter_dot) {
+                    NamedArgumentSyntaxContext ctx;
+                    ctx.kind = CompletionContextKind::Parameter;
+                    ctx.scope_name = current_instantiation_type;
+                    collect_named_params_before_dot(*node.parameters, dot_offset,
+                                                    ctx.connected_names);
+                    result = std::move(ctx);
+                    current_instantiation_type = saved_type;
+                    return;
+                }
+            }
+
+            visitDefault(node);
+            current_instantiation_type = saved_type;
+        }
+
+        void handle(const HierarchicalInstanceSyntax& node) {
+            if (done() || current_instantiation_type.empty()) {
+                visitDefault(node);
+                return;
+            }
+
+            bool port_dot = token_delimited_region_contains(node.openParen, node.closeParen,
+                                                            dot_offset) ||
+                            range_contains_offset(node.sourceRange(), dot_offset);
+            for (const auto* conn : node.connections) {
+                if (!conn)
+                    continue;
+                if (const auto* named = conn->as_if<NamedPortConnectionSyntax>()) {
+                    if (token_start_offset(named->dot) == dot_offset) {
+                        port_dot = true;
+                        break;
+                    }
+                }
+            }
+
+            if (port_dot) {
+                NamedArgumentSyntaxContext ctx;
+                ctx.kind = CompletionContextKind::NamedPort;
+                ctx.scope_name = current_instantiation_type;
+                collect_named_ports_before_dot(node, dot_offset, ctx.connected_names);
+                result = std::move(ctx);
+                return;
+            }
+
+            visitDefault(node);
+        }
+    };
+
+    NamedArgVisitor visitor(dot_offset);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
 static std::string trim_completion_copy(std::string text) {
     auto first =
         std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
@@ -318,42 +578,6 @@ static bool paren_is_event_control(const std::string& text, size_t open) {
     size_t pos = open;
     backward_skip_ws(text, pos);
     return pos > 0 && text[pos - 1] == '@';
-}
-
-// Given the offset of a '.' that triggered NamedPort/Parameter context, scan
-// backward to find the enclosing module name (the type identifier in a
-// hierarchy instantiation). Returns nullopt when not determinable.
-static std::optional<std::string> find_enclosing_instance(const std::string& text,
-                                                            size_t dot_offset) {
-    // Find the '(' opening our current argument list
-    const size_t paren = find_opening_paren(text, dot_offset);
-    if (paren >= text.size()) return std::nullopt;
-
-    size_t pos = paren; // just before '('
-    backward_skip_ws(text, pos);
-
-    // Skip a '#(...)' parameter block if present (for port list inside an
-    // already-parameterized instantiation, e.g. foo #(.W(8)) u0 (.clk|))
-    if (pos > 0 && text[pos - 1] == ')') {
-        --pos; // consume ')'
-        const size_t inner = find_opening_paren(text, pos + 1);
-        if (inner < text.size()) {
-            pos = inner;
-            if (pos > 0 && text[pos - 1] == '#') --pos;
-        }
-        backward_skip_ws(text, pos);
-    }
-
-    // Skip instance name
-    if (pos == 0 || !is_ident_char(text[pos - 1])) return std::nullopt;
-    while (pos > 0 && is_ident_char(text[pos - 1])) --pos;
-    backward_skip_ws(text, pos);
-
-    // Read module/type name
-    if (pos == 0 || !is_ident_char(text[pos - 1])) return std::nullopt;
-    const size_t mod_end = pos;
-    while (pos > 0 && is_ident_char(text[pos - 1])) --pos;
-    return text.substr(pos, mod_end - pos);
 }
 
 // Prefix / fuzzy match score. Returns 0 when there is no match.
@@ -535,38 +759,6 @@ static std::string completion_base_type_name(std::string type) {
     while (end < type.size() && is_ident_char(type[end]))
         ++end;
     return type.substr(0, end);
-}
-
-static std::string infer_assignment_lhs_type(const std::string& text, size_t offset,
-                                             const SyntaxIndex& index,
-                                             const std::string& scope) {
-    size_t pos = offset;
-    backward_skip_ws(text, pos);
-    if (pos == 0)
-        return {};
-
-    // Recognize the common RHS-expression completion point:
-    //     lhs = |
-    //     lhs <= |
-    //     lhs = pre|
-    // Prefix characters have already been left of the cursor in `offset`, so
-    // the operator should be immediately before whitespace.
-    if (text[pos - 1] == '=') {
-        --pos;
-        if (pos > 0 && text[pos - 1] == '<')
-            --pos;
-    } else {
-        return {};
-    }
-
-    backward_skip_ws(text, pos);
-    const std::string lhs = backward_read_word(text, pos);
-    if (lhs.empty())
-        return {};
-
-    if (auto type = type_of_value(index, scope, lhs))
-        return trim_completion_copy(*type);
-    return {};
 }
 
 static std::unordered_set<std::string> enum_members_for_type(const SyntaxIndex& index,
@@ -1389,7 +1581,9 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
     // Step 1: read the prefix (identifier chars already typed after trigger)
     size_t pos = offset;
     ctx.prefix = backward_read_word(text, pos);
-    ctx.expected_type = infer_assignment_lhs_type(text, pos, index, ctx.current_scope_name);
+    if (state.tree)
+        ctx.expected_type = infer_assignment_lhs_type_from_syntax(*state.tree, pos, index,
+                                                                  ctx.current_scope_name);
     // pos now at start of prefix
 
     if (pos == 0) {
@@ -1411,46 +1605,19 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
                 return ctx;
             }
 
-            // bare '.' (no preceding identifier) → NamedPort or Parameter
-            const size_t open = find_opening_paren(text, dot_offset);
-            if (open < text.size() && open > 0 && text[open - 1] == '#') {
-                ctx.kind = CompletionContextKind::Parameter;
-                // Module name sits directly before '#'; no instance name between
-                size_t hp = open - 1; // '#'
-                backward_skip_ws(text, hp);
-                ctx.scope_name = backward_read_word(text, hp);
-            } else {
-                ctx.kind = CompletionContextKind::NamedPort;
-                ctx.scope_name =
-                    find_enclosing_instance(text, dot_offset).value_or(std::string{});
+            // bare '.' (no preceding identifier) → NamedPort or Parameter.
+            // This is recovered from slang hierarchy-instantiation nodes and
+            // named connection/parameter nodes, not from a backward source
+            // scanner.  If the partial edit is too incomplete for slang to put
+            // the dot under an instantiation, we leave it as ordinary
+            // identifier completion instead of guessing from raw text.
+            if (auto named_arg_ctx = syntax_named_argument_context_at_dot(*state.tree,
+                                                                          dot_offset)) {
+                ctx.kind = named_arg_ctx->kind;
+                ctx.scope_name = std::move(named_arg_ctx->scope_name);
+                ctx.connected_ports = std::move(named_arg_ctx->connected_names);
+                return ctx;
             }
-
-            // Collect already-connected port/param names from .portname( patterns
-            // between the opening paren and the current dot.
-            if (open < dot_offset) {
-                size_t scan = open + 1;
-                while (scan < dot_offset) {
-                    if (text[scan] == '.') {
-                        ++scan;
-                        const size_t name_start = scan;
-                        while (scan < dot_offset && is_ident_char(text[scan]))
-                            ++scan;
-                        if (scan > name_start) {
-                            std::string port_name = text.substr(name_start, scan - name_start);
-                            // confirm followed (after optional ws) by '('
-                            size_t tmp = scan;
-                            while (tmp < dot_offset &&
-                                   std::isspace((unsigned char)text[tmp]))
-                                ++tmp;
-                            if (tmp < dot_offset && text[tmp] == '(')
-                                ctx.connected_ports.insert(std::move(port_name));
-                        }
-                    } else {
-                        ++scan;
-                    }
-                }
-            }
-            return ctx;
         }
     }
 
@@ -1458,41 +1625,19 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
     // that do not yet have a robust SyntaxTree recovery path.
     const char c1 = text[pos - 1];
 
-    if (c1 == '.') {
-        const size_t dot_offset = pos - 1;
-        const size_t open = find_opening_paren(text, dot_offset);
-        if (open < text.size() && open > 0 && text[open - 1] == '#') {
-            ctx.kind = CompletionContextKind::Parameter;
-            size_t hp = open - 1;
-            backward_skip_ws(text, hp);
-            ctx.scope_name = backward_read_word(text, hp);
-        } else {
-            ctx.kind = CompletionContextKind::NamedPort;
-            ctx.scope_name = find_enclosing_instance(text, dot_offset).value_or(std::string{});
+    // If the edit is malformed enough that slang does not surface the typed
+    // dot as a Dot token, we can still use the editor trigger location together
+    // with SyntaxTree hierarchy-instantiation nodes to classify named
+    // port/parameter completion.  This intentionally does not scan backward for
+    // module names or previous `.foo(` text; the surrounding instance and used
+    // connections still come from SyntaxTree nodes/tokens.
+    if (c1 == '.' && state.tree) {
+        if (auto named_arg_ctx = syntax_named_argument_context_at_dot(*state.tree, pos - 1)) {
+            ctx.kind = named_arg_ctx->kind;
+            ctx.scope_name = std::move(named_arg_ctx->scope_name);
+            ctx.connected_ports = std::move(named_arg_ctx->connected_names);
+            return ctx;
         }
-
-        if (open < dot_offset) {
-            size_t scan = open + 1;
-            while (scan < dot_offset) {
-                if (text[scan] == '.') {
-                    ++scan;
-                    const size_t name_start = scan;
-                    while (scan < dot_offset && is_ident_char(text[scan]))
-                        ++scan;
-                    if (scan > name_start) {
-                        std::string port_name = text.substr(name_start, scan - name_start);
-                        size_t tmp = scan;
-                        while (tmp < dot_offset && std::isspace((unsigned char)text[tmp]))
-                            ++tmp;
-                        if (tmp < dot_offset && text[tmp] == '(')
-                            ctx.connected_ports.insert(std::move(port_name));
-                    }
-                } else {
-                    ++scan;
-                }
-            }
-        }
-        return ctx;
     }
 
     // --- pkg::sym | / class#(...)::sym | ---------------------------------
