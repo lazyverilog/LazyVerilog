@@ -2,7 +2,7 @@
 
 **LSP:** `textDocument/completion`
 
-Context-aware completion for SystemVerilog. Suggestions vary by what the cursor is inside — named port lists, member access, package scope, macro invocations, and general identifiers are all handled separately.
+Context-aware completion for SystemVerilog. Suggestions vary by what the cursor is inside — keyword positions, identifier expressions, named port lists, member access, package scope, macro invocations, and include directives are handled separately.
 
 ---
 
@@ -38,6 +38,11 @@ Suggests symbols visible from the current syntax context. Module/interface names
 are available where an instantiation can start, but they are hidden in procedural
 expression contexts such as `state = |`.
 
+Block-local declarations are visible only inside their enclosing lexical range.
+Local/current-file symbols rank ahead of symbols from the design filelist.
+When completing the right-hand side of an assignment, enum literals and signals
+with a compatible syntactic type are ranked higher.
+
 Package-owned classes, typedefs, enum literals, values, functions, and tasks are
 not flattened into ordinary identifier completion merely because their package
 source is listed in `vcode.f`. They become ordinary identifier candidates only
@@ -53,13 +58,16 @@ uvm_pkg::                   // explicit package-scope completion
 
 Triggered by `.` inside a module instantiation argument list.
 
-Suggests all ports from the instantiated module as `.port(port)` connections.
+Suggests only ports from the instantiated module that are not already connected.
+If every port is connected, no named-port items are returned. Items insert as
+snippets, for example `.clk(${1:clk})`, and the insertion text omits the already
+typed dot.
 
 ```systemverilog
 m_fifo u_fifo (
     .i_clk(i_clk),
     .i_rst_n(i_rst_n),
-    .i_data(|)  // typing . here lists all module ports
+    .i_data(|)  // typing . here lists remaining unconnected ports
 );
 ```
 
@@ -78,6 +86,9 @@ bus_if_inst.     // lists interface signals and modports
 ```
 
 The member-access trigger itself is detected from the SyntaxTree dot token and its immediately-adjacent left-hand name. Type resolution is still syntactic and best-effort; complex expressions and long typedef chains may not resolve.
+
+Member definitions can come from the current file or from files listed in
+`vcode.f`.
 
 ### Package scope
 
@@ -106,12 +117,16 @@ pkg_a::   // lists a_state_t, A_IDLE, A_DONE, a_object; not b_object
 
 Include-heavy packages such as UVM work the same way when the package source is
 listed in `vcode.f` and its headers are reachable through `+incdir+` entries.
+Package-scope completion remains available after go-to-definition opens the
+package source and the user returns to the original buffer.
 
 ### Parameter connections
 
 Triggered by `.` inside `#(...)`.
 
-Suggests unassigned parameter names from the instantiated module. The declared type and default value are shown in the detail field (e.g., `int = 256`).
+Suggests unresolved parameter names from the instantiated module. The declared
+type and default value are shown in the detail field (e.g., `int = 256`). If all
+parameters are assigned, no parameter items are returned.
 
 ```systemverilog
 m_fifo #(
@@ -136,13 +151,21 @@ Requires a filelist configured under `[design]` in `lazyverilog.toml`. See [Desi
 
 Triggered by `` ` ``.
 
-Suggests macro names defined in the current file and all files in the design filelist. If a listed source file includes headers through `+incdir+` resolution, macros discovered during that parse are also available. Function-like macros insert a snippet with placeholders for each parameter. Object-like macros insert the name only.
+Suggests macro names visible from the current file's preprocessing context,
+including macros from headers included by the current file. Extra-file macros are
+not flattened into unrelated buffers. Function-like macros insert a snippet with
+placeholders for each parameter; object-like macros insert the name only. slang
+built-in macros with no real source location, such as `SV_COV_ERROR`, are hidden
+from completion, hover, and go-to-definition.
 
 ### General identifiers
 
 Triggered on any identifier position.
 
 Suggests visible identifiers from the current SyntaxTree scope plus appropriate global design symbols such as package names and module/interface names in instantiation-capable contexts. Package members from filelist libraries are filtered by visible `import` declarations, module ports and declarations from unrelated modules are not flattened into the current scope, and block-local declarations are visible only inside their enclosing block range. Structural snippets (`module`, `class`, `always_ff`, `function`, etc.) are also included.
+
+Snippet suggestions are context-aware. For example, `always_comb` is offered at
+module/interface item level, but not inside a class or covergroup body.
 
 ---
 
@@ -152,12 +175,14 @@ Items are sorted by a combined score:
 
 - **Prefix match**: exact case-insensitive prefix match scores highest; fuzzy match (all typed characters appear in order) scores lower; no match is excluded
 - **Scope**: symbols declared in the current file score higher than symbols from the design filelist
+- **Type hints**: enum literals and same-type signals score higher in assignment contexts
 
 ---
 
 ## Degradation
 
-If the file has syntax errors, context detection falls back to the `Identifier` context, which returns all indexed symbols and keywords.
+If the file has syntax errors, context detection falls back to the `Identifier`
+context. Visibility filters still apply where possible.
 
 ---
 
