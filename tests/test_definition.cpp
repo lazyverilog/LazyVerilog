@@ -204,12 +204,14 @@ TEST_CASE("definition: named subroutine argument resolves to formal argument", "
     CHECK(loc->end_col == 28);
 }
 
-TEST_CASE("definition: macro lookup uses cached extra files", "[definition]") {
+TEST_CASE("definition: macro lookup uses open extra file AST", "[definition]") {
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_macro.sv", kExtraDefinitionFixture);
+    const std::string extra_uri = "file://" + extra_path.string();
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_macro.sv";
     analyzer.set_extra_files({extra_path.string()});
+    analyzer.open(extra_uri, kExtraDefinitionFixture);
     analyzer.open(top_uri, kTopUsingExtraFixture);
 
     auto loc = analyzer.definition_of(top_uri, 9, 13);
@@ -233,12 +235,14 @@ TEST_CASE("definition: slang built-in macro has no user-facing definition", "[de
     CHECK_FALSE(analyzer.definition_of(uri, 1, 18).has_value());
 }
 
-TEST_CASE("definition: named subroutine argument lookup uses cached extra files", "[definition]") {
+TEST_CASE("definition: named subroutine argument lookup uses open extra file AST", "[definition]") {
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_arg.sv", kExtraDefinitionFixture);
+    const std::string extra_uri = "file://" + extra_path.string();
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_arg.sv";
     analyzer.set_extra_files({extra_path.string()});
+    analyzer.open(extra_uri, kExtraDefinitionFixture);
     analyzer.open(top_uri, kTopUsingExtraFixture);
 
     auto loc = analyzer.definition_of(top_uri, 7, 15);
@@ -250,12 +254,14 @@ TEST_CASE("definition: named subroutine argument lookup uses cached extra files"
     std::filesystem::remove(extra_path);
 }
 
-TEST_CASE("definition: generic lookup uses cached extra files", "[definition]") {
+TEST_CASE("definition: generic lookup uses open extra file AST", "[definition]") {
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_generic.sv", kExtraDefinitionFixture);
+    const std::string extra_uri = "file://" + extra_path.string();
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_generic.sv";
     analyzer.set_extra_files({extra_path.string()});
+    analyzer.open(extra_uri, kExtraDefinitionFixture);
     analyzer.open(top_uri, kTopUsingExtraFixture);
 
     auto loc = analyzer.definition_of(top_uri, 10, 6);
@@ -304,6 +310,9 @@ TEST_CASE("extra file cache refreshes on explicit filelist reset and drops remov
                                           "endmodule\n");
     const std::string top_uri = "file:///tmp/lazyverilog_definition_cache_top.sv";
     analyzer.set_extra_files({extra_path.string()});
+    auto snapshots = analyzer.extra_file_snapshots();
+    REQUIRE(snapshots.size() == 1);
+    CHECK(snapshots[0].state == nullptr);
     analyzer.open(top_uri, "module top;\n"
                            "    logic clk, done;\n"
                            "    child u_child(.clk(clk), .done(done));\n"

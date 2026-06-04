@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "dynamic_file_index.hpp"
 #include "features/autoff.hpp"
 #include "features/autowire.hpp"
 #include "syntax_index.hpp"
@@ -91,7 +92,7 @@ TEST_CASE("autowire uses cached extra-file modules", "[autowire]") {
     auto state = analyzer.get_state(uri);
     REQUIRE(state);
     REQUIRE(state->tree);
-    auto index = state->index;
+    auto index = build_dynamic_file_index(*state);
     analyzer.merge_extra_file_modules(index);
 
     auto updated = autowire_apply(*state, index, AutowireOptions{});
@@ -114,9 +115,9 @@ TEST_CASE("autowire ignores missing signals in later modules", "[autowire]") {
     REQUIRE(state);
     REQUIRE(state->tree);
 
-    auto updated = autowire_apply(*state, state->index, AutowireOptions{});
+    auto updated = autowire_apply(*state, build_dynamic_file_index(*state), AutowireOptions{});
     CHECK(updated == state->text);
 
-    updated = autowire_apply(*state, state->index, AutowireOptions{}, 4);
+    updated = autowire_apply(*state, build_dynamic_file_index(*state), AutowireOptions{}, 4);
     CHECK(updated.find("module inv(input logic i_a);\nlogic i_d;\n") != std::string::npos);
 }

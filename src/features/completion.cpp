@@ -754,6 +754,10 @@ static std::string infer_current_scope(const DocumentState& state, const SyntaxI
     return infer_current_scope_from_index(index, line);
 }
 
+static std::string completion_syntax_text(const slang::syntax::SyntaxNode& node) {
+    return trim_completion_copy(node.toString());
+}
+
 static KeywordContextKind infer_keyword_context(const DocumentState& state, size_t offset) {
     if (!state.tree)
         return KeywordContextKind::General;
@@ -962,6 +966,681 @@ static lsCompletionItem make_item(std::string label, lsCompletionItemKind kind) 
     item.label = std::move(label);
     item.kind = optional<lsCompletionItemKind>(kind);
     return item;
+}
+
+static std::pair<int, int> completion_ast_token_pos(const slang::SourceManager& sm,
+                                                    const slang::parsing::Token& token) {
+    if (!token || !token.location().valid())
+        return {0, 0};
+    const auto line = sm.getLineNumber(token.location());
+    const auto col = sm.getColumnNumber(token.location());
+    return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
+}
+
+static std::string completion_ast_text(const slang::syntax::SyntaxNode& node) {
+    return trim_completion_copy(node.toString());
+}
+
+static void push_unique_item(std::vector<lsCompletionItem>& items,
+                             std::unordered_set<std::string>& seen,
+                             std::string name,
+                             lsCompletionItemKind kind,
+                             std::string detail = {}) {
+    if (name.empty() || !seen.insert(name).second)
+        return;
+    auto item = make_item(std::move(name), kind);
+    if (!detail.empty())
+        item.detail = optional<std::string>(std::move(detail));
+    items.push_back(std::move(item));
+}
+
+static std::vector<lsCompletionItem>
+current_file_identifier_items_from_ast(const DocumentState& state, const CompletionContext& ctx) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree)
+        return items;
+    std::unordered_set<std::string> seen;
+    const size_t offset = position_to_offset(state.text, ctx.line, ctx.col);
+
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const CompletionContext& ctx;
+        size_t offset;
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string>& seen;
+        bool in_current_module{false};
+        int package_depth{0};
+        std::vector<bool> block_contains_cursor;
+
+        Visitor(const slang::SourceManager& sm, const CompletionContext& ctx, size_t offset,
+                std::vector<lsCompletionItem>& items, std::unordered_set<std::string>& seen)
+            : sm(sm), ctx(ctx), offset(offset), items(items), seen(seen) {}
+
+        bool contains(const SyntaxNode& node) const {
+            const auto r = node.sourceRange();
+            return r.start().valid() && r.end().valid() &&
+                   r.start().offset() <= offset && offset <= r.end().offset();
+        }
+
+        bool before_cursor(const slang::parsing::Token& token) const {
+            return token && token.location().valid() && token.location().offset() <= offset;
+        }
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            const std::string name(node.header->name.valueText());
+            if (node.kind == SyntaxKind::PackageDeclaration) {
+                push_unique_item(items, seen, name, lsCompletionItemKind::Module, "package");
+                ++package_depth;
+                visitDefault(node);
+                --package_depth;
+                return;
+            }
+            if (module_name_visible_in_identifier_context(SyntaxIndex{}, ctx,
+                                                          ModuleEntry{.name = name}))
+                push_unique_item(items, seen, name, lsCompletionItemKind::Module, "module");
+
+            const bool old = in_current_module;
+            in_current_module = contains(node);
+            if (in_current_module)
+                visitDefault(node);
+            in_current_module = old;
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            if (package_depth > 0)
+                return;
+            push_unique_item(items, seen, std::string(node.name.valueText()),
+                             lsCompletionItemKind::Class);
+        }
+
+        void handle(const TypedefDeclarationSyntax& node) {
+            if (package_depth > 0)
+                return;
+            push_unique_item(items, seen, std::string(node.name.valueText()),
+                             node.type->kind == SyntaxKind::EnumType ? lsCompletionItemKind::Enum
+                                                                     : lsCompletionItemKind::TypeParameter);
+            if (const auto* enum_type = node.type->as_if<EnumTypeSyntax>()) {
+                for (const auto* member : enum_type->members) {
+                    if (member)
+                        push_unique_item(items, seen, std::string(member->name.valueText()),
+                                         lsCompletionItemKind::EnumMember);
+                }
+            }
+        }
+
+        void handle(const BlockStatementSyntax& node) {
+            if (!in_current_module)
+                return;
+            block_contains_cursor.push_back(contains(node));
+            visitDefault(node);
+            block_contains_cursor.pop_back();
+        }
+
+        bool visible_here() const {
+            return block_contains_cursor.empty() ||
+                   std::find(block_contains_cursor.begin(), block_contains_cursor.end(), true) !=
+                       block_contains_cursor.end();
+        }
+
+        void handle(const DataDeclarationSyntax& node) {
+            if (!in_current_module || !visible_here())
+                return;
+            const auto type = completion_ast_text(*node.type);
+            for (const auto* decl : node.declarators) {
+                if (!decl || !before_cursor(decl->name))
+                    continue;
+                push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                 lsCompletionItemKind::Variable, type);
+            }
+            visitDefault(node);
+        }
+
+        void handle(const LocalVariableDeclarationSyntax& node) {
+            if (!in_current_module || !visible_here())
+                return;
+            const auto type = completion_ast_text(*node.type);
+            for (const auto* decl : node.declarators) {
+                if (!decl || !before_cursor(decl->name))
+                    continue;
+                push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                 lsCompletionItemKind::Variable, type);
+            }
+            visitDefault(node);
+        }
+
+        void handle(const PortDeclarationSyntax& node) {
+            if (!in_current_module)
+                return;
+            const auto type = completion_ast_text(*node.header);
+            for (const auto* decl : node.declarators) {
+                if (decl)
+                    push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                     lsCompletionItemKind::Variable, type);
+            }
+        }
+    };
+
+    Visitor visitor(state.tree->sourceManager(), ctx, offset, items, seen);
+    state.tree->root().visit(visitor);
+    return items;
+}
+
+static std::string current_ast_decl_text(const slang::syntax::SyntaxNode& node) {
+    return trim_completion_copy(node.toString());
+}
+
+static bool current_ast_token_before(const slang::parsing::Token& token, size_t offset) {
+    return token && token.location().valid() && token.location().offset() <= offset;
+}
+
+static void current_ast_add_port_item(std::vector<lsCompletionItem>& items,
+                                      std::unordered_set<std::string>& seen,
+                                      const PortEntry& p,
+                                      bool parameter_context) {
+    if (!seen.insert(p.name).second)
+        return;
+    lsCompletionItem item;
+    item.label = "." + p.name;
+    item.filterText = optional<std::string>(p.name);
+    item.kind = optional<lsCompletionItemKind>(parameter_context
+                                                  ? lsCompletionItemKind::Constant
+                                                  : lsCompletionItemKind::Field);
+    std::string detail = p.direction + (p.type.empty() ? "" : " " + p.type);
+    if (parameter_context && !p.default_value.empty())
+        detail += (detail.empty() ? "" : " ") + std::string("= ") + p.default_value;
+    if (!detail.empty())
+        item.detail = optional<std::string>(std::move(detail));
+    item.insertText = optional<std::string>(parameter_context ? p.name + "(${1:})"
+                                                              : p.name + "(${1:" + p.name + "})");
+    item.insertTextFormat = optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
+    items.push_back(std::move(item));
+}
+
+static std::string current_ast_port_direction(const slang::syntax::PortHeaderSyntax& header) {
+    using namespace slang::syntax;
+    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
+        return std::string(variable->direction.valueText()).empty()
+                   ? "unknown"
+                   : std::string(variable->direction.valueText());
+    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
+        return std::string(net->direction.valueText()).empty() ? "unknown"
+                                                               : std::string(net->direction.valueText());
+    return "unknown";
+}
+
+static std::string current_ast_port_type(const slang::syntax::PortHeaderSyntax& header) {
+    using namespace slang::syntax;
+    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
+        return current_ast_decl_text(*variable->dataType);
+    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
+        return current_ast_decl_text(*net->dataType);
+    return {};
+}
+
+static std::vector<lsCompletionItem>
+current_file_named_argument_items_from_ast(const DocumentState& state, const CompletionContext& ctx) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree || ctx.scope_name.empty())
+        return items;
+
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        const CompletionContext& ctx;
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string> seen;
+
+        Visitor(const CompletionContext& ctx, std::vector<lsCompletionItem>& items)
+            : ctx(ctx), items(items) {}
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            if (std::string(node.header->name.valueText()) != ctx.scope_name)
+                return;
+
+            auto add = [&](const slang::parsing::Token& name, std::string direction,
+                           std::string type, std::string default_value = {}) {
+                if (!name)
+                    return;
+                const bool is_param = direction == "parameter" || direction == "localparam";
+                if (ctx.kind == CompletionContextKind::NamedPort && is_param)
+                    return;
+                if (ctx.kind == CompletionContextKind::Parameter && !is_param)
+                    return;
+                if (ctx.connected_ports.count(std::string(name.valueText())))
+                    return;
+                current_ast_add_port_item(items, seen,
+                                          PortEntry{.name = std::string(name.valueText()),
+                                                    .direction = std::move(direction),
+                                                    .type = std::move(type),
+                                                    .default_value = std::move(default_value)},
+                                          ctx.kind == CompletionContextKind::Parameter);
+            };
+
+            if (node.header->parameters) {
+                for (const auto* base : node.header->parameters->declarations) {
+                    const auto* param = base ? base->as_if<ParameterDeclarationSyntax>() : nullptr;
+                    if (!param)
+                        continue;
+                    const auto type = current_ast_decl_text(*param->type);
+                    for (const auto* decl : param->declarators) {
+                        if (!decl)
+                            continue;
+                        std::string def;
+                        if (decl->initializer)
+                            def = current_ast_decl_text(*decl->initializer->expr);
+                        add(decl->name, std::string(param->keyword.valueText()), type, def);
+                    }
+                }
+            }
+
+            if (node.header->ports) {
+                if (const auto* ansi = node.header->ports->as_if<AnsiPortListSyntax>()) {
+                    for (const auto* port : ansi->ports) {
+                        if (const auto* implicit = port ? port->as_if<ImplicitAnsiPortSyntax>() : nullptr) {
+                            add(implicit->declarator->name,
+                                current_ast_port_direction(*implicit->header),
+                                current_ast_port_type(*implicit->header));
+                        } else if (const auto* explicit_port =
+                                       port ? port->as_if<ExplicitAnsiPortSyntax>() : nullptr) {
+                            add(explicit_port->name, std::string(explicit_port->direction.valueText()),
+                                {});
+                        }
+                    }
+                }
+            }
+
+            for (const auto* member : node.members) {
+                const auto* port_decl = member ? member->as_if<PortDeclarationSyntax>() : nullptr;
+                if (!port_decl)
+                    continue;
+                const auto direction = current_ast_port_direction(*port_decl->header);
+                const auto type = current_ast_port_type(*port_decl->header);
+                for (const auto* decl : port_decl->declarators) {
+                    if (decl)
+                        add(decl->name, direction, type);
+                }
+            }
+        }
+    };
+
+    Visitor visitor(ctx, items);
+    state.tree->root().visit(visitor);
+    return items;
+}
+
+static std::vector<lsCompletionItem>
+current_file_macro_items_from_ast(const DocumentState& state, bool with_backtick) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree)
+        return items;
+    std::unordered_set<std::string> seen;
+    const auto& sm = state.tree->sourceManager();
+    for (const auto* def : state.tree->getDefinedMacros()) {
+        if (!def || !def->name || !def->name.location().valid() || !sm.isFileLoc(def->name.location()))
+            continue;
+        std::string name(def->name.valueText());
+        if (!seen.insert(name).second)
+            continue;
+        auto item = make_item(with_backtick ? "`" + name : name,
+                              def->formalArguments ? lsCompletionItemKind::Function
+                                                   : lsCompletionItemKind::Constant);
+        if (def->formalArguments) {
+            std::string snippet = name + "(";
+            int idx = 1;
+            for (const auto* arg : def->formalArguments->args) {
+                if (!arg)
+                    continue;
+                if (idx > 1)
+                    snippet += ", ";
+                snippet += "${" + std::to_string(idx++) + ":" + std::string(arg->name.valueText()) + "}";
+            }
+            snippet += ")";
+            item.insertText = optional<std::string>(std::move(snippet));
+            item.insertTextFormat = optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
+        }
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+static void current_ast_emit_package_member(const slang::syntax::MemberSyntax& member,
+                                            std::vector<lsCompletionItem>& items,
+                                            std::unordered_set<std::string>& seen) {
+    using namespace slang::syntax;
+    if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
+        push_unique_item(items, seen, std::string(td->name.valueText()),
+                         td->type->kind == SyntaxKind::EnumType ? lsCompletionItemKind::Enum
+                                                                : lsCompletionItemKind::TypeParameter);
+        if (const auto* enum_type = td->type->as_if<EnumTypeSyntax>()) {
+            for (const auto* em : enum_type->members) {
+                if (em)
+                    push_unique_item(items, seen, std::string(em->name.valueText()),
+                                     lsCompletionItemKind::EnumMember);
+            }
+        }
+    } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
+        push_unique_item(items, seen, std::string(cls->name.valueText()), lsCompletionItemKind::Class);
+    } else if (const auto* fn = member.as_if<FunctionDeclarationSyntax>()) {
+        push_unique_item(items, seen, completion_ast_text(*fn->prototype->name),
+                         lsCompletionItemKind::Function);
+    } else if (const auto* data = member.as_if<DataDeclarationSyntax>()) {
+        for (const auto* decl : data->declarators) {
+            if (decl)
+                push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                 lsCompletionItemKind::Variable);
+        }
+    } else if (const auto* ps = member.as_if<ParameterDeclarationStatementSyntax>()) {
+        if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+            for (const auto* decl : param->declarators) {
+                if (decl)
+                    push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                     lsCompletionItemKind::Constant);
+            }
+        }
+    }
+}
+
+static std::vector<lsCompletionItem>
+current_file_package_scope_items_from_ast(const DocumentState& state, std::string_view scope) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree || scope.empty())
+        return items;
+    std::unordered_set<std::string> seen;
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        std::string_view scope;
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string>& seen;
+        Visitor(std::string_view scope, std::vector<lsCompletionItem>& items,
+                std::unordered_set<std::string>& seen)
+            : scope(scope), items(items), seen(seen) {}
+        void handle(const ModuleDeclarationSyntax& node) {
+            if (node.kind == SyntaxKind::PackageDeclaration &&
+                std::string_view(node.header->name.valueText()) == scope) {
+                for (const auto* member : node.members) {
+                    if (member)
+                        current_ast_emit_package_member(*member, items, seen);
+                }
+                return;
+            }
+            visitDefault(node);
+        }
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != scope)
+                return;
+            for (const auto* item : node.items) {
+                const auto* method = item ? item->as_if<ClassMethodDeclarationSyntax>() : nullptr;
+                if (!method)
+                    continue;
+                push_unique_item(items, seen, completion_ast_text(*method->declaration->prototype->name),
+                                 method->declaration->kind == SyntaxKind::TaskDeclaration
+                                     ? lsCompletionItemKind::Method
+                                     : lsCompletionItemKind::Function);
+            }
+        }
+    } visitor(scope, items, seen);
+    state.tree->root().visit(visitor);
+    return items;
+}
+
+static std::vector<lsCompletionItem>
+current_file_new_expression_items_from_ast(const DocumentState& state) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree)
+        return items;
+    std::unordered_set<std::string> seen;
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string>& seen;
+        Visitor(std::vector<lsCompletionItem>& items, std::unordered_set<std::string>& seen)
+            : items(items), seen(seen) {}
+        void handle(const ClassDeclarationSyntax& node) {
+            push_unique_item(items, seen, std::string(node.name.valueText()), lsCompletionItemKind::Class);
+            visitDefault(node);
+        }
+    } visitor(items, seen);
+    state.tree->root().visit(visitor);
+    return items;
+}
+
+static std::string current_file_type_of_name_from_ast(const DocumentState& state,
+                                                      const CompletionContext& ctx) {
+    if (!state.tree || ctx.scope_name.empty())
+        return ctx.scope_name;
+    const size_t offset = position_to_offset(state.text, ctx.line, ctx.col);
+    std::string result;
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        const CompletionContext& ctx;
+        size_t offset;
+        std::string& result;
+        Visitor(const CompletionContext& ctx, size_t offset, std::string& result)
+            : ctx(ctx), offset(offset), result(result) {}
+        bool before(const slang::parsing::Token& t) const {
+            return current_ast_token_before(t, offset);
+        }
+        void handle(const DataDeclarationSyntax& node) {
+            if (!result.empty())
+                return;
+            for (const auto* decl : node.declarators) {
+                if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
+                    result = completion_base_type_name(current_ast_decl_text(*node.type));
+                    return;
+                }
+            }
+            visitDefault(node);
+        }
+        void handle(const LocalVariableDeclarationSyntax& node) {
+            if (!result.empty())
+                return;
+            for (const auto* decl : node.declarators) {
+                if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
+                    result = completion_base_type_name(current_ast_decl_text(*node.type));
+                    return;
+                }
+            }
+            visitDefault(node);
+        }
+        void handle(const HierarchyInstantiationSyntax& node) {
+            if (!result.empty())
+                return;
+            for (const auto* inst : node.instances) {
+                if (inst && inst->decl && inst->decl->name.valueText() == ctx.scope_name) {
+                    result = std::string(node.type.valueText());
+                    return;
+                }
+            }
+        }
+    } visitor(ctx, offset, result);
+    state.tree->root().visit(visitor);
+    return result.empty() ? ctx.scope_name : result;
+}
+
+static std::vector<lsCompletionItem>
+current_file_member_access_items_from_ast(const DocumentState& state, const CompletionContext& ctx) {
+    std::vector<lsCompletionItem> items;
+    if (!state.tree || ctx.scope_name.empty())
+        return items;
+    std::unordered_set<std::string> seen;
+    const std::string target = current_file_type_of_name_from_ast(state, ctx);
+    using namespace slang::syntax;
+
+    std::function<void(std::string_view)> emit_class;
+    emit_class = [&](std::string_view class_name) {
+        struct ClassVisitor : SyntaxVisitor<ClassVisitor> {
+            std::string_view class_name;
+            std::vector<lsCompletionItem>& items;
+            std::unordered_set<std::string>& seen;
+            const std::function<void(std::string_view)>& emit_class;
+            ClassVisitor(std::string_view class_name, std::vector<lsCompletionItem>& items,
+                         std::unordered_set<std::string>& seen,
+                         const std::function<void(std::string_view)>& emit_class)
+                : class_name(class_name), items(items), seen(seen), emit_class(emit_class) {}
+            void handle(const ClassDeclarationSyntax& node) {
+                if (std::string_view(node.name.valueText()) != class_name) {
+                    visitDefault(node);
+                    return;
+                }
+                if (node.extendsClause)
+                    emit_class(completion_base_type_name(current_ast_decl_text(*node.extendsClause->baseName)));
+                for (const auto* item : node.items) {
+                    if (const auto* prop = item ? item->as_if<ClassPropertyDeclarationSyntax>() : nullptr) {
+                        if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+                            const auto type = current_ast_decl_text(*data->type);
+                            for (const auto* decl : data->declarators) {
+                                if (decl)
+                                    push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                                     lsCompletionItemKind::Field, type);
+                            }
+                        }
+                    } else if (const auto* method =
+                                   item ? item->as_if<ClassMethodDeclarationSyntax>() : nullptr) {
+                        push_unique_item(items, seen,
+                                         completion_ast_text(*method->declaration->prototype->name),
+                                         lsCompletionItemKind::Method);
+                    }
+                }
+            }
+        } visitor(class_name, items, seen, emit_class);
+        state.tree->root().visit(visitor);
+    };
+
+    emit_class(target);
+
+    struct OtherVisitor : SyntaxVisitor<OtherVisitor> {
+        std::string_view target;
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string>& seen;
+        OtherVisitor(std::string_view target, std::vector<lsCompletionItem>& items,
+                     std::unordered_set<std::string>& seen)
+            : target(target), items(items), seen(seen) {}
+        void handle(const TypedefDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != target)
+                return;
+            if (const auto* st = node.type->as_if<StructUnionTypeSyntax>()) {
+                for (const auto* member : st->members) {
+                    if (!member)
+                        continue;
+                    const auto type = current_ast_decl_text(*member->type);
+                    for (const auto* decl : member->declarators) {
+                        if (decl)
+                            push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                             lsCompletionItemKind::Field, type);
+                    }
+                }
+            }
+        }
+        void handle(const ModuleDeclarationSyntax& node) {
+            if (std::string_view(node.header->name.valueText()) != target)
+                return;
+            for (const auto* member : node.members) {
+                if (const auto* data = member ? member->as_if<DataDeclarationSyntax>() : nullptr) {
+                    const auto type = current_ast_decl_text(*data->type);
+                    for (const auto* decl : data->declarators) {
+                        if (decl)
+                            push_unique_item(items, seen, std::string(decl->name.valueText()),
+                                             lsCompletionItemKind::Field, type);
+                    }
+                } else if (const auto* modport =
+                               member ? member->as_if<ModportDeclarationSyntax>() : nullptr) {
+                    for (const auto* item : modport->items) {
+                        if (item)
+                            push_unique_item(items, seen, std::string(item->name.valueText()),
+                                             lsCompletionItemKind::Interface, "modport");
+                    }
+                }
+            }
+            if (node.header->ports) {
+                if (const auto* ansi = node.header->ports->as_if<AnsiPortListSyntax>()) {
+                    for (const auto* p : ansi->ports) {
+                        if (const auto* implicit = p ? p->as_if<ImplicitAnsiPortSyntax>() : nullptr)
+                            push_unique_item(items, seen,
+                                             std::string(implicit->declarator->name.valueText()),
+                                             lsCompletionItemKind::Field);
+                    }
+                }
+            }
+        }
+    } other(target, items, seen);
+    state.tree->root().visit(other);
+    return items;
+}
+
+static void append_current_file_imported_package_items(const DocumentState& state,
+                                                       const CompletionContext& ctx,
+                                                       std::vector<lsCompletionItem>& items) {
+    if (!state.tree)
+        return;
+    std::unordered_set<std::string> imported_pkgs;
+    std::unordered_set<std::string> wildcard_pkgs;
+    std::unordered_set<std::string> explicit_symbols;
+    using namespace slang::syntax;
+    struct ImportVisitor : SyntaxVisitor<ImportVisitor> {
+        std::unordered_set<std::string>& pkgs;
+        std::unordered_set<std::string>& wildcard_pkgs;
+        std::unordered_set<std::string>& symbols;
+        int cursor_line;
+        const slang::SourceManager& sm;
+        ImportVisitor(std::unordered_set<std::string>& pkgs,
+                      std::unordered_set<std::string>& wildcard_pkgs,
+                      std::unordered_set<std::string>& symbols,
+                      int cursor_line,
+                      const slang::SourceManager& sm)
+            : pkgs(pkgs), wildcard_pkgs(wildcard_pkgs), symbols(symbols),
+              cursor_line(cursor_line), sm(sm) {}
+        void handle(const PackageImportDeclarationSyntax& node) {
+            const int import_line =
+                node.keyword.location().valid() ? (int)sm.getLineNumber(node.keyword.location()) - 1 : 0;
+            if (import_line > cursor_line)
+                return;
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                const std::string pkg(item->package.valueText());
+                pkgs.insert(pkg);
+                if (item->item.kind == slang::parsing::TokenKind::Star)
+                    wildcard_pkgs.insert(pkg);
+                else
+                    symbols.insert(std::string(item->item.valueText()));
+            }
+            visitDefault(node);
+        }
+    } iv(imported_pkgs, wildcard_pkgs, explicit_symbols, ctx.line, state.tree->sourceManager());
+    state.tree->root().visit(iv);
+    if (imported_pkgs.empty())
+        return;
+    std::unordered_set<std::string> seen;
+    struct PackageVisitor : SyntaxVisitor<PackageVisitor> {
+        const std::unordered_set<std::string>& pkgs;
+        const std::unordered_set<std::string>& wildcard_pkgs;
+        const std::unordered_set<std::string>& explicit_symbols;
+        std::vector<lsCompletionItem>& items;
+        std::unordered_set<std::string>& seen;
+        PackageVisitor(const std::unordered_set<std::string>& pkgs,
+                       const std::unordered_set<std::string>& wildcard_pkgs,
+                       const std::unordered_set<std::string>& explicit_symbols,
+                       std::vector<lsCompletionItem>& items, std::unordered_set<std::string>& seen)
+            : pkgs(pkgs), wildcard_pkgs(wildcard_pkgs), explicit_symbols(explicit_symbols),
+              items(items), seen(seen) {}
+        void handle(const ModuleDeclarationSyntax& node) {
+            const std::string pkg_name(node.header->name.valueText());
+            if (node.kind != SyntaxKind::PackageDeclaration || !pkgs.count(pkg_name))
+                return;
+            std::vector<lsCompletionItem> tmp;
+            std::unordered_set<std::string> tmp_seen;
+            for (const auto* member : node.members) {
+                if (member)
+                    current_ast_emit_package_member(*member, tmp, tmp_seen);
+            }
+            for (auto& item : tmp) {
+                if (wildcard_pkgs.count(pkg_name) || explicit_symbols.count(item.label))
+                    push_unique_item(items, seen, item.label,
+                                     item.kind ? *item.kind : lsCompletionItemKind::Variable);
+            }
+        }
+    } pv(imported_pkgs, wildcard_pkgs, explicit_symbols, items, seen);
+    state.tree->root().visit(pv);
 }
 
 // ── Providers ─────────────────────────────────────────────────────────────────
@@ -1932,16 +2611,9 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     CompletionList result;
     result.isIncomplete = false;
 
-    // Collect symbol names declared in the current document for scope scoring.
-    std::unordered_set<std::string> local_names;
-    for (const auto& m : state.index.modules)  local_names.insert(m.name);
-    for (const auto& c : state.index.classes)  local_names.insert(c.name);
-    for (const auto& t : state.index.typedefs) local_names.insert(t.name);
-    for (const auto& mac : state.index.macros) local_names.insert(mac.name);
-    for (const auto& v : state.index.values)   local_names.insert(v.name);
-
     const int line = params.position.line;
     const int col  = params.position.character;
+    SyntaxIndex current_index;
 
     CompletionContext ctx;
     try {
@@ -1951,13 +2623,13 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         // include, or explicit scope context.  Do not touch the .f project
         // cache until after we know this request actually needs project-wide
         // symbols.
-        ctx = detect_context(state, line, col, state.index);
+        ctx = detect_context(state, line, col, current_index);
     } catch (...) {
         ctx.kind = CompletionContextKind::Identifier;
     }
-    for (const auto& mac : state.index.macros)
+    for (const auto& mac : current_index.macros)
         ctx.visible_macros.insert(mac.name);
-    ctx.visible_imports = state.index.imports;
+    ctx.visible_imports = current_index.imports;
 
     if (ctx.kind == CompletionContextKind::IncludeFile) {
         for (const auto& p : analyzer.extra_files()) {
@@ -1967,20 +2639,87 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         }
     }
 
-    // Generic identifier completion intentionally uses only the current file.
-    // Earlier v1.0.6 code merged every file from .f on every completion
-    // request.  On large HPC projects that placed project-wide parse/merge work
-    // directly on the typing path.  Project-wide symbols are now pulled in only
-    // for explicit semantic contexts that need them, and the Analyzer maintains
-    // a cached premerged extra-file index so those contexts do not rebuild the
-    // same project merge for every request.
-    SyntaxIndex completion_index = state.index;
+    // clangd-style index layering:
+    //
+    //   1. current file AST query    — exact unsaved text
+    //   2. dynamic/opened-file shard — other buffers parsed in this session
+    //   3. background project shard  — .f files parsed asynchronously
+    //
+    // The expensive/background layer is still context-gated.  Generic typing
+    // should not pull the whole .f project into the completion menu, but it is
+    // safe to merge the small dynamic/opened-file layer because those files
+    // have already paid the parse cost through didOpen/didChange.
+    SyntaxIndex completion_index = std::move(current_index);
+    if (auto opened_index = analyzer.opened_files_index(params.textDocument.uri.raw_uri_))
+        completion_index.merge(*opened_index);
     if (completion_context_needs_project_index(ctx.kind)) {
         if (auto project_index = analyzer.extra_project_index())
             completion_index.merge(*project_index);
     }
 
+    // Collect symbol names declared in the current document for scope scoring.
+    // Include AST-derived block locals so live current-file symbols rank as
+    // local even though they are no longer stored in DocumentState::index by
+    // didChange.
+    std::unordered_set<std::string> local_names;
+    for (const auto& m : completion_index.modules)  local_names.insert(m.name);
+    for (const auto& c : completion_index.classes)  local_names.insert(c.name);
+    for (const auto& t : completion_index.typedefs) local_names.insert(t.name);
+    for (const auto& mac : completion_index.macros) local_names.insert(mac.name);
+    for (const auto& v : completion_index.values) {
+        if (v.parent_scope.empty() || v.parent_scope == ctx.current_scope_name)
+            local_names.insert(v.name);
+    }
+
     std::vector<lsCompletionItem> all_items;
+
+    switch (ctx.kind) {
+    case CompletionContextKind::Identifier:
+    case CompletionContextKind::Unknown:
+    case CompletionContextKind::EventControl: {
+        auto items = current_file_identifier_items_from_ast(state, ctx);
+        auto macros = current_file_macro_items_from_ast(state, true);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        all_items.insert(all_items.end(), std::make_move_iterator(macros.begin()),
+                         std::make_move_iterator(macros.end()));
+        append_current_file_imported_package_items(state, ctx, all_items);
+        break;
+    }
+    case CompletionContextKind::MemberAccess: {
+        auto items = current_file_member_access_items_from_ast(state, ctx);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        break;
+    }
+    case CompletionContextKind::NamedPort:
+    case CompletionContextKind::Parameter: {
+        auto items = current_file_named_argument_items_from_ast(state, ctx);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        break;
+    }
+    case CompletionContextKind::Macro: {
+        auto items = current_file_macro_items_from_ast(state, false);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        break;
+    }
+    case CompletionContextKind::PackageScope: {
+        auto items = current_file_package_scope_items_from_ast(state, ctx.scope_name);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        break;
+    }
+    case CompletionContextKind::NewExpression: {
+        auto items = current_file_new_expression_items_from_ast(state);
+        all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
+                         std::make_move_iterator(items.end()));
+        break;
+    }
+    default:
+        break;
+    }
 
     try {
         for (const auto& provider : providers_) {

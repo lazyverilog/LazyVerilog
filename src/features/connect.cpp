@@ -1,4 +1,5 @@
 #include "connect.hpp"
+#include "../dynamic_file_index.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -100,27 +101,28 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     std::vector<FileView> files;
     std::unordered_set<std::string> seen;
 
-    // Open buffers are authoritative: they contain unsaved edits and their
-    // SyntaxIndex was built from the same in-memory text.
+    // Open buffers are authoritative: they contain unsaved edits.  Derive the
+    // structural view from the live SyntaxTree on demand instead of relying on
+    // a didChange-built current-file index.
     analyzer.for_each_state([&](const std::string& state_uri,
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{state_uri, state->text, state->index});
+        files.push_back(FileView{state_uri, state->text, build_current_ast_structural_index(*state)});
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
     // file is also open, skip it so the open-buffer version wins.
-    for (const auto& extra : analyzer.extra_file_snapshots()) {
-        if (!extra.state || !seen.insert(extra.uri).second)
+    for (const auto& extra : analyzer.extra_index_snapshots()) {
+        if (!seen.insert(extra.uri).second)
             continue;
-        files.push_back(FileView{extra.uri, extra.state->text, extra.index});
+        files.push_back(FileView{extra.uri, {}, extra.index});
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{uri, state->text, state->index});
+            files.push_back(FileView{uri, state->text, build_current_ast_structural_index(*state)});
     }
     return files;
 }

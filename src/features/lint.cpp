@@ -1,4 +1,6 @@
 #include "lint.hpp"
+#include "../analyzer.hpp"
+#include "../dynamic_file_index.hpp"
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -573,7 +575,24 @@ std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig
         return diags;
 
     auto& sm = state.tree->sourceManager();
-    LintVisitor v(config, merged_index ? *merged_index : state.index, sm, file_stem_from_uri(state.uri));
+    // Most lint rules are pure SyntaxTree walks.  Do not synthesize a broad
+    // file index just because lint is running on didChange; that puts indexing
+    // back on the editing hot path.  The only current rule that needs an index
+    // is stale_autoinst_diagnostic, and server.cpp passes a merged index only
+    // when that rule is enabled.
+    SyntaxIndex local_stale_index;
+    SyntaxIndex empty_index;
+    const SyntaxIndex* index_for_rules = merged_index;
+    if (!index_for_rules && config.module.stale_autoinst_diagnostic) {
+        // Standalone/unit-test path: no Analyzer is available to provide a
+        // merged project index, but the stale-autoinst rule still needs at
+        // least same-file module declarations.  Build this only for that rule,
+        // never for ordinary didChange lint.
+        local_stale_index = build_current_ast_structural_index(state);
+        index_for_rules = &local_stale_index;
+    }
+    LintVisitor v(config, index_for_rules ? *index_for_rules : empty_index, sm,
+                  file_stem_from_uri(state.uri));
     state.tree->root().visit(v);
     v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {
         return !diag.uri.empty() && diag.uri != state.uri;

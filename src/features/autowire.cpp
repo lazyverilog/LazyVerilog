@@ -1,6 +1,8 @@
 #include "autowire.hpp"
 #include <algorithm>
+#include <optional>
 #include <set>
+#include <unordered_map>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -211,23 +213,177 @@ struct InstSignal {
     int order;
 };
 
-static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_index,
-                                                 const std::string& parent_module) {
+static std::string trim_copy(std::string s) {
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::optional<PortEntry> project_port(const SyntaxIndex& syntax_index,
+                                             const std::string& module_name,
+                                             const std::string& port_name) {
+    auto module_it = syntax_index.module_by_name.find(module_name);
+    if (module_it == syntax_index.module_by_name.end() ||
+        module_it->second >= syntax_index.modules.size())
+        return std::nullopt;
+    const auto& module = syntax_index.modules[module_it->second];
+    auto port_it = module.port_by_name.find(port_name);
+    if (port_it == module.port_by_name.end() || port_it->second >= module.ports.size())
+        return std::nullopt;
+    return module.ports[port_it->second];
+}
+
+static std::unordered_map<std::string, PortEntry>
+current_ast_ports_for_module(const DocumentState& state, const std::string& module_name) {
+    std::unordered_map<std::string, PortEntry> ports;
+    if (!state.tree)
+        return ports;
+
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        std::string module_name;
+        std::unordered_map<std::string, PortEntry>& ports;
+        bool in_target{false};
+        bool done{false};
+
+        Visitor(std::string module_name, std::unordered_map<std::string, PortEntry>& ports)
+            : module_name(std::move(module_name)), ports(ports) {}
+
+        void add(std::string name, std::string direction, std::string type) {
+            if (name.empty() || ports.contains(name))
+                return;
+            ports.emplace(name, PortEntry{.name = std::move(name),
+                                          .direction = std::move(direction),
+                                          .type = trim_copy(std::move(type))});
+        }
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            if (done)
+                return;
+            const bool was = in_target;
+            in_target = node.header && node.header->name.valueText() == module_name;
+            if (in_target)
+                visitDefault(node);
+            in_target = was;
+            if (!ports.empty())
+                done = true;
+        }
+
+        void handle(const ImplicitAnsiPortSyntax& node) {
+            if (in_target && node.declarator) {
+                std::string direction;
+                std::string type;
+                if (node.header) {
+                    if (const auto* variable = node.header->as_if<VariablePortHeaderSyntax>()) {
+                        direction = std::string(variable->direction.valueText());
+                        type = variable->dataType ? variable->dataType->toString() : "";
+                    } else if (const auto* net = node.header->as_if<NetPortHeaderSyntax>()) {
+                        direction = std::string(net->direction.valueText());
+                        type = net->dataType ? net->dataType->toString() : "";
+                    }
+                }
+                add(std::string(node.declarator->name.valueText()), direction, type);
+            }
+            if (!done)
+                visitDefault(node);
+        }
+
+        void handle(const ExplicitAnsiPortSyntax& node) {
+            if (in_target)
+                add(std::string(node.name.valueText()), std::string(node.direction.valueText()), "");
+            if (!done)
+                visitDefault(node);
+        }
+
+        void handle(const PortDeclarationSyntax& node) {
+            if (in_target) {
+                std::string direction;
+                std::string type;
+                if (const auto* variable = node.header->as_if<VariablePortHeaderSyntax>()) {
+                    direction = std::string(variable->direction.valueText());
+                    type = variable->dataType ? variable->dataType->toString() : "";
+                } else if (const auto* net = node.header->as_if<NetPortHeaderSyntax>()) {
+                    direction = std::string(net->direction.valueText());
+                    type = net->dataType ? net->dataType->toString() : "";
+                }
+                for (const auto* declarator : node.declarators) {
+                    if (declarator)
+                        add(std::string(declarator->name.valueText()), direction, type);
+                }
+            }
+            if (!done)
+                visitDefault(node);
+        }
+    };
+
+    Visitor visitor(module_name, ports);
+    state.tree->root().visit(visitor);
+    return ports;
+}
+
+static std::vector<NamedPortConn>
+current_ast_instance_connections(const DocumentState& state, LineRange parent_range,
+                                 const std::string& parent_module,
+                                 std::vector<std::string>& module_names) {
+    std::vector<NamedPortConn> connections;
+    if (!state.tree)
+        return connections;
+
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        const SourceManager& sm;
+        LineRange parent_range;
+        const std::string& parent_module;
+        std::vector<NamedPortConn>& connections;
+        std::vector<std::string>& module_names;
+
+        Visitor(const SourceManager& sm, LineRange parent_range, const std::string& parent_module,
+                std::vector<NamedPortConn>& connections, std::vector<std::string>& module_names)
+            : sm(sm), parent_range(parent_range), parent_module(parent_module),
+              connections(connections), module_names(module_names) {}
+
+        void handle(const HierarchyInstantiationSyntax& node) {
+            if (!in_range(token_line(sm, node.getFirstToken()), parent_range))
+                return;
+            const std::string module_name(node.type.valueText());
+            for (const auto* inst : node.instances) {
+                if (!inst)
+                    continue;
+                for (const auto* conn : inst->connections) {
+                    const auto* named = conn ? conn->as_if<NamedPortConnectionSyntax>() : nullptr;
+                    if (!named)
+                        continue;
+                    std::string signal = trim_copy(named->expr ? named->expr->toString() : "");
+                    connections.push_back(NamedPortConn{
+                        .port_name = std::string(named->name.valueText()),
+                        .signal_name = std::move(signal),
+                    });
+                    module_names.push_back(module_name);
+                }
+            }
+            visitDefault(node);
+        }
+    };
+
+    Visitor visitor(state.tree->sourceManager(), parent_range, parent_module, connections,
+                    module_names);
+    state.tree->root().visit(visitor);
+    return connections;
+}
+
+static std::vector<InstSignal> collect_inst_signals(const DocumentState& state,
+                                                    const SyntaxIndex& syntax_index,
+                                                    const std::string& parent_module,
+                                                    LineRange parent_range) {
     std::vector<InstSignal> results;
     std::set<std::string> seen;
     int order = 0;
 
-    for (const auto& inst : syntax_index.instances) {
-        if (inst.parent_module != parent_module)
-            continue;
-        // Find module definition for port info
-        const ModuleEntry* mod_entry = nullptr;
-        auto module_it = syntax_index.module_by_name.find(inst.module_name);
-        if (module_it != syntax_index.module_by_name.end() &&
-            module_it->second < syntax_index.modules.size())
-            mod_entry = &syntax_index.modules[module_it->second];
-
-        for (const auto& conn : inst.connections) {
+    std::vector<std::string> module_names;
+    const auto conns = current_ast_instance_connections(state, parent_range, parent_module,
+                                                        module_names);
+    for (size_t i = 0; i < conns.size(); ++i) {
+        const auto& conn = conns[i];
+        const std::string& module_name = module_names[i];
             std::string port_name = conn.port_name;
             std::string signal = conn.signal_name;
             if (!is_simple_id(signal))
@@ -235,21 +391,23 @@ static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_in
             if (seen.count(signal))
                 continue;
 
-            // Look up port direction
             std::string direction;
             std::string type_kw = "logic";
             std::string dimension;
-            if (mod_entry) {
-                auto port_it = mod_entry->port_by_name.find(port_name);
-                if (port_it != mod_entry->port_by_name.end() &&
-                    port_it->second < mod_entry->ports.size()) {
-                    const auto& p = mod_entry->ports[port_it->second];
-                    direction = p.direction;
-                    auto lb = p.type.find('[');
-                    auto rb = p.type.rfind(']');
-                    if (lb != std::string::npos && rb != std::string::npos && lb < rb)
-                        dimension = p.type.substr(lb, rb - lb + 1);
-                }
+
+            auto current_ports = current_ast_ports_for_module(state, module_name);
+            std::optional<PortEntry> port;
+            if (auto it = current_ports.find(port_name); it != current_ports.end())
+                port = it->second;
+            else
+                port = project_port(syntax_index, module_name, port_name);
+
+            if (port) {
+                direction = port->direction;
+                auto lb = port->type.find('[');
+                auto rb = port->type.rfind(']');
+                if (lb != std::string::npos && rb != std::string::npos && lb < rb)
+                    dimension = port->type.substr(lb, rb - lb + 1);
             }
 
             // Only include output/inout ports
@@ -260,8 +418,7 @@ static std::vector<InstSignal> collect_inst_signals(const SyntaxIndex& syntax_in
                 continue;
 
             seen.insert(signal);
-            results.push_back({signal, inst.module_name, type_kw, dimension, order++});
-        }
+            results.push_back({signal, module_name, type_kw, dimension, order++});
     }
     return results;
 }
@@ -409,7 +566,8 @@ static std::vector<SignalDecl> compute_new_signals(const DocumentState& state,
     state.tree->root().visit(comb_coll);
 
     // Collect instantiation signals in the same parent module.
-    auto inst_sigs = collect_inst_signals(syntax_index, module_finder.name);
+    auto inst_sigs = collect_inst_signals(state, syntax_index, module_finder.name,
+                                          module_finder.range);
 
     // Build result: filter out already declared
     std::set<std::string> seen;

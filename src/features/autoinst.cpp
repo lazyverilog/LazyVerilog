@@ -1,5 +1,6 @@
 #include "autoinst.hpp"
 #include <algorithm>
+#include <unordered_set>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -73,6 +74,88 @@ static std::string simple_identifier_from_expr(const PropertyExprSyntax* expr) {
     return {};
 }
 
+static void push_unique_port(std::vector<std::string>& ports, std::unordered_set<std::string>& seen,
+                             std::string name) {
+    if (!name.empty() && seen.insert(name).second)
+        ports.push_back(std::move(name));
+}
+
+static std::vector<std::string> ports_for_module_in_current_ast(const DocumentState& state,
+                                                                std::string_view module_type) {
+    std::vector<std::string> ports;
+    if (!state.tree)
+        return ports;
+
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        std::string_view module_type;
+        std::vector<std::string>& ports;
+        std::unordered_set<std::string> seen;
+        bool in_target{false};
+        bool done{false};
+
+        Visitor(std::string_view module_type, std::vector<std::string>& ports)
+            : module_type(module_type), ports(ports) {}
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            if (done)
+                return;
+            const bool was = in_target;
+            in_target = node.header && node.header->name.valueText() == module_type;
+            if (in_target)
+                visitDefault(node);
+            in_target = was;
+            if (!ports.empty())
+                done = true;
+        }
+
+        void handle(const ImplicitAnsiPortSyntax& node) {
+            if (in_target && node.declarator)
+                push_unique_port(ports, seen, std::string(node.declarator->name.valueText()));
+            if (!done)
+                visitDefault(node);
+        }
+
+        void handle(const ExplicitAnsiPortSyntax& node) {
+            if (in_target)
+                push_unique_port(ports, seen, std::string(node.name.valueText()));
+            if (!done)
+                visitDefault(node);
+        }
+
+        void handle(const PortDeclarationSyntax& node) {
+            if (in_target) {
+                for (const auto* declarator : node.declarators) {
+                    if (declarator)
+                        push_unique_port(ports, seen, std::string(declarator->name.valueText()));
+                }
+            }
+            if (!done)
+                visitDefault(node);
+        }
+    };
+
+    Visitor visitor(module_type, ports);
+    state.tree->root().visit(visitor);
+    return ports;
+}
+
+static std::vector<std::string> ports_for_module_in_project_index(const SyntaxIndex& syntax_index,
+                                                                  const std::string& module_type) {
+    const ModuleEntry* mod_entry = nullptr;
+    auto module_it = syntax_index.module_by_name.find(module_type);
+    if (module_it != syntax_index.module_by_name.end() &&
+        module_it->second < syntax_index.modules.size())
+        mod_entry = &syntax_index.modules[module_it->second];
+    if (!mod_entry)
+        return {};
+
+    std::vector<std::string> port_names;
+    port_names.reserve(mod_entry->ports.size());
+    for (const auto& p : mod_entry->ports)
+        port_names.push_back(p.name);
+    return port_names;
+}
+
 // ── Main implementation ───────────────────────────────────────────────────────
 
 std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line, int /*col*/,
@@ -117,18 +200,12 @@ std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line
             }
         }
 
-        // Look up ports from SyntaxIndex
-        const ModuleEntry* mod_entry = nullptr;
-        auto module_it = syntax_index.module_by_name.find(module_type);
-        if (module_it != syntax_index.module_by_name.end() &&
-            module_it->second < syntax_index.modules.size())
-            mod_entry = &syntax_index.modules[module_it->second];
-        if (!mod_entry)
-            return std::nullopt; // module not found
-
-        std::vector<std::string> port_names;
-        for (const auto& p : mod_entry->ports)
-            port_names.push_back(p.name);
+        // AST-first lookup: if the instantiated module is declared in the
+        // current file, extract its ports directly from the live SyntaxTree.
+        // Only fall back to the project index when same-file AST lookup fails.
+        auto port_names = ports_for_module_in_current_ast(state, module_type);
+        if (port_names.empty())
+            port_names = ports_for_module_in_project_index(syntax_index, module_type);
 
         if (port_names.empty())
             return std::nullopt;

@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "analyzer.hpp"
+#include "dynamic_file_index.hpp"
 #include "features/lint.hpp"
 #include <algorithm>
 #include <filesystem>
@@ -91,7 +92,7 @@ TEST_CASE("lint: stale autoinst uses merged extra-file module ports", "[lint]") 
     auto state = analyzer.get_state(uri);
     REQUIRE(state != nullptr);
 
-    SyntaxIndex idx = state->index;
+    SyntaxIndex idx = build_dynamic_file_index(*state);
     analyzer.merge_extra_file_modules(idx);
 
     LintConfig cfg;

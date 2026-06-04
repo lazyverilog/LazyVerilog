@@ -1,5 +1,6 @@
 #include "inlay_hints.hpp"
 
+#include "dynamic_file_index.hpp"
 #include "syntax_index.hpp"
 
 #include <algorithm>
@@ -38,13 +39,13 @@ static void overlay_modules(ModuleMap& modules, const SyntaxIndex& index) {
 static ModuleMap build_module_map(const Analyzer& analyzer) {
     ModuleMap modules;
 
-    for (const auto& extra : analyzer.extra_file_snapshots())
-        overlay_modules(modules, extra.index);
+    if (auto project_index = analyzer.extra_project_index())
+        overlay_modules(modules, *project_index);
 
     analyzer.for_each_state(
         [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {
             if (state && state->tree)
-                overlay_modules(modules, state->index);
+                overlay_modules(modules, build_current_ast_structural_index(*state));
         });
 
     return modules;
@@ -72,7 +73,7 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
         return {};
 
     const auto lines = split_lines(state->text);
-    const auto& current_index = state->index;
+    const auto current_index = build_current_ast_structural_index(*state);
     const auto modules = build_module_map(analyzer);
     std::vector<lsInlayHint> hints;
 

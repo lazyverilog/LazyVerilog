@@ -125,16 +125,6 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
     return std::nullopt;
 }
 
-static std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>>
-open_states(const Analyzer& analyzer) {
-    std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> states;
-    analyzer.for_each_state(
-        [&](const std::string& uri, const std::shared_ptr<const DocumentState>& state) {
-            states.emplace_back(uri, state);
-        });
-    return states;
-}
-
 static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree,
                                                           const std::string& name) {
     struct Visitor : public SyntaxVisitor<Visitor> {
@@ -219,39 +209,33 @@ static std::optional<std::vector<ParamInfo>> module_params_from_tree(const Synta
     return visitor.result;
 }
 
-static std::optional<SubroutineInfo> find_subroutine(const Analyzer& analyzer,
-                                                     const std::string& name) {
-    for (const auto& [uri, state] : open_states(analyzer)) {
-        (void)uri;
-        if (state && state->tree) {
-            if (auto found = subroutine_from_tree(*state->tree, name))
-                return found;
-        }
-    }
-    for (const auto& extra : analyzer.extra_file_snapshots()) {
-        if (!extra.state || !extra.state->tree)
+static std::optional<std::vector<ParamInfo>> module_params_from_index(const SyntaxIndex& index,
+                                                                      const std::string& name) {
+    auto module_it = index.module_by_name.find(name);
+    if (module_it == index.module_by_name.end() || module_it->second >= index.modules.size())
+        return std::nullopt;
+
+    std::vector<ParamInfo> params;
+    for (const auto& port : index.modules[module_it->second].ports) {
+        if (port.direction != "parameter" && port.direction != "localparam")
             continue;
-        if (auto found = subroutine_from_tree(*extra.state->tree, name))
-            return found;
+        params.push_back(ParamInfo{.name = port.name,
+                                   .direction = port.direction,
+                                   .type = port.type,
+                                   .default_value = port.default_value});
     }
-    return std::nullopt;
+    if (params.empty())
+        return std::nullopt;
+    return params;
 }
 
 static std::optional<std::vector<ParamInfo>> find_module_params(const Analyzer& analyzer,
+                                                                const SyntaxTree& current_tree,
                                                                 const std::string& name) {
-    for (const auto& [uri, state] : open_states(analyzer)) {
-        (void)uri;
-        if (state && state->tree) {
-            if (auto found = module_params_from_tree(*state->tree, name))
-                return found;
-        }
-    }
-    for (const auto& extra : analyzer.extra_file_snapshots()) {
-        if (!extra.state || !extra.state->tree)
-            continue;
-        if (auto found = module_params_from_tree(*extra.state->tree, name))
-            return found;
-    }
+    if (auto found = module_params_from_tree(current_tree, name))
+        return found;
+    if (auto project = analyzer.extra_project_index())
+        return module_params_from_index(*project, name);
     return std::nullopt;
 }
 
@@ -331,7 +315,7 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
         return std::nullopt;
 
     if (ctx->is_module_param) {
-        auto params_info = find_module_params(analyzer, ctx->name);
+        auto params_info = find_module_params(analyzer, *state->tree, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;
@@ -354,9 +338,9 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
             labels, active);
     }
 
-    auto subroutine = find_subroutine(analyzer, ctx->name);
+    auto subroutine = subroutine_from_tree(*state->tree, ctx->name);
     if (!subroutine) {
-        auto params_info = find_module_params(analyzer, ctx->name);
+        auto params_info = find_module_params(analyzer, *state->tree, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;

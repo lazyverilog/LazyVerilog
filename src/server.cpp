@@ -2,6 +2,7 @@
 #include "analyzer.hpp"
 #include "background_compiler.hpp"
 #include "config.hpp"
+#include "dynamic_file_index.hpp"
 
 // LspCpp headers
 #include "LibLsp/JsonRpc/Condition.h"
@@ -447,9 +448,9 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // request, so this avoids broad per-edit overhead for users who do
             // not enable stale_autoinst_diagnostic.
             SyntaxIndex lint_index;
-            const SyntaxIndex* lint_index_ptr = &state->index;
+            const SyntaxIndex* lint_index_ptr = nullptr;
             if (config_.lint.module.stale_autoinst_diagnostic) {
-                lint_index = state->index;
+                lint_index = build_current_ast_structural_index(*state);
                 analyzer_.merge_extra_file_modules(lint_index);
                 lint_index_ptr = &lint_index;
             }
@@ -1221,8 +1222,11 @@ void LazyVerilogServer::register_handlers() {
                 int target_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
-                    auto idx = state->index;
-                    analyzer_.merge_extra_file_modules(idx);
+                    SyntaxIndex idx;
+                    if (auto opened = analyzer_.opened_files_index(uri))
+                        idx.merge(*opened);
+                    if (auto project = analyzer_.extra_project_index())
+                        idx.merge(*project);
                     if (cmd == "lazyverilog.autowirepreview") {
                         auto preview = autowire_preview(*state, idx, config_.autowire, target_line);
                         // Return preview lines as JSON array of strings

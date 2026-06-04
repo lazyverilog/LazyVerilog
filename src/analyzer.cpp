@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "dynamic_file_index.hpp"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -93,45 +94,18 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
     }
 }
 
-std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
-                                                    const std::string& text) const {
-    const auto start = Clock::now();
-    // Pass URI as name (display label) and stripped filesystem path as path
-    // (used by SourceManager::assignText for include resolution relative to
-    // the file's directory, not the server CWD).
-    std::string path = uri;
-    if (path.starts_with("file://"))
-        path = path.substr(7);
-    // Fresh SourceManager per document snapshot: avoids "path already assigned"
-    // errors when the same file is re-parsed on didChange, and prevents the
-    // static singleton from accumulating stale buffers across edits.
-    auto sm = std::make_unique<slang::SourceManager>();
-    add_include_dirs(*sm, include_dirs_);
-    slang::parsing::PreprocessorOptions ppo;
-    ppo.predefines = defines_;
-    slang::Bag bag;
-    bag.set(ppo);
-    auto tree = slang::syntax::SyntaxTree::fromText(
-        std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
-    auto state = std::make_shared<DocumentState>(uri, text, nullptr);
-    state->source_manager = std::move(sm);
-    state->tree = std::move(tree);
-    if (state->tree)
-        state->index = SyntaxIndex::build(*state->tree, state->text);
-    collect_parse_diagnostics(*state, uri);
-    log_perf("make_state " + uri, start);
-    return state;
-}
-
-std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::path& path) const {
+static std::shared_ptr<DocumentState>
+make_file_state_with_options(const std::filesystem::path& path,
+                             const std::vector<std::string>& defines,
+                             const std::vector<std::string>& include_dirs) {
     const auto start = Clock::now();
     const auto norm = normalize_path(path);
     const std::string uri = path_to_uri(norm);
 
     auto sm = std::make_unique<slang::SourceManager>();
-    add_include_dirs(*sm, include_dirs_);
+    add_include_dirs(*sm, include_dirs);
     slang::parsing::PreprocessorOptions ppo;
-    ppo.predefines = defines_;
+    ppo.predefines = defines;
     slang::Bag bag;
     bag.set(ppo);
 
@@ -144,10 +118,70 @@ std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::
     state->source_manager = std::move(sm);
     state->tree = std::move(*tree_or_error);
     if (state->tree)
-        state->index = SyntaxIndex::build(*state->tree, state->text);
+        state->index = SyntaxIndex::build(*state->tree, state->text, IndexDepth::Declarations);
     collect_parse_diagnostics(*state, uri);
     log_perf("make_file_state " + uri, start);
     return state;
+}
+
+Analyzer::~Analyzer() {
+    if (background_indexer_.joinable()) {
+        background_indexer_.request_stop();
+        background_cv_.notify_all();
+    }
+}
+
+std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
+                                                    const std::string& text) const {
+    const auto start = Clock::now();
+    // Pass URI as name (display label) and stripped filesystem path as path
+    // (used by SourceManager::assignText for include resolution relative to
+    // the file's directory, not the server CWD).
+    std::string path = uri;
+    if (path.starts_with("file://"))
+        path = path.substr(7);
+    // Fresh SourceManager per document snapshot: avoids "path already assigned"
+    // errors when the same file is re-parsed on didChange, and prevents the
+    // static singleton from accumulating stale buffers across edits.
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        defines = defines_;
+        include_dirs = include_dirs_;
+    }
+
+    auto sm = std::make_unique<slang::SourceManager>();
+    add_include_dirs(*sm, include_dirs);
+    slang::parsing::PreprocessorOptions ppo;
+    ppo.predefines = defines;
+    slang::Bag bag;
+    bag.set(ppo);
+    auto tree = slang::syntax::SyntaxTree::fromText(
+        std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
+    auto state = std::make_shared<DocumentState>(uri, text, nullptr);
+    state->source_manager = std::move(sm);
+    state->tree = std::move(tree);
+    // clangd-style current-file layer:
+    //
+    // Do not materialize any current-file SyntaxIndex on didOpen/didChange.
+    // The live SyntaxTree is the current-file representation.  Features derive
+    // narrow AST facts on demand, and project/background files keep the indexed
+    // shard representation.
+    collect_parse_diagnostics(*state, uri);
+    log_perf("make_state " + uri, start);
+    return state;
+}
+
+std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::path& path) const {
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        defines = defines_;
+        include_dirs = include_dirs_;
+    }
+    return make_file_state_with_options(path, defines, include_dirs);
 }
 
 void Analyzer::open(const std::string& uri, const std::string& text) {
@@ -168,16 +202,15 @@ void Analyzer::close(const std::string& uri) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_.erase(uri);
     // If the closed file is also in the filelist cache, replace its live shard
-    // with a disk-backed parse.  This keeps the per-file project-index shards
-    // source-of-truth correct without polling mtimes for every .f entry.
+    // with a disk-backed parse in the background.  Keeping this asynchronous is
+    // important for large buffers: closing a split should not synchronously
+    // parse an include-heavy RTL file on the UI path.
     for (auto& entry : extra_cache_) {
         if (entry.uri != uri)
             continue;
-        if (auto state = make_file_state(entry.path)) {
-            entry.state = state;
-            entry.index = state->index;
-            invalidate_extra_project_index_locked();
-        }
+        background_pending_files_.push_back(entry.path);
+        start_background_indexer_locked();
+        background_cv_.notify_all();
         break;
     }
 }
@@ -302,8 +335,10 @@ find_module_definition(const SyntaxIndex& index, const std::string& uri, const s
         return std::nullopt;
 
     const auto& module = index.modules[it->second];
+    const auto actual_uri = index.source_uri(module.file_id);
     const int line = to_lsp_line(module.line);
-    return Location{uri, line, module.col, line, module.col + (int)module.name.size()};
+    return Location{actual_uri.empty() ? uri : actual_uri, line, module.col, line,
+                    module.col + (int)module.name.size()};
 }
 
 static const ModuleEntry* find_module_entry(const SyntaxIndex& index, const std::string& name) {
@@ -320,6 +355,10 @@ static const PortEntry* find_port_entry(const ModuleEntry& module, const std::st
     return &module.ports[it->second];
 }
 
+static Location location_from_token_actual_uri(const slang::SourceManager& sm,
+                                               const std::string& fallback_uri,
+                                               const slang::parsing::Token& token);
+
 static std::optional<Location> find_port_definition(const SyntaxIndex& index,
                                                     const std::string& uri,
                                                     const std::string& module_name,
@@ -331,8 +370,116 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
     if (!port)
         return std::nullopt;
 
+    const auto actual_uri = index.source_uri(port->file_id);
     const int line = to_lsp_line(port->line);
-    return Location{uri, line, port->col, line, port->col + (int)port->name.size()};
+    return Location{actual_uri.empty() ? uri : actual_uri, line, port->col, line,
+                    port->col + (int)port->name.size()};
+}
+
+static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex& index,
+                                                               const Location& loc) {
+    for (const auto& ref : index.references) {
+        if (!ref.symbol_id || ref.symbol_debug.starts_with("name:"))
+            continue;
+        // ReferenceEntry no longer stores a URI string directly.  It stores a
+        // compact FileID that is local to the SyntaxIndex shard, so always
+        // resolve through the shard's file table before comparing locations.
+        const auto ref_uri = index.source_uri(ref.file_id);
+        if (!ref_uri.empty() && ref_uri != loc.uri)
+            continue;
+        if (to_lsp_line(ref.line) == loc.line && ref.col == loc.col)
+            return ref.symbol_debug;
+    }
+    return std::nullopt;
+}
+
+static std::optional<Location>
+find_module_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                               const std::string& name) {
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        const std::string& name;
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, const std::string& name)
+            : sm(sm), uri(uri), name(name) {}
+
+        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+            if (result)
+                return;
+            if (node.header->name.valueText() == name)
+                result = location_from_token_actual_uri(sm, uri, node.header->name);
+            if (!result)
+                visitDefault(node);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, name);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+static std::optional<Location>
+find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                             const std::string& module_name, const std::string& port_name) {
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        const std::string& module_name;
+        const std::string& port_name;
+        bool in_target_module{false};
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri,
+                const std::string& module_name, const std::string& port_name)
+            : sm(sm), uri(uri), module_name(module_name), port_name(port_name) {}
+
+        void maybe_set(const slang::parsing::Token& token) {
+            if (!result && token && token.valueText() == port_name)
+                result = location_from_token_actual_uri(sm, uri, token);
+        }
+
+        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+            if (result)
+                return;
+            const bool was = in_target_module;
+            in_target_module = node.header->name.valueText() == module_name;
+            if (in_target_module)
+                visitDefault(node);
+            in_target_module = was;
+        }
+
+        void handle(const slang::syntax::ImplicitAnsiPortSyntax& node) {
+            if (in_target_module && node.declarator)
+                maybe_set(node.declarator->name);
+            if (!result)
+                visitDefault(node);
+        }
+
+        void handle(const slang::syntax::ExplicitAnsiPortSyntax& node) {
+            if (in_target_module)
+                maybe_set(node.name);
+            if (!result)
+                visitDefault(node);
+        }
+
+        void handle(const slang::syntax::PortDeclarationSyntax& node) {
+            if (!in_target_module)
+                return;
+            for (const auto* declarator : node.declarators) {
+                if (declarator)
+                    maybe_set(declarator->name);
+                if (result)
+                    return;
+            }
+            visitDefault(node);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, module_name, port_name);
+    tree.root().visit(visitor);
+    return visitor.result;
 }
 
 static Location location_from_token(const slang::SourceManager& sm, const std::string& uri,
@@ -1098,8 +1245,12 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
     };
 
-    auto built_index = prebuilt_index ? SyntaxIndex{} : SyntaxIndex::build(tree);
-    const auto& index = prebuilt_index ? *prebuilt_index : built_index;
+    // Hover/symbol info is a request-local AST query.  Older code built a full
+    // SyntaxIndex here when the caller did not provide one, solely to enrich a
+    // module hover document.  That recreated the exact anti-pattern we are
+    // removing: a point query should not silently index the whole current file.
+    SyntaxIndex empty_index;
+    const auto& index = prebuilt_index ? *prebuilt_index : empty_index;
     Visitor visitor(tree.sourceManager(), uri, name, definition, index);
     tree.root().visit(visitor);
     return visitor.result;
@@ -1164,6 +1315,7 @@ enum class DefinitionTargetKind {
     None,
     Instance,
     NamedPort,
+    NamedParameter,
     NamedArgument,
     Macro,
     Generic,
@@ -1207,13 +1359,31 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
         if (token_contains_position_in_uri(sm, node.type, uri, line, col)) {
-            target.kind = DefinitionTargetKind::Generic;
+            target.kind = DefinitionTargetKind::Instance;
             target.name = std::string(node.type.valueText());
+            target.module_name = target.name;
             target.scope_module = current_module;
             return;
         }
 
         const std::string module_name(node.type.valueText());
+        if (node.parameters) {
+            for (const auto* parameter : node.parameters->parameters) {
+                const auto* named =
+                    parameter ? parameter->as_if<slang::syntax::NamedParamAssignmentSyntax>()
+                              : nullptr;
+                if (!named)
+                    continue;
+                if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+                    target.kind = DefinitionTargetKind::NamedParameter;
+                    target.name = std::string(named->name.valueText());
+                    target.module_name = module_name;
+                    target.scope_module = current_module;
+                    return;
+                }
+            }
+        }
+
         for (const auto* instance : node.instances) {
             if (!instance)
                 continue;
@@ -1323,7 +1493,6 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     if (ident.empty())
         return std::nullopt;
 
-    const auto& idx = state->index;
     auto target = definition_target_at(*state->tree, uri, line, col);
     auto extra_files = extra_file_snapshots();
 
@@ -1344,7 +1513,7 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     if (definition) {
         std::string name = target.name.empty() ? ident : target.name;
         if (definition->uri == uri) {
-            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition, &idx))
+            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
                 return info;
         } else {
             for (const auto& extra : extra_files) {
@@ -1370,6 +1539,11 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         if (target.kind == DefinitionTargetKind::NamedPort)
             return SymbolInfo{.name = target.name,
                               .kind = "port",
+                              .line = definition->line,
+                              .col = definition->col};
+        if (target.kind == DefinitionTargetKind::NamedParameter)
+            return SymbolInfo{.name = target.name,
+                              .kind = "parameter",
                               .line = definition->line,
                               .col = definition->col};
         return SymbolInfo{
@@ -1443,7 +1617,6 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return std::nullopt;
 
     auto target = definition_target_at(*state.tree, uri, line, col);
-    const auto& idx = state.index;
 
     if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
         auto ident = extract_ident_span(state.text, line, col);
@@ -1474,7 +1647,21 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     if (target.kind == DefinitionTargetKind::NamedPort) {
-        if (auto loc = find_port_definition(idx, uri, target.module_name, target.name))
+        if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
+                                                    target.name))
+            return loc;
+
+        for (const auto& extra : extra_files) {
+            if (auto loc =
+                    find_port_definition(extra.index, extra.uri, target.module_name, target.name))
+                return loc;
+        }
+        return std::nullopt;
+    }
+
+    if (target.kind == DefinitionTargetKind::NamedParameter) {
+        if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
+                                                    target.name))
             return loc;
 
         for (const auto& extra : extra_files) {
@@ -1501,7 +1688,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     if (target.kind == DefinitionTargetKind::Instance) {
-        if (auto loc = find_module_definition(idx, uri, target.module_name))
+        if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
             return loc;
         for (const auto& extra : extra_files) {
             if (auto loc = find_module_definition(extra.index, extra.uri, target.module_name))
@@ -1526,11 +1713,95 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
                                                 bool include_declaration) const {
     auto target = identifier_at(uri, line, col);
-    auto target_def = definition_of(uri, line, col);
-    if (!target || !target_def)
+    // References/Rename must not walk closed project-file ASTs.  Current and
+    // other open files are live SyntaxTrees; closed project files require a
+    // future reference-occurrence index before they can participate scalably.
+    std::vector<ExtraFileInfo> extra_files;
+    auto state = get_state(uri);
+    if (!target || !state)
+        return {};
+    const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
+                                         : DefinitionTarget{};
+    auto target_def = definition_of_state(*state, uri, line, col, extra_files);
+    if (!target_def && target_info.kind == DefinitionTargetKind::Instance) {
+        for (const auto& extra : extra_index_snapshots()) {
+            if ((target_def = find_module_definition(extra.index, extra.uri,
+                                                     target_info.module_name)))
+                break;
+        }
+    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedPort) {
+        for (const auto& extra : extra_index_snapshots()) {
+            if ((target_def = find_port_definition(extra.index, extra.uri,
+                                                   target_info.module_name, target_info.name)))
+                break;
+        }
+    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedParameter) {
+        for (const auto& extra : extra_index_snapshots()) {
+            if ((target_def = find_port_definition(extra.index, extra.uri,
+                                                   target_info.module_name, target_info.name)))
+                break;
+        }
+    }
+    if (!target_def)
         return {};
 
-    auto extra_files = extra_file_snapshots();
+    std::string target_symbol_debug;
+    if (target_info.kind == DefinitionTargetKind::Instance) {
+        // Go-to-definition on an instance name resolves to the instantiated
+        // module declaration.  Use the module symbol identity for the closed
+        // project occurrence index, matching other instantiations of that
+        // module and the declaration itself instead of all same-spelled
+        // instance names.
+        target_symbol_debug = "module::" + target_info.module_name;
+    } else if (target_info.kind == DefinitionTargetKind::NamedPort) {
+        target_symbol_debug = "module_port::" + target_info.module_name + "::" + target_info.name;
+    } else if (target_info.kind == DefinitionTargetKind::NamedParameter) {
+        target_symbol_debug =
+            "module_param::" + target_info.module_name + "::" + target_info.name;
+    } else if (target_info.kind == DefinitionTargetKind::Macro) {
+        target_symbol_debug = "macro::" + target_info.name;
+    }
+    if (target_symbol_debug.empty()) {
+        // Prefer the symbol identity at the token the user actually clicked.
+        // This matters for declaration tokens whose plain name appears in
+        // multiple declaration scopes:
+        //
+        //   typedef struct { logic addr; } a_t;
+        //   typedef struct { logic addr; } b_t;
+        //                          ^ clicked here
+        //
+        // A generic definition fallback may find the first `addr` declaration
+        // textually, but the current-file structural index has a scoped
+        // declaration occurrence at the clicked location:
+        //
+        //   typedef_field::b_t::addr
+        //
+        // Recovering that ID first prevents same-name typedef fields from being
+        // merged by references/rename.
+        auto current_structural_index = build_current_ast_structural_index(*state);
+        Location clicked_loc{uri, target->line, target->col, target->line, target->end_col};
+        if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc))
+            target_symbol_debug = *id;
+
+        // If the cursor was on a declaration or on a syntactic generic token
+        // such as a hierarchy type, recover the project-index SymbolID from the
+        // declaration location.  This keeps "find references from declaration"
+        // precise without keeping closed-file ASTs alive.
+        if (target_symbol_debug.empty() && target_def->uri == uri) {
+            if (auto id = symbol_id_for_index_location(current_structural_index, *target_def))
+                target_symbol_debug = *id;
+        }
+        if (target_symbol_debug.empty()) {
+            for (const auto& extra : extra_index_snapshots()) {
+                if (extra.uri != target_def->uri)
+                    continue;
+                if (auto id = symbol_id_for_index_location(extra.index, *target_def))
+                    target_symbol_debug = *id;
+                break;
+            }
+        }
+    }
+    const SymbolID target_symbol_id = SymbolID::from_canonical(target_symbol_debug);
 
     std::vector<Location> result;
     std::set<std::tuple<std::string, int, int>> seen;
@@ -1593,11 +1864,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             open_states.emplace_back(state_uri, state);
     }
 
-    std::set<std::string> open_uris;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> open_state_by_uri;
+    std::unordered_set<std::string> open_uris;
     for (const auto& [state_uri, state] : open_states) {
-        open_uris.insert(state_uri);
         open_state_by_uri[state_uri] = state;
+        open_uris.insert(state_uri);
     }
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
@@ -1607,30 +1878,78 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 return std::nullopt;
             return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, extra_files);
         }
-        for (const auto& extra : extra_files) {
-            if (extra.uri != candidate_uri || !extra.state)
-                continue;
-            return definition_of_state(*extra.state, candidate_uri, ref_line, ref_col, extra_files);
-        }
         return std::nullopt;
+    };
+
+    auto add_indexed_reference = [&](const std::string& file_uri, const SyntaxIndex& index,
+                                     const ReferenceEntry& ref) {
+        // `file_uri` is the parsed shard / open document URI.  Reference
+        // occurrences can originate from an included header inside that shard,
+        // so prefer the per-token URI when the index captured one:
+        //
+        //   memory.sv     `include "params.svh"
+        //   params.svh    task add_number; endtask
+        //
+        // Without this, the params.svh line/column would be reported against
+        // memory.sv and could appear to point at an unrelated token such as an
+        // input port named `address`.
+        const auto actual_uri = index.source_uri(ref.file_id);
+        const std::string& result_uri = actual_uri.empty() ? file_uri : actual_uri;
+        const int ref_line = to_lsp_line(ref.line);
+        if (!include_declaration && result_uri == target_def->uri &&
+            ref_line == target_def->line && ref.col == target_def->col)
+            return;
+
+        auto key = std::make_tuple(result_uri, ref_line, ref.col);
+        if (!seen.insert(key).second)
+            return;
+        result.push_back(Location{
+            .uri = result_uri,
+            .line = ref_line,
+            .col = ref.col,
+            .end_line = ref_line,
+            .end_col = ref.end_col,
+        });
     };
 
     for (const auto& [state_uri, state] : open_states) {
         if (!state || !state->tree)
             continue;
-        visit_tree(*state->tree, state_uri, resolve_snapshot);
+
+        if (target_symbol_id) {
+            // For owner-qualified symbols (module / port / parameter), use the
+            // same compact occurrence representation for open files that closed
+            // project files use.  This is important for cross-file open buffers:
+            //
+            //   memory.sv      module memory; endmodule
+            //   memory_top.sv  memory u_mem();
+            //
+            // Resolving `memory` in memory_top.sv through definition_of_state()
+            // would require closed/project-file ASTs in the resolver.  The
+            // SymbolID path avoids that by matching `module:memory` directly.
+            const auto open_index = build_current_ast_structural_index(*state);
+            for (const auto& ref : open_index.references) {
+                if (ref.symbol_id == target_symbol_id)
+                    add_indexed_reference(state_uri, open_index, ref);
+            }
+        } else {
+            visit_tree(*state->tree, state_uri, resolve_snapshot);
+        }
     }
 
-    for (const auto& extra : extra_files) {
-        if (open_uris.contains(extra.uri) || !extra.state || !extra.state->tree)
+    // Closed project files are represented by compact reference-occurrence
+    // shards.  We intentionally do not load or walk their full SyntaxTrees here.
+    for (const auto& extra : extra_index_snapshots()) {
+        if (open_uris.contains(extra.uri))
             continue;
-        auto resolver = [&](const std::string& candidate_uri, int ref_line,
-                            int ref_col) -> std::optional<Location> {
-            if (candidate_uri != extra.uri)
-                return std::nullopt;
-            return resolve_snapshot(candidate_uri, ref_line, ref_col);
-        };
-        visit_tree(*extra.state->tree, extra.uri, resolver);
+        if (!target_symbol_id)
+            continue;
+        for (const auto& ref : extra.index.references) {
+            if (ref.symbol_id != target_symbol_id)
+                continue;
+
+            add_indexed_reference(extra.uri, extra.index, ref);
+        }
     }
 
     std::sort(result.begin(), result.end(), [](const Location& a, const Location& b) {
@@ -1681,7 +2000,9 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     defines_ = defines;
     // Invalidate extra-file cache so reopened files pick up the new defines.
     extra_cache_.clear();
-    invalidate_extra_project_index_locked();
+    clear_extra_project_index_locked();
+    if (!extra_files_.empty())
+        schedule_background_reindex_locked();
 }
 
 void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
@@ -1695,7 +2016,9 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     // cache even if the filelist itself did not change, otherwise a newly added
     // UVM include directory would not be visible until the next source edit.
     extra_cache_.clear();
-    invalidate_extra_project_index_locked();
+    clear_extra_project_index_locked();
+    if (!extra_files_.empty())
+        schedule_background_reindex_locked();
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
@@ -1707,9 +2030,11 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     extra_files_.reserve(paths.size());
     for (const auto& path : paths)
         extra_files_.push_back(normalize_path(path).string());
-    invalidate_extra_project_index_locked();
+    clear_extra_project_index_locked();
     if (filelist_path_.empty())
         refresh_extra_cache_locked();
+    else
+        schedule_background_reindex_locked();
 }
 
 std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
@@ -1719,31 +2044,30 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
     // as configuration loaded at startup / config reload.  This avoids metadata
     // I/O in HPC environments and keeps edits to listed open buffers
     // incremental through update_extra_cache_for_live_state_locked().
-    if (!extra_files_.empty() && extra_cache_.size() < extra_files_.size())
+    if (!extra_files_.empty() && extra_cache_.size() < extra_files_.size() &&
+        filelist_path_.empty())
         refresh_extra_cache_locked();
 
     std::vector<ExtraFileInfo> result;
     result.reserve(extra_cache_.size());
     for (const auto& entry : extra_cache_) {
-        if (!entry.state)
-            continue;
-        // If the file is currently open in the editor, use its live docs_ state
-        // so callers see the latest edits rather than the stale disk parse.
-        // (Previously this skipped open files entirely, making split-open buffers
-        // invisible to cross-file lookups like go-to-def, hover, references.)
+        // Closed project files intentionally have no DocumentState here.  They
+        // are represented only by the compact SyntaxIndex shard.  If the file
+        // is open, attach the live state so AST-only features can inspect the
+        // unsaved buffer without keeping closed project ASTs alive.
         if (const auto it = docs_.find(entry.uri); it != docs_.end()) {
             result.push_back(ExtraFileInfo{
                 .path = entry.path,
                 .uri = entry.uri,
                 .state = it->second,
-                .index = it->second->index,
+                .index = build_dynamic_file_index(*it->second),
             });
             continue;
         }
         result.push_back(ExtraFileInfo{
             .path = entry.path,
             .uri = entry.uri,
-            .state = entry.state,
+            .state = nullptr,
             .index = entry.index,
         });
     }
@@ -1751,8 +2075,25 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
     return result;
 }
 
+std::vector<ExtraIndexInfo> Analyzer::extra_index_snapshots() const {
+    const auto start = Clock::now();
+    std::lock_guard<std::mutex> lock(map_mutex_);
+
+    std::vector<ExtraIndexInfo> result;
+    result.reserve(extra_cache_.size());
+    for (const auto& entry : extra_cache_) {
+        result.push_back(ExtraIndexInfo{
+            .path = entry.path,
+            .uri = entry.uri,
+            .index = entry.index,
+        });
+    }
+    log_perf("extra_index_snapshots files=" + std::to_string(result.size()), start);
+    return result;
+}
+
 void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
-    for (const auto& extra : extra_file_snapshots())
+    for (const auto& extra : extra_index_snapshots())
         index.merge(extra.index);
 }
 
@@ -1760,29 +2101,25 @@ std::shared_ptr<const SyntaxIndex> Analyzer::extra_project_index() const {
     const auto start = Clock::now();
     std::lock_guard<std::mutex> lock(map_mutex_);
 
-    // No .f mtime polling here.  The filelist is a configuration input, and
-    // open-buffer edits to files listed in it update their individual cache
-    // shards directly.  If this is the first project-aware request, populate
-    // the missing shards once from disk.
-    if (!extra_files_.empty() && extra_cache_.size() < extra_files_.size())
-        refresh_extra_cache_locked();
-
-    if (!extra_project_index_cache_) {
-        auto merged = std::make_shared<SyntaxIndex>();
-        for (const auto& entry : extra_cache_) {
-            if (!entry.state)
-                continue;
-            // Each entry is a source-file shard.  It is disk-backed for closed
-            // files and live-buffer-backed for open filelist files that receive
-            // didOpen/didChange.  Rebuilding this merged view happens only when
-            // a shard changes, not on every completion request.
-            merged->merge(entry.index);
-        }
-        extra_project_index_cache_ = std::move(merged);
-    }
-
+    // Request path is read-only: the background/index-update path publishes
+    // immutable merged ProjectIndex snapshots.  If the worker has not published
+    // yet, return an empty snapshot rather than merging shards synchronously.
+    if (!extra_project_index_cache_)
+        extra_project_index_cache_ = std::make_shared<SyntaxIndex>();
     log_perf("extra_project_index files=" + std::to_string(extra_cache_.size()), start);
     return extra_project_index_cache_;
+}
+
+std::shared_ptr<const SyntaxIndex>
+Analyzer::opened_files_index(const std::string& current_uri) const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto merged = std::make_shared<SyntaxIndex>();
+    for (const auto& [uri, state] : docs_) {
+        if (uri == current_uri || !state)
+            continue;
+        merged->merge(build_dynamic_file_index(*state));
+    }
+    return merged;
 }
 
 CompilationSnapshot Analyzer::compilation_snapshot() const {
@@ -1893,20 +2230,23 @@ void add_rtl_index_file(RtlIndexView& view, std::unordered_set<std::string>& see
 
 std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     auto state = get_state(uri);
-    if (!state || !state->tree || state->index.modules.empty())
+    if (!state || !state->tree)
+        return std::nullopt;
+    const auto state_index = build_current_ast_structural_index(*state);
+    if (state_index.modules.empty())
         return std::nullopt;
 
     RtlIndexView view;
     std::unordered_set<std::string> seen_uris;
     for_each_state([&](const std::string& state_uri, const auto& state_snapshot) {
         if (state_snapshot && state_snapshot->tree)
-            add_rtl_index_file(view, seen_uris, state_uri, state_snapshot->index);
+            add_rtl_index_file(view, seen_uris, state_uri, build_current_ast_structural_index(*state_snapshot));
     });
     for (const auto& extra : extra_file_snapshots())
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
 
-    const auto* root = &state->index.modules.front();
-    for (const auto& module : state->index.modules) {
+    const auto* root = &state_index.modules.front();
+    for (const auto& module : state_index.modules) {
         if (module.line > 0 && (root->line <= 0 || module.line < root->line))
             root = &module;
     }
@@ -1944,20 +2284,23 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
 
 std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) const {
     auto state = get_state(uri);
-    if (!state || !state->tree || state->index.modules.empty())
+    if (!state || !state->tree)
+        return std::nullopt;
+    const auto state_index = build_current_ast_structural_index(*state);
+    if (state_index.modules.empty())
         return std::nullopt;
 
     RtlIndexView view;
     std::unordered_set<std::string> seen_uris;
     for_each_state([&](const std::string& state_uri, const auto& state_snapshot) {
         if (state_snapshot && state_snapshot->tree)
-            add_rtl_index_file(view, seen_uris, state_uri, state_snapshot->index);
+            add_rtl_index_file(view, seen_uris, state_uri, build_current_ast_structural_index(*state_snapshot));
     });
     for (const auto& extra : extra_file_snapshots())
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
 
-    const auto* target = &state->index.modules.front();
-    for (const auto& module : state->index.modules) {
+    const auto* target = &state_index.modules.front();
+    for (const auto& module : state_index.modules) {
         if (module.line > 0 && (target->line <= 0 || module.line < target->line))
             target = &module;
     }
@@ -2029,39 +2372,170 @@ void Analyzer::refresh_extra_cache_locked() const {
             refreshed.push_back(ExtraFileCacheEntry{
                 .path = path_string,
                 .uri = uri,
-                .state = doc->second,
-                .index = doc->second->index,
+                .index = build_dynamic_file_index(*doc->second),
             });
             continue;
         }
 
         auto existing = std::find_if(
             extra_cache_.begin(), extra_cache_.end(), [&](const ExtraFileCacheEntry& entry) {
-                return entry.path == path_string && entry.state;
+                return entry.path == path_string;
             });
         if (existing != extra_cache_.end()) {
             refreshed.push_back(*existing);
             continue;
         }
 
-        auto state = make_file_state(path);
+        auto state = make_file_state_with_options(path, defines_, include_dirs_);
         if (!state || !state->tree)
             continue;
 
         refreshed.push_back(ExtraFileCacheEntry{
             .path = path_string,
             .uri = uri,
-            .state = state,
             .index = state->index,
         });
     }
 
     extra_cache_ = std::move(refreshed);
-    invalidate_extra_project_index_locked();
+    publish_extra_project_index_locked();
     log_perf("refresh_extra_cache files=" + std::to_string(extra_cache_.size()), start);
 }
 
-void Analyzer::invalidate_extra_project_index_locked() const {
+void Analyzer::start_background_indexer_locked() const {
+    if (background_indexer_.joinable())
+        return;
+
+    background_indexer_ = std::jthread([this](std::stop_token stop) {
+        background_index_loop(stop);
+    });
+}
+
+void Analyzer::schedule_background_reindex_locked() const {
+    // A new generation invalidates parse results from older define/include/file
+    // configurations.  The worker checks the generation again just before
+    // committing each shard, so a slow parse can never overwrite newer project
+    // state.
+    ++background_generation_;
+    background_pending_files_.clear();
+    for (const auto& path : extra_files_)
+        background_pending_files_.push_back(path);
+    start_background_indexer_locked();
+    background_cv_.notify_all();
+}
+
+void Analyzer::schedule_background_project_publish_locked() const {
+    background_publish_requested_ = true;
+    start_background_indexer_locked();
+    background_cv_.notify_all();
+}
+
+void Analyzer::background_index_loop(std::stop_token stop) const {
+    while (!stop.stop_requested()) {
+        std::string path_string;
+        std::string uri;
+        std::vector<std::string> defines;
+        std::vector<std::string> include_dirs;
+        uint64_t generation = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(map_mutex_);
+            background_cv_.wait(lock, stop, [&] {
+                return stop.stop_requested() || !background_pending_files_.empty() ||
+                       background_publish_requested_;
+            });
+            if (stop.stop_requested())
+                break;
+
+            if (background_pending_files_.empty() && background_publish_requested_) {
+                background_publish_requested_ = false;
+                publish_extra_project_index_locked();
+                continue;
+            }
+
+            path_string = std::move(background_pending_files_.front());
+            background_pending_files_.pop_front();
+            const auto path = normalize_path(path_string);
+            path_string = path.string();
+            uri = path_to_uri(path);
+            generation = background_generation_;
+            defines = defines_;
+            include_dirs = include_dirs_;
+
+            // Open buffers are already parsed from unsaved text by didOpen /
+            // didChange.  Commit that live shard immediately and avoid wasting
+            // background CPU reparsing stale disk contents.
+            if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
+                auto live_index = build_dynamic_file_index(*doc->second);
+                auto existing = std::find_if(
+                    extra_cache_.begin(), extra_cache_.end(), [&](const ExtraFileCacheEntry& e) {
+                        return e.path == path_string || e.uri == uri;
+                    });
+                if (existing != extra_cache_.end()) {
+                    existing->path = path_string;
+                    existing->uri = uri;
+                    existing->index = std::move(live_index);
+                } else {
+                    extra_cache_.push_back(ExtraFileCacheEntry{
+                        .path = path_string,
+                        .uri = uri,
+                        .index = std::move(live_index),
+                    });
+                }
+                background_publish_requested_ = true;
+                continue;
+            }
+        }
+
+        auto state = make_file_state_with_options(path_string, defines, include_dirs);
+        if (stop.stop_requested() || !state || !state->tree)
+            continue;
+
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (generation != background_generation_)
+                continue;
+
+            // If the user opened/edited this file while the disk parse was in
+            // flight, the live buffer is newer and must win.
+            SyntaxIndex committed_index = state->index;
+            if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
+                committed_index = build_dynamic_file_index(*doc->second);
+            }
+
+            auto existing = std::find_if(
+                extra_cache_.begin(), extra_cache_.end(), [&](const ExtraFileCacheEntry& e) {
+                    return e.path == path_string || e.uri == uri;
+                });
+            if (existing != extra_cache_.end()) {
+                existing->path = path_string;
+                existing->uri = uri;
+                existing->index = std::move(committed_index);
+            } else {
+                extra_cache_.push_back(ExtraFileCacheEntry{
+                    .path = path_string,
+                    .uri = uri,
+                    .index = std::move(committed_index),
+                });
+            }
+
+            // ProjectIndex is an immutable merged view derived from shards.
+            // Publish from the background worker so request handlers never pay
+            // the project-wide shard merge cost.
+            publish_extra_project_index_locked();
+        }
+    }
+}
+
+void Analyzer::publish_extra_project_index_locked() const {
+    auto merged = std::make_shared<SyntaxIndex>();
+    for (const auto& entry : extra_cache_) {
+        merged->merge(entry.index);
+    }
+    extra_project_index_cache_ = std::move(merged);
+}
+
+void Analyzer::clear_extra_project_index_locked() const {
     extra_project_index_cache_.reset();
 }
 
@@ -2088,22 +2562,22 @@ void Analyzer::update_extra_cache_for_live_state_locked(
                                  [&](const ExtraFileCacheEntry& entry) {
                                      return entry.path == path_string || entry.uri == uri;
                                  });
+    auto live_index = build_dynamic_file_index(*state);
     if (existing != extra_cache_.end()) {
         existing->path = path_string;
         existing->uri = uri;
-        existing->state = state;
-        existing->index = state->index;
+        existing->index = std::move(live_index);
     } else {
         extra_cache_.push_back(ExtraFileCacheEntry{
             .path = path_string,
             .uri = uri,
-            .state = state,
-            .index = state->index,
+            .index = std::move(live_index),
         });
     }
 
     // This is the Option-B shard replacement point: b.sv's shard is replaced
-    // when b.sv receives didOpen/didChange.  The merged project view is derived
-    // from shards and is rebuilt lazily on the next project-aware completion.
-    invalidate_extra_project_index_locked();
+    // when b.sv receives didOpen/didChange.  The merged project view is
+    // published asynchronously by the background worker; request handlers keep
+    // seeing the previous snapshot until the worker finishes the merge.
+    schedule_background_project_publish_locked();
 }

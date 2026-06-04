@@ -1,11 +1,14 @@
 #pragma once
 #include "document_state.hpp"
 #include "syntax_index.hpp"
+#include <condition_variable>
 #include <filesystem>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -36,7 +39,16 @@ struct IdentifierAtPosition {
 struct ExtraFileInfo {
     std::string path;
     std::string uri;
+    // Non-null only when this file is currently open in the editor.  Closed
+    // project files must not keep DocumentState / SyntaxTree alive; they are
+    // represented by `index` only.
     std::shared_ptr<const DocumentState> state;
+    SyntaxIndex index;
+};
+
+struct ExtraIndexInfo {
+    std::string path;
+    std::string uri;
     SyntaxIndex index;
 };
 
@@ -64,6 +76,7 @@ struct RtlTreeNode {
 class Analyzer {
   public:
     Analyzer() = default;
+    ~Analyzer();
 
     /// Create a new DocumentState for uri with the given text.
     void open(const std::string& uri, const std::string& text);
@@ -130,23 +143,38 @@ class Analyzer {
     /// Return extra files from .f filelist.
     std::vector<std::string> extra_files() const;
 
-    /// Return parsed/indexed extra files, refreshing stale disk entries first.
+    /// Return project-file index shards.
+    ///
+    /// Historical note: this used to return cached closed-file DocumentState
+    /// objects as well.  It now keeps DocumentState only for open buffers, so
+    /// callers must treat `state` as optional and use `index` for closed files.
     std::vector<ExtraFileInfo> extra_file_snapshots() const;
+
+    /// Return per-file project index shards without exposing full SyntaxTrees.
+    ///
+    /// Cross-file features should prefer this over extra_file_snapshots() when
+    /// they only need indexed structural data.  This supports the indexing
+    /// philosophy: current file uses AST, project files use index.
+    std::vector<ExtraIndexInfo> extra_index_snapshots() const;
 
     /// Append cached extra-file modules to an existing SyntaxIndex.
     void merge_extra_file_modules(SyntaxIndex& index) const;
 
-    /// Return a cached project-wide index built from filelist-only extra files.
+    /// Return the last background-published project-wide index snapshot.
     ///
-    /// This is intentionally separate from extra_file_snapshots():
-    /// extra_file_snapshots() returns per-file copies and substitutes live
-    /// open-buffer states, which is useful for navigation features but
-    /// expensive for high-frequency completion requests.  extra_project_index()
-    /// keeps one premerged disk-backed index that is invalidated whenever the
-    /// extra-file cache is refreshed.  Callers that need current-buffer facts
-    /// should merge this into the current DocumentState::index, letting the
-    /// current buffer win for duplicate module/class/typedef names.
+    /// The request path never merges per-file shards.  The background worker
+    /// parses/replaces shards and publishes an immutable merged SyntaxIndex
+    /// snapshot.  While the worker is still catching up, callers see the last
+    /// published snapshot (or an empty one before the first publish).
     std::shared_ptr<const SyntaxIndex> extra_project_index() const;
+
+    /// Return a merged dynamic/file index for other open buffers.
+    ///
+    /// This is the clangd "dynamic" layer: files that have been opened/parsed
+    /// during this editor session, including unsaved edits.  The current file
+    /// is excluded because completion/point queries inspect its SyntaxTree
+    /// directly instead of materializing a current-file index.
+    std::shared_ptr<const SyntaxIndex> opened_files_index(const std::string& current_uri) const;
 
     /// Return an immutable snapshot for background semantic compilation.
     /// Open documents include their in-memory text; filelist-only documents
@@ -186,12 +214,16 @@ class Analyzer {
     struct ExtraFileCacheEntry {
         std::string path;
         std::string uri;
-        std::shared_ptr<const DocumentState> state;
         SyntaxIndex index;
     };
 
     void refresh_extra_cache_locked() const;
-    void invalidate_extra_project_index_locked() const;
+    void start_background_indexer_locked() const;
+    void schedule_background_reindex_locked() const;
+    void schedule_background_project_publish_locked() const;
+    void background_index_loop(std::stop_token stop) const;
+    void publish_extra_project_index_locked() const;
+    void clear_extra_project_index_locked() const;
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state);
 
     // Resolved .f filelist path.  We intentionally do not poll this file's
@@ -208,5 +240,19 @@ class Analyzer {
     mutable std::vector<std::string> extra_files_;
     mutable std::vector<ExtraFileCacheEntry> extra_cache_;
     mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
+
+    // clangd-style background index state.
+    //
+    // The map mutex protects both the foreground document shards and this
+    // background queue.  The worker copies one path + config snapshot, releases
+    // the mutex while slang parses that file, then reacquires it only to commit
+    // the resulting per-file shard.  This keeps the LSP request path from
+    // blocking behind a full .f parse.
+    mutable std::condition_variable_any background_cv_;
+    mutable std::deque<std::string> background_pending_files_;
+    mutable bool background_publish_requested_{false};
+    mutable uint64_t background_generation_{0};
+    mutable std::jthread background_indexer_;
+
     std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
 };

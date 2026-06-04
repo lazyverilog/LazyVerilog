@@ -30,3 +30,4 @@ Notable difference from older examples:
 
 - [Build and tests](dev/test.md)
 - [Design filelist cache](dev/files.md)
+- [Indexing philosophy](dev/indexing.md)
