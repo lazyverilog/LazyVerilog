@@ -99,29 +99,60 @@ static size_t lsp_offset(const std::string& text, int line, int col) {
 static std::pair<size_t, size_t> lsp_offset_pair(const std::string& text,
                                                   int line1, int col1,
                                                   int line2, int col2) {
-    // Ensure we scan in document order.
+    // Ensure we scan in document order while preserving the caller-visible
+    // ordering at the end.  LSP ranges are normally ordered, but the helper is
+    // used by generic range utilities, so accepting reversed positions makes
+    // the function defensive.
     bool swapped = (line1 > line2 || (line1 == line2 && col1 > col2));
     if (swapped) { std::swap(line1, line2); std::swap(col1, col2); }
 
+    // Walk to the start of the first requested line once.
     int cur = 0;
     size_t pos = 0;
     while (pos < text.size() && cur < line1) {
         if (text[pos] == '\n') ++cur;
         ++pos;
     }
-    size_t ls1 = pos;
-    while (pos < text.size() && text[pos] != '\n' && (int)(pos - ls1) < col1)
-        ++pos;
-    size_t off1 = pos;
+    const size_t line1_start = pos;
 
+    // Important: compute both same-line offsets from the original line start.
+    // A previous implementation set the second line start to the already
+    // advanced first offset.  For a zero-width same-line insertion at column C,
+    // that turned (C, C) into offsets (C, 2*C), causing didChange to delete
+    // existing text after the cursor.  In practice this could eat the closing
+    // bracket when typing inside a declaration such as:
+    //
+    //     logic [`PARAMSVH_PARAM-1:0] include_param;
+    //
+    // because Neovim sends the typed macro text as a same-line incremental
+    // edit before the existing ']'.
+    size_t off1 = line1_start;
+    while (off1 < text.size() && text[off1] != '\n' &&
+           (int)(off1 - line1_start) < col1)
+        ++off1;
+
+    if (line1 == line2) {
+        size_t off2 = line1_start;
+        while (off2 < text.size() && text[off2] != '\n' &&
+               (int)(off2 - line1_start) < col2)
+            ++off2;
+
+        if (swapped) std::swap(off1, off2);
+        return {off1, off2};
+    }
+
+    // Different-line case: continue scanning from line1 start to line2 start,
+    // then compute col2 relative to that true second-line start.
+    pos = line1_start;
     while (pos < text.size() && cur < line2) {
         if (text[pos] == '\n') ++cur;
         ++pos;
     }
-    size_t ls2 = pos;
-    while (pos < text.size() && text[pos] != '\n' && (int)(pos - ls2) < col2)
-        ++pos;
-    size_t off2 = pos;
+    const size_t line2_start = pos;
+    size_t off2 = line2_start;
+    while (off2 < text.size() && text[off2] != '\n' &&
+           (int)(off2 - line2_start) < col2)
+        ++off2;
 
     if (swapped) std::swap(off1, off2);
     return {off1, off2};
@@ -408,7 +439,8 @@ void LazyVerilogServer::configure_background_compiler() {
     background_compiler_->configure(config_.compilation.background_compilation,
                                     config_.compilation.background_compilation_threads,
                                     config_.compilation.background_compilation_debounce_ms,
-                                    config_.compilation.log_timing);
+                                    config_.compilation.log_timing,
+                                    config_.compilation.nice_value);
 
     if (!config_.compilation.background_compilation)
         analyzer_.clear_all_semantic_diagnostics();

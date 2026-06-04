@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <sys/resource.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -93,7 +94,7 @@ BackgroundCompiler::BackgroundCompiler(ResultCallback callback) : callback_(std:
 BackgroundCompiler::~BackgroundCompiler() { stop(); }
 
 void BackgroundCompiler::configure(bool enabled, int thread_count, int debounce_ms,
-                                   bool log_timing) {
+                                   bool log_timing, int nice_value) {
     thread_count = std::max(1, thread_count);
     debounce_ms = std::max(0, debounce_ms);
 
@@ -101,6 +102,7 @@ void BackgroundCompiler::configure(bool enabled, int thread_count, int debounce_
     enabled_ = enabled;
     log_timing_ = log_timing;
     debounce_ms_ = debounce_ms;
+    nice_value_ = nice_value;
 
     if (!enabled_) {
         pending_.reset();
@@ -111,7 +113,10 @@ void BackgroundCompiler::configure(bool enabled, int thread_count, int debounce_
     }
 
     while (static_cast<int>(workers_.size()) < thread_count)
-        workers_.emplace_back([this] { worker_loop(); });
+        workers_.emplace_back([this, nice_value] {
+            setpriority(PRIO_PROCESS, 0, nice_value);
+            worker_loop();
+        });
 
     // Keep existing workers if the count is lowered. They are idle unless jobs
     // are scheduled, and avoiding per-config thread teardown keeps this simple.

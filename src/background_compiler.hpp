@@ -28,7 +28,8 @@ class BackgroundCompiler {
     BackgroundCompiler(const BackgroundCompiler&) = delete;
     BackgroundCompiler& operator=(const BackgroundCompiler&) = delete;
 
-    void configure(bool enabled, int thread_count, int debounce_ms, bool log_timing);
+    void configure(bool enabled, int thread_count, int debounce_ms, bool log_timing,
+                   int nice_value);
     void schedule(CompilationSnapshot snapshot);
     void stop();
 
@@ -44,6 +45,7 @@ class BackgroundCompiler {
     bool enabled_{false};
     bool log_timing_{false};
     int debounce_ms_{1500};
+    int nice_value_{10};
     uint64_t latest_generation_{0};
     std::optional<CompilationSnapshot> pending_;
     std::chrono::steady_clock::time_point due_time_{};
