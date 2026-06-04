@@ -3,6 +3,7 @@
 #include "formatter_token.hpp"
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <regex>
 #include <string_view>
 #include <slang/diagnostics/Diagnostics.h>
@@ -22,6 +23,15 @@ inline std::string lower_ascii(std::string_view text) {
     return out;
 }
 
+inline std::optional<std::regex> compile_format_marker_regex(const std::string& pattern) {
+    if (pattern.empty()) return std::nullopt;
+    try {
+        return std::regex(pattern, std::regex::ECMAScript | std::regex::icase);
+    } catch (const std::regex_error&) {
+        return std::nullopt; // malformed — callers fall back to literal search
+    }
+}
+
 inline bool is_format_marker(std::string_view comment, const std::string& configured_pattern) {
     if (configured_pattern.empty()) return false;
     try {
@@ -33,9 +43,25 @@ inline bool is_format_marker(std::string_view comment, const std::string& config
     }
 }
 
+// Fast path: use pre-compiled regex (compiled once at TokenCollector construction).
+inline bool is_format_marker(std::string_view comment,
+                              const std::optional<std::regex>& compiled_re,
+                              const std::string& pattern_fallback) {
+    if (compiled_re) {
+        try {
+            return std::regex_search(std::string(comment), *compiled_re);
+        } catch (...) {}
+    }
+    if (pattern_fallback.empty()) return false;
+    return std::string(comment).find(pattern_fallback) != std::string::npos;
+}
+
 class TokenCollector {
 public:
-    TokenCollector(const std::string& source, const FormatOptions& opts) : source_(source), opts_(opts) {}
+    TokenCollector(const std::string& source, const FormatOptions& opts)
+        : source_(source), opts_(opts),
+          format_off_re_(compile_format_marker_regex(opts.format_off_comment_pattern)),
+          format_on_re_(compile_format_marker_regex(opts.format_on_comment_pattern)) {}
 
     TokenStream collect() {
         slang::SourceManager sm;
@@ -119,6 +145,8 @@ public:
 private:
     const std::string& source_;
     const FormatOptions& opts_;
+    std::optional<std::regex> format_off_re_;
+    std::optional<std::regex> format_on_re_;
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
@@ -219,7 +247,7 @@ private:
                 trivia.kind == TV::LineComment ? CommentLexemeKind::Line :
                 trivia.kind == TV::BlockComment ? CommentLexemeKind::Block :
                 CommentLexemeKind::None;
-            const bool format_on = is_comment && is_format_marker(raw, opts_.format_on_comment_pattern);
+            const bool format_on = is_comment && is_format_marker(raw, format_on_re_, opts_.format_on_comment_pattern);
             if (!raw_chunk.empty())
                 add_token(TK::Unknown, raw_chunk, cursor_, is_comment, false, true,
                           comment_kind, false, format_on);
@@ -234,8 +262,8 @@ private:
         consume_gap_to(pos);
 
         if (trivia.kind == TV::LineComment || trivia.kind == TV::BlockComment) {
-            bool format_off = is_format_marker(raw, opts_.format_off_comment_pattern);
-            bool format_on = is_format_marker(raw, opts_.format_on_comment_pattern);
+            bool format_off = is_format_marker(raw, format_off_re_, opts_.format_off_comment_pattern);
+            bool format_on = is_format_marker(raw, format_on_re_, opts_.format_on_comment_pattern);
             const CommentLexemeKind comment_kind =
                 trivia.kind == TV::LineComment ? CommentLexemeKind::Line : CommentLexemeKind::Block;
             add_token(TK::Unknown, raw, pos, true, false, disabled_ || format_off || format_on,
@@ -393,7 +421,7 @@ private:
                 const size_t end = line_end_after(pos + 2);
                 const size_t comment_end = (end > pos && source_[end - 1] == '\n') ? end - 1 : end;
                 std::string_view comment(source_.data() + pos, comment_end - pos);
-                if (is_format_marker(comment, opts_.format_on_comment_pattern))
+                if (is_format_marker(comment, format_on_re_, opts_.format_on_comment_pattern))
                     return end;
                 pos = end == 0 ? pos : end - 1;
                 continue;
@@ -402,7 +430,7 @@ private:
             if (source_[pos + 1] == '*') {
                 const size_t comment_end = block_comment_end_after(pos + 2);
                 std::string_view comment(source_.data() + pos, comment_end - pos);
-                if (is_format_marker(comment, opts_.format_on_comment_pattern)) {
+                if (is_format_marker(comment, format_on_re_, opts_.format_on_comment_pattern)) {
                     size_t end = comment_end;
                     if (end < source_.size() && source_[end] == '\r' &&
                         end + 1 < source_.size() && source_[end + 1] == '\n')

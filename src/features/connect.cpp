@@ -108,7 +108,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{state_uri, state->text, build_current_ast_structural_index(*state)});
+        files.push_back(FileView{state_uri, state->text, get_structural_index(*state)});
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
@@ -122,7 +122,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{uri, state->text, build_current_ast_structural_index(*state)});
+            files.push_back(FileView{uri, state->text, get_structural_index(*state)});
     }
     return files;
 }

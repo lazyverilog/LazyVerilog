@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -40,6 +41,10 @@ struct DocumentState {
     std::vector<ParseDiagInfo> parse_diagnostics;
     // Derived syntax index built once per immutable document snapshot.
     SyntaxIndex index;
+    // Lazy structural index cache — populated on first call to get_structural_index().
+    // mutable so const DocumentState& callers can warm it without a full index rebuild.
+    mutable std::once_flag structural_index_once_;
+    mutable SyntaxIndex structural_index_cache_;
     // Compilation is optional — only present when background_compilation=true
     std::optional<std::shared_ptr<slang::ast::Compilation>> compilation;
     std::string tree_filename{"buffer.sv"};

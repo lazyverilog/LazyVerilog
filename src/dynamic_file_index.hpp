@@ -30,3 +30,9 @@ SyntaxIndex build_dynamic_file_index(const DocumentState& state);
 /// those point-query/completion concerns should query the current SyntaxTree
 /// directly.
 SyntaxIndex build_current_ast_structural_index(const DocumentState& state);
+
+/// Cached variant of build_current_ast_structural_index.
+/// Computes the structural index once per DocumentState instance (on first call)
+/// and returns a const reference to the cached result on every subsequent call.
+/// Thread-safe: concurrent callers block until the first computation completes.
+const SyntaxIndex& get_structural_index(const DocumentState& state);

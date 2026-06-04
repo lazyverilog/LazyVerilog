@@ -93,6 +93,40 @@ static size_t lsp_offset(const std::string& text, int line, int col) {
     return pos;
 }
 
+// Compute two byte offsets in a single scan. Positions must be in document order
+// (start before end); if not they are swapped and the result pair is returned
+// in swapped order so callers always get (start_offset, end_offset).
+static std::pair<size_t, size_t> lsp_offset_pair(const std::string& text,
+                                                  int line1, int col1,
+                                                  int line2, int col2) {
+    // Ensure we scan in document order.
+    bool swapped = (line1 > line2 || (line1 == line2 && col1 > col2));
+    if (swapped) { std::swap(line1, line2); std::swap(col1, col2); }
+
+    int cur = 0;
+    size_t pos = 0;
+    while (pos < text.size() && cur < line1) {
+        if (text[pos] == '\n') ++cur;
+        ++pos;
+    }
+    size_t ls1 = pos;
+    while (pos < text.size() && text[pos] != '\n' && (int)(pos - ls1) < col1)
+        ++pos;
+    size_t off1 = pos;
+
+    while (pos < text.size() && cur < line2) {
+        if (text[pos] == '\n') ++cur;
+        ++pos;
+    }
+    size_t ls2 = pos;
+    while (pos < text.size() && text[pos] != '\n' && (int)(pos - ls2) < col2)
+        ++pos;
+    size_t off2 = pos;
+
+    if (swapped) std::swap(off1, off2);
+    return {off1, off2};
+}
+
 // Format a generated replacement fragment and strip final newlines so it can be
 // used as an LSP TextEdit.newText value for a bounded range.  `format_source()`
 // renders complete files with a trailing newline, but range replacements such as
@@ -160,14 +194,12 @@ static lsTextEdit whole_document_edit(const std::string& old_text, const std::st
 }
 
 static std::string slice_lsp_range(const std::string& text, const lsRange& range) {
-    size_t start = lsp_offset(text, range.start.line, range.start.character);
-    size_t end = lsp_offset(text, range.end.line, range.end.character);
-    if (start > text.size())
-        start = text.size();
-    if (end > text.size())
-        end = text.size();
-    if (start > end)
-        start = end;
+    auto [start, end] = lsp_offset_pair(text,
+        range.start.line, range.start.character,
+        range.end.line, range.end.character);
+    if (start > text.size()) start = text.size();
+    if (end > text.size()) end = text.size();
+    if (start > end) start = end;
     return text.substr(start, end - start);
 }
 
@@ -214,14 +246,12 @@ static std::string apply_incremental_change(std::string text,
                                             const lsTextDocumentContentChangeEvent& chg) {
     if (!chg.range)
         return chg.text; // full-document replacement fallback
-    size_t start = lsp_offset(text, chg.range->start.line, chg.range->start.character);
-    size_t end = lsp_offset(text, chg.range->end.line, chg.range->end.character);
-    if (start > text.size())
-        start = text.size();
-    if (end > text.size())
-        end = text.size();
-    if (start > end)
-        start = end;
+    auto [start, end] = lsp_offset_pair(text,
+        chg.range->start.line, chg.range->start.character,
+        chg.range->end.line, chg.range->end.character);
+    if (start > text.size()) start = text.size();
+    if (end > text.size()) end = text.size();
+    if (start > end) start = end;
     text.replace(start, end - start, chg.text);
     return text;
 }
@@ -450,8 +480,8 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             SyntaxIndex lint_index;
             const SyntaxIndex* lint_index_ptr = nullptr;
             if (config_.lint.module.stale_autoinst_diagnostic) {
-                lint_index = build_current_ast_structural_index(*state);
-                analyzer_.merge_extra_file_modules(lint_index);
+                lint_index = get_structural_index(*state);
+                lint_index.merge(*analyzer_.extra_project_index());
                 lint_index_ptr = &lint_index;
             }
 
@@ -1025,7 +1055,9 @@ void LazyVerilogServer::register_handlers() {
                 // or, for errors/warnings:
                 //   { "error": "...", "warn": true }
                 // Keep this separate from autoffApply, which returns a WorkspaceEdit.
-                std::string json = "{";
+                std::string json;
+                json.reserve(128 + result.pairs.size() * 150);
+                json += "{";
                 bool need_comma = false;
                 auto comma = [&]() {
                     if (need_comma)
@@ -1076,38 +1108,38 @@ void LazyVerilogServer::register_handlers() {
                 if (!state)
                     return;
 
-                // Apply edits in reverse order to build new text
-                auto lines = [&]() {
-                    std::vector<std::string> ls;
+                // Apply edits in reverse order to build new text.
+                // Use string_view slices for source lines — no per-line string copies.
+                std::vector<std::string_view> lines;
+                {
+                    const std::string_view tv = state->text;
                     size_t start = 0;
-                    const std::string& t = state->text;
-                    while (start <= t.size()) {
-                        size_t end = t.find('\n', start);
-                        if (end == std::string::npos) {
-                            ls.push_back(t.substr(start));
+                    while (start <= tv.size()) {
+                        size_t end = tv.find('\n', start);
+                        if (end == std::string_view::npos) {
+                            lines.push_back(tv.substr(start));
                             break;
                         }
-                        ls.push_back(t.substr(start, end - start));
+                        lines.push_back(tv.substr(start, end - start));
                         start = end + 1;
                     }
-                    return ls;
-                }();
+                }
 
-                // Insert edits (already sorted in reverse line order)
+                // Insert edits (already sorted in reverse line order).
+                // Edit text views remain valid for the duration of this lambda.
                 for (const auto& edit : result.edits) {
                     if (edit.line >= 0 && edit.line <= (int)lines.size()) {
-                        // Split edit.text into lines and insert before lines[edit.line]
-                        std::vector<std::string> new_lines;
-                        std::string remaining = edit.text;
+                        const std::string_view ev = edit.text;
+                        std::vector<std::string_view> new_lines;
                         size_t pos = 0;
-                        while (pos <= remaining.size()) {
-                            size_t nl = remaining.find('\n', pos);
-                            if (nl == std::string::npos) {
-                                if (pos < remaining.size())
-                                    new_lines.push_back(remaining.substr(pos));
+                        while (pos <= ev.size()) {
+                            size_t nl = ev.find('\n', pos);
+                            if (nl == std::string_view::npos) {
+                                if (pos < ev.size())
+                                    new_lines.push_back(ev.substr(pos));
                                 break;
                             }
-                            new_lines.push_back(remaining.substr(pos, nl - pos));
+                            new_lines.push_back(ev.substr(pos, nl - pos));
                             pos = nl + 1;
                         }
                         lines.insert(lines.begin() + edit.line, new_lines.begin(), new_lines.end());
@@ -1115,9 +1147,10 @@ void LazyVerilogServer::register_handlers() {
                 }
 
                 std::string new_text;
+                new_text.reserve(state->text.size() + 256);
                 for (size_t i = 0; i < lines.size(); ++i) {
                     if (i > 0)
-                        new_text += "\n";
+                        new_text += '\n';
                     new_text += lines[i];
                 }
                 new_text = format_source(new_text, config_.format);

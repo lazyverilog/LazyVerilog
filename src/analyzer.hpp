@@ -238,7 +238,7 @@ class Analyzer {
     std::vector<std::string> defines_;
     std::vector<std::string> include_dirs_;
     mutable std::vector<std::string> extra_files_;
-    mutable std::vector<ExtraFileCacheEntry> extra_cache_;
+    mutable std::unordered_map<std::string, ExtraFileCacheEntry> extra_cache_;
     mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
 
     // clangd-style background index state.

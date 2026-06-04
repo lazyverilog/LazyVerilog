@@ -588,7 +588,7 @@ std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig
         // merged project index, but the stale-autoinst rule still needs at
         // least same-file module declarations.  Build this only for that rule,
         // never for ordinary didChange lint.
-        local_stale_index = build_current_ast_structural_index(state);
+        local_stale_index = get_structural_index(state);
         index_for_rules = &local_stale_index;
     }
     LintVisitor v(config, index_for_rules ? *index_for_rules : empty_index, sm,

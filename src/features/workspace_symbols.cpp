@@ -71,7 +71,7 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
     analyzer.for_each_state([&](const std::string& uri,
                                 const std::shared_ptr<const DocumentState>& state) {
         if (state && state->tree)
-            append_index_symbols(build_current_ast_structural_index(*state), uri, query, symbols);
+            append_index_symbols(get_structural_index(*state), uri, query, symbols);
     });
 
     for (const auto& extra : analyzer.extra_index_snapshots())
