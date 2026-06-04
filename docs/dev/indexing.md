@@ -31,3 +31,12 @@ can safely finish against the old snapshot while new requests see a fresh cache.
 Do not retain full ASTs for closed project files to get similar behavior; closed
 files should continue to participate through compact `SyntaxIndex` shards only.
 
+## Project-index refresh notifications
+
+Features that depend on definitions from filelist/project files may produce partial
+answers before the background indexer publishes its first merged snapshot.  When
+the project snapshot is republished, the server requests `workspace/inlayHint/refresh`
+so clients can re-query inlay hints without waiting for a user edit.  Keep this
+refresh path lightweight: project indexing still happens in the background, and
+request handlers should not synchronously merge or parse project files.
+

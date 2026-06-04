@@ -98,6 +98,8 @@ Displays inline hints inside module instantiations:
 - **Port hints** — direction and type of each connected port shown inline.
 - **Coverage hint** — `N/M` connected port count shown at the opening parenthesis.
 
+Hints for instances whose module definitions live in `design.vcode` are refreshed after the background project index is published.  This means a file opened immediately at startup may first receive an empty hint response, then receive hints once the filelist index is ready.
+
 ```toml
 [inlay_hint]
 enable = true
