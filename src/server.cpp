@@ -537,10 +537,31 @@ void LazyVerilogServer::register_handlers() {
             caps.workspaceSymbolProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
 
-            // Completion: trigger on '.', '::', '`', '(', '#', '"'
+            // Completion triggers are intentionally conservative.
+            //
+            // Earlier versions advertised several very common typing
+            // characters, such as `(`, `#`, `"`, and `=`.  That made clients
+            // which automatically request completion on trigger characters
+            // enter the completion engine during ordinary RTL editing:
+            //
+            //   u_foo (       // `(` is typed constantly in instantiations/calls
+            //   #(.W(32))     // `#` is common in parameterized instantiations
+            //   assign a =    // `=` appears in normal expressions
+            //   `include "    // `"` appears in strings/includes
+            //
+            // In HPC/shared-resource environments those extra requests are
+            // especially painful because even a cached completion path still
+            // burns shared CPU.  Manual completion remains available in all
+            // contexts; only automatic trigger-based requests are reduced.
+            //
+            // Keep only the triggers that strongly indicate a SystemVerilog
+            // completion context:
+            //   "."  member / named-port style contexts
+            //   ":"  package/class scope completion via "::" (LSP triggers are
+            //        single strings, so ":" is the practical trigger)
+            //   "`"  macro completion
             lsCompletionOptions comp_opts;
-            comp_opts.triggerCharacters =
-                std::vector<std::string>{".", ":", "`", "(", "#", "\"", "="};
+            comp_opts.triggerCharacters = std::vector<std::string>{".", ":", "`"};
             comp_opts.resolveProvider = false;
             caps.completionProvider = comp_opts;
 
