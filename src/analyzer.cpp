@@ -154,26 +154,31 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     auto state = make_state(uri, text);
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_[uri] = state;
+    update_extra_cache_for_live_state_locked(state);
 }
 
 void Analyzer::change(const std::string& uri, const std::string& text) {
     auto state = make_state(uri, text);
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_[uri] = state;
+    update_extra_cache_for_live_state_locked(state);
 }
 
 void Analyzer::close(const std::string& uri) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_.erase(uri);
-    // If the closed file is also in extra_cache_, invalidate its mtime so
-    // refresh_extra_cache_locked() re-parses it from disk on the next access.
-    // Without this, extra_cache_ holds the pre-open snapshot — missing any
-    // edits the user made while the file was open.
+    // If the closed file is also in the filelist cache, replace its live shard
+    // with a disk-backed parse.  This keeps the per-file project-index shards
+    // source-of-truth correct without polling mtimes for every .f entry.
     for (auto& entry : extra_cache_) {
-        if (entry.uri == uri) {
-            entry.mtime = std::nullopt;
-            break;
+        if (entry.uri != uri)
+            continue;
+        if (auto state = make_file_state(entry.path)) {
+            entry.state = state;
+            entry.index = state->index;
+            invalidate_extra_project_index_locked();
         }
+        break;
     }
 }
 
@@ -375,15 +380,6 @@ static std::filesystem::path normalize_path(const std::string& path) {
     if (ec)
         absolute = std::filesystem::path(path);
     return absolute.lexically_normal();
-}
-
-static std::optional<std::filesystem::file_time_type>
-file_mtime(const std::filesystem::path& path) {
-    std::error_code ec;
-    auto mtime = std::filesystem::last_write_time(path, ec);
-    if (ec)
-        return std::nullopt;
-    return mtime;
 }
 
 static std::string trim_copy(std::string text) {
@@ -1685,7 +1681,7 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     defines_ = defines;
     // Invalidate extra-file cache so reopened files pick up the new defines.
     extra_cache_.clear();
-    filelist_mtime_.reset();
+    invalidate_extra_project_index_locked();
 }
 
 void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
@@ -1699,7 +1695,7 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     // cache even if the filelist itself did not change, otherwise a newly added
     // UVM include directory would not be visible until the next source edit.
     extra_cache_.clear();
-    filelist_mtime_.reset();
+    invalidate_extra_project_index_locked();
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
@@ -1707,10 +1703,11 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     std::lock_guard<std::mutex> lock(map_mutex_);
     filelist_path_ = filelist_path;
     extra_files_.clear();
+    extra_cache_.clear();
     extra_files_.reserve(paths.size());
     for (const auto& path : paths)
         extra_files_.push_back(normalize_path(path).string());
-    filelist_mtime_.reset();
+    invalidate_extra_project_index_locked();
     if (filelist_path_.empty())
         refresh_extra_cache_locked();
 }
@@ -1718,19 +1715,12 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
 std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
     const auto start = Clock::now();
     std::lock_guard<std::mutex> lock(map_mutex_);
-    // Verible-style: stat() only the .f filelist file (1 syscall per request)
-    // instead of every individual extra file (N syscalls). Refresh the cache
-    // only when the filelist itself changes. On NFS/HPC this keeps per-request
-    // overhead at O(1) instead of O(N * stat_latency).
-    if (!filelist_path_.empty()) {
-        const auto current_mtime = file_mtime(std::filesystem::path(filelist_path_));
-        if (current_mtime != filelist_mtime_) {
-            refresh_extra_cache_locked();
-            filelist_mtime_ = current_mtime;
-        }
-    } else if (!extra_files_.empty() && extra_cache_.empty()) {
+    // Do not poll the .f file mtime on request paths.  The filelist is treated
+    // as configuration loaded at startup / config reload.  This avoids metadata
+    // I/O in HPC environments and keeps edits to listed open buffers
+    // incremental through update_extra_cache_for_live_state_locked().
+    if (!extra_files_.empty() && extra_cache_.size() < extra_files_.size())
         refresh_extra_cache_locked();
-    }
 
     std::vector<ExtraFileInfo> result;
     result.reserve(extra_cache_.size());
@@ -1764,6 +1754,35 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
 void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
     for (const auto& extra : extra_file_snapshots())
         index.merge(extra.index);
+}
+
+std::shared_ptr<const SyntaxIndex> Analyzer::extra_project_index() const {
+    const auto start = Clock::now();
+    std::lock_guard<std::mutex> lock(map_mutex_);
+
+    // No .f mtime polling here.  The filelist is a configuration input, and
+    // open-buffer edits to files listed in it update their individual cache
+    // shards directly.  If this is the first project-aware request, populate
+    // the missing shards once from disk.
+    if (!extra_files_.empty() && extra_cache_.size() < extra_files_.size())
+        refresh_extra_cache_locked();
+
+    if (!extra_project_index_cache_) {
+        auto merged = std::make_shared<SyntaxIndex>();
+        for (const auto& entry : extra_cache_) {
+            if (!entry.state)
+                continue;
+            // Each entry is a source-file shard.  It is disk-backed for closed
+            // files and live-buffer-backed for open filelist files that receive
+            // didOpen/didChange.  Rebuilding this merged view happens only when
+            // a shard changes, not on every completion request.
+            merged->merge(entry.index);
+        }
+        extra_project_index_cache_ = std::move(merged);
+    }
+
+    log_perf("extra_project_index files=" + std::to_string(extra_cache_.size()), start);
+    return extra_project_index_cache_;
 }
 
 CompilationSnapshot Analyzer::compilation_snapshot() const {
@@ -2000,20 +2019,31 @@ void Analyzer::refresh_extra_cache_locked() const {
     for (const auto& configured_path : extra_files_) {
         const auto path = normalize_path(configured_path);
         const auto path_string = path.string();
-        const auto mtime = file_mtime(path);
-        if (!mtime)
+        const auto uri = path_to_uri(path);
+
+        // If this file is open in the editor, its DocumentState is the
+        // authoritative shard.  This makes project-wide completion see unsaved
+        // edits in b.sv when completing from top.sv, without reparsing every
+        // filelist source.
+        if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
+            refreshed.push_back(ExtraFileCacheEntry{
+                .path = path_string,
+                .uri = uri,
+                .state = doc->second,
+                .index = doc->second->index,
+            });
             continue;
+        }
 
         auto existing = std::find_if(
             extra_cache_.begin(), extra_cache_.end(), [&](const ExtraFileCacheEntry& entry) {
-                return entry.path == path_string && entry.mtime == mtime && entry.state;
+                return entry.path == path_string && entry.state;
             });
         if (existing != extra_cache_.end()) {
             refreshed.push_back(*existing);
             continue;
         }
 
-        const auto uri = path_to_uri(path);
         auto state = make_file_state(path);
         if (!state || !state->tree)
             continue;
@@ -2021,12 +2051,59 @@ void Analyzer::refresh_extra_cache_locked() const {
         refreshed.push_back(ExtraFileCacheEntry{
             .path = path_string,
             .uri = uri,
-            .mtime = mtime,
             .state = state,
             .index = state->index,
         });
     }
 
     extra_cache_ = std::move(refreshed);
+    invalidate_extra_project_index_locked();
     log_perf("refresh_extra_cache files=" + std::to_string(extra_cache_.size()), start);
+}
+
+void Analyzer::invalidate_extra_project_index_locked() const {
+    extra_project_index_cache_.reset();
+}
+
+void Analyzer::update_extra_cache_for_live_state_locked(
+    std::shared_ptr<const DocumentState> state) {
+    if (!state)
+        return;
+
+    std::string path_text = state->uri;
+    if (path_text.starts_with("file://"))
+        path_text = path_text.substr(7);
+    const auto path = normalize_path(path_text);
+    const auto path_string = path.string();
+    const auto uri = path_to_uri(path);
+
+    // Only files explicitly listed in the design filelist participate in the
+    // project index.  Random open buffers should not pollute project-wide
+    // completion for the configured design.
+    const auto listed = std::find(extra_files_.begin(), extra_files_.end(), path_string);
+    if (listed == extra_files_.end())
+        return;
+
+    auto existing = std::find_if(extra_cache_.begin(), extra_cache_.end(),
+                                 [&](const ExtraFileCacheEntry& entry) {
+                                     return entry.path == path_string || entry.uri == uri;
+                                 });
+    if (existing != extra_cache_.end()) {
+        existing->path = path_string;
+        existing->uri = uri;
+        existing->state = state;
+        existing->index = state->index;
+    } else {
+        extra_cache_.push_back(ExtraFileCacheEntry{
+            .path = path_string,
+            .uri = uri,
+            .state = state,
+            .index = state->index,
+        });
+    }
+
+    // This is the Option-B shard replacement point: b.sv's shard is replaced
+    // when b.sv receives didOpen/didChange.  The merged project view is derived
+    // from shards and is rebuilt lazily on the next project-aware completion.
+    invalidate_extra_project_index_locked();
 }

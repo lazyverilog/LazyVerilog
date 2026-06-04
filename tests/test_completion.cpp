@@ -539,6 +539,35 @@ TEST_CASE("completion: NamedPort insertText omits typed dot", "[completion]") {
     CHECK(!item->textEdit.has_value());
 }
 
+TEST_CASE("completion: NamedPort uses cached project index for extra-file module", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto child_path =
+        std::filesystem::temp_directory_path() / "completion_namedport_extra_child.sv";
+    {
+        std::ofstream out(child_path);
+        REQUIRE(out.good());
+        out << "module extra_child(input logic clk, output logic done);\n"
+               "endmodule\n";
+    }
+    analyzer.set_extra_files({child_path.string()});
+
+    const std::string uri = "file:///tmp/completion_namedport_extra_top.sv";
+    const std::string text =
+        "module top;\n"
+        "    extra_child u_child (.\n"
+        "    );\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 1, 26);
+    CHECK(has_label(result, ".clk"));
+    CHECK(has_label(result, ".done"));
+
+    std::filesystem::remove(child_path);
+}
+
 TEST_CASE("completion: Parameter context suggests params in #()", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
@@ -861,6 +890,66 @@ TEST_CASE("completion: package scope survives opening package definition file", 
     std::filesystem::remove(use);
 }
 
+TEST_CASE("completion: project index shard follows live edits to extra file", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto lib = std::filesystem::temp_directory_path() / "completion_live_shard_lib.sv";
+    const auto use = std::filesystem::temp_directory_path() / "completion_live_shard_use.sv";
+    const std::string old_lib_text =
+        "package old_live_pkg;\n"
+        "    parameter int OLD_VALUE = 1;\n"
+        "endpackage\n";
+    const std::string new_lib_text =
+        "package new_live_pkg;\n"
+        "    parameter int NEW_VALUE = 2;\n"
+        "endpackage\n";
+    const std::string use_text =
+        "module top;\n"
+        "    new_live_pkg::\n"
+        "endmodule\n";
+
+    {
+        std::ofstream out(lib);
+        REQUIRE(out.good());
+        out << old_lib_text;
+    }
+    {
+        std::ofstream out(use);
+        REQUIRE(out.good());
+        out << use_text;
+    }
+
+    analyzer.set_extra_files({use.string(), lib.string()});
+    const std::string use_uri = "file://" + use.string();
+    const std::string lib_uri = "file://" + lib.string();
+    analyzer.open(use_uri, use_text);
+
+    // Opening/changing the library file replaces only that file's project-index
+    // shard.  The stale old_live_pkg symbols from the original disk parse
+    // should not survive in project-aware completion.
+    analyzer.open(lib_uri, new_lib_text);
+
+    auto [line, col] = pos_of(use_text, "new_live_pkg::");
+    auto result = complete_at(engine, analyzer, use_uri, line,
+                              col + (int)std::string("new_live_pkg::").size());
+    CHECK(has_label(result, "NEW_VALUE"));
+    CHECK_FALSE(has_label(result, "OLD_VALUE"));
+
+    const std::string stale_query_text =
+        "module top;\n"
+        "    old_live_pkg::\n"
+        "endmodule\n";
+    analyzer.change(use_uri, stale_query_text);
+    auto [old_line, old_col] = pos_of(stale_query_text, "old_live_pkg::");
+    auto stale_result = complete_at(engine, analyzer, use_uri, old_line,
+                                    old_col + (int)std::string("old_live_pkg::").size());
+    CHECK_FALSE(has_label(stale_result, "OLD_VALUE"));
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(use);
+}
+
 TEST_CASE("completion: identifier completion requires package import", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
@@ -928,7 +1017,11 @@ TEST_CASE("completion: imports from extra files do not leak into current file", 
 
     auto result = complete_at(engine, analyzer, uri, 1, 4);
 
-    CHECK(has_label(result, "pkg_extra_import"));
+    // Generic identifier completion is intentionally current-file-only on the
+    // hot typing path.  The package can still be reached through explicit
+    // package-scope completion (`pkg_extra_import::`), but it should not force
+    // project-wide .f index merging for every ordinary identifier request.
+    CHECK_FALSE(has_label(result, "pkg_extra_import"));
     CHECK_FALSE(has_label(result, "extra_state_t"));
     CHECK_FALSE(has_label(result, "EXTRA_IDLE"));
     CHECK_FALSE(has_label(result, "EXTRA_PARAM"));
@@ -1284,7 +1377,7 @@ TEST_CASE("completion: degradation never returns empty for identifier context", 
     CHECK(!result.items.empty());
 }
 
-TEST_CASE("completion: local module ranks above extra-file module with same prefix", "[completion]") {
+TEST_CASE("completion: generic identifier completion avoids extra-file modules", "[completion]") {
     const auto extra_path =
         std::filesystem::temp_directory_path() / "completion_scope_extra.sv";
     {
@@ -1307,17 +1400,11 @@ TEST_CASE("completion: local module ranks above extra-file module with same pref
 
     auto result = complete_at(engine, analyzer, uri, 3, 5);
 
-    // Both should appear
+    // Generic identifier completion should stay local.  Extra-file modules are
+    // used by narrower project-wide contexts such as named-port completion, not
+    // by every ordinary identifier popup while typing on HPC/shared filesystems.
     REQUIRE(has_label(result, "m_local_adder"));
-    REQUIRE(has_label(result, "m_extra_adder"));
-
-    // Local item must sort before the extra-file item
-    int local_pos = -1, extra_pos = -1;
-    for (int i = 0; i < (int)result.items.size(); ++i) {
-        if (result.items[i].label == "m_local_adder") local_pos = i;
-        if (result.items[i].label == "m_extra_adder") extra_pos = i;
-    }
-    CHECK(local_pos < extra_pos);
+    CHECK_FALSE(has_label(result, "m_extra_adder"));
 
     std::filesystem::remove(extra_path);
 }

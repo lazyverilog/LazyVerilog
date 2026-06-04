@@ -1,6 +1,5 @@
 #include "analyzer.hpp"
 #include <catch2/catch_test_macros.hpp>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -297,7 +296,8 @@ TEST_CASE("definition: nested include cursor matching is file-aware", "[definiti
     std::filesystem::remove(b_path);
 }
 
-TEST_CASE("extra file cache refreshes by mtime and drops removed files", "[definition]") {
+TEST_CASE("extra file cache refreshes on explicit filelist reset and drops removed files",
+          "[definition]") {
     Analyzer analyzer;
     const auto extra_path = write_temp_sv("lazyverilog_definition_cache.sv",
                                           "module child(input logic clk, output logic done);\n"
@@ -313,21 +313,10 @@ TEST_CASE("extra file cache refreshes by mtime and drops removed files", "[defin
     REQUIRE(original.has_value());
     CHECK(original->line == 0);
 
-    const auto original_mtime = std::filesystem::last_write_time(extra_path);
     {
         std::ofstream out(extra_path);
         out << "module child(input logic clk, output logic ack);\nendmodule\n";
     }
-    std::filesystem::last_write_time(extra_path, original_mtime);
-    analyzer.set_extra_files({extra_path.string()});
-    auto unchanged = analyzer.definition_of(top_uri, 2, 31);
-    REQUIRE(unchanged.has_value());
-
-    {
-        std::ofstream out(extra_path);
-        out << "module child(input logic clk, output logic ack);\nendmodule\n";
-    }
-    std::filesystem::last_write_time(extra_path, original_mtime + std::chrono::seconds(2));
     analyzer.set_extra_files({extra_path.string()});
     CHECK_FALSE(analyzer.definition_of(top_uri, 2, 31).has_value());
 

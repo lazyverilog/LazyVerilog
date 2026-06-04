@@ -136,6 +136,18 @@ class Analyzer {
     /// Append cached extra-file modules to an existing SyntaxIndex.
     void merge_extra_file_modules(SyntaxIndex& index) const;
 
+    /// Return a cached project-wide index built from filelist-only extra files.
+    ///
+    /// This is intentionally separate from extra_file_snapshots():
+    /// extra_file_snapshots() returns per-file copies and substitutes live
+    /// open-buffer states, which is useful for navigation features but
+    /// expensive for high-frequency completion requests.  extra_project_index()
+    /// keeps one premerged disk-backed index that is invalidated whenever the
+    /// extra-file cache is refreshed.  Callers that need current-buffer facts
+    /// should merge this into the current DocumentState::index, letting the
+    /// current buffer win for duplicate module/class/typedef names.
+    std::shared_ptr<const SyntaxIndex> extra_project_index() const;
+
     /// Return an immutable snapshot for background semantic compilation.
     /// Open documents include their in-memory text; filelist-only documents
     /// include only paths and are read by the background worker.
@@ -174,20 +186,20 @@ class Analyzer {
     struct ExtraFileCacheEntry {
         std::string path;
         std::string uri;
-        std::optional<std::filesystem::file_time_type> mtime;
         std::shared_ptr<const DocumentState> state;
         SyntaxIndex index;
     };
 
     void refresh_extra_cache_locked() const;
+    void invalidate_extra_project_index_locked() const;
+    void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state);
 
-    // Verible-style filelist mtime tracking: on every extra_file_snapshots()
-    // call, stat() only the .f filelist file (1 syscall) instead of every
-    // individual extra file (N syscalls). Refresh the cache only when the
-    // filelist itself changes. On NFS/HPC this reduces per-request overhead
-    // from O(N * stat_latency) to O(1).
+    // Resolved .f filelist path.  We intentionally do not poll this file's
+    // mtime on LSP requests: HPC projects usually do not edit filelists while
+    // the editor is alive, and even one metadata operation per request is still
+    // unwanted noise on shared filesystems.  Configuration reloads call
+    // set_extra_files() explicitly when the filelist should be re-read.
     mutable std::string filelist_path_;
-    mutable std::optional<std::filesystem::file_time_type> filelist_mtime_;
 
     mutable std::mutex map_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
@@ -195,5 +207,6 @@ class Analyzer {
     std::vector<std::string> include_dirs_;
     mutable std::vector<std::string> extra_files_;
     mutable std::vector<ExtraFileCacheEntry> extra_cache_;
+    mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
     std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
 };

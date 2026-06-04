@@ -213,6 +213,67 @@ syntax_scope_base_before_double_colon(const slang::syntax::SyntaxTree& tree,
     return names.result;
 }
 
+static std::optional<std::string> text_scope_base_before_double_colon(const std::string& text,
+                                                                      size_t pos) {
+    // Slang can fail to build a useful ScopedNameSyntax for edit snapshots like
+    // `uvm_pkg::|` where the right-hand name is still missing.  Completion is
+    // allowed to use a narrow textual fallback here because `::` is itself the
+    // explicit user request for package/static scope completion; unlike generic
+    // identifier completion, this does not guess a project-wide context from
+    // ordinary typing.
+    if (pos < 2 || text[pos - 1] != ':' || text[pos - 2] != ':')
+        return std::nullopt;
+
+    size_t lhs_end = pos - 2;
+    while (lhs_end > 0 && std::isspace(static_cast<unsigned char>(text[lhs_end - 1])))
+        --lhs_end;
+    if (lhs_end == 0)
+        return std::nullopt;
+
+    size_t scan = lhs_end;
+
+    // Parameterized class static scope:
+    //
+    //     uvm_config_db#(uvm_object)::|
+    //
+    // The project index stores the unspecialized class declaration, so skip a
+    // balanced #( ... ) suffix and return only `uvm_config_db`.
+    if (scan > 0 && text[scan - 1] == ')') {
+        int depth = 0;
+        while (scan > 0) {
+            const char ch = text[scan - 1];
+            --scan;
+            if (ch == ')') {
+                ++depth;
+            } else if (ch == '(') {
+                --depth;
+                if (depth == 0) {
+                    size_t before_paren = scan;
+                    while (before_paren > 0 &&
+                           std::isspace(static_cast<unsigned char>(text[before_paren - 1])))
+                        --before_paren;
+                    if (before_paren > 0 && text[before_paren - 1] == '#') {
+                        scan = before_paren - 1;
+                    } else {
+                        scan = lhs_end;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+
+    const size_t ident_end = scan;
+    while (scan > 0 && is_ident_char(text[scan - 1]))
+        --scan;
+    if (scan == ident_end)
+        return std::nullopt;
+    return text.substr(scan, ident_end - scan);
+}
+
 struct DotCompletionSyntaxContext {
     size_t dot_offset{0};
     std::string base_name;
@@ -1650,6 +1711,38 @@ CompletionEngine::CompletionEngine() {
     providers_.push_back(std::make_unique<KeywordProvider>());
 }
 
+static bool completion_context_needs_project_index(CompletionContextKind kind) {
+    switch (kind) {
+    case CompletionContextKind::MemberAccess:
+        // A variable in the current file can have a class/interface/typedef
+        // type declared in a filelist library file.
+        return true;
+    case CompletionContextKind::NamedPort:
+    case CompletionContextKind::Parameter:
+        // The instantiated module is often in another RTL file from the .f
+        // list, so named-port / parameter completion needs the project module
+        // table.  This is a narrow context, unlike generic identifier
+        // completion while typing ordinary expressions.
+        return true;
+    case CompletionContextKind::PackageScope:
+        // Explicit `pkg::` / `class::` asks for symbols from that scope, which
+        // commonly lives in a package library listed in .f.
+        return true;
+    case CompletionContextKind::NewExpression:
+        // Class construction is an explicit class-oriented context.  Project
+        // classes are useful here, but this context is much less frequent than
+        // generic identifier completion.
+        return true;
+    case CompletionContextKind::Identifier:
+    case CompletionContextKind::Macro:
+    case CompletionContextKind::IncludeFile:
+    case CompletionContextKind::EventControl:
+    case CompletionContextKind::Unknown:
+        return false;
+    }
+    return false;
+}
+
 CompletionContext CompletionEngine::detect_context(const DocumentState& state, int line, int col,
                                                     const SyntaxIndex& index) const {
     const std::string& text = state.text;
@@ -1733,6 +1826,14 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
     if (state.tree) {
         ctx.scope_name =
             syntax_scope_base_before_double_colon(*state.tree, pos).value_or(std::string{});
+        if (ctx.scope_name.empty())
+            ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
+        if (!ctx.scope_name.empty()) {
+            ctx.kind = CompletionContextKind::PackageScope;
+            return ctx;
+        }
+    } else {
+        ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
         if (!ctx.scope_name.empty()) {
             ctx.kind = CompletionContextKind::PackageScope;
             return ctx;
@@ -1831,18 +1932,6 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     CompletionList result;
     result.isIncomplete = false;
 
-    // Build a merged index: current document + extra files from .f list
-    SyntaxIndex merged = state.index;
-    for (const auto& extra : analyzer.extra_file_snapshots()) {
-        // If the current buffer is also listed in vcode.f, prefer the live
-        // buffer index we already copied into `merged`.  Merging the extra-file
-        // snapshot again duplicates local variables/ports in completion (for
-        // example demo/tmp fixtures listed in demo/vcode.f).
-        if (extra.uri == state.uri)
-            continue;
-        merged.merge(extra.index);
-    }
-
     // Collect symbol names declared in the current document for scope scoring.
     std::unordered_set<std::string> local_names;
     for (const auto& m : state.index.modules)  local_names.insert(m.name);
@@ -1856,7 +1945,13 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     CompletionContext ctx;
     try {
-        ctx = detect_context(state, line, col, merged);
+        // Context detection should stay cheap for ordinary typing.  The current
+        // buffer index has enough information to decide whether the cursor is
+        // in a generic identifier, member access, named-port, parameter, macro,
+        // include, or explicit scope context.  Do not touch the .f project
+        // cache until after we know this request actually needs project-wide
+        // symbols.
+        ctx = detect_context(state, line, col, state.index);
     } catch (...) {
         ctx.kind = CompletionContextKind::Identifier;
     }
@@ -1872,13 +1967,26 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         }
     }
 
+    // Generic identifier completion intentionally uses only the current file.
+    // Earlier v1.0.6 code merged every file from .f on every completion
+    // request.  On large HPC projects that placed project-wide parse/merge work
+    // directly on the typing path.  Project-wide symbols are now pulled in only
+    // for explicit semantic contexts that need them, and the Analyzer maintains
+    // a cached premerged extra-file index so those contexts do not rebuild the
+    // same project merge for every request.
+    SyntaxIndex completion_index = state.index;
+    if (completion_context_needs_project_index(ctx.kind)) {
+        if (auto project_index = analyzer.extra_project_index())
+            completion_index.merge(*project_index);
+    }
+
     std::vector<lsCompletionItem> all_items;
 
     try {
         for (const auto& provider : providers_) {
             if (tok.cancelled) throw CompletionCancelled{};
             if (!provider->accepts(ctx)) continue;
-            auto items = provider->provide(ctx, merged, tok);
+            auto items = provider->provide(ctx, completion_index, tok);
             all_items.insert(all_items.end(),
                              std::make_move_iterator(items.begin()),
                              std::make_move_iterator(items.end()));
@@ -1894,11 +2002,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         ctx.kind != CompletionContextKind::Parameter) {
         KeywordProvider fallback;
         CancellationToken dummy;
-        all_items = fallback.provide(ctx, merged, dummy);
+        all_items = fallback.provide(ctx, completion_index, dummy);
     }
 
-    const auto expected_names = enum_members_for_type(merged, ctx.expected_type);
-    const auto same_type_names = value_names_for_type(merged, ctx);
+    const auto expected_names = enum_members_for_type(completion_index, ctx.expected_type);
+    const auto same_type_names = value_names_for_type(completion_index, ctx);
     rank_and_sort(all_items, ctx, local_names, expected_names, same_type_names);
     result.items = std::move(all_items);
     return result;
