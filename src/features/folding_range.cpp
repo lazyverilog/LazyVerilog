@@ -1,12 +1,14 @@
 #include "folding_range.hpp"
 #include "document_state.hpp"
+#include "formatter_lexer.hpp"
+#include "formatter_token.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <string_view>
 #include <tuple>
-#include <unordered_map>
 #include <utility>
+
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -19,39 +21,16 @@ using namespace slang::parsing;
 
 namespace {
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
-static int token_line(const SourceManager& sm, const Token& tok) {
-    if (!tok || !tok.location().valid()) return -1;
-    return (int)sm.getLineNumber(tok.location()) - 1;
-}
-
-static int first_line(const SourceManager& sm, const SyntaxNode& n) {
-    return token_line(sm, n.getFirstToken());
-}
-
-static int last_line(const SourceManager& sm, const SyntaxNode& n) {
-    return token_line(sm, n.getLastToken());
-}
+// ── helpers shared by both paths ──────────────────────────────────────────
 
 static std::pair<size_t, size_t> line_bounds(std::string_view text, int line) {
-    // LSP folding ranges are line-oriented, but startCharacter / endCharacter
-    // are still real positions, not placeholders.  Compute bounds directly from
-    // the source buffer so clients that honor these fields do not interpret every
-    // fold as ending at column 0 of the closing line.
-    //
-    // The returned pair is [line_start_offset, line_end_offset), where line_end
-    // points at the newline byte or text.size().  The helper accepts a zero-based
-    // line number to match LSP and all folding code in this file.
     if (line < 0) return {0, 0};
-
     size_t start = 0;
     for (int current = 0; current < line && start < text.size(); ++current) {
         size_t newline = text.find('\n', start);
         if (newline == std::string_view::npos) return {text.size(), text.size()};
         start = newline + 1;
     }
-
     size_t end = text.find('\n', start);
     if (end == std::string_view::npos) end = text.size();
     return {start, end};
@@ -71,12 +50,25 @@ static int line_length(std::string_view text, int line) {
     return static_cast<int>(end - start);
 }
 
+// ── AST path helpers (used only by IfElseChainVisitor) ───────────────────
+
+static int token_line(const SourceManager& sm, const Token& tok) {
+    if (!tok || !tok.location().valid()) return -1;
+    return (int)sm.getLineNumber(tok.location()) - 1;
+}
+
+static int first_line(const SourceManager& sm, const SyntaxNode& n) {
+    return token_line(sm, n.getFirstToken());
+}
+
+static int last_line(const SourceManager& sm, const SyntaxNode& n) {
+    return token_line(sm, n.getLastToken());
+}
+
 static void emit(std::vector<FoldingRange>& out, const SourceManager& sm, BufferID buffer,
                  int start, int end, const std::string& kind = "region") {
     if (start < 0 || end < 0 || start >= end) return;
-
     auto text = sm.getSourceText(buffer);
-
     FoldingRange r;
     r.startLine      = start;
     r.endLine        = end;
@@ -93,160 +85,25 @@ static void emit_node(std::vector<FoldingRange>& out, const SourceManager& sm,
     emit(out, sm, first.location().buffer(), first_line(sm, node), last_line(sm, node), kind);
 }
 
-// ── fold visitor ──────────────────────────────────────────────────────────
+// ── minimal AST visitor: if/else chain linking only ──────────────────────
+//
+// Token-based fold detection cannot reliably link chained if/else-if/else
+// branches because it cannot distinguish them from independent blocks without
+// parsing context.  This minimal visitor handles exactly two node types where
+// AST precision is needed:
+//   - ConditionalStatementSyntax: fold the whole if/else chain as one region
+//   - IfGenerateSyntax: fold if-arm and else-arm as separate regions
+//
+// All other folds are produced by collect_token_folds() below.
 
-struct FoldVisitor : public SyntaxVisitor<FoldVisitor> {
+struct IfElseChainVisitor : public SyntaxVisitor<IfElseChainVisitor> {
     const SourceManager&       sm;
     std::vector<FoldingRange>& out;
-    std::vector<FoldingRange>  directive_folds;
 
-    struct PreprocessorBranch {
-        int start_line{-1};
-        BufferID buffer{};
-    };
-
-    // preprocessor stack: current branch start for nested `ifdef / `elsif / `else blocks
-    std::vector<PreprocessorBranch> pp_stack;
-
-    struct OpenLine {
-        int start_line{-1};
-        BufferID buffer{};
-    };
-
-    // celldefine stack: line / buffer of the opening `celldefine
-    std::vector<OpenLine> cell_stack;
-
-    // consecutive line-comment run
-    int comment_run_start{-1};
-    int comment_run_last{-1};
-    BufferID comment_run_buffer{};
-
-    // cache: line number → byte offset of line start; cleared on buffer change
-    mutable BufferID                        line_start_cache_buf_{};
-    mutable std::unordered_map<int, size_t> line_start_cache_;
-
-    FoldVisitor(const SourceManager& sm, std::vector<FoldingRange>& out)
+    IfElseChainVisitor(const SourceManager& sm, std::vector<FoldingRange>& out)
         : sm(sm), out(out) {}
 
-    void flush_comment_run() {
-        if (comment_run_start >= 0 && comment_run_last > comment_run_start)
-            emit(out, sm, comment_run_buffer, comment_run_start, comment_run_last, "comment");
-        comment_run_start = -1;
-        comment_run_last  = -1;
-        comment_run_buffer = {};
-    }
-
-    void emit_directive(BufferID buffer, int start, int end) {
-        emit(directive_folds, sm, buffer, start, end, "region");
-    }
-
-    // ── top-level declarations ────────────────────────────────────────────
-
-    // module / macromodule / interface / program / package (all use same type)
-    void handle(const ModuleDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const ClassDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const CheckerDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // primitive / UDP
-    void handle(const UdpDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const ConfigDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const ClockingDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // function / task (TaskDeclaration maps to FunctionDeclarationSyntax)
-    void handle(const FunctionDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // ── statement blocks ──────────────────────────────────────────────────
-
-    // begin/end (SequentialBlockStatement) + fork/join* (ParallelBlockStatement)
-    void handle(const BlockStatementSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // if / else if / else — fold the whole chain as one region
     void handle(const ConditionalStatementSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // case / casex / casez / endcase
-    void handle(const CaseStatementSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // randcase / endcase
-    void handle(const RandCaseStatementSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // individual multi-line case items
-    void handle(const StandardCaseItemSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // ── verification constructs ───────────────────────────────────────────
-
-    void handle(const ConstraintDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const CovergroupDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const PropertyDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const SequenceDeclarationSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const SpecifyBlockSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    // ── generate constructs ───────────────────────────────────────────────
-
-    void handle(const GenerateRegionSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
-
-    void handle(const LoopGenerateSyntax& node) {
         emit_node(out, sm, node);
         visitDefault(node);
     }
@@ -256,566 +113,509 @@ struct FoldVisitor : public SyntaxVisitor<FoldVisitor> {
         int node_end   = last_line(sm, node);
         if (node.elseClause) {
             int else_line = token_line(sm, node.elseClause->elseKeyword);
-            // fold the if arm
-            emit(out, sm, node.getFirstToken().location().buffer(), node_start, else_line - 1);
-            // fold the else arm
-            emit(out, sm, node.getFirstToken().location().buffer(), else_line, node_end);
+            emit(out, sm, node.getFirstToken().location().buffer(),
+                 node_start, else_line - 1);
+            emit(out, sm, node.getFirstToken().location().buffer(),
+                 else_line, node_end);
         } else {
-            emit(out, sm, node.getFirstToken().location().buffer(), node_start, node_end);
+            emit(out, sm, node.getFirstToken().location().buffer(),
+                 node_start, node_end);
         }
         visitDefault(node);
     }
+};
 
-    void handle(const CaseGenerateSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
+// ── token path helpers ────────────────────────────────────────────────────
+
+// Convert a byte offset in source_text to a 0-based line number.
+static int line_of(std::string_view text, size_t offset) {
+    int line = 0;
+    size_t lim = std::min(offset, text.size());
+    for (size_t i = 0; i < lim; ++i) {
+        if (text[i] == '\n') ++line;
     }
+    return line;
+}
 
-    void handle(const GenerateBlockSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
+// Emit a fold using source_text for character-column computation.
+// Used exclusively by collect_token_folds(); the AST post-pass uses emit().
+static void emit_token_fold(std::vector<FoldingRange>& out, std::string_view source_text,
+                            int start, int end, const std::string& kind = "region") {
+    if (start < 0 || end < 0 || start >= end) return;
+    FoldingRange r;
+    r.startLine      = start;
+    r.endLine        = end;
+    r.startCharacter = first_non_space_column(source_text, start);
+    r.endCharacter   = line_length(source_text, end);
+    r.kind           = kind;
+    out.push_back(r);
+}
+
+// True if only whitespace precedes `offset` on its line.
+// Used for comment role classification (own-line vs trailing).
+static bool is_own_line_at_offset(std::string_view text, size_t offset) {
+    if (offset > text.size()) return false;
+    size_t pos = offset;
+    while (pos > 0 && text[pos - 1] != '\n') --pos;
+    for (size_t i = pos; i < offset; ++i) {
+        if (!std::isspace(static_cast<unsigned char>(text[i]))) return false;
     }
+    return true;
+}
 
-    // ── port / parameter lists ────────────────────────────────────────────
+// ── unified token scan ────────────────────────────────────────────────────
+//
+// One sequential pass over the formatter's TokenStream handles ALL fold
+// constructs for both active code and disabled preprocessor branches.
+//
+// This works because svfmt::TokenCollector does raw lexing without
+// preprocessing: every token in the source — whether inside an active or
+// inactive #ifdef branch — appears in the TokenStream with its real TokenKind.
+//
+// Preprocessor directive subtype classification uses lower_text prefix
+// matching.  This is a justified CLAUDE.md exception: formatter_lexer.hpp
+// collapses all preprocessor directives to TokenKind::Directive, so
+// TokenKind cannot distinguish `ifdef from `endif from `celldefine.
 
-    void handle(const AnsiPortListSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
+static void collect_token_folds(const svfmt::TokenStream& tokens,
+                                std::string_view source_text,
+                                std::vector<FoldingRange>& out) {
+    using TK = TokenKind;
 
-    void handle(const ParameterPortListSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
+    struct BraceRegion { int start_line{-1}; int outer_depth{0}; };
+    struct ParenRegion  { int start_line{-1}; int outer_depth{0}; };
 
-    // instance parameter override #(...)
-    void handle(const ParameterValueAssignmentSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
+    std::vector<int>         block_stack;
+    std::vector<int>         case_stack;
+    std::vector<int>         keyword_region_stack;
+    std::vector<BraceRegion> brace_region_stack;
+    std::vector<ParenRegion> paren_region_stack;
+    std::vector<int>         pp_stack;
+    std::vector<int>         cell_stack;
 
-    // instance connection list (...)
-    void handle(const HierarchicalInstanceSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
+    int  pending_control_start{-1};
+    int  pending_brace_region_start{-1};
+    int  pending_bins_start{-1};
+    bool pending_bins_equals{false};
+    bool pending_paren_region{false};
+    int  brace_depth{0};
+    int  paren_depth{0};
 
-    // multi-line argument lists
-    void handle(const ArgumentListSyntax& node) {
-        emit_node(out, sm, node);
-        visitDefault(node);
-    }
+    int comment_run_start{-1};
+    int comment_run_last{-1};
+    int import_run_start{-1};
+    int import_run_last{-1};
 
-    // ── token trivia (comments) ───────────────────────────────────────────
+    auto flush_comment_run = [&]() {
+        if (comment_run_start >= 0 && comment_run_last > comment_run_start)
+            emit_token_fold(out, source_text, comment_run_start, comment_run_last, "comment");
+        comment_run_start = -1;
+        comment_run_last  = -1;
+    };
 
-    void visitToken(Token token) {
-        if (!token || !token.location().valid()) return;
+    auto flush_import_run = [&]() {
+        if (import_run_start >= 0 && import_run_last > import_run_start)
+            emit_token_fold(out, source_text, import_run_start, import_run_last, "imports");
+        import_run_start = -1;
+        import_run_last  = -1;
+    };
 
-        auto    buffer      = token.location().buffer();
-        size_t  tok_offset  = token.location().offset();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const auto& t = tokens[i];
 
-        // derive trivia start offset: trivia comes immediately before the token
-        size_t trivia_total = 0;
-        for (const auto& t : token.trivia())
-            trivia_total += t.getRawText().size();
-        // If tok_offset < trivia_total the layout invariant is violated (e.g.
-        // synthetic token with an impossible offset).  Skip rather than clamping
-        // to 0 and emitting folds attributed to the wrong line.
-        if (tok_offset < trivia_total) return;
-        size_t pos = tok_offset - trivia_total;
+        // Skip verbatim passthrough bodies from format-off/on regions.
+        if (t.lex->is_disabled_region_body) continue;
 
-        for (const auto& t : token.trivia()) {
-            process_trivia(t, pos, buffer);
-            pos += t.getRawText().size();
-        }
-    }
+        // ── comments ──────────────────────────────────────────────────────
+        if (t.lex->is_comment) {
+            size_t offset = t.lex->range.start().offset();
+            int    line   = line_of(source_text, offset);
 
-    void process_trivia(const Trivia& t, size_t offset, BufferID buffer) {
-        using TV = TriviaKind;
-
-        if (t.kind == TV::Directive) {
-            //
-            // Preprocessor directives are represented by slang as structured
-            // directive trivia attached to regular tokens, not necessarily as
-            // children visited by SyntaxVisitor::visitDefault().  Use the directive
-            // SyntaxKind here instead of scanning source lines for strings such as
-            // "`ifdef" or "`endif".
-            flush_comment_run();
-            if (auto* syntax = t.syntax())
-                process_directive_syntax(*syntax);
-        } else if (t.kind == TV::BlockComment) {
-            flush_comment_run();
-            auto raw       = t.getRawText();
-            int  start     = line_at(buffer, offset);
-            int  newlines  = (int)std::count(raw.begin(), raw.end(), '\n');
-            //
-            // Only fold block comments that start on their own line.  A multi-line
-            // block comment can legally appear after code:
-            //
-            //     assign a = b; /* explanation
-            //                      continues */
-            //
-            // Folding from that line would hide real RTL, which is surprising and
-            // different from how editors normally treat comment folds.  Own-line
-            // detection is intentionally source-position based; unlike syntax folds,
-            // comment role classification has to know whether text before the comment
-            // on the same physical line is whitespace or code.
-            if (start >= 0 && newlines > 0 && is_own_line_trivia(buffer, offset))
-                emit(out, sm, buffer, start, start + newlines, "comment");
-        } else if (t.kind == TV::LineComment) {
-            int line = line_at(buffer, offset);
-            if (line < 0) return;
-            //
-            // Do not let trailing comments join an own-line comment run.  Otherwise
-            // this RTL:
-            //
-            //     assign a = b; // trailing
-            //     // own-line
-            //
-            // would produce comment fold [assign-line, own-comment-line], hiding the
-            // assignment when the user folds comments.
-            if (!is_own_line_trivia(buffer, offset)) {
+            if (t.lex->comment_kind == svfmt::CommentLexemeKind::Block) {
                 flush_comment_run();
-                return;
+                int newlines = (int)std::count(t.lex->text.begin(), t.lex->text.end(), '\n');
+                // Only fold block comments that start on their own line.
+                // Comment role classification may reference source positioning
+                // (per CLAUDE.md exception for comment classification).
+                if (newlines > 0 && is_own_line_at_offset(source_text, offset))
+                    emit_token_fold(out, source_text, line, line + newlines, "comment");
+            } else if (t.lex->comment_kind == svfmt::CommentLexemeKind::Line) {
+                if (!is_own_line_at_offset(source_text, offset)) {
+                    // Trailing comment breaks the run so it does not fold
+                    // together with any preceding own-line comment.
+                    flush_comment_run();
+                } else if (comment_run_start < 0) {
+                    comment_run_start = line;
+                    comment_run_last  = line;
+                } else if (line == comment_run_last + 1) {
+                    comment_run_last = line;
+                } else {
+                    flush_comment_run();
+                    comment_run_start = line;
+                    comment_run_last  = line;
+                }
             }
-            if (comment_run_start < 0) {
-                comment_run_start = line;
-                comment_run_last  = line;
-                comment_run_buffer = buffer;
-            } else if (line == comment_run_last + 1) {
-                comment_run_last = line;
-            } else {
-                flush_comment_run();
-                comment_run_start = line;
-                comment_run_last  = line;
-                comment_run_buffer = buffer;
-            }
-        } else if (t.kind != TV::Whitespace && t.kind != TV::EndOfLine) {
-            // directive or other non-whitespace trivia breaks a comment run
+            continue;
+        }
+
+        // ── preprocessor directives ────────────────────────────────────────
+        // All directives share TokenKind::Directive in the formatter token
+        // stream.  Subtype is classified via lower_text prefix matching.
+        if (t.lex->is_directive) {
             flush_comment_run();
-        }
-    }
+            // Directives between import statements do not break an import run
+            // (mirrors the AST path where directives are trivia, not members).
 
-    void process_directive_syntax(const SyntaxNode& syntax) {
-        if (const auto* node = syntax.as_if<ConditionalBranchDirectiveSyntax>()) {
-            process_conditional_branch_directive(*node);
-        } else if (const auto* node = syntax.as_if<UnconditionalBranchDirectiveSyntax>()) {
-            process_unconditional_branch_directive(*node);
-        } else if (const auto* node = syntax.as_if<SimpleDirectiveSyntax>()) {
-            process_simple_directive(*node);
-        }
-    }
+            const std::string& lt       = t.lex->lower_text;
+            int                dir_line = line_of(source_text, t.lex->range.start().offset());
 
-    void process_conditional_branch_directive(const ConditionalBranchDirectiveSyntax& node) {
-        collect_disabled_token_folds(node.disabledTokens);
+            auto sw = [&](const char* prefix) {
+                return lt.rfind(prefix, 0) == 0;
+            };
 
-        int line = token_line(sm, node.directive);
-        BufferID buffer = node.directive.location().buffer();
-        if (node.kind == SyntaxKind::IfDefDirective ||
-            node.kind == SyntaxKind::IfNDefDirective) {
-            pp_stack.push_back({line, buffer});
-        } else if (node.kind == SyntaxKind::ElsIfDirective) {
-            if (!pp_stack.empty()) {
-                emit_directive(pp_stack.back().buffer, pp_stack.back().start_line, line - 1);
-                pp_stack.back() = {line, buffer};
+            if (sw("`ifdef") || sw("`ifndef")) {
+                pp_stack.push_back(dir_line);
+            } else if (sw("`elsif")) {
+                if (!pp_stack.empty()) {
+                    emit_token_fold(out, source_text, pp_stack.back(), dir_line - 1);
+                    pp_stack.back() = dir_line;
+                }
+            } else if (sw("`else") && !sw("`elsif")) {
+                if (!pp_stack.empty()) {
+                    emit_token_fold(out, source_text, pp_stack.back(), dir_line - 1);
+                    pp_stack.back() = dir_line;
+                }
+            } else if (sw("`endif")) {
+                if (!pp_stack.empty()) {
+                    emit_token_fold(out, source_text, pp_stack.back(), dir_line);
+                    pp_stack.pop_back();
+                }
+            } else if (sw("`celldefine")) {
+                cell_stack.push_back(dir_line);
+            } else if (sw("`endcelldefine")) {
+                if (!cell_stack.empty()) {
+                    emit_token_fold(out, source_text, cell_stack.back(), dir_line);
+                    cell_stack.pop_back();
+                }
             }
-        }
-    }
 
-    void process_unconditional_branch_directive(const UnconditionalBranchDirectiveSyntax& node) {
-        collect_disabled_token_folds(node.disabledTokens);
-
-        int line = token_line(sm, node.directive);
-        BufferID buffer = node.directive.location().buffer();
-        if (node.kind == SyntaxKind::ElseDirective) {
-            if (!pp_stack.empty()) {
-                emit_directive(pp_stack.back().buffer, pp_stack.back().start_line, line - 1);
-                pp_stack.back() = {line, buffer};
-            }
-        } else if (node.kind == SyntaxKind::EndIfDirective) {
-            if (!pp_stack.empty()) {
-                PreprocessorBranch branch = pp_stack.back();
-                // Fold only the current preprocessor branch body:
-                //
-                //     `ifdef FOO      <-- fold starts here
-                //         ...
-                //     `else           <-- first branch folds to the line before this
-                //         ...
-                //     `endif          <-- final branch folds through this line
-                //
-                // The first branch must not hide the `else directive.  The final
-                // branch should include the closing `endif so folding on `else,
-                // the last `elsif, or an `ifdef with no alternate branch hides the
-                // whole branch including its terminator.
-                emit_directive(branch.buffer, branch.start_line, line);
-                pp_stack.pop_back();
-            }
-        }
-    }
-
-    void collect_disabled_token_folds(const TokenList& tokens) {
-        //
-        // Inactive preprocessor branches are not represented as normal AST nodes,
-        // so an `ifdef branch that contains:
-        //
-        //     always_ff (...) begin
-        //         if (...) begin
-        //             ...
-        //         end
-        //     end
-        //
-        // would otherwise only have the coarse preprocessor branch fold.  That is
-        // exactly the bad UX where "za" inside the if/always block closes the whole
-        // `ifdef.  Use token kinds from slang's disabled token list to recover the
-        // most important local block folds without comparing raw source strings.
-        //
-        // This intentionally handles only token-delimited regions in disabled
-        // branches.  Active branches continue to use the real AST visitor.  This is
-        // still deliberately a lightweight, token-kind-only recovery path rather
-        // than a second parser for disabled SystemVerilog; do not add raw source
-        // string searches or regexes here.
-        struct BraceRegion {
-            int start_line{-1};
-            int outer_depth{0};
-        };
-
-        std::vector<int> block_stack;
-        std::vector<int> case_stack;
-        std::vector<int> keyword_region_stack;
-        std::vector<BraceRegion> brace_region_stack;
-        int              pending_control_start{-1};
-        int              pending_brace_region_start{-1};
-        int              pending_bins_start{-1};
-        int              brace_depth{0};
-        bool             pending_bins_equals{false};
-
-        auto mark_control_start = [&](const Token& token) {
-            int line = token_line(sm, token);
-            if (line >= 0)
-                pending_control_start = line;
-        };
-
-        auto push_keyword_region = [&](const Token& token) {
-            int line = token_line(sm, token);
-            if (line >= 0)
-                keyword_region_stack.push_back(line);
             pending_control_start = -1;
-        };
+            pending_paren_region  = false;
+            continue;
+        }
 
-        auto pop_keyword_region = [&](const Token& token) {
-            int end_line = token_line(sm, token);
+        // ── all other tokens ───────────────────────────────────────────────
+        // Any non-comment, non-directive code token flushes the comment run.
+        // Any such token that is not ImportKeyword also flushes the import run
+        // (matches AST behavior where non-import members break import groups).
+        flush_comment_run();
+        if (t.lex->kind != TK::ImportKeyword)
+            flush_import_run();
+
+        switch (t.lex->kind) {
+
+        // Control keywords: mark pending start for begin attribution
+        case TK::AlwaysKeyword:
+        case TK::AlwaysCombKeyword:
+        case TK::AlwaysFFKeyword:
+        case TK::AlwaysLatchKeyword:
+        case TK::InitialKeyword:
+        case TK::FinalKeyword:
+        case TK::IfKeyword:
+        case TK::ElseKeyword:
+        case TK::ForKeyword:
+        case TK::ForeachKeyword:
+        case TK::ForeverKeyword:
+        case TK::WhileKeyword:
+        case TK::RepeatKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
+            if (line >= 0) pending_control_start = line;
+            break;
+        }
+
+        // Keyword-region open: push start line, next ( may be a port list
+        case TK::ForkKeyword:
+        case TK::GenerateKeyword:
+        case TK::FunctionKeyword:
+        case TK::TaskKeyword:
+        case TK::ClassKeyword:
+        case TK::CoverGroupKeyword:
+        case TK::PropertyKeyword:
+        case TK::SequenceKeyword:
+        case TK::CheckerKeyword:
+        case TK::PrimitiveKeyword:
+        case TK::ConfigKeyword:
+        case TK::SpecifyKeyword:
+        case TK::PackageKeyword:
+        case TK::InterfaceKeyword:
+        case TK::ProgramKeyword:
+        case TK::ModuleKeyword:
+        case TK::MacromoduleKeyword:
+        case TK::ClockingKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
+            if (line >= 0) keyword_region_stack.push_back(line);
+            pending_control_start = -1;
+            pending_paren_region  = true;
+            break;
+        }
+
+        // Keyword-region close: pop and emit
+        // ModuleKeyword and MacromoduleKeyword both close with EndModuleKeyword.
+        case TK::JoinKeyword:
+        case TK::JoinAnyKeyword:
+        case TK::JoinNoneKeyword:
+        case TK::EndGenerateKeyword:
+        case TK::EndFunctionKeyword:
+        case TK::EndTaskKeyword:
+        case TK::EndClassKeyword:
+        case TK::EndGroupKeyword:
+        case TK::EndPropertyKeyword:
+        case TK::EndSequenceKeyword:
+        case TK::EndCheckerKeyword:
+        case TK::EndPrimitiveKeyword:
+        case TK::EndConfigKeyword:
+        case TK::EndSpecifyKeyword:
+        case TK::EndPackageKeyword:
+        case TK::EndInterfaceKeyword:
+        case TK::EndProgramKeyword:
+        case TK::EndModuleKeyword:
+        case TK::EndClockingKeyword: {
+            int end_line = line_of(source_text, t.lex->range.start().offset());
             if (!keyword_region_stack.empty()) {
-                emit(directive_folds, sm, token.location().buffer(),
-                     keyword_region_stack.back(), end_line, "region");
+                emit_token_fold(out, source_text, keyword_region_stack.back(), end_line);
                 keyword_region_stack.pop_back();
             }
             pending_control_start = -1;
-        };
+            pending_paren_region  = false;
+            break;
+        }
 
-        auto mark_pending_brace_region = [&](const Token& token) {
-            int line = token_line(sm, token);
-            if (line >= 0)
+        // Brace-region starters (constraint / coverpoint / cross / typedef)
+        // TypedefKeyword anchors the fold start so "typedef struct {" folds
+        // from the typedef line rather than the struct/enum/union line.
+        case TK::TypedefKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
+            if (line >= 0) pending_brace_region_start = line;
+            pending_control_start = -1;
+            break;
+        }
+
+        case TK::ConstraintKeyword:
+        case TK::CoverPointKeyword:
+        case TK::CrossKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
+            if (line >= 0) pending_brace_region_start = line;
+            pending_control_start = -1;
+            break;
+        }
+
+        // enum/struct/union brace bodies fold as regions.  Only set pending
+        // when not already pending so a preceding TypedefKeyword wins as the
+        // fold start line (e.g. "typedef struct {" folds from "typedef").
+        case TK::EnumKeyword:
+        case TK::StructKeyword:
+        case TK::UnionKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
+            if (line >= 0 && pending_brace_region_start < 0)
                 pending_brace_region_start = line;
             pending_control_start = -1;
-        };
+            break;
+        }
 
-        auto mark_pending_bins_region = [&](const Token& token) {
-            int line = token_line(sm, token);
+        // Bins keywords: wait for = before tracking the brace region
+        case TK::BinsKeyword:
+        case TK::IllegalBinsKeyword:
+        case TK::IgnoreBinsKeyword: {
+            int line = line_of(source_text, t.lex->range.start().offset());
             if (line >= 0) {
                 pending_bins_start  = line;
                 pending_bins_equals = false;
             }
             pending_control_start = -1;
-        };
+            break;
+        }
 
-        for (const auto& token : tokens) {
-            switch (token.kind) {
-            case TokenKind::AlwaysKeyword:
-            case TokenKind::AlwaysCombKeyword:
-            case TokenKind::AlwaysFFKeyword:
-            case TokenKind::AlwaysLatchKeyword:
-            case TokenKind::InitialKeyword:
-            case TokenKind::FinalKeyword:
-            case TokenKind::IfKeyword:
-            case TokenKind::ElseKeyword:
-            case TokenKind::ForKeyword:
-            case TokenKind::ForeachKeyword:
-            case TokenKind::ForeverKeyword:
-            case TokenKind::WhileKeyword:
-            case TokenKind::RepeatKeyword:
-                mark_control_start(token);
-                break;
+        case TK::Equals:
+            if (pending_bins_start >= 0) pending_bins_equals = true;
+            break;
 
-            case TokenKind::ForkKeyword:
-            case TokenKind::GenerateKeyword:
-            case TokenKind::FunctionKeyword:
-            case TokenKind::TaskKeyword:
-            case TokenKind::ClassKeyword:
-            case TokenKind::CoverGroupKeyword:
-            case TokenKind::PropertyKeyword:
-            case TokenKind::SequenceKeyword:
-            case TokenKind::CheckerKeyword:
-            case TokenKind::PrimitiveKeyword:
-            case TokenKind::ConfigKeyword:
-            case TokenKind::SpecifyKeyword:
-            case TokenKind::PackageKeyword:
-            case TokenKind::InterfaceKeyword:
-            case TokenKind::ProgramKeyword:
-            case TokenKind::ModuleKeyword:
-            case TokenKind::MacromoduleKeyword:
-                push_keyword_region(token);
-                break;
-
-            case TokenKind::JoinKeyword:
-            case TokenKind::JoinAnyKeyword:
-            case TokenKind::JoinNoneKeyword:
-            case TokenKind::EndGenerateKeyword:
-            case TokenKind::EndFunctionKeyword:
-            case TokenKind::EndTaskKeyword:
-            case TokenKind::EndClassKeyword:
-            case TokenKind::EndGroupKeyword:
-            case TokenKind::EndPropertyKeyword:
-            case TokenKind::EndSequenceKeyword:
-            case TokenKind::EndCheckerKeyword:
-            case TokenKind::EndPrimitiveKeyword:
-            case TokenKind::EndConfigKeyword:
-            case TokenKind::EndSpecifyKeyword:
-            case TokenKind::EndPackageKeyword:
-            case TokenKind::EndInterfaceKeyword:
-            case TokenKind::EndProgramKeyword:
-            case TokenKind::EndModuleKeyword:
-                pop_keyword_region(token);
-                break;
-
-            case TokenKind::ConstraintKeyword:
-            case TokenKind::CoverPointKeyword:
-            case TokenKind::CrossKeyword:
-                mark_pending_brace_region(token);
-                break;
-
-            case TokenKind::BinsKeyword:
-            case TokenKind::IllegalBinsKeyword:
-            case TokenKind::IgnoreBinsKeyword:
-                mark_pending_bins_region(token);
-                break;
-
-            case TokenKind::Equals:
-                if (pending_bins_start >= 0)
-                    pending_bins_equals = true;
-                break;
-
-            case TokenKind::OpenBrace:
-                if (pending_brace_region_start >= 0) {
-                    brace_region_stack.push_back({pending_brace_region_start, brace_depth});
-                    pending_brace_region_start = -1;
-                } else if (pending_bins_start >= 0 && pending_bins_equals) {
-                    brace_region_stack.push_back({pending_bins_start, brace_depth});
-                    pending_bins_start  = -1;
-                    pending_bins_equals = false;
-                }
-                ++brace_depth;
-                pending_control_start = -1;
-                break;
-
-            case TokenKind::CloseBrace: {
-                int close_line = token_line(sm, token);
-                if (brace_depth > 0)
-                    --brace_depth;
-                if (!brace_region_stack.empty() &&
-                    brace_region_stack.back().outer_depth == brace_depth) {
-                    emit(directive_folds, sm, token.location().buffer(),
-                         brace_region_stack.back().start_line, close_line, "region");
-                    brace_region_stack.pop_back();
-                }
-                pending_control_start = -1;
-                break;
-            }
-
-            case TokenKind::ApostropheOpenBrace:
-                ++brace_depth;
-                pending_control_start = -1;
-                break;
-
-            case TokenKind::CaseKeyword:
-            case TokenKind::CaseXKeyword:
-            case TokenKind::CaseZKeyword:
-            case TokenKind::RandCaseKeyword: {
-                int case_line = token_line(sm, token);
-                if (case_line >= 0)
-                    case_stack.push_back(case_line);
-                pending_control_start = -1;
-                break;
-            }
-
-            case TokenKind::EndCaseKeyword: {
-                int endcase_line = token_line(sm, token);
-                if (!case_stack.empty()) {
-                    emit(directive_folds, sm, token.location().buffer(), case_stack.back(),
-                         endcase_line, "region");
-                    case_stack.pop_back();
-                }
-                pending_control_start = -1;
-                break;
-            }
-
-            case TokenKind::BeginKeyword: {
-                int begin_line = token_line(sm, token);
-                block_stack.push_back(pending_control_start >= 0 ? pending_control_start
-                                                                 : begin_line);
-                pending_control_start = -1;
-                break;
-            }
-
-            case TokenKind::EndKeyword: {
-                int end_line = token_line(sm, token);
-                if (!block_stack.empty()) {
-                    emit(directive_folds, sm, token.location().buffer(), block_stack.back(),
-                         end_line, "region");
-                    block_stack.pop_back();
-                }
-                pending_control_start = -1;
-                break;
-            }
-
-            case TokenKind::Semicolon:
-                // A semicolon after a control keyword means no begin follows
-                // (e.g. `if (cond) a <= 1;`).  Clear pending so the stale
-                // start line is not attributed to a later unrelated begin.
-                pending_control_start = -1;
+        case TK::OpenBrace:
+            if (pending_brace_region_start >= 0) {
+                brace_region_stack.push_back({pending_brace_region_start, brace_depth});
                 pending_brace_region_start = -1;
-                pending_bins_start = -1;
+            } else if (pending_bins_start >= 0 && pending_bins_equals) {
+                brace_region_stack.push_back({pending_bins_start, brace_depth});
+                pending_bins_start  = -1;
                 pending_bins_equals = false;
-                break;
+            }
+            ++brace_depth;
+            pending_control_start = -1;
+            break;
 
-            default:
+        case TK::CloseBrace: {
+            int close_line = line_of(source_text, t.lex->range.start().offset());
+            if (brace_depth > 0) --brace_depth;
+            if (!brace_region_stack.empty() &&
+                brace_region_stack.back().outer_depth == brace_depth) {
+                emit_token_fold(out, source_text,
+                                brace_region_stack.back().start_line, close_line);
+                brace_region_stack.pop_back();
+            }
+            pending_control_start = -1;
+            break;
+        }
+
+        // Array literal '{...}: increment brace depth without starting a new
+        // brace region.  Without this, inner apostrophe-braces inside a
+        // constraint { } block would miscount depth and emit folds at wrong
+        // boundaries.
+        case TK::ApostropheOpenBrace:
+            ++brace_depth;
+            pending_control_start = -1;
+            break;
+
+        case TK::CaseKeyword:
+        case TK::CaseXKeyword:
+        case TK::CaseZKeyword:
+        case TK::RandCaseKeyword: {
+            int case_line = line_of(source_text, t.lex->range.start().offset());
+            if (case_line >= 0) case_stack.push_back(case_line);
+            pending_control_start = -1;
+            break;
+        }
+
+        case TK::EndCaseKeyword: {
+            int endcase_line = line_of(source_text, t.lex->range.start().offset());
+            if (!case_stack.empty()) {
+                emit_token_fold(out, source_text, case_stack.back(), endcase_line);
+                case_stack.pop_back();
+            }
+            pending_control_start = -1;
+            break;
+        }
+
+        case TK::BeginKeyword: {
+            int begin_line = line_of(source_text, t.lex->range.start().offset());
+            block_stack.push_back(
+                pending_control_start >= 0 ? pending_control_start : begin_line);
+            pending_control_start = -1;
+            break;
+        }
+
+        case TK::EndKeyword: {
+            int end_line = line_of(source_text, t.lex->range.start().offset());
+            if (!block_stack.empty()) {
+                emit_token_fold(out, source_text, block_stack.back(), end_line);
+                block_stack.pop_back();
+            }
+            pending_control_start = -1;
+            break;
+        }
+
+        // #( introduces a parameter value assignment paren region
+        case TK::Hash: {
+            if (i + 1 < tokens.size() &&
+                tokens[i + 1].lex->kind == TK::OpenParenthesis)
+                pending_paren_region = true;
+            break;
+        }
+
+        // Parenthesized port/parameter list regions.
+        // pending_paren_region is set by module/function/task/interface/program/
+        // checker/primitive keywords (and #) so only the first ( after such a
+        // keyword starts a fold.  This covers ANSI port lists, function/task
+        // parameter lists, and parameter value assignments.  Instantiation
+        // connection lists are not detected here because instance names are
+        // identifiers, not keywords.
+        case TK::OpenParenthesis: {
+            int open_line = line_of(source_text, t.lex->range.start().offset());
+            if (pending_paren_region) {
+                paren_region_stack.push_back({open_line, paren_depth});
+                pending_paren_region = false;
+            }
+            ++paren_depth;
+            pending_control_start = -1;
+            break;
+        }
+
+        case TK::CloseParenthesis: {
+            if (paren_depth > 0) --paren_depth;
+            int close_line = line_of(source_text, t.lex->range.start().offset());
+            if (!paren_region_stack.empty() &&
+                paren_region_stack.back().outer_depth == paren_depth) {
+                emit_token_fold(out, source_text,
+                                paren_region_stack.back().start_line, close_line);
+                paren_region_stack.pop_back();
+            }
+            pending_control_start = -1;
+            break;
+        }
+
+        // Import run grouping.
+        // ImportKeyword covers both package imports and DPI imports.
+        // DPI imports (next non-trivia token is a StringLiteral) are excluded
+        // from run grouping.  The run flushes when a non-adjacent import or
+        // any non-import code token is encountered.
+        case TK::ImportKeyword: {
+            // Look ahead past comments/unknowns to the first content token.
+            size_t next = i + 1;
+            while (next < tokens.size() &&
+                   (tokens[next].lex->is_comment ||
+                    tokens[next].lex->kind == TK::Unknown ||
+                    tokens[next].lex->is_disabled_region_body))
+                ++next;
+
+            if (next < tokens.size() &&
+                tokens[next].lex->kind == TK::StringLiteral) {
+                // DPI import: skip to closing semicolon, do not track.
+                while (i < tokens.size() && tokens[i].lex->kind != TK::Semicolon)
+                    ++i;
                 break;
             }
-        }
-    }
 
-    void process_simple_directive(const SimpleDirectiveSyntax& node) {
-        int line = token_line(sm, node.directive);
-        BufferID buffer = node.directive.location().buffer();
-        if (node.kind == SyntaxKind::CellDefineDirective) {
-            cell_stack.push_back({line, buffer});
-        } else if (node.kind == SyntaxKind::EndCellDefineDirective) {
-            if (!cell_stack.empty()) {
-                emit(out, sm, cell_stack.back().buffer, cell_stack.back().start_line, line,
-                     "region");
-                cell_stack.pop_back();
-            }
-        }
-    }
+            // Package import: extent is from ImportKeyword to its Semicolon.
+            int    import_start_line =
+                line_of(source_text, t.lex->range.start().offset());
+            size_t semi = i + 1;
+            while (semi < tokens.size() && tokens[semi].lex->kind != TK::Semicolon)
+                ++semi;
+            int import_end_line = semi < tokens.size()
+                ? line_of(source_text, tokens[semi].lex->range.start().offset())
+                : import_start_line;
 
-    int line_at(BufferID buffer, size_t offset) const {
-        SourceLocation loc(buffer, offset);
-        if (!loc.valid()) return -1;
-        return (int)sm.getLineNumber(loc) - 1;
-    }
-
-    bool is_own_line_trivia(BufferID buffer, size_t offset) const {
-        auto text = sm.getSourceText(buffer);
-        if (offset > text.size()) return false;
-
-        // Find line start, caching by line number to avoid repeated backward
-        // scans for multiple trivia items on the same line.
-        if (buffer != line_start_cache_buf_) {
-            line_start_cache_.clear();
-            line_start_cache_buf_ = buffer;
-        }
-        int    line_num  = line_at(buffer, offset);
-        size_t line_start;
-        auto   it        = line_start_cache_.find(line_num);
-        if (it != line_start_cache_.end()) {
-            line_start = it->second;
-        } else {
-            line_start = offset;
-            while (line_start > 0 && text[line_start - 1] != '\n')
-                --line_start;
-            line_start_cache_[line_num] = line_start;
-        }
-
-        for (size_t i = line_start; i < offset; ++i) {
-            unsigned char ch = static_cast<unsigned char>(text[i]);
-            if (!std::isspace(ch)) return false;
-        }
-        return true;
-    }
-};
-
-// ── import group collector ───────────────────────────────────────────────
-
-static void collect_import_runs(const SourceManager& sm,
-                                 const SyntaxList<MemberSyntax>& members,
-                                 std::vector<FoldingRange>& out);
-
-static void collect_import_folds(const SourceManager& sm, const SyntaxNode& root,
-                                  std::vector<FoldingRange>& out) {
-    // SyntaxTree::fromText uses parseGuess(), which can return the inner
-    // declaration directly (e.g. ModuleDeclarationSyntax) instead of a
-    // CompilationUnitSyntax when the file contains a single top-level construct.
-    if (const auto* unit = root.as_if<CompilationUnitSyntax>())
-        collect_import_runs(sm, unit->members, out);
-    else if (const auto* mod = root.as_if<ModuleDeclarationSyntax>())
-        collect_import_runs(sm, mod->members, out);
-    else if (const auto* cls = root.as_if<ClassDeclarationSyntax>())
-        collect_import_runs(sm, cls->items, out);
-}
-
-static void collect_import_runs(const SourceManager& sm,
-                                 const SyntaxList<MemberSyntax>& members,
-                                 std::vector<FoldingRange>& out) {
-    int run_start = -1;
-    int run_last  = -1;
-    BufferID run_buffer{};
-
-    auto flush = [&] {
-        if (run_start >= 0 && run_last > run_start)
-            emit(out, sm, run_buffer, run_start, run_last, "imports");
-        run_start = -1;
-        run_last  = -1;
-        run_buffer = {};
-    };
-
-    for (const auto* member : members) {
-        if (!member) { flush(); continue; }
-        if (member->kind == SyntaxKind::PackageImportDeclaration) {
-            int fl = first_line(sm, *member);
-            int ll = last_line(sm, *member);
-            if (run_start < 0) {
-                run_start = fl;
-                run_last  = ll;
-                Token first = member->getFirstToken();
-                if (first && first.location().valid())
-                    run_buffer = first.location().buffer();
-            } else if (fl == run_last + 1) {
-                // Treat an import "run" as a source-adjacent visual group, not
-                // merely consecutive PackageImportDeclarationSyntax members in the
-                // AST.  Comments, blank lines, directives, and other trivia can be
-                // invisible to the member list; folding across them would hide
-                // explanatory text and merge intentionally separated import groups.
-                run_last = ll;
+            if (import_run_start < 0) {
+                import_run_start = import_start_line;
+                import_run_last  = import_end_line;
+            } else if (import_start_line == import_run_last + 1) {
+                import_run_last = import_end_line;
             } else {
-                flush();
-                run_start = fl;
-                run_last = ll;
-                Token first = member->getFirstToken();
-                if (first && first.location().valid())
-                    run_buffer = first.location().buffer();
+                flush_import_run();
+                import_run_start = import_start_line;
+                import_run_last  = import_end_line;
             }
-        } else {
-            flush();
-            // Recurse into declaration bodies that can contain import statements.
-            if (const auto* mod = member->as_if<ModuleDeclarationSyntax>())
-                collect_import_runs(sm, mod->members, out);
-            else if (const auto* cls = member->as_if<ClassDeclarationSyntax>())
-                collect_import_runs(sm, cls->items, out);
+            i = semi; // advance past the import statement
+            break;
+        }
+
+        case TK::Semicolon:
+            pending_control_start      = -1;
+            pending_brace_region_start = -1;
+            pending_bins_start         = -1;
+            pending_bins_equals        = false;
+            pending_paren_region       = false;
+            break;
+
+        default:
+            pending_control_start = -1;
+            break;
         }
     }
-    flush();
+
+    flush_comment_run();
+    flush_import_run();
 }
 
-// ── final result normalization ───────────────────────────────────────────
+// ── normalization ─────────────────────────────────────────────────────────
 
 static void normalize_folds(std::vector<FoldingRange>& folds) {
     std::sort(folds.begin(), folds.end(), [](const FoldingRange& a, const FoldingRange& b) {
@@ -823,31 +623,14 @@ static void normalize_folds(std::vector<FoldingRange>& folds) {
                std::tie(b.startLine, b.endLine, b.kind, b.startCharacter, b.endCharacter);
     });
 
-    folds.erase(std::unique(folds.begin(), folds.end(), [](const FoldingRange& a,
-                                                           const FoldingRange& b) {
-                    return a.startLine == b.startLine && a.endLine == b.endLine &&
-                           a.kind == b.kind && a.startCharacter == b.startCharacter &&
-                           a.endCharacter == b.endCharacter;
-                }),
-                folds.end());
-}
-
-static void append_directive_folds(std::vector<FoldingRange>& accepted_folds,
-                                   const std::vector<FoldingRange>& directive_candidates) {
-    //
-    // Keep preprocessor conditional folds available at the directive line itself.
-    // Earlier we tried suppressing a directive fold if it wrapped structural RTL
-    // folds.  That made "za" inside always/if blocks nicer, but it also meant that
-    // pressing "za" on the `ifdef line had no local directive fold and Neovim fell
-    // back to folding the whole module.  The better compromise is to emit both:
-    //
-    //   `ifdef ... `else branch fold
-    //   local always/begin/if folds inside that branch
-    //
-    // In inactive branches, local begin/end folds are recovered from slang's
-    // disabled token list so the inner RTL blocks are still present.
-    accepted_folds.insert(accepted_folds.end(), directive_candidates.begin(),
-                          directive_candidates.end());
+    folds.erase(
+        std::unique(folds.begin(), folds.end(),
+                    [](const FoldingRange& a, const FoldingRange& b) {
+                        return a.startLine == b.startLine && a.endLine == b.endLine &&
+                               a.kind == b.kind && a.startCharacter == b.startCharacter &&
+                               a.endCharacter == b.endCharacter;
+                    }),
+        folds.end());
 }
 
 } // namespace
@@ -859,17 +642,24 @@ std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
     auto state = analyzer.get_state(params.textDocument.uri.raw_uri_);
     if (!state || !state->tree) return {};
 
-    auto&                    sm = *state->source_manager;
     std::vector<FoldingRange> out;
 
-    FoldVisitor v{sm, out};
-    state->tree->root().visit(v);
-    v.flush_comment_run(); // flush any trailing comment run
+    // Primary path: unified token scan over the formatter's TokenStream.
+    // TokenCollector does raw lexing without preprocessing, so tokens from
+    // both active and inactive preprocessor branches appear in the stream.
+    FormatOptions default_opts;
+    svfmt::TokenStream tokens =
+        svfmt::TokenCollector(state->text, default_opts).collect();
+    collect_token_folds(tokens, state->text, out);
 
-    collect_import_folds(sm, state->tree->root(), out);
-    append_directive_folds(out, v.directive_folds);
+    // AST post-pass: if/else chain linking only.
+    // ConditionalStatementSyntax and IfGenerateSyntax require AST precision
+    // to link chained branches; token-only detection cannot reliably do this.
+    if (state->source_manager) {
+        IfElseChainVisitor v{*state->source_manager, out};
+        state->tree->root().visit(v);
+    }
 
     normalize_folds(out);
-
     return out;
 }

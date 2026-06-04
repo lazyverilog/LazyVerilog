@@ -700,3 +700,185 @@ endmodule
     CHECK(always->startCharacter == 4); // indentation before always_comb
     CHECK(always->endCharacter == 7);   // four spaces + strlen("end")
 }
+
+// ── begin/end control keyword attribution ────────────────────────────────────
+
+TEST_CASE("foldingRange: begin/end fold starts at control keyword when begin is on next line",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_begin_attribution.sv";
+    analyzer.open(uri, R"(module top;
+    always_comb
+    begin
+        a = b;
+    end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // The fold must start at line 1 (always_comb), not line 2 (begin).
+    // Line 4 (end) closes it.
+    CHECK(has_fold(folds, 1, 4));
+    // No fold starting at the bare begin line
+    for (const auto& f : folds)
+        CHECK_FALSE((f.startLine == 2 && f.endLine == 4));
+}
+
+// ── active fork/join variants ─────────────────────────────────────────────────
+
+TEST_CASE("foldingRange: active fork/join variants fold", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_fork_join.sv";
+    analyzer.open(uri, R"(module top;
+    initial begin
+        fork
+            task_a();
+        join
+        fork
+            task_b();
+        join_any
+        fork
+            task_c();
+        join_none
+    end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    CHECK(has_fold(folds, 2, 4));  // fork ... join
+    CHECK(has_fold(folds, 5, 7));  // fork ... join_any
+    CHECK(has_fold(folds, 8, 10)); // fork ... join_none
+}
+
+// ── clocking block ────────────────────────────────────────────────────────────
+
+TEST_CASE("foldingRange: clocking/endclocking fold", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_clocking.sv";
+    analyzer.open(uri, R"(module top(input logic clk);
+    clocking cb @(posedge clk);
+        input  data_in;
+        output data_out;
+    endclocking
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // clocking block: lines 1-4
+    CHECK(has_fold(folds, 1, 4));
+    // module: lines 0-5
+    CHECK(has_fold(folds, 0, 5));
+}
+
+// ── import run excludes DPI imports ──────────────────────────────────────────
+
+TEST_CASE("foldingRange: import run excludes DPI imports", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_dpi_import.sv";
+    analyzer.open(uri, R"(import pkg_a::*;
+import pkg_b::*;
+import "DPI-C" function void c_func(int x);
+import pkg_c::*;
+module top;
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // pkg_a + pkg_b form one import run [0,1]
+    CHECK(has_fold_kind(folds, 0, 1, "imports"));
+    // DPI import breaks the run; pkg_c is alone on line 3 — no run fold for it
+    CHECK_FALSE(has_fold_kind(folds, 2, 3, "imports"));
+    CHECK_FALSE(has_fold_kind(folds, 0, 3, "imports"));
+}
+
+// ── typedef enum / struct / union ────────────────────────────────────────────
+
+TEST_CASE("foldingRange: typedef enum body folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_typedef_enum.sv";
+    analyzer.open(uri, R"(package types_pkg;
+    typedef enum logic [1:0] {
+        STATE_IDLE  = 2'b00,
+        STATE_BUSY  = 2'b01,
+        STATE_DONE  = 2'b10
+    } state_t;
+endpackage
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // typedef enum body: line 1 (typedef) to line 5 (closing })
+    CHECK(has_fold(folds, 1, 5));
+    // package: lines 0-6
+    CHECK(has_fold(folds, 0, 6));
+}
+
+TEST_CASE("foldingRange: typedef struct body folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_typedef_struct.sv";
+    analyzer.open(uri, R"(package types_pkg;
+    typedef struct packed {
+        logic        valid;
+        logic [7:0]  data;
+        logic [1:0]  keep;
+    } axi_word_t;
+endpackage
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // typedef struct body: line 1 (typedef) to line 5 (closing })
+    CHECK(has_fold(folds, 1, 5));
+}
+
+TEST_CASE("foldingRange: typedef union body folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_typedef_union.sv";
+    analyzer.open(uri, R"(package types_pkg;
+    typedef union packed {
+        logic [31:0] raw;
+        struct packed { logic [15:0] hi; logic [15:0] lo; } halves;
+    } word_u;
+endpackage
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // typedef union body: line 1 (typedef) to line 4 (closing })
+    CHECK(has_fold(folds, 1, 4));
+}
+
+TEST_CASE("foldingRange: enum without typedef folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_enum_no_typedef.sv";
+    analyzer.open(uri, R"(module top;
+    enum logic [1:0] {
+        A = 2'b00,
+        B = 2'b01,
+        C = 2'b10
+    } state;
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // enum body: line 1 (enum) to line 5 (closing })
+    CHECK(has_fold(folds, 1, 5));
+}
+
+// ── #ifndef inactive branch ───────────────────────────────────────────────────
+
+TEST_CASE("foldingRange: #ifndef inactive branch folds", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_ifndef.sv";
+    // ALWAYS_DEFINED is not defined, so the body is the inactive branch.
+    analyzer.open(uri, R"(module top;
+`ifndef ALWAYS_DEFINED
+    logic unused_a;
+    logic unused_b;
+`endif
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Preprocessor fold covers lines 1-4 (`ifndef ... `endif)
+    CHECK(has_fold(folds, 1, 4));
+    // Module still folds
+    CHECK(has_fold(folds, 0, 5));
+}
