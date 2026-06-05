@@ -522,6 +522,15 @@ static int find_instance_end_line(const std::vector<std::string_view>& lines, in
     return lines.empty() ? 0 : (int)lines.size() - 1;
 }
 
+static int syntax_end_line0(const slang::SourceManager& sm, const SyntaxNode& node,
+                            int fallback_line) {
+    const auto end = node.sourceRange().end();
+    if (!end.valid())
+        return fallback_line;
+    const auto line = sm.getLineNumber(end);
+    return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
+}
+
 static void extract_instances(const SyntaxList<MemberSyntax>& members,
                               std::vector<InstanceEntry>& out, SyntaxIndex& index,
                               const slang::SourceManager& sm,
@@ -550,8 +559,13 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
                 entry.line = token_pos(sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
-            entry.end_line = source.empty() ? entry.start_line
-                                            : find_instance_end_line(lines, entry.start_line);
+            // Use the parsed hierarchy range when available.  A raw ';' search
+            // is a best-effort fallback only: comments and string literals can
+            // legally contain semicolons before the actual instance terminator.
+            const int fallback_end_line = source.empty()
+                                              ? entry.start_line
+                                              : find_instance_end_line(lines, entry.start_line);
+            entry.end_line = syntax_end_line0(sm, *hierarchy, fallback_end_line);
 
             for (const auto* connection : instance->connections) {
                 if (!connection)

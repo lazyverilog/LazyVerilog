@@ -294,6 +294,16 @@ static lsTextEdit whole_document_edit(const std::string& old_text, const std::st
     return edit;
 }
 
+static std::string whole_document_workspace_edit_json(const std::string& uri,
+                                                      const std::string& old_text,
+                                                      const std::string& new_text) {
+    const auto end = document_end_position(old_text);
+    return "{\"changes\":{" + json_string(uri) +
+           ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":" +
+           std::to_string(end.line) + ",\"character\":" + std::to_string(end.character) +
+           "}},\"newText\":" + json_string(new_text) + "}]}}";
+}
+
 static std::string slice_lsp_range(const std::string& text, const lsRange& range) {
     auto [start, end] = lsp_offset_pair(text,
         range.start.line, range.start.character,
@@ -1382,19 +1392,13 @@ void LazyVerilogServer::register_handlers() {
 
                 // Build workspace edit JSON and set as result
                 lsWorkspaceEdit we;
-                lsTextEdit text_edit;
-                text_edit.range.start = lsPosition(0, 0);
-                text_edit.range.end = lsPosition(999999, 0);
-                text_edit.newText = new_text;
+                lsTextEdit text_edit = whole_document_edit(state->text, new_text);
                 we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
                 (*we.changes)[uri] = {text_edit};
 
-                // Serialize WorkspaceEdit manually to JSON
-                std::string json = "{\"changes\":{" + json_string(uri) +
-                                   ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":"
-                                   "{\"line\":999999,\"character\":0}},\"newText\":";
-                json += json_string(new_text) + "}]}}";
-                rsp.result.SetJsonString(json, lsp::Any::kObjectType);
+                rsp.result.SetJsonString(
+                    whole_document_workspace_edit_json(uri, state->text, new_text),
+                    lsp::Any::kObjectType);
             };
 
             if (cmd == "lazyverilog.format") {
@@ -1497,19 +1501,12 @@ void LazyVerilogServer::register_handlers() {
                             new_source = format_source(new_source, config_.format);
                         if (new_source != state->text) {
                             lsWorkspaceEdit we;
-                            lsTextEdit text_edit;
-                            text_edit.range.start = lsPosition(0, 0);
-                            text_edit.range.end = lsPosition(999999, 0);
-                            text_edit.newText = new_source;
+                            lsTextEdit text_edit = whole_document_edit(state->text, new_source);
                             we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
                             (*we.changes)[uri] = {text_edit};
-                            // Serialize WorkspaceEdit manually to JSON
-                            std::string json =
-                                "{\"changes\":{" + json_string(uri) +
-                                ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{"
-                                "\"line\":999999,\"character\":0}},\"newText\":";
-                            json += json_string(new_source) + "}]}}";
-                            rsp.result.SetJsonString(json, lsp::Any::kObjectType);
+                            rsp.result.SetJsonString(
+                                whole_document_workspace_edit_json(uri, state->text, new_source),
+                                lsp::Any::kObjectType);
                         }
                     }
                 }

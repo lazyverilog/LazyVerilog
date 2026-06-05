@@ -191,11 +191,11 @@ std::string with_dims(const slang::SourceManager& sm, std::string type,
     return type;
 }
 
-void add_value(SyntaxIndex& index, const slang::SourceManager& sm,
-               const slang::parsing::Token& name, std::string type, std::string kind,
-               std::string parent_scope) {
+ValueEntry* add_value(SyntaxIndex& index, const slang::SourceManager& sm,
+                      const slang::parsing::Token& name, std::string type, std::string kind,
+                      std::string parent_scope) {
     if (!name)
-        return;
+        return nullptr;
     auto [line, col] = token_pos(sm, name);
     index.values.push_back(ValueEntry{.name = tok_text(name),
                                       .type = std::move(type),
@@ -204,6 +204,7 @@ void add_value(SyntaxIndex& index, const slang::SourceManager& sm,
                                       .file_id = token_file_id_for_dynamic_index(index, sm, name),
                                       .line = line,
                                       .col = col});
+    return &index.values.back();
 }
 
 void add_port(ModuleEntry& module, SyntaxIndex& index, const slang::SourceManager& sm,
@@ -311,6 +312,14 @@ int instance_end_line(const std::vector<std::string_view>& lines, int start_line
     return start_line;
 }
 
+int node_end_line0(const slang::SourceManager& sm, const SyntaxNode& node, int fallback_line) {
+    const auto end = node.sourceRange().end();
+    if (!end.valid())
+        return fallback_line;
+    const auto line = sm.getLineNumber(end);
+    return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
+}
+
 void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxIndex& index,
                        const slang::SourceManager& sm, const std::vector<std::string_view>& lines,
                        const std::string& parent_module) {
@@ -327,7 +336,13 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
             entry.line = token_pos(sm, inst->decl->name).first;
         }
         entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
-        entry.end_line = instance_end_line(lines, entry.start_line);
+        // Prefer slang's parsed source range over a raw ';' line scan.  The
+        // scanner remains only as a fallback for malformed/incomplete syntax
+        // where the parser cannot provide a valid range; raw text can be
+        // fooled by semicolons inside strings or comments.
+        entry.end_line = node_end_line0(
+            sm, hierarchy,
+            lines.empty() ? entry.start_line : instance_end_line(lines, entry.start_line));
         for (const auto* conn : inst->connections) {
             if (const auto* named = conn ? conn->as_if<NamedPortConnectionSyntax>() : nullptr) {
                 auto [line, col] = token_pos(sm, named->name);
@@ -511,10 +526,10 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                               module.name);
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            add_value(index, sm, fn->prototype->keyword, node_text(*fn->prototype->returnType),
-                      "function", module.name);
-            if (!index.values.empty())
-                index.values.back().name = node_text(*fn->prototype->name);
+            if (auto* value = add_value(index, sm, fn->prototype->keyword,
+                                        node_text(*fn->prototype->returnType), "function",
+                                        module.name))
+                value->name = node_text(*fn->prototype->name);
         } else if (const auto* hierarchy = member->as_if<HierarchyInstantiationSyntax>()) {
             process_hierarchy(*hierarchy, index, sm, lines, module.name);
         } else if (const auto* modport = member->as_if<ModportDeclarationSyntax>()) {

@@ -213,6 +213,7 @@ void BackgroundCompiler::schedule(CompilationSnapshot snapshot) {
 }
 
 void BackgroundCompiler::stop() {
+    std::vector<std::thread> workers_to_join;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_)
@@ -221,13 +222,24 @@ void BackgroundCompiler::stop() {
         enabled_ = false;
         pending_.reset();
         ++latest_generation_;
+
+        // Move thread handles out while holding mutex_ so configure() cannot
+        // concurrently erase or append workers_ while stop() is deciding what
+        // must be joined.  The worker threads keep their WorkerSlot alive via
+        // the shared_ptr captured by the thread function; clearing this vector
+        // only drops the server's bookkeeping references.
+        workers_to_join.reserve(workers_.size());
+        for (auto& slot : workers_) {
+            if (slot->thread.joinable())
+                workers_to_join.push_back(std::move(slot->thread));
+        }
+        workers_.clear();
     }
     cv_.notify_all();
-    for (auto& slot : workers_) {
-        if (slot->thread.joinable())
-            slot->thread.join();
+    for (auto& worker : workers_to_join) {
+        if (worker.joinable())
+            worker.join();
     }
-    workers_.clear();
 }
 
 void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
