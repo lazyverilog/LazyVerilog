@@ -210,7 +210,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     // outside map_mutex_ so a large listed file opened in the editor does not
     // block unrelated request handlers behind global analyzer state.
     if (listed_extra_file) {
-        auto index = build_dynamic_file_index(*state);
+        auto index = get_dynamic_index(*state);
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second == state)
             update_extra_cache_for_live_state_locked(state, std::move(index));
@@ -236,7 +236,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
     // See Analyzer::open(): current-buffer shard building is intentionally
     // outside map_mutex_ to keep the edit path responsive on large RTL files.
     if (listed_extra_file) {
-        auto index = build_dynamic_file_index(*state);
+        auto index = get_dynamic_index(*state);
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second == state)
             update_extra_cache_for_live_state_locked(state, std::move(index));
@@ -2148,6 +2148,37 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
         schedule_background_reindex_locked();
 }
 
+void Analyzer::set_project_config(const std::vector<std::string>& defines,
+                                  const std::vector<std::string>& include_dirs,
+                                  const std::vector<std::string>& extra_files,
+                                  const std::string& filelist_path) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+
+    // Apply every parse-affecting project input under one lock.  A config reload
+    // commonly changes several of these at once (for example a new .f file plus
+    // +incdir+ entries and preprocessor defines).  Clearing and scheduling once
+    // avoids creating redundant background generations that cannot commit but
+    // can still burn CPU / shared-filesystem bandwidth while they parse.
+    defines_ = defines;
+
+    include_dirs_.clear();
+    include_dirs_.reserve(include_dirs.size());
+    for (const auto& dir : include_dirs)
+        include_dirs_.push_back(normalize_path(dir).string());
+
+    filelist_path_ = filelist_path;
+    extra_files_.clear();
+    extra_files_.reserve(extra_files.size());
+    for (const auto& path : extra_files)
+        extra_files_.push_back(normalize_path(path).string());
+
+    extra_cache_.clear();
+    clear_extra_project_index_locked();
+
+    if (!extra_files_.empty())
+        schedule_background_reindex_locked();
+}
+
 void Analyzer::wait_for_background_index_idle() const {
     std::unique_lock<std::mutex> lock(map_mutex_);
     background_cv_.wait(lock, [&] {
@@ -2256,7 +2287,7 @@ Analyzer::opened_files_index(const std::string& current_uri) const {
 
     auto merged = std::make_shared<SyntaxIndex>();
     for (const auto& state : states)
-        merged->merge(build_dynamic_file_index(*state));
+        merged->merge(get_dynamic_index(*state));
     return merged;
 }
 
@@ -2578,7 +2609,7 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
         }
 
         if (live_doc) {
-            auto live_index = build_dynamic_file_index(*live_doc);
+            auto live_index = get_dynamic_index(*live_doc);
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation == background_generation_) {
                 if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second == live_doc) {

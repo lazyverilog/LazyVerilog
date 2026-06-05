@@ -63,6 +63,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
@@ -313,6 +314,45 @@ static lsTextEdit range_format_edit(const std::string& old_text, const std::stri
     return edit;
 }
 
+static std::string did_change_config_file(lsp::Any settings_any) {
+    // LspCpp stores arbitrary JSON as lsp::Any.  Avoid reflected nested structs
+    // here: GetFromMap() is convenient for flat maps, but nested user structs
+    // require full Reflect() overloads.  The didChangeConfiguration payload is
+    // tiny, so explicit maps are clearer and more robust.
+    //
+    // Expected shape from lua/lazyverilog/lsp.lua:
+    //   { "lazyverilog": { "configFile": "/proj/lazyverilog.toml" } }
+    std::map<std::string, lsp::Any> settings;
+    try {
+        settings_any.Get(settings);
+    } catch (...) {
+        return {};
+    }
+
+    auto lazy_it = settings.find("lazyverilog");
+    if (lazy_it == settings.end())
+        return {};
+
+    std::map<std::string, lsp::Any> lazyverilog;
+    try {
+        lazy_it->second.Get(lazyverilog);
+    } catch (...) {
+        return {};
+    }
+
+    auto file_it = lazyverilog.find("configFile");
+    if (file_it == lazyverilog.end())
+        return {};
+
+    std::string config_file;
+    try {
+        file_it->second.GetForMapHelper(config_file);
+    } catch (...) {
+        return {};
+    }
+    return config_file;
+}
+
 static std::string workspace_edit_json(const std::string& uri, const lsTextEdit& edit) {
     return "{\"changes\":{" + json_string(uri) +
            ":[{\"range\":{\"start\":{\"line\":" + std::to_string(edit.range.start.line) +
@@ -462,8 +502,10 @@ struct LazyVerilogServer::Impl {
     std::shared_ptr<lsp::ProtocolJsonHandler> json_handler =
         std::make_shared<lsp::ProtocolJsonHandler>();
     std::shared_ptr<GenericEndpoint> endpoint = std::make_shared<GenericEndpoint>(log);
-    // max_workers=1: prevents concurrent mimalloc TLS init race between Asio workers
-    // on their first allocation (didOpen vs didChangeConfiguration race).
+    // max_workers=1: keeps LSP request handling serialized.  This avoids
+    // historical allocator/runtime races and keeps mutable server state such as
+    // diagnostics/config notifications simple.  Expensive project indexing and
+    // optional semantic compilation still run on their own background workers.
     RemoteEndPoint remote_endpoint{json_handler, endpoint, log, lsp::JSONStreamStyle::Standard, 1};
     std::shared_ptr<StdOutStream> output = std::make_shared<StdOutStream>();
     std::shared_ptr<StdInStream> input = std::make_shared<StdInStream>();
@@ -474,10 +516,9 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
     analyzer_.set_project_index_publish_callback([this] { request_inlay_hint_refresh(); });
-    analyzer_.set_defines(config_.design.define);
     { auto vcode = load_vcode(root_, config_);
-      analyzer_.set_include_dirs(vcode.include_dirs);
-      analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
+      analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
+                                   vcode.files, resolve_vcode_path(root_, config_)); }
     background_compiler_ =
         std::make_unique<BackgroundCompiler>([this](BackgroundCompileResult result) {
             std::unordered_set<std::string> uris_to_publish;
@@ -760,10 +801,9 @@ void LazyVerilogServer::register_handlers() {
                     if (!warn.empty())
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                    analyzer_.set_defines(config_.design.define);
                     { auto vcode = load_vcode(root_, config_);
-                      analyzer_.set_include_dirs(vcode.include_dirs);
-                      analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
+                      analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
+                                                   vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                     schedule_background_compilation();
                 }
@@ -777,10 +817,9 @@ void LazyVerilogServer::register_handlers() {
                     if (!warn.empty())
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                    analyzer_.set_defines(config_.design.define);
                     { auto vcode = load_vcode(root_, config_);
-                      analyzer_.set_include_dirs(vcode.include_dirs);
-                      analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
+                      analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
+                                                   vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                     schedule_background_compilation();
                 }
@@ -847,20 +886,48 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler(
         [&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
             try {
-                // Re-read config from disk on every configuration change
+                // Prefer the explicit config path supplied by our Neovim
+                // client.  This avoids stale formatter options when Neovim and
+                // the server disagree about the workspace root:
+                //
+                //   client root: /repo              (because .git was found)
+                //   config file: /repo/rtl/lazyverilog.toml
+                //   server root: /repo              (from initialize rootUri)
+                //
+                // If we ignored configFile, reload would keep reading
+                // /repo/lazyverilog.toml (or defaults) forever.  The payload is
+                // only a hint for selecting the root; load_config() still reads
+                // and validates lazyverilog.toml from disk.
+                {
+                    std::string config_file = did_change_config_file(note.params.settings);
+                    if (!config_file.empty()) {
+                        if (config_file.starts_with("file://"))
+                            config_file = config_file.substr(7);
+                        std::filesystem::path config_path(config_file);
+                        if (config_path.is_relative())
+                            config_path = root_ / config_path;
+                        if (config_path.filename() == "lazyverilog.toml")
+                            root_ = config_path.parent_path();
+                    }
+                }
+
+                // Re-read config from disk on every configuration-change
+                // notification.  Apply project-parse inputs with one analyzer
+                // transaction so a single config change schedules at most one
+                // full-project background reindex generation.
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
+                std::cerr << "[lazyverilog] reloaded config from "
+                          << (root_ / "lazyverilog.toml").string() << "\n";
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                analyzer_.set_defines(config_.design.define);
                 { auto vcode = load_vcode(root_, config_);
-                  analyzer_.set_include_dirs(vcode.include_dirs);
-                  analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
+                  analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
+                                               vcode.files, resolve_vcode_path(root_, config_)); }
                 configure_background_compiler();
                 schedule_background_compilation();
-                (void)note; // settings in note.params.settings parsed lazily
             } catch (const std::exception& e) {
                 std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }
@@ -884,10 +951,9 @@ void LazyVerilogServer::register_handlers() {
                     if (!warn.empty())
                         show_warning(warn);
                     publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                    analyzer_.set_defines(config_.design.define);
                     { auto vcode = load_vcode(root_, config_);
-                      analyzer_.set_include_dirs(vcode.include_dirs);
-                      analyzer_.set_extra_files(vcode.files, resolve_vcode_path(root_, config_)); }
+                      analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
+                                                   vcode.files, resolve_vcode_path(root_, config_)); }
                     configure_background_compiler();
                 }
             }

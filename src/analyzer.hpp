@@ -131,6 +131,20 @@ class Analyzer {
     void set_extra_files(const std::vector<std::string>& paths,
                          const std::string& filelist_path = {});
 
+    /// Apply all project-parse inputs from one loaded configuration in a single
+    /// analyzer transaction.
+    ///
+    /// This is preferred by the LSP server when loading or reloading
+    /// lazyverilog.toml because defines, include directories, and filelist
+    /// entries all affect project shards.  Updating them independently can
+    /// schedule multiple full-project background reindex generations for a
+    /// single user-visible config change.  This batched setter clears the old
+    /// project cache once and schedules at most one asynchronous reindex.
+    void set_project_config(const std::vector<std::string>& defines,
+                            const std::vector<std::string>& include_dirs,
+                            const std::vector<std::string>& extra_files,
+                            const std::string& filelist_path = {});
+
     /// Block until all currently queued project-index work is published.
     ///
     /// Production LSP request paths should not call this: project files are

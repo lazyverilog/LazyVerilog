@@ -1270,3 +1270,10 @@ SyntaxIndex build_dynamic_file_index(const DocumentState& state) {
     // (MacroEntry), so do not add references a second time here.
     return index;
 }
+
+const SyntaxIndex& get_dynamic_index(const DocumentState& state) {
+    std::call_once(state.dynamic_index_once_, [&state] {
+        state.dynamic_index_cache_ = build_dynamic_file_index(state);
+    });
+    return state.dynamic_index_cache_;
+}

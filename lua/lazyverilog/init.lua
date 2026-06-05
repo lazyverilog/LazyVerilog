@@ -313,6 +313,19 @@ function M.setup(user_config)
 		desc     = "Sync RtlTree highlight with current buffer",
 	})
 
+	-- Notify the server when the project config is saved from Neovim.  The LSP
+	-- module also installs a libuv watcher for external mtime/content changes,
+	-- but this BufWritePost path is a useful fallback on platforms/filesystems
+	-- where file watching is unavailable or coalesced away.
+	vim.api.nvim_create_autocmd("BufWritePost", {
+		group    = "LazyVerilog",
+		pattern  = "lazyverilog.toml",
+		callback = function(ev)
+			lsp.notify_config_changed_for_path(ev.file, "lazyverilog.toml saved")
+		end,
+		desc     = "Notify LazyVerilog LSP after lazyverilog.toml changes",
+	})
+
 	-- Register :Interface <inst> or :Interface <inst1> <inst2> user command.
 	--
 	-- Use `nargs = "*"` instead of `"+"` so Neovim dispatches zero-argument

@@ -36,3 +36,12 @@ SyntaxIndex build_current_ast_structural_index(const DocumentState& state);
 /// and returns a const reference to the cached result on every subsequent call.
 /// Thread-safe: concurrent callers block until the first computation completes.
 const SyntaxIndex& get_structural_index(const DocumentState& state);
+
+/// Cached variant of build_dynamic_file_index.
+///
+/// Computes the full dynamic/open-buffer shard once per immutable DocumentState
+/// snapshot and returns a const reference thereafter.  Use this on request paths
+/// that need index-shaped facts for open files other than the current cursor
+/// query.  Because didChange replaces DocumentState rather than mutating it, the
+/// cache is naturally invalidated by snapshot replacement.
+const SyntaxIndex& get_dynamic_index(const DocumentState& state);

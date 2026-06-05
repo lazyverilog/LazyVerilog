@@ -38,19 +38,20 @@ parsed as independent extra files.
 
 ## Startup and config reload
 
-On startup, initialization with a workspace root, or `workspace/didChangeConfiguration`,
-the server:
+On startup, initialization with a workspace root, or
+`workspace/didChangeConfiguration`, the server:
 
 1. reads `lazyverilog.toml`
 2. resolves `[design].vcode` relative to the config root
 3. reads the filelist source paths and `+incdir+` entries
-4. calls `Analyzer::set_include_dirs(...)`
-5. calls `Analyzer::set_extra_files(...)`
+4. applies defines, include directories, and filelist entries with one
+   `Analyzer::set_project_config(...)` transaction
 
-`Analyzer::set_extra_files(...)` stores the normalized file path list, clears the
-old extra-file cache, clears the old merged project-index snapshot, and schedules
-background indexing. It does **not** synchronously parse the full filelist on the
-LSP request/configuration path.
+`Analyzer::set_project_config(...)` stores the normalized parse inputs, clears
+the old extra-file cache, clears the old merged project-index snapshot, and
+schedules at most one asynchronous background reindex for that config load.  It
+does **not** synchronously parse the full filelist on the LSP request or
+configuration path.
 
 ## Background project indexing
 
@@ -83,17 +84,23 @@ Consequences:
 - Cross-file features may be temporarily incomplete until the background indexer
   publishes enough shards.
 - Disk-only edits to closed listed files are not noticed automatically during a
-  session. Reload configuration or restart the server to rebuild from disk, or
-  open the changed file so its live buffer shard replaces the cached shard.
+  session unless the client sends `workspace/didChangeConfiguration` after the
+  config/filelist change, or the file is opened so its live buffer shard replaces
+  the cached shard.
 
 ## Invalidation and freshness
 
 The extra-file cache is cleared and rebuilt asynchronously when:
 
-- configuration reload calls `set_extra_files(...)`
+- configuration reload calls `set_project_config(...)`
 - preprocessor defines change via `Analyzer::set_defines(...)`
 - include directories change via `Analyzer::set_include_dirs(...)`
 - the server restarts
+
+The server uses `set_project_config(...)` for user-facing startup/root-discovery
+and `workspace/didChangeConfiguration` paths so one config reload produces one
+project reindex generation instead of separate generations for defines, include
+directories, and filelist entries.
 
 For listed files that are open in the editor, `didOpen` / `didChange` update the
 cached shard from unsaved in-memory text. The expensive AST-derived shard build is

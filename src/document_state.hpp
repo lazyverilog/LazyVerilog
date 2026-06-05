@@ -45,6 +45,27 @@ struct DocumentState {
     // mutable so const DocumentState& callers can warm it without a full index rebuild.
     mutable std::once_flag structural_index_once_;
     mutable SyntaxIndex structural_index_cache_;
+    // Lazy dynamic/open-buffer index cache — populated on first call to
+    // get_dynamic_index().
+    //
+    // This is intentionally separate from the structural cache above:
+    //
+    //   structural index:
+    //       module/interface/package declarations, instances, ports, values,
+    //       references, and other broad syntax facts derived from the live AST.
+    //
+    //   dynamic index:
+    //       structural index plus open-buffer-only project facts such as imports
+    //       and macro completion metadata.
+    //
+    // Completion, code actions, and other request handlers often need the
+    // dynamic shards for "other open files".  Without this per-snapshot cache,
+    // each request copies the structural shard and re-walks imports/macros for
+    // every open buffer.  DocumentState is immutable and didChange replaces the
+    // whole instance, so this cache needs no explicit invalidation: a new edit
+    // gets a new DocumentState and therefore a fresh once_flag/cache pair.
+    mutable std::once_flag dynamic_index_once_;
+    mutable SyntaxIndex dynamic_index_cache_;
     // Compilation is optional — only present when background_compilation=true
     std::optional<std::shared_ptr<slang::ast::Compilation>> compilation;
     std::string tree_filename{"buffer.sv"};
