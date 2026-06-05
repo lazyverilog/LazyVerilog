@@ -58,6 +58,12 @@ std::pair<int, int> token_pos(const slang::SourceManager& sm,
     return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
 }
 
+std::pair<int, int> token_pos0(const slang::SourceManager& sm,
+                               const slang::parsing::Token& token) {
+    auto [line, col] = token_pos(sm, token);
+    return {line > 0 ? line - 1 : -1, col};
+}
+
 std::string path_to_uri_for_dynamic_index(const std::filesystem::path& path) {
     return "file://" + std::filesystem::absolute(path).lexically_normal().string();
 }
@@ -106,6 +112,38 @@ SourceFileID location_file_id_for_dynamic_index(SyntaxIndex& index, const slang:
     if (uri.empty())
         return kInvalidSourceFileID;
     return index.intern_source_file(std::move(uri));
+}
+
+void fill_module_edit_ranges(ModuleEntry& module, const ModuleHeaderSyntax& header,
+                             const slang::SourceManager& sm) {
+    auto [semi_line, semi_col] = token_pos0(sm, header.semi);
+    module.header_semi_line = semi_line;
+    module.header_semi_col = semi_col;
+
+    if (!header.ports)
+        return;
+
+    module.has_port_list = true;
+    module.ansi_port_list = header.ports->kind == SyntaxKind::AnsiPortList;
+
+    slang::parsing::Token close;
+    if (const auto* ansi = header.ports->as_if<AnsiPortListSyntax>()) {
+        module.port_list_has_ports = !ansi->ports.empty();
+        close = ansi->closeParen;
+    } else if (const auto* non_ansi = header.ports->as_if<NonAnsiPortListSyntax>()) {
+        module.port_list_has_ports = !non_ansi->ports.empty();
+        close = non_ansi->closeParen;
+    } else if (const auto* wildcard = header.ports->as_if<WildcardPortListSyntax>()) {
+        module.port_list_has_ports = true;
+        close = wildcard->closeParen;
+    } else {
+        module.port_list_has_ports = true;
+        close = header.ports->getLastToken();
+    }
+
+    auto [close_line, close_col] = token_pos0(sm, close);
+    module.port_list_close_line = close_line;
+    module.port_list_close_col = close_col;
 }
 
 std::string symbol_canonical(std::string kind, std::string scope, std::string name) {
@@ -409,6 +447,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
     auto [line, col] = token_pos(sm, node.header->name);
     module.line = line;
     module.col = col;
+    fill_module_edit_ranges(module, *node.header, sm);
 
     if (node.header->parameters) {
         for (const auto* base : node.header->parameters->declarations) {
@@ -505,6 +544,7 @@ void process_module_signature(const ModuleDeclarationSyntax& node, SyntaxIndex& 
     auto [line, col] = token_pos(sm, node.header->name);
     module.line = line;
     module.col = col;
+    fill_module_edit_ranges(module, *node.header, sm);
 
     if (node.header->parameters) {
         for (const auto* base : node.header->parameters->declarations) {

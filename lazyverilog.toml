@@ -11,6 +11,7 @@ log_timing = false              # emit [compilation] timing lines to the LSP log
 [lint]
 enable = true   # global kill-switch; false disables all lint rules
 
+
 [lint.naming]
 enable = true
 severity = "hint"          # "warning" | "error" | "hint"
@@ -140,12 +141,13 @@ signal_min_width = 10
 [format.instance]
 align = true
 port_indent_level = 1                   # indent levels for port lines relative to instantiation
-instance_port_name_width = 10           # total field width from '.' to '(' (port name + gap)
-instance_port_between_paren_width = 10  # total field width from '(' to ')' (signal + trailing gap)
+instance_port_name_width = 20           # total field width from '.' to '(' (port name + gap)
+instance_port_between_paren_width = 30  # total field width from '(' to ')' (signal + trailing gap)
 align_adaptive = true                  # if true, per-line gap; if false, all ports in instance align to common column
 
+
 [inlay_hint]
-enable = true  # set false to disable all inlay hints
+enable = false  # set false to disable all inlay hints
 
 [autoff]
 register_pattern = "^r_"  # regex — signal matching this is the register (dst); the other is the source

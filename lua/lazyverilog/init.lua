@@ -1628,12 +1628,52 @@ local function _float_select(items, opts, callback)
 	hl()
 end
 
+local function _connect_force_insert(win)
+	local function enter()
+		if win and vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_set_current_win(win)
+			pcall(vim.cmd, "startinsert!")
+		end
+	end
+	-- Enter insert mode now, after the current scheduled callback, and once more
+	-- on a tiny timer.  Some prompt chains close the previous floating input and
+	-- call `stopinsert` while the next prompt is being created; the delayed call
+	-- makes the new prompt win that race.
+	enter()
+	vim.schedule(enter)
+	vim.defer_fn(enter, 20)
+end
+
 local function _float_input(opts, callback)
 	local prompt  = opts.prompt or "Input:"
 	local default = opts.default or ""
-	local width   = math.min(80, math.max(30, vim.o.columns - 40))
-	local row     = math.floor((vim.o.lines - 1) / 2)
+	local context = opts.context
+	local width   = math.min(90, math.max(30, vim.o.columns - 30))
+	local input_row = math.floor((vim.o.lines - 1) / 2)
+	if context and context ~= "" then input_row = input_row + 2 end
 	local col     = math.floor((vim.o.columns - width) / 2)
+
+	local context_buf, context_win
+	if context and context ~= "" then
+		context_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_buf_set_option(context_buf, "buftype", "nofile")
+		vim.api.nvim_buf_set_option(context_buf, "bufhidden", "wipe")
+		vim.api.nvim_buf_set_option(context_buf, "swapfile", false)
+		vim.api.nvim_buf_set_lines(context_buf, 0, -1, false, { "  " .. context })
+		vim.api.nvim_buf_set_option(context_buf, "modifiable", false)
+		context_win = vim.api.nvim_open_win(context_buf, false, {
+			relative = "editor",
+			row = input_row - 3,
+			col = col,
+			width = width,
+			height = 1,
+			style = "minimal",
+			border = "rounded",
+			title = " Connect route ",
+			title_pos = "center",
+		})
+	end
+
 	local buf     = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
 	vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
@@ -1641,7 +1681,7 @@ local function _float_input(opts, callback)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, { default })
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
-		row = row,
+		row = input_row,
 		col = col,
 		width = width,
 		height = 1,
@@ -1650,8 +1690,9 @@ local function _float_input(opts, callback)
 		title = " " .. prompt .. " ",
 		title_pos = "center",
 	})
-	vim.cmd("startinsert!")
+	_connect_force_insert(win)
 	local function close()
+		if context_win and vim.api.nvim_win_is_valid(context_win) then vim.api.nvim_win_close(context_win, true) end
 		if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
 	end
 	local ko = { noremap = true, silent = true, buffer = buf }
@@ -1667,6 +1708,177 @@ local function _float_input(opts, callback)
 		end, ko)
 	end
 	_ = win -- suppress unused warning
+end
+
+local function _fuzzy_match(needle, haystack)
+	needle = tostring(needle or ""):lower()
+	haystack = tostring(haystack or ""):lower()
+	if needle == "" then return true end
+	local pos = 1
+	for i = 1, #needle do
+		local ch = needle:sub(i, i)
+		pos = haystack:find(ch, pos, true)
+		if not pos then return false end
+		pos = pos + 1
+	end
+	return true
+end
+
+local function _float_port_input(opts, callback)
+	local prompt = opts.prompt or "Port:"
+	local default = opts.default or ""
+	local candidates = opts.candidates or {}
+	local candidate_set = {}
+	for _, name in ipairs(candidates) do
+		candidate_set[tostring(name)] = true
+	end
+
+	local width = math.min(90, math.max(40, vim.o.columns - 30))
+	local context = opts.context
+	local list_height = math.min(12, math.max(5, #candidates + 2))
+	local route_height = (context and context ~= "") and 3 or 0
+	local row = math.floor((vim.o.lines - list_height - route_height - 3) / 2)
+	local input_row = row + route_height
+	local col = math.floor((vim.o.columns - width) / 2)
+
+	local input_buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_option(input_buf, "buftype", "nofile")
+	vim.api.nvim_buf_set_option(input_buf, "bufhidden", "wipe")
+	vim.api.nvim_buf_set_option(input_buf, "swapfile", false)
+	vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { default })
+
+	local list_buf = vim.api.nvim_create_buf(false, true)
+	vim.api.nvim_buf_set_option(list_buf, "buftype", "nofile")
+	vim.api.nvim_buf_set_option(list_buf, "bufhidden", "wipe")
+	vim.api.nvim_buf_set_option(list_buf, "swapfile", false)
+	vim.api.nvim_buf_set_option(list_buf, "modifiable", true)
+
+	local context_buf, context_win
+	if context and context ~= "" then
+		context_buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_buf_set_option(context_buf, "buftype", "nofile")
+		vim.api.nvim_buf_set_option(context_buf, "bufhidden", "wipe")
+		vim.api.nvim_buf_set_option(context_buf, "swapfile", false)
+		vim.api.nvim_buf_set_lines(context_buf, 0, -1, false, { "  " .. context })
+		vim.api.nvim_buf_set_option(context_buf, "modifiable", false)
+		context_win = vim.api.nvim_open_win(context_buf, false, {
+			relative = "editor",
+			row = row,
+			col = col,
+			width = width,
+			height = 1,
+			style = "minimal",
+			border = "rounded",
+			title = " Connect route ",
+			title_pos = "center",
+		})
+	end
+
+	local input_win = vim.api.nvim_open_win(input_buf, true, {
+		relative = "editor",
+		row = input_row,
+		col = col,
+		width = width,
+		height = 1,
+		style = "minimal",
+		border = "rounded",
+		title = " " .. prompt .. " ",
+		title_pos = "center",
+	})
+	local list_win = vim.api.nvim_open_win(list_buf, false, {
+		relative = "editor",
+		row = input_row + 3,
+		col = col,
+		width = width,
+		height = list_height,
+		style = "minimal",
+		border = "rounded",
+		title = " Port candidates ",
+		title_pos = "center",
+	})
+
+	local ns = vim.api.nvim_create_namespace("lazyverilog_port_picker")
+	local filtered = {}
+	local cur = 1
+	local closed = false
+
+	local function close()
+		if closed then return end
+		closed = true
+		if context_win and vim.api.nvim_win_is_valid(context_win) then vim.api.nvim_win_close(context_win, true) end
+		if vim.api.nvim_win_is_valid(input_win) then vim.api.nvim_win_close(input_win, true) end
+		if vim.api.nvim_win_is_valid(list_win) then vim.api.nvim_win_close(list_win, true) end
+	end
+
+	local function current_text()
+		if not vim.api.nvim_buf_is_valid(input_buf) then return "" end
+		return vim.api.nvim_buf_get_lines(input_buf, 0, 1, false)[1] or ""
+	end
+
+	local function render()
+		local text = current_text()
+		filtered = {}
+		for _, name in ipairs(candidates) do
+			if _fuzzy_match(text, name) then table.insert(filtered, name) end
+		end
+		if cur > #filtered then cur = math.max(1, #filtered) end
+		local lines = {}
+		table.insert(lines, "Type to fuzzy filter. <Tab>: highlighted existing port. <Enter>: typed/new port.")
+		local candidate_start = #lines + 1
+		if #filtered == 0 then
+			table.insert(lines, "  no existing port matches; <Enter> will add '" .. text .. "'")
+		else
+			for i, name in ipairs(filtered) do
+				local suffix = candidate_set[text] and name == text and "  [exact]" or ""
+				table.insert(lines, string.format(" %-3d %s%s", i, name, suffix))
+			end
+		end
+		vim.api.nvim_buf_set_option(list_buf, "modifiable", true)
+		vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
+		vim.api.nvim_buf_clear_namespace(list_buf, ns, 0, -1)
+		vim.api.nvim_buf_add_highlight(list_buf, ns, "Comment", 0, 0, -1)
+		if #filtered > 0 then
+			vim.api.nvim_buf_add_highlight(list_buf, ns, "CursorLine", candidate_start + cur - 2, 0, -1)
+		end
+		vim.api.nvim_buf_set_option(list_buf, "modifiable", false)
+	end
+
+	local function finish(value)
+		close(); vim.cmd("stopinsert")
+		vim.schedule(function() callback(value) end)
+	end
+
+	local function accept_typed()
+		local text = vim.trim(current_text())
+		if text == "" then finish(nil); return end
+		-- Exact existing port names are reused.  Any other typed name is passed to
+		-- the server as a new boundary port to add to the module header.
+		finish(text)
+	end
+
+	local function accept_highlighted()
+		if #filtered == 0 then accept_typed(); return end
+		finish(filtered[cur])
+	end
+
+	local ko = { noremap = true, silent = true, buffer = input_buf }
+	vim.keymap.set("i", "<CR>", accept_typed, ko)
+	vim.keymap.set("i", "<Tab>", accept_highlighted, ko)
+	vim.keymap.set("i", "<Down>", function()
+		if #filtered > 0 then cur = math.min(cur + 1, #filtered); render() end
+	end, ko)
+	vim.keymap.set("i", "<Up>", function()
+		if #filtered > 0 then cur = math.max(cur - 1, 1); render() end
+	end, ko)
+	vim.keymap.set({ "i", "n" }, "<Esc>", function() finish(nil) end, ko)
+	vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
+		buffer = input_buf,
+		callback = function() cur = 1; render() end,
+	})
+	render()
+	_connect_force_insert(input_win)
+	_ = input_win
+	_ = list_win
 end
 
 local function _connect_show_preview(preview, callback)
@@ -1792,13 +2004,45 @@ local function _connect_suggest_port(base_port, boundary_path)
 	return tostring(base_port or "sig") .. "_" .. inst
 end
 
+
+local function _connect_path_to_module_map(mods)
+	local path_to_module = {}
+	for module_name, mod in pairs(mods or {}) do
+		for _, inst in ipairs(mod.instances or {}) do
+			if inst.hierarchical_path then
+				path_to_module[inst.hierarchical_path] = module_name
+			end
+		end
+	end
+	return path_to_module
+end
+
+local function _connect_port_candidates(mods, path_to_module, boundary_path, direction)
+	local module_name = path_to_module[boundary_path]
+	local mod = module_name and mods[module_name] or nil
+	local names = {}
+	if not mod then return names, module_name end
+	for _, port in ipairs(mod.ports or {}) do
+		if not direction or port.direction == direction then
+			table.insert(names, port.name)
+		end
+	end
+	table.sort(names)
+	return names, module_name
+end
+
 local function _connect_prompt_boundary_ports(requests, idx, acc, callback)
 	if idx > #requests then
 		callback(acc)
 		return
 	end
 	local req = requests[idx]
-	_float_input({ prompt = req.prompt, default = req.default }, function(name)
+	_float_port_input({
+		prompt = req.prompt,
+		default = req.default,
+		candidates = req.candidates or {},
+		context = req.context,
+	}, function(name)
 		if not name then
 			callback(nil)
 			return
@@ -1858,6 +2102,7 @@ function M.connect(module1, module2)
 
 			local mod1 = mods[module1]
 			local mod2 = mods[module2]
+			local path_to_module = _connect_path_to_module_map(mods)
 
 			vim.schedule(function()
 				-- Step 1: pick inst1
@@ -1875,18 +2120,21 @@ function M.connect(module1, module2)
 				}, function(inst1)
 					if not inst1 then return end
 
-					-- Step 2: pick output port
-					local out_ports = vim.tbl_filter(
-						function(p) return p.direction == "output" end, mod1.ports or {})
-					if #out_ports == 0 then
-						vim.notify("[LazyVerilog] Connect: no output ports on " .. module1,
-							vim.log.levels.ERROR); return
+					-- Step 2: pick or type the source leaf output port.  If the
+					-- typed name is not in the existing output-port list, the server
+					-- will add it to the leaf module header before wiring the instance.
+					local out_port_names = {}
+					for _, p in ipairs(mod1.ports or {}) do
+						if p.direction == "output" then table.insert(out_port_names, p.name) end
 					end
-					_float_select(out_ports, {
-						prompt      = "Select output port of " .. module1 .. ":",
-						format_item = function(p) return p.name .. "  [" .. p.type_str .. "]" end,
-					}, function(port1)
-						if not port1 then return end
+					table.sort(out_port_names)
+					_float_port_input({
+						prompt = "Source output port of " .. module1 .. ":",
+						default = "",
+						candidates = out_port_names,
+					}, function(port1_name)
+						if not port1_name then return end
+						local port1 = { name = port1_name }
 
 						-- Step 3: pick inst2
 						local insts2 = mod2.instances or {}
@@ -1905,27 +2153,24 @@ function M.connect(module1, module2)
 						}, function(inst2)
 							if not inst2 then return end
 
-							-- Step 4: pick input port
-							local in_ports = vim.tbl_filter(
-								function(p) return p.direction == "input" end,
-								mod2.ports or {})
-							if #in_ports == 0 then
-								vim.notify(
-									"[LazyVerilog] Connect: no input ports on " ..
-									module2,
-									vim.log.levels.ERROR); return
+							-- Step 4: pick or type the destination leaf input port.
+							local in_port_names = {}
+							for _, p in ipairs(mod2.ports or {}) do
+								if p.direction == "input" then table.insert(in_port_names, p.name) end
 							end
-							_float_select(in_ports, {
-								prompt      = "Select input port of " .. module2 .. ":",
-								format_item = function(p)
-									return p.name ..
-									    "  [" .. p.type_str .. "]"
-								end,
-							}, function(port2)
-								if not port2 then return end
+							table.sort(in_port_names)
+							_float_port_input({
+								prompt = "Destination input port of " .. module2 .. ":",
+								default = "",
+								candidates = in_port_names,
+							}, function(port2_name)
+								if not port2_name then return end
+								local port2 = { name = port2_name }
+								local connect_route = inst1.hierarchical_path .. "." .. port1.name ..
+								    " -> " .. inst2.hierarchical_path .. "." .. port2.name
 
 								-- Step 5: wire name
-								_float_input({ prompt = "Wire name:" },
+								_float_input({ prompt = "Wire name at common root:", context = connect_route },
 									function(wire_name)
 										if not wire_name then return end
 
@@ -1934,16 +2179,26 @@ function M.connect(module1, module2)
 											    _connect_boundary_paths(inst1.hierarchical_path, inst2.hierarchical_path)
 											local source_requests = {}
 											for _, path in ipairs(source_boundary_paths) do
+												local candidates, boundary_module = _connect_port_candidates(mods, path_to_module, path, "output")
 												table.insert(source_requests, {
-													prompt = "Output port on " .. path .. " to export " .. port1.name .. ":",
-													default = _connect_suggest_port(port1.name, path),
+													prompt = "Output port on " .. path ..
+													    (boundary_module and (" [" .. boundary_module .. "]") or "") ..
+													    " to export " .. port1.name .. ":",
+													default = "",
+													candidates = candidates,
+													context = connect_route,
 												})
 											end
 											local dest_requests = {}
 											for _, path in ipairs(dest_boundary_paths) do
+												local candidates, boundary_module = _connect_port_candidates(mods, path_to_module, path, "input")
 												table.insert(dest_requests, {
-													prompt = "Input port on " .. path .. " to import " .. port2.name .. ":",
-													default = _connect_suggest_port(port2.name, path),
+													prompt = "Input port on " .. path ..
+													    (boundary_module and (" [" .. boundary_module .. "]") or "") ..
+													    " to import " .. port2.name .. ":",
+													default = "",
+													candidates = candidates,
+													context = connect_route,
 												})
 											end
 

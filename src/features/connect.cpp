@@ -23,7 +23,13 @@ namespace {
 
 struct FileView {
     std::string uri;
-    std::string text;
+    std::string path;
+    // Text is present immediately for open buffers because it can include
+    // unsaved edits.  For closed project files it starts empty and is filled
+    // lazily only when Connect must compute a TextEdit in that exact file.
+    // This avoids reading every .f entry on ConnectInfo/preview/apply requests.
+    mutable std::string text;
+    mutable bool text_loaded{false};
     SyntaxIndex index;
     // Non-null only for open/current buffers.  Per project architecture, these
     // live SyntaxTree snapshots are authoritative for edit-local facts such as
@@ -119,6 +125,14 @@ static std::string read_file_text_best_effort(const std::string& path) {
     return ss.str();
 }
 
+static const std::string& file_text(const FileView& file) {
+    if (!file.text_loaded) {
+        file.text = read_file_text_best_effort(file.path);
+        file.text_loaded = true;
+    }
+    return file.text;
+}
+
 static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::string& uri) {
     std::vector<FileView> files;
     std::unordered_set<std::string> seen;
@@ -130,30 +144,48 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{state_uri, state->text, get_structural_index(*state), state});
+        files.push_back(FileView{.uri = state_uri,
+                                 .path = {},
+                                 .text = state->text,
+                                 .text_loaded = true,
+                                 .index = get_structural_index(*state),
+                                 .state = state});
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
     // file is also open, skip it so the open-buffer version wins.  Closed
-    // project files remain index-authoritative structurally, but Connect may
-    // need their source text to produce WorkspaceEdits.  Read text lazily from
-    // disk here without retaining a closed-file AST.
+    // project files remain index-authoritative structurally.  Keep only their
+    // path here; edit helpers call file_text() lazily for the small subset of
+    // closed files that actually receive WorkspaceEdits.
     for (const auto& extra : analyzer.extra_file_snapshots()) {
         if (!seen.insert(extra.uri).second)
             continue;
         if (extra.state) {
-            files.push_back(FileView{extra.uri, extra.state->text,
-                                     get_structural_index(*extra.state), extra.state});
+            files.push_back(FileView{.uri = extra.uri,
+                                     .path = extra.path,
+                                     .text = extra.state->text,
+                                     .text_loaded = true,
+                                     .index = get_structural_index(*extra.state),
+                                     .state = extra.state});
         } else {
-            files.push_back(FileView{extra.uri, read_file_text_best_effort(extra.path),
-                                     extra.index, nullptr});
+            files.push_back(FileView{.uri = extra.uri,
+                                     .path = extra.path,
+                                     .text = {},
+                                     .text_loaded = false,
+                                     .index = extra.index,
+                                     .state = nullptr});
         }
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{uri, state->text, get_structural_index(*state), state});
+            files.push_back(FileView{.uri = uri,
+                                     .path = {},
+                                     .text = state->text,
+                                     .text_loaded = true,
+                                     .index = get_structural_index(*state),
+                                     .state = state});
     }
     return files;
 }
@@ -227,6 +259,106 @@ build_hierarchy(const std::vector<FileView>& files) {
     return resolved;
 }
 
+
+struct DesignLookup {
+    std::unordered_map<std::string, const FileView*> module_file_by_name;
+    std::unordered_map<std::string, const ModuleEntry*> module_by_name;
+};
+
+static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
+    DesignLookup lookup;
+    for (const auto& file : files) {
+        for (const auto& module : file.index.modules) {
+            // First definition wins, matching find_module().  Open buffers are
+            // collected before filelist shards, so unsaved current text remains
+            // authoritative when a file also appears in the project filelist.
+            lookup.module_file_by_name.emplace(module.name, &file);
+            lookup.module_by_name.emplace(module.name, &module);
+        }
+        // Do not pre-group every instance in the project here.  Connect
+        // preview/apply resolves only the requested source/destination routes,
+        // so instance scans are deferred to the file that owns the current
+        // parent module at each hierarchy step.
+    }
+    return lookup;
+}
+
+static std::vector<std::string> split_hier_path(const std::string& path) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '.')) {
+        if (!part.empty())
+            parts.push_back(part);
+    }
+    return parts;
+}
+
+static std::optional<std::vector<ResolvedInst>> resolve_instance_route(
+    const DesignLookup& lookup, const std::string& hierarchical_inst_path, std::string& error) {
+    const auto parts = split_hier_path(hierarchical_inst_path);
+    if (parts.size() < 2) {
+        error = "instance '" + hierarchical_inst_path + "' not found";
+        return std::nullopt;
+    }
+
+    const std::string root_module = parts.front();
+    if (!lookup.module_by_name.contains(root_module)) {
+        error = "root module '" + root_module + "' not found";
+        return std::nullopt;
+    }
+
+    std::vector<ResolvedInst> route;
+    std::string parent_path = root_module;
+    std::string parent_module = root_module;
+    for (size_t i = 1; i < parts.size(); ++i) {
+        const auto module_file_it = lookup.module_file_by_name.find(parent_module);
+        if (module_file_it == lookup.module_file_by_name.end()) {
+            error = "module '" + parent_module + "' not found";
+            return std::nullopt;
+        }
+
+        // Route-local hierarchy construction: inspect only the indexed file
+        // that owns the current parent module, find the requested child
+        // instance, then jump to that child module for the next segment.
+        // This avoids building `top.*` paths for unrelated branches.
+        const FileView* inst_file = module_file_it->second;
+        const InstanceEntry* inst_entry = nullptr;
+        for (const auto& inst : inst_file->index.instances) {
+            if (inst.parent_module == parent_module && inst.instance_name == parts[i]) {
+                inst_entry = &inst;
+                break;
+            }
+        }
+        if (!inst_entry) {
+            error = "instance '" + hierarchical_inst_path + "' not found";
+            return std::nullopt;
+        }
+
+        const std::string child_path = parent_path + "." + inst_entry->instance_name;
+        route.push_back(ResolvedInst{.path = child_path,
+                                     .inst_name = inst_entry->instance_name,
+                                     .module_name = inst_entry->module_name,
+                                     .parent_path = parent_path,
+                                     .parent_module = parent_module,
+                                     .file_uri = inst_file->uri,
+                                     .entry = *inst_entry});
+        parent_path = child_path;
+        parent_module = inst_entry->module_name;
+    }
+    return route;
+}
+
+static std::unordered_map<std::string, ResolvedInst> route_hierarchy_map(
+    const std::vector<ResolvedInst>& source_route, const std::vector<ResolvedInst>& dest_route) {
+    std::unordered_map<std::string, ResolvedInst> hierarchy;
+    for (const auto& inst : source_route)
+        hierarchy.emplace(inst.path, inst);
+    for (const auto& inst : dest_route)
+        hierarchy.emplace(inst.path, inst);
+    return hierarchy;
+}
+
 static std::optional<PortEntry> port_on_module(const std::vector<FileView>& files,
                                                const std::string& module_name,
                                                const std::string& port_name) {
@@ -271,6 +403,24 @@ static std::pair<int, int> offset_to_pos(const std::string& text, size_t off) {
         }
     }
     return {line, col};
+}
+
+static size_t offset_from_position(const std::string& text, int line, int col) {
+    line = std::max(line, 0);
+    col = std::max(col, 0);
+
+    size_t offset = 0;
+    int current_line = 0;
+    while (offset < text.size() && current_line < line) {
+        if (text[offset] == '\n')
+            ++current_line;
+        ++offset;
+    }
+
+    size_t line_end = offset;
+    while (line_end < text.size() && text[line_end] != '\n')
+        ++line_end;
+    return std::min(offset + static_cast<size_t>(col), line_end);
 }
 
 static bool syntax_fragment_edge_is_wordlike(char c) {
@@ -471,17 +621,28 @@ static int wire_insert_line(const FileView& file, const std::string& module_name
         return last_decl_line + 1;
 
     for (const auto& value : file.index.values) {
-        if ((module_name.empty() || value.parent_scope == module_name) && value.line > 0)
+        // SyntaxIndex.values also contains ports and parameter-port-list
+        // entries.  Those are not valid anchors for inserting an internal
+        // bridge wire: with an ANSI header they can be physically inside the
+        // module header, causing the wire to be inserted into the port list.
+        // Only real module-item declarations should move the insertion point
+        // past the header fallback.
+        if ((value.kind == "variable" || value.kind == "net") &&
+            (module_name.empty() || value.parent_scope == module_name) && value.line > 0)
             last_decl_line = std::max(last_decl_line, value.line - 1);
     }
     if (last_decl_line >= 0)
         return last_decl_line + 1;
 
-    auto lines = split_lines(file.text);
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-        if (lines[i].find(");") != std::string::npos)
-            return i + 1;
+    // No existing declarations in this module. Insert immediately after this
+    // module's header semicolon using the AST/SyntaxIndex-derived edit range.
+    auto mod_it = file.index.module_by_name.find(module_name);
+    if (mod_it != file.index.module_by_name.end()) {
+        const auto& module = file.index.modules[mod_it->second];
+        if (module.header_semi_line >= 0)
+            return module.header_semi_line + 1;
     }
+
     return 0;
 }
 
@@ -508,7 +669,7 @@ static std::optional<TextEdit> declaration_delete_edit(const FileView& file,
         if (decl.name != signal_name || decl.declarator_count != 1)
             continue;
 
-        auto lines = split_lines(file.text);
+        auto lines = split_lines(file_text(file));
         if (decl.start_line >= 0 && decl.start_line < static_cast<int>(lines.size())) {
             const auto prefix = lines[decl.start_line].substr(0, std::min<size_t>(decl.start_col, lines[decl.start_line].size()));
             if (trim(prefix).empty() && decl.end_line == decl.start_line) {
@@ -526,7 +687,7 @@ static std::optional<TextEdit> replace_or_add_connection(const FileView& file,
                                                          const std::string& signal,
                                                          const std::string& old_signal = {},
                                                          bool add_if_missing = true) {
-    auto lines = split_lines(file.text);
+    auto lines = split_lines(file_text(file));
     const int start = std::max(inst.start_line, 0);
     const int end = std::min(inst.end_line, static_cast<int>(lines.size()) - 1);
 
@@ -606,7 +767,7 @@ static std::optional<TextEdit> replace_or_add_connections(const FileView& file,
     if (desired.empty())
         return std::nullopt;
 
-    auto lines = split_lines(file.text);
+    auto lines = split_lines(file_text(file));
     if (lines.empty())
         return std::nullopt;
     const int start = std::max(inst.start_line, 0);
@@ -749,37 +910,138 @@ static std::optional<TextEdit> add_wire_decl(const FileView& file, const std::st
     return TextEdit{file.uri, line, 0, line, 0, type_for_decl(type) + " " + name + ";\n"};
 }
 
-static std::optional<TextEdit> add_module_port(const FileView& file, const std::string& module_name,
-                                               const std::string& direction,
-                                               const std::string& type,
-                                               const std::string& port_name) {
-    const auto module_pos = file.text.find("module " + module_name);
-    if (module_pos == std::string::npos)
-        return std::nullopt;
-    const auto semi = file.text.find(';', module_pos);
-    if (semi == std::string::npos)
-        return std::nullopt;
-    const auto close = file.text.rfind(')', semi);
-    auto lines = split_lines(file.text);
+struct ModulePortAddition {
+    std::string direction;
+    std::string type;
+    std::string name;
+};
+
+static std::vector<TextEdit> add_module_ports(const FileView& file, const std::string& module_name,
+                                              const std::vector<ModulePortAddition>& ports) {
+    if (ports.empty())
+        return {};
+    auto mod_it = file.index.module_by_name.find(module_name);
+    if (mod_it == file.index.module_by_name.end())
+        return {};
+    const auto& module = file.index.modules[mod_it->second];
+    if (module.header_semi_line < 0 || module.header_semi_col < 0)
+        return {};
+
+    auto lines = split_lines(file_text(file));
     std::string indent = "    ";
-    if (close == std::string::npos || close < module_pos) {
-        // Module has no ANSI port list yet. Convert `module child;` to an ANSI
-        // header that carries the new boundary port.
-        auto [line, col] = offset_to_pos(file.text, semi);
-        return TextEdit{file.uri, line, col, line, col,
-                        "(\n" + indent + direction + " " + type_for_decl(type) + " " +
-                            port_name + "\n)"};
+    const auto& text = file_text(file);
+    const int header_start_line = std::max(module.line - 1, 0);
+    const int header_start_col = std::max(module.col, 0);
+
+    if (!module.has_port_list) {
+        // Module has no port list yet. Replace the complete module header with
+        // a complete generated header instead of inserting a raw fragment.
+        // Keeping the replacement self-contained also avoids overlapping edits
+        // when multiple ports are added to the same module header.
+        const size_t header_start = offset_from_position(text, header_start_line, header_start_col);
+        const size_t header_end = offset_from_position(text, module.header_semi_line,
+                                                       module.header_semi_col + 1);
+        if (header_start > header_end || header_end > text.size())
+            return {};
+        std::string header = text.substr(header_start, header_end - header_start);
+        const auto semi = header.rfind(';');
+        if (semi == std::string::npos)
+            return {};
+        std::string generated = "(\n";
+        for (size_t i = 0; i < ports.size(); ++i) {
+            generated += indent + ports[i].direction + " " + type_for_decl(ports[i].type) +
+                         " " + ports[i].name;
+            if (i + 1 < ports.size())
+                generated += ",";
+            generated += "\n";
+        }
+        generated += ")";
+        header.insert(semi, generated);
+        return {TextEdit{file.uri, header_start_line, header_start_col,
+                         module.header_semi_line, module.header_semi_col + 1,
+                         header}};
     }
-    auto [line, col] = offset_to_pos(file.text, close);
+
+    if (module.port_list_close_line < 0 || module.port_list_close_col < 0)
+        return {};
+
+    const int line = module.port_list_close_line;
+    const int col = module.port_list_close_col;
     for (int i = line; i >= 0; --i) {
+        if (i >= static_cast<int>(lines.size()))
+            continue;
         if (lines[i].find("input") != std::string::npos || lines[i].find("output") != std::string::npos ||
             lines[i].find("inout") != std::string::npos) {
             indent = lines[i].substr(0, lines[i].find_first_not_of(" \t"));
             break;
         }
     }
-    return TextEdit{file.uri, line, col, line, col,
-                    ",\n" + indent + direction + " " + type_for_decl(type) + " " + port_name};
+
+    auto replace_complete_header = [&](const std::string& insertion) -> std::vector<TextEdit> {
+        const size_t header_start = offset_from_position(text, header_start_line, header_start_col);
+        const size_t header_end = offset_from_position(text, module.header_semi_line,
+                                                       module.header_semi_col + 1);
+        const size_t close = offset_from_position(text, line, col);
+        if (header_start > header_end || close < header_start || close > header_end ||
+            header_end > text.size())
+            return {};
+        std::string header = text.substr(header_start, header_end - header_start);
+        header.insert(close - header_start, insertion);
+        return {TextEdit{file.uri, header_start_line, header_start_col,
+                         module.header_semi_line, module.header_semi_col + 1,
+                         header}};
+    };
+
+    if (module.ansi_port_list || !module.port_list_has_ports) {
+        // Existing ANSI style: keep direction/type in the module header.  The
+        // whole header replacement is still "generated code" for formatting
+        // purposes because Connect constructs this replacement text; unrelated
+        // module body/source remains untouched.
+        const std::string prefix = module.port_list_has_ports ? ",\n" : "\n";
+        std::string generated = prefix;
+        for (size_t i = 0; i < ports.size(); ++i) {
+            generated += indent + ports[i].direction + " " + type_for_decl(ports[i].type) +
+                         " " + ports[i].name;
+            if (i + 1 < ports.size())
+                generated += ",\n";
+        }
+        return replace_complete_header(generated);
+    }
+
+    // Existing non-ANSI style: add only the bare name to the header list, then
+    // add a separate port declaration after the module header semicolon.
+    std::string name_indent = indent;
+    for (int i = line; i >= 0; --i) {
+        if (i >= static_cast<int>(lines.size()))
+            continue;
+        const auto first = lines[i].find_first_not_of(" \t");
+        if (first != std::string::npos && lines[i].find("module") == std::string::npos) {
+            name_indent = lines[i].substr(0, first);
+            break;
+        }
+    }
+    std::string header_names = ",\n";
+    for (size_t i = 0; i < ports.size(); ++i) {
+        header_names += name_indent + ports[i].name;
+        if (i + 1 < ports.size())
+            header_names += ",\n";
+    }
+    auto edits = replace_complete_header(header_names);
+    if (edits.empty())
+        return {};
+    std::string declarations;
+    for (const auto& port : ports)
+        declarations += port.direction + " " + type_for_decl(port.type) + " " + port.name + ";\n";
+    edits.push_back(TextEdit{file.uri, module.header_semi_line + 1, 0,
+                             module.header_semi_line + 1, 0, declarations});
+    return edits;
+}
+
+static std::vector<TextEdit> add_module_port(const FileView& file, const std::string& module_name,
+                                             const std::string& direction,
+                                             const std::string& type,
+                                             const std::string& port_name) {
+    return add_module_ports(file, module_name, {{direction, type, port_name}});
 }
 
 static std::string workspace_edit_json(const std::vector<TextEdit>& edits) {
@@ -882,25 +1144,45 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
                                         const std::vector<std::string>& dest_boundary_ports = {}) {
     ConnectBuildResult r;
     auto files = collect_files(analyzer, uri);
-    auto hierarchy = build_hierarchy(files);
-    if (!hierarchy.contains(source_path)) {
-        r.error = "instance '" + source_path + "' not found";
+    const auto lookup = build_design_lookup(files);
+
+    // Preview/apply only needs the two requested instance routes.  Avoid
+    // expanding every possible hierarchical path in the project; resolving
+    // `top.u_a.u_leaf` is just a step-by-step walk through indexed instances:
+    // root module -> child instance -> child module -> ... .
+    auto source_route = resolve_instance_route(lookup, source_path, r.error);
+    if (!source_route)
         return r;
-    }
-    if (!hierarchy.contains(dest_path)) {
-        r.error = "instance '" + dest_path + "' not found";
+    auto dest_route = resolve_instance_route(lookup, dest_path, r.error);
+    if (!dest_route)
         return r;
-    }
+    auto hierarchy = route_hierarchy_map(*source_route, *dest_route);
+
     const auto& src = hierarchy.at(source_path);
     const auto& dst = hierarchy.at(dest_path);
     auto sp = port_on_module(files, src.module_name, source_port);
     auto dp = port_on_module(files, dst.module_name, dest_port);
-    if (!sp) { r.error = "port '" + source_port + "' not found"; return r; }
-    if (!dp) { r.error = "port '" + dest_port + "' not found"; return r; }
-    if (sp->direction != "output") { r.error = "port '" + source_port + "' is not an output port"; return r; }
-    if (dp->direction != "input") { r.error = "port '" + dest_port + "' is not an input port"; return r; }
-    r.wire_type = signal_decl_type_for_port(*sp).empty() ? "logic" : signal_decl_type_for_port(*sp);
-    if (decl_type_for_port(*sp) != decl_type_for_port(*dp))
+    if (sp && sp->direction != "output") {
+        r.error = "port '" + source_port + "' is not an output port";
+        return r;
+    }
+    if (dp && dp->direction != "input") {
+        r.error = "port '" + dest_port + "' is not an input port";
+        return r;
+    }
+
+    // Leaf ports can be typed as new names from the UI.  Existing source
+    // output type is best; otherwise use an existing destination input type if
+    // present, and fall back to a scalar logic declaration for entirely new
+    // leaf-to-leaf connections.
+    if (sp)
+        r.wire_type = signal_decl_type_for_port(*sp).empty() ? "logic" : signal_decl_type_for_port(*sp);
+    else if (dp)
+        r.wire_type = signal_decl_type_for_port(*dp).empty() ? "logic" : signal_decl_type_for_port(*dp);
+    else
+        r.wire_type = "logic";
+
+    if (sp && dp && decl_type_for_port(*sp) != decl_type_for_port(*dp))
         r.warnings.push_back("type mismatch: source port '" + decl_type_for_port(*sp) + "' vs dest port '" + decl_type_for_port(*dp) + "' — using source type");
     const std::string lca = lca_path(source_path, dest_path);
     if (lca.empty()) { r.error = "no common ancestor found"; return r; }
@@ -956,6 +1238,14 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     std::vector<InstanceEditGroup> instance_edit_groups;
     std::unordered_map<std::string, size_t> instance_group_by_key;
 
+    struct PendingModulePortEdits {
+        const FileView* file{nullptr};
+        std::string module_name;
+        std::vector<ModulePortAddition> ports;
+    };
+    std::vector<PendingModulePortEdits> pending_module_ports;
+    std::unordered_map<std::string, size_t> pending_module_port_by_key;
+
     auto instance_group_key = [](const ResolvedInst& inst) {
         return inst.file_uri + "|" + inst.parent_module + "|" + inst.inst_name + "|" +
                std::to_string(inst.entry.start_line) + "|" + std::to_string(inst.entry.end_line);
@@ -980,6 +1270,26 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
                                         old && !old->signal_name.empty()});
     };
 
+    auto queue_module_port = [&](const FileView* module_file, const std::string& module_name,
+                                 const std::string& direction, const std::string& type,
+                                 const std::string& port_name, const std::string& preview_description) {
+        if (!module_file)
+            return;
+        const std::string key = module_file->uri + "|" + module_name;
+        auto [it, inserted] = pending_module_port_by_key.emplace(key, pending_module_ports.size());
+        if (inserted)
+            pending_module_ports.push_back(PendingModulePortEdits{.file = module_file,
+                                                                  .module_name = module_name});
+        auto& pending = pending_module_ports[it->second];
+        for (const auto& existing : pending.ports) {
+            if (existing.name == port_name)
+                return;
+        }
+        pending.ports.push_back(ModulePortAddition{direction, type, port_name});
+        r.preview.push_back(PreviewEdit{basename_from_uri(module_file->uri), 0,
+                                        preview_description, false});
+    };
+
     auto add_boundary_port = [&](const ResolvedInst& child_inst, const std::string& direction,
                                  const std::string& port_name) {
         const FileView* module_file = nullptr;
@@ -988,15 +1298,28 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
             return;
         if (module && module->port_by_name.contains(port_name))
             return;
-        if (auto edit = add_module_port(*module_file, child_inst.parent_module, direction,
-                                        r.wire_type, port_name)) {
-            r.preview.push_back(PreviewEdit{basename_from_uri(module_file->uri), edit->sl + 1,
-                                            "add " + direction + " " + r.wire_type + " " +
-                                                port_name + " to " + child_inst.parent_module,
-                                            false});
-            r.edits.push_back(*edit);
-        }
+        queue_module_port(module_file, child_inst.parent_module, direction, r.wire_type, port_name,
+                          "add " + direction + " " + r.wire_type + " " + port_name +
+                              " to " + child_inst.parent_module);
     };
+
+    auto add_leaf_port = [&](const ResolvedInst& leaf_inst, const std::string& leaf_module,
+                             const std::string& direction, const std::string& port_name) {
+        const FileView* module_file = nullptr;
+        const auto* module = find_module(files, leaf_module, &module_file);
+        if (!module_file)
+            return;
+        if (module && module->port_by_name.contains(port_name))
+            return;
+        queue_module_port(module_file, leaf_module, direction, r.wire_type, port_name,
+                          "add " + direction + " " + r.wire_type + " " + port_name +
+                              " to " + leaf_module + " for " + leaf_inst.path);
+    };
+
+    if (!sp)
+        add_leaf_port(src, src.module_name, "output", source_port);
+    if (!dp)
+        add_leaf_port(dst, dst.module_name, "input", dest_port);
 
     // Source side: export the selected leaf output upward through each ancestor
     // module port chosen by the user.  The final child-of-LCA instance connects
@@ -1021,6 +1344,13 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
         add_step(inst, inst_port, signal, i == 0);
         if (i + 1 < dest_steps.size())
             add_boundary_port(inst, "input", dest_boundary_ports[i]);
+    }
+
+    for (const auto& pending : pending_module_ports) {
+        if (!pending.file)
+            continue;
+        auto edits = add_module_ports(*pending.file, pending.module_name, pending.ports);
+        r.edits.insert(r.edits.end(), edits.begin(), edits.end());
     }
 
     for (const auto& group : instance_edit_groups) {

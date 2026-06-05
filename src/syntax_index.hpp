@@ -99,6 +99,18 @@ struct ModuleEntry {
     SourceFileID file_id{kInvalidSourceFileID};
     int line{0}; // 1-based, 0 if unknown
     int col{0};  // 0-based
+    // Edit-oriented source facts derived from the current-file AST or from a
+    // closed-file SyntaxIndex shard.  These are intentionally small ranges, not
+    // retained AST nodes, so cross-file edit features can follow the project
+    // model: current files use AST snapshots, closed project files use index
+    // facts.  Lines here are 0-based because they feed LSP TextEdit ranges.
+    int header_semi_line{-1};
+    int header_semi_col{-1};
+    bool has_port_list{false};
+    bool ansi_port_list{false};
+    bool port_list_has_ports{false};
+    int port_list_close_line{-1};
+    int port_list_close_col{-1};
     std::vector<PortEntry> ports;
     std::vector<ModportEntry> modports;
     std::unordered_map<std::string, size_t> port_by_name;
