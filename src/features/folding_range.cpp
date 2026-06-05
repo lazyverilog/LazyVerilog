@@ -326,6 +326,31 @@ struct DeclarationRunVisitor : public SyntaxVisitor<DeclarationRunVisitor> {
         visitDefault(node);
     }
 
+    void handle(const PortDeclarationSyntax& node) {
+        // Non-ANSI module/interface headers declare only port names in the
+        // header, then provide semicolon-terminated port declarations in the
+        // body-like declaration area:
+        //
+        //     module m(clk, rst_n, data);
+        //         input  logic       clk;
+        //         input  logic       rst_n;
+        //         output logic [7:0] data;
+        //     endmodule
+        //
+        // These are declarations just like consecutive internal variables and
+        // should participate in the same declaration-run folding.  Recording the
+        // parsed AST node avoids lexical guesses and also handles typed ports
+        // that use user-defined types:
+        //
+        //     output payload_t payload;
+        //
+        // ANSI header ports are parsed as header port syntax, not as these
+        // semicolon-terminated PortDeclarationSyntax members, so this does not
+        // create extra folds inside "(input ..., output ...)" headers.
+        record(node);
+        visitDefault(node);
+    }
+
     void handle(const LocalVariableDeclarationSyntax& node) {
         // Procedural / assertion-local declarations.  This also catches
         // user-defined local variables inside begin/end blocks.
@@ -1049,56 +1074,6 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
                     }),
         folds.end());
 
-    // Parameterized module headers create two useful child folds that meet at
-    // the ")(" boundary:
-    //
-    //     module m #(          // parameter-list fold starts at "#("
-    //         ...
-    //     )(                   // port-list fold starts at "("
-    //         ...
-    //     );
-    //
-    // The enclosing module fold also naturally starts on the `module` line.
-    // Some editors (notably common Neovim folding setups) expose only one fold
-    // operation per line and choose the larger range, so pressing fold on the
-    // `module ... #(` line collapses the whole module/header instead of the
-    // parameter list.  To make the fine-grained header fold reachable, shift
-    // only enclosing folds that start earlier on the same line than an adjacent
-    // parameter-list / port-list pair.  The whole module body remains foldable
-    // from the header terminator line.
-    //
-    // This is intentionally stricter than "any adjacent child ranges": the
-    // left child must start later on the same physical line, which matches
-    // `module m #(` and avoids rewriting ordinary nested block structures.
-    for (auto& outer : folds) {
-        if (outer.kind != "region")
-            continue;
-
-        bool shifted = false;
-        for (const auto& left : folds) {
-            if (left.kind != "region" ||
-                left.startLine != outer.startLine ||
-                left.startCharacter <= outer.startCharacter ||
-                left.endLine <= left.startLine ||
-                left.endLine >= outer.endLine)
-                continue;
-
-            for (const auto& right : folds) {
-                if (right.kind == "region" &&
-                    right.startLine == left.endLine &&
-                    right.endLine > right.startLine &&
-                    right.endLine < outer.endLine) {
-                    outer.startLine = right.endLine;
-                    outer.startCharacter = 0;
-                    shifted = true;
-                    break;
-                }
-            }
-            if (shifted)
-                break;
-        }
-    }
-
     // If the token pass and AST pass both found the same line range, prefer the
     // more precise AST delimiter columns over the token pass's line-indentation
     // columns.  This matters for parameterized module headers where a coarse
@@ -1170,13 +1145,16 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
     //     (...)   => [")(" line, ");" line]
     //     module  => [");" line, endmodule line]
     //
-    // But in Neovim those touching ranges become one continuous fold, so `zc`
-    // on the module header collapses the whole module instead of just the
-    // parameter list.  Make parameterized headers line-compatible by leaving the
+    // But in Neovim those touching child ranges become one continuous header
+    // fold.  Make parameterized header children line-compatible by leaving the
     // shared delimiter lines outside the child folds:
     //     #(...)  => [module line, line before ")("]
     //     (...)   => [line after ")(", line before ");"]
-    //     module  => still starts at the ");" line
+    //     module  => remains the full module [module line, endmodule line]
+    //
+    // Keeping the enclosing module as the full declaration is important for
+    // users who close a fold from inside the module body: that operation should
+    // collapse the whole module, not only the text after the port list.
     //
     // This is deliberately applied only to the distinctive header shape where a
     // region starts later on the same line as an enclosing region (the "#(" on a

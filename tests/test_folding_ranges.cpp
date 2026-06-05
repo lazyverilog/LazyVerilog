@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <fstream>
 #include <map>
-#include <sstream>
 #include <tuple>
 
 static FoldingRangeRequestParams make_params(const std::string& uri) {
@@ -48,33 +47,6 @@ static bool has_exact_duplicate_fold(const std::vector<FoldingRange>& folds) {
         if (++seen[key] > 1) return true;
     }
     return false;
-}
-
-static std::string read_demo_folding_file() {
-    for (const char* path : {"demo/folding_demo.sv", "../demo/folding_demo.sv"}) {
-        std::ifstream in(path);
-        if (!in)
-            continue;
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        return ss.str();
-    }
-    return {};
-}
-
-static int find_line_containing(const std::string& text, const std::string& needle) {
-    int line = 0;
-    size_t pos = 0;
-    while (pos < text.size()) {
-        size_t end = text.find('\n', pos);
-        if (end == std::string::npos)
-            end = text.size();
-        if (text.substr(pos, end - pos).find(needle) != std::string::npos)
-            return line;
-        pos = end + 1;
-        ++line;
-    }
-    return -1;
 }
 
 // ── module body ───────────────────────────────────────────────────────────
@@ -950,38 +922,19 @@ endmodule
     //                  shared ")(" delimiter line for Neovim's line fold model.
     //   region [5,10]  ANSI port list "(...)", excluding both delimiter lines.
     //   region [13,15] consecutive module-scoped declarations
-    //   region [11,16] module/body fold starts at the header terminator line.
+    //   region [0,16]  whole module fold, including the header.
     //
     // LSP can describe exact column-delimited folds, but Neovim's built-in
     // foldexpr merges adjacent line ranges like [0,4] + [4,11] + [11,16].
-    // These intentionally non-touching header folds keep zc on the header from
-    // collapsing the whole module.
+    // These intentionally non-touching header child folds avoid making the
+    // header lists one continuous line fold, while the enclosing module range
+    // still covers the whole module so folding from the body closes the module
+    // including its header.
     CHECK(has_fold(folds, 0, 3));
     CHECK(has_fold(folds, 5, 10));
     CHECK_FALSE(has_fold(folds, 0, 11));
-    CHECK_FALSE(has_fold_starting_at_and_ending_after(folds, 0, 11));
     CHECK(has_fold(folds, 13, 15));
-    CHECK(has_fold(folds, 11, 16));
-}
-
-TEST_CASE("foldingRange: demo folding_demo header splits parameter and port lists",
-          "[folding]") {
-    Analyzer    analyzer;
-    std::string uri = "file:///tmp/fold_demo_fixture.sv";
-    std::string text = read_demo_folding_file();
-    REQUIRE(!text.empty());
-
-    int module_line = find_line_containing(text, "module folding_demo #(");
-    REQUIRE(module_line >= 0);
-
-    analyzer.open(uri, text);
-    auto folds = provide_folding_range(analyzer, make_params(uri));
-
-    CHECK(has_fold(folds, module_line, module_line + 3));
-    CHECK(has_fold(folds, module_line + 5, module_line + 10));
-    CHECK_FALSE(has_fold(folds, module_line, module_line + 11));
-    CHECK_FALSE(has_fold_starting_at_and_ending_after(
-        folds, module_line, module_line + 11));
+    CHECK(has_fold(folds, 0, 16));
 }
 
 TEST_CASE("foldingRange: varied semicolon declarations fold as one consecutive run",
@@ -1025,6 +978,32 @@ endmodule
     CHECK(has_fold(folds, 1, 2));
     CHECK(has_fold(folds, 4, 5));
     CHECK_FALSE(has_fold(folds, 1, 5));
+}
+
+TEST_CASE("foldingRange: non-ANSI port declarations join declaration runs",
+          "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_non_ansi_port_declarations.sv";
+    analyzer.open(uri, R"(module top (
+    clk,
+    rst_n,
+    data_in,
+    data_out
+);
+    input  logic       clk;
+    input  logic       rst_n;
+    input  payload_t   data_in;
+    output payload_t   data_out;
+    logic              valid_q;
+    logic [3:0]        count_q;
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Non-ANSI ports are declared as semicolon-terminated declarations after
+    // the header.  They should fold as one consecutive declaration run together
+    // with following ordinary variables, including user-defined port types.
+    CHECK(has_fold_kind(folds, 6, 11, "declarations"));
 }
 
 TEST_CASE("foldingRange: user-defined type declarations join declaration runs",
