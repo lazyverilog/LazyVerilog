@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -180,16 +181,8 @@ inline bool is_covergroup_event_at(const TokenStream& tokens, size_t at) {
 }
 
 inline bool is_inside_argument_list(const TokenStream& tokens, size_t idx) {
-    idx = std::min(idx, tokens.size());
-    for (size_t n = idx; n > 0; --n) {
-        size_t open = n - 1;
-        if (!kind_is(tokens[open], TK::OpenParenthesis))
-            continue;
-        size_t close = tokens[open].immutable.syntax.matching_token;
-        if (close != npos && close > idx && tokens[open].immutable.topology.starts_argument_list)
-            return true;
-    }
-    return false;
+    if (idx >= tokens.size()) return false;
+    return tokens[idx].immutable.topology.inside_argument_list;
 }
 
 inline bool is_nested_argument_list_open(const TokenStream& tokens, size_t open) {
@@ -705,6 +698,7 @@ public:
         bool in_function_decl = false;
         bool in_task_decl = false;
         bool in_class_decl = false;
+        bool in_covergroup = false;
         bool in_modport = false;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
@@ -714,6 +708,7 @@ public:
             t.immutable.syntax.in_function_decl = in_function_decl;
             t.immutable.syntax.in_task_decl = in_task_decl;
             t.immutable.syntax.in_class_decl = in_class_decl;
+            t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
             // Freeze input-line topology before any wrap decision exists.
             t.immutable.topology.begins_line_construct = t.immutable.input_trivia.starts_original_line;
@@ -754,12 +749,10 @@ public:
                 t.immutable.comment.inside_expression = pd > 0 || bd > 0 || brd > 0;
                 t.immutable.comment.inside_arg_list = pd > 0;
             }
-            if (t.lex->is_directive) {
-                (void)0; // pp-conditional tracking reserved for future use
-            }
             if (kind_is(t, TK::FunctionKeyword)) in_function_decl = true;
             if (kind_is(t, TK::TaskKeyword)) in_task_decl = true;
             if (kind_is(t, TK::ClassKeyword)) in_class_decl = true;
+            if (kind_is(t, TK::CoverGroupKeyword)) in_covergroup = true;
             if (kind_is(t, TK::ModPortKeyword)) in_modport = true;
             if (kind_is(t, TK::OpenParenthesis)) { parens.push_back(i); ++pd; }
             else if (kind_is(t, TK::CloseParenthesis)) { if (!parens.empty()) { auto j = parens.back(); parens.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; t.immutable.topology.ends_argument_list = tokens[j].immutable.topology.starts_argument_list; } pd = std::max(0, pd - 1); }
@@ -774,12 +767,29 @@ public:
             }
             if (kind_is(t, TK::EndClassKeyword))
                 in_class_decl = false;
+            if (kind_is(t, TK::EndGroupKeyword))
+                in_covergroup = false;
         }
         size_t stmt_start = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::Comma)) {
                 for (size_t j = stmt_start; j <= i && j < tokens.size(); ++j) { tokens[j].immutable.syntax.stmt_begin = stmt_start; tokens[j].immutable.syntax.stmt_end = i; }
                 stmt_start = i + 1;
+            }
+        }
+        // Precompute inside_argument_list: O(n), replaces O(n) backward scan in
+        // is_inside_argument_list().  A token is inside an argument list when
+        // depth > 0, with ( exclusive (depth increments after) and ) exclusive
+        // (depth decrements before), matching the original backward-scan semantics.
+        {
+            int depth = 0;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                auto& tok = tokens[i];
+                if (kind_is(tok, TK::CloseParenthesis) && tok.immutable.topology.ends_argument_list)
+                    depth = std::max(0, depth - 1);
+                tok.immutable.topology.inside_argument_list = depth > 0;
+                if (kind_is(tok, TK::OpenParenthesis) && tok.immutable.topology.starts_argument_list)
+                    ++depth;
             }
         }
     }
@@ -1618,9 +1628,9 @@ public:
         int  paren_depth = 0;
 
         bool ctrl_just_closed = false; // defers single_stmt_pending resolution by one token
-        std::vector<size_t> procedural_body_end(tokens.size(), npos);
-        std::vector<size_t> else_body_end(tokens.size(), npos);
-        std::vector<size_t> forever_body_end(tokens.size(), npos);
+        std::unordered_map<size_t, size_t> procedural_body_end;
+        std::unordered_map<size_t, size_t> else_body_end;
+        std::unordered_map<size_t, size_t> forever_body_end;
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (!is_procedural_block_keyword(tokens[i].lex->kind))
                 continue;
@@ -1721,20 +1731,20 @@ public:
             }
             ctrl_just_closed = false;
 
-            if (i < procedural_body_end.size() && procedural_body_end[i] != npos) {
+            if (auto it = procedural_body_end.find(i); it != procedural_body_end.end()) {
                 ++level;
                 procedural_body_active = true;
-                procedural_body_stmt_end = procedural_body_end[i];
+                procedural_body_stmt_end = it->second;
             }
-            if (i < else_body_end.size() && else_body_end[i] != npos) {
+            if (auto it = else_body_end.find(i); it != else_body_end.end()) {
                 ++level;
                 else_body_active = true;
-                else_body_stmt_end = else_body_end[i];
+                else_body_stmt_end = it->second;
             }
-            if (i < forever_body_end.size() && forever_body_end[i] != npos) {
+            if (auto it = forever_body_end.find(i); it != forever_body_end.end()) {
                 ++level;
                 forever_body_active = true;
-                forever_body_stmt_end = forever_body_end[i];
+                forever_body_stmt_end = it->second;
             }
 
             t.mutable_.indent.base_indent = level * opts_.indent_size;

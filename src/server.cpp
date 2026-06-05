@@ -62,10 +62,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 DEFINE_REQUEST_RESPONSE_TYPE(wp_inlayHintRefresh, JsonNull, JsonNull,
                              "workspace/inlayHint/refresh");
@@ -229,16 +231,26 @@ static std::string json_string(std::string_view text) {
     return out;
 }
 
+static int saturating_lsp_int(size_t value) {
+    // LspCpp stores positions as int.  Keep scanning with size_t so very large
+    // documents cannot overflow the loop counter, then saturate at the protocol
+    // representation boundary instead of truncating through an unchecked cast.
+    constexpr auto max_int = static_cast<size_t>(std::numeric_limits<int>::max());
+    return value > max_int ? std::numeric_limits<int>::max() : static_cast<int>(value);
+}
+
 static lsPosition document_end_position(const std::string& text) {
-    int line = 0;
-    int last_nl = -1;
-    for (int i = 0; i < (int)text.size(); ++i) {
+    size_t line = 0;
+    size_t last_nl = std::string::npos;
+    for (size_t i = 0; i < text.size(); ++i) {
         if (text[i] == '\n') {
             ++line;
             last_nl = i;
         }
     }
-    return lsPosition(line, (int)text.size() - last_nl - 1);
+    const size_t col = last_nl == std::string::npos ? text.size()
+                                                     : text.size() - last_nl - 1;
+    return lsPosition(saturating_lsp_int(line), saturating_lsp_int(col));
 }
 
 static lsTextEdit whole_document_edit(const std::string& old_text, const std::string& new_text) {
@@ -1116,6 +1128,23 @@ void LazyVerilogServer::register_handlers() {
                 return v;
             };
 
+            auto get_string_list = [&](size_t i) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                std::string packed = get_string(i);
+                size_t start = 0;
+                while (start <= packed.size()) {
+                    size_t end = packed.find('\n', start);
+                    std::string item = packed.substr(start, end == std::string::npos ? std::string::npos
+                                                                                      : end - start);
+                    if (!item.empty())
+                        out.push_back(std::move(item));
+                    if (end == std::string::npos)
+                        break;
+                    start = end + 1;
+                }
+                return out;
+            };
+
             auto preview_ff_result = [&](const AutoffResult& result) {
                 // The Neovim client-side AutoFF command expects a small JSON object:
                 //   { "pairs": [{ "src": "...", "dst": "...", ... }] }
@@ -1365,9 +1394,13 @@ void LazyVerilogServer::register_handlers() {
                 std::string dest_path = get_string(3);
                 std::string dest_port = get_string(4);
                 std::string wire_name = get_string(5);
+                auto source_boundary_ports = get_string_list(6);
+                auto dest_boundary_ports = get_string_list(7);
                 rsp.result.SetJsonString(connect_apply_preview_json(analyzer_, uri, source_path,
                                                                      source_port, dest_path,
-                                                                     dest_port, wire_name),
+                                                                     dest_port, wire_name,
+                                                                     source_boundary_ports,
+                                                                     dest_boundary_ports),
                                          lsp::Any::kObjectType);
             } else if (cmd == "lazyverilog.connectApply") {
                 std::string uri = get_string(0);
@@ -1376,9 +1409,13 @@ void LazyVerilogServer::register_handlers() {
                 std::string dest_path = get_string(3);
                 std::string dest_port = get_string(4);
                 std::string wire_name = get_string(5);
+                auto source_boundary_ports = get_string_list(6);
+                auto dest_boundary_ports = get_string_list(7);
                 rsp.result.SetJsonString(connect_apply_edit_json(analyzer_, uri, source_path,
                                                                  source_port, dest_path, dest_port,
-                                                                 wire_name),
+                                                                 wire_name,
+                                                                 source_boundary_ports,
+                                                                 dest_boundary_ports),
                                          lsp::Any::kObjectType);
             } else if (cmd == "lazyverilog.interface") {
                 std::string uri = get_string(0);

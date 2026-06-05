@@ -1,7 +1,9 @@
 ./memory.sv
+./memory_top.sv
 ./folding_demo.sv
 ./demo.sv
 ./cell.sv
+./inv.sv
 ./params.svh
 +incdir+./uvm-core/src
 ./uvm-core/src/uvm_pkg.sv

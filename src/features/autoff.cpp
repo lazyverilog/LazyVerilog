@@ -334,6 +334,29 @@ static std::pair<std::vector<AutoffEdit>, int> build_ff_edits(
     return {edits, pending_count};
 }
 
+// ── Regex cache ───────────────────────────────────────────────────────────────
+
+// Cache the last compiled register regex per thread.  AutoFF commands are
+// invoked repeatedly with the same pattern; avoid recompiling on each call.
+static const std::regex* cached_register_regex(const std::string& pattern,
+                                                std::string& error_out) {
+    thread_local std::string cached_pattern;
+    thread_local std::optional<std::regex> cached_re;
+    if (pattern != cached_pattern) {
+        cached_pattern = pattern;
+        try {
+            cached_re = std::regex(pattern);
+        } catch (...) {
+            cached_re = std::nullopt;
+        }
+    }
+    if (!cached_re) {
+        error_out = "AutoFF: invalid register_pattern '" + pattern + "'";
+        return nullptr;
+    }
+    return &*cached_re;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 AutoffResult autoff(const DocumentState& state, int cursor_line, const std::string& register_pattern) {
@@ -344,14 +367,12 @@ AutoffResult autoff(const DocumentState& state, int cursor_line, const std::stri
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    std::regex reg_re;
-    try {
-        reg_re = std::regex(pat);
-    } catch (...) {
+    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    if (!reg_re_ptr) {
         result.has_error = true;
-        result.error = "AutoFF: invalid register_pattern '" + pat + "'";
         return result;
     }
+    const std::regex& reg_re = *reg_re_ptr;
 
     std::vector<std::string> names;
     try {
@@ -408,14 +429,12 @@ AutoffResult autoff_all(const DocumentState& state, const std::string& register_
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    std::regex reg_re;
-    try {
-        reg_re = std::regex(pat);
-    } catch (...) {
+    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    if (!reg_re_ptr) {
         result.has_error = true;
-        result.error = "AutoFF: invalid register_pattern '" + pat + "'";
         return result;
     }
+    const std::regex& reg_re = *reg_re_ptr;
 
     if (!state.tree) {
         result.has_error = true;
@@ -469,14 +488,12 @@ AutoffResult preview_autoff(const DocumentState& state, int cursor_line, const s
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    std::regex reg_re;
-    try {
-        reg_re = std::regex(pat);
-    } catch (...) {
+    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    if (!reg_re_ptr) {
         result.has_error = true;
-        result.error = "AutoFF: invalid register_pattern '" + pat + "'";
         return result;
     }
+    const std::regex& reg_re = *reg_re_ptr;
 
     std::vector<std::string> names;
     try {
@@ -539,14 +556,12 @@ AutoffResult preview_autoff_all(const DocumentState& state, const std::string& r
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    std::regex reg_re;
-    try {
-        reg_re = std::regex(pat);
-    } catch (...) {
+    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    if (!reg_re_ptr) {
         result.has_error = true;
-        result.error = "AutoFF: invalid register_pattern '" + pat + "'";
         return result;
     }
+    const std::regex& reg_re = *reg_re_ptr;
 
     if (!state.tree) {
         result.has_error = true;

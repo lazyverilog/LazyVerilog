@@ -95,6 +95,11 @@ struct TopologyFacts {
 
     bool starts_parameter_list{false};
     bool starts_port_list{false};
+
+    // True for tokens strictly between a starts_argument_list OpenParen and its
+    // matching CloseParenthesis (exclusive on both ends).  Precomputed by
+    // SyntaxPass to replace O(n) backward scans.
+    bool inside_argument_list{false};
 };
 
 // 4. CommentFacts: frozen comment classification.  Comments are classified once
@@ -166,7 +171,7 @@ struct IndentMetadata { int base_indent{0}; int continuation_indent{0}; size_t a
 struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; };
 struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
 struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
-struct BlankLineMetadata { int before{0}; int after{0}; };
+struct BlankLineMetadata { int before{0}; };
 struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; };
 
 struct MutableData {

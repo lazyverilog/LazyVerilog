@@ -1729,6 +1729,72 @@ local function _connect_show_preview(preview, callback)
 	end
 end
 
+local function _connect_split_path(path)
+	local parts = {}
+	for part in tostring(path or ""):gmatch("[^%.]+") do
+		table.insert(parts, part)
+	end
+	return parts
+end
+
+local function _connect_join_path(parts, count)
+	local out = {}
+	for i = 1, count do
+		table.insert(out, parts[i])
+	end
+	return table.concat(out, ".")
+end
+
+local function _connect_lca_len(path_a, path_b)
+	local a = _connect_split_path(path_a)
+	local b = _connect_split_path(path_b)
+	local n = math.min(#a, #b)
+	local i = 1
+	while i <= n and a[i] == b[i] do
+		i = i + 1
+	end
+	return i - 1, a, b
+end
+
+local function _connect_boundary_paths(source_path, dest_path)
+	local lca_len, src, dst = _connect_lca_len(source_path, dest_path)
+	local source_up = {}
+	-- Immediate parent of the source leaf, then upward to the child of LCA.
+	for i = #src - 1, lca_len + 1, -1 do
+		table.insert(source_up, _connect_join_path(src, i))
+	end
+
+	local dest_down = {}
+	-- Child of LCA, then downward to the immediate parent of the destination leaf.
+	for i = lca_len + 1, #dst - 1 do
+		table.insert(dest_down, _connect_join_path(dst, i))
+	end
+	return source_up, dest_down
+end
+
+local function _connect_suggest_port(base_port, boundary_path)
+	local inst = tostring(boundary_path or ""):match("([^%.]+)$") or ""
+	inst = inst:gsub("^u_", "")
+	if inst == "" then return base_port end
+	return tostring(base_port or "sig") .. "_" .. inst
+end
+
+local function _connect_prompt_boundary_ports(requests, idx, acc, callback)
+	if idx > #requests then
+		callback(acc)
+		return
+	end
+	local req = requests[idx]
+	_float_input({ prompt = req.prompt, default = req.default }, function(name)
+		if not name then
+			callback(nil)
+			return
+		end
+		table.insert(acc, name)
+		_connect_prompt_boundary_ports(requests, idx + 1, acc, callback)
+	end)
+end
+
 --- Connect an output port of module1 instances to an input port of module2 instances
 --- via interactive pickers and a floating preview.
 function M.connect(module1, module2)
@@ -1850,88 +1916,87 @@ function M.connect(module1, module2)
 									function(wire_name)
 										if not wire_name then return end
 
-										-- Step 6: preview
-										local apply_args = {
-											uri,
-											inst1.hierarchical_path,
-											port1.name,
-											inst2.hierarchical_path,
-											port2.name,
-											wire_name,
-										}
-										client:request(
-											"workspace/executeCommand", {
-												command   =
-												"lazyverilog.connectApplyPreview",
-												arguments = apply_args,
-											}, function(perr, preview)
-												if perr then
-													vim.notify(
-														"[LazyVerilog] Connect: " ..
-														tostring(
-															perr
-															.message),
-														vim.log
-														.levels
-														.ERROR); return
-												end
-												if not preview or preview.error then
-													vim.notify(
-														"[LazyVerilog] Connect: " ..
-														(preview and preview.error or "no preview"),
-														vim.log
-														.levels
-														.ERROR); return
-												end
+											-- Step 6: ask for hierarchy boundary ports, from source toward destination.
+											local source_boundary_paths, dest_boundary_paths =
+											    _connect_boundary_paths(inst1.hierarchical_path, inst2.hierarchical_path)
+											local source_requests = {}
+											for _, path in ipairs(source_boundary_paths) do
+												table.insert(source_requests, {
+													prompt = "Output port on " .. path .. " to export " .. port1.name .. ":",
+													default = _connect_suggest_port(port1.name, path),
+												})
+											end
+											local dest_requests = {}
+											for _, path in ipairs(dest_boundary_paths) do
+												table.insert(dest_requests, {
+													prompt = "Input port on " .. path .. " to import " .. port2.name .. ":",
+													default = _connect_suggest_port(port2.name, path),
+												})
+											end
 
-												vim.schedule(function()
-													_connect_show_preview(
-														preview,
-														function(
-														    confirmed)
-															if not confirmed then return end
+											_connect_prompt_boundary_ports(source_requests, 1, {}, function(source_ports)
+												if not source_ports then return end
+												_connect_prompt_boundary_ports(dest_requests, 1, {}, function(dest_ports_down)
+													if not dest_ports_down then return end
 
-															-- Step 7: apply
-															client:request(
-																"workspace/executeCommand",
-																{
-																	command   =
-																	"lazyverilog.connectApply",
-																	arguments =
-																	    apply_args,
-																},
-																function(
-																    aerr,
-																    result)
+													-- The server applies destination steps from the leaf upward, while the UI asks
+													-- from the LCA child downward so prompts read source-to-destination.
+													local dest_ports_leaf_up = {}
+													for i = #dest_ports_down, 1, -1 do
+														table.insert(dest_ports_leaf_up, dest_ports_down[i])
+													end
+
+													-- Step 7: preview
+													local apply_args = {
+														uri,
+														inst1.hierarchical_path,
+														port1.name,
+														inst2.hierarchical_path,
+														port2.name,
+														wire_name,
+														table.concat(source_ports, "\n"),
+														table.concat(dest_ports_leaf_up, "\n"),
+													}
+													client:request("workspace/executeCommand", {
+														command   = "lazyverilog.connectApplyPreview",
+														arguments = apply_args,
+													}, function(perr, preview)
+														if perr then
+															vim.notify("[LazyVerilog] Connect: " .. tostring(perr.message),
+																vim.log.levels.ERROR); return
+														end
+														if not preview or preview.error then
+															vim.notify("[LazyVerilog] Connect: " ..
+																(preview and preview.error or "no preview"),
+																vim.log.levels.ERROR); return
+														end
+
+														vim.schedule(function()
+															_connect_show_preview(preview, function(confirmed)
+																if not confirmed then return end
+
+																-- Step 8: apply
+																client:request("workspace/executeCommand", {
+																	command   = "lazyverilog.connectApply",
+																	arguments = apply_args,
+																}, function(aerr, result)
 																	if aerr then
-																		vim.notify(
-																			"[LazyVerilog] Connect apply: " ..
-																			tostring(
-																				aerr.message),
-																			vim.log
-																			.levels
-																			.ERROR); return
+																		vim.notify("[LazyVerilog] Connect apply: " .. tostring(aerr.message),
+																			vim.log.levels.ERROR); return
 																	end
 																	if result and result.error then
-																		vim.notify(
-																			"[LazyVerilog] Connect: " ..
-																			result.error,
-																			vim.log
-																			.levels
-																			.ERROR); return
+																		vim.notify("[LazyVerilog] Connect: " .. result.error,
+																			vim.log.levels.ERROR); return
 																	end
 																	if result and result.changes then
-																		vim.lsp
-																		    .util
-																		    .apply_workspace_edit(
-																			    result,
-																			    "utf-8")
+																		vim.lsp.util.apply_workspace_edit(result, "utf-8")
 																	end
-																end,
-																src_bufnr)
+																end, src_bufnr)
+															end)
 														end)
+													end, src_bufnr)
 												end)
-											end, src_bufnr)
+											end)
 									end)
 							end)
 						end)

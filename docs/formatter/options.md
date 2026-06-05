@@ -123,6 +123,19 @@ safe_mode = true
 
 ---
 
+### `log_path`
+
+Directory path for formatter diagnostic log files. When non-empty, the formatter writes per-pass token dumps into this directory after each format operation. Useful for debugging unexpected formatting output.
+
+```toml
+[format]
+log_path = "/tmp/lv-fmt-logs"
+```
+
+Disabled by default (empty string). Has no effect on formatted output.
+
+---
+
 ### `format_off_comment_pattern` / `format_on_comment_pattern`
 
 Regex patterns used to detect line comments that disable and re-enable formatting.
@@ -1212,6 +1225,12 @@ Minimum character width for the signal name column.
 [format.modport]
 signal_min_width = 0
 ```
+
+---
+
+## `[format.macros]`
+
+Controls how user-defined macros are classified for formatting purposes. Macro classification affects wrapping, indentation, and spacing decisions. See [`macros.md`](macros.md) for the full option reference, available role lists, and examples.
 
 ---
 

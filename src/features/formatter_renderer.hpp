@@ -124,13 +124,6 @@ inline std::string render_tokens(const TokenStream& tokens) {
     return out;
 }
 
-inline std::string strip_ws(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) if (!std::isspace(c)) out.push_back(static_cast<char>(c));
-    return out;
-}
-
 // Non-allocating whitespace-ignoring equality check.
 inline bool ws_equal(const std::string& a, const std::string& b) {
     auto ia = a.begin(), ib = b.begin();

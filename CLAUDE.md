@@ -79,7 +79,8 @@ ctest --test-dir build                          # all tests
   `SpacingPass`, `BlankLinePass`, then rendering.
 - Token data is split into immutable facts and mutable formatting metadata.
 - Each pass has exclusive write ownership of its metadata family:
-  - `SyntaxPass` writes `ImmutableData`
+  - `TokenCollector` (lexer) writes `LexemeFacts` and `InputTriviaFacts`
+  - `SyntaxPass` writes `SyntaxFacts`, `TopologyFacts`, and `CommentFacts`
   - `MacroPass` writes `MacroMetadata`
   - `WrapPass` writes `WrapMetadata`
   - `IndentPass` writes `IndentMetadata`

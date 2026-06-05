@@ -38,11 +38,11 @@ inline bool is_format_marker(std::string_view comment,
                               const std::string& pattern_fallback) {
     if (compiled_re) {
         try {
-            return std::regex_search(std::string(comment), *compiled_re);
+            return std::regex_search(comment.begin(), comment.end(), *compiled_re);
         } catch (...) {}
     }
     if (pattern_fallback.empty()) return false;
-    return std::string(comment).find(pattern_fallback) != std::string::npos;
+    return comment.find(pattern_fallback) != std::string_view::npos;
 }
 
 class TokenCollector {
@@ -189,7 +189,11 @@ private:
         auto lex = std::make_shared<LexemeFacts>();
         lex->kind = kind;
         lex->text.assign(text);
-        lex->lower_text = lower_ascii(text);
+        // lower_text is needed by folding_range (directive classification) and
+        // debug logging.  Skip the allocation for the common case: non-directive
+        // tokens when logging is disabled.
+        if (is_directive || !opts_.log_path.empty())
+            lex->lower_text = lower_ascii(text);
         lex->range = slang::SourceRange(slang::SourceLocation(slang::BufferID::getPlaceholder(), pos),
                                         slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
         lex->is_comment = is_comment;

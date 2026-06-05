@@ -24,13 +24,6 @@ typedef struct {
     logic                                   valid                               ;
 } packet_ta;
 
-typedef enum logic [1:0] {
-    IDLE       = 2'd0        ,
-    FETCH                    ,
-    EXECUTE    = 2'd2        ,
-    ERROR
-} state_t;
-
 interface bus_intf #(
     parameter W_IDTH = 8
 )(
@@ -43,6 +36,7 @@ logic               [`WIDTH123:0]       addr                                ;
 logic               [`WIDTH-1:0]        wdata                               ;
 logic               [`WIDTH-1:0]        rdata                               ;
 logic                                   write                               ;
+logic               [`PARAMSVH_PARAM-1:0] include_test                        ;
 
 // DUT view
 modport dut (
@@ -78,8 +72,7 @@ module memory_top #(
     i_data2, i_data3, i_dd,
     i_dd22222, dd22222, i_d33333,
     i_d44333, i_dd44321, i_d44334,
-    VDD, VSS, test,
-    VSS
+    VDD, VSS
 );
 input                            i_clk                           ;
 input                            i_rst_n                         ;
@@ -93,8 +86,8 @@ input                            i_d33333                        ;
 input                            i_d44333                        , i_dd44321                  ;
 input                            i_d44334                        ;
 output    logic unsigned [0:0]   VDD                             , VSS                        ; // output
-output    packet_tttttttttttttt [0:0] test                       , VSS                        ; /* output */ // test
 
+fifo_entry_t                            test                                ;
 logic               [7:0]               dout                = 8'hFF         ;
 logic               [8:0]               douteeeeeee         = 8'hFF         ;
 packet_tttttttttttttt [1:0]             test_init           = 8'hFF         ;
@@ -124,35 +117,40 @@ automatic int       [3:0]               b                                   ;
 
 wire                [1:0]               addr                                ;
 logic                                   address                             ;
-logic                                   test                                , r_test                              ; // test
 logic                                   test3                               , r_test2                             ;
 /* */
 logic                                   r_test4                             ;
 logic               [`BB-1:0]           data23                              ;
 logic               [`BB-1:0]           data32                              ;
-[5:0] data32;
 
 assign d          = a + 2;
 assign daaa       = a + 2;
 assign very_long_text = a + 2;
 
-memory #(.DEPTH(4), .WIDTH(3).WIDTH(2)) u_mem2 (
+memory #(.DEPTH(4), .WIDTH(3)) u_mem2 (
     .i_clk    (          ),
     .address  (          ),
-    .i_data   (data32    ),
-    .o_data   (o_data    )
+    .i_data   (inv3_to_inv2),
+    .o_data   (          )
 );
 
 memory u_mem3 (
     .i_clk    (          ),
     .address  (          ),
-    .i_data   (data23    ),
-    .o_data   (data32    )
+    .i_data   (          ),
+    .o_data   (inv3_to_inv2)
 );
 
-state_t             state                               , r_state                             ;
+state_t                                 state                               , r_state                             ;
+logic               [`BB-1:0]           data3232                            ;
+logic               [`BB-1:0]           inv3_to_inv2                        ;
+logic               [`BB-1:0]           mem3_to_mem2                        ;
+
 always_comb begin
+    logic               test2test                           ;
     state      = ERROR;
+    add_number();
+    test.id = 1;
 end
 
 endmodule

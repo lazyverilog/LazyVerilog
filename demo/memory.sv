@@ -15,5 +15,12 @@ input     wire       [5:0]       address                    ;
 input     wire       [`AA-1:0]   i_data                     ;
 output    wire       [`BB-1:0]   o_data                     ;
 
-inv u_inv();
+state_t             state                               ;
+inv u_inv (
+    .o        (o_data    ),
+    .i        (i_data    )
+);
+always_comb begin
+    state      = state_t::IDLE;
+end
 endmodule

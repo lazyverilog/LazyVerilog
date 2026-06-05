@@ -172,7 +172,7 @@ inline std::string token_stream_to_log(const TokenStream& tokens) {
         out << "  mutable.comment: preserve_internal_indent=" << bool01(mut.comment.preserve_internal_indent)
             << " force_own_line=" << bool01(mut.comment.force_own_line)
             << " relative_indent=" << mut.comment.relative_indent << "\n";
-        out << "  mutable.blank: before=" << mut.blank.before << " after=" << mut.blank.after << "\n";
+        out << "  mutable.blank: before=" << mut.blank.before << "\n";
         out << "  mutable.macro: passthrough=" << bool01(mut.macro.passthrough)
             << " suppress_alignment=" << bool01(mut.macro.suppress_alignment)
             << " suppress_wrapping=" << bool01(mut.macro.suppress_wrapping) << "\n";

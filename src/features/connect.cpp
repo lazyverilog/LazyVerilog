@@ -1,14 +1,21 @@
 #include "connect.hpp"
 #include "../dynamic_file_index.hpp"
 
+#include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
+#include <slang/syntax/SyntaxVisitor.h>
+#include <slang/text/SourceManager.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <fstream>
 #include <map>
+#include <memory>
 #include <optional>
-#include <regex>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -18,6 +25,10 @@ struct FileView {
     std::string uri;
     std::string text;
     SyntaxIndex index;
+    // Non-null only for open/current buffers.  Per project architecture, these
+    // live SyntaxTree snapshots are authoritative for edit-local facts such as
+    // declarations in unsaved text.  Closed/filelist files keep only SyntaxIndex.
+    std::shared_ptr<const DocumentState> state;
 };
 
 struct ResolvedInst {
@@ -97,6 +108,17 @@ static std::string trim(std::string s) {
     return s;
 }
 
+static std::string read_file_text_best_effort(const std::string& path) {
+    if (path.empty())
+        return {};
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
 static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::string& uri) {
     std::vector<FileView> files;
     std::unordered_set<std::string> seen;
@@ -108,21 +130,30 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{state_uri, state->text, get_structural_index(*state)});
+        files.push_back(FileView{state_uri, state->text, get_structural_index(*state), state});
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
-    // file is also open, skip it so the open-buffer version wins.
-    for (const auto& extra : analyzer.extra_index_snapshots()) {
+    // file is also open, skip it so the open-buffer version wins.  Closed
+    // project files remain index-authoritative structurally, but Connect may
+    // need their source text to produce WorkspaceEdits.  Read text lazily from
+    // disk here without retaining a closed-file AST.
+    for (const auto& extra : analyzer.extra_file_snapshots()) {
         if (!seen.insert(extra.uri).second)
             continue;
-        files.push_back(FileView{extra.uri, {}, extra.index});
+        if (extra.state) {
+            files.push_back(FileView{extra.uri, extra.state->text,
+                                     get_structural_index(*extra.state), extra.state});
+        } else {
+            files.push_back(FileView{extra.uri, read_file_text_best_effort(extra.path),
+                                     extra.index, nullptr});
+        }
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{uri, state->text, get_structural_index(*state)});
+            files.push_back(FileView{uri, state->text, get_structural_index(*state), state});
     }
     return files;
 }
@@ -228,10 +259,6 @@ static std::optional<NamedPortConn> connection_for(const InstanceEntry& inst,
     return std::nullopt;
 }
 
-static int line_count_before(const std::string& s, size_t off) {
-    return static_cast<int>(std::count(s.begin(), s.begin() + std::min(off, s.size()), '\n'));
-}
-
 static std::pair<int, int> offset_to_pos(const std::string& text, size_t off) {
     off = std::min(off, text.size());
     int line = 0, col = 0;
@@ -246,6 +273,253 @@ static std::pair<int, int> offset_to_pos(const std::string& text, size_t off) {
     return {line, col};
 }
 
+static bool syntax_fragment_edge_is_wordlike(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
+}
+
+static bool needs_space_between_syntax_fragments(std::string_view previous,
+                                                 std::string_view next) {
+    if (previous.empty() || next.empty())
+        return false;
+    const char prev = previous.back();
+    const char curr = next.front();
+    if (syntax_fragment_edge_is_wordlike(prev) && syntax_fragment_edge_is_wordlike(curr))
+        return true;
+    if (syntax_fragment_edge_is_wordlike(prev) && (curr == '[' || curr == '{'))
+        return true;
+    if (prev == ',')
+        return true;
+    return false;
+}
+
+static std::string token_text(const slang::parsing::Token& token) {
+    if (!token || token.isMissing())
+        return {};
+    if (token.rawText().empty())
+        return std::string(token.valueText());
+    return std::string(token.rawText());
+}
+
+static std::string render_syntax_text(const slang::syntax::SyntaxNode& node) {
+    std::string text;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto fragment = token_text(*it);
+        if (fragment.empty())
+            continue;
+        if (needs_space_between_syntax_fragments(text, fragment))
+            text += ' ';
+        text += fragment;
+    }
+    return trim(std::move(text));
+}
+
+static std::string append_declarator_dimensions(std::string type,
+                                                const slang::syntax::DeclaratorSyntax& declarator) {
+    for (const auto* dimension : declarator.dimensions) {
+        if (!dimension)
+            continue;
+        const auto rendered = render_syntax_text(*dimension);
+        if (!rendered.empty())
+            type += (type.empty() ? "" : " ") + rendered;
+    }
+    return trim(std::move(type));
+}
+
+static std::string type_from_data_declaration(const slang::syntax::DataDeclarationSyntax& node,
+                                              const slang::syntax::DeclaratorSyntax& declarator) {
+    return append_declarator_dimensions(render_syntax_text(*node.type), declarator);
+}
+
+static std::string type_from_net_declaration(const slang::syntax::NetDeclarationSyntax& node,
+                                             const slang::syntax::DeclaratorSyntax& declarator) {
+    std::string type = token_text(node.netType);
+    const auto data_type = render_syntax_text(*node.type);
+    if (!data_type.empty())
+        type += (type.empty() ? "" : " ") + data_type;
+    return append_declarator_dimensions(std::move(type), declarator);
+}
+
+static std::pair<int, int> token_pos(const slang::SourceManager& sm,
+                                     const slang::parsing::Token& token) {
+    if (!token || !token.location().valid())
+        return {0, 0};
+    const auto line = sm.getLineNumber(token.location());
+    const auto col = sm.getColumnNumber(token.location());
+    return {line > 0 ? static_cast<int>(line) - 1 : 0,
+            col > 0 ? static_cast<int>(col) - 1 : 0};
+}
+
+static std::pair<int, int> range_end_pos(const slang::SourceManager& sm,
+                                         slang::SourceRange range) {
+    if (!range.end().valid())
+        return {0, 0};
+    return offset_to_pos(std::string(sm.getSourceText(range.end().buffer())), range.end().offset());
+}
+
+struct DeclInfo {
+    std::string name;
+    std::string type;
+    int start_line{0};
+    int start_col{0};
+    int end_line{0};
+    int end_col{0};
+    size_t declarator_count{0};
+};
+
+struct ModuleDeclVisitor : public slang::syntax::SyntaxVisitor<ModuleDeclVisitor> {
+    const slang::SourceManager& sm;
+    std::string target_module;
+    std::vector<DeclInfo> decls;
+
+    ModuleDeclVisitor(const slang::SourceManager& sm, std::string target_module)
+        : sm(sm), target_module(std::move(target_module)) {}
+
+    void add_decl_at_range_start(const slang::parsing::Token& name_token, const std::string& type,
+                                 slang::SourceRange range, size_t count) {
+        if (!range.start().valid() || range.start().buffer() != range.end().buffer())
+            return;
+        auto [start_line, start_col] = offset_to_pos(
+            std::string(sm.getSourceText(range.start().buffer())), range.start().offset());
+        auto [end_line, end_col] = range_end_pos(sm, range);
+        decls.push_back(DeclInfo{.name = token_text(name_token),
+                                 .type = type,
+                                 .start_line = start_line,
+                                 .start_col = start_col,
+                                 .end_line = end_line,
+                                 .end_col = end_col,
+                                 .declarator_count = count});
+    }
+
+    void add_data_declaration(const slang::syntax::DataDeclarationSyntax& node) {
+        const size_t count = node.declarators.size();
+        for (const auto* decl : node.declarators) {
+            if (!decl)
+                continue;
+            add_decl_at_range_start(decl->name, type_from_data_declaration(node, *decl),
+                                    node.sourceRange(), count);
+        }
+    }
+
+    void add_net_declaration(const slang::syntax::NetDeclarationSyntax& node) {
+        const size_t count = node.declarators.size();
+        for (const auto* decl : node.declarators) {
+            if (!decl)
+                continue;
+            add_decl_at_range_start(decl->name, type_from_net_declaration(node, *decl),
+                                    node.sourceRange(), count);
+        }
+    }
+
+    void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+        const std::string module_name = token_text(node.header->name);
+        if (!target_module.empty() && module_name != target_module)
+            return;
+
+        // Only module-scope declarations are relevant for Connect/Interface
+        // bridge wires.  Do not recursively visit procedural blocks, functions,
+        // tasks, classes, or generate bodies: inserting a bridge declaration
+        // after a local variable inside those scopes would be syntactically and
+        // semantically wrong.  Closed-file data uses SyntaxIndex; open buffers
+        // use this direct AST member pass to preserve unsaved declarations.
+        for (const auto* member : node.members) {
+            if (!member)
+                continue;
+            if (const auto* data = member->as_if<slang::syntax::DataDeclarationSyntax>())
+                add_data_declaration(*data);
+            else if (const auto* net = member->as_if<slang::syntax::NetDeclarationSyntax>())
+                add_net_declaration(*net);
+        }
+    }
+};
+
+static std::vector<DeclInfo> ast_declarations_for_module(const FileView& file,
+                                                         const std::string& module_name) {
+    if (!file.state || !file.state->tree)
+        return {};
+    ModuleDeclVisitor visitor(file.state->tree->sourceManager(), module_name);
+    file.state->tree->root().visit(visitor);
+    return std::move(visitor.decls);
+}
+
+static bool declared_signal(const FileView& file, const std::string& module_name,
+                            const std::string& name) {
+    if (name.empty())
+        return false;
+
+    if (file.state && file.state->tree) {
+        for (const auto& decl : ast_declarations_for_module(file, module_name)) {
+            if (decl.name == name)
+                return true;
+        }
+    }
+
+    // Closed/project files are represented by SyntaxIndex.  This is also a
+    // conservative fallback if an open buffer temporarily lacks a SyntaxTree.
+    for (const auto& value : file.index.values) {
+        if (value.name == name &&
+            (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
+            return true;
+    }
+    return false;
+}
+
+static int wire_insert_line(const FileView& file, const std::string& module_name) {
+    int last_decl_line = -1;
+    for (const auto& decl : ast_declarations_for_module(file, module_name))
+        last_decl_line = std::max(last_decl_line, decl.end_line);
+    if (last_decl_line >= 0)
+        return last_decl_line + 1;
+
+    for (const auto& value : file.index.values) {
+        if ((module_name.empty() || value.parent_scope == module_name) && value.line > 0)
+            last_decl_line = std::max(last_decl_line, value.line - 1);
+    }
+    if (last_decl_line >= 0)
+        return last_decl_line + 1;
+
+    auto lines = split_lines(file.text);
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        if (lines[i].find(");") != std::string::npos)
+            return i + 1;
+    }
+    return 0;
+}
+
+static std::string signal_type_in_file(const FileView& file, const std::string& module_name,
+                                       const std::string& sig) {
+    if (sig.empty())
+        return "";
+    for (const auto& decl : ast_declarations_for_module(file, module_name)) {
+        if (decl.name == sig)
+            return decl.type;
+    }
+    for (const auto& value : file.index.values) {
+        if (value.name == sig &&
+            (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
+            return value.type;
+    }
+    return "";
+}
+
+static std::optional<TextEdit> declaration_delete_edit(const FileView& file,
+                                                       const std::string& module_name,
+                                                       const std::string& signal_name) {
+    for (const auto& decl : ast_declarations_for_module(file, module_name)) {
+        if (decl.name != signal_name || decl.declarator_count != 1)
+            continue;
+
+        auto lines = split_lines(file.text);
+        if (decl.start_line >= 0 && decl.start_line < static_cast<int>(lines.size())) {
+            const auto prefix = lines[decl.start_line].substr(0, std::min<size_t>(decl.start_col, lines[decl.start_line].size()));
+            if (trim(prefix).empty() && decl.end_line == decl.start_line) {
+                return TextEdit{file.uri, decl.start_line, 0, decl.start_line + 1, 0, ""};
+            }
+        }
+        return TextEdit{file.uri, decl.start_line, decl.start_col, decl.end_line, decl.end_col, ""};
+    }
+    return std::nullopt;
+}
+
 static std::optional<TextEdit> replace_or_add_connection(const FileView& file,
                                                          const InstanceEntry& inst,
                                                          const std::string& port,
@@ -255,39 +529,39 @@ static std::optional<TextEdit> replace_or_add_connection(const FileView& file,
     auto lines = split_lines(file.text);
     const int start = std::max(inst.start_line, 0);
     const int end = std::min(inst.end_line, static_cast<int>(lines.size()) - 1);
-    static const std::regex conn_re(R"(\.\s*(\w+)\s*\(([^)]*)\))");
 
-    for (int i = start; i <= end; ++i) {
-        const std::string old_line = lines[i];
-        std::string new_line;
-        std::sregex_iterator it(old_line.begin(), old_line.end(), conn_re), last;
-        size_t cursor = 0;
-        bool changed = false;
-        for (; it != last; ++it) {
-            const auto& m = *it;
-            new_line.append(old_line, cursor, static_cast<size_t>(m.position()) - cursor);
-            if (m[1].str() == port && (old_signal.empty() || trim(m[2].str()) == old_signal)) {
-                new_line += "." + port + "(" + signal + ")";
-                changed = true;
-            } else {
-                new_line += m.str();
-            }
-            cursor = static_cast<size_t>(m.position() + m.length());
-        }
-        new_line.append(old_line, cursor, std::string::npos);
-        if (changed)
-            return TextEdit{file.uri, i, 0, i, static_cast<int>(old_line.size()), new_line};
+    for (const auto& conn : inst.connections) {
+        if (conn.port_name != port)
+            continue;
+        if (!old_signal.empty() && conn.signal_name != old_signal)
+            continue;
+        const int line = conn.line > 0 ? conn.line - 1 : start;
+        if (line < 0 || line >= static_cast<int>(lines.size()))
+            continue;
+
+        const std::string& old_line = lines[line];
+        size_t open = old_line.find('(', static_cast<size_t>(std::max(conn.col, 0)));
+        if (open == std::string::npos)
+            open = old_line.find('(', static_cast<size_t>(std::max(conn.hint_col - 1, 0)));
+        if (open == std::string::npos)
+            continue;
+        const size_t close = old_line.find(')', open + 1);
+        if (close == std::string::npos)
+            continue;
+
+        std::string new_line = old_line.substr(0, open + 1) + signal + old_line.substr(close);
+        return TextEdit{file.uri, line, 0, line, static_cast<int>(old_line.size()), new_line};
     }
 
-    if (!add_if_missing)
+    if (!add_if_missing || lines.empty())
         return std::nullopt;
 
-    // Missing port: insert before the instance-closing ");". This mirrors the
-    // Python command's intentionally simple textual behavior and keeps the
-    // edit local to the instance instead of regenerating the whole block.
-    int close_line = end;
+    // Missing port: insert before the instance-closing ");". This remains a
+    // local textual edit because the AST tells us the instance span, but the
+    // formatter/user owns the preferred trailing-comma layout.
+    int close_line = std::max(0, std::min(end, static_cast<int>(lines.size()) - 1));
     int close_col = static_cast<int>(lines[close_line].size());
-    for (int i = end; i >= start; --i) {
+    for (int i = close_line; i >= start; --i) {
         auto pos = lines[i].rfind(");");
         if (pos != std::string::npos) {
             close_line = i;
@@ -295,39 +569,154 @@ static std::optional<TextEdit> replace_or_add_connection(const FileView& file,
             break;
         }
     }
-    static const std::regex indent_re(R"(^(\s*)\.)");
     std::string indent = "    ";
-    for (int i = end; i >= start; --i) {
-        std::smatch m;
-        if (std::regex_search(lines[i], m, indent_re)) {
-            indent = m[1].str();
-            break;
+    for (const auto& conn : inst.connections) {
+        const int line = conn.line > 0 ? conn.line - 1 : -1;
+        if (line >= start && line <= close_line && line < static_cast<int>(lines.size())) {
+            const auto dot = lines[line].find('.');
+            if (dot != std::string::npos) {
+                indent = lines[line].substr(0, dot);
+                break;
+            }
         }
     }
     return TextEdit{file.uri, close_line, close_col, close_line, close_col,
                     ",\n" + indent + "." + port + "(" + signal + ")"};
 }
 
-static bool declared_signal(const std::string& text, const std::string& name) {
-    const std::regex decl_re("\\b(?:wire|logic|reg)\\b[^;]*\\b" + name + "\\b");
-    return std::regex_search(text, decl_re);
+struct PortSignalEdit {
+    std::string port;
+    std::string signal;
+};
+
+static std::string join_lines(const std::vector<std::string>& lines, int start, int end) {
+    std::string out;
+    for (int i = start; i <= end; ++i) {
+        if (i > start)
+            out += '\n';
+        out += lines[i];
+    }
+    out += '\n';
+    return out;
 }
 
-static int wire_insert_line(const std::string& text) {
-    auto lines = split_lines(text);
-    static const std::regex port_decl_re(R"(^\s*(?:input|output|inout|wire|logic|reg)\b)");
-    int last_decl = -1;
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-        if (std::regex_search(lines[i], port_decl_re))
-            last_decl = i;
+static std::optional<TextEdit> replace_or_add_connections(const FileView& file,
+                                                          const InstanceEntry& inst,
+                                                          const std::vector<PortSignalEdit>& desired) {
+    if (desired.empty())
+        return std::nullopt;
+
+    auto lines = split_lines(file.text);
+    if (lines.empty())
+        return std::nullopt;
+    const int start = std::max(inst.start_line, 0);
+    const int end = std::min(inst.end_line, static_cast<int>(lines.size()) - 1);
+    if (start > end)
+        return std::nullopt;
+
+    std::unordered_map<std::string, std::string> desired_by_port;
+    std::vector<std::string> desired_order;
+    for (const auto& item : desired) {
+        if (item.port.empty())
+            continue;
+        if (!desired_by_port.contains(item.port))
+            desired_order.push_back(item.port);
+        desired_by_port[item.port] = item.signal;
     }
-    if (last_decl >= 0)
-        return last_decl + 1;
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-        if (lines[i].find(");") != std::string::npos)
-            return i + 1;
+
+    std::unordered_set<std::string> handled;
+    struct Replacement { size_t begin; size_t end; std::string text; };
+    std::unordered_map<int, std::vector<Replacement>> replacements_by_line;
+
+    for (const auto& conn : inst.connections) {
+        auto want = desired_by_port.find(conn.port_name);
+        if (want == desired_by_port.end())
+            continue;
+
+        const int line = conn.line > 0 ? conn.line - 1 : start;
+        if (line < start || line > end || line >= static_cast<int>(lines.size()))
+            continue;
+
+        const std::string& old_line = lines[line];
+        size_t open = old_line.find('(', static_cast<size_t>(std::max(conn.col, 0)));
+        if (open == std::string::npos)
+            open = old_line.find('(', static_cast<size_t>(std::max(conn.hint_col - 1, 0)));
+        if (open == std::string::npos)
+            continue;
+        const size_t close = old_line.find(')', open + 1);
+        if (close == std::string::npos)
+            continue;
+
+        replacements_by_line[line].push_back(Replacement{open + 1, close, want->second});
+        handled.insert(conn.port_name);
     }
-    return 0;
+
+    for (auto& [line, replacements] : replacements_by_line) {
+        std::sort(replacements.begin(), replacements.end(),
+                  [](const Replacement& a, const Replacement& b) { return a.begin > b.begin; });
+        for (const auto& repl : replacements) {
+            if (repl.begin > repl.end || repl.end > lines[line].size())
+                continue;
+            lines[line].replace(repl.begin, repl.end - repl.begin, repl.text);
+        }
+    }
+
+    std::vector<PortSignalEdit> missing;
+    for (const auto& port : desired_order) {
+        if (!handled.contains(port))
+            missing.push_back(PortSignalEdit{port, desired_by_port[port]});
+    }
+
+    if (!missing.empty()) {
+        int close_line = end;
+        int close_col = static_cast<int>(lines[close_line].size());
+        for (int i = end; i >= start; --i) {
+            auto pos = lines[i].rfind(");");
+            if (pos != std::string::npos) {
+                close_line = i;
+                close_col = static_cast<int>(pos);
+                break;
+            }
+        }
+
+        std::string indent = "    ";
+        for (const auto& conn : inst.connections) {
+            const int line = conn.line > 0 ? conn.line - 1 : -1;
+            if (line >= start && line <= close_line && line < static_cast<int>(lines.size())) {
+                const auto dot = lines[line].find('.');
+                if (dot != std::string::npos) {
+                    indent = lines[line].substr(0, dot);
+                    break;
+                }
+            }
+        }
+        if (inst.connections.empty() && close_line >= 0 && close_line < static_cast<int>(lines.size())) {
+            const auto first_non_ws = lines[close_line].find_first_not_of(" \t");
+            indent = (first_non_ws == std::string::npos ? std::string{} : lines[close_line].substr(0, first_non_ws)) + "    ";
+        }
+        const auto close_non_ws = lines[close_line].find_first_not_of(" \t");
+        const std::string close_indent = close_non_ws == std::string::npos
+            ? std::string{}
+            : lines[close_line].substr(0, close_non_ws);
+
+        std::string insertion;
+        if (!inst.connections.empty())
+            insertion += ",";
+        insertion += "\n";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            insertion += indent + "." + missing[i].port + "(" + missing[i].signal + ")";
+            if (i + 1 < missing.size())
+                insertion += ",";
+            insertion += "\n";
+        }
+        insertion += close_indent;
+
+        if (close_col < 0 || close_col > static_cast<int>(lines[close_line].size()))
+            return std::nullopt;
+        lines[close_line].insert(static_cast<size_t>(close_col), insertion);
+    }
+
+    return TextEdit{file.uri, start, 0, end + 1, 0, join_lines(lines, start, end)};
 }
 
 static std::string type_for_decl(std::string type) {
@@ -352,11 +741,11 @@ static std::string type_for_decl(std::string type) {
     return type;
 }
 
-static std::optional<TextEdit> add_wire_decl(const FileView& file, const std::string& name,
-                                             const std::string& type) {
-    if (declared_signal(file.text, name))
+static std::optional<TextEdit> add_wire_decl(const FileView& file, const std::string& module_name,
+                                             const std::string& name, const std::string& type) {
+    if (declared_signal(file, module_name, name))
         return std::nullopt;
-    const int line = wire_insert_line(file.text);
+    const int line = wire_insert_line(file, module_name);
     return TextEdit{file.uri, line, 0, line, 0, type_for_decl(type) + " " + name + ";\n"};
 }
 
@@ -371,11 +760,17 @@ static std::optional<TextEdit> add_module_port(const FileView& file, const std::
     if (semi == std::string::npos)
         return std::nullopt;
     const auto close = file.text.rfind(')', semi);
-    if (close == std::string::npos || close < module_pos)
-        return std::nullopt;
-    auto [line, col] = offset_to_pos(file.text, close);
     auto lines = split_lines(file.text);
     std::string indent = "    ";
+    if (close == std::string::npos || close < module_pos) {
+        // Module has no ANSI port list yet. Convert `module child;` to an ANSI
+        // header that carries the new boundary port.
+        auto [line, col] = offset_to_pos(file.text, semi);
+        return TextEdit{file.uri, line, col, line, col,
+                        "(\n" + indent + direction + " " + type_for_decl(type) + " " +
+                            port_name + "\n)"};
+    }
+    auto [line, col] = offset_to_pos(file.text, close);
     for (int i = line; i >= 0; --i) {
         if (lines[i].find("input") != std::string::npos || lines[i].find("output") != std::string::npos ||
             lines[i].find("inout") != std::string::npos) {
@@ -482,7 +877,9 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
                                         const std::string& source_port,
                                         const std::string& dest_path,
                                         const std::string& dest_port,
-                                        const std::string& wire_name) {
+                                        const std::string& wire_name,
+                                        const std::vector<std::string>& source_boundary_ports = {},
+                                        const std::vector<std::string>& dest_boundary_ports = {}) {
     ConnectBuildResult r;
     auto files = collect_files(analyzer, uri);
     auto hierarchy = build_hierarchy(files);
@@ -510,61 +907,133 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     const auto root_mod = lca.substr(lca.find_last_of('.') == std::string::npos ? 0 : lca.find_last_of('.') + 1);
     r.lca_module = hierarchy.contains(lca) ? hierarchy.at(lca).module_name : root_mod;
 
+    auto source_steps = path_pairs_to_lca(source_path, lca);
+    auto dest_steps = path_pairs_to_lca(dest_path, lca);
+    const size_t needed_source_ports = source_steps.empty() ? 0 : source_steps.size() - 1;
+    const size_t needed_dest_ports = dest_steps.empty() ? 0 : dest_steps.size() - 1;
+    if (source_boundary_ports.size() < needed_source_ports) {
+        r.error = "missing source hierarchy port choices: expected " +
+                  std::to_string(needed_source_ports) + ", got " +
+                  std::to_string(source_boundary_ports.size());
+        return r;
+    }
+    if (dest_boundary_ports.size() < needed_dest_ports) {
+        r.error = "missing destination hierarchy port choices: expected " +
+                  std::to_string(needed_dest_ports) + ", got " +
+                  std::to_string(dest_boundary_ports.size());
+        return r;
+    }
+
+    // If the user routes through existing hierarchy boundary ports, size the
+    // LCA bridge wire from those boundary ports rather than from the leaf cell
+    // pin.  In the demo case `inv.o` is 1 bit, but `memory.o_data` is the real
+    // exported bus that should determine the top-level bridge declaration.
+    if (!source_boundary_ports.empty()) {
+        const auto& child = hierarchy.at(source_steps.front());
+        if (auto bp = port_on_module(files, child.parent_module, source_boundary_ports.front())) {
+            const auto typ = signal_decl_type_for_port(*bp);
+            if (!typ.empty())
+                r.wire_type = typ;
+        }
+    } else if (!dest_boundary_ports.empty()) {
+        const auto& child = hierarchy.at(dest_steps.front());
+        if (auto bp = port_on_module(files, child.parent_module, dest_boundary_ports.front())) {
+            const auto typ = signal_decl_type_for_port(*bp);
+            if (!typ.empty())
+                r.wire_type = typ;
+        }
+    }
+
     auto file_by_uri = std::unordered_map<std::string, const FileView*>();
     for (const auto& f : files)
         file_by_uri.emplace(f.uri, &f);
 
-    auto add_step = [&](const ResolvedInst& inst, const std::string& port, bool warn_override) {
+    struct InstanceEditGroup {
+        const FileView* file{nullptr};
+        InstanceEntry inst;
+        std::vector<PortSignalEdit> desired;
+    };
+    std::vector<InstanceEditGroup> instance_edit_groups;
+    std::unordered_map<std::string, size_t> instance_group_by_key;
+
+    auto instance_group_key = [](const ResolvedInst& inst) {
+        return inst.file_uri + "|" + inst.parent_module + "|" + inst.inst_name + "|" +
+               std::to_string(inst.entry.start_line) + "|" + std::to_string(inst.entry.end_line);
+    };
+
+    auto add_step = [&](const ResolvedInst& inst, const std::string& port,
+                        const std::string& signal, bool warn_override) {
         const auto* f = file_by_uri[inst.file_uri];
         auto old = connection_for(inst.entry, port);
         if (old && !old->signal_name.empty() && warn_override)
             r.warnings.push_back(inst.path + "." + port + " was connected to '" + old->signal_name + "' — will override");
-        if (auto edit = replace_or_add_connection(*f, inst.entry, port, wire_name)) {
-            r.preview.push_back(PreviewEdit{basename_from_uri(f->uri), inst.entry.start_line + 1,
-                                            "connect " + inst.inst_name + "." + port + "(" + wire_name + ")" +
-                                                (old && !old->signal_name.empty() ? " [overrides " + old->signal_name + "]" : ""),
-                                            old && !old->signal_name.empty()});
+
+        const auto key = instance_group_key(inst);
+        auto [it, inserted] = instance_group_by_key.emplace(key, instance_edit_groups.size());
+        if (inserted)
+            instance_edit_groups.push_back(InstanceEditGroup{.file = f, .inst = inst.entry});
+        instance_edit_groups[it->second].desired.push_back(PortSignalEdit{port, signal});
+
+        r.preview.push_back(PreviewEdit{basename_from_uri(f->uri), inst.entry.start_line + 1,
+                                        "connect " + inst.path + "." + port + "(" + signal + ")" +
+                                            (old && !old->signal_name.empty() ? " [overrides " + old->signal_name + "]" : ""),
+                                        old && !old->signal_name.empty()});
+    };
+
+    auto add_boundary_port = [&](const ResolvedInst& child_inst, const std::string& direction,
+                                 const std::string& port_name) {
+        const FileView* module_file = nullptr;
+        const auto* module = find_module(files, child_inst.parent_module, &module_file);
+        if (!module_file)
+            return;
+        if (module && module->port_by_name.contains(port_name))
+            return;
+        if (auto edit = add_module_port(*module_file, child_inst.parent_module, direction,
+                                        r.wire_type, port_name)) {
+            r.preview.push_back(PreviewEdit{basename_from_uri(module_file->uri), edit->sl + 1,
+                                            "add " + direction + " " + r.wire_type + " " +
+                                                port_name + " to " + child_inst.parent_module,
+                                            false});
             r.edits.push_back(*edit);
         }
     };
 
-    for (const auto& child_path : path_pairs_to_lca(source_path, lca)) {
-        const auto& inst = hierarchy.at(child_path);
-        add_step(inst, child_path == source_path ? source_port : wire_name, child_path == source_path);
-        if (inst.parent_path != lca && hierarchy.contains(inst.parent_path)) {
-            const auto& parent = hierarchy.at(inst.parent_path);
-            const FileView* mf = nullptr;
-            find_module(files, parent.module_name, &mf);
-            if (mf) {
-                if (auto edit = add_module_port(*mf, parent.module_name, "output", r.wire_type, wire_name)) {
-                    r.preview.push_back(PreviewEdit{basename_from_uri(mf->uri), edit->sl + 1,
-                                                    "add output " + r.wire_type + " " + wire_name + " to " + parent.module_name, false});
-                    r.edits.push_back(*edit);
-                }
-            }
-        }
+    // Source side: export the selected leaf output upward through each ancestor
+    // module port chosen by the user.  The final child-of-LCA instance connects
+    // to the LCA-local bridge wire.
+    for (size_t i = 0; i < source_steps.size(); ++i) {
+        const auto& inst = hierarchy.at(source_steps[i]);
+        const std::string inst_port = (i == 0) ? source_port : source_boundary_ports[i - 1];
+        const std::string signal = (i + 1 < source_steps.size()) ? source_boundary_ports[i]
+                                                                 : wire_name;
+        add_step(inst, inst_port, signal, i == 0);
+        if (i + 1 < source_steps.size())
+            add_boundary_port(inst, "output", source_boundary_ports[i]);
     }
-    for (const auto& child_path : path_pairs_to_lca(dest_path, lca)) {
-        const auto& inst = hierarchy.at(child_path);
-        add_step(inst, child_path == dest_path ? dest_port : wire_name, child_path == dest_path);
-        if (inst.parent_path != lca && hierarchy.contains(inst.parent_path)) {
-            const auto& parent = hierarchy.at(inst.parent_path);
-            const FileView* mf = nullptr;
-            find_module(files, parent.module_name, &mf);
-            if (mf) {
-                if (auto edit = add_module_port(*mf, parent.module_name, "input", r.wire_type, wire_name)) {
-                    r.preview.push_back(PreviewEdit{basename_from_uri(mf->uri), edit->sl + 1,
-                                                    "add input " + r.wire_type + " " + wire_name + " to " + parent.module_name, false});
-                    r.edits.push_back(*edit);
-                }
-            }
-        }
+
+    // Destination side: import the LCA-local bridge wire downward through each
+    // user-chosen ancestor input port until the selected leaf input is driven.
+    for (size_t i = 0; i < dest_steps.size(); ++i) {
+        const auto& inst = hierarchy.at(dest_steps[i]);
+        const std::string inst_port = (i == 0) ? dest_port : dest_boundary_ports[i - 1];
+        const std::string signal = (i + 1 < dest_steps.size()) ? dest_boundary_ports[i]
+                                                               : wire_name;
+        add_step(inst, inst_port, signal, i == 0);
+        if (i + 1 < dest_steps.size())
+            add_boundary_port(inst, "input", dest_boundary_ports[i]);
+    }
+
+    for (const auto& group : instance_edit_groups) {
+        if (!group.file)
+            continue;
+        if (auto edit = replace_or_add_connections(*group.file, group.inst, group.desired))
+            r.edits.push_back(*edit);
     }
 
     const FileView* lca_file = nullptr;
     find_module(files, r.lca_module, &lca_file);
     if (lca_file) {
-        if (auto edit = add_wire_decl(*lca_file, wire_name, r.wire_type)) {
+        if (auto edit = add_wire_decl(*lca_file, r.lca_module, wire_name, r.wire_type)) {
             r.preview.push_back(PreviewEdit{basename_from_uri(lca_file->uri), edit->sl + 1,
                                             "declare " + r.wire_type + " " + wire_name + " in " + r.lca_module, false});
             r.edits.push_back(*edit);
@@ -606,20 +1075,6 @@ find_current_file_instance(const std::vector<FileView>& files, const std::string
     return std::nullopt;
 }
 
-static std::string signal_type_in_text(const std::string& text, const std::string& sig) {
-    if (sig.empty())
-        return "";
-    const std::regex re("\\b(?:wire|logic|reg)\\b([^;]*?)\\b" + sig + "\\b");
-    std::smatch m;
-    if (std::regex_search(text, m, re)) {
-        std::string s = trim(m.str());
-        const auto name_pos = s.rfind(sig);
-        if (name_pos != std::string::npos)
-            s = trim(s.substr(0, name_pos));
-        return s;
-    }
-    return "";
-}
 
 } // namespace
 
@@ -656,8 +1111,11 @@ std::string connect_apply_preview_json(const Analyzer& analyzer, const std::stri
                                        const std::string& source_port,
                                        const std::string& dest_path,
                                        const std::string& dest_port,
-                                       const std::string& wire_name) {
-    auto r = build_connect(analyzer, uri, source_path, source_port, dest_path, dest_port, wire_name);
+                                       const std::string& wire_name,
+                                       const std::vector<std::string>& source_boundary_ports,
+                                       const std::vector<std::string>& dest_boundary_ports) {
+    auto r = build_connect(analyzer, uri, source_path, source_port, dest_path, dest_port,
+                           wire_name, source_boundary_ports, dest_boundary_ports);
     if (!r.error.empty())
         return error_json(r.error);
     return preview_json(wire_name, r.wire_type, r.lca_module, r.preview, r.warnings);
@@ -668,8 +1126,11 @@ std::string connect_apply_edit_json(const Analyzer& analyzer, const std::string&
                                     const std::string& source_port,
                                     const std::string& dest_path,
                                     const std::string& dest_port,
-                                    const std::string& wire_name) {
-    auto r = build_connect(analyzer, uri, source_path, source_port, dest_path, dest_port, wire_name);
+                                    const std::string& wire_name,
+                                    const std::vector<std::string>& source_boundary_ports,
+                                    const std::vector<std::string>& dest_boundary_ports) {
+    auto r = build_connect(analyzer, uri, source_path, source_port, dest_path, dest_port,
+                           wire_name, source_boundary_ports, dest_boundary_ports);
     if (!r.error.empty())
         return error_json(r.error);
     return workspace_edit_json(r.edits);
@@ -703,13 +1164,13 @@ std::string interface_json(const Analyzer& analyzer, const std::string& uri,
             if (!first) out += ",";
             first = false;
             out += "{\"inst1_port\":" + q(c1.port_name) + ",\"inst2_port\":\"\",\"signal\":" + q(c1.signal_name) +
-                   ",\"signal_type\":" + q(signal_type_in_text(a->first->text, c1.signal_name)) + "}";
+                   ",\"signal_type\":" + q(signal_type_in_file(*a->first, inst1.parent_module, c1.signal_name)) + "}";
             continue;
         }
         if (!first) out += ",";
         first = false;
         out += "{\"inst1_port\":" + q(c1.port_name) + ",\"inst2_port\":" + q(it->second.port_name) +
-               ",\"signal\":" + q(c1.signal_name) + ",\"signal_type\":" + q(signal_type_in_text(a->first->text, c1.signal_name)) + "}";
+               ",\"signal\":" + q(c1.signal_name) + ",\"signal_type\":" + q(signal_type_in_file(*a->first, inst1.parent_module, c1.signal_name)) + "}";
     }
     out += "]}";
     return out;
@@ -758,14 +1219,14 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
         if (!any) {
             if (!first) out += ","; first = false;
             out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(decl_type_for_port(p)) + ",\"port_dir\":" + q(p.direction) +
-                   ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_text(file.text, sig)) +
+                   ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_file(file, inst.parent_module, sig)) +
                    ",\"other_inst\":\"\",\"other_port\":\"\",\"other_dir\":\"\",\"other_type\":\"\"}";
         } else {
             for (auto it = range.first; it != range.second; ++it) {
                 const auto& [oi, op, od, ot] = it->second;
                 if (!first) out += ","; first = false;
                 out += "{\"port_name\":" + q(p.name) + ",\"port_type\":" + q(decl_type_for_port(p)) + ",\"port_dir\":" + q(p.direction) +
-                       ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_text(file.text, sig)) +
+                       ",\"signal\":" + q(sig) + ",\"signal_type\":" + q(signal_type_in_file(file, inst.parent_module, sig)) +
                        ",\"other_inst\":" + q(oi) + ",\"other_port\":" + q(op) + ",\"other_dir\":" + q(od) +
                        ",\"other_type\":" + q(ot) + "}";
             }
@@ -812,7 +1273,7 @@ std::string interface_connect_edit_json(const Analyzer& analyzer, const std::str
     std::vector<TextEdit> edits;
     if (auto e = replace_or_add_connection(*a->first, *a->second, inst1_port, wire_name)) edits.push_back(*e);
     if (auto e = replace_or_add_connection(*b->first, *b->second, inst2_port, wire_name)) edits.push_back(*e);
-    if (auto e = add_wire_decl(*a->first, wire_name, declaration_type)) edits.push_back(*e);
+    if (auto e = add_wire_decl(*a->first, a->second->parent_module, wire_name, declaration_type)) edits.push_back(*e);
     return workspace_edit_json(edits);
 }
 
@@ -831,13 +1292,7 @@ std::string interface_disconnect_edit_json(const Analyzer& analyzer, const std::
     if (!inst1_port.empty()) if (auto e = replace_or_add_connection(*a->first, *a->second, inst1_port, "", signal_name, false)) edits.push_back(*e);
     if (!inst2_port.empty()) if (auto e = replace_or_add_connection(*b->first, *b->second, inst2_port, "", signal_name, false)) edits.push_back(*e);
 
-    auto lines = split_lines(a->first->text);
-    const std::regex sig_decl_re("^\\s*(?:wire|logic|reg)\\b[^;]*\\b" + signal_name + "\\b[^;]*;\\s*$");
-    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
-        if (std::regex_search(lines[i], sig_decl_re)) {
-            edits.push_back(TextEdit{a->first->uri, i, 0, i + 1, 0, ""});
-            break;
-        }
-    }
+    if (auto e = declaration_delete_edit(*a->first, a->second->parent_module, signal_name))
+        edits.push_back(*e);
     return workspace_edit_json(edits);
 }

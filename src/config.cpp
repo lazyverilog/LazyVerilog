@@ -169,6 +169,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 cfg.format.format_off_comment_pattern = *v;
             if (auto v = (*f)["format_on_comment_pattern"].value<std::string>())
                 cfg.format.format_on_comment_pattern = *v;
+            if (auto v = (*f)["log_path"].value<std::string>())
+                cfg.format.log_path = *v;
             // Nested subtables
             if (auto st = (*f)["statement"].as_table()) {
                 if (auto v = (*st)["align"].value<bool>())
