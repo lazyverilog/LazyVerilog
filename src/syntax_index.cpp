@@ -1,4 +1,5 @@
 #include "syntax_index.hpp"
+#include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
 #include <cctype>
@@ -17,100 +18,6 @@ using namespace slang::syntax;
 
 static std::string tok_str(const slang::parsing::Token& token) {
     return std::string(token.valueText());
-}
-
-static bool index_fragment_edge_is_wordlike(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
-}
-
-static bool index_needs_space_between_fragments(std::string_view previous,
-                                                std::string_view next) {
-    if (previous.empty() || next.empty())
-        return false;
-
-    const char prev = previous.back();
-    const char curr = next.front();
-
-    // SyntaxTree::toString() is convenient, but it can render tokens after
-    // preprocessing.  The syntax index feeds hover, so it should preserve the
-    // user's spelling for declarations such as:
-    //
-    //     input logic [`WIDTH-1:0] data [DEPTH]
-    //
-    // To do that we concatenate raw syntax tokens, which means we must restore
-    // a few human-readable separators that trivia removal would otherwise
-    // collapse ("logic[3:0]" -> "logic [3:0]", "bitsigned" -> "bit signed").
-    if (index_fragment_edge_is_wordlike(prev) && index_fragment_edge_is_wordlike(curr))
-        return true;
-    if (index_fragment_edge_is_wordlike(prev) && (curr == '[' || curr == '{'))
-        return true;
-    if (prev == ',')
-        return true;
-    return false;
-}
-
-static std::optional<std::string> source_text_for_index_range(const slang::SourceManager& sm,
-                                                              slang::SourceRange range) {
-    if (!range.start().valid() || !range.end().valid())
-        return std::nullopt;
-    if (range.start().buffer() != range.end().buffer())
-        return std::nullopt;
-
-    const auto source = sm.getSourceText(range.start().buffer());
-    const size_t begin = range.start().offset();
-    const size_t end = range.end().offset();
-    if (begin > end || end > source.size())
-        return std::nullopt;
-
-    return std::string(source.substr(begin, end - begin));
-}
-
-static bool same_index_source_range(slang::SourceRange lhs, slang::SourceRange rhs) {
-    return lhs.start() == rhs.start() && lhs.end() == rhs.end();
-}
-
-static std::string render_index_token_text(
-    const slang::SourceManager& sm, const slang::parsing::Token& token,
-    std::optional<slang::SourceRange>& last_macro_range) {
-    if (sm.isMacroLoc(token.location())) {
-        const auto expansion_range = sm.getExpansionRange(token.location());
-
-        // One macro invocation can produce multiple parser tokens.  Emitting
-        // the expansion range once preserves exactly what the user wrote while
-        // avoiding duplicates:
-        //
-        //     [`WIDTH-1:0]   -> one source slice, not repeated raw expansion
-        if (last_macro_range && same_index_source_range(*last_macro_range, expansion_range))
-            return {};
-        last_macro_range = expansion_range;
-
-        if (auto text = source_text_for_index_range(sm, expansion_range))
-            return *text;
-    } else {
-        last_macro_range.reset();
-    }
-
-    return std::string(token.rawText());
-}
-
-static std::string render_index_syntax_text(const slang::SourceManager& sm,
-                                            const slang::syntax::SyntaxNode& node) {
-    std::string text;
-    std::optional<slang::SourceRange> last_macro_range;
-    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
-        const auto token = *it;
-        if (!token || token.isMissing())
-            continue;
-
-        const auto fragment = render_index_token_text(sm, token, last_macro_range);
-        if (fragment.empty())
-            continue;
-
-        if (index_needs_space_between_fragments(text, fragment))
-            text += ' ';
-        text += fragment;
-    }
-    return trim_copy(std::move(text));
 }
 
 static std::string simple_identifier_from_expr(const PropertyExprSyntax* expr) {
@@ -132,94 +39,6 @@ static std::pair<int, int> token_pos(const slang::SourceManager& sm,
     const auto line = sm.getLineNumber(token.location());
     const auto col = sm.getColumnNumber(token.location());
     return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
-}
-
-static std::string path_to_uri_for_index(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
-}
-
-static std::string token_uri_for_index(const slang::SourceManager& sm,
-                                       const slang::parsing::Token& token) {
-    if (!token || !token.location().valid())
-        return {};
-
-    const auto file_name = sm.getFileName(token.location());
-    if (file_name.empty())
-        return {};
-
-    std::string file(file_name);
-    if (file.starts_with("file://"))
-        return file;
-    return path_to_uri_for_index(file);
-}
-
-static SourceFileID token_file_id_for_index(SyntaxIndex& index, const slang::SourceManager& sm,
-                                            const slang::parsing::Token& token) {
-    auto uri = token_uri_for_index(sm, token);
-    if (uri.empty())
-        return kInvalidSourceFileID;
-    return index.intern_source_file(std::move(uri));
-}
-
-static std::string location_uri_for_index(const slang::SourceManager& sm,
-                                          slang::SourceLocation location) {
-    if (!location.valid())
-        return {};
-
-    const auto file_name = sm.getFileName(location);
-    if (file_name.empty())
-        return {};
-
-    std::string file(file_name);
-    if (file.starts_with("file://"))
-        return file;
-    return path_to_uri_for_index(file);
-}
-
-static SourceFileID location_file_id_for_index(SyntaxIndex& index, const slang::SourceManager& sm,
-                                               slang::SourceLocation location) {
-    auto uri = location_uri_for_index(sm, location);
-    if (uri.empty())
-        return kInvalidSourceFileID;
-    return index.intern_source_file(std::move(uri));
-}
-
-static std::string symbol_canonical(std::string kind, std::string scope, std::string name) {
-    if (scope.empty())
-        return kind + "::" + name;
-    return kind + "::" + scope + "::" + name;
-}
-
-static bool is_module_value_kind(std::string_view kind) {
-    return kind == "variable" || kind == "net" || kind == "parameter" || kind == "localparam" ||
-           kind == "port";
-}
-
-static std::string canonical_type_name_from_index_text(std::string_view type) {
-    // Keep this deliberately syntactic and cheap.  The index cannot rely on a
-    // full semantic type checker for closed files, so for member references we
-    // recover the last identifier-ish component from declarations such as:
-    //
-    //   packet_t pkt;
-    //   pkg::packet_t pkt;
-    //   logic [7:0] not_a_struct;
-    //
-    // Built-in scalar types will simply fail to match any typedef field map.
-    size_t end = type.size();
-    while (end > 0 && !index_fragment_edge_is_wordlike(type[end - 1]))
-        --end;
-    size_t begin = end;
-    while (begin > 0 && index_fragment_edge_is_wordlike(type[begin - 1]))
-        --begin;
-    return std::string(type.substr(begin, end - begin));
-}
-
-static std::string simple_identifier_from_index_expr(const ExpressionSyntax* expr) {
-    if (!expr)
-        return {};
-    if (const auto* ident = expr->as_if<IdentifierNameSyntax>())
-        return tok_str(ident->identifier);
-    return {};
 }
 
 static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
@@ -268,7 +87,7 @@ static void collect_macro_reference_occurrences(const slang::syntax::SyntaxTree&
         if (!def || !index_macro_has_user_source_location(sm, def->name))
             continue;
         const auto [line, col] = token_pos(sm, def->name);
-        add_macro_ref(std::string(def->name.valueText()), token_file_id_for_index(index, sm, def->name),
+        add_macro_ref(std::string(def->name.valueText()), source_file_id_for_token(index, sm, def->name),
                       line, col);
     }
 
@@ -297,7 +116,7 @@ static void collect_macro_reference_occurrences(const slang::syntax::SyntaxTree&
             // One invocation can expand to many parser tokens.  Use the
             // spelling range as the de-duplication key so each `FOO occurrence
             // is reported once.
-            const auto uri = location_uri_for_index(sm, range.start());
+            const auto uri = uri_from_source_location(sm, range.start());
             const std::string key = uri + ":" + std::to_string(range.start().offset()) + ":" +
                                     std::to_string(range.end().offset());
             if (!seen_expansions.insert(key).second)
@@ -307,10 +126,10 @@ static void collect_macro_reference_occurrences(const slang::syntax::SyntaxTree&
             int col = (int)sm.getColumnNumber(range.start()) - 1;
             if (col < 0)
                 col = 0;
-            if (auto text = source_text_for_index_range(sm, range); text && text->starts_with('`'))
+            if (auto text = source_text_for_syntax_range(sm, range); text && text->starts_with('`'))
                 ++col;
 
-            add_ref(std::string(macro_name), location_file_id_for_index(index, sm, range.start()),
+            add_ref(std::string(macro_name), source_file_id_for_location(index, sm, range.start()),
                           line, col);
         }
     };
@@ -323,7 +142,7 @@ static MacroEntry macro_entry_from_define(SyntaxIndex& index, const slang::Sourc
                                           const DefineDirectiveSyntax& def) {
     MacroEntry mac;
     mac.name = std::string(def.name.valueText());
-    mac.file_id = token_file_id_for_index(index, sm, def.name);
+    mac.file_id = source_file_id_for_token(index, sm, def.name);
     if (def.formalArguments) {
         mac.is_function_like = true;
         for (const auto* arg : def.formalArguments->args) {
@@ -345,15 +164,15 @@ static std::string direction_of(const PortHeaderSyntax& header) {
 
 static std::string type_of(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return render_index_syntax_text(sm, *variable->dataType);
+        return render_syntax_node_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
-        return render_index_syntax_text(sm, *net->dataType);
+        return render_syntax_node_text(sm, *net->dataType);
     return {};
 }
 
 static std::string decl_type_of(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return render_index_syntax_text(sm, *variable->dataType);
+        return render_syntax_node_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>()) {
         // Net ports split the declaration into a net kind token and a data
         // type node in slang's syntax tree:
@@ -370,10 +189,10 @@ static std::string decl_type_of(const slang::SourceManager& sm, const PortHeader
         //     [5:0] data32;
         //
         // Store the full declaration type separately.  This remains syntactic
-        // text: render_index_syntax_text() preserves typedef names and macro /
+        // text: render_syntax_node_text() preserves typedef names and macro /
         // parameter based dimensions such as `WIDTH or [DEPTH-1:0].
         std::string type = tok_str(net->netType);
-        const auto data_type = render_index_syntax_text(sm, *net->dataType);
+        const auto data_type = render_syntax_node_text(sm, *net->dataType);
         if (!data_type.empty())
             type += (type.empty() ? "" : " ") + data_type;
         return type;
@@ -383,7 +202,7 @@ static std::string decl_type_of(const slang::SourceManager& sm, const PortHeader
 
 static std::string signal_decl_type_of(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return render_index_syntax_text(sm, *variable->dataType);
+        return render_syntax_node_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>()) {
         // This branch is selected from slang's NetPortHeaderSyntax, not from
         // textual matching.  Internal bridge signals generated by Connect /
@@ -395,7 +214,7 @@ static std::string signal_decl_type_of(const slang::SourceManager& sm, const Por
         // The data type text is still rendered syntactically, so macro and
         // parameter dimensions remain as the user wrote them.
         std::string type = "logic";
-        const auto data_type = render_index_syntax_text(sm, *net->dataType);
+        const auto data_type = render_syntax_node_text(sm, *net->dataType);
         if (!data_type.empty())
             type += " " + data_type;
         return type;
@@ -418,7 +237,7 @@ static std::string with_declarator_dimensions(const slang::SourceManager& sm, st
         if (!dimension)
             continue;
 
-        const auto rendered = render_index_syntax_text(sm, *dimension);
+        const auto rendered = render_syntax_node_text(sm, *dimension);
         if (rendered.empty())
             continue;
 
@@ -438,7 +257,7 @@ static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
     auto [line, col] = token_pos(sm, name);
     ports.push_back(PortEntry{
         .name = tok_str(name),
-        .file_id = token_file_id_for_index(index, sm, name),
+        .file_id = source_file_id_for_token(index, sm, name),
         .direction = std::move(direction),
         .type = std::move(type),
         .decl_type = std::move(decl_type),
@@ -555,7 +374,7 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
             entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = tok_str(instance->decl->name);
-                entry.file_id = token_file_id_for_index(index, sm, instance->decl->name);
+                entry.file_id = source_file_id_for_token(index, sm, instance->decl->name);
                 entry.line = token_pos(sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -579,7 +398,7 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
                 entry.connections.push_back(NamedPortConn{
                     .port_name = tok_str(named->name),
                     .signal_name = simple_identifier_from_expr(named->expr),
-                    .file_id = token_file_id_for_index(index, sm, named->name),
+                    .file_id = source_file_id_for_token(index, sm, named->name),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,
@@ -595,7 +414,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                            IndexDepth depth = IndexDepth::Full) {
     ModuleEntry entry;
     entry.name = tok_str(module.header->name);
-    entry.file_id = token_file_id_for_index(index, sm, module.header->name);
+    entry.file_id = source_file_id_for_token(index, sm, module.header->name);
     auto [line, col] = token_pos(sm, module.header->name);
     entry.line = line;
     entry.col = col;
@@ -609,13 +428,13 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             if (!param)
                 continue;
             const std::string direction = tok_str(param->keyword); // "parameter" or "localparam"
-            const std::string type_text = render_index_syntax_text(sm, *param->type);
+            const std::string type_text = render_syntax_node_text(sm, *param->type);
             for (const auto* decl : param->declarators) {
                 if (!decl)
                     continue;
                 std::string default_val;
                 if (decl->initializer)
-                    default_val = render_index_syntax_text(sm, *decl->initializer->expr);
+                    default_val = render_syntax_node_text(sm, *decl->initializer->expr);
                 add_port(entry.ports, index, sm, decl->name, direction, type_text, type_text, {},
                          std::move(default_val));
             }
@@ -638,7 +457,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 auto [ml, mc] = token_pos(sm, item->name);
                 entry.modports.push_back(ModportEntry{
                     .name = tok_str(item->name),
-                    .file_id = token_file_id_for_index(index, sm, item->name),
+                    .file_id = source_file_id_for_token(index, sm, item->name),
                     .line = ml,
                     .col = mc,
                 });
@@ -671,7 +490,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         if (!member)
             continue;
         if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const std::string type_text = render_index_syntax_text(sm, *data->type);
+            const std::string type_text = render_syntax_node_text(sm, *data->type);
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
@@ -681,7 +500,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = entry.name,
-                    .file_id = token_file_id_for_index(index, sm, decl->name),
+                    .file_id = source_file_id_for_token(index, sm, decl->name),
                     .line = vl,
                     .col = vc,
                 });
@@ -690,11 +509,11 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             const auto& proto = *fn->prototype;
             auto [vl, vc] = token_pos(sm, proto.keyword);
             index.values.push_back(ValueEntry{
-                .name = render_index_syntax_text(sm, *proto.name),
-                .type = render_index_syntax_text(sm, *proto.returnType),
+                .name = render_syntax_node_text(sm, *proto.name),
+                .type = render_syntax_node_text(sm, *proto.returnType),
                 .kind = "function",
                 .parent_scope = entry.name,
-                .file_id = token_file_id_for_index(index, sm, proto.keyword),
+                .file_id = source_file_id_for_token(index, sm, proto.keyword),
                 .line = vl,
                 .col = vc,
             });
@@ -726,7 +545,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         }
 
         void handle(const LocalVariableDeclarationSyntax& node) {
-            const auto type_text = render_index_syntax_text(sm, *node.type);
+            const auto type_text = render_syntax_node_text(sm, *node.type);
             const auto [scope_start, scope_end] =
                 scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back();
             for (const auto* decl : node.declarators) {
@@ -738,7 +557,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = token_file_id_for_index(index, sm, decl->name),
+                    .file_id = source_file_id_for_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -754,7 +573,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 return;
             }
 
-            const auto type_text = render_index_syntax_text(sm, *node.type);
+            const auto type_text = render_syntax_node_text(sm, *node.type);
             const auto [scope_start, scope_end] = scope_stack.back();
             for (const auto* decl : node.declarators) {
                 if (!decl)
@@ -765,7 +584,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = token_file_id_for_index(index, sm, decl->name),
+                    .file_id = source_file_id_for_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -792,21 +611,21 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                            const slang::SourceManager& sm, std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = tok_str(cls.name);
-    entry.file_id = token_file_id_for_index(index, sm, cls.name);
+    entry.file_id = source_file_id_for_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos(sm, cls.name);
     entry.line = line;
     entry.col = col;
 
     if (cls.extendsClause)
-        entry.base_class = render_index_syntax_text(sm, *cls.extendsClause->baseName);
+        entry.base_class = render_syntax_node_text(sm, *cls.extendsClause->baseName);
 
     for (const auto* item : cls.items) {
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
             if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
-                const std::string type_text = render_index_syntax_text(sm, *data->type);
+                const std::string type_text = render_syntax_node_text(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)
                         continue;
@@ -814,7 +633,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     entry.fields.push_back(
                         FieldEntry{.name = tok_str(decl->name),
                                    .type = type_text,
-                                   .file_id = token_file_id_for_index(index, sm, decl->name),
+                                   .file_id = source_file_id_for_token(index, sm, decl->name),
                                    .line = fl,
                                    .col = fc});
                 }
@@ -822,10 +641,10 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         } else if (const auto* meth = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *meth->declaration->prototype;
             MethodEntry m;
-            m.name = render_index_syntax_text(sm, *proto.name);
-            m.return_type = render_index_syntax_text(sm, *proto.returnType);
+            m.name = render_syntax_node_text(sm, *proto.name);
+            m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
-            m.file_id = token_file_id_for_index(index, sm, proto.keyword);
+            m.file_id = source_file_id_for_token(index, sm, proto.keyword);
             auto [ml, mc] = token_pos(sm, proto.keyword);
             m.line = ml;
             m.col = mc;
@@ -842,7 +661,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
     TypedefEntry entry;
     entry.name = tok_str(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = token_file_id_for_index(index, sm, td.name);
+    entry.file_id = source_file_id_for_token(index, sm, td.name);
     auto [td_line, td_col] = token_pos(sm, td.name);
     entry.line = td_line;
     entry.col = td_col;
@@ -854,7 +673,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 auto [em_line, em_col] = token_pos(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = tok_str(member->name),
-                    .file_id = token_file_id_for_index(index, sm, member->name),
+                    .file_id = source_file_id_for_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -865,7 +684,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const std::string type_text = render_index_syntax_text(sm, *member->type);
+            const std::string type_text = render_syntax_node_text(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;
@@ -873,14 +692,14 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 entry.fields.push_back(FieldEntry{
                     .name = tok_str(decl->name),
                     .type = with_declarator_dimensions(sm, type_text, *decl),
-                    .file_id = token_file_id_for_index(index, sm, decl->name),
+                    .file_id = source_file_id_for_token(index, sm, decl->name),
                     .line = fl,
                     .col = fc,
                 });
             }
         }
     } else {
-        entry.resolved = render_index_syntax_text(sm, *td.type);
+        entry.resolved = render_syntax_node_text(sm, *td.type);
     }
 
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -912,9 +731,9 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
             symbols.push_back(tok_str(cls->name));
             process_class(*cls, index, sm, pkg_name);
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            symbols.push_back(render_index_syntax_text(sm, *fn->prototype->name));
+            symbols.push_back(render_syntax_node_text(sm, *fn->prototype->name));
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const std::string type_text = render_index_syntax_text(sm, *data->type);
+            const std::string type_text = render_syntax_node_text(sm, *data->type);
             for (const auto* decl : data->declarators) {
                 if (decl) {
                     symbols.push_back(tok_str(decl->name));
@@ -924,7 +743,7 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                         .type = with_declarator_dimensions(sm, type_text, *decl),
                         .kind = "variable",
                         .parent_scope = pkg_name,
-                        .file_id = token_file_id_for_index(index, sm, decl->name),
+                        .file_id = source_file_id_for_token(index, sm, decl->name),
                         .line = vl,
                         .col = vc,
                     });
@@ -932,7 +751,7 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
             }
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                const std::string type_text = render_index_syntax_text(sm, *param->type);
+                const std::string type_text = render_syntax_node_text(sm, *param->type);
                 for (const auto* decl : param->declarators) {
                     if (decl) {
                         symbols.push_back(tok_str(decl->name));
@@ -942,7 +761,7 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                             .type = type_text,
                             .kind = tok_str(param->keyword),
                             .parent_scope = pkg_name,
-                            .file_id = token_file_id_for_index(index, sm, decl->name),
+                            .file_id = source_file_id_for_token(index, sm, decl->name),
                             .line = vl,
                             .col = vc,
                         });
@@ -1028,7 +847,7 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
                 if (!entry.wildcard)
                     entry.symbol_name = tok_str(item->item);
                 entry.parent_scope = current_scope();
-                entry.file_id = token_file_id_for_index(index, sm, item->package);
+                entry.file_id = source_file_id_for_token(index, sm, item->package);
                 entry.start_line = decl_line;
                 entry.end_line = current_end_line();
 
@@ -1041,464 +860,6 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
     };
 
     ImportVisitor visitor(index, sm);
-    root.visit(visitor);
-}
-
-static void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
-                                          const slang::SourceManager& sm) {
-    std::unordered_set<std::string> module_values;
-    std::unordered_map<std::string, std::string> module_value_types;
-    std::unordered_set<std::string> package_values;
-    std::unordered_set<std::string> class_fields;
-    std::unordered_set<std::string> typedef_fields;
-    std::unordered_map<std::string, std::string> unique_typedef_scopes;
-    std::unordered_set<std::string> ambiguous_typedef_names;
-    std::unordered_map<std::string, std::string> unique_enum_member_ids;
-    std::unordered_set<std::string> ambiguous_enum_members;
-    std::unordered_map<std::string, std::string> unique_type_ids;
-    std::unordered_set<std::string> ambiguous_type_names;
-    for (const auto& value : index.values) {
-        if (value.parent_scope.empty())
-            continue;
-        if (index.package_names.contains(value.parent_scope)) {
-            package_values.insert(value.parent_scope + "\n" + value.name);
-            continue;
-        }
-        if (is_module_value_kind(value.kind)) {
-            const auto key = value.parent_scope + "\n" + value.name;
-            module_values.insert(key);
-            // A file can contain duplicate declarations while being edited
-            // (and demo/memory_top.sv intentionally has an output named `test`
-            // followed by a local `fifo_entry_t test`).  For member references
-            // in a module body, the later declaration is the best syntactic
-            // approximation of the object type at the use site.  Overwrite
-            // instead of keeping the first declaration, otherwise `test.id`
-            // can be resolved through the stale output type and miss the
-            // fifo_entry_t::id field occurrence.
-            module_value_types[key] = canonical_type_name_from_index_text(value.type);
-        }
-    }
-    for (const auto& cls : index.classes) {
-        const std::string class_scope =
-            cls.parent_scope.empty() ? cls.name : cls.parent_scope + "::" + cls.name;
-        const auto class_id = symbol_canonical("class", cls.parent_scope, cls.name);
-        if (!ambiguous_type_names.contains(cls.name) && !unique_type_ids.try_emplace(cls.name, class_id).second) {
-            unique_type_ids.erase(cls.name);
-            ambiguous_type_names.insert(cls.name);
-        }
-        for (const auto& field : cls.fields)
-            class_fields.insert(class_scope + "\n" + field.name);
-    }
-    for (const auto& td : index.typedefs) {
-        const auto typedef_id = symbol_canonical("typedef", td.parent_scope, td.name);
-        if (!ambiguous_type_names.contains(td.name) && !unique_type_ids.try_emplace(td.name, typedef_id).second) {
-            unique_type_ids.erase(td.name);
-            ambiguous_type_names.insert(td.name);
-        }
-        const auto typedef_scope =
-            td.parent_scope.empty() ? td.name : td.parent_scope + "::" + td.name;
-        if (!ambiguous_typedef_names.contains(td.name) &&
-            !unique_typedef_scopes.try_emplace(td.name, typedef_scope).second) {
-            unique_typedef_scopes.erase(td.name);
-            ambiguous_typedef_names.insert(td.name);
-        }
-        for (const auto& field : td.fields)
-            typedef_fields.insert(typedef_scope + "\n" + field.name);
-        if (td.is_enum) {
-            for (const auto& member : td.enum_members) {
-                const auto member_id = symbol_canonical("enum_member", typedef_scope, member.name);
-                if (!ambiguous_enum_members.contains(member.name) &&
-                    !unique_enum_member_ids.try_emplace(member.name, member_id).second) {
-                    unique_enum_member_ids.erase(member.name);
-                    ambiguous_enum_members.insert(member.name);
-                }
-            }
-        }
-    }
-
-    auto add_reference = [&](const slang::parsing::Token& token, std::string canonical_id) {
-        if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
-            !token.location().valid())
-            return;
-
-        const auto [line, col] = token_pos(sm, token);
-        const std::string name(token.valueText());
-        if (name.empty())
-            return;
-
-        index.references.push_back(ReferenceEntry{
-            .name = name,
-            .file_id = token_file_id_for_index(index, sm, token),
-            .symbol_id = SymbolID::from_canonical(canonical_id),
-            .symbol_debug = std::move(canonical_id),
-            .line = line,
-            .col = col,
-            .end_col = col + (int)name.size(),
-        });
-    };
-
-    struct ReferenceVisitor : public SyntaxVisitor<ReferenceVisitor> {
-        SyntaxIndex& index;
-        const slang::SourceManager& sm;
-        decltype(add_reference)& add_ref;
-        const std::unordered_set<std::string>& module_values;
-        const std::unordered_map<std::string, std::string>& module_value_types;
-        const std::unordered_set<std::string>& package_values;
-        const std::unordered_set<std::string>& class_fields;
-        const std::unordered_set<std::string>& typedef_fields;
-        const std::unordered_map<std::string, std::string>& unique_typedef_scopes;
-        const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
-        const std::unordered_map<std::string, std::string>& unique_type_ids;
-        std::string current_module;
-        std::string current_package;
-        std::string current_class;
-
-        ReferenceVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
-                         decltype(add_reference)& add_reference,
-                         const std::unordered_set<std::string>& module_values,
-                         const std::unordered_map<std::string, std::string>& module_value_types,
-                         const std::unordered_set<std::string>& package_values,
-                         const std::unordered_set<std::string>& class_fields,
-                         const std::unordered_set<std::string>& typedef_fields,
-                         const std::unordered_map<std::string, std::string>& unique_typedef_scopes,
-                         const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
-                         const std::unordered_map<std::string, std::string>& unique_type_ids)
-            : index(index), sm(sm), add_ref(add_reference), module_values(module_values),
-              module_value_types(module_value_types), package_values(package_values),
-              class_fields(class_fields), typedef_fields(typedef_fields),
-              unique_typedef_scopes(unique_typedef_scopes),
-              unique_enum_member_ids(unique_enum_member_ids),
-              unique_type_ids(unique_type_ids) {}
-
-        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
-            const std::string module_name(node.header->name.valueText());
-            if (!module_name.empty())
-                add_ref(node.header->name, symbol_canonical("module", {}, module_name));
-
-            auto previous_module = current_module;
-            auto previous_package = current_package;
-            if (node.kind == SyntaxKind::PackageDeclaration) {
-                current_package = module_name;
-                current_module.clear();
-            } else {
-                current_module = module_name;
-            }
-            visitDefault(node);
-            current_module = std::move(previous_module);
-            current_package = std::move(previous_package);
-        }
-
-        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
-            const std::string class_name(node.name.valueText());
-            const std::string parent_scope = !current_package.empty() ? current_package : std::string{};
-            if (!class_name.empty())
-                add_ref(node.name, symbol_canonical("class", parent_scope, class_name));
-
-            auto previous_class = current_class;
-            current_class = parent_scope.empty() ? class_name : parent_scope + "::" + class_name;
-            visitDefault(node);
-            current_class = std::move(previous_class);
-        }
-
-        void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
-            const std::string typedef_name(node.name.valueText());
-            const std::string parent_scope = !current_package.empty() ? current_package : std::string{};
-            if (!typedef_name.empty())
-                add_ref(node.name, symbol_canonical("typedef", parent_scope, typedef_name));
-            visitDefault(node);
-        }
-
-        void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
-            const std::string module_name(node.type.valueText());
-            if (!module_name.empty())
-                add_ref(node.type, symbol_canonical("module", {}, module_name));
-
-            if (node.parameters) {
-                for (const auto* parameter : node.parameters->parameters) {
-                    const auto* named =
-                        parameter ? parameter->as_if<NamedParamAssignmentSyntax>() : nullptr;
-                    if (!named)
-                        continue;
-                    const std::string param_name(named->name.valueText());
-                    if (!module_name.empty() && !param_name.empty())
-                        add_ref(named->name,
-                                symbol_canonical("module_param", module_name, param_name));
-                }
-            }
-
-            for (const auto* instance : node.instances) {
-                if (!instance)
-                    continue;
-
-                if (instance->decl) {
-                    const std::string instance_name(instance->decl->name.valueText());
-                    if (!current_module.empty() && !instance_name.empty())
-                        add_ref(instance->decl->name,
-                                symbol_canonical("instance", current_module, instance_name));
-                }
-
-                for (const auto* connection : instance->connections) {
-                    const auto* named =
-                        connection ? connection->as_if<NamedPortConnectionSyntax>() : nullptr;
-                    if (!named)
-                        continue;
-
-                    const std::string port_name(named->name.valueText());
-                    if (!module_name.empty() && !port_name.empty())
-                        add_ref(named->name, symbol_canonical("module_port", module_name, port_name));
-                }
-            }
-
-            visitDefault(node);
-        }
-
-        void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
-            const std::string field_name(node.name.valueText());
-            const std::string object_name = simple_identifier_from_index_expr(node.left);
-            if (!current_module.empty() && !field_name.empty() && !object_name.empty()) {
-                const auto value_it = module_value_types.find(current_module + "\n" + object_name);
-                if (value_it != module_value_types.end()) {
-                    std::string typedef_scope = value_it->second;
-                    if (const auto scope_it = unique_typedef_scopes.find(typedef_scope);
-                        scope_it != unique_typedef_scopes.end())
-                        typedef_scope = scope_it->second;
-
-                    if (typedef_fields.contains(typedef_scope + "\n" + field_name)) {
-                        add_ref(node.name,
-                                symbol_canonical("typedef_field", typedef_scope, field_name));
-                        if (node.left)
-                            node.left->visit(*this);
-                        return;
-                    }
-                }
-            }
-            visitDefault(node);
-        }
-
-        std::string object_before_member_dot(const slang::parsing::Token& token) const {
-            if (!token || !token.location().valid())
-                return {};
-            const auto source = sm.getSourceText(token.location().buffer());
-            size_t i = token.location().offset();
-            if (i > source.size())
-                return {};
-            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
-                --i;
-            if (i == 0 || source[i - 1] != '.')
-                return {};
-            --i;
-            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
-                --i;
-            const size_t end = i;
-            while (i > 0 && index_fragment_edge_is_wordlike(source[i - 1]))
-                --i;
-            if (i == end)
-                return {};
-            return std::string(source.substr(i, end - i));
-        }
-
-        bool try_add_typedef_field_reference(const slang::parsing::Token& token,
-                                             std::string_view field_name) {
-            const auto object_name = object_before_member_dot(token);
-            if (current_module.empty() || object_name.empty() || field_name.empty())
-                return false;
-            const auto value_it = module_value_types.find(current_module + "\n" + object_name);
-            if (value_it == module_value_types.end())
-                return false;
-
-            std::string typedef_scope = value_it->second;
-            if (const auto scope_it = unique_typedef_scopes.find(typedef_scope);
-                scope_it != unique_typedef_scopes.end())
-                typedef_scope = scope_it->second;
-
-            if (!typedef_fields.contains(typedef_scope + "\n" + std::string(field_name)))
-                return false;
-
-            add_ref(token, symbol_canonical("typedef_field", typedef_scope, std::string(field_name)));
-            return true;
-        }
-
-        void visitToken(slang::parsing::Token token) {
-            if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
-                !token.location().valid())
-                return;
-            const std::string name(token.valueText());
-            if (name.empty())
-                return;
-            if (try_add_typedef_field_reference(token, name))
-                return;
-            if (!current_class.empty()) {
-                const std::string key = current_class + "\n" + name;
-                if (class_fields.contains(key)) {
-                    add_ref(token, symbol_canonical("class_field", current_class, name));
-                    return;
-                }
-            }
-            if (!current_module.empty()) {
-                const std::string key = current_module + "\n" + name;
-                if (module_values.contains(key)) {
-                    add_ref(token, symbol_canonical("module_signal", current_module, name));
-                    return;
-                }
-            }
-            if (!current_package.empty()) {
-                const std::string key = current_package + "\n" + name;
-                if (package_values.contains(key)) {
-                    add_ref(token, symbol_canonical("package_value", current_package, name));
-                    return;
-                }
-            }
-            if (const auto type_it = unique_type_ids.find(name); type_it != unique_type_ids.end()) {
-                add_ref(token, type_it->second);
-                return;
-            }
-            if (const auto enum_it = unique_enum_member_ids.find(name);
-                enum_it != unique_enum_member_ids.end()) {
-                add_ref(token, enum_it->second);
-                return;
-            }
-            add_ref(token, "name:" + name);
-        }
-    };
-
-    // Declarations are already extracted into the index.  Add owner-qualified
-    // declaration references from those tables so closed-file reference search
-    // can match e.g. `.clk(...)` to `module memory(input clk);` without loading
-    // the declaring file's AST.
-    for (const auto& module : index.modules) {
-        if (!module.name.empty() && module.line > 0)
-            index.references.push_back(ReferenceEntry{.name = module.name,
-                                                      .file_id = module.file_id,
-                                                      .symbol_id = SymbolID::from_canonical(
-                                                          symbol_canonical("module", {}, module.name)),
-                                                      .symbol_debug = symbol_canonical("module", {}, module.name),
-                                                      .line = module.line,
-                                                      .col = module.col,
-                                                      .end_col = module.col +
-                                                                 (int)module.name.size()});
-        for (const auto& port : module.ports) {
-            if (!port.name.empty() && port.line > 0) {
-                const bool is_parameter =
-                    port.direction == "parameter" || port.direction == "localparam";
-                index.references.push_back(ReferenceEntry{
-                    .name = port.name,
-                    .file_id = port.file_id,
-                    .symbol_id = SymbolID::from_canonical(symbol_canonical(
-                        is_parameter ? "module_param" : "module_port", module.name, port.name)),
-                    .symbol_debug = symbol_canonical(
-                        is_parameter ? "module_param" : "module_port", module.name, port.name),
-                    .line = port.line,
-                    .col = port.col,
-                    .end_col = port.col + (int)port.name.size()});
-            }
-        }
-    }
-
-    for (const auto& value : index.values) {
-        if (value.name.empty() || value.parent_scope.empty() || !is_module_value_kind(value.kind) ||
-            value.line <= 0)
-            continue;
-        if (index.package_names.contains(value.parent_scope))
-            continue;
-        const auto canonical = symbol_canonical("module_signal", value.parent_scope, value.name);
-        index.references.push_back(ReferenceEntry{.name = value.name,
-                                                  .file_id = value.file_id,
-                                                  .symbol_id = SymbolID::from_canonical(canonical),
-                                                  .symbol_debug = canonical,
-                                                  .line = value.line,
-                                                  .col = value.col,
-                                                  .end_col = value.col +
-                                                             (int)value.name.size()});
-    }
-    for (const auto& value : index.values) {
-        if (value.name.empty() || value.parent_scope.empty() ||
-            !index.package_names.contains(value.parent_scope) || value.line <= 0)
-            continue;
-        const auto canonical = symbol_canonical("package_value", value.parent_scope, value.name);
-        index.references.push_back(ReferenceEntry{.name = value.name,
-                                                  .file_id = value.file_id,
-                                                  .symbol_id = SymbolID::from_canonical(canonical),
-                                                  .symbol_debug = canonical,
-                                                  .line = value.line,
-                                                  .col = value.col,
-                                                  .end_col = value.col +
-                                                             (int)value.name.size()});
-    }
-    for (const auto& cls : index.classes) {
-        if (cls.name.empty() || cls.line <= 0)
-            continue;
-        const auto class_scope =
-            cls.parent_scope.empty() ? cls.name : cls.parent_scope + "::" + cls.name;
-        const auto class_canonical = symbol_canonical("class", cls.parent_scope, cls.name);
-        index.references.push_back(ReferenceEntry{.name = cls.name,
-                                                  .file_id = cls.file_id,
-                                                  .symbol_id = SymbolID::from_canonical(class_canonical),
-                                                  .symbol_debug = class_canonical,
-                                                  .line = cls.line,
-                                                  .col = cls.col,
-                                                  .end_col = cls.col + (int)cls.name.size()});
-        for (const auto& field : cls.fields) {
-            if (field.name.empty() || field.line <= 0)
-                continue;
-            const auto canonical = symbol_canonical("class_field", class_scope, field.name);
-            index.references.push_back(ReferenceEntry{.name = field.name,
-                                                      .file_id = field.file_id,
-                                                      .symbol_id = SymbolID::from_canonical(canonical),
-                                                      .symbol_debug = canonical,
-                                                      .line = field.line,
-                                                      .col = field.col,
-                                                      .end_col = field.col +
-                                                                 (int)field.name.size()});
-        }
-    }
-    for (const auto& td : index.typedefs) {
-        if (td.name.empty() || td.line <= 0)
-            continue;
-        const auto typedef_scope =
-            td.parent_scope.empty() ? td.name : td.parent_scope + "::" + td.name;
-        const auto canonical = symbol_canonical("typedef", td.parent_scope, td.name);
-        index.references.push_back(ReferenceEntry{.name = td.name,
-                                                  .file_id = td.file_id,
-                                                  .symbol_id = SymbolID::from_canonical(canonical),
-                                                  .symbol_debug = canonical,
-                                                  .line = td.line,
-                                                  .col = td.col,
-                                                  .end_col = td.col + (int)td.name.size()});
-        for (const auto& field : td.fields) {
-            if (field.name.empty() || field.line <= 0)
-                continue;
-            const auto field_canonical =
-                symbol_canonical("typedef_field", typedef_scope, field.name);
-            index.references.push_back(ReferenceEntry{.name = field.name,
-                                                      .file_id = field.file_id,
-                                                      .symbol_id =
-                                                          SymbolID::from_canonical(field_canonical),
-                                                      .symbol_debug = field_canonical,
-                                                      .line = field.line,
-                                                      .col = field.col,
-                                                      .end_col = field.col +
-                                                                 (int)field.name.size()});
-        }
-        for (const auto& member : td.enum_members) {
-            if (member.name.empty() || member.line <= 0)
-                continue;
-            const auto member_canonical =
-                symbol_canonical("enum_member", typedef_scope, member.name);
-            index.references.push_back(ReferenceEntry{.name = member.name,
-                                                      .file_id = member.file_id,
-                                                      .symbol_id =
-                                                          SymbolID::from_canonical(member_canonical),
-                                                      .symbol_debug = member_canonical,
-                                                      .line = member.line,
-                                                      .col = member.col,
-                                                      .end_col = member.col +
-                                                                 (int)member.name.size()});
-        }
-    }
-
-    ReferenceVisitor visitor(index, sm, add_reference, module_values, module_value_types,
-                             package_values, class_fields, typedef_fields, unique_typedef_scopes,
-                             unique_enum_member_ids, unique_type_ids);
     root.visit(visitor);
 }
 

@@ -111,6 +111,7 @@ set(LAZYVERILOG_SOURCES
     src/dynamic_file_index.cpp
     src/background_compiler.cpp
     src/syntax_index.cpp
+    src/syntax_index_shared.cpp
     src/features/hover.cpp
     src/features/definition.cpp
     src/features/references.cpp
@@ -173,6 +174,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/analyzer.cpp
     src/dynamic_file_index.cpp
     src/syntax_index.cpp
+    src/syntax_index_shared.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp

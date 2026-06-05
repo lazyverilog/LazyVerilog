@@ -1,5 +1,6 @@
 #include "analyzer.hpp"
 #include "dynamic_file_index.hpp"
+#include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
 #include <cctype>
@@ -45,7 +46,6 @@ void log_perf(std::string_view label, Clock::time_point start) {
 } // namespace
 
 static std::string file_name_to_uri(std::string_view file_name, const std::string& fallback_uri);
-static std::string path_to_uri(const std::filesystem::path& path);
 static std::optional<std::string> read_file_text_optional(const std::filesystem::path& path);
 static std::filesystem::path normalize_path(const std::string& path);
 
@@ -106,7 +106,7 @@ make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& include_dirs) {
     const auto start = Clock::now();
     const auto norm = normalize_path(path);
-    const std::string uri = path_to_uri(norm);
+    const std::string uri = uri_from_path(norm);
 
     auto sm = std::make_unique<slang::SourceManager>();
     add_include_dirs(*sm, include_dirs);
@@ -365,18 +365,12 @@ static bool is_define_identifier(std::string_view src, int line, int ident_start
 
 static int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line - 1 : 0; }
 
-static std::string path_to_uri(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
-}
-
 static std::string file_name_to_uri(std::string_view file_name, const std::string& fallback_uri) {
     if (file_name.empty())
         return fallback_uri;
 
-    std::string file(file_name);
-    if (file.starts_with("file://"))
-        return file;
-    return path_to_uri(file);
+    auto uri = uri_from_file_name(file_name);
+    return uri.empty() ? fallback_uri : uri;
 }
 
 static std::optional<Location>
@@ -576,116 +570,6 @@ static std::filesystem::path normalize_path(const std::string& path) {
     return absolute.lexically_normal();
 }
 
-static bool hover_fragment_edge_is_wordlike(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
-}
-
-static bool hover_needs_space_between_fragments(std::string_view previous,
-                                                std::string_view next) {
-    if (previous.empty() || next.empty())
-        return false;
-
-    const char prev = previous.back();
-    const char curr = next.front();
-
-    // Keep adjacent identifiers / keywords / literals readable:
-    //
-    //     bit signed
-    //     virtual interface axi_if
-    //     struct packed
-    //
-    // Without this, a trivia-free token stream would become "bitsigned" or
-    // "virtualinterface".
-    if (hover_fragment_edge_is_wordlike(prev) && hover_fragment_edge_is_wordlike(curr))
-        return true;
-
-    // Packed and unpacked dimensions are syntactically bracketed, but hover is
-    // documentation for humans.  Prefer "logic [31:0]" over "logic[31:0]".
-    if (hover_fragment_edge_is_wordlike(prev) && curr == '[')
-        return true;
-
-    // Struct / union / enum bodies are easier to read with a separator:
-    // "struct packed { ... }" instead of "struct packed{ ... }".
-    if (hover_fragment_edge_is_wordlike(prev) && curr == '{')
-        return true;
-
-    // Lists should not collapse after commas when comments/trivia are stripped.
-    if (prev == ',')
-        return true;
-
-    return false;
-}
-
-static std::optional<std::string>
-source_text_for_hover_range(const slang::SourceManager& sm, slang::SourceRange range) {
-    if (!range.start().valid() || !range.end().valid())
-        return std::nullopt;
-    if (range.start().buffer() != range.end().buffer())
-        return std::nullopt;
-
-    const auto source = sm.getSourceText(range.start().buffer());
-    const size_t begin = range.start().offset();
-    const size_t end = range.end().offset();
-    if (begin > end || end > source.size())
-        return std::nullopt;
-
-    return std::string(source.substr(begin, end - begin));
-}
-
-static bool same_source_range(slang::SourceRange lhs, slang::SourceRange rhs) {
-    return lhs.start() == rhs.start() && lhs.end() == rhs.end();
-}
-
-static std::string render_hover_token_text(const slang::SourceManager& sm,
-                                           const slang::parsing::Token& token,
-                                           std::optional<slang::SourceRange>& last_macro_range) {
-    if (sm.isMacroLoc(token.location())) {
-        const auto expansion_range = sm.getExpansionRange(token.location());
-
-        // A single macro invocation can expand to several syntax tokens.  Those
-        // tokens all point back to the same invocation range in the user's
-        // source.  Hover should show the invocation once:
-        //
-        //     logic [`RANGE] value;   // `RANGE might expand to 7:0
-        //            ^^^^^^          // show `RANGE, not `RANGE`RANGE`RANGE
-        //
-        // For ordinary macro constants used as part of a larger range, this
-        // still preserves the exact source spelling:
-        //
-        //     logic [`WIDTH-1:0] value;  // show `WIDTH-1:0, not 32-1:0
-        if (last_macro_range && same_source_range(*last_macro_range, expansion_range))
-            return {};
-        last_macro_range = expansion_range;
-
-        if (auto text = source_text_for_hover_range(sm, expansion_range))
-            return *text;
-    } else {
-        last_macro_range.reset();
-    }
-
-    return std::string(token.rawText());
-}
-
-static std::string render_hover_syntax_text(const slang::SourceManager& sm,
-                                            const slang::syntax::SyntaxNode& node) {
-    std::string text;
-    std::optional<slang::SourceRange> last_macro_range;
-    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
-        const auto token = *it;
-        if (!token || token.isMissing())
-            continue;
-
-        const auto fragment = render_hover_token_text(sm, token, last_macro_range);
-        if (fragment.empty())
-            continue;
-
-        if (hover_needs_space_between_fragments(text, fragment))
-            text += ' ';
-        text += fragment;
-    }
-    return trim_copy(std::move(text));
-}
-
 static std::string render_hover_dimensions(
     const slang::SourceManager& sm,
     const slang::syntax::SyntaxList<slang::syntax::VariableDimensionSyntax>& dimensions) {
@@ -694,11 +578,11 @@ static std::string render_hover_dimensions(
         if (!dimension)
             continue;
 
-        const auto rendered = render_hover_syntax_text(sm, *dimension);
+        const auto rendered = render_syntax_node_text(sm, *dimension);
         if (rendered.empty())
             continue;
 
-        if (hover_needs_space_between_fragments(text, rendered))
+        if (syntax_needs_space_between_fragments(text, rendered))
             text += ' ';
         text += rendered;
     }
@@ -1021,13 +905,13 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 if (const auto* variable =
                         node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                     detail = token_text(variable->direction);
-                    auto type = render_hover_syntax_text(sm, *variable->dataType);
+                    auto type = render_syntax_node_text(sm, *variable->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 } else if (const auto* net =
                                node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                     detail = token_text(net->direction);
-                    auto type = render_hover_syntax_text(sm, *net->dataType);
+                    auto type = render_syntax_node_text(sm, *net->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 }
@@ -1056,12 +940,12 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             if (const auto* variable =
                     node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                 detail = token_text(variable->direction);
-                auto type = render_hover_syntax_text(sm, *variable->dataType);
+                auto type = render_syntax_node_text(sm, *variable->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             } else if (const auto* net = node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                 detail = token_text(net->direction);
-                auto type = render_hover_syntax_text(sm, *net->dataType);
+                auto type = render_syntax_node_text(sm, *net->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }
@@ -1102,7 +986,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             //
             // rather than the previous empty detail string, which made a
             // variable hover display only "**name** — *variable*".
-            auto base_type = render_hover_syntax_text(sm, *node.type);
+            auto base_type = render_syntax_node_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -1116,7 +1000,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
 
         void handle(const slang::syntax::NetDeclarationSyntax& node) {
             auto detail = token_text(node.netType);
-            auto type = render_hover_syntax_text(sm, *node.type);
+            auto type = render_syntax_node_text(sm, *node.type);
             if (!type.empty())
                 detail += (detail.empty() ? "" : " ") + type;
             for (const auto* declarator : node.declarators) {
@@ -1143,7 +1027,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // DeclaratorSyntax, but hover must still reconstruct the field's
             // declaration type from StructUnionMemberSyntax::type plus any
             // declarator-local unpacked dimensions.
-            auto base_type = render_hover_syntax_text(sm, *node.type);
+            auto base_type = render_syntax_node_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -1161,7 +1045,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // variable kind plus the declared data type.  Keep this in the
             // definition-to-symbol layer instead of the hover renderer so hover
             // formatting remains a pure presentation step over SymbolInfo.
-            auto base_type = render_hover_syntax_text(sm, *node.type);
+            auto base_type = render_syntax_node_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -1174,7 +1058,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::ParameterDeclarationSyntax& node) {
-            auto detail = render_hover_syntax_text(sm, *node.type);
+            auto detail = render_syntax_node_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -1189,7 +1073,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::FunctionPortSyntax& node) {
             auto detail = token_text(node.direction);
             if (node.dataType) {
-                auto type = render_hover_syntax_text(sm, *node.dataType);
+                auto type = render_syntax_node_text(sm, *node.dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }
@@ -1210,7 +1094,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                         node.prototype->portList ? node.prototype->portList->toString() : "";
                     doc = "```\ntask " + name + format_ports_doc(ports) + "\n```";
                 } else {
-                    auto return_type = render_hover_syntax_text(sm, *node.prototype->returnType);
+                    auto return_type = render_syntax_node_text(sm, *node.prototype->returnType);
                     auto ports =
                         node.prototype->portList ? node.prototype->portList->toString() : "";
                     doc = "```\nfunction " + return_type + " " + name + format_ports_doc(ports) +
@@ -1231,7 +1115,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
-            set_from_token(node.name, "typedef", render_hover_syntax_text(sm, *node.type));
+            set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
             if (!result)
                 visitDefault(node);
         }
@@ -2273,7 +2157,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     for (const auto& configured_path : extra_files_) {
         const auto path = normalize_path(configured_path);
         const auto path_string = path.string();
-        const auto uri = path_to_uri(path);
+        const auto uri = uri_from_path(path);
         if (seen_uris.contains(uri) || seen_paths.contains(path_string))
             continue;
 
@@ -2544,7 +2428,7 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
             background_index_active_ = true;
             const auto path = normalize_path(path_string);
             path_string = path.string();
-            uri = path_to_uri(path);
+            uri = uri_from_path(path);
             generation = background_generation_;
             defines = defines_;
             include_dirs = include_dirs_;
@@ -2650,7 +2534,7 @@ void Analyzer::update_extra_cache_for_live_state_locked(
         path_text = path_text.substr(7);
     const auto path = normalize_path(path_text);
     const auto path_string = path.string();
-    const auto uri = path_to_uri(path);
+    const auto uri = uri_from_path(path);
 
     // Only files explicitly listed in the design filelist participate in the
     // project index.  Random open buffers should not pollute project-wide

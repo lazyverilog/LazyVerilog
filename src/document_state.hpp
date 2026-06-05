@@ -1,7 +1,6 @@
 #pragma once
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,10 +11,6 @@
 namespace slang::syntax {
 class SyntaxTree;
 }
-namespace slang::ast {
-class Compilation;
-}
-
 /// Pre-formatted diagnostic info extracted at parse time.
 /// Avoids copying slang::Diagnostic (whose ConstantValue args are
 /// not safely copyable — internal arena pointers become dangling).
@@ -66,11 +61,6 @@ struct DocumentState {
     // gets a new DocumentState and therefore a fresh once_flag/cache pair.
     mutable std::once_flag dynamic_index_once_;
     mutable SyntaxIndex dynamic_index_cache_;
-    // Compilation is optional — only present when background_compilation=true
-    std::optional<std::shared_ptr<slang::ast::Compilation>> compilation;
-    std::string tree_filename{"buffer.sv"};
-    bool compilation_dirty{false};
-
     DocumentState() = default;
     DocumentState(std::string uri, std::string text,
                   std::shared_ptr<slang::syntax::SyntaxTree> tree)

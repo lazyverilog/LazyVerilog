@@ -1,4 +1,5 @@
 #include "background_compiler.hpp"
+#include "syntax_index_shared.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -25,10 +26,6 @@ static std::string read_file_text(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-static std::string path_to_uri(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
-}
-
 static std::string normalize_path(const std::filesystem::path& path) {
     return std::filesystem::absolute(path).lexically_normal().string();
 }
@@ -46,7 +43,7 @@ static std::string diagnostic_uri(const slang::SourceManager& sm, const std::str
         std::string text(file_name);
         if (text.starts_with("file://"))
             return text;
-        return path_to_uri(text);
+        return uri_from_path(text);
     } catch (...) {
         return fallback_uri;
     }
