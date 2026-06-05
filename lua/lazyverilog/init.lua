@@ -1857,7 +1857,12 @@ local function _float_port_input(opts, callback)
 	end
 
 	local function accept_highlighted()
-		if #filtered == 0 then accept_typed(); return end
+		-- <Tab> means "use the highlighted existing port".  When the candidate
+		-- list is empty there is no highlighted existing port, so keep the prompt
+		-- open instead of silently accepting the typed/new name and advancing the
+		-- Connect flow.  <Enter> remains the explicit "accept typed/new port"
+		-- action shown in the help line.
+		if #filtered == 0 then return end
 		finish(filtered[cur])
 	end
 
@@ -2060,35 +2065,81 @@ local function _connect_select_instance(client, bufnr, uri, roots, target_module
 		end
 	end
 
-	local function choose(nodes, title)
-		remember(nodes)
-		if not nodes or #nodes == 0 then
-			vim.notify("[LazyVerilog] Connect: no hierarchy children here", vim.log.levels.WARN)
+	-- Do not ask the user to manually choose a root/top-level expansion path.
+	-- The user already told us the semantic target module via `:Connect A B`;
+	-- showing package/library roots such as `uvm_pkg` or `cpu_pkg` is just
+	-- implementation noise.  Instead, walk the lazy hierarchy in the background,
+	-- collect only concrete instances whose module type matches target_module,
+	-- and present that filtered list.
+	--
+	-- This preserves the server-side fix for large projects: connectInfo no
+	-- longer constructs every hierarchical path in one response.  The client
+	-- still may need to visit many nodes if the requested module is absent or
+	-- very deep, but that cost is now paid only by this targeted Connect flow,
+	-- not every time Connect metadata is opened.
+	local queue = vim.deepcopy(roots or {})
+	local seen = {}
+	local matches = {}
+	local max_nodes = 10000
+	local visited_count = 0
+
+	local function drain()
+		if #queue == 0 then
+			if #matches == 0 then
+				vim.notify("[LazyVerilog] Connect: no instances of '" .. target_module .. "' found",
+					vim.log.levels.ERROR)
+				callback(nil)
+				return
+			end
+
+			table.sort(matches, function(a, b)
+				return tostring(a.hierarchical_path or "") < tostring(b.hierarchical_path or "")
+			end)
+			_float_select(matches, {
+				prompt      = "Select " .. target_module .. " instance:",
+				format_item = function(it)
+					return (it.inst_name or "") .. "  (" .. (it.hierarchical_path or "") .. ")"
+				end,
+			}, callback)
+			return
+		end
+
+		if visited_count >= max_nodes then
+			vim.notify("[LazyVerilog] Connect: stopped hierarchy search after " .. max_nodes ..
+				" nodes; narrow the project/filelist", vim.log.levels.WARN)
 			callback(nil)
 			return
 		end
 
-		_float_select(nodes, {
-			prompt      = title,
-			format_item = function(it)
-				local action = (not it.root and it.module_name == target_module) and "[select]" or "[expand]"
-				return string.format("%s %-8s %s  (%s)", action, it.module_name or "",
-					it.hierarchical_path or "", it.inst_name or "")
-			end,
-		}, function(sel)
-			if not sel then callback(nil); return end
-			if not sel.root and sel.module_name == target_module then
-				callback(sel)
-				return
+		local node = table.remove(queue, 1)
+		local path = node and node.hierarchical_path or ""
+		if path == "" or seen[path] then
+			vim.schedule(drain)
+			return
+		end
+		seen[path] = true
+		visited_count = visited_count + 1
+		remember({ node })
+
+		if not node.root and node.module_name == target_module then
+			table.insert(matches, node)
+			vim.schedule(drain)
+			return
+		end
+
+		_connect_request_children(client, bufnr, uri, path, function(children)
+			if not children then callback(nil); return end
+			remember(children)
+			for _, child in ipairs(children) do
+				if child.hierarchical_path and not seen[child.hierarchical_path] then
+					table.insert(queue, child)
+				end
 			end
-			_connect_request_children(client, bufnr, uri, sel.hierarchical_path, function(children)
-				if not children then callback(nil); return end
-				choose(children, "Expand " .. (sel.hierarchical_path or "") .. " for " .. target_module .. ":")
-			end)
+			drain()
 		end)
 	end
 
-	choose(roots or {}, "Select/expand hierarchy for " .. target_module .. ":")
+	drain()
 end
 
 local function _connect_prompt_boundary_ports(requests, idx, acc, callback)
