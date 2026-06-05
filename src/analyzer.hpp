@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct SymbolInfo {
@@ -267,6 +268,10 @@ class Analyzer {
     std::vector<std::string> defines_;
     std::vector<std::string> include_dirs_;
     mutable std::vector<std::string> extra_files_;
+    // Membership mirror for extra_files_.  The vector remains the ordered
+    // source for iteration/background scheduling, while this set keeps the
+    // didOpen/didChange critical section from scanning large filelists.
+    mutable std::unordered_set<std::string> extra_file_set_;
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> extra_cache_;
     mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
     mutable std::function<void()> project_index_publish_callback_;

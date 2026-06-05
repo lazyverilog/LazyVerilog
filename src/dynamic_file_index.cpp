@@ -372,14 +372,14 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     entry.line = line;
     entry.col = col;
     if (cls.extendsClause)
-        entry.base_class = node_text(*cls.extendsClause->baseName);
+        entry.base_class = node_text_raw(sm, *cls.extendsClause->baseName);
 
     for (const auto* item : cls.items) {
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
             if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
-                const auto type = node_text(*data->type);
+                const auto type = node_text_raw(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)
                         continue;
@@ -394,8 +394,8 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *method->declaration->prototype;
             auto [ml, mc] = token_pos(sm, proto.keyword);
-            entry.methods.push_back(MethodEntry{.name = node_text(*proto.name),
-                                                .return_type = node_text(*proto.returnType),
+            entry.methods.push_back(MethodEntry{.name = node_text_raw(sm, *proto.name),
+                                                .return_type = node_text_raw(sm, *proto.returnType),
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
                                                 .file_id = token_file_id_for_dynamic_index(index, sm, proto.keyword),
@@ -434,7 +434,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const auto type = node_text(*member->type);
+            const auto type = node_text_raw(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;
@@ -447,7 +447,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
             }
         }
     } else {
-        entry.resolved = node_text(*td.type);
+        entry.resolved = node_text_raw(sm, *td.type);
     }
 
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -470,13 +470,13 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             if (!param)
                 continue;
             const std::string direction = tok_text(param->keyword);
-            const std::string type = node_text(*param->type);
+            const std::string type = node_text_raw(sm, *param->type);
             for (const auto* decl : param->declarators) {
                 if (!decl)
                     continue;
                 std::string default_value;
                 if (decl->initializer)
-                    default_value = node_text(*decl->initializer->expr);
+                    default_value = node_text_raw(sm, *decl->initializer->expr);
                 add_port(module, index, sm, decl->name, direction, type, type, {},
                          std::move(default_value));
             }
@@ -519,7 +519,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                              with_dims(sm, port_signal_decl_type(sm, *port_decl->header), *decl));
             }
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const auto type = node_text(*data->type);
+            const auto type = node_text_raw(sm, *data->type);
             for (const auto* decl : data->declarators) {
                 if (decl)
                     add_value(index, sm, decl->name, with_dims(sm, type, *decl), "variable",
@@ -527,9 +527,9 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             if (auto* value = add_value(index, sm, fn->prototype->keyword,
-                                        node_text(*fn->prototype->returnType), "function",
+                                        node_text_raw(sm, *fn->prototype->returnType), "function",
                                         module.name))
-                value->name = node_text(*fn->prototype->name);
+                value->name = node_text_raw(sm, *fn->prototype->name);
         } else if (const auto* hierarchy = member->as_if<HierarchyInstantiationSyntax>()) {
             process_hierarchy(*hierarchy, index, sm, lines, module.name);
         } else if (const auto* modport = member->as_if<ModportDeclarationSyntax>()) {
@@ -567,13 +567,13 @@ void process_module_signature(const ModuleDeclarationSyntax& node, SyntaxIndex& 
             if (!param)
                 continue;
             const std::string direction = tok_text(param->keyword);
-            const std::string type = node_text(*param->type);
+            const std::string type = node_text_raw(sm, *param->type);
             for (const auto* decl : param->declarators) {
                 if (!decl)
                     continue;
                 std::string default_value;
                 if (decl->initializer)
-                    default_value = node_text(*decl->initializer->expr);
+                    default_value = node_text_raw(sm, *decl->initializer->expr);
                 add_port(module, index, sm, decl->name, direction, type, type, {},
                          std::move(default_value));
             }
@@ -635,7 +635,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
         if (!member)
             continue;
         if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const auto type = node_text(*data->type);
+            const auto type = node_text_raw(sm, *data->type);
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
@@ -644,7 +644,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
             }
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                const auto type = node_text(*param->type);
+                const auto type = node_text_raw(sm, *param->type);
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
@@ -660,9 +660,9 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                 }
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            const auto name = node_text(*fn->prototype->name);
+            const auto name = node_text_raw(sm, *fn->prototype->name);
             index.values.push_back(ValueEntry{.name = name,
-                                              .type = node_text(*fn->prototype->returnType),
+                                              .type = node_text_raw(sm, *fn->prototype->returnType),
                                               .kind = "function",
                                               .parent_scope = module.name,
                                               .file_id = token_file_id_for_dynamic_index(index, sm, fn->prototype->keyword)});

@@ -202,8 +202,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        listed_extra_file =
-            std::find(extra_files_.begin(), extra_files_.end(), path_string) != extra_files_.end();
+        listed_extra_file = extra_file_set_.contains(path_string);
     }
 
     // Building a dynamic/open-buffer SyntaxIndex may walk the full AST. Do that
@@ -229,8 +228,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        listed_extra_file =
-            std::find(extra_files_.begin(), extra_files_.end(), path_string) != extra_files_.end();
+        listed_extra_file = extra_file_set_.contains(path_string);
     }
 
     // See Analyzer::open(): current-buffer shard building is intentionally
@@ -2078,10 +2076,15 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     std::lock_guard<std::mutex> lock(map_mutex_);
     filelist_path_ = filelist_path;
     extra_files_.clear();
+    extra_file_set_.clear();
     extra_cache_.clear();
     extra_files_.reserve(paths.size());
-    for (const auto& path : paths)
-        extra_files_.push_back(normalize_path(path).string());
+    extra_file_set_.reserve(paths.size());
+    for (const auto& path : paths) {
+        auto normalized = normalize_path(path).string();
+        extra_files_.push_back(normalized);
+        extra_file_set_.insert(std::move(normalized));
+    }
     clear_extra_project_index_locked();
 
     // Always index configured project files asynchronously, regardless of
@@ -2111,9 +2114,14 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
 
     filelist_path_ = filelist_path;
     extra_files_.clear();
+    extra_file_set_.clear();
     extra_files_.reserve(extra_files.size());
-    for (const auto& path : extra_files)
-        extra_files_.push_back(normalize_path(path).string());
+    extra_file_set_.reserve(extra_files.size());
+    for (const auto& path : extra_files) {
+        auto normalized = normalize_path(path).string();
+        extra_files_.push_back(normalized);
+        extra_file_set_.insert(std::move(normalized));
+    }
 
     extra_cache_.clear();
     clear_extra_project_index_locked();
@@ -2647,8 +2655,7 @@ void Analyzer::update_extra_cache_for_live_state_locked(
     // Only files explicitly listed in the design filelist participate in the
     // project index.  Random open buffers should not pollute project-wide
     // completion for the configured design.
-    const auto listed = std::find(extra_files_.begin(), extra_files_.end(), path_string);
-    if (listed == extra_files_.end())
+    if (!extra_file_set_.contains(path_string))
         return;
 
     extra_cache_[uri] = ExtraFileCacheEntry{

@@ -286,6 +286,10 @@ struct SyntaxIndex {
     // instead of repeating URI strings.  merge() remaps IDs from shard-local
     // tables into the merged table.
     std::vector<std::string> source_files;
+    // Reverse table for intern_source_file().  This keeps per-token and
+    // per-reference file attribution O(1) instead of linearly scanning
+    // source_files as the shard grows.
+    std::unordered_map<std::string, SourceFileID> source_file_ids;
 
     // Modules (also used for interface/package declarations — see interface_names / package_names)
     std::vector<ModuleEntry>   modules;

@@ -59,6 +59,7 @@
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -530,6 +531,7 @@ struct LazyVerilogServer::Impl {
 
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
+    config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
     config_ = load_config(root_);
     analyzer_.set_project_index_publish_callback([this] { request_inlay_hint_refresh(); });
     { auto vcode = load_vcode(root_, config_);
@@ -813,6 +815,7 @@ void LazyVerilogServer::register_handlers() {
                 auto p = uri_to_path(req.params.rootUri->raw_uri_);
                 if (std::filesystem::exists(p)) {
                     root_ = p;
+                    config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
                     std::string warn;
                     ConfigWarning warning_detail;
                     config_ = load_config(root_, &warn, &warning_detail);
@@ -829,6 +832,7 @@ void LazyVerilogServer::register_handlers() {
                 std::filesystem::path p(*req.params.rootPath);
                 if (std::filesystem::exists(p)) {
                     root_ = p;
+                    config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
                     std::string warn;
                     ConfigWarning warning_detail;
                     config_ = load_config(root_, &warn, &warning_detail);
@@ -928,8 +932,10 @@ void LazyVerilogServer::register_handlers() {
                         std::filesystem::path config_path(config_file);
                         if (config_path.is_relative())
                             config_path = root_ / config_path;
-                        if (config_path.filename() == "lazyverilog.toml")
+                        if (config_path.filename() == "lazyverilog.toml") {
                             root_ = config_path.parent_path();
+                            config_found_ = true;
+                        }
                     }
                 }
 
@@ -960,13 +966,14 @@ void LazyVerilogServer::register_handlers() {
         try {
             const auto& td = note.params.textDocument;
             // Walk up from file to find lazyverilog.toml if not already found
-            if (!std::filesystem::exists(root_ / "lazyverilog.toml")) {
+            if (!config_found_) {
                 auto uri = td.uri.raw_uri_;
                 if (uri.starts_with("file://"))
                     uri = uri.substr(7);
                 auto found = find_config_root(uri);
                 if (!found.empty()) {
                     root_ = found;
+                    config_found_ = true;
                     std::string warn;
                     ConfigWarning warning_detail;
                     config_ = load_config(root_, &warn, &warning_detail);
@@ -1343,8 +1350,10 @@ void LazyVerilogServer::register_handlers() {
                 if (!state)
                     return;
 
-                // Apply edits in reverse order to build new text.
-                // Use string_view slices for source lines — no per-line string copies.
+                // Split once and build the final text in append order.  The
+                // previous implementation inserted into the middle of a vector
+                // for every edit; many flip-flop declarations could therefore
+                // shift the same tail lines repeatedly.
                 std::vector<std::string_view> lines;
                 {
                     const std::string_view tv = state->text;
@@ -1360,34 +1369,48 @@ void LazyVerilogServer::register_handlers() {
                     }
                 }
 
-                // Insert edits (already sorted in reverse line order).
-                // Edit text views remain valid for the duration of this lambda.
+                std::vector<const AutoffEdit*> edits;
+                edits.reserve(result.edits.size());
                 for (const auto& edit : result.edits) {
-                    if (edit.line >= 0 && edit.line <= (int)lines.size()) {
-                        const std::string_view ev = edit.text;
-                        std::vector<std::string_view> new_lines;
-                        size_t pos = 0;
-                        while (pos <= ev.size()) {
-                            size_t nl = ev.find('\n', pos);
-                            if (nl == std::string_view::npos) {
-                                if (pos < ev.size())
-                                    new_lines.push_back(ev.substr(pos));
-                                break;
-                            }
-                            new_lines.push_back(ev.substr(pos, nl - pos));
-                            pos = nl + 1;
-                        }
-                        lines.insert(lines.begin() + edit.line, new_lines.begin(), new_lines.end());
-                    }
+                    if (edit.line >= 0 && edit.line <= static_cast<int>(lines.size()))
+                        edits.push_back(&edit);
                 }
+                std::sort(edits.begin(), edits.end(), [](const AutoffEdit* a, const AutoffEdit* b) {
+                    return a->line < b->line;
+                });
 
+                size_t next_line = 0;
                 std::string new_text;
                 new_text.reserve(state->text.size() + 256);
-                for (size_t i = 0; i < lines.size(); ++i) {
-                    if (i > 0)
+                bool emitted_line = false;
+                auto append_line = [&](std::string_view line) {
+                    if (emitted_line)
                         new_text += '\n';
-                    new_text += lines[i];
+                    new_text += line;
+                    emitted_line = true;
+                };
+                auto append_edit_text = [&](std::string_view text) {
+                    size_t pos = 0;
+                    while (pos <= text.size()) {
+                        const size_t nl = text.find('\n', pos);
+                        if (nl == std::string_view::npos) {
+                            if (pos < text.size())
+                                append_line(text.substr(pos));
+                            break;
+                        }
+                        append_line(text.substr(pos, nl - pos));
+                        pos = nl + 1;
+                    }
+                };
+                for (const auto* edit : edits) {
+                    const auto edit_line = static_cast<size_t>(edit->line);
+                    while (next_line < edit_line)
+                        append_line(lines[next_line++]);
+                    append_edit_text(edit->text);
                 }
+                while (next_line < lines.size())
+                    append_line(lines[next_line++]);
+
                 new_text = format_source(new_text, config_.format);
 
                 // Build workspace edit JSON and set as result

@@ -27,6 +27,7 @@ class LazyVerilogServer {
     void schedule_background_compilation();
 
     std::filesystem::path root_;
+    bool config_found_{false};
     std::string config_diagnostic_uri_;
     Config config_;
     Analyzer analyzer_;

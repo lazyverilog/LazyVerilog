@@ -1569,11 +1569,14 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
 SourceFileID SyntaxIndex::intern_source_file(std::string uri) {
     if (uri.empty())
         return kInvalidSourceFileID;
-    auto it = std::find(source_files.begin(), source_files.end(), uri);
-    if (it != source_files.end())
-        return static_cast<SourceFileID>(std::distance(source_files.begin(), it));
+
+    if (auto it = source_file_ids.find(uri); it != source_file_ids.end())
+        return it->second;
+
+    const auto id = static_cast<SourceFileID>(source_files.size());
     source_files.push_back(std::move(uri));
-    return static_cast<SourceFileID>(source_files.size() - 1);
+    source_file_ids.emplace(source_files.back(), id);
+    return id;
 }
 
 std::string SyntaxIndex::source_uri(SourceFileID file_id) const {

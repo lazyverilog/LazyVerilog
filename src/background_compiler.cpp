@@ -310,14 +310,21 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     slang::ast::Compilation compilation(bag);
     std::string first_uri;
     std::unordered_set<std::string> assigned_paths;
+    size_t scanned_buffer_count = 0;
 
-    auto refresh_assigned_paths = [&] {
-        assigned_paths.clear();
-        for (auto buffer : source_manager->getAllBuffers()) {
+    auto add_new_assigned_paths = [&] {
+        const auto buffers = source_manager->getAllBuffers();
+        // SourceManager buffer IDs are append-only for this compilation.  Do
+        // not clear and rebuild the whole set after each syntax tree: on large
+        // filelists that turns a simple duplicate check into O(n²) allocator
+        // churn.  Scan only buffers that appeared since the previous tree.
+        for (size_t i = scanned_buffer_count; i < buffers.size(); ++i) {
+            auto buffer = buffers[i];
             const auto& path = source_manager->getFullPath(buffer);
             if (!path.empty())
                 assigned_paths.insert(normalize_path(path));
         }
+        scanned_buffer_count = buffers.size();
     };
 
     for (const auto& file : snapshot.files) {
@@ -337,18 +344,14 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
                                                             std::string_view(file.uri),
                                                             std::string_view(file.path), bag);
             compilation.addSyntaxTree(std::move(tree));
-            refresh_assigned_paths();
+            add_new_assigned_paths();
         } catch (const std::exception& e) {
-            bool log_timing = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                log_timing = log_timing_;
-            }
+            const bool log_timing = log_timing_.load(std::memory_order_relaxed);
             if (log_timing) {
                 std::cerr << "[lazyverilog] semantic compile skipped " << file.path << ": "
                           << e.what() << "\n";
             }
-            refresh_assigned_paths();
+            add_new_assigned_paths();
         }
     }
 
@@ -361,21 +364,13 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
                 result.diagnostics_by_uri[uri].push_back(std::move(info));
             }
         } catch (const std::exception& e) {
-            bool log_timing = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                log_timing = log_timing_;
-            }
+            const bool log_timing = log_timing_.load(std::memory_order_relaxed);
             if (log_timing)
                 std::cerr << "[lazyverilog] semantic diagnostics failed: " << e.what() << "\n";
         }
     }
 
-    bool log_timing = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        log_timing = log_timing_;
-    }
+    const bool log_timing = log_timing_.load(std::memory_order_relaxed);
     if (log_timing) {
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);

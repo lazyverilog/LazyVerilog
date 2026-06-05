@@ -54,7 +54,7 @@ class BackgroundCompiler {
     std::condition_variable cv_;
     bool stopping_{false};
     bool enabled_{false};
-    bool log_timing_{false};
+    std::atomic<bool> log_timing_{false};
     int debounce_ms_{1500};
     int nice_value_{10};
     size_t next_worker_id_{0};
