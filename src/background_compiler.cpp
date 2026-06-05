@@ -89,37 +89,117 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
 
 } // namespace
 
+struct BackgroundCompiler::WorkerSlot {
+    explicit WorkerSlot(size_t worker_id) : id(worker_id) {}
+
+    // Monotonic debug identity.  Do not use this as the desired worker index:
+    // workers can retire and be erased, then later workers may be spawned with
+    // larger ids.  The explicit retire flag is the source of truth.
+    size_t id{0};
+
+    // Guarded by BackgroundCompiler::mutex_.  configure() sets retire when the
+    // configured worker count shrinks.  The worker checks it only between jobs,
+    // so currently-running slang compilation is allowed to finish cleanly.
+    bool retire{false};
+
+    // Guarded by BackgroundCompiler::mutex_.  Set immediately before the worker
+    // thread returns; configure() can then join and erase the thread without
+    // blocking on long background compilation work.
+    bool exited{false};
+
+    std::thread thread;
+};
+
 BackgroundCompiler::BackgroundCompiler(ResultCallback callback) : callback_(std::move(callback)) {}
 
 BackgroundCompiler::~BackgroundCompiler() { stop(); }
+
+std::vector<std::thread> BackgroundCompiler::collect_exited_workers_locked() {
+    std::vector<std::thread> exited_threads;
+
+    auto it = workers_.begin();
+    while (it != workers_.end()) {
+        auto& slot = *it;
+        if (!slot->exited) {
+            ++it;
+            continue;
+        }
+
+        if (slot->thread.joinable())
+            exited_threads.push_back(std::move(slot->thread));
+        it = workers_.erase(it);
+    }
+
+    return exited_threads;
+}
 
 void BackgroundCompiler::configure(bool enabled, int thread_count, int debounce_ms,
                                    bool log_timing, int nice_value) {
     thread_count = std::max(1, thread_count);
     debounce_ms = std::max(0, debounce_ms);
 
-    std::unique_lock<std::mutex> lock(mutex_);
-    enabled_ = enabled;
-    log_timing_ = log_timing;
-    debounce_ms_ = debounce_ms;
-    nice_value_ = nice_value;
+    std::vector<std::thread> exited_threads;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        enabled_ = enabled;
+        log_timing_ = log_timing;
+        debounce_ms_ = debounce_ms;
+        nice_value_ = nice_value;
 
-    if (!enabled_) {
-        pending_.reset();
-        ++latest_generation_;
-        lock.unlock();
-        cv_.notify_all();
-        return;
+        exited_threads = collect_exited_workers_locked();
+
+        if (!enabled_) {
+            pending_.reset();
+            ++latest_generation_;
+            lock.unlock();
+            cv_.notify_all();
+        } else {
+            // If the user raises the count again before previously-retired
+            // workers have exited, keep those workers instead of spawning an
+            // unnecessary replacement.  Retire requests are only a graceful
+            // shrink mechanism, not an irreversible cancellation.
+            if (static_cast<int>(workers_.size()) <= thread_count) {
+                for (auto& slot : workers_)
+                    slot->retire = false;
+            }
+
+            while (static_cast<int>(workers_.size()) < thread_count) {
+                auto slot = std::make_shared<WorkerSlot>(next_worker_id_++);
+                slot->thread = std::thread([this, slot, nice_value] {
+                    setpriority(PRIO_PROCESS, 0, nice_value);
+                    worker_loop(std::move(slot));
+                });
+                workers_.push_back(std::move(slot));
+            }
+
+            // Graceful shrink: mark newest excess workers for retirement.  An
+            // idle worker exits immediately after the notify below; a busy
+            // worker exits after publishing/skipping its current generation and
+            // before taking another pending snapshot.
+            int kept = 0;
+            for (auto& slot : workers_) {
+                if (slot->exited)
+                    continue;
+                if (kept < thread_count) {
+                    ++kept;
+                    continue;
+                }
+                slot->retire = true;
+            }
+
+            lock.unlock();
+            cv_.notify_all();
+        }
     }
 
-    while (static_cast<int>(workers_.size()) < thread_count)
-        workers_.emplace_back([this, nice_value] {
-            setpriority(PRIO_PROCESS, 0, nice_value);
-            worker_loop();
-        });
-
-    // Keep existing workers if the count is lowered. They are idle unless jobs
-    // are scheduled, and avoiding per-config thread teardown keeps this simple.
+    // Join only workers that have already reported exit.  This keeps config
+    // reload responsive: lowering the thread count does not block on a large
+    // in-progress semantic compile; cleanup happens on a later configure() or
+    // stop().
+    for (auto& worker : exited_threads) {
+        if (worker.joinable())
+            worker.join();
+    }
 }
 
 void BackgroundCompiler::schedule(CompilationSnapshot snapshot) {
@@ -144,30 +224,36 @@ void BackgroundCompiler::stop() {
         ++latest_generation_;
     }
     cv_.notify_all();
-    for (auto& worker : workers_) {
-        if (worker.joinable())
-            worker.join();
+    for (auto& slot : workers_) {
+        if (slot->thread.joinable())
+            slot->thread.join();
     }
     workers_.clear();
 }
 
-void BackgroundCompiler::worker_loop() {
+void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
     while (true) {
         uint64_t generation = 0;
         CompilationSnapshot snapshot;
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [&] { return stopping_ || (enabled_ && pending_.has_value()); });
-            if (stopping_)
+            cv_.wait(lock, [&] {
+                return stopping_ || slot->retire || (enabled_ && pending_.has_value());
+            });
+            if (stopping_ || slot->retire) {
+                slot->exited = true;
                 return;
+            }
 
-            while (!stopping_ && pending_.has_value()) {
+            while (!stopping_ && !slot->retire && pending_.has_value()) {
                 if (cv_.wait_until(lock, due_time_) == std::cv_status::timeout)
                     break;
             }
-            if (stopping_)
+            if (stopping_ || slot->retire) {
+                slot->exited = true;
                 return;
+            }
             if (!enabled_ || !pending_)
                 continue;
 
