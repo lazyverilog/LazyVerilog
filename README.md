@@ -201,9 +201,7 @@ doesn't work for your codebase, bug reports are welcome.
 | Inlay hints | ✅ | Port directions on instantiation |
 | Workspace symbols | ✅ | Modules and classes from indexed design files |
 | RTL tree | ✅ | Module instantiation hierarchy |
-| Auto-instantiation | ✅ | Code Action AutoInst |
-| Auto-wire | ✅ | Code Action AutoWire |
-| Auto-arg / auto-function / auto-FF | ✅ | Code Action AutoArg |
+| Auto-instantiation / Auto-wire / Auto-arg / Auto-function / Auto-FF | ✅ | Various Code Actions for RTL generation |
 | Project-local config | ✅ | Full customization available by `lazyverilog.toml` at project root |
 
 &nbsp;
