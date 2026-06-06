@@ -3,7 +3,9 @@
 #include "string_utils.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <sys/resource.h>
 #include <filesystem>
 #include <fstream>
@@ -163,7 +165,12 @@ void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
             while (static_cast<int>(workers_.size()) < config.thread_count) {
                 auto slot = std::make_shared<WorkerSlot>(next_worker_id_++);
                 slot->thread = std::thread([this, slot, nice_value = config.nice_value] {
-                    setpriority(PRIO_PROCESS, 0, nice_value);
+                    errno = 0;
+                    if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {
+                        std::cerr << "[lazyverilog] background compiler setpriority("
+                                  << nice_value << ") failed: " << std::strerror(errno)
+                                  << "\n";
+                    }
                     worker_loop(std::move(slot));
                 });
                 workers_.push_back(std::move(slot));
