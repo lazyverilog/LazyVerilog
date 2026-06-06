@@ -234,7 +234,13 @@ static std::string format_emit_text(const std::string& text, const FormatOptions
 }
 
 static std::string json_string(std::string_view text) {
-    std::string out = "\"";
+    std::string out;
+    // Most SystemVerilog text does not need escaping.  Reserve the common-case
+    // payload plus quotes up front so large formatting/workspace responses do
+    // not grow one byte at a time.  Escaped characters can exceed this estimate,
+    // but the reserve still removes nearly all reallocations for normal files.
+    out.reserve(text.size() + 2 + text.size() / 8);
+    out += "\"";
     for (char c : text) {
         switch (c) {
         case '"':
@@ -380,20 +386,25 @@ static std::string workspace_edit_json(const std::string& uri, const lsTextEdit&
            "}},\"newText\":" + json_string(edit.newText) + "}]}}";
 }
 
-static std::string rtl_tree_json(const RtlTreeNode& node, bool show_file,
+static void append_rtl_tree_json(std::string& out, const RtlTreeNode& node, bool show_file,
                                  bool show_instance_name, size_t depth = 0) {
     constexpr size_t kMaxRtlTreeJsonDepth = 512;
-    std::string out = "{\"name\":" + json_string(node.name);
-    if (show_instance_name)
-        out += ",\"inst\":" + json_string(node.inst);
-    if (show_file)
-        out += ",\"file\":" + json_string(node.file);
+    out += "{\"name\":";
+    out += json_string(node.name);
+    if (show_instance_name) {
+        out += ",\"inst\":";
+        out += json_string(node.inst);
+    }
+    if (show_file) {
+        out += ",\"file\":";
+        out += json_string(node.file);
+    }
     out += ",\"children\":[";
     if (depth < kMaxRtlTreeJsonDepth) {
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0)
                 out += ",";
-            out += rtl_tree_json(node.children[i], show_file, show_instance_name, depth + 1);
+            append_rtl_tree_json(out, node.children[i], show_file, show_instance_name, depth + 1);
         }
     }
     out += "]";
@@ -402,6 +413,16 @@ static std::string rtl_tree_json(const RtlTreeNode& node, bool show_file,
     if (node.truncated || depth >= kMaxRtlTreeJsonDepth)
         out += ",\"truncated\":true";
     out += "}";
+}
+
+static std::string rtl_tree_json(const RtlTreeNode& node, bool show_file,
+                                 bool show_instance_name) {
+    std::string out;
+    // Start with a modest reserve; recursive appends grow this single buffer
+    // instead of allocating and copying one completed child JSON string per
+    // hierarchy node.
+    out.reserve(1024);
+    append_rtl_tree_json(out, node, show_file, show_instance_name);
     return out;
 }
 
