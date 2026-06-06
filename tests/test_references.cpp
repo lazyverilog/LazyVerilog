@@ -525,6 +525,76 @@ endclass
     std::filesystem::remove(dir);
 }
 
+TEST_CASE("references: object method call excludes same-name unit task", "[references]") {
+    const auto dir =
+        std::filesystem::temp_directory_path() / "lazyverilog_refs_object_method_vs_unit_task";
+    std::filesystem::create_directories(dir);
+
+    const auto header_path = dir / "params.svh";
+    const auto top_path = dir / "top.sv";
+
+    const std::string header = R"(task req_data();
+endtask
+
+class Packet;
+    int data;
+
+    task req_data();
+    endtask
+endclass
+)";
+    const std::string top = R"(`include "params.svh"
+module top;
+    always_comb begin
+        Packet p;
+        p.req_data();
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(header_path);
+        REQUIRE(out.good());
+        out << header;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({header_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = "file://" + top_path.string();
+    const std::string header_uri = "file://" + header_path.string();
+    analyzer.open(top_uri, top);
+
+    const auto [line, col] = find_position(top, "req_data();");
+    const auto def = analyzer.definition_of(top_uri, line, col);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == header_uri);
+    CHECK(def->line == 6);
+
+    const auto refs = analyzer.find_references(top_uri, line, col, true);
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == header_uri && ref.line == 6;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 4;
+    }));
+    CHECK(std::none_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == header_uri && ref.line == 0;
+    }));
+
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: changed watched file refreshes only that project shard", "[references]") {
     const auto path =
         std::filesystem::temp_directory_path() / "lazyverilog_refs_watched_refresh.sv";

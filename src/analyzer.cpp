@@ -1037,6 +1037,141 @@ static std::optional<Location> find_generic_definition(const slang::syntax::Synt
     return visitor.result();
 }
 
+static std::optional<std::string> class_type_for_object_reference(const SyntaxIndex& index,
+                                                                  std::string_view module_name,
+                                                                  std::string_view object_name,
+                                                                  int use_line_one_based) {
+    if (module_name.empty() || object_name.empty())
+        return std::nullopt;
+
+    std::optional<std::string> result;
+    for (const auto& value : index.values) {
+        if (value.parent_scope != module_name || value.name != object_name ||
+            !is_module_value_kind(value.kind))
+            continue;
+
+        // Block-local values carry a lexical visibility range.  Module-level
+        // values have a zero range and are visible throughout the module.  If
+        // multiple declarations with the same name are visible, prefer the
+        // later one because it is the innermost/latest declaration encountered
+        // by the structural index walk.
+        if (value.scope_start_line > 0 && use_line_one_based < value.scope_start_line)
+            continue;
+        if (value.scope_end_line > 0 && use_line_one_based > value.scope_end_line)
+            continue;
+
+        const auto type = canonical_type_name_from_text(value.type);
+        if (!type.empty())
+            result = type;
+    }
+    return result;
+}
+
+static std::pair<int, int> source_range_lines_one_based(const slang::SourceManager& sm,
+                                                        slang::SourceRange range) {
+    if (!range.start().valid() || !range.end().valid())
+        return {0, 0};
+    const auto start = sm.getLineNumber(range.start());
+    const auto end = sm.getLineNumber(range.end());
+    return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
+}
+
+static std::optional<std::string> class_type_for_object_reference_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view module_name,
+    std::string_view object_name, int use_line_one_based) {
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view module_name;
+        std::string_view object_name;
+        int use_line_one_based;
+        std::string current_module;
+        std::vector<std::pair<int, int>> scope_stack;
+        std::optional<std::string> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri,
+                std::string_view module_name, std::string_view object_name,
+                int use_line_one_based)
+            : sm(sm), uri(uri), module_name(module_name), object_name(object_name),
+              use_line_one_based(use_line_one_based) {}
+
+        void maybe_set(const slang::syntax::DataTypeSyntax& type,
+                       const slang::syntax::SeparatedSyntaxList<slang::syntax::DeclaratorSyntax>& declarators) {
+            if (current_module != module_name)
+                return;
+            const auto [scope_start, scope_end] =
+                scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back();
+            if (scope_start > 0 && use_line_one_based < scope_start)
+                return;
+            if (scope_end > 0 && use_line_one_based > scope_end)
+                return;
+            for (const auto* decl : declarators) {
+                if (!decl || decl->name.valueText() != object_name)
+                    continue;
+                const auto decl_uri = uri_from_source_location(sm, decl->name.location());
+                if (!decl_uri.empty() && decl_uri != uri)
+                    continue;
+                const auto type_name = canonical_type_name_from_text(render_syntax_node_text(sm, type));
+                if (!type_name.empty())
+                    result = type_name;
+            }
+        }
+
+        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+            const auto previous_module = current_module;
+            current_module = std::string(node.header->name.valueText());
+            scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+            current_module = previous_module;
+        }
+
+        void handle(const slang::syntax::BlockStatementSyntax& node) {
+            scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
+        void handle(const slang::syntax::LocalVariableDeclarationSyntax& node) {
+            maybe_set(*node.type, node.declarators);
+            visitDefault(node);
+        }
+
+        void handle(const slang::syntax::DataDeclarationSyntax& node) {
+            maybe_set(*node.type, node.declarators);
+            visitDefault(node);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, module_name, object_name, use_line_one_based);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+static std::optional<Location> find_class_method_definition(const SyntaxIndex& index,
+                                                            const std::string& uri,
+                                                            std::string_view class_name,
+                                                            std::string_view method_name) {
+    if (class_name.empty() || method_name.empty())
+        return std::nullopt;
+
+    for (const auto& cls : index.classes) {
+        const std::string class_scope =
+            cls.parent_scope.empty() ? cls.name : cls.parent_scope + "::" + cls.name;
+        if (class_scope != class_name && cls.name != class_name)
+            continue;
+        for (const auto& method : cls.methods) {
+            if (method.name != method_name || method.line <= 0)
+                continue;
+            const std::string actual_uri = index.source_uri(method.file_id);
+            const int line = to_lsp_line(method.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
+                            method.col + (int)method.name.size()};
+        }
+    }
+    return std::nullopt;
+}
+
 static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
                               const Location& location) {
     if (!token || !token.location().valid())
@@ -1406,6 +1541,7 @@ enum class DefinitionTargetKind {
     NamedPort,
     NamedParameter,
     NamedArgument,
+    ClassMember,
     Macro,
     Generic,
 };
@@ -1415,6 +1551,7 @@ struct DefinitionTarget {
     std::string name;
     std::string module_name;
     std::string subroutine_name;
+    std::string object_name;
     std::string scope_module;
     std::string scope_package;
 };
@@ -1433,6 +1570,28 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         : sm(sm), uri(uri), line(line), col(col) {}
 
     bool found() const { return target.kind != DefinitionTargetKind::None; }
+
+    std::string object_before_member_dot(const slang::parsing::Token& token) const {
+        if (!token || !token.location().valid())
+            return {};
+        const auto source = sm.getSourceText(token.location().buffer());
+        size_t i = token.location().offset();
+        if (i > source.size())
+            return {};
+        while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+            --i;
+        if (i == 0 || source[i - 1] != '.')
+            return {};
+        --i;
+        while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+            --i;
+        const size_t end = i;
+        while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
+            --i;
+        if (i == end)
+            return {};
+        return std::string(source.substr(i, end - i));
+    }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
         if (token_contains_position_in_uri(sm, node.header->name, uri, line, col)) {
@@ -1540,6 +1699,18 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
     }
 
+    void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
+        if (token_contains_position_in_uri(sm, node.name, uri, line, col)) {
+            target.kind = DefinitionTargetKind::ClassMember;
+            target.name = std::string(node.name.valueText());
+            target.object_name = simple_identifier_from_expr(node.left);
+            target.scope_module = current_module;
+            target.scope_package = current_package;
+            return;
+        }
+        visitDefault(node);
+    }
+
     void handle(const slang::syntax::NamedTypeSyntax& node) {
         const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>();
         if (identifier &&
@@ -1574,6 +1745,15 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
         if (token.kind == slang::parsing::TokenKind::Identifier &&
             token_contains_position_in_uri(sm, token, uri, line, col)) {
+            const auto object_name = object_before_member_dot(token);
+            if (!object_name.empty()) {
+                target.kind = DefinitionTargetKind::ClassMember;
+                target.name = std::string(token.valueText());
+                target.object_name = object_name;
+                target.scope_module = current_module;
+                target.scope_package = current_package;
+                return;
+            }
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
@@ -1825,10 +2005,43 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return std::nullopt;
     }
 
+    const int use_line_one_based = line + 1;
+
+    if (target.kind == DefinitionTargetKind::ClassMember) {
+        // Resolve simple object member calls by first identifying the object's
+        // declared class type in the current lexical module, then looking up
+        // the requested method inside that class.  This intentionally runs
+        // before the generic definition fallback so:
+        //
+        //   Packet p;
+        //   p.req_data();
+        //
+        // jumps to `class Packet::req_data`, not to an unrelated unit-level
+        // `task req_data`.
+        const auto& current_index = get_structural_index(state);
+        auto class_type = class_type_for_object_reference(current_index, target.scope_module,
+                                                          target.object_name, use_line_one_based);
+        if (!class_type) {
+            class_type = class_type_for_object_reference_in_tree(
+                *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
+        }
+        if (class_type) {
+            if (auto loc =
+                    find_class_method_definition(current_index, uri, *class_type, target.name))
+                return loc;
+            for (const auto& extra : extra_files) {
+                if (skip_extra(extra))
+                    continue;
+                if (auto loc = find_class_method_definition(extra.index, extra.uri, *class_type,
+                                                            target.name))
+                    return loc;
+            }
+        }
+    }
+
     std::vector<ImportEntry> visible_imports;
     if (state.tree)
         visible_imports = get_dynamic_index(state).imports;
-    const int use_line_one_based = line + 1;
 
     if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module,
                                            target.scope_package, visible_imports,
@@ -1921,6 +2134,29 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     } else if (target_info.kind == DefinitionTargetKind::NamedParameter) {
         target_symbol_debug =
             "module_param::" + target_info.module_name + "::" + target_info.name;
+    } else if (target_info.kind == DefinitionTargetKind::ClassMember) {
+        const auto& current_index = get_structural_index(*state);
+        const int use_line_one_based = line + 1;
+        auto class_type =
+            class_type_for_object_reference(current_index, target_info.scope_module,
+                                            target_info.object_name, use_line_one_based);
+        if (!class_type && state->tree) {
+            class_type = class_type_for_object_reference_in_tree(
+                *state->tree, uri, target_info.scope_module, target_info.object_name,
+                use_line_one_based);
+        }
+        const bool has_class_method =
+            class_type &&
+            (find_class_method_definition(current_index, uri, *class_type, target_info.name)
+                 .has_value() ||
+             std::any_of(extra_idx->begin(), extra_idx->end(), [&](const ExtraIndexInfo& extra) {
+                 return find_class_method_definition(extra.index, extra.uri, *class_type,
+                                                     target_info.name)
+                     .has_value();
+             }));
+        if (has_class_method)
+            target_symbol_debug =
+                symbol_canonical("class_method", *class_type, target_info.name);
     } else if (target_info.kind == DefinitionTargetKind::Macro) {
         target_symbol_debug = "macro::" + target_info.name;
     } else if (is_backtick_identifier(state->text, line, target->col) ||
@@ -2140,6 +2376,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                     (fallback_symbol_id && ref.symbol_id == fallback_symbol_id))
                     add_indexed_reference(state_uri, open_index, ref);
             }
+            if (target_info.kind == DefinitionTargetKind::ClassMember &&
+                target_symbol_debug.starts_with("class_method::"))
+                visit_tree(*state->tree, state_uri, resolve_snapshot);
         } else {
             visit_tree(*state->tree, state_uri, resolve_snapshot);
         }
