@@ -13,6 +13,7 @@ SystemVerilog LSP server written in C++. Provides language intelligence (formatt
 | `lazyverilog.toml` | LSP server config — formatting and linting options |
 | `CLAUDE.md` | Project instructions for AI agents |
 | `README.md` | Project overview and usage |
+| `src/features/` | Individual LSP feature implementations |
 | `.gitmodules` | Git submodule configuration |
 
 ## Subdirectories
