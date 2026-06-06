@@ -1,5 +1,6 @@
 #include "background_compiler.hpp"
 #include "syntax_index_shared.hpp"
+#include "string_utils.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -26,9 +27,6 @@ static std::string read_file_text(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-static std::string normalize_path(const std::filesystem::path& path) {
-    return std::filesystem::absolute(path).lexically_normal().string();
-}
 
 static std::string diagnostic_uri(const slang::SourceManager& sm, const std::string& fallback_uri,
                                   slang::SourceLocation location) {
@@ -319,13 +317,13 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
             auto buffer = buffers[i];
             const auto& path = source_manager->getFullPath(buffer);
             if (!path.empty())
-                assigned_paths.insert(normalize_path(path));
+                assigned_paths.insert(normalize_filesystem_path(path));
         }
         scanned_buffer_count = buffers.size();
     };
 
     for (const auto& file : snapshot.files) {
-        const auto normalized_path = normalize_path(file.path);
+        const auto normalized_path = normalize_filesystem_path(file.path);
         if (assigned_paths.contains(normalized_path))
             continue;
 

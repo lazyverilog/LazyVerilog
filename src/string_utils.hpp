@@ -16,8 +16,17 @@ inline std::string trim_copy(std::string text) {
     return std::string(first, last);
 }
 
+
+inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path) {
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(path, ec);
+    if (ec)
+        absolute = path;
+    return absolute.lexically_normal();
+}
+
 inline std::string uri_from_path(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
+    return "file://" + normalize_filesystem_path(path).string();
 }
 
 /// Split source text into logical lines without copying.  The returned
