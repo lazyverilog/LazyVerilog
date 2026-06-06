@@ -141,6 +141,7 @@ make_file_state_with_options(const std::filesystem::path& path,
 
     auto text = read_file_text_optional(norm);
     auto state = std::make_shared<DocumentState>(uri, text.value_or(std::string{}), nullptr);
+    state->normalized_path = norm.string();
     state->source_manager = std::move(sm);
     state->tree = std::move(*tree_or_error);
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
@@ -186,15 +187,11 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         for (const auto& [open_uri, open_state] : docs_) {
             if (!open_state || open_uri == uri)
                 continue;
-            std::string open_path = open_uri;
-            if (open_path.starts_with("file://"))
-                open_path = open_path.substr(7);
-            open_path = normalize_filesystem_path(open_path).string();
-            if (open_path == normalized_current_path)
+            if (open_state->normalized_path == normalized_current_path)
                 continue;
             open_overlays.push_back(OpenTextOverlay{
                 .uri = open_uri,
-                .path = std::move(open_path),
+                .path = open_state->normalized_path,
                 .text = open_state->text,
             });
         }
@@ -210,6 +207,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     auto tree = slang::syntax::SyntaxTree::fromText(
         std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
+    state->normalized_path = normalized_current_path;
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
@@ -239,15 +237,11 @@ std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::
         for (const auto& [open_uri, open_state] : docs_) {
             if (!open_state)
                 continue;
-            std::string open_path = open_uri;
-            if (open_path.starts_with("file://"))
-                open_path = open_path.substr(7);
-            open_path = normalize_filesystem_path(open_path).string();
-            if (open_path == normalized_path)
+            if (open_state->normalized_path == normalized_path)
                 continue;
             open_overlays.push_back(OpenTextOverlay{
                 .uri = open_uri,
-                .path = std::move(open_path),
+                .path = open_state->normalized_path,
                 .text = open_state->text,
             });
         }
@@ -258,10 +252,7 @@ std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::
 void Analyzer::open(const std::string& uri, const std::string& text) {
     auto state = make_state(uri, text);
 
-    std::string path_text = uri;
-    if (path_text.starts_with("file://"))
-        path_text = path_text.substr(7);
-    const auto path_string = normalize_filesystem_path(path_text).string();
+    const auto path_string = state->normalized_path;
 
     bool listed_extra_file = false;
     {
@@ -286,10 +277,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
 void Analyzer::change(const std::string& uri, const std::string& text) {
     auto state = make_state(uri, text);
 
-    std::string path_text = uri;
-    if (path_text.starts_with("file://"))
-        path_text = path_text.substr(7);
-    const auto path_string = normalize_filesystem_path(path_text).string();
+    const auto path_string = state->normalized_path;
 
     bool listed_extra_file = false;
     {
@@ -312,10 +300,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
                 !depends_on_changed_uri(*other_state))
                 continue;
 
-            std::string other_path = other_uri;
-            if (other_path.starts_with("file://"))
-                other_path = other_path.substr(7);
-            other_path = normalize_filesystem_path(other_path).string();
+            const std::string& other_path = other_state->normalized_path;
             // Indirect include fanout belongs on the background path.  A common
             // header can be included by many open files; reparsing all of them
             // synchronously on each keystroke would violate the current-file
@@ -2062,11 +2047,13 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
 }
 
 void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    include_dirs_.clear();
-    include_dirs_.reserve(include_dirs.size());
+    std::vector<std::string> normalized_include_dirs;
+    normalized_include_dirs.reserve(include_dirs.size());
     for (const auto& dir : include_dirs)
-        include_dirs_.push_back(normalize_filesystem_path(dir).string());
+        normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    include_dirs_ = std::move(normalized_include_dirs);
 
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
@@ -2080,19 +2067,20 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
                                const std::string& filelist_path) {
+    std::vector<std::string> normalized_paths;
+    normalized_paths.reserve(paths.size());
+    for (const auto& path : paths)
+        normalized_paths.push_back(normalize_filesystem_path(path).string());
+
     std::lock_guard<std::mutex> lock(map_mutex_);
     filelist_path_ = filelist_path;
-    extra_files_.clear();
+    extra_files_ = std::move(normalized_paths);
     extra_file_set_.clear();
+    extra_file_set_.reserve(extra_files_.size());
+    for (const auto& path : extra_files_)
+        extra_file_set_.insert(path);
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
-    extra_files_.reserve(paths.size());
-    extra_file_set_.reserve(paths.size());
-    for (const auto& path : paths) {
-        auto normalized = normalize_filesystem_path(path).string();
-        extra_files_.push_back(normalized);
-        extra_file_set_.insert(std::move(normalized));
-    }
     clear_extra_project_index_locked();
 
     // Always index configured project files asynchronously, regardless of
@@ -2106,6 +2094,16 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
                                   const std::string& filelist_path) {
+    std::vector<std::string> normalized_include_dirs;
+    normalized_include_dirs.reserve(include_dirs.size());
+    for (const auto& dir : include_dirs)
+        normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
+
+    std::vector<std::string> normalized_extra_files;
+    normalized_extra_files.reserve(extra_files.size());
+    for (const auto& path : extra_files)
+        normalized_extra_files.push_back(normalize_filesystem_path(path).string());
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     // Apply every parse-affecting project input under one lock.  A config reload
@@ -2114,22 +2112,14 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // avoids creating redundant background generations that cannot commit but
     // can still burn CPU / shared-filesystem bandwidth while they parse.
     defines_ = defines;
-
-    include_dirs_.clear();
-    include_dirs_.reserve(include_dirs.size());
-    for (const auto& dir : include_dirs)
-        include_dirs_.push_back(normalize_filesystem_path(dir).string());
+    include_dirs_ = std::move(normalized_include_dirs);
 
     filelist_path_ = filelist_path;
-    extra_files_.clear();
+    extra_files_ = std::move(normalized_extra_files);
     extra_file_set_.clear();
-    extra_files_.reserve(extra_files.size());
-    extra_file_set_.reserve(extra_files.size());
-    for (const auto& path : extra_files) {
-        auto normalized = normalize_filesystem_path(path).string();
-        extra_files_.push_back(normalized);
-        extra_file_set_.insert(std::move(normalized));
-    }
+    extra_file_set_.reserve(extra_files_.size());
+    for (const auto& path : extra_files_)
+        extra_file_set_.insert(path);
 
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
@@ -2149,14 +2139,23 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         return normalize_filesystem_path(uri).string();
     };
 
+    std::vector<std::string> deleted_paths;
+    deleted_paths.reserve(deleted_uris.size());
+    for (const auto& uri : deleted_uris)
+        deleted_paths.push_back(normalized_project_path(uri));
+
+    std::vector<std::string> changed_paths;
+    changed_paths.reserve(changed_uris.size());
+    for (const auto& uri : changed_uris)
+        changed_paths.push_back(normalized_project_path(uri));
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     bool queued_changed_file = false;
     bool removed_deleted_file = false;
     std::unordered_set<std::string> seen_changed_paths;
 
-    for (const auto& uri : deleted_uris) {
-        const auto path = normalized_project_path(uri);
+    for (const auto& path : deleted_paths) {
         if (path.empty() || !extra_file_set_.contains(path))
             continue;
         extra_cache_.erase(uri_from_path(path));
@@ -2164,8 +2163,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         removed_deleted_file = true;
     }
 
-    for (const auto& uri : changed_uris) {
-        const auto path = normalized_project_path(uri);
+    for (const auto& path : changed_paths) {
         if (path.empty() || !extra_file_set_.contains(path) || !seen_changed_paths.insert(path).second)
             continue;
 
@@ -2366,18 +2364,14 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         if (!state)
             continue;
 
-        std::string path = uri;
-        if (path.starts_with("file://"))
-            path = path.substr(7);
-
         snapshot.files.push_back(CompilationSourceFile{
             .uri = uri,
-            .path = normalize_filesystem_path(path).string(),
+            .path = state->normalized_path,
             .text = state->text,
         });
         snapshot.open_uris.push_back(uri);
         seen_uris.insert(uri);
-        seen_paths.insert(normalize_filesystem_path(path).string());
+        seen_paths.insert(state->normalized_path);
     }
 
     for (const auto& configured_path : extra_files_) {
@@ -2663,15 +2657,11 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
             for (const auto& [open_uri, open_state] : docs_) {
                 if (!open_state || open_uri == uri)
                     continue;
-                std::string open_path = open_uri;
-                if (open_path.starts_with("file://"))
-                    open_path = open_path.substr(7);
-                open_path = normalize_filesystem_path(open_path).string();
-                if (open_path == path_string)
+                if (open_state->normalized_path == path_string)
                     continue;
                 open_overlays.push_back(OpenTextOverlay{
                     .uri = open_uri,
-                    .path = std::move(open_path),
+                    .path = open_state->normalized_path,
                     .text = open_state->text,
                 });
             }
@@ -2785,12 +2775,8 @@ void Analyzer::update_extra_cache_for_live_state_locked(
     if (!state)
         return;
 
-    std::string path_text = state->uri;
-    if (path_text.starts_with("file://"))
-        path_text = path_text.substr(7);
-    const auto path = normalize_filesystem_path(path_text);
-    const auto path_string = path.string();
-    const auto uri = uri_from_path(path);
+    const auto path_string = state->normalized_path;
+    const auto uri = state->uri;
 
     // Only files explicitly listed in the design filelist participate in the
     // project index.  Random open buffers should not pollute project-wide

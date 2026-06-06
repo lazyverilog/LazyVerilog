@@ -29,6 +29,10 @@ struct ParseDiagInfo {
 struct DocumentState {
     std::string uri;
     std::string text;
+    // Normalized filesystem path for this URI.  Store it once per immutable
+    // snapshot so request/change paths do not repeatedly call filesystem
+    // normalization while holding Analyzer::map_mutex_.
+    std::string normalized_path;
     // source_manager must outlive tree (SyntaxTree holds SourceManager&).
     std::unique_ptr<slang::SourceManager> source_manager;
     std::shared_ptr<slang::syntax::SyntaxTree> tree;
