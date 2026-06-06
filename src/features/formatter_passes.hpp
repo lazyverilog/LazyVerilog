@@ -927,6 +927,13 @@ struct MacroClassifier {
         if (control_flow_like.count(name)) return MacroRole::ControlFlowLike;
         if (declaration_like.count(name))  return MacroRole::DeclarationLike;
         if (statement_like.count(name))    return MacroRole::StatementLike;
+
+        // Unknown macros are safest as expression-like leaves.  That default
+        // keeps the formatter conservative: it avoids inventing statement,
+        // declaration, or block-boundary structure for a macro whose expansion
+        // is not known to the lexer.  Users can opt into stronger roles with
+        // [format.macros] when a project macro intentionally behaves like a
+        // block opener/closer, declaration, statement, or control-flow token.
         return MacroRole::ObjectLikeExpr;
     }
 
