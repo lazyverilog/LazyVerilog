@@ -1,9 +1,10 @@
 #pragma once
 
 #include "../config.hpp"
+#include <cctype>
 #include <cstddef>
-#include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <slang/parsing/Token.h>
 #include <slang/text/SourceLocation.h>
@@ -11,6 +12,14 @@
 namespace svfmt {
 
 static constexpr size_t npos = static_cast<size_t>(-1);
+
+inline std::string lower_ascii(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text)
+        out.push_back(static_cast<char>(std::tolower(c)));
+    return out;
+}
 
 // -----------------------------------------------------------------------------
 // Immutable fact layers
@@ -193,7 +202,13 @@ struct ImmutableData {
 };
 
 struct Tok {
-    std::shared_ptr<const LexemeFacts> lex;
+    // Lexeme facts have exactly one owner: the token itself.  They used to live
+    // behind a shared_ptr, which made every collected token pay for a heap
+    // allocation, a control block, and atomic refcount operations.  The facts
+    // are immutable by convention after collection, but they are not shared
+    // across tokens or snapshots, so embedding them keeps ownership explicit and
+    // removes the allocator hot spot from large repeated formatting runs.
+    LexemeFacts lex;
 
     ImmutableData immutable;
     MutableData mutable_;

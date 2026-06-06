@@ -43,7 +43,7 @@ inline std::string render_tokens(const TokenStream& tokens) {
     std::string out;
     size_t token_text_bytes = 0;
     for (const Tok& tok : tokens)
-        token_text_bytes += tok.lex->text.size();
+        token_text_bytes += tok.lex.text.size();
     // Rendering appends every immutable token text plus formatter-owned
     // whitespace.  Large generated register files can easily contain hundreds
     // of thousands of small tokens; without a reserve(), std::string growth
@@ -77,7 +77,7 @@ inline std::string render_tokens(const TokenStream& tokens) {
         // regions and whitespace-sensitive macro bodies.  The renderer still
         // owns the surrounding newline decision.
         if (d.passthrough) {
-            std::string_view text(tok.lex->text);
+            std::string_view text(tok.lex.text);
             out.append(text.data(), text.size());
             size_t last_nl = last_newline_offset(text);
             if (last_nl == std::string::npos) {
@@ -107,8 +107,8 @@ inline std::string render_tokens(const TokenStream& tokens) {
             col += spaces;
         }
 
-        out += tok.lex->text;
-        col += static_cast<int>(tok.lex->text.size());
+        out += tok.lex.text;
+        col += static_cast<int>(tok.lex.text.size());
 
         if (tok.mutable_.wrap.must_break_after) {
             trim_trailing_spaces(out);

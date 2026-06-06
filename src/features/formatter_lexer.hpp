@@ -2,10 +2,11 @@
 
 #include "formatter_token.hpp"
 #include <algorithm>
-#include <cctype>
-#include <optional>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <string_view>
+#include <unordered_map>
 #include <slang/diagnostics/Diagnostics.h>
 #include <slang/parsing/Lexer.h>
 #include <slang/syntax/AllSyntax.h>
@@ -15,26 +16,38 @@
 
 namespace svfmt {
 
-inline std::string lower_ascii(std::string_view text) {
-    std::string out;
-    out.reserve(text.size());
-    for (unsigned char c : text)
-        out.push_back(static_cast<char>(std::tolower(c)));
-    return out;
-}
+using FormatMarkerRegex = std::shared_ptr<const std::regex>;
 
-inline std::optional<std::regex> compile_format_marker_regex(const std::string& pattern) {
-    if (pattern.empty()) return std::nullopt;
+inline FormatMarkerRegex compile_format_marker_regex_uncached(const std::string& pattern) {
+    if (pattern.empty()) return nullptr;
     try {
-        return std::regex(pattern, std::regex::ECMAScript | std::regex::icase);
+        return std::make_shared<const std::regex>(pattern, std::regex::ECMAScript | std::regex::icase);
     } catch (const std::regex_error&) {
-        return std::nullopt; // malformed — callers fall back to literal search
+        return nullptr; // malformed — callers fall back to literal search
     }
 }
 
-// Use pre-compiled regex (compiled once at TokenCollector construction).
+inline FormatMarkerRegex cached_format_marker_regex(const std::string& pattern) {
+    // Regex construction is surprisingly expensive in libstdc++/libc++, and a
+    // TokenCollector is constructed for every format request.  Cache both valid
+    // compiled regexes and invalid/empty patterns (stored as nullptr) so repeated
+    // calls with the common default patterns do not repeatedly recompile.
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, FormatMarkerRegex> cache;
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(pattern);
+    if (it != cache.end())
+        return it->second;
+
+    FormatMarkerRegex compiled = compile_format_marker_regex_uncached(pattern);
+    cache.emplace(pattern, compiled);
+    return compiled;
+}
+
+// Use pre-compiled regex (cached by pattern across TokenCollector instances).
 inline bool is_format_marker(std::string_view comment,
-                              const std::optional<std::regex>& compiled_re,
+                              const FormatMarkerRegex& compiled_re,
                               const std::string& pattern_fallback) {
     if (compiled_re) {
         try {
@@ -49,8 +62,8 @@ class TokenCollector {
 public:
     TokenCollector(const std::string& source, const FormatOptions& opts)
         : source_(source), opts_(opts),
-          format_off_re_(compile_format_marker_regex(opts.format_off_comment_pattern)),
-          format_on_re_(compile_format_marker_regex(opts.format_on_comment_pattern)) {}
+          format_off_re_(cached_format_marker_regex(opts.format_off_comment_pattern)),
+          format_on_re_(cached_format_marker_regex(opts.format_on_comment_pattern)) {}
 
     TokenStream collect() {
         slang::SourceManager sm;
@@ -134,8 +147,8 @@ public:
 private:
     const std::string& source_;
     const FormatOptions& opts_;
-    std::optional<std::regex> format_off_re_;
-    std::optional<std::regex> format_on_re_;
+    FormatMarkerRegex format_off_re_;
+    FormatMarkerRegex format_on_re_;
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
@@ -186,25 +199,25 @@ private:
                    bool is_format_off_marker = false,
                    bool is_format_on_marker = false,
                    bool is_disabled_region_body = false) {
-        auto lex = std::make_shared<LexemeFacts>();
-        lex->kind = kind;
-        lex->text.assign(text);
-        // lower_text is needed by folding_range (directive classification) and
-        // debug logging.  Skip the allocation for the common case: non-directive
-        // tokens when logging is disabled.
-        if (is_directive || !opts_.log_path.empty())
-            lex->lower_text = lower_ascii(text);
-        lex->range = slang::SourceRange(slang::SourceLocation(slang::BufferID::getPlaceholder(), pos),
-                                        slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
-        lex->is_directive = is_directive;
-        lex->is_whitespace_sensitive = whitespace_sensitive;
-        lex->comment_kind = comment_kind;
-        lex->is_format_off_marker = is_format_off_marker;
-        lex->is_format_on_marker = is_format_on_marker;
-        lex->is_disabled_region_body = is_disabled_region_body;
-
         Tok tok;
-        tok.lex = std::move(lex);
+        auto& lex = tok.lex;
+        lex.kind = kind;
+        lex.text.assign(text);
+        // lower_text is needed by folding_range (directive classification) and
+        // is intentionally not precomputed for every token when diagnostic
+        // logging is enabled.  The logger can derive it on demand; keeping this
+        // lexer path directive-only avoids a per-token string allocation in
+        // repeated large-file formatting runs.
+        if (is_directive)
+            lex.lower_text = lower_ascii(text);
+        lex.range = slang::SourceRange(slang::SourceLocation(slang::BufferID::getPlaceholder(), pos),
+                                        slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
+        lex.is_directive = is_directive;
+        lex.is_whitespace_sensitive = whitespace_sensitive;
+        lex.comment_kind = comment_kind;
+        lex.is_format_off_marker = is_format_off_marker;
+        lex.is_format_on_marker = is_format_on_marker;
+        lex.is_disabled_region_body = is_disabled_region_body;
         tok.immutable.input_trivia.original_spaces_before = pending_newlines_ > 0 ? pending_indent_ : pending_spaces_;
         tok.immutable.input_trivia.original_newlines_before = pending_newlines_;
         tok.immutable.input_trivia.original_indent = pending_newlines_ > 0 ? pending_indent_ : col_;

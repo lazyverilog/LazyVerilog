@@ -606,24 +606,24 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         const auto& t = tokens[i];
 
         // Skip verbatim passthrough bodies from format-off/on regions.
-        if (t.lex->is_disabled_region_body) continue;
+        if (t.lex.is_disabled_region_body) continue;
 
         // ── comments ──────────────────────────────────────────────────────
-        if (t.lex->comment_kind != svfmt::CommentLexemeKind::None) {
+        if (t.lex.comment_kind != svfmt::CommentLexemeKind::None) {
             if (active_decl_start < 0)
                 flush_decl_run();
-            size_t offset = t.lex->range.start().offset();
+            size_t offset = t.lex.range.start().offset();
             int    line   = lt.line_of(offset);
 
-            if (t.lex->comment_kind == svfmt::CommentLexemeKind::Block) {
+            if (t.lex.comment_kind == svfmt::CommentLexemeKind::Block) {
                 flush_comment_run();
-                int newlines = (int)std::count(t.lex->text.begin(), t.lex->text.end(), '\n');
+                int newlines = (int)std::count(t.lex.text.begin(), t.lex.text.end(), '\n');
                 // Only fold block comments that start on their own line.
                 // Comment role classification may reference source positioning
                 // (per CLAUDE.md exception for comment classification).
                 if (newlines > 0 && is_own_line_at_offset(lt.text, offset))
                     emit_token_fold(out, lt, line, line + newlines, "comment");
-            } else if (t.lex->comment_kind == svfmt::CommentLexemeKind::Line) {
+            } else if (t.lex.comment_kind == svfmt::CommentLexemeKind::Line) {
                 if (!is_own_line_at_offset(lt.text, offset)) {
                     // Trailing comment breaks the run so it does not fold
                     // together with any preceding own-line comment.
@@ -645,15 +645,15 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         // ── preprocessor directives ────────────────────────────────────────
         // All directives share TokenKind::Directive in the formatter token
         // stream.  Subtype is classified via lower_text prefix matching.
-        if (t.lex->is_directive) {
+        if (t.lex.is_directive) {
             if (active_decl_start < 0)
                 flush_decl_run();
             flush_comment_run();
             // Directives between import statements do not break an import run
             // (mirrors the AST path where directives are trivia, not members).
 
-            const std::string& ltext     = t.lex->lower_text;
-            int                dir_line = lt.line_of(t.lex->range.start().offset());
+            const std::string& ltext     = t.lex.lower_text;
+            int                dir_line = lt.line_of(t.lex.range.start().offset());
 
             auto sw = [&](const char* prefix) {
                 return ltext.rfind(prefix, 0) == 0;
@@ -696,23 +696,23 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         // Any such token that is not ImportKeyword also flushes the import run
         // (matches AST behavior where non-import members break import groups).
         flush_comment_run();
-        if (t.lex->kind != TK::ImportKeyword)
+        if (t.lex.kind != TK::ImportKeyword)
             flush_import_run();
 
-        const int token_line_number = lt.line_of(t.lex->range.start().offset());
+        const int token_line_number = lt.line_of(t.lex.range.start().offset());
         if (active_decl_start < 0 && at_statement_start &&
             paren_depth == 0 && brace_depth == 0 &&
-            is_decl_start_keyword(t.lex->kind)) {
+            is_decl_start_keyword(t.lex.kind)) {
             active_decl_start = token_line_number;
         } else if (active_decl_start < 0 && at_statement_start &&
-                   t.lex->kind != TK::Semicolon) {
+                   t.lex.kind != TK::Semicolon) {
             // A non-declaration statement breaks a declaration run.  For
             // example, do not fold declarations across an intervening assign,
             // always block, instance, or assertion.
             flush_decl_run();
         }
 
-        switch (t.lex->kind) {
+        switch (t.lex.kind) {
 
         // Control keywords: mark pending start for begin attribution
         case TK::AlwaysKeyword:
@@ -729,7 +729,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::ForeverKeyword:
         case TK::WhileKeyword:
         case TK::RepeatKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0) pending_control_start = line;
             break;
         }
@@ -753,7 +753,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::ModuleKeyword:
         case TK::MacromoduleKeyword:
         case TK::ClockingKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0) keyword_region_stack.push_back(line);
             pending_control_start = -1;
             pending_paren_region  = true;
@@ -781,7 +781,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::EndProgramKeyword:
         case TK::EndModuleKeyword:
         case TK::EndClockingKeyword: {
-            int end_line = lt.line_of(t.lex->range.start().offset());
+            int end_line = lt.line_of(t.lex.range.start().offset());
             if (!keyword_region_stack.empty()) {
                 emit_token_fold(out, lt, keyword_region_stack.back(), end_line);
                 keyword_region_stack.pop_back();
@@ -795,7 +795,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         // TypedefKeyword anchors the fold start so "typedef struct {" folds
         // from the typedef line rather than the struct/enum/union line.
         case TK::TypedefKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0) pending_brace_region_start = line;
             pending_control_start = -1;
             break;
@@ -804,7 +804,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::ConstraintKeyword:
         case TK::CoverPointKeyword:
         case TK::CrossKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0) pending_brace_region_start = line;
             pending_control_start = -1;
             break;
@@ -816,7 +816,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::EnumKeyword:
         case TK::StructKeyword:
         case TK::UnionKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0 && pending_brace_region_start < 0)
                 pending_brace_region_start = line;
             pending_control_start = -1;
@@ -827,7 +827,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::BinsKeyword:
         case TK::IllegalBinsKeyword:
         case TK::IgnoreBinsKeyword: {
-            int line = lt.line_of(t.lex->range.start().offset());
+            int line = lt.line_of(t.lex.range.start().offset());
             if (line >= 0) {
                 pending_bins_start  = line;
                 pending_bins_equals = false;
@@ -854,7 +854,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
             break;
 
         case TK::CloseBrace: {
-            int close_line = lt.line_of(t.lex->range.start().offset());
+            int close_line = lt.line_of(t.lex.range.start().offset());
             if (brace_depth > 0) --brace_depth;
             if (!brace_region_stack.empty() &&
                 brace_region_stack.back().outer_depth == brace_depth) {
@@ -879,14 +879,14 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::CaseXKeyword:
         case TK::CaseZKeyword:
         case TK::RandCaseKeyword: {
-            int case_line = lt.line_of(t.lex->range.start().offset());
+            int case_line = lt.line_of(t.lex.range.start().offset());
             if (case_line >= 0) case_stack.push_back(case_line);
             pending_control_start = -1;
             break;
         }
 
         case TK::EndCaseKeyword: {
-            int endcase_line = lt.line_of(t.lex->range.start().offset());
+            int endcase_line = lt.line_of(t.lex.range.start().offset());
             if (!case_stack.empty()) {
                 emit_token_fold(out, lt, case_stack.back(), endcase_line);
                 case_stack.pop_back();
@@ -896,7 +896,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         }
 
         case TK::BeginKeyword: {
-            int begin_line = lt.line_of(t.lex->range.start().offset());
+            int begin_line = lt.line_of(t.lex.range.start().offset());
             block_stack.push_back(
                 pending_control_start >= 0 ? pending_control_start : begin_line);
             pending_control_start = -1;
@@ -904,7 +904,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         }
 
         case TK::EndKeyword: {
-            int end_line = lt.line_of(t.lex->range.start().offset());
+            int end_line = lt.line_of(t.lex.range.start().offset());
             if (!block_stack.empty()) {
                 emit_token_fold(out, lt, block_stack.back(), end_line);
                 block_stack.pop_back();
@@ -916,7 +916,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         // #( introduces a parameter value assignment paren region
         case TK::Hash: {
             if (i + 1 < tokens.size() &&
-                tokens[i + 1].lex->kind == TK::OpenParenthesis) {
+                tokens[i + 1].lex.kind == TK::OpenParenthesis) {
                 // If a keyword header (module/interface/program/etc.) was
                 // waiting for its first parenthesized region and sees "#(",
                 // the hash paren is the parameter list.  After that closes,
@@ -935,7 +935,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         // connection lists are not detected here because instance names are
         // identifiers, not keywords.
         case TK::OpenParenthesis: {
-            int open_line = lt.line_of(t.lex->range.start().offset());
+            int open_line = lt.line_of(t.lex.range.start().offset());
             if (pending_paren_region) {
                 paren_region_stack.push_back(
                     {open_line, paren_depth, pending_hash_paren_from_header});
@@ -950,7 +950,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
 
         case TK::CloseParenthesis: {
             if (paren_depth > 0) --paren_depth;
-            int close_line = lt.line_of(t.lex->range.start().offset());
+            int close_line = lt.line_of(t.lex.range.start().offset());
             if (!paren_region_stack.empty() &&
                 paren_region_stack.back().outer_depth == paren_depth) {
                 bool hash_from_header = paren_region_stack.back().hash_from_header;
@@ -981,15 +981,15 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
             // Look ahead past comments/unknowns to the first content token.
             size_t next = i + 1;
             while (next < tokens.size() &&
-                   (tokens[next].lex->comment_kind != svfmt::CommentLexemeKind::None ||
-                    tokens[next].lex->kind == TK::Unknown ||
-                    tokens[next].lex->is_disabled_region_body))
+                   (tokens[next].lex.comment_kind != svfmt::CommentLexemeKind::None ||
+                    tokens[next].lex.kind == TK::Unknown ||
+                    tokens[next].lex.is_disabled_region_body))
                 ++next;
 
             if (next < tokens.size() &&
-                tokens[next].lex->kind == TK::StringLiteral) {
+                tokens[next].lex.kind == TK::StringLiteral) {
                 // DPI import: skip to closing semicolon, do not track.
-                while (i < tokens.size() && tokens[i].lex->kind != TK::Semicolon)
+                while (i < tokens.size() && tokens[i].lex.kind != TK::Semicolon)
                     ++i;
                 // Reset state as if we processed the semicolon.
                 pending_control_start          = -1;
@@ -1004,12 +1004,12 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
 
             // Package import: extent is from ImportKeyword to its Semicolon.
             int    import_start_line =
-                lt.line_of(t.lex->range.start().offset());
+                lt.line_of(t.lex.range.start().offset());
             size_t semi = i + 1;
-            while (semi < tokens.size() && tokens[semi].lex->kind != TK::Semicolon)
+            while (semi < tokens.size() && tokens[semi].lex.kind != TK::Semicolon)
                 ++semi;
             int import_end_line = semi < tokens.size()
-                ? lt.line_of(tokens[semi].lex->range.start().offset())
+                ? lt.line_of(tokens[semi].lex.range.start().offset())
                 : import_start_line;
 
             if (import_run_start < 0) {
@@ -1035,7 +1035,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         }
 
         case TK::Semicolon:
-            finish_active_decl(lt.line_of(t.lex->range.start().offset()));
+            finish_active_decl(lt.line_of(t.lex.range.start().offset()));
             pending_control_start      = -1;
             pending_brace_region_start = -1;
             pending_bins_start         = -1;

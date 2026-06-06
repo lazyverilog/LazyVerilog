@@ -8,9 +8,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
+#include <ostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <slang/parsing/LexerFacts.h>
 
@@ -23,12 +26,31 @@ namespace svfmt {
 // they own no metadata, and they must never affect formatter decisions.  Their
 // only side effect is writing diagnostic text under FormatOptions::log_path.
 
+inline void ensure_log_directory_created(const std::string& log_path) {
+    // Avoid repeated metadata operations on shared filesystems.  A single
+    // format request writes multiple log files, and a long server session may
+    // format thousands of buffers with the same log directory.
+    static std::mutex created_mutex;
+    static std::unordered_set<std::string> created_paths;
+
+    std::lock_guard<std::mutex> lock(created_mutex);
+    if (created_paths.find(log_path) != created_paths.end())
+        return;
+
+    std::filesystem::create_directories(log_path);
+    created_paths.insert(log_path);
+}
+
+inline std::ofstream open_log_file(const FormatOptions& opts, const std::string& filename) {
+    ensure_log_directory_created(opts.log_path);
+    return std::ofstream(std::filesystem::path(opts.log_path) / filename);
+}
+
 inline void write_log(const FormatOptions& opts, const std::string& filename, const std::string& text) {
     if (opts.log_path.empty())
         return;
 
-    std::filesystem::create_directories(opts.log_path);
-    std::ofstream out(std::filesystem::path(opts.log_path) / filename);
+    std::ofstream out = open_log_file(opts, filename);
     out << text;
 }
 
@@ -102,16 +124,22 @@ inline const char* bool01(bool value) {
     return value ? "1" : "0";
 }
 
-inline std::string token_stream_to_log(const TokenStream& tokens) {
-    std::ostringstream out;
+inline std::string lexeme_lower_text_for_log(const LexemeFacts& lex) {
+    // Directives still carry precomputed lower_text for folding-range logic.
+    // Non-directives no longer allocate lower_text during lexing merely because
+    // logging is enabled; derive the diagnostic spelling only while writing the
+    // diagnostic log.
+    return lex.lower_text.empty() ? lower_ascii(lex.text) : lex.lower_text;
+}
 
+inline void write_token_stream_log(std::ostream& out, const TokenStream& tokens) {
     out << "TokenStream dump\n";
     out << "token_count: " << tokens.size() << "\n";
     out << "note: this file is diagnostic only; renderer output must not depend on it.\n\n";
 
     for (size_t i = 0; i < tokens.size(); ++i) {
         const Tok& tok = tokens[i];
-        const LexemeFacts& lex = *tok.lex;
+        const LexemeFacts& lex = tok.lex;
         const ImmutableData& imm = tok.immutable;
         const MutableData& mut = tok.mutable_;
 
@@ -121,7 +149,7 @@ inline std::string token_stream_to_log(const TokenStream& tokens) {
         out << "  lex.kind: " << token_kind_name(lex.kind) << "\n";
         out << "  lex.kind_value: " << static_cast<int>(lex.kind) << "\n";
         out << "  lex.text: \"" << escaped_for_log(lex.text) << "\"\n";
-        out << "  lex.lower_text: \"" << escaped_for_log(lex.lower_text) << "\"\n";
+        out << "  lex.lower_text: \"" << escaped_for_log(lexeme_lower_text_for_log(lex)) << "\"\n";
         out << "  lex.range: " << lex.range.start().offset() << ".." << lex.range.end().offset() << "\n";
         out << "  lex.comment_kind: " << comment_lexeme_kind_name(lex.comment_kind) << "\n";
         out << "  lex.is_directive: " << bool01(lex.is_directive) << "\n";
@@ -188,13 +216,23 @@ inline std::string token_stream_to_log(const TokenStream& tokens) {
         out << "\n";
     }
 
+}
+
+inline std::string token_stream_to_log(const TokenStream& tokens) {
+    // Kept for tests/tools that may want a string, but normal file logging uses
+    // write_token_stream_log() below to avoid constructing a multi-megabyte
+    // intermediate string for large token streams.
+    std::ostringstream out;
+    write_token_stream_log(out, tokens);
     return out.str();
 }
 
 inline void write_log(const FormatOptions& opts, const std::string& filename, const TokenStream& tokens) {
     if (opts.log_path.empty())
         return;
-    write_log(opts, filename, token_stream_to_log(tokens));
+
+    std::ofstream out = open_log_file(opts, filename);
+    write_token_stream_log(out, tokens);
 }
 
 } // namespace svfmt

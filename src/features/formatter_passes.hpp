@@ -12,9 +12,9 @@ namespace svfmt {
 
 using TK = slang::parsing::TokenKind;
 
-inline bool kind_is(const Tok& t, TK k) { return t.lex->kind == k; }
-inline bool is_passthrough(const Tok& t) { return t.mutable_.macro.passthrough || t.lex->is_whitespace_sensitive; }
-inline int token_width(const Tok& t) { return static_cast<int>(t.lex->text.size()); }
+inline bool kind_is(const Tok& t, TK k) { return t.lex.kind == k; }
+inline bool is_passthrough(const Tok& t) { return t.mutable_.macro.passthrough || t.lex.is_whitespace_sensitive; }
+inline int token_width(const Tok& t) { return static_cast<int>(t.lex.text.size()); }
 
 inline bool is_control_keyword(TK k) {
     return k == TK::IfKeyword || k == TK::ForKeyword || k == TK::ForeachKeyword ||
@@ -124,9 +124,9 @@ inline bool is_port_direction(TK k) {
            k == TK::InOutKeyword || k == TK::RefKeyword;
 }
 inline bool is_numeric(const Tok& t) {
-    return t.lex->kind == TK::IntegerLiteral || t.lex->kind == TK::IntegerBase ||
-           t.lex->kind == TK::UnbasedUnsizedLiteral || t.lex->kind == TK::RealLiteral ||
-           t.lex->kind == TK::TimeLiteral;
+    return t.lex.kind == TK::IntegerLiteral || t.lex.kind == TK::IntegerBase ||
+           t.lex.kind == TK::UnbasedUnsizedLiteral || t.lex.kind == TK::RealLiteral ||
+           t.lex.kind == TK::TimeLiteral;
 }
 
 inline bool is_based_literal_body_piece(const Tok& t) {
@@ -140,9 +140,9 @@ inline bool is_based_literal_body_piece(const Tok& t) {
     // The formatter must keep every body piece adjacent to the preceding
     // IntegerBase; otherwise it can render illegal/changed literals such as
     // `12'h7 c4`.
-    return t.lex->kind == TK::IntegerLiteral ||
-           t.lex->kind == TK::UnbasedUnsizedLiteral ||
-           t.lex->kind == TK::Identifier;
+    return t.lex.kind == TK::IntegerLiteral ||
+           t.lex.kind == TK::UnbasedUnsizedLiteral ||
+           t.lex.kind == TK::Identifier;
 }
 
 inline bool is_based_literal_continuation(const TokenStream& tokens, size_t idx) {
@@ -159,12 +159,12 @@ inline bool is_based_literal_continuation(const TokenStream& tokens, size_t idx)
 }
 
 inline bool is_identifier_like(const Tok& t) {
-    return t.lex->kind == TK::Identifier || t.lex->kind == TK::SystemIdentifier ||
-           t.lex->kind == TK::MacroUsage;
+    return t.lex.kind == TK::Identifier || t.lex.kind == TK::SystemIdentifier ||
+           t.lex.kind == TK::MacroUsage;
 }
 
 inline bool is_code_token(const Tok& t) {
-    return t.lex->comment_kind == CommentLexemeKind::None && !t.lex->is_directive && !is_passthrough(t);
+    return t.lex.comment_kind == CommentLexemeKind::None && !t.lex.is_directive && !is_passthrough(t);
 }
 
 inline bool is_covergroup_event_at(const TokenStream& tokens, size_t at) {
@@ -224,7 +224,7 @@ inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
         return false;
     if (kind_is(tokens[idx], TK::ForkKeyword))
         return is_fork_block_open(tokens, idx);
-    return is_open_block(tokens[idx].lex->kind);
+    return is_open_block(tokens[idx].lex.kind);
 }
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end) {
@@ -236,7 +236,7 @@ inline size_t next_code(const TokenStream& tokens, size_t first, size_t end) {
 }
 
 inline size_t procedural_body_start(const TokenStream& tokens, size_t proc) {
-    if (proc >= tokens.size() || !is_procedural_block_keyword(tokens[proc].lex->kind))
+    if (proc >= tokens.size() || !is_procedural_block_keyword(tokens[proc].lex.kind))
         return npos;
 
     size_t cur = next_code(tokens, proc + 1, tokens.size());
@@ -266,7 +266,7 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body);
 
 inline size_t single_statement_control_body_start(const TokenStream& tokens, size_t control) {
     if (control == npos || control >= tokens.size() ||
-        !is_single_stmt_control(tokens[control].lex->kind))
+        !is_single_stmt_control(tokens[control].lex.kind))
         return npos;
 
     // `forever` is the one procedural control in this family that has no
@@ -356,7 +356,7 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
         return then_end;
     }
 
-    if (is_single_stmt_control(tokens[body].lex->kind)) {
+    if (is_single_stmt_control(tokens[body].lex.kind)) {
         // SystemVerilog uses the same `statement_or_null` body shape for
         // if/for/foreach/while/repeat/forever.  Find that body syntactically
         // and recurse so nested single-statement controls are treated as one
@@ -415,10 +415,10 @@ inline int compact_width(const TokenStream& tokens, size_t first, size_t end) {
     for (size_t i = first; i < end; ++i) {
         const Tok& t = tokens[i];
         if (!is_code_token(t)) continue;
-        if (need_space && !no_space_before(t.lex->kind))
+        if (need_space && !no_space_before(t.lex.kind))
             ++w;
         w += token_width(t);
-        need_space = !no_space_after(t.lex->kind);
+        need_space = !no_space_after(t.lex.kind);
     }
     return w;
 }
@@ -433,7 +433,7 @@ inline int token_text_width(const TokenStream& tokens, size_t first, size_t end)
 }
 
 inline int canonical_space_between(const Tok& left, const Tok& right) {
-    if (no_space_before(right.lex->kind) || no_space_after(left.lex->kind))
+    if (no_space_before(right.lex.kind) || no_space_after(left.lex.kind))
         return 0;
     if (kind_is(left, TK::Dot) || kind_is(right, TK::Dot) ||
         kind_is(left, TK::DoubleColon) || kind_is(right, TK::DoubleColon))
@@ -443,7 +443,7 @@ inline int canonical_space_between(const Tok& left, const Tok& right) {
          kind_is(left, TK::CloseParenthesis)))
         return 0;
     if (kind_is(right, TK::OpenParenthesis) &&
-        (is_identifier_like(left) || is_control_keyword(left.lex->kind) ||
+        (is_identifier_like(left) || is_control_keyword(left.lex.kind) ||
          kind_is(left, TK::CloseParenthesis) || kind_is(left, TK::Hash)))
         return 0;
     return 1;
@@ -531,9 +531,9 @@ inline bool is_module_header_import_semicolon(const TokenStream& tokens, size_t 
         if (kind_is(tokens[i], TK::ImportKeyword))
             return true;
         if (kind_is(tokens[i], TK::Semicolon) ||
-            is_outer_close(tokens[i].lex->kind) ||
-            is_close_block(tokens[i].lex->kind) ||
-            starts_module_like_header(tokens[i].lex->kind))
+            is_outer_close(tokens[i].lex.kind) ||
+            is_close_block(tokens[i].lex.kind) ||
+            starts_module_like_header(tokens[i].lex.kind))
             break;
     }
     return false;
@@ -556,13 +556,13 @@ inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open)
         if (!is_code_token(tokens[i])) continue;
         if (kind_is(tokens[i], TK::CloseParenthesis)) ++pd;
         else if (kind_is(tokens[i], TK::OpenParenthesis) && pd > 0) --pd;
-        if (pd == 0 && starts_module_like_header(tokens[i].lex->kind))
+        if (pd == 0 && starts_module_like_header(tokens[i].lex.kind))
             return i;
         if (pd == 0 && kind_is(tokens[i], TK::Semicolon) &&
             !open_follows_header_import &&
             !is_module_header_import_semicolon(tokens, i))
             break;
-        if (pd == 0 && (is_outer_close(tokens[i].lex->kind) || is_close_block(tokens[i].lex->kind)))
+        if (pd == 0 && (is_outer_close(tokens[i].lex.kind) || is_close_block(tokens[i].lex.kind)))
             break;
     }
     return npos;
@@ -580,7 +580,7 @@ inline size_t module_header_import_owner(const TokenStream& tokens, size_t impor
             saw_import_semicolon = true;
             break;
         }
-        if (is_outer_close(tokens[i].lex->kind) || is_close_block(tokens[i].lex->kind))
+        if (is_outer_close(tokens[i].lex.kind) || is_close_block(tokens[i].lex.kind))
             return npos;
     }
     if (!saw_import_semicolon)
@@ -590,12 +590,12 @@ inline size_t module_header_import_owner(const TokenStream& tokens, size_t impor
         size_t i = n - 1;
         if (!is_code_token(tokens[i]))
             continue;
-        if (starts_module_like_header(tokens[i].lex->kind))
+        if (starts_module_like_header(tokens[i].lex.kind))
             return i;
         if (kind_is(tokens[i], TK::Semicolon) &&
             !is_module_header_import_semicolon(tokens, i))
             break;
-        if (is_outer_close(tokens[i].lex->kind) || is_close_block(tokens[i].lex->kind))
+        if (is_outer_close(tokens[i].lex.kind) || is_close_block(tokens[i].lex.kind))
             break;
     }
     return npos;
@@ -603,7 +603,7 @@ inline size_t module_header_import_owner(const TokenStream& tokens, size_t impor
 
 inline bool parameter_list_contains_directive(const TokenStream& tokens, size_t open, size_t close) {
     for (size_t i = open + 1; i < close && i < tokens.size(); ++i) {
-        if (tokens[i].lex->is_directive)
+        if (tokens[i].lex.is_directive)
             return true;
     }
     return false;
@@ -731,9 +731,9 @@ public:
             // Freeze input-line topology before any wrap decision exists.
             t.immutable.topology.begins_line_construct = t.immutable.input_trivia.starts_original_line;
             t.immutable.topology.ends_line_construct = kind_is(t, TK::Semicolon) || kind_is(t, TK::Comma) ||
-                                             (t.lex->comment_kind == CommentLexemeKind::Line);
-            t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex->kind);
-            t.immutable.topology.closes_indent_scope = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind);
+                                             (t.lex.comment_kind == CommentLexemeKind::Line);
+            t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex.kind);
+            t.immutable.topology.closes_indent_scope = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind);
 
             if (kind_is(t, TK::OpenParenthesis)) {
                 size_t prev_i = prev_code(tokens, i);
@@ -749,10 +749,10 @@ public:
             }
             // ends_argument_list is set later when matching token is known (see below)
 
-            if (t.lex->comment_kind != CommentLexemeKind::None) {
+            if (t.lex.comment_kind != CommentLexemeKind::None) {
                 bool comma_interstitial_block = false;
                 if (t.immutable.input_trivia.starts_original_line &&
-                    t.lex->comment_kind == CommentLexemeKind::Block) {
+                    t.lex.comment_kind == CommentLexemeKind::Block) {
                     size_t p = prev_code(tokens, i);
                     size_t nx = next_code(tokens, i + 1, tokens.size());
                     comma_interstitial_block =
@@ -970,7 +970,7 @@ public:
         MacroClassifier mc(opts_.macros);
         std::unordered_set<std::string> local_whitespace_sensitive;
         for (const auto& t : tokens) {
-            if (!t.lex->is_directive)
+            if (!t.lex.is_directive)
                 continue;
             // Multiline `define bodies are frozen by the lexer as one
             // whitespace-sensitive directive token.  A macro whose replacement
@@ -978,23 +978,23 @@ public:
             // substituted exactly as written; remember its name so nested
             // function calls inside later invocations are not independently
             // exploded by the function-call wrapping pass.
-            if (t.lex->is_whitespace_sensitive) {
-                std::string name = extract_define_name(t.lex->text);
+            if (t.lex.is_whitespace_sensitive) {
+                std::string name = extract_define_name(t.lex.text);
                 if (!name.empty())
                     local_whitespace_sensitive.insert(std::move(name));
             }
         }
         for (auto& t : tokens) {
-            if (t.lex->is_whitespace_sensitive) {
+            if (t.lex.is_whitespace_sensitive) {
                 t.mutable_.macro.passthrough = true;
                 t.mutable_.macro.suppress_alignment = true;
                 t.mutable_.macro.suppress_wrapping = true;
-            } else if (t.lex->is_directive) {
+            } else if (t.lex.is_directive) {
                 t.mutable_.macro.suppress_alignment = true;
-            } else if (t.lex->kind == TK::MacroUsage) {
-                const std::string macro_name = MacroClassifier::extract_name(t.lex->text);
+            } else if (t.lex.kind == TK::MacroUsage) {
+                const std::string macro_name = MacroClassifier::extract_name(t.lex.text);
                 const bool whitespace_sensitive =
-                    mc.is_whitespace_sensitive(t.lex->text) ||
+                    mc.is_whitespace_sensitive(t.lex.text) ||
                     local_whitespace_sensitive.count(macro_name) > 0;
                 if (whitespace_sensitive) {
                     t.mutable_.macro.suppress_alignment = true;
@@ -1010,7 +1010,7 @@ public:
                     }
                 } else {
                     t.mutable_.macro.suppress_alignment = true;
-                    MacroRole role = mc.classify(t.lex->text);
+                    MacroRole role = mc.classify(t.lex.text);
                     if (role == MacroRole::StatementLike || role == MacroRole::DeclarationLike ||
                         role == MacroRole::ControlFlowLike || role == MacroRole::BlockBeginLike ||
                         role == MacroRole::BlockEndLike) {
@@ -1043,11 +1043,11 @@ public:
             auto& t = tokens[i];
             if (i == 0)
                 t.mutable_.wrap.must_break_before = true;
-            if (t.lex->comment_kind != CommentLexemeKind::None && t.immutable.comment.role == CommentRole::OwnLine) {
+            if (t.lex.comment_kind != CommentLexemeKind::None && t.immutable.comment.role == CommentRole::OwnLine) {
                 t.mutable_.wrap.must_break_before = true;
                 t.mutable_.wrap.must_break_after = true;
             } else if (t.immutable.comment.role == CommentRole::Trailing &&
-                       t.lex->comment_kind == CommentLexemeKind::Line) {
+                       t.lex.comment_kind == CommentLexemeKind::Line) {
                 // A trailing line comment consumes the rest of the physical
                 // line.  Treat it as a hard line boundary in the wrap layer so
                 // later packing/alignment decisions cannot place the following
@@ -1055,7 +1055,7 @@ public:
                 t.mutable_.wrap.must_break_after = true;
             }
             // PP directives (ifdef/endif/else/define/…) are always on their own line.
-            if (t.lex->is_directive) {
+            if (t.lex.is_directive) {
                 t.mutable_.wrap.must_break_before = true;
                 t.mutable_.wrap.must_break_after = true;
             }
@@ -1074,7 +1074,7 @@ public:
             if (kind_is(t, TK::MacroUsage) && t.mutable_.macro.force_line_break) {
                 size_t break_at = i;
                 for (size_t j = i + 1; j < tokens.size(); ++j) {
-                    if (tokens[j].lex->comment_kind != CommentLexemeKind::None) continue;
+                    if (tokens[j].lex.comment_kind != CommentLexemeKind::None) continue;
                     if (kind_is(tokens[j], TK::OpenParenthesis) &&
                         tokens[j].immutable.syntax.matching_token != npos)
                         break_at = tokens[j].immutable.syntax.matching_token;
@@ -1086,8 +1086,8 @@ public:
                 size_t prev = prev_code(tokens, i);
                 bool statement_position =
                     prev == npos || kind_is(tokens[prev], TK::Semicolon) ||
-                    kind_is(tokens[prev], TK::BeginKeyword) || is_close_block(tokens[prev].lex->kind) ||
-                    is_outer_close(tokens[prev].lex->kind);
+                    kind_is(tokens[prev], TK::BeginKeyword) || is_close_block(tokens[prev].lex.kind) ||
+                    is_outer_close(tokens[prev].lex.kind);
                 size_t open = next_code(tokens, i + 1, tokens.size());
                 if (statement_position && open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
                     size_t close = tokens[open].immutable.syntax.matching_token;
@@ -1097,7 +1097,7 @@ public:
             }
             if (i > 0 &&
                 tokens[i - 1].immutable.comment.role == CommentRole::Trailing &&
-                tokens[i - 1].lex->comment_kind == CommentLexemeKind::Line)
+                tokens[i - 1].lex.comment_kind == CommentLexemeKind::Line)
                 t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) {
                 size_t next = next_code(tokens, i + 1, tokens.size());
@@ -1109,10 +1109,10 @@ public:
                 // defer the line break to after the comment so it renders inline.
                 for (size_t j = i + 1; j < tokens.size(); ++j) {
                     if (is_passthrough(tokens[j])) continue;
-                    if (tokens[j].lex->comment_kind != CommentLexemeKind::None &&
+                    if (tokens[j].lex.comment_kind != CommentLexemeKind::None &&
                         tokens[j].immutable.comment.role == CommentRole::Trailing) {
                         t.mutable_.wrap.must_break_after = false;
-                        if (j > i + 1 && tokens[j - 1].lex->comment_kind != CommentLexemeKind::None)
+                        if (j > i + 1 && tokens[j - 1].lex.comment_kind != CommentLexemeKind::None)
                             tokens[j - 1].mutable_.wrap.must_break_after = false;
                         tokens[j].mutable_.wrap.must_break_after = true;
                         continue;
@@ -1142,8 +1142,8 @@ public:
             if (kind_is(t, TK::Comma)) t.mutable_.wrap.can_break_after = true;
             // Close-block keywords always start a new line; CloseBrace only when
             // not inside a parenthesised expression (e.g. `inside {A, B}`).
-            if (is_outer_close(t.lex->kind) ||
-                (is_close_block(t.lex->kind) &&
+            if (is_outer_close(t.lex.kind) ||
+                (is_close_block(t.lex.kind) &&
                  !(kind_is(t, TK::CloseBrace) &&
                    (t.immutable.syntax.paren_depth > 0 ||
                     (t.immutable.syntax.matching_token != npos &&
@@ -1163,8 +1163,8 @@ public:
                 kind_is(t, TK::EndKeyword) && next_i != npos && kind_is(tokens[next_i], TK::WhileKeyword);
             if (kind_is(t, TK::BeginKeyword) ||
                 is_fork_block_open(tokens, i) ||
-                (is_outer_close(t.lex->kind) && !followed_by_label_colon) ||
-                (is_close_block(t.lex->kind) && !followed_by_label_colon &&
+                (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
+                (is_close_block(t.lex.kind) && !followed_by_label_colon &&
                  !end_before_do_while &&
                  !close_brace_before_decl_name &&
                  !close_brace_before_semicolon &&
@@ -1179,7 +1179,7 @@ public:
                 size_t p = prev_code(tokens, i);
                 size_t pp = p == npos ? npos : prev_code(tokens, p);
                 if (p != npos && pp != npos && kind_is(tokens[p], TK::Colon) &&
-                    (is_close_block(tokens[pp].lex->kind) || is_outer_close(tokens[pp].lex->kind)))
+                    (is_close_block(tokens[pp].lex.kind) || is_outer_close(tokens[pp].lex.kind)))
                     t.mutable_.wrap.must_break_after = true;
             }
             if (opts_.statement.begin_newline &&
@@ -1216,10 +1216,10 @@ public:
             // physical line break after the comment.  The semicolon path above
             // handles ordinary statements, but EOF comments after final
             // `endmodule` / `endclass` labels need the same treatment.
-            if (t.mutable_.wrap.must_break_after && t.lex->comment_kind == CommentLexemeKind::None) {
+            if (t.mutable_.wrap.must_break_after && t.lex.comment_kind == CommentLexemeKind::None) {
                 for (size_t j = i + 1; j < tokens.size(); ++j) {
                     if (is_passthrough(tokens[j])) continue;
-                    if (tokens[j].lex->comment_kind != CommentLexemeKind::None &&
+                    if (tokens[j].lex.comment_kind != CommentLexemeKind::None &&
                         tokens[j].immutable.comment.role == CommentRole::Trailing) {
                         t.mutable_.wrap.must_break_after = false;
                         tokens[j].mutable_.wrap.must_break_after = true;
@@ -1248,8 +1248,8 @@ public:
                 if (n > 0 && kind != WrapListKind::InstancePorts) {
                     for (size_t c = item.first; c > open + 1; --c) {
                         size_t p = c - 1;
-                        if (tokens[p].lex->comment_kind == CommentLexemeKind::Block) {
-                            if (!(p + 1 < tokens.size() && tokens[p + 1].lex->comment_kind != CommentLexemeKind::None &&
+                        if (tokens[p].lex.comment_kind == CommentLexemeKind::Block) {
+                            if (!(p + 1 < tokens.size() && tokens[p + 1].lex.comment_kind != CommentLexemeKind::None &&
                                   tokens[p + 1].immutable.comment.role == CommentRole::OwnLine))
                                 leading_block_comment = p;
                             break;
@@ -1273,7 +1273,7 @@ public:
                     bool preceded_by_own_line_comment = false;
                     for (size_t p = item.first; p > open + 1; --p) {
                         size_t c = p - 1;
-                        if (tokens[c].lex->comment_kind != CommentLexemeKind::None &&
+                        if (tokens[c].lex.comment_kind != CommentLexemeKind::None &&
                             tokens[c].immutable.comment.role == CommentRole::OwnLine) {
                             preceded_by_own_line_comment = true;
                             break;
@@ -1287,11 +1287,11 @@ public:
                 if (item.comma != npos) {
                     size_t break_token = item.comma;
                     for (size_t c = item.comma + 1; c < tokens.size(); ++c) {
-                        if (tokens[c].lex->comment_kind != CommentLexemeKind::None &&
+                        if (tokens[c].lex.comment_kind != CommentLexemeKind::None &&
                             tokens[c].immutable.comment.role == CommentRole::Trailing &&
                             (kind == WrapListKind::InstancePorts ||
-                             tokens[c].lex->comment_kind == CommentLexemeKind::Line ||
-                             (c + 1 < tokens.size() && tokens[c + 1].lex->comment_kind != CommentLexemeKind::None &&
+                             tokens[c].lex.comment_kind == CommentLexemeKind::Line ||
+                             (c + 1 < tokens.size() && tokens[c + 1].lex.comment_kind != CommentLexemeKind::None &&
                               tokens[c + 1].immutable.comment.role == CommentRole::OwnLine))) {
                             break_token = c;
                             break;
@@ -1312,14 +1312,14 @@ public:
                 tokens[close].mutable_.wrap.must_break_before = false;
 
             size_t after_open = open + 1;
-            if (after_open < close && tokens[after_open].lex->comment_kind != CommentLexemeKind::None &&
+            if (after_open < close && tokens[after_open].lex.comment_kind != CommentLexemeKind::None &&
                 tokens[after_open].immutable.comment.role == CommentRole::Trailing) {
                 tokens[open].mutable_.wrap.must_break_after = false;
                 tokens[after_open].mutable_.wrap.must_break_after = true;
             }
 
             if (kind == WrapListKind::ModulePorts && !items.empty() &&
-                !is_declaration_keyword(tokens[items.front().first].lex->kind)) {
+                !is_declaration_keyword(tokens[items.front().first].lex.kind)) {
                 int per_line = 1;
                 if (opts_.module.non_ansi_port_per_line_enabled)
                     per_line = std::max(1, opts_.module.non_ansi_port_per_line);
@@ -1351,7 +1351,7 @@ public:
                     if (items[n].comma != npos && keep_with_prev[n + 1]) {
                             tokens[items[n].comma].mutable_.wrap.must_break_after = false;
                             for (size_t c = items[n].comma + 1; c < tokens.size(); ++c) {
-                                if (tokens[c].lex->comment_kind != CommentLexemeKind::None &&
+                                if (tokens[c].lex.comment_kind != CommentLexemeKind::None &&
                                     tokens[c].immutable.comment.role == CommentRole::Trailing)
                                     tokens[c].mutable_.wrap.must_break_after = false;
                                 if (is_code_token(tokens[c]))
@@ -1516,13 +1516,13 @@ public:
         // line terminator in SystemVerilog; allowing any later token to render
         // after it changes that token into comment text on the next pass.
         for (auto& t : tokens) {
-            if (t.lex->comment_kind == CommentLexemeKind::None)
+            if (t.lex.comment_kind == CommentLexemeKind::None)
                 continue;
             if (t.immutable.comment.role == CommentRole::OwnLine) {
                 t.mutable_.wrap.must_break_before = true;
                 t.mutable_.wrap.must_break_after = true;
             } else if (t.immutable.comment.role == CommentRole::Trailing &&
-                       t.lex->comment_kind == CommentLexemeKind::Line) {
+                       t.lex.comment_kind == CommentLexemeKind::Line) {
                 t.mutable_.wrap.must_break_after = true;
             }
         }
@@ -1530,7 +1530,7 @@ public:
 private:
     static void apply_procedural_block_wrap(TokenStream& tokens) {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!is_procedural_block_keyword(tokens[i].lex->kind))
+            if (!is_procedural_block_keyword(tokens[i].lex.kind))
                 continue;
             size_t body = procedural_body_start(tokens, i);
             if (body == npos || body >= tokens.size())
@@ -1584,7 +1584,7 @@ private:
                 continue;
             }
 
-            if (is_single_stmt_control(t.lex->kind))
+            if (is_single_stmt_control(t.lex.kind))
                 ctrl_expr_pending = true;
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
                 ctrl_expr_pending = false;
@@ -1607,12 +1607,12 @@ private:
                 ctrl_just_closed = true;
             }
 
-            if (single_stmt_pending && !ctrl_just_closed && t.lex->comment_kind == CommentLexemeKind::None) {
+            if (single_stmt_pending && !ctrl_just_closed && t.lex.comment_kind == CommentLexemeKind::None) {
                 single_stmt_pending = false;
                 const bool is_block = kind_is(t, TK::BeginKeyword) ||
                                       is_fork_block_open(tokens, i) ||
                                       kind_is(t, TK::OpenBrace);
-                const bool closes = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind) ||
+                const bool closes = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind) ||
                                     t.mutable_.macro.closes_indent_scope;
                 if (!is_block && !closes)
                     t.mutable_.wrap.must_break_before = true;
@@ -1654,7 +1654,7 @@ public:
         std::unordered_map<size_t, size_t> else_body_end;
         std::unordered_map<size_t, size_t> forever_body_end;
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!is_procedural_block_keyword(tokens[i].lex->kind))
+            if (!is_procedural_block_keyword(tokens[i].lex.kind))
                 continue;
             size_t body = procedural_body_start(tokens, i);
             if (body == npos || body >= tokens.size())
@@ -1708,7 +1708,7 @@ public:
             else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0) --paren_depth;
 
             // Detect control expression start
-            if (is_single_stmt_control(t.lex->kind) && !kind_is(t, TK::ForeverKeyword)) {
+            if (is_single_stmt_control(t.lex.kind) && !kind_is(t, TK::ForeverKeyword)) {
                 ctrl_expr_pending = true;
             }
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
@@ -1737,12 +1737,12 @@ public:
             if (kind_is(t, TK::Semicolon))      { in_import = false; in_extern = false; in_typedef = false; }
 
             // Compute indent — close tokens first so they dedent before assignment
-            bool closes = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind) ||
+            bool closes = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind) ||
                           t.mutable_.macro.closes_indent_scope;
             if (closes) level = std::max(0, level - 1);
 
             // Resolve single-stmt pending on first non-passthrough, non-comment token AFTER control expr close
-            if (single_stmt_pending && !ctrl_just_closed && t.lex->comment_kind == CommentLexemeKind::None) {
+            if (single_stmt_pending && !ctrl_just_closed && t.lex.comment_kind == CommentLexemeKind::None) {
                 single_stmt_pending = false;
                 bool is_block = kind_is(t, TK::BeginKeyword) ||
                                 is_fork_block_open(tokens, i) ||
@@ -1777,9 +1777,9 @@ public:
                     tokens[hdr].mutable_.indent.base_indent + opts_.indent_size;
             if (size_t hdr = module_header_parameter_hash_owner(tokens, i); hdr != npos)
                 t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
-            if (is_outer_close(t.lex->kind))
+            if (is_outer_close(t.lex.kind))
                 t.mutable_.indent.base_indent = 0;
-            else if (is_outer_open(t.lex->kind) && opts_.default_indent_level_inside_outmost_block == 0)
+            else if (is_outer_open(t.lex.kind) && opts_.default_indent_level_inside_outmost_block == 0)
                 t.mutable_.indent.base_indent = 0; // OuterOpen itself is at outer level
             if (t.mutable_.wrap.continuation)
                 t.mutable_.indent.continuation_indent = opts_.indent_size;
@@ -1795,7 +1795,7 @@ public:
                     in_typedef && kind_is(t, TK::ClassKeyword);
                 if (!is_qualifier_fn_task && !is_typedef_class &&
                     (opens_indent_scope_at(tokens, i) ||
-                     (is_outer_open(t.lex->kind) && opts_.default_indent_level_inside_outmost_block > 0) ||
+                     (is_outer_open(t.lex.kind) && opts_.default_indent_level_inside_outmost_block > 0) ||
                      t.mutable_.macro.opens_indent_scope))
                     ++level;
             }
@@ -1843,7 +1843,7 @@ public:
                 (is_identifier_like(tokens[prev]) || kind_is(tokens[prev], TK::Hash));
             if (idx != s && prev != npos && prev >= s &&
                 !call_or_hash_paren &&
-                !no_space_before(tokens[idx].lex->kind) && !no_space_after(tokens[prev].lex->kind))
+                !no_space_before(tokens[idx].lex.kind) && !no_space_after(tokens[prev].lex.kind))
                 ++col;
             return col;
         };
@@ -1852,7 +1852,7 @@ public:
             tokens[first].mutable_.indent.base_indent = std::max(0, indent);
             for (size_t k = first + 1; k <= last && k < tokens.size(); ++k) {
                 if (tokens[k].mutable_.wrap.must_break_before ||
-                    (tokens[k].lex->comment_kind != CommentLexemeKind::None && tokens[k].immutable.comment.role == CommentRole::OwnLine))
+                    (tokens[k].lex.comment_kind != CommentLexemeKind::None && tokens[k].immutable.comment.role == CommentRole::OwnLine))
                     tokens[k].mutable_.indent.base_indent = std::max(0, indent);
             }
         };
@@ -1924,13 +1924,13 @@ public:
             for (const auto& item : items)
                 set_item_indent(item.first, item.last, item_indent);
             for (size_t k = open + 1; k < close; ++k) {
-                if (tokens[k].lex->comment_kind != CommentLexemeKind::None &&
+                if (tokens[k].lex.comment_kind != CommentLexemeKind::None &&
                     (tokens[k].immutable.comment.role == CommentRole::OwnLine ||
                      tokens[k].mutable_.wrap.must_break_before))
                     tokens[k].mutable_.indent.base_indent = std::max(0, item_indent);
                 if ((kind == WrapListKind::ModuleParametersBlock ||
                      kind == WrapListKind::ModuleParametersHanging) &&
-                    tokens[k].lex->is_directive &&
+                    tokens[k].lex.is_directive &&
                     tokens[k].mutable_.wrap.must_break_before)
                     tokens[k].mutable_.indent.base_indent = std::max(0, item_indent);
             }
@@ -2010,8 +2010,8 @@ public:
             if (cur_first != npos)
                 ln.indent = tokens[cur_first].mutable_.indent.base_indent;
             if (cur_first != npos &&
-                (is_type_keyword(tokens[cur_first].lex->kind) ||
-                 is_port_direction(tokens[cur_first].lex->kind) ||
+                (is_type_keyword(tokens[cur_first].lex.kind) ||
+                 is_port_direction(tokens[cur_first].lex.kind) ||
                  ((kind_is(tokens[cur_first], TK::ParameterKeyword) ||
                    kind_is(tokens[cur_first], TK::LocalParamKeyword)) &&
                   tokens[cur_first].immutable.syntax.paren_depth > 0)))
@@ -2041,7 +2041,7 @@ public:
             for (size_t k = scan_start; k < end_idx; ++k) {
                 auto& tok = tokens[k];
                 if (is_passthrough(tok)) { ln.disabled = true; continue; }
-                if (tok.lex->comment_kind != CommentLexemeKind::None) continue;
+                if (tok.lex.comment_kind != CommentLexemeKind::None) continue;
                 if (kind_is(tok, TK::OpenParenthesis))  ++pd;
                 else if (kind_is(tok, TK::CloseParenthesis) && pd > 0)  --pd;
                 else if (kind_is(tok, TK::OpenBracket))   ++bd;
@@ -2050,7 +2050,7 @@ public:
                 else if (kind_is(tok, TK::CloseBrace)   && brd > 0)   --brd;
                 if (pd == 0 && bd == 0 && brd == 0 &&
                     !tok.mutable_.macro.suppress_alignment &&
-                    is_assignment_op(tok.lex->kind)) {
+                    is_assignment_op(tok.lex.kind)) {
                     ln.assign_idx = k;
                     break;
                 }
@@ -2128,8 +2128,8 @@ public:
             int declaration_keyword_width = 0;
             for (const auto& ln : lines) {
                 if (ln.first != npos &&
-                    (is_type_keyword(tokens[ln.first].lex->kind) ||
-                     is_port_direction(tokens[ln.first].lex->kind))) {
+                    (is_type_keyword(tokens[ln.first].lex.kind) ||
+                     is_port_direction(tokens[ln.first].lex.kind))) {
                     ++declaration_line_count;
                     declaration_keyword_width = std::max(declaration_keyword_width,
                                                          token_width(tokens[ln.first]));
@@ -2139,8 +2139,8 @@ public:
                 if (ln.first == npos || ln.end <= ln.first)
                     continue;
                 size_t first = ln.first;
-                if (!is_type_keyword(tokens[first].lex->kind) &&
-                    !is_port_direction(tokens[first].lex->kind))
+                if (!is_type_keyword(tokens[first].lex.kind) &&
+                    !is_port_direction(tokens[first].lex.kind))
                     continue;
 
                 size_t semi = npos;
@@ -2187,7 +2187,7 @@ public:
                 }
 
                 const int base = tokens[first].mutable_.indent.base_indent;
-                const bool port_decl = is_port_direction(tokens[first].lex->kind);
+                const bool port_decl = is_port_direction(tokens[first].lex.kind);
                 const int section1 = option_width(port_decl ? opts_.port_declaration.section1_min_width
                                                             : opts_.var_declaration.section1_min_width, opts_);
                 const int section2 = option_width(port_decl ? opts_.port_declaration.section2_min_width
@@ -2321,14 +2321,14 @@ public:
             auto is_var_decl_line = [&](const Line& ln, VarLine& out) {
                 if (ln.first == npos || ln.end <= ln.first)
                     return false;
-                if (is_port_direction(tokens[ln.first].lex->kind))
+                if (is_port_direction(tokens[ln.first].lex.kind))
                     return false;
                 size_t eq = npos;
                 size_t semi = find_statement_semicolon(ln, eq);
                 if (semi == npos)
                     return false;
 
-                bool plausible_start = is_var_decl_leading_keyword(tokens[ln.first].lex->kind);
+                bool plausible_start = is_var_decl_leading_keyword(tokens[ln.first].lex.kind);
                 if (!plausible_start && is_identifier_like(tokens[ln.first])) {
                     size_t nx = next_code(tokens, ln.first + 1, semi);
                     plausible_start = nx != npos &&
@@ -2477,7 +2477,7 @@ public:
             // wrong for comma-separated ports (`a, b`) and creates the compact
             // misalignment seen in memory_top.sv.
             for (const auto& ln : lines) {
-                if (ln.first == npos || !is_port_direction(tokens[ln.first].lex->kind) ||
+                if (ln.first == npos || !is_port_direction(tokens[ln.first].lex.kind) ||
                     tokens[ln.first].immutable.syntax.paren_depth != 0)
                     continue;
 
@@ -2654,7 +2654,7 @@ public:
             }
 
             for (const auto& ln : lines) {
-                if (ln.first == npos || !is_port_direction(tokens[ln.first].lex->kind) ||
+                if (ln.first == npos || !is_port_direction(tokens[ln.first].lex.kind) ||
                     tokens[ln.first].immutable.syntax.paren_depth == 0)
                     continue;
                 size_t dim = npos;
@@ -2697,7 +2697,7 @@ public:
                 std::vector<Decl> decls;
                 int type_width = opts_.port_declaration.section2_min_width;
                 for (const auto& item : items) {
-                    if (!is_port_direction(tokens[item.first].lex->kind))
+                    if (!is_port_direction(tokens[item.first].lex.kind))
                         continue;
                     size_t name = npos;
                     int pd = 0, bd = 0, brd = 0;
@@ -2888,7 +2888,7 @@ public:
     const char* name() const override { return "comment"; }
     void run(TokenStream& tokens) override {
         for (auto& t : tokens) {
-            if (t.lex->comment_kind == CommentLexemeKind::None)
+            if (t.lex.comment_kind == CommentLexemeKind::None)
                 continue;
             if (t.immutable.comment.role == CommentRole::OwnLine)
                 t.mutable_.comment.force_own_line = true;
@@ -2913,8 +2913,8 @@ public:
             int spaces = 1;
 
             // Basic no-space rules
-            if (no_space_before(t.lex->kind) || no_space_after(L.lex->kind)) spaces = 0;
-            if (t.lex->comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis))
+            if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
+            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis))
                 spaces = 1;
             // Empty positional argument: `, ,` — keep one space so the slot is visible
             if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
@@ -2936,7 +2936,7 @@ public:
             // Exception: `~ &a`, `~ |a`, `~ ^a` — tilde followed by a
             // reduction operator must keep a space so it isn't read as
             // the compound `~&` / `~|` / `~^` operator.
-            if (is_unary_op(L.lex->kind)) {
+            if (is_unary_op(L.lex.kind)) {
                 bool tilde_before_reduction = kind_is(L, TK::Tilde) &&
                     (kind_is(t, TK::And) || kind_is(t, TK::Or) || kind_is(t, TK::Xor));
                 if (!tilde_before_reduction) {
@@ -2989,7 +2989,7 @@ public:
             if (kind_is(t, TK::OpenParenthesis) && t.immutable.topology.starts_port_list &&
                 kind_is(L, TK::CloseParenthesis))
                 spaces = 0;
-            if (kind_is(t, TK::OpenParenthesis) && is_control_keyword(L.lex->kind))
+            if (kind_is(t, TK::OpenParenthesis) && is_control_keyword(L.lex.kind))
                 spaces = opts_.spacing.control_keyword_space ? 1 : 0;
             if ((kind_is(L, TK::OpenParenthesis) || kind_is(t, TK::CloseParenthesis)) && opts_.spacing.space_inside_parens) spaces = 1;
             // function.space_inside_paren: space inside argument-list parens only
@@ -3015,9 +3015,9 @@ public:
             // LessThanEquals is context-sensitive: inside parens it's a comparison, not
             // non-blocking assignment.  Treat it as a regular binary op in that context.
             auto is_assign = [&](const Tok& tok) {
-                if (tok.lex->kind == TK::LessThanEquals && tok.immutable.syntax.paren_depth > 0)
+                if (tok.lex.kind == TK::LessThanEquals && tok.immutable.syntax.paren_depth > 0)
                     return false;
-                return is_assignment_op(tok.lex->kind);
+                return is_assignment_op(tok.lex.kind);
             };
             if (is_assign(t)) spaces = wants_before(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
             if (is_assign(L)) spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
@@ -3028,12 +3028,12 @@ public:
             bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
                           (L.immutable.syntax.bracket_depth > 0 && !kind_is(L, TK::CloseBracket));
             const std::string& bop_mode = in_dim ? opts_.spacing.dimension_binary_operator_spacing : opts_.spacing.binary_operator_spacing;
-            if (is_binary_op(t.lex->kind) && !is_assign(t))
+            if (is_binary_op(t.lex.kind) && !is_assign(t))
                 spaces = wants_before(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex->kind) && !is_assign(L))
+            if (is_binary_op(L.lex.kind) && !is_assign(L))
                 spaces = wants_after(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex->kind) && !is_assign(L) &&
-                can_begin_unary_expression(t.lex->kind)) {
+            if (is_binary_op(L.lex.kind) && !is_assign(L) &&
+                can_begin_unary_expression(t.lex.kind)) {
                 // Do not concatenate a binary operator with the unary operator
                 // that starts its right-hand operand.  SystemVerilog has many
                 // multi-character operator tokens, so removing this separator
@@ -3097,7 +3097,7 @@ public:
             }
 
             // End-label colon: `endclass: Foo`, `endfunction: bar`, etc. — no space before `:`
-            if (kind_is(t, TK::Colon) && (is_close_block(L.lex->kind) || is_outer_close(L.lex->kind) ||
+            if (kind_is(t, TK::Colon) && (is_close_block(L.lex.kind) || is_outer_close(L.lex.kind) ||
                                            kind_is(L, TK::BeginKeyword) || kind_is(L, TK::ForkKeyword)))
                 spaces = 0;
             if (kind_is(t, TK::Colon) && is_numeric(L) && !in_dim)
@@ -3180,8 +3180,8 @@ public:
 private:
     static bool passthrough_text_ends_with_newline(const Tok& tok) {
         return is_passthrough(tok) &&
-               !tok.lex->text.empty() &&
-               tok.lex->text.back() == '\n';
+               !tok.lex.text.empty() &&
+               tok.lex.text.back() == '\n';
     }
 
     const FormatOptions& opts_;
