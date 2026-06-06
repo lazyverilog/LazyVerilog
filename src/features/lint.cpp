@@ -8,6 +8,7 @@
 #include <slang/parsing/TokenKind.h>
 #include <algorithm>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <regex>
 #include <optional>
@@ -32,7 +33,16 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
                 if (!d.uri.starts_with("file://"))
                     d.uri = "file://" + std::filesystem::absolute(d.uri).lexically_normal().string();
             }
+        } catch (const std::exception& e) {
+            // URI attribution failures should not drop the diagnostic, but they
+            // also should not be invisible: clients will fall back to the
+            // owning document when d.uri is empty, and this log explains why an
+            // included-file diagnostic may not carry its original URI.
+            std::cerr << "[lazyverilog] lint diagnostic URI resolution failed: "
+                      << e.what() << "\n";
         } catch (...) {
+            std::cerr << "[lazyverilog] lint diagnostic URI resolution failed: "
+                         "non-standard exception\n";
         }
         size_t ln = sm.getLineNumber(loc);
         size_t co = sm.getColumnNumber(loc);
