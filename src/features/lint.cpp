@@ -8,6 +8,7 @@
 #include <slang/parsing/TokenKind.h>
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <regex>
 #include <optional>
 #include <string_view>
@@ -98,10 +99,32 @@ static PortDir get_port_direction(const PortHeaderSyntax& hdr) {
     }
 }
 
-static std::optional<std::regex> compile_re(const std::string& pat) {
-    if (pat.empty()) return std::nullopt;
-    try { return std::regex(pat); }
-    catch (...) { return std::nullopt; }
+using CachedRegex = std::shared_ptr<const std::regex>;
+
+static CachedRegex compile_re(const std::string& pat) {
+    if (pat.empty())
+        return nullptr;
+
+    // Naming lint runs on every diagnostics refresh.  Keep compilation
+    // thread-local and keyed by the exact config pattern so repeated didChange
+    // notifications pay only a hash lookup, while config edits naturally
+    // compile a new pattern the first time it is observed on this worker.
+    //
+    // Invalid patterns are cached as nullptr too.  That preserves the previous
+    // "silently disable invalid naming rule" behavior without repeatedly
+    // throwing std::regex_error on every keystroke.
+    thread_local std::unordered_map<std::string, CachedRegex> cache;
+    if (auto it = cache.find(pat); it != cache.end())
+        return it->second;
+
+    CachedRegex compiled;
+    try {
+        compiled = std::make_shared<const std::regex>(pat);
+    } catch (...) {
+        compiled = nullptr;
+    }
+    cache.emplace(pat, compiled);
+    return compiled;
 }
 
 static int severity_from(const std::string& severity) {
@@ -228,18 +251,19 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     int module_count_{0};
     std::string file_stem_;
 
-    // Compiled naming regexes
-    std::optional<std::regex> module_re_;
-    std::optional<std::regex> input_port_re_;
-    std::optional<std::regex> output_port_re_;
-    std::optional<std::regex> signal_re_;
-    std::optional<std::regex> register_re_;
-    std::optional<std::regex> interface_re_;
-    std::optional<std::regex> struct_re_;
-    std::optional<std::regex> union_re_;
-    std::optional<std::regex> enum_re_;
-    std::optional<std::regex> parameter_re_;
-    std::optional<std::regex> localparam_re_;
+    // Shared pointers into a thread-local pattern cache.  Copying the pointer is
+    // cheap; compiling std::regex on every lint pass is not.
+    CachedRegex module_re_;
+    CachedRegex input_port_re_;
+    CachedRegex output_port_re_;
+    CachedRegex signal_re_;
+    CachedRegex register_re_;
+    CachedRegex interface_re_;
+    CachedRegex struct_re_;
+    CachedRegex union_re_;
+    CachedRegex enum_re_;
+    CachedRegex parameter_re_;
+    CachedRegex localparam_re_;
 
     LintVisitor(const LintConfig& c, const CurrentModulePortMap& current,
                 const SyntaxIndex* project, SourceManager& s, std::string file_stem)
@@ -265,7 +289,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     int statement_sev() const { return severity_from(cfg.statement.severity); }
 
     void chk_name(const std::string& name, SourceLocation loc,
-                  const std::optional<std::regex>& re,
+                  const CachedRegex& re,
                   const std::string& pat, const char* cat) {
         if (!re || name.empty()) return;
         if (!std::regex_match(name, *re))
