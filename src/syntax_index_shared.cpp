@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
@@ -164,6 +165,36 @@ std::string canonical_type_name_from_text(std::string_view type) {
     while (begin > 0 && syntax_fragment_edge_is_wordlike(type[begin - 1]))
         --begin;
     return std::string(type.substr(begin, end - begin));
+}
+
+std::vector<std::string> collect_include_dependency_uris(const slang::SourceManager& sm,
+                                                         const std::string& owning_uri) {
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> result;
+
+    auto add_path = [&](const std::filesystem::path& path) {
+        if (path.empty())
+            return;
+        const auto uri = uri_from_path(path);
+        if (uri == owning_uri)
+            return;
+        if (seen.insert(uri).second)
+            result.push_back(uri);
+    };
+
+    for (auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (!full_path.empty()) {
+            add_path(full_path);
+            continue;
+        }
+
+        const auto raw_name = sm.getRawFileName(buffer);
+        if (!raw_name.empty())
+            add_path(std::filesystem::path(std::string(raw_name)));
+    }
+
+    return result;
 }
 
 namespace {

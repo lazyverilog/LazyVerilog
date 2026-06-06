@@ -34,6 +34,9 @@ struct DocumentState {
     // Pre-formatted diagnostics extracted in make_state() while the
     // SyntaxTree and its arena allocators are still alive.
     std::vector<ParseDiagInfo> parse_diagnostics;
+    // Normalized file:// URIs of files included while parsing this document.
+    // Used to reparse open dependents when an included open buffer changes.
+    std::vector<std::string> include_dependencies;
     // Derived syntax index built once per immutable document snapshot.
     SyntaxIndex index;
     // Lazy structural index cache — populated on first call to get_structural_index().

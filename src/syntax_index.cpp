@@ -900,6 +900,8 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
 
     collect_reference_occurrences(root, index, sm);
     collect_macro_reference_occurrences(tree, index);
+    if (!index.source_files.empty())
+        index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
 
     // Macros are queried from the live current-file layer.  Extra-file macro
     // entries are intentionally skipped by Declarations depth to avoid both
@@ -1036,5 +1038,11 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
     for (auto reference : other.references) {
         reference.file_id = remap_file_id(file_remap, reference.file_id);
         references.push_back(std::move(reference));
+    }
+    std::unordered_set<std::string> include_seen(include_dependencies.begin(),
+                                                 include_dependencies.end());
+    for (const auto& uri : other.include_dependencies) {
+        if (include_seen.insert(uri).second)
+            include_dependencies.push_back(uri);
     }
 }

@@ -100,16 +100,38 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
     }
 }
 
+struct OpenTextOverlay {
+    std::string uri;
+    std::string path;
+    std::string text;
+};
+
+static void preload_open_text_overlays(slang::SourceManager& sm,
+                                       const std::vector<OpenTextOverlay>& overlays,
+                                       const std::string& excluded_path = {}) {
+    for (const auto& overlay : overlays) {
+        if (overlay.path.empty() || overlay.path == excluded_path)
+            continue;
+        // Seed SourceManager's file cache with unsaved open-buffer text before
+        // slang resolves `include directives.  This lets a dependent file such
+        // as memory.sv see an unsaved rename in params.svh without polling or
+        // reading every project file.  Only already-open buffers are copied.
+        sm.assignText(std::string_view(overlay.path), std::string_view(overlay.text));
+    }
+}
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
-                             const std::vector<std::string>& include_dirs) {
+                             const std::vector<std::string>& include_dirs,
+                             const std::vector<OpenTextOverlay>& open_overlays = {}) {
     const auto start = Clock::now();
     const auto norm = normalize_path(path);
     const std::string uri = uri_from_path(norm);
 
     auto sm = std::make_unique<slang::SourceManager>();
     add_include_dirs(*sm, include_dirs);
+    preload_open_text_overlays(*sm, open_overlays, norm.string());
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
     slang::Bag bag;
@@ -123,8 +145,11 @@ make_file_state_with_options(const std::filesystem::path& path,
     auto state = std::make_shared<DocumentState>(uri, text.value_or(std::string{}), nullptr);
     state->source_manager = std::move(sm);
     state->tree = std::move(*tree_or_error);
-    if (state->tree)
+    state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
+    if (state->tree) {
         state->index = SyntaxIndex::build(*state->tree, state->text, IndexDepth::Declarations);
+        state->index.include_dependencies = state->include_dependencies;
+    }
     collect_parse_diagnostics(*state, uri);
     log_perf("make_file_state " + uri, start);
     return state;
@@ -151,14 +176,33 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // static singleton from accumulating stale buffers across edits.
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
+    std::vector<OpenTextOverlay> open_overlays;
+    const auto normalized_current_path = normalize_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         defines = defines_;
         include_dirs = include_dirs_;
+        open_overlays.reserve(docs_.size());
+        for (const auto& [open_uri, open_state] : docs_) {
+            if (!open_state || open_uri == uri)
+                continue;
+            std::string open_path = open_uri;
+            if (open_path.starts_with("file://"))
+                open_path = open_path.substr(7);
+            open_path = normalize_path(open_path).string();
+            if (open_path == normalized_current_path)
+                continue;
+            open_overlays.push_back(OpenTextOverlay{
+                .uri = open_uri,
+                .path = std::move(open_path),
+                .text = open_state->text,
+            });
+        }
     }
 
     auto sm = std::make_unique<slang::SourceManager>();
     add_include_dirs(*sm, include_dirs);
+    preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
     slang::Bag bag;
@@ -168,6 +212,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
+    state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
     // clangd-style current-file layer:
     //
     // Do not materialize any current-file SyntaxIndex on didOpen/didChange.
@@ -182,12 +227,30 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
 std::shared_ptr<DocumentState> Analyzer::make_file_state(const std::filesystem::path& path) const {
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
+    std::vector<OpenTextOverlay> open_overlays;
+    const auto normalized_path = normalize_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         defines = defines_;
         include_dirs = include_dirs_;
+        open_overlays.reserve(docs_.size());
+        for (const auto& [open_uri, open_state] : docs_) {
+            if (!open_state)
+                continue;
+            std::string open_path = open_uri;
+            if (open_path.starts_with("file://"))
+                open_path = open_path.substr(7);
+            open_path = normalize_path(open_path).string();
+            if (open_path == normalized_path)
+                continue;
+            open_overlays.push_back(OpenTextOverlay{
+                .uri = open_uri,
+                .path = std::move(open_path),
+                .text = open_state->text,
+            });
+        }
     }
-    return make_file_state_with_options(path, defines, include_dirs);
+    return make_file_state_with_options(path, defines, include_dirs, open_overlays);
 }
 
 void Analyzer::open(const std::string& uri, const std::string& text) {
@@ -229,6 +292,42 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
         listed_extra_file = extra_file_set_.contains(path_string);
+
+        auto depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
+            return std::find(deps.begin(), deps.end(), uri) != deps.end();
+        };
+
+        bool queued_dependent = false;
+        for (const auto& [other_uri, other_state] : docs_) {
+            if (other_uri == uri || !other_state ||
+                !depends_on_changed_uri(other_state->include_dependencies))
+                continue;
+
+            std::string other_path = other_uri;
+            if (other_path.starts_with("file://"))
+                other_path = other_path.substr(7);
+            other_path = normalize_path(other_path).string();
+            // Indirect include fanout belongs on the background path.  A common
+            // header can be included by many open files; reparsing all of them
+            // synchronously on each keystroke would violate the current-file
+            // AST / background-project-index split and can lag badly on shared
+            // HPC filesystems.  The worker reparses live open buffers from
+            // their in-memory text and open include overlays.
+            background_pending_files_.push_front(other_path);
+            queued_dependent = true;
+        }
+
+        for (const auto& [extra_uri, entry] : extra_cache_) {
+            if (docs_.contains(extra_uri) || !depends_on_changed_uri(entry.index.include_dependencies))
+                continue;
+            background_pending_files_.push_front(entry.path);
+            queued_dependent = true;
+        }
+        if (queued_dependent) {
+            ++background_generation_;
+            start_background_indexer_locked();
+            background_cv_.notify_all();
+        }
     }
 
     // See Analyzer::open(): current-buffer shard building is intentionally
@@ -239,6 +338,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second == state)
             update_extra_cache_for_live_state_locked(state, std::move(index));
     }
+
 }
 
 void Analyzer::close(const std::string& uri) {
@@ -1703,22 +1803,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         }
     }
     std::string fallback_symbol_debug;
-    if (!target_symbol_debug.empty() && target_symbol_debug.starts_with("typedef::")) {
-        // Unsaved include edge case:
-        //
-        //   params.svh   typedef enum ... states_t;   // open buffer, not saved
-        //   memory.sv    `include "params.svh"
-        //                states_t state;
-        //
-        // Parsing memory.sv asks slang to resolve the include from disk, where
-        // params.svh may still contain the pre-rename spelling `state_t`.  The
-        // visible `states_t` tokens in memory.sv therefore cannot be tied to the
-        // precise typedef SymbolID and are indexed as `name:states_t`.  Keep a
-        // narrow fallback for typedef targets so find-references immediately
-        // after rename can still bridge those open/included uses without
-        // reintroducing generic-name matching for functions/tasks/signals.
-        fallback_symbol_debug = "name:" + target->name;
-    }
     if (target_symbol_debug.empty()) {
         // If the lightweight index cannot prove a scope-qualified identity, keep
         // open-buffer references on the AST/definition-verification path below
@@ -2484,6 +2568,7 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
         std::string uri;
         std::vector<std::string> defines;
         std::vector<std::string> include_dirs;
+        std::vector<OpenTextOverlay> open_overlays;
         std::shared_ptr<const DocumentState> live_doc;
         uint64_t generation = 0;
 
@@ -2512,6 +2597,22 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
             generation = background_generation_;
             defines = defines_;
             include_dirs = include_dirs_;
+            open_overlays.reserve(docs_.size());
+            for (const auto& [open_uri, open_state] : docs_) {
+                if (!open_state || open_uri == uri)
+                    continue;
+                std::string open_path = open_uri;
+                if (open_path.starts_with("file://"))
+                    open_path = open_path.substr(7);
+                open_path = normalize_path(open_path).string();
+                if (open_path == path_string)
+                    continue;
+                open_overlays.push_back(OpenTextOverlay{
+                    .uri = open_uri,
+                    .path = std::move(open_path),
+                    .text = open_state->text,
+                });
+            }
 
             // Open buffers are already parsed from unsaved text by didOpen /
             // didChange.  Avoid reparsing stale disk contents, but also avoid
@@ -2524,16 +2625,25 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
         }
 
         if (live_doc) {
-            auto live_index = get_dynamic_index(*live_doc);
+            // The queued path may represent an indirect include dependency
+            // refresh, not a direct edit to this open document.  Reparse the
+            // live text in the background so includes are resolved against the
+            // latest open-buffer overlays, then atomically replace the stale
+            // DocumentState if the user has not edited it meanwhile.
+            auto reparsed_live_doc = make_state(uri, live_doc->text);
+            auto live_index = get_dynamic_index(*reparsed_live_doc);
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation == background_generation_) {
                 if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second == live_doc) {
-                    extra_cache_[uri] = ExtraFileCacheEntry{
-                        .path = path_string,
-                        .uri = uri,
-                        .index = std::move(live_index),
-                    };
-                    background_publish_requested_ = true;
+                    docs_[uri] = reparsed_live_doc;
+                    if (extra_file_set_.contains(path_string)) {
+                        extra_cache_[uri] = ExtraFileCacheEntry{
+                            .path = path_string,
+                            .uri = uri,
+                            .index = std::move(live_index),
+                        };
+                        background_publish_requested_ = true;
+                    }
                 }
             }
             background_index_active_ = false;
@@ -2541,7 +2651,8 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
             continue;
         }
 
-        auto state = make_file_state_with_options(path_string, defines, include_dirs);
+        auto state = make_file_state_with_options(path_string, defines, include_dirs,
+                                                  open_overlays);
         if (stop.stop_requested() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             background_index_active_ = false;

@@ -290,6 +290,11 @@ struct SyntaxIndex {
     // per-reference file attribution O(1) instead of linearly scanning
     // source_files as the shard grows.
     std::unordered_map<std::string, SourceFileID> source_file_ids;
+    // Files loaded through `include while parsing this shard, represented as
+    // normalized file:// URIs.  The owning parsed file itself is excluded.
+    // Analyzer uses this for event-driven dependent reindexing: when a header
+    // changes, only shards that actually included that header are reparsed.
+    std::vector<std::string> include_dependencies;
 
     // Modules (also used for interface/package declarations — see interface_names / package_names)
     std::vector<ModuleEntry>   modules;

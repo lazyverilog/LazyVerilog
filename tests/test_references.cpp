@@ -484,7 +484,7 @@ endmodule
     std::filesystem::remove(dir);
 }
 
-TEST_CASE("references: renamed unsaved included typedef matches open includer fallback uses",
+TEST_CASE("references: renamed unsaved included typedef reparses open includer",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_unsaved_include_typedef";
     std::filesystem::create_directories(dir);
@@ -506,6 +506,12 @@ typedef enum logic [1:0] {
 } states_t;
 endpackage
 )";
+    const std::string disk_use = R"(`include "params.svh"
+module memory;
+    state_t state;
+    always_comb state = state_t::IDLE;
+endmodule
+)";
     const std::string open_use = R"(`include "params.svh"
 module memory;
     states_t state;
@@ -521,15 +527,30 @@ endmodule
     {
         std::ofstream out(use_path);
         REQUIRE(out.good());
-        out << open_use;
+        out << disk_use;
     }
 
     Analyzer analyzer;
     analyzer.set_include_dirs({dir.string()});
     const auto header_uri = uri_from_path(header_path);
     const auto use_uri = uri_from_path(use_path);
-    analyzer.open(header_uri, open_header);
-    analyzer.open(use_uri, open_use);
+
+    // Match the relevant Neovim rename ordering from /tmp/lsp-cpp.log without
+    // any server-side WorkspaceEdit prediction:
+    //
+    // 1. params.svh is open with the old typedef spelling.
+    // 2. Neovim opens memory.sv as part of applying edits, initially with the
+    //    old on-disk text.
+    // 3. Neovim sends didChange for params.svh.
+    // 4. Neovim sends didChange for memory.sv.
+    //
+    // The final memory.sv parse must see the open, unsaved params.svh overlay;
+    // otherwise its visible `states_t` tokens remain unresolved and references
+    // from the typedef declaration only return the declaration itself.
+    analyzer.open(header_uri, disk_header);
+    analyzer.open(use_uri, disk_use);
+    analyzer.change(header_uri, open_header);
+    analyzer.change(use_uri, open_use);
 
     const auto [line, col] = find_position(open_header, "states_t");
     const auto refs = analyzer.find_references(header_uri, line, col, true);

@@ -274,7 +274,7 @@ class Analyzer {
     mutable std::string filelist_path_;
 
     mutable std::mutex map_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
+    mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
     std::vector<std::string> defines_;
     std::vector<std::string> include_dirs_;
     mutable std::vector<std::string> extra_files_;

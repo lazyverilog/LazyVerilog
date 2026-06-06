@@ -42,6 +42,8 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
 std::string symbol_canonical(std::string kind, std::string scope, std::string name);
 bool is_module_value_kind(std::string_view kind);
 std::string canonical_type_name_from_text(std::string_view type);
+std::vector<std::string> collect_include_dependency_uris(const slang::SourceManager& sm,
+                                                         const std::string& owning_uri);
 
 /// Add declaration and use-site ReferenceEntry records to an already-populated
 /// SyntaxIndex.  Both closed-file indexing and dynamic/open-buffer indexing call

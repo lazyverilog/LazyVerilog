@@ -419,31 +419,6 @@ static std::string apply_incremental_change(std::string text,
     return text;
 }
 
-static std::string apply_text_edits_descending(std::string text,
-                                               std::vector<lsTextEdit> edits) {
-    // WorkspaceEdit ranges are expressed against the pre-edit document.  Apply
-    // edits from the end of the file towards the beginning so earlier offsets
-    // stay valid after later text replacement.  This helper is used only for
-    // open documents that the server already has in memory; closed project
-    // files still refresh through explicit change notifications / background
-    // indexing and are never polled here.
-    std::sort(edits.begin(), edits.end(), [](const lsTextEdit& a, const lsTextEdit& b) {
-        return std::tie(a.range.start.line, a.range.start.character) >
-               std::tie(b.range.start.line, b.range.start.character);
-    });
-
-    for (const auto& edit : edits) {
-        auto [start, end] = lsp_offset_pair(text,
-            edit.range.start.line, edit.range.start.character,
-            edit.range.end.line, edit.range.end.character);
-        if (start > text.size()) start = text.size();
-        if (end > text.size()) end = text.size();
-        if (start > end) start = end;
-        text.replace(start, end - start, edit.newText);
-    }
-    return text;
-}
-
 static std::string resolve_vcode_path(const std::filesystem::path& root, const Config& config) {
     if (config.design.vcode.empty())
         return {};
@@ -1064,11 +1039,10 @@ void LazyVerilogServer::register_handlers() {
                 const int incoming_version = *note.params.textDocument.version;
                 const auto known = document_versions_.find(uri);
                 if (known != document_versions_.end() && incoming_version <= known->second) {
-                    // Neovim may send an immediate full sync from our
-                    // workspace-edit hook and later flush its normal debounced
-                    // incremental didChange for the same buffer version.  The
-                    // first one already made the analyzer current; replaying the
-                    // second one would double-apply the same text edit.
+                    // Drop stale/duplicate notifications.  For WorkspaceEdit
+                    // application (rename, code action, etc.) the client is
+                    // authoritative: once it sends a newer didChange below, we
+                    // reparse from the reported text and refresh dependents.
                     return;
                 }
                 document_versions_[uri] = incoming_version;
@@ -1230,38 +1204,6 @@ void LazyVerilogServer::register_handlers() {
         rsp.id = req.id;
         try {
             rsp.result = provide_rename(analyzer_, req.params);
-
-            // Rename is a client-applied WorkspaceEdit, so normally the server
-            // learns about open-buffer text changes from the client's later
-            // textDocument/didChange.  Neovim can debounce that notification;
-            // if the user immediately runs references on the new name, the
-            // analyzer may still contain the old text and return no refs.
-            //
-            // For documents already open in this server, we can safely predict
-            // the same text transformation from the WorkspaceEdit we just
-            // returned and update the immutable DocumentState immediately.  We
-            // only touch open documents and only listed edit ranges; no disk
-            // stat(), mtime check, or workspace scan is involved.  Closed files
-            // remain event-driven through workspace/didChangeWatchedFiles.
-            if (rsp.result.changes) {
-                for (const auto& [uri, edits] : *rsp.result.changes) {
-                    auto state = analyzer_.get_state(uri);
-                    if (!state || edits.empty())
-                        continue;
-
-                    const auto next_text = apply_text_edits_descending(state->text, edits);
-                    analyzer_.change(uri, next_text);
-                    analyzer_.clear_semantic_diagnostics(uri);
-
-                    // Suppress the client's debounced duplicate sync for the
-                    // same rename.  LSP document versions increase after each
-                    // edit; predicting one edit means the next normal didChange
-                    // for this URI should be <= this value and can be ignored.
-                    auto& version = document_versions_[uri];
-                    ++version;
-                }
-                schedule_background_compilation();
-            }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] rename error: " << e.what() << "\n";
         }
