@@ -597,20 +597,6 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index) {
     }
 }
 
-std::optional<std::string> source_text_for_dynamic_range(const slang::SourceManager& sm,
-                                                         slang::SourceRange range) {
-    if (!range.start().valid() || !range.end().valid())
-        return std::nullopt;
-    if (range.start().buffer() != range.end().buffer())
-        return std::nullopt;
-
-    const auto source = sm.getSourceText(range.start().buffer());
-    const size_t begin = range.start().offset();
-    const size_t end = range.end().offset();
-    if (begin > end || end > source.size())
-        return std::nullopt;
-    return std::string(source.substr(begin, end - begin));
-}
 
 
 } // namespace
