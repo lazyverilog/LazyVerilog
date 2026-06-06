@@ -93,12 +93,12 @@ TEST_CASE("lint: stale autoinst uses merged extra-file module ports", "[lint]") 
     auto state = analyzer.get_state(uri);
     REQUIRE(state != nullptr);
 
-    SyntaxIndex idx = build_dynamic_file_index(*state);
-    analyzer.merge_extra_file_modules(idx);
+    auto project_index = analyzer.extra_project_index();
+    REQUIRE(project_index != nullptr);
 
     LintConfig cfg;
     cfg.module.stale_autoinst_diagnostic = true;
-    auto diags = run_lint(*state, cfg, &idx);
+    auto diags = run_lint(*state, cfg, project_index.get());
 
     CHECK(has_message_containing(diags, "unknown port 'old'"));
     CHECK(has_message_containing(diags, "missing port 'b'"));

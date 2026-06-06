@@ -194,9 +194,6 @@ class Analyzer {
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
     std::vector<ExtraIndexInfo> extra_index_snapshots() const;
 
-    /// Append cached extra-file modules to an existing SyntaxIndex.
-    void merge_extra_file_modules(SyntaxIndex& index) const;
-
     /// Return the last background-published project-wide index snapshot.
     ///
     /// The request path never merges per-file shards.  The background worker

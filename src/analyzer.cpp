@@ -2290,11 +2290,6 @@ std::vector<ExtraIndexInfo> Analyzer::extra_index_snapshots() const {
     return snapshot ? *snapshot : std::vector<ExtraIndexInfo>{};
 }
 
-void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
-    for (const auto& extra : *extra_index_snapshot_ptr())
-        index.merge(extra.index);
-}
-
 std::shared_ptr<const SyntaxIndex> Analyzer::extra_project_index() const {
     const auto start = Clock::now();
     std::lock_guard<std::mutex> lock(map_mutex_);
