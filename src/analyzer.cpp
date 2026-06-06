@@ -665,7 +665,30 @@ static std::optional<std::string> read_file_text_optional(const std::filesystem:
     std::ifstream in(path, std::ios::binary);
     if (!in)
         return std::nullopt;
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+
+    // Prefer a single allocation/read for regular files.  The fallback keeps the
+    // helper robust for paths where the size cannot be queried or the stream is
+    // not seekable.  This matters on large RTL sources because the iterator
+    // constructor repeatedly grows the string while pulling one character at a
+    // time through the stream buffer.
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (!ec) {
+        std::string text(size, '\0');
+        if (size == 0)
+            return text;
+        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        text.resize(static_cast<size_t>(in.gcount()));
+        return text;
+    }
+
+    std::string text;
+    in.seekg(0, std::ios::end);
+    if (const auto end = in.tellg(); end > 0)
+        text.reserve(static_cast<size_t>(end));
+    in.seekg(0, std::ios::beg);
+    text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return text;
 }
 
 static std::filesystem::path normalize_path(const std::string& path) {
