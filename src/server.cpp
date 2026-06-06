@@ -1146,12 +1146,15 @@ void LazyVerilogServer::register_handlers() {
                         size_t line_start = lsp_offset(text, result.open_line, 0);
                         size_t open = lsp_offset(text, result.open_line, result.open_col);
                         std::string line_prefix = text.substr(line_start, open - line_start);
-                        // Generate the AutoArg port list, then run the resulting module-header
-                        // fragment through the formatter.  This keeps AutoArg-on-save formatting
-                        // consistent even when whole-document format-on-save is disabled below.
-                        std::string replacement = format_emit_text(
-                            line_prefix + format_autoarg(result, config_.autoarg, config_.format),
-                            config_.format);
+                        // Generate the AutoArg port list.  If whole-document formatting is
+                        // enabled, leave the fragment unformatted here and let the single final
+                        // document pass normalize both the generated ports and the surrounding
+                        // source.  Formatting each fragment first is wasted work on save because
+                        // the full pass immediately reformats the same text again.
+                        std::string replacement =
+                            line_prefix + format_autoarg(result, config_.autoarg, config_.format);
+                        if (!config_.format.enable_format_on_save)
+                            replacement = format_emit_text(replacement, config_.format);
                         size_t end = lsp_offset(text, result.end_line, result.end_col);
                         text.replace(line_start, end - line_start, replacement);
                     }
