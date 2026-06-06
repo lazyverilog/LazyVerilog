@@ -1755,6 +1755,13 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     auto state = get_state(uri);
     if (!state)
         return {};
+
+    // Keep one immutable view of the closed-file project index for the whole
+    // request.  Grabbing extra_index_snapshot_ptr() repeatedly would both
+    // contend on map_mutex_ and could mix different background-index
+    // generations in one references response if a didChange / shard publish
+    // happened between loops.
+    const auto extra_idx = extra_index_snapshot_ptr();
     if (!target) {
         // Macro invocations are often represented in slang's parsed tree as
         // expansion tokens rather than as an ordinary Identifier token at the
@@ -1777,19 +1784,19 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                          : DefinitionTarget{};
     auto target_def = definition_of_state(*state, uri, line, col, extra_files);
     if (!target_def && target_info.kind == DefinitionTargetKind::Instance) {
-        for (const auto& extra : *extra_index_snapshot_ptr()) {
+        for (const auto& extra : *extra_idx) {
             if ((target_def = find_module_definition(extra.index, extra.uri,
                                                      target_info.module_name)))
                 break;
         }
     } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedPort) {
-        for (const auto& extra : *extra_index_snapshot_ptr()) {
+        for (const auto& extra : *extra_idx) {
             if ((target_def = find_port_definition(extra.index, extra.uri,
                                                    target_info.module_name, target_info.name)))
                 break;
         }
     } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedParameter) {
-        for (const auto& extra : *extra_index_snapshot_ptr()) {
+        for (const auto& extra : *extra_idx) {
             if ((target_def = find_port_definition(extra.index, extra.uri,
                                                    target_info.module_name, target_info.name)))
                 break;
@@ -1852,7 +1859,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 target_symbol_debug = *id;
         }
         if (target_symbol_debug.empty()) {
-            for (const auto& extra : *extra_index_snapshot_ptr()) {
+            for (const auto& extra : *extra_idx) {
                 if (extra.uri != target_def->uri)
                     continue;
                 if (auto id = symbol_id_for_index_location(extra.index, *target_def))
@@ -1886,7 +1893,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             }
         }
         if (fallback_symbol_debug.empty()) {
-            for (const auto& extra : *extra_index_snapshot_ptr()) {
+            for (const auto& extra : *extra_idx) {
                 if (extra.uri != target_def->uri)
                     continue;
                 if (auto id = symbol_id_for_index_location(extra.index, *target_def, true);
@@ -2037,7 +2044,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
 
     // Closed project files are represented by compact reference-occurrence
     // shards.  We intentionally do not load or walk their full SyntaxTrees here.
-    for (const auto& extra : *extra_index_snapshot_ptr()) {
+    for (const auto& extra : *extra_idx) {
         if (open_uris.contains(extra.uri))
             continue;
         if (!target_symbol_id && !fallback_symbol_id)
