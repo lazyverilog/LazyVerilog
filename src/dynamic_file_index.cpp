@@ -1,8 +1,8 @@
 #include "dynamic_file_index.hpp"
 #include "syntax_index_shared.hpp"
+#include "string_utils.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <filesystem>
 #include <optional>
 #include <slang/parsing/TokenKind.h>
@@ -22,19 +22,8 @@ std::string tok_text(const slang::parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
 }
 
-std::string trim_text(std::string text) {
-    auto first =
-        std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
-    auto last = std::find_if_not(text.rbegin(), text.rend(), [](unsigned char c) {
-                    return std::isspace(c);
-                }).base();
-    if (first >= last)
-        return {};
-    return std::string(first, last);
-}
-
 std::string node_text(const SyntaxNode& node) {
-    return trim_text(node.toString());
+    return trim_copy(node.toString());
 }
 
 std::string node_text_raw(const slang::SourceManager& sm, const SyntaxNode& node) {
