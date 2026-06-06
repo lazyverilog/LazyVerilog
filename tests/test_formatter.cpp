@@ -895,7 +895,7 @@ TEST_CASE("formatter: extern class method declarations do not indent following d
 
     CHECK(formatted == "class esc_monitor;\n"
                        "  `uvm_component_utils(esc_monitor)\n"
-                       "  extern function new (string name, uvm_component parent);\n"
+                       "  extern function new(string name, uvm_component parent);\n"
                        "  extern virtual task run_phase(uvm_phase phase);\n"
                        "  extern virtual function bit get_esc();\n"
                        "endclass: esc_monitor\n");
@@ -2972,6 +2972,47 @@ TEST_CASE("formatter: function declaration block and hanging layouts", "[formatt
     opts.function_declaration.layout = "hanging";
     CHECK(format_source("class c;\nfunction automatic int add(input int a, input int b, input int c);\nendfunction\nendclass\n", opts) ==
           "class c;\n    function automatic int add(input int a,\n                               input int b,\n                               input int c);\n    endfunction\nendclass\n");
+}
+
+TEST_CASE("formatter: function declaration space_before_paren is independent from calls",
+          "[formatter][options]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.function_call.break_policy = "never";
+    opts.function_call.space_before_paren = true;
+    opts.function_declaration.line_length = 24;
+
+    const std::string source =
+        "module top;\n"
+        "task add_number(input int a, input int b, output int result);\n"
+        "result=calc(a,b);\n"
+        "endtask\n"
+        "endmodule\n";
+
+    opts.function_declaration.space_before_paren = false;
+    CHECK(format_source(source, opts) ==
+          "module top;\n"
+          "task add_number(\n"
+          "    input int a,\n"
+          "    input int b,\n"
+          "    output int result\n"
+          ");\n"
+          "    result = calc (a, b);\n"
+          "endtask\n"
+          "endmodule\n");
+
+    opts.function_declaration.space_before_paren = true;
+    CHECK(format_source(source, opts) ==
+          "module top;\n"
+          "task add_number (\n"
+          "    input int a,\n"
+          "    input int b,\n"
+          "    output int result\n"
+          ");\n"
+          "    result = calc (a, b);\n"
+          "endtask\n"
+          "endmodule\n");
 }
 
 TEST_CASE("formatter: non-ANSI module ports can wrap by max line length", "[formatter][options]") {

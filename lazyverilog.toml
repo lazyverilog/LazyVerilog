@@ -118,6 +118,7 @@ space_inside_paren = false
 [format.function_declaration]
 layout = "block"           # hanging | block — applies to function and task declarations
 line_length = 13          # declarations shorter than this stay single-line
+space_before_paren = false # insert a space between function/task name and '('
 
 [format.module]
 parameter_layout = "block" # block | hanging

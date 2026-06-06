@@ -993,6 +993,33 @@ function void foo(
 
 ---
 
+### `space_before_paren`
+
+Insert a space between the declared function/task name and the opening `(`.
+
+```toml
+[format.function_declaration]
+space_before_paren = false
+```
+
+```systemverilog
+// space_before_paren = false
+function int add_number(
+  input int a,
+  input int b,
+  output int result
+);
+
+// space_before_paren = true
+function int add_number (
+  input int a,
+  input int b,
+  output int result
+);
+```
+
+---
+
 ## `[format.module]`
 
 Controls module header formatting.

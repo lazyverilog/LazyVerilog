@@ -68,6 +68,7 @@ struct FunctionOptions {
 struct FunctionDeclarationOptions {
     std::string layout{"block"};
     int line_length{100};
+    bool space_before_paren{false};
 };
 
 struct ModuleOptions {

@@ -568,6 +568,34 @@ inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open)
     return npos;
 }
 
+inline bool is_function_task_declaration_open(const TokenStream& tokens, size_t open) {
+    if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenParenthesis))
+        return false;
+
+    // This option is about the declaration header:
+    //
+    //   function int add(
+    //                   ^ this open paren
+    //
+    // not about nested calls/default expressions inside the port list.  Walking
+    // backward until a declaration boundary keeps the test token-kind based and
+    // idempotent.  Seeing another '(' first means the current '(' belongs to an
+    // expression nested inside an already-open declaration header.
+    for (size_t n = open; n > 0; --n) {
+        size_t i = n - 1;
+        if (!is_code_token(tokens[i]))
+            continue;
+        if (kind_is(tokens[i], TK::FunctionKeyword) || kind_is(tokens[i], TK::TaskKeyword))
+            return true;
+        if (kind_is(tokens[i], TK::OpenParenthesis) ||
+            kind_is(tokens[i], TK::Semicolon) ||
+            is_close_block(tokens[i].lex.kind) ||
+            is_outer_close(tokens[i].lex.kind))
+            return false;
+    }
+    return false;
+}
+
 inline size_t module_header_import_owner(const TokenStream& tokens, size_t import_idx) {
     if (import_idx >= tokens.size() || !kind_is(tokens[import_idx], TK::ImportKeyword))
         return npos;
@@ -2981,8 +3009,15 @@ public:
                     spaces = 1;
             }
 
+            // Function/task declaration spacing has its own option because many
+            // codebases prefer `foo (...)` for calls but `function foo(...)` for
+            // declarations (or vice versa).  Check it before the generic
+            // call-like rule below; wrapped and unwrapped declarations both
+            // pass through this spacing pass.
+            if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
+                spaces = opts_.function_declaration.space_before_paren ? 1 : 0;
             // Function/task call spacing
-            if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage)))
+            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage)))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::InstancePorts &&
                 opts_.instance.align)

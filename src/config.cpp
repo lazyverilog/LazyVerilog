@@ -245,6 +245,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                     cfg.format.function_declaration.layout = *v;
                 if (auto v = (*fd)["line_length"].value<int64_t>())
                     cfg.format.function_declaration.line_length = static_cast<int>(*v);
+                if (auto v = (*fd)["space_before_paren"].value<bool>())
+                    cfg.format.function_declaration.space_before_paren = *v;
             }
             if (auto po = (*f)["module"].as_table()) {
                 if (auto v = (*po)["non_ansi_port_per_line_enabled"].value<bool>())

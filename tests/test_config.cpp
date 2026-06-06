@@ -105,6 +105,11 @@ layout = "hanging"
 space_before_paren = true
 space_inside_paren = true
 
+[format.function_declaration]
+layout = "hanging"
+line_length = 70
+space_before_paren = true
+
 [format.spacing]
 control_keyword_space = false
 space_inside_parens = true
@@ -237,6 +242,9 @@ autoarg_on_save = true
     CHECK(cfg.format.function_call.layout == "hanging");
     CHECK(cfg.format.function_call.space_before_paren == true);
     CHECK(cfg.format.function_call.space_inside_paren == true);
+    CHECK(cfg.format.function_declaration.layout == "hanging");
+    CHECK(cfg.format.function_declaration.line_length == 70);
+    CHECK(cfg.format.function_declaration.space_before_paren == true);
 
     CHECK(cfg.format.spacing.control_keyword_space == false);
     CHECK(cfg.format.spacing.space_inside_parens == true);
