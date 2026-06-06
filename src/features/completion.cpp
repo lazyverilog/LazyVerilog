@@ -2686,13 +2686,12 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     //
     // The expensive/background layer is still context-gated.  Generic typing
     // should not pull the whole .f project into the completion menu, but it is
-    // safe to merge the small dynamic/opened-file layer because those files
-    // have already paid the parse cost through didOpen/didChange.  The merged
-    // opened-file layer is cached per current URI, so repeated completion /
-    // code-action requests do not rebuild the same dynamic merge.
+    // Other open buffers are consumed as per-file shards, not merged into the
+    // current file index.  This avoids rebuilding a full "all open files except
+    // current" SyntaxIndex on every edit-driven cache miss while still reusing
+    // each immutable DocumentState's cached dynamic SyntaxIndex.
     SyntaxIndex completion_index = std::move(current_index);
-    if (auto opened_index = analyzer.opened_files_index(params.textDocument.uri.raw_uri_))
-        completion_index.merge(*opened_index);
+    auto opened_shards = analyzer.opened_file_index_shards(params.textDocument.uri.raw_uri_);
     std::vector<const SyntaxIndex*> project_shards;
     if (completion_context_needs_project_index(ctx.kind)) {
         if (auto project_index = analyzer.project_index_snapshot()) {
@@ -2709,14 +2708,20 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     // local even though they are no longer stored in DocumentState::index by
     // didChange.
     std::unordered_set<std::string> local_names;
-    for (const auto& m : completion_index.modules)  local_names.insert(m.name);
-    for (const auto& c : completion_index.classes)  local_names.insert(c.name);
-    for (const auto& t : completion_index.typedefs) local_names.insert(t.name);
-    for (const auto& mac : completion_index.macros) local_names.insert(mac.name);
-    for (const auto& v : completion_index.values) {
-        if (v.parent_scope.empty() || v.parent_scope == ctx.current_scope_name)
-            local_names.insert(v.name);
-    }
+    auto add_local_names = [&](const SyntaxIndex& index) {
+        for (const auto& m : index.modules)  local_names.insert(m.name);
+        for (const auto& c : index.classes)  local_names.insert(c.name);
+        for (const auto& t : index.typedefs) local_names.insert(t.name);
+        for (const auto& mac : index.macros) local_names.insert(mac.name);
+        for (const auto& v : index.values) {
+            if (v.parent_scope.empty() || v.parent_scope == ctx.current_scope_name)
+                local_names.insert(v.name);
+        }
+    };
+    add_local_names(completion_index);
+    for (const auto& shard : *opened_shards)
+        if (shard.index)
+            add_local_names(*shard.index);
 
     std::vector<lsCompletionItem> all_items;
 
@@ -2769,25 +2774,36 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     }
 
     try {
-        CompletionContext project_ctx = ctx;
+        CompletionContext indexed_ctx = ctx;
         if (ctx.kind == CompletionContextKind::MemberAccess && !ctx.scope_name.empty()) {
             // Member access is inherently layered:
             //
             //   current/open layer:  my_handle is declared as some_pkg::my_class
-            //   project shard:       my_class members are indexed in a library file
+            //   open/project shard:  my_class members are indexed in another file
             //
             // A flat merged index used to make type_of_value(current variable)
-            // and class_by_name(project class) visible to the same provider
-            // invocation.  Now that project shards remain separate, resolve the
-            // receiver's type once from the current/open layer and ask each
-            // project shard for members of that type.  This keeps the no-flat-
-            // merge rule without losing the common "variable_of_project_class."
-            // completion case.
-            if (auto value_type = type_of_value(completion_index, ctx.current_scope_name,
-                                                ctx.scope_name)) {
+            // and class_by_name(other-file class) visible to the same provider
+            // invocation.  Now that open/project shards remain separate,
+            // resolve the receiver's type once from the current/open layer and
+            // ask each shard for members of that type.  This keeps the
+            // no-flat-merge rule without losing the common
+            // "variable_of_other_file_class." completion case.
+            std::optional<std::string> value_type =
+                type_of_value(completion_index, ctx.current_scope_name, ctx.scope_name);
+            if (!value_type) {
+                for (const auto& shard : *opened_shards) {
+                    if (!shard.index)
+                        continue;
+                    value_type = type_of_value(*shard.index, ctx.current_scope_name,
+                                               ctx.scope_name);
+                    if (value_type)
+                        break;
+                }
+            }
+            if (value_type) {
                 const std::string base = completion_base_type_name(*value_type);
                 if (!base.empty())
-                    project_ctx.scope_name = base;
+                    indexed_ctx.scope_name = base;
             }
         }
 
@@ -2798,10 +2814,18 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             all_items.insert(all_items.end(),
                              std::make_move_iterator(items.begin()),
                              std::make_move_iterator(items.end()));
+            for (const auto& shard : *opened_shards) {
+                if (!shard.index)
+                    continue;
+                auto open_items = provider->provide(indexed_ctx, *shard.index, tok);
+                all_items.insert(all_items.end(),
+                                 std::make_move_iterator(open_items.begin()),
+                                 std::make_move_iterator(open_items.end()));
+            }
             for (const auto* shard : project_shards) {
                 if (!shard)
                     continue;
-                auto project_items = provider->provide(project_ctx, *shard, tok);
+                auto project_items = provider->provide(indexed_ctx, *shard, tok);
                 all_items.insert(all_items.end(),
                                  std::make_move_iterator(project_items.begin()),
                                  std::make_move_iterator(project_items.end()));
@@ -2823,6 +2847,12 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     auto expected_names = enum_members_for_type(completion_index, ctx.expected_type);
     auto same_type_names = value_names_for_type(completion_index, ctx);
+    for (const auto& shard : *opened_shards) {
+        if (!shard.index)
+            continue;
+        append_set(expected_names, enum_members_for_type(*shard.index, ctx.expected_type));
+        append_set(same_type_names, value_names_for_type(*shard.index, ctx));
+    }
     for (const auto* shard : project_shards) {
         if (!shard)
             continue;

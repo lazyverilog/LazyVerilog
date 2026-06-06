@@ -1,4 +1,5 @@
 #include "autoinst.hpp"
+#include "../analyzer.hpp"
 #include "../string_utils.hpp"
 #include "../syntax_index_shared.hpp"
 #include <algorithm>
@@ -163,11 +164,24 @@ static std::vector<std::string> ports_for_module_in_project_snapshot(
     return port_names;
 }
 
+static std::vector<std::string> ports_for_module_in_open_shards(
+    std::span<const OpenIndexShard> opened_shards, const std::string& module_type) {
+    for (const auto& shard : opened_shards) {
+        if (!shard.index)
+            continue;
+        auto ports = ports_for_module_in_syntax_index(*shard.index, module_type);
+        if (!ports.empty())
+            return ports;
+    }
+    return {};
+}
+
 // ── Main implementation ───────────────────────────────────────────────────────
 
-std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line, int /*col*/,
-                                            const SyntaxIndex* opened_index,
-                                            const ProjectIndexSnapshot* project_index) {
+static std::optional<AutoinstResult> autoinst_impl_layers(
+    const DocumentState& state, int line, int /*col*/, const SyntaxIndex* opened_index,
+    std::span<const OpenIndexShard> opened_shards,
+    const ProjectIndexSnapshot* project_index) {
     if (!state.tree)
         return std::nullopt;
 
@@ -214,6 +228,8 @@ std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line
         auto port_names = ports_for_module_in_current_ast(state, module_type);
         if (port_names.empty() && opened_index)
             port_names = ports_for_module_in_syntax_index(*opened_index, module_type);
+        if (port_names.empty() && !opened_shards.empty())
+            port_names = ports_for_module_in_open_shards(opened_shards, module_type);
         if (port_names.empty() && project_index)
             port_names = ports_for_module_in_project_snapshot(*project_index, module_type);
 
@@ -241,6 +257,18 @@ std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line
         return result;
     }
     return std::nullopt;
+}
+
+std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line, int col,
+                                            const SyntaxIndex* opened_index,
+                                            const ProjectIndexSnapshot* project_index) {
+    return autoinst_impl_layers(state, line, col, opened_index, {}, project_index);
+}
+
+std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line, int col,
+                                            std::span<const OpenIndexShard> opened_shards,
+                                            const ProjectIndexSnapshot* project_index) {
+    return autoinst_impl_layers(state, line, col, nullptr, opened_shards, project_index);
 }
 
 // ── Parse existing port connections ──────────────────────────────────────────

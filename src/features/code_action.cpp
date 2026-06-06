@@ -7,6 +7,7 @@
 #include "autowire.hpp"
 #include "formatter.hpp"
 #include <iostream>
+#include <span>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -135,17 +136,19 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     // AST-first inside autoinst_impl(); other open buffers and project files
     // stay as separate index layers so code actions do not materialize a flat
     // all-shard project index on request paths.
-    std::shared_ptr<const SyntaxIndex> opened_index;
+    std::shared_ptr<const std::vector<OpenIndexShard>> opened_shards;
     std::shared_ptr<const ProjectIndexSnapshot> project_index;
     if (state->tree) {
-        opened_index = analyzer.opened_files_index(uri);
+        opened_shards = analyzer.opened_file_index_shards(uri);
         project_index = analyzer.project_index_snapshot();
     }
 
     // ── 1. AutoInst ──────────────────────────────────────────────────────────
     try {
         if (state->tree) {
-            auto result = autoinst_impl(*state, line, col, opened_index.get(),
+            auto result = autoinst_impl(*state, line, col,
+                                        opened_shards ? std::span<const OpenIndexShard>(*opened_shards)
+                                                      : std::span<const OpenIndexShard>{},
                                         project_index.get());
             if (result) {
                 std::string formatted = format_emit_text(

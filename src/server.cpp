@@ -66,6 +66,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -1640,10 +1641,13 @@ void LazyVerilogServer::register_handlers() {
                 int target_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state && state->tree) {
-                    auto opened = analyzer_.opened_files_index(uri);
+                    auto opened = analyzer_.opened_file_index_shards(uri);
                     auto project = analyzer_.project_index_snapshot();
+                    std::span<const OpenIndexShard> opened_shards =
+                        opened ? std::span<const OpenIndexShard>(*opened)
+                               : std::span<const OpenIndexShard>{};
                     if (cmd == "lazyverilog.autowirepreview") {
-                        auto preview = autowire_preview(*state, opened.get(), project.get(),
+                        auto preview = autowire_preview(*state, opened_shards, project.get(),
                                                         config_.autowire, target_line);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
@@ -1667,7 +1671,7 @@ void LazyVerilogServer::register_handlers() {
                         rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
                     } else {
                         std::string new_source =
-                            autowire_apply(*state, opened.get(), project.get(),
+                            autowire_apply(*state, opened_shards, project.get(),
                                            config_.autowire, target_line);
                         if (new_source != state->text)
                             new_source = format_source(new_source, config_.format);

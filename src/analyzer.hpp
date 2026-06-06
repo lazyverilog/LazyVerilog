@@ -57,6 +57,16 @@ struct ExtraIndexInfo {
     SyntaxIndex index;
 };
 
+struct OpenIndexShard {
+    std::string uri;
+    // Keep the immutable DocumentState alive for as long as `index` is used.
+    // get_dynamic_index() returns a reference to a cache owned by DocumentState,
+    // so the shard snapshot must retain the owner rather than exposing a
+    // dangling raw SyntaxIndex pointer after didChange replaces docs_[uri].
+    std::shared_ptr<const DocumentState> state;
+    const SyntaxIndex* index{nullptr};
+};
+
 struct CompilationSourceFile {
     std::string uri;
     std::string path;
@@ -228,13 +238,18 @@ class Analyzer {
     /// it must be non-blocking and must not call back into Analyzer.
     void set_project_index_publish_callback(std::function<void()> callback);
 
-    /// Return a cached merged dynamic/file index for other open buffers.
+    /// Return dynamic/file indexes for other open buffers as per-file shards.
     ///
-    /// This is the clangd "dynamic" layer: files that have been opened/parsed
-    /// during this editor session, including unsaved edits.  The current file
-    /// is excluded because completion/point queries inspect its SyntaxTree
-    /// directly instead of materializing a current-file index.
-    std::shared_ptr<const SyntaxIndex> opened_files_index(const std::string& current_uri) const;
+    /// This is the clangd-style dynamic layer: files that have been
+    /// opened/parsed during this editor session, including unsaved edits.  The
+    /// current file is excluded because completion/point queries inspect its
+    /// SyntaxTree directly instead of materializing a current-file index.
+    ///
+    /// The API returns independent SyntaxIndex shards rather than a merged
+    /// SyntaxIndex, so request paths do not rebuild an all-open-file merge on
+    /// every edit-driven cache miss.
+    std::shared_ptr<const std::vector<OpenIndexShard>>
+    opened_file_index_shards(const std::string& current_uri) const;
 
     /// Return an immutable snapshot for background semantic compilation.
     /// Open documents include their in-memory text; filelist-only documents
@@ -284,7 +299,6 @@ class Analyzer {
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
     void invalidate_extra_snapshots_locked() const;
-    void invalidate_opened_files_index_locked() const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state,
@@ -311,12 +325,6 @@ class Analyzer {
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
     mutable std::function<void()> project_index_publish_callback_;
-    // Per-current-URI merged dynamic layer for "other open files".  The key is
-    // necessary because current/open file facts must come from the caller's AST,
-    // so the current URI is excluded from the cached merge.
-    mutable std::unordered_map<std::string, std::shared_ptr<const SyntaxIndex>>
-        opened_files_index_cache_;
-    mutable uint64_t opened_files_index_generation_{0};
 
     // clangd-style background index state.
     //

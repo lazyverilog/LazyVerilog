@@ -4,8 +4,11 @@
 #include "../config.hpp"
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
+
+struct OpenIndexShard;
 
 struct AutoinstResult {
     std::string module_name;
@@ -19,6 +22,11 @@ struct AutoinstResult {
 std::optional<AutoinstResult> autoinst_impl(
     const DocumentState& state, int line, int col,
     const SyntaxIndex* opened_index = nullptr,
+    const ProjectIndexSnapshot* project_index = nullptr);
+
+std::optional<AutoinstResult> autoinst_impl(
+    const DocumentState& state, int line, int col,
+    std::span<const OpenIndexShard> opened_shards,
     const ProjectIndexSnapshot* project_index = nullptr);
 
 std::string format_autoinst(
