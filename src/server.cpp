@@ -355,13 +355,22 @@ static void append_rtl_tree_json(std::string& out, const RtlTreeNode& node, bool
     constexpr size_t kMaxRtlTreeJsonDepth = 512;
     out += "{\"name\":";
     out += json_string(node.name);
-    if (show_instance_name) {
-        out += ",\"inst\":";
-        out += json_string(node.inst);
-    }
-    if (show_file) {
-        out += ",\"file\":";
-        out += json_string(node.file);
+    // Always include navigation metadata.  `rtltree.show_file` and
+    // `rtltree.show_instance_name` control the rendered label in the client,
+    // not whether <CR> can jump to a definition when that label is hidden.
+    out += ",\"inst\":";
+    out += json_string(node.inst);
+    out += ",\"file\":";
+    out += json_string(node.file);
+    out += ",\"line\":";
+    out += std::to_string(node.line);
+    out += ",\"col\":";
+    out += std::to_string(node.col);
+    if (depth == 0) {
+        out += ",\"show_file\":";
+        out += show_file ? "true" : "false";
+        out += ",\"show_instance_name\":";
+        out += show_instance_name ? "true" : "false";
     }
     out += ",\"children\":[";
     if (depth < kMaxRtlTreeJsonDepth) {
@@ -898,6 +907,7 @@ void LazyVerilogServer::register_handlers() {
                 "lazyverilog.interfaceDisconnect",
                 "lazyverilog.singleInterface",
                 "lazyverilog.lint",
+                "lazyverilog.lintAll",
             };
             caps.executeCommandProvider = exec_opts;
         } catch (const std::exception& e) {
@@ -1372,37 +1382,8 @@ void LazyVerilogServer::register_handlers() {
                 return out;
             };
 
-            auto lint_result_json = [&](const std::string& uri) {
-                auto state = analyzer_.get_state(uri);
-                if (!state) {
-                    rsp.result.SetJsonString("[]", lsp::Any::kArrayType);
-                    return;
-                }
-
-                std::vector<std::pair<std::string, ParseDiagInfo>> diagnostics;
-                auto add_diag = [&](ParseDiagInfo diag) {
-                    const std::string target_uri = diag.uri.empty() ? uri : diag.uri;
-                    diag.uri.clear();
-                    diagnostics.emplace_back(target_uri, std::move(diag));
-                };
-
-                for (auto diag : state->parse_diagnostics)
-                    add_diag(std::move(diag));
-
-                std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-                if (config_.lint.module.stale_autoinst_diagnostic)
-                    project_lint_index = analyzer_.project_index_snapshot();
-
-                auto lint_diags = run_lint(*state, config_.lint, project_lint_index.get());
-                for (auto diag : lint_diags)
-                    add_diag(std::move(diag));
-
-                if (config_.compilation.background_compilation) {
-                    auto semantic_diags = analyzer_.semantic_diagnostics(uri);
-                    for (auto diag : semantic_diags)
-                        add_diag(std::move(diag));
-                }
-
+            auto lint_result_json =
+                [&](const std::vector<std::shared_ptr<const DocumentState>>& states) {
                 auto severity_text = [](int severity) -> std::string_view {
                     switch (severity) {
                     case 1:
@@ -1415,12 +1396,54 @@ void LazyVerilogServer::register_handlers() {
                         return "Information";
                     }
                 };
+
                 auto uri_to_file = [](std::string uri) {
                     constexpr std::string_view prefix = "file://";
                     if (uri.starts_with(prefix))
                         uri.erase(0, prefix.size());
                     return uri;
                 };
+
+                std::vector<std::pair<std::string, ParseDiagInfo>> diagnostics;
+                std::unordered_set<std::string> seen_uris;
+
+                // :LintAll is intentionally a manual, potentially slow command:
+                // it receives temporary DocumentState snapshots for all .f
+                // files so AST-based lint can run without retaining those ASTs
+                // or mutating the persistent project index.  Cross-file rules
+                // still consult the current published ProjectIndexSnapshot; the
+                // command does not perform hidden reindexing as a side effect.
+                std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
+                if (config_.lint.module.stale_autoinst_diagnostic)
+                    project_lint_index = analyzer_.project_index_snapshot();
+
+                auto add_diag = [&](const std::string& fallback_uri, ParseDiagInfo diag) {
+                    const std::string target_uri = diag.uri.empty() ? fallback_uri : diag.uri;
+                    diag.uri.clear();
+                    diagnostics.emplace_back(target_uri, std::move(diag));
+                };
+
+                for (const auto& state : states) {
+                    if (!state)
+                        continue;
+                    const auto& uri = state->uri;
+                    if (!seen_uris.insert(uri).second)
+                        continue;
+
+                    for (auto diag : state->parse_diagnostics)
+                        add_diag(uri, std::move(diag));
+
+                    auto lint_diags = run_lint(*state, config_.lint,
+                                               project_lint_index.get());
+                    for (auto diag : lint_diags)
+                        add_diag(uri, std::move(diag));
+
+                    if (config_.compilation.background_compilation) {
+                        auto semantic_diags = analyzer_.semantic_diagnostics(uri);
+                        for (auto diag : semantic_diags)
+                            add_diag(uri, std::move(diag));
+                    }
+                }
 
                 std::string json = "[";
                 for (size_t i = 0; i < diagnostics.size(); ++i) {
@@ -1574,7 +1597,12 @@ void LazyVerilogServer::register_handlers() {
             };
 
             if (cmd == "lazyverilog.lint") {
-                lint_result_json(get_string(0));
+                std::vector<std::shared_ptr<const DocumentState>> states;
+                if (auto state = analyzer_.get_state(get_string(0)))
+                    states.push_back(std::move(state));
+                lint_result_json(states);
+            } else if (cmd == "lazyverilog.lintAll") {
+                lint_result_json(analyzer_.project_file_states_sync());
             } else if (cmd == "lazyverilog.format") {
                 std::string uri = get_string(0);
                 std::string mode = get_string(1);

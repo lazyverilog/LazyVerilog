@@ -358,6 +358,64 @@ std::vector<std::string> Analyzer::extra_files() const {
     return extra_files_;
 }
 
+std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_sync() const {
+    const auto start = Clock::now();
+
+    std::vector<std::string> paths;
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+    std::vector<OpenTextOverlay> open_overlays;
+    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> live_by_path;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        paths = extra_files_;
+        defines = defines_;
+        include_dirs = include_dirs_;
+
+        open_overlays.reserve(docs_.size());
+        live_by_path.reserve(docs_.size());
+        for (const auto& [open_uri, open_state] : docs_) {
+            if (!open_state)
+                continue;
+            open_overlays.push_back(OpenTextOverlay{
+                .uri = open_uri,
+                .path = open_state->normalized_path,
+                .state = open_state,
+            });
+            live_by_path.emplace(open_state->normalized_path, open_state);
+        }
+    }
+
+    std::vector<std::shared_ptr<const DocumentState>> states;
+    states.reserve(paths.size());
+    std::unordered_set<std::string> seen_paths;
+    seen_paths.reserve(paths.size());
+
+    for (const auto& raw_path : paths) {
+        const auto normalized_path = normalize_filesystem_path(raw_path).string();
+        if (!seen_paths.insert(normalized_path).second)
+            continue;
+
+        if (const auto live = live_by_path.find(normalized_path); live != live_by_path.end()) {
+            states.push_back(live->second);
+            continue;
+        }
+
+        // Parse into a short-lived DocumentState so :LintAll can run the same
+        // AST-based lint rules as an open buffer, then discard the AST after the
+        // executeCommand response is built.  This deliberately does not update
+        // extra_cache_ or publish a ProjectIndexSnapshot; :LintAll is a manual
+        // diagnostics command, not a hidden reindex operation.
+        auto state = make_file_state_with_options(normalized_path, defines, include_dirs,
+                                                  open_overlays);
+        if (state)
+            states.push_back(std::move(state));
+    }
+
+    log_perf("project_file_states_sync files=" + std::to_string(states.size()), start);
+    return states;
+}
+
 std::shared_ptr<const DocumentState> Analyzer::get_state(const std::string& uri) const {
     std::lock_guard<std::mutex> lock(map_mutex_);
     auto it = docs_.find(uri);
@@ -2474,9 +2532,26 @@ struct RtlIndexedInstance {
     std::string uri;
 };
 
+struct RtlModuleLocation {
+    std::string uri;
+    int line{0};
+    int col{0};
+};
+
 struct RtlIndexView {
-    std::unordered_map<std::string, std::string> module_uris;
+    std::unordered_map<std::string, RtlModuleLocation> modules;
     std::vector<RtlIndexedInstance> instances;
+    // parent module name -> indexes into `instances`.
+    //
+    // Forward RTL tree construction asks the same question at every hierarchy
+    // node: "which instances are declared directly inside this module?"  The
+    // old implementation answered that by scanning every indexed instance for
+    // every visited module, which made tree building O(visited modules × total
+    // instances).  Keep the instance vector as the canonical per-request
+    // storage (reverse tree construction still benefits from a flat list), and
+    // build this small adjacency table once after all open/project shards have
+    // been merged into the request-local view.
+    std::unordered_map<std::string, std::vector<size_t>> instances_by_parent;
 };
 
 void add_rtl_index_file(RtlIndexView& view, std::unordered_set<std::string>& seen_uris,
@@ -2484,11 +2559,31 @@ void add_rtl_index_file(RtlIndexView& view, std::unordered_set<std::string>& see
     if (!seen_uris.insert(uri).second)
         return;
 
-    for (const auto& module : index.modules)
-        view.module_uris.try_emplace(module.name, uri);
+    for (const auto& module : index.modules) {
+        // First definition wins to preserve the historical RTL tree behavior
+        // where duplicate module names resolve to the first indexed file.  Keep
+        // the source location next to the URI so editor clients can jump to the
+        // definition line without issuing a second definition request.
+        view.modules.try_emplace(module.name, RtlModuleLocation{
+            .uri = uri,
+            .line = module.line,
+            .col = module.col,
+        });
+    }
 
     for (const auto& instance : index.instances)
         view.instances.push_back(RtlIndexedInstance{.entry = instance, .uri = uri});
+}
+
+void build_rtl_parent_adjacency(RtlIndexView& view) {
+    view.instances_by_parent.clear();
+
+    for (size_t i = 0; i < view.instances.size(); ++i) {
+        const auto& parent_module = view.instances[i].entry.parent_module;
+        if (parent_module.empty())
+            continue;
+        view.instances_by_parent[parent_module].push_back(i);
+    }
 }
 
 } // namespace
@@ -2521,6 +2616,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     }
     for (const auto& extra : *extra_snapshot)
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
+    build_rtl_parent_adjacency(view);
 
     const auto* root = &state_index.modules.front();
     for (const auto& module : state_index.modules) {
@@ -2531,15 +2627,17 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     std::function<RtlTreeNode(const std::string&, size_t, std::unordered_set<std::string>&)> build =
         [&](const std::string& module_name, size_t depth,
             std::unordered_set<std::string>& seen) -> RtlTreeNode {
-        auto module_it = view.module_uris.find(module_name);
+        auto module_it = view.modules.find(module_name);
         RtlTreeNode node{
             .name = module_name,
             .inst = {},
-            .file = module_it != view.module_uris.end() ? module_it->second : std::string{},
+            .file = module_it != view.modules.end() ? module_it->second.uri : std::string{},
+            .line = module_it != view.modules.end() ? module_it->second.line : 0,
+            .col = module_it != view.modules.end() ? module_it->second.col : 0,
             .children = {},
             .recursive = seen.contains(module_name),
         };
-        if (node.recursive || module_it == view.module_uris.end())
+        if (node.recursive || module_it == view.modules.end())
             return node;
         if (depth >= kMaxRtlTreeDepth) {
             node.truncated = true;
@@ -2547,9 +2645,13 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
         }
 
         seen.insert(module_name);
-        for (const auto& inst : view.instances) {
-            if (inst.entry.parent_module != module_name)
-                continue;
+        const auto children = view.instances_by_parent.find(module_name);
+        if (children == view.instances_by_parent.end()) {
+            seen.erase(module_name);
+            return node;
+        }
+        for (const size_t instance_index : children->second) {
+            const auto& inst = view.instances[instance_index];
             if (inst.entry.module_name == module_name)
                 continue;
             auto child = build(inst.entry.module_name, depth + 1, seen);
@@ -2618,11 +2720,13 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
     std::function<RtlTreeNode(const std::string&, size_t, std::unordered_set<std::string>&)> build =
         [&](const std::string& module_name, size_t depth,
             std::unordered_set<std::string>& seen) -> RtlTreeNode {
-        auto module_it = view.module_uris.find(module_name);
+        auto module_it = view.modules.find(module_name);
         RtlTreeNode node{
             .name = module_name,
             .inst = {},
-            .file = module_it != view.module_uris.end() ? module_it->second : std::string{},
+            .file = module_it != view.modules.end() ? module_it->second.uri : std::string{},
+            .line = module_it != view.modules.end() ? module_it->second.line : 0,
+            .col = module_it != view.modules.end() ? module_it->second.col : 0,
             .children = {},
             .recursive = seen.contains(module_name),
         };

@@ -26,7 +26,7 @@ local _cfg     = nil
 local _rtltree = {
 	bufnr      = nil, -- tree buffer handle
 	source_buf = nil, -- source RTL buffer handle
-	line_data  = {}, -- 1-indexed array: {name, file, depth}
+	line_data  = {}, -- 1-indexed array: nil/guide rows or {name, file, line, col, depth}
 	hl_ns      = nil, -- highlight namespace
 	jumping    = false, -- guard: suppress BufEnter sync during jump
 	command    = nil, -- last command used ("lazyverilog.rtlTree" or …Reverse)
@@ -474,7 +474,13 @@ local function _rtltree_render(node, lines, line_data, prefix, is_last, depth, o
 		line = prefix .. connector .. label
 	end
 	table.insert(lines, line)
-	table.insert(line_data, { name = node.name, file = node.file, depth = depth })
+	table.insert(line_data, {
+		name  = node.name,
+		file  = node.file,
+		line  = node.line,
+		col   = node.col,
+		depth = depth,
+	})
 
 	local children = node.children or {}
 	local n = #children
@@ -490,10 +496,25 @@ local function _rtltree_render(node, lines, line_data, prefix, is_last, depth, o
 	end
 end
 
+local function _rtltree_stats(node, depth)
+	if not node then
+		return 0, 0
+	end
+
+	local rows = 1
+	local max_depth = depth
+	for _, child in ipairs(node.children or {}) do
+		local child_rows, child_max_depth = _rtltree_stats(child, depth + 1)
+		rows = rows + child_rows
+		max_depth = math.max(max_depth, child_max_depth)
+	end
+	return rows, max_depth
+end
+
 -- foldexpr accessor (called from Neovim via v:lua).
 function M._rtltree_foldexpr(lnum)
 	local data = _rtltree.line_data[lnum]
-	if not data then return "0" end
+	if not data or data.guide or data.depth == nil then return "0" end
 	return tostring(data.depth)
 end
 
@@ -506,8 +527,20 @@ local function _rtltree_jump(split_cmd)
 	end
 	local path = data.file:gsub("^file://", "")
 
+	local function place_cursor()
+		-- Server lines are 1-based, with 0/nil meaning "unknown".  Columns are
+		-- 0-based, matching nvim_win_set_cursor().  When older servers do not
+		-- provide locations, opening the file still succeeds and the cursor is
+		-- left wherever Neovim places it.
+		if data.line and data.line > 0 then
+			pcall(vim.api.nvim_win_set_cursor, 0, { data.line, math.max(data.col or 0, 0) })
+			vim.cmd("normal! zvzz")
+		end
+	end
+
 	if split_cmd then
 		vim.cmd(split_cmd .. " " .. vim.fn.fnameescape(path))
+		place_cursor()
 		return
 	end
 
@@ -518,11 +551,13 @@ local function _rtltree_jump(split_cmd)
 		if _rtltree.source_buf and vim.api.nvim_win_get_buf(win) == _rtltree.source_buf then
 			vim.api.nvim_set_current_win(win)
 			vim.cmd("edit " .. vim.fn.fnameescape(path))
+			place_cursor()
 			_rtltree.jumping = false
 			return
 		end
 	end
 	vim.cmd("edit " .. vim.fn.fnameescape(path))
+	place_cursor()
 	_rtltree.jumping = false
 end
 
@@ -538,6 +573,11 @@ local function _rtltree_build_buf(lines, line_data)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.api.nvim_buf_set_option(buf, "modifiable", false)
 	vim.api.nvim_buf_set_option(buf, "readonly", true)
+	pcall(vim.api.nvim_set_hl, 0, "LazyVerilogRtlTreeTitle", { link = "Title", default = true })
+	pcall(vim.api.nvim_set_hl, 0, "LazyVerilogKeyGuide", { link = "Comment", default = true })
+	local ns = vim.api.nvim_create_namespace("LazyVerilogRtlTreeGuide")
+	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogRtlTreeTitle", 0, 0, -1)
+	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogKeyGuide", 1, 0, -1)
 
 	local function map(key, fn)
 		vim.keymap.set("n", key, fn, { noremap = true, silent = true, buffer = buf })
@@ -555,6 +595,12 @@ end
 
 local function _rtltree_show(tree, source_buf)
 	local opts = { show_instance_name = true, show_file = true }
+	if tree.show_instance_name ~= nil then
+		opts.show_instance_name = tree.show_instance_name
+	end
+	if tree.show_file ~= nil then
+		opts.show_file = tree.show_file
+	end
 	if _cfg and _cfg.rtltree then
 		if _cfg.rtltree.show_instance_name ~= nil then
 			opts.show_instance_name = _cfg.rtltree.show_instance_name
@@ -564,8 +610,17 @@ local function _rtltree_show(tree, source_buf)
 		end
 	end
 
-	local lines     = {}
-	local line_data = {}
+	local instance_rows, max_depth = _rtltree_stats(tree, 0)
+	local lines     = {
+		string.format("RtlTree (Depth: %d / Instance: %d)", max_depth + 1, instance_rows),
+		"Keys: [Enter] jump  [o] split  [v] vsplit  [t] tab  [r] refresh  [q] exit",
+		"",
+	}
+	local line_data = {
+		{ guide = true },
+		{ guide = true },
+		{ guide = true },
+	}
 	_rtltree_render(tree, lines, line_data, "", true, 0, opts)
 
 	-- Find existing tree window
@@ -2376,18 +2431,85 @@ end
 --- buffer makes `:Lint` a self-contained inspection command that does not
 --- clobber the user's project quickfix list.  Press <CR> on an entry to jump to
 --- its location, or q/Esc to close the list.
+local function _lint_highlight_buffer(buf, items)
+	local ns = vim.api.nvim_create_namespace("LazyVerilogLint")
+
+	-- Define plugin-specific groups as defaults only.  Linking to the standard
+	-- Diagnostic groups lets existing colorschemes decide the concrete colors,
+	-- while still giving this nofile buffer clear visual structure.
+	local links = {
+		LazyVerilogLintTitle = "Title",
+		LazyVerilogLintFile  = "Directory",
+		LazyVerilogLintLine  = "LineNr",
+		LazyVerilogLintError = "DiagnosticError",
+		LazyVerilogLintWarn  = "DiagnosticWarn",
+		LazyVerilogLintInfo  = "DiagnosticInfo",
+		LazyVerilogLintHint  = "DiagnosticHint",
+		LazyVerilogKeyGuide  = "Comment",
+	}
+	for group, target in pairs(links) do
+		pcall(vim.api.nvim_set_hl, 0, group, { link = target, default = true })
+	end
+
+	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogLintTitle", 0, 0, -1)
+	vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogKeyGuide", 1, 0, -1)
+
+	local severity_group = {
+		E = "LazyVerilogLintError",
+		W = "LazyVerilogLintWarn",
+		I = "LazyVerilogLintInfo",
+		H = "LazyVerilogLintHint",
+	}
+
+	for i, item in ipairs(items) do
+		local lnum = i + 2 -- title, guide, and blank lines precede the first diagnostic.
+		local line = vim.api.nvim_buf_get_lines(buf, lnum, lnum + 1, false)[1] or ""
+		local severity_start, severity_end = line:find("^%[[A-Z]%]")
+		if severity_start then
+			vim.api.nvim_buf_add_highlight(
+				buf,
+				ns,
+				severity_group[item.type] or "LazyVerilogLintWarn",
+				lnum,
+				severity_start - 1,
+				severity_end
+			)
+		end
+		local class_start, class_end = line:find("%s%[[^%]]+%]", severity_end or 1)
+		if class_start then
+			vim.api.nvim_buf_add_highlight(
+				buf,
+				ns,
+				"LazyVerilogLintInfo",
+				lnum,
+				class_start,
+				class_end
+			)
+		end
+		if item.filename and item.filename ~= "" then
+			local file_start, file_end = line:find(item.filename, 1, true)
+			if file_start then
+				vim.api.nvim_buf_add_highlight(buf, ns, "LazyVerilogLintFile", lnum, file_start - 1, file_end)
+			end
+		end
+	end
+end
+
 local function _show_lint_split(items, label)
 	local lines = {
 		string.format("%s diagnostics (%d)", label, #items),
+		"Keys: [Enter] jump  [q]/[Esc] exit",
 		"",
 	}
 	for _, item in ipairs(items) do
+		local class = item.class and item.class ~= "" and (" " .. item.class) or ""
 		table.insert(lines, string.format(
-			"%s:%d:%d: [%s] %s",
+			"[%s]%s %s:%d:%d: %s",
+			item.type,
+			class,
 			item.filename,
 			item.lnum,
 			item.col,
-			item.type,
 			item.text
 		))
 	end
@@ -2401,6 +2523,7 @@ local function _show_lint_split(items, label)
 	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 	vim.bo[buf].modifiable = false
 	vim.b[buf].lazyverilog_lint_items = items
+	_lint_highlight_buffer(buf, items)
 
 	-- Split the current window, then replace the split's buffer.  `:vnew`
 	-- would create an extra unnamed buffer before we install the lint buffer,
@@ -2421,7 +2544,7 @@ local function _show_lint_split(items, label)
 
 	local function jump()
 		local row = vim.api.nvim_win_get_cursor(0)[1]
-		local item = vim.b[buf].lazyverilog_lint_items[row - 2]
+		local item = vim.b[buf].lazyverilog_lint_items[row - 3]
 		if not item then
 			return
 		end
@@ -2443,7 +2566,8 @@ end
 --- Internal: request lint results and display them in a vertical split.
 --- @param filter_file string|nil  absolute path to restrict results to, or nil for all files
 --- @param label string            prefix for notify messages (e.g. "Lint" or "LintAll")
-local function _run_lint(filter_file, label)
+--- @param command string          server executeCommand name
+local function _run_lint(filter_file, label, command)
 	local src_bufnr = vim.api.nvim_get_current_buf()
 	local clients = vim.lsp.get_clients({ bufnr = src_bufnr, name = "lazyverilog" })
 	if #clients == 0 then
@@ -2462,7 +2586,7 @@ local function _run_lint(filter_file, label)
 	end
 	local current_uri = vim.uri_from_bufnr(src_bufnr)
 	client:request("workspace/executeCommand", {
-		command = "lazyverilog.lint",
+		command = command,
 		arguments = { current_uri },
 	}, function(err, result)
 		if err then
@@ -2476,13 +2600,22 @@ local function _run_lint(filter_file, label)
 		vim.schedule(function()
 			local items = {}
 			local severity_map = { Error = "E", Warning = "W", Hint = "I", Information = "I" }
+			local function split_lint_class(message)
+				local class, rest = message:match("^(%[[^%]]+%])%s*(.*)$")
+				if class then
+					return class, rest
+				end
+				return "", message
+			end
 			for _, d in ipairs(result) do
 				if filter_file == nil or d.file == filter_file then
+					local class, text = split_lint_class(d.message)
 					table.insert(items, {
 						filename = d.file,
 						lnum     = d.line,
 						col      = d.col,
-						text     = d.message,
+						class    = class,
+						text     = text,
 						type     = severity_map[d.severity] or "W",
 					})
 				end
@@ -2491,6 +2624,12 @@ local function _run_lint(filter_file, label)
 				vim.notify("[LazyVerilog] " .. label .. ": no violations found", vim.log.levels.INFO)
 				return
 			end
+			table.sort(items, function(a, b)
+				if a.filename ~= b.filename then return a.filename < b.filename end
+				if a.lnum ~= b.lnum then return a.lnum < b.lnum end
+				if a.col ~= b.col then return a.col < b.col end
+				return a.text < b.text
+			end)
 			_show_lint_split(items, label)
 			vim.notify(
 				string.format("[LazyVerilog] %s: %d violation(s)", label, #items),
@@ -2504,12 +2643,22 @@ end
 function M.lint()
 	local src_bufnr = vim.api.nvim_get_current_buf()
 	local current_file = vim.uri_to_fname(vim.uri_from_bufnr(src_bufnr))
-	_run_lint(current_file, "Lint")
+	_run_lint(current_file, "Lint", "lazyverilog.lint")
 end
 
---- Run lint on all project files (.f filelist) and populate the quickfix list.
+--- Show diagnostics for all indexed project files from the .f filelist.
 function M.lint_all()
-	_run_lint(nil, "LintAll")
+	local choice = vim.fn.confirm(
+		"LazyVerilog LintAll will synchronously parse and lint all .f files. This may take a while. Continue?",
+		"&Yes\n&No",
+		2
+	)
+	if choice ~= 1 then
+		vim.notify("[LazyVerilog] LintAll cancelled", vim.log.levels.INFO)
+		return
+	end
+	vim.notify("[LazyVerilog] LintAll: parsing and linting all .f files...", vim.log.levels.INFO)
+	_run_lint(nil, "LintAll", "lazyverilog.lintAll")
 end
 
 return M

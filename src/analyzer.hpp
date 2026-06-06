@@ -87,6 +87,12 @@ struct RtlTreeNode {
     std::string name;
     std::string inst;
     std::string file;
+    // Definition location for the displayed module.  `line` follows the
+    // existing SyntaxIndex convention for ModuleEntry: 1-based, with 0 meaning
+    // unknown.  `col` is 0-based.  The Neovim tree client uses these fields to
+    // make <CR> jump to the module definition instead of only opening the file.
+    int line{0};
+    int col{0};
     std::vector<RtlTreeNode> children;
     bool recursive{false};
     bool truncated{false};
@@ -201,6 +207,16 @@ class Analyzer {
 
     /// Return extra files from .f filelist.
     std::vector<std::string> extra_files() const;
+
+    /// Synchronously parse all configured project files and return temporary
+    /// document snapshots for whole-project commands such as :LintAll.
+    ///
+    /// This is intentionally not used by normal hot LSP request paths.  It may
+    /// be slow for large .f designs, but it does not mutate extra_cache_,
+    /// ProjectIndexSnapshot, background queues, or open-buffer state.  Open
+    /// project buffers are returned from their live DocumentState snapshots so
+    /// unsaved edits participate in the command.
+    std::vector<std::shared_ptr<const DocumentState>> project_file_states_sync() const;
 
     /// Refresh project-index shards for files that the client reports changed.
     ///
