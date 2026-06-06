@@ -34,7 +34,7 @@ std::string node_text_raw(const slang::SourceManager& sm, const SyntaxNode& node
         const size_t begin = range.start().offset();
         const size_t end = range.end().offset();
         if (begin <= end && end <= source.size())
-            return trim_text(std::string(source.substr(begin, end - begin)));
+            return trim_copy(std::string(source.substr(begin, end - begin)));
     }
     return node_text(node);
 }
