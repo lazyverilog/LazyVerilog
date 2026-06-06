@@ -945,6 +945,8 @@ foo( a, b );
 
 Controls formatting of `function` and `task` declaration port lists.
 
+Declaration spacing is intentionally limited to the gap before the opening parenthesis. Unlike `[format.function_call]`, declarations do not currently expose `space_inside_paren`; declaration port-list interior spacing is normalized by the formatter's declaration layout rules.
+
 ### `layout`
 
 How to indent broken port arguments.
