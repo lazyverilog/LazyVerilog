@@ -728,10 +728,6 @@ public:
             t.immutable.syntax.in_class_decl = in_class_decl;
             t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
-            // Freeze input-line topology before any wrap decision exists.
-            t.immutable.topology.begins_line_construct = t.immutable.input_trivia.starts_original_line;
-            t.immutable.topology.ends_line_construct = kind_is(t, TK::Semicolon) || kind_is(t, TK::Comma) ||
-                                             (t.lex.comment_kind == CommentLexemeKind::Line);
             t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex.kind);
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind);
 

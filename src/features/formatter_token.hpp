@@ -92,9 +92,6 @@ struct SyntaxFacts {
 // simpler.  Example: an opening parenthesis can be known to start an argument
 // list without deciding whether that list is rendered on one line or many lines.
 struct TopologyFacts {
-    bool begins_line_construct{false};
-    bool ends_line_construct{false};
-
     bool opens_indent_scope{false};
     bool closes_indent_scope{false};
 

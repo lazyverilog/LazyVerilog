@@ -169,8 +169,6 @@ inline void write_token_stream_log(std::ostream& out, const TokenStream& tokens)
         out << "  immutable.syntax.in_modport: " << bool01(imm.syntax.in_modport) << "\n";
 
         // TopologyFacts: stable graph-ish labels.
-        out << "  immutable.topology.begins_line_construct: " << bool01(imm.topology.begins_line_construct) << "\n";
-        out << "  immutable.topology.ends_line_construct: " << bool01(imm.topology.ends_line_construct) << "\n";
         out << "  immutable.topology.opens_indent_scope: " << bool01(imm.topology.opens_indent_scope) << "\n";
         out << "  immutable.topology.closes_indent_scope: " << bool01(imm.topology.closes_indent_scope) << "\n";
         out << "  immutable.topology.starts_argument_list: " << bool01(imm.topology.starts_argument_list) << "\n";
