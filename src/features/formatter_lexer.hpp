@@ -2,9 +2,8 @@
 
 #include "formatter_token.hpp"
 #include <algorithm>
-#include <memory>
-#include <mutex>
 #include <iostream>
+#include <memory>
 #include <regex>
 #include <string_view>
 #include <unordered_map>
@@ -33,10 +32,16 @@ inline FormatMarkerRegex cached_format_marker_regex(const std::string& pattern) 
     // TokenCollector is constructed for every format request.  Cache both valid
     // compiled regexes and invalid/empty patterns (stored as nullptr) so repeated
     // calls with the common default patterns do not repeatedly recompile.
-    static std::mutex cache_mutex;
-    static std::unordered_map<std::string, FormatMarkerRegex> cache;
+    //
+    // Keep the cache thread-local instead of guarding one process-wide map with
+    // a mutex.  Formatting is naturally per-request/per-buffer work, and cached
+    // regex values are immutable shared_ptr<const std::regex> after creation.
+    // A global mutex would serialize unrelated concurrent format requests even
+    // on pure cache hits.  The tradeoff here is intentional: each long-lived LSP
+    // worker thread may compile a pattern once, but after that it formats
+    // without cross-thread synchronization.
+    thread_local std::unordered_map<std::string, FormatMarkerRegex> cache;
 
-    std::lock_guard<std::mutex> lock(cache_mutex);
     auto it = cache.find(pattern);
     if (it != cache.end())
         return it->second;
