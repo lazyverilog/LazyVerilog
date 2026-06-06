@@ -58,7 +58,10 @@ struct ExtraIndexInfo {
 struct CompilationSourceFile {
     std::string uri;
     std::string path;
-    std::optional<std::string> text;
+    // Non-null for open buffers.  This aliases the immutable DocumentState text
+    // so background compilation sees unsaved contents without copying entire
+    // large RTL buffers into every CompilationSnapshot.
+    std::shared_ptr<const std::string> text;
 };
 
 struct CompilationSnapshot {

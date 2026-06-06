@@ -2374,7 +2374,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         snapshot.files.push_back(CompilationSourceFile{
             .uri = uri,
             .path = state->normalized_path,
-            .text = state->text,
+            .text = std::shared_ptr<const std::string>(state, &state->text),
         });
         snapshot.open_uris.push_back(uri);
         seen_uris.insert(uri);
@@ -2391,7 +2391,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         snapshot.files.push_back(CompilationSourceFile{
             .uri = uri,
             .path = path_string,
-            .text = std::nullopt,
+            .text = nullptr,
         });
         seen_uris.insert(uri);
         seen_paths.insert(path_string);
