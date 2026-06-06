@@ -316,9 +316,10 @@ TEST_CASE("extra file cache refreshes on explicit filelist reset and drops remov
     const std::string top_uri = "file:///tmp/lazyverilog_definition_cache_top.sv";
     analyzer.set_extra_files({extra_path.string()});
     analyzer.wait_for_background_index_idle();
-    auto snapshots = analyzer.extra_file_snapshots();
-    REQUIRE(snapshots.size() == 1);
-    CHECK(snapshots[0].state == nullptr);
+    auto snapshots = analyzer.extra_file_snapshot_ptr();
+    REQUIRE(snapshots != nullptr);
+    REQUIRE(snapshots->size() == 1);
+    CHECK((*snapshots)[0].state == nullptr);
     analyzer.open(top_uri, "module top;\n"
                            "    logic clk, done;\n"
                            "    child u_child(.clk(clk), .done(done));\n"
@@ -339,5 +340,7 @@ TEST_CASE("extra file cache refreshes on explicit filelist reset and drops remov
     std::filesystem::remove(extra_path);
     analyzer.set_extra_files({extra_path.string()});
     analyzer.wait_for_background_index_idle();
-    CHECK(analyzer.extra_file_snapshots().empty());
+    snapshots = analyzer.extra_file_snapshot_ptr();
+    REQUIRE(snapshots != nullptr);
+    CHECK(snapshots->empty());
 }

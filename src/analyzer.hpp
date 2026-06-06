@@ -185,15 +185,13 @@ class Analyzer {
     /// objects as well.  It now keeps DocumentState only for open buffers, so
     /// callers must treat `state` as optional and use `index` for closed files.
     std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_ptr() const;
-    std::vector<ExtraFileInfo> extra_file_snapshots() const;
 
     /// Return per-file project index shards without exposing full SyntaxTrees.
     ///
-    /// Cross-file features should prefer this over extra_file_snapshots() when
+    /// Cross-file features should prefer this over extra_file_snapshot_ptr() when
     /// they only need indexed structural data.  This supports the indexing
     /// philosophy: current file uses AST, project files use index.
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
-    std::vector<ExtraIndexInfo> extra_index_snapshots() const;
 
     /// Return the last background-published project-wide index snapshot.
     ///

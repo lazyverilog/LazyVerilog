@@ -980,7 +980,7 @@ TEST_CASE("completion: package scope survives opening package definition file", 
 
     // Simulate go-to-definition opening the package file in the editor.  The
     // package file remains in the filelist, but its live open-buffer snapshot
-    // should now be used by extra_file_snapshots().
+    // should now be used by the shared extra-file snapshot.
     analyzer.open(lib_uri, lib_text);
 
     auto after_nav =

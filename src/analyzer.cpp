@@ -2285,11 +2285,6 @@ Analyzer::extra_file_snapshot_ptr() const {
     return extra_file_snapshot_cache_;
 }
 
-std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
-    const auto snapshot = extra_file_snapshot_ptr();
-    return snapshot ? *snapshot : std::vector<ExtraFileInfo>{};
-}
-
 std::shared_ptr<const std::vector<ExtraIndexInfo>>
 Analyzer::extra_index_snapshot_ptr() const {
     const auto start = Clock::now();
@@ -2298,11 +2293,6 @@ Analyzer::extra_index_snapshot_ptr() const {
         extra_index_snapshot_cache_ = build_extra_index_snapshot_locked();
     log_perf("extra_index_snapshot_ptr files=" + std::to_string(extra_index_snapshot_cache_->size()), start);
     return extra_index_snapshot_cache_;
-}
-
-std::vector<ExtraIndexInfo> Analyzer::extra_index_snapshots() const {
-    const auto snapshot = extra_index_snapshot_ptr();
-    return snapshot ? *snapshot : std::vector<ExtraIndexInfo>{};
 }
 
 std::shared_ptr<const SyntaxIndex> Analyzer::extra_project_index() const {

@@ -792,15 +792,16 @@ endmodule
     analyzer.set_extra_files({closed_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const auto snapshots = analyzer.extra_index_snapshots();
-    REQUIRE(snapshots.size() == 1);
+    const auto snapshots = analyzer.extra_index_snapshot_ptr();
+    REQUIRE(snapshots != nullptr);
+    REQUIRE(snapshots->size() == 1);
     const auto indexed_add_number = std::find_if(
-        snapshots[0].index.references.begin(), snapshots[0].index.references.end(),
+        (*snapshots)[0].index.references.begin(), (*snapshots)[0].index.references.end(),
         [&](const ReferenceEntry& ref) {
             return ref.name == "add_number" &&
-                   snapshots[0].index.source_uri(ref.file_id) == "file://" + header_path.string();
+                   (*snapshots)[0].index.source_uri(ref.file_id) == "file://" + header_path.string();
         });
-    REQUIRE(indexed_add_number != snapshots[0].index.references.end());
+    REQUIRE(indexed_add_number != (*snapshots)[0].index.references.end());
 
     const std::string top_uri = "file://" + top_path.string();
     const std::string closed_uri = "file://" + closed_path.string();
@@ -862,16 +863,17 @@ endmodule
     const std::string includer_uri = "file://" + includer_path.string();
     analyzer.open(header_uri, header);
 
-    const auto snapshots = analyzer.extra_index_snapshots();
-    REQUIRE(snapshots.size() == 1);
+    const auto snapshots = analyzer.extra_index_snapshot_ptr();
+    REQUIRE(snapshots != nullptr);
+    REQUIRE(snapshots->size() == 1);
     const auto indexed_state_t = std::find_if(
-        snapshots[0].index.references.begin(), snapshots[0].index.references.end(),
+        (*snapshots)[0].index.references.begin(), (*snapshots)[0].index.references.end(),
         [&](const ReferenceEntry& ref) {
             return ref.name == "state_t" &&
-                   snapshots[0].index.source_uri(ref.file_id) == header_uri &&
+                   (*snapshots)[0].index.source_uri(ref.file_id) == header_uri &&
                    ref.symbol_debug == "typedef::state_t";
         });
-    REQUIRE(indexed_state_t != snapshots[0].index.references.end());
+    REQUIRE(indexed_state_t != (*snapshots)[0].index.references.end());
 
     const auto [line, col] = find_position(header, "} state_t;");
     const auto refs = analyzer.find_references(header_uri, line, col + 2, true);
