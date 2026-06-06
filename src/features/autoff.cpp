@@ -4,7 +4,6 @@
 #include <slang/text/SourceManager.h>
 #include <regex>
 #include <algorithm>
-#include <unordered_map>
 
 using namespace slang;
 using namespace slang::syntax;
@@ -318,40 +317,25 @@ static std::pair<std::vector<AutoffEdit>, int> build_ff_edits(
 
 // ── Regex cache ───────────────────────────────────────────────────────────────
 
-// Cache compiled register regexes per thread.  AutoFF is commonly called many
-// times with the same project configuration, but multi-root editors can
-// alternate between a few different register_pattern values.  A one-entry
-// cache recompiles on every A/B/A/B call sequence, so keep a small map keyed by
-// pattern instead.  Invalid patterns are cached as std::nullopt too; otherwise
-// a typo in config would repeatedly pay the regex-construction failure cost.
+// Cache the last compiled register regex per thread.  AutoFF commands are
+// invoked repeatedly with the same pattern; avoid recompiling on each call.
 static const std::regex* cached_register_regex(const std::string& pattern,
                                                 std::string& error_out) {
-    constexpr size_t kMaxCachedPatterns = 16;
-    thread_local std::unordered_map<std::string, std::optional<std::regex>> cache;
-
-    auto it = cache.find(pattern);
-    if (it == cache.end()) {
-        // Keep the cache bounded without adding an LRU list to this hot helper.
-        // Sixteen distinct register naming conventions in one editor thread is
-        // already far beyond normal use; clearing is deterministic and avoids
-        // unbounded growth for generated/accidental patterns.
-        if (cache.size() >= kMaxCachedPatterns)
-            cache.clear();
-
-        std::optional<std::regex> compiled;
+    thread_local std::string cached_pattern;
+    thread_local std::optional<std::regex> cached_re;
+    if (pattern != cached_pattern) {
+        cached_pattern = pattern;
         try {
-            compiled.emplace(pattern);
+            cached_re = std::regex(pattern);
         } catch (...) {
-            compiled = std::nullopt;
+            cached_re = std::nullopt;
         }
-        it = cache.emplace(pattern, std::move(compiled)).first;
     }
-
-    if (!it->second) {
+    if (!cached_re) {
         error_out = "AutoFF: invalid register_pattern '" + pattern + "'";
         return nullptr;
     }
-    return &*it->second;
+    return &*cached_re;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
