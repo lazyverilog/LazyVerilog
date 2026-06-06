@@ -28,7 +28,7 @@ inline bool is_open_block(TK k) {
            k == TK::GenerateKeyword || k == TK::CoverGroupKeyword ||
            k == TK::PropertyKeyword || k == TK::SequenceKeyword || k == TK::CheckerKeyword ||
            k == TK::ClockingKeyword || k == TK::ConfigKeyword || k == TK::PrimitiveKeyword ||
-           k == TK::SpecifyKeyword;
+           k == TK::SpecifyKeyword || k == TK::ForkKeyword;
 }
 inline bool is_outer_open(TK k) {
     return k == TK::ModuleKeyword || k == TK::InterfaceKeyword || k == TK::PackageKeyword ||
@@ -40,7 +40,8 @@ inline bool is_close_block(TK k) {
            k == TK::EndGenerateKeyword || k == TK::EndGroupKeyword || k == TK::EndPropertyKeyword ||
            k == TK::EndSequenceKeyword || k == TK::EndCheckerKeyword || k == TK::EndClockingKeyword ||
            k == TK::EndConfigKeyword || k == TK::EndPrimitiveKeyword || k == TK::EndSpecifyKeyword ||
-           k == TK::EndTableKeyword;
+           k == TK::EndTableKeyword || k == TK::JoinKeyword || k == TK::JoinAnyKeyword ||
+           k == TK::JoinNoneKeyword;
 }
 inline bool is_outer_close(TK k) {
     return k == TK::EndModuleKeyword || k == TK::EndInterfaceKeyword || k == TK::EndPackageKeyword ||
@@ -207,6 +208,42 @@ inline size_t prev_code(const TokenStream& tokens, size_t before) {
             return i;
     }
     return npos;
+}
+
+inline bool is_fork_block_open(const TokenStream& tokens, size_t fork_idx) {
+    if (fork_idx >= tokens.size() || !kind_is(tokens[fork_idx], TK::ForkKeyword))
+        return false;
+
+    // `fork` is a block opener in a fork-join statement:
+    //
+    //   fork
+    //     a();
+    //     b();
+    //   join_any
+    //
+    // But the same keyword also appears in statement forms that do *not* open
+    // a scope:
+    //
+    //   wait fork;
+    //   disable fork;
+    //
+    // Keep the token-kind predicate (`is_open_block`) broad enough to describe
+    // SystemVerilog block keywords, then apply this contextual guard at actual
+    // token sites that mutate wrap/indent metadata.  That preserves correct
+    // scope tracking for real fork blocks without regressing the non-opening
+    // control statements above.
+    size_t prev = prev_code(tokens, fork_idx);
+    return prev == npos ||
+           (!kind_is(tokens[prev], TK::WaitKeyword) &&
+            !kind_is(tokens[prev], TK::DisableKeyword));
+}
+
+inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size())
+        return false;
+    if (kind_is(tokens[idx], TK::ForkKeyword))
+        return is_fork_block_open(tokens, idx);
+    return is_open_block(tokens[idx].lex->kind);
 }
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end) {
@@ -714,7 +751,7 @@ public:
             t.immutable.topology.begins_line_construct = t.immutable.input_trivia.starts_original_line;
             t.immutable.topology.ends_line_construct = kind_is(t, TK::Semicolon) || kind_is(t, TK::Comma) ||
                                              (t.lex->comment_kind == CommentLexemeKind::Line);
-            t.immutable.topology.opens_indent_scope = is_open_block(t.lex->kind) || is_outer_open(t.lex->kind);
+            t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex->kind);
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind);
 
             if (kind_is(t, TK::OpenParenthesis)) {
@@ -1144,6 +1181,7 @@ public:
             bool end_before_do_while =
                 kind_is(t, TK::EndKeyword) && next_i != npos && kind_is(tokens[next_i], TK::WhileKeyword);
             if (kind_is(t, TK::BeginKeyword) ||
+                is_fork_block_open(tokens, i) ||
                 (is_outer_close(t.lex->kind) && !followed_by_label_colon) ||
                 (is_close_block(t.lex->kind) && !followed_by_label_colon &&
                  !end_before_do_while &&
@@ -1165,6 +1203,7 @@ public:
             }
             if (opts_.statement.begin_newline &&
                 (kind_is(t, TK::BeginKeyword) ||
+                 is_fork_block_open(tokens, i) ||
                  (kind_is(t, TK::OpenBrace) && !is_expression_brace(tokens, i))))
                 t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::OpenBrace) && is_multiline_brace_construct(tokens, i)) {
@@ -1589,7 +1628,9 @@ private:
 
             if (single_stmt_pending && !ctrl_just_closed && !t.lex->is_comment) {
                 single_stmt_pending = false;
-                const bool is_block = kind_is(t, TK::BeginKeyword) || kind_is(t, TK::OpenBrace);
+                const bool is_block = kind_is(t, TK::BeginKeyword) ||
+                                      is_fork_block_open(tokens, i) ||
+                                      kind_is(t, TK::OpenBrace);
                 const bool closes = is_close_block(t.lex->kind) || is_outer_close(t.lex->kind) ||
                                     t.mutable_.macro.closes_indent_scope;
                 if (!is_block && !closes)
@@ -1722,7 +1763,9 @@ public:
             // Resolve single-stmt pending on first non-passthrough, non-comment token AFTER control expr close
             if (single_stmt_pending && !ctrl_just_closed && !t.lex->is_comment) {
                 single_stmt_pending = false;
-                bool is_block = kind_is(t, TK::BeginKeyword) || kind_is(t, TK::OpenBrace);
+                bool is_block = kind_is(t, TK::BeginKeyword) ||
+                                is_fork_block_open(tokens, i) ||
+                                kind_is(t, TK::OpenBrace);
                 if (!is_block && !closes) {
                     level++;
                     single_stmt_active = true;
@@ -1770,7 +1813,7 @@ public:
                 bool is_typedef_class =
                     in_typedef && kind_is(t, TK::ClassKeyword);
                 if (!is_qualifier_fn_task && !is_typedef_class &&
-                    (is_open_block(t.lex->kind) ||
+                    (opens_indent_scope_at(tokens, i) ||
                      (is_outer_open(t.lex->kind) && opts_.default_indent_level_inside_outmost_block > 0) ||
                      t.mutable_.macro.opens_indent_scope))
                     ++level;

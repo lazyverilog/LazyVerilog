@@ -2358,6 +2358,40 @@ TEST_CASE("formatter: wait fork does not open a fork block", "[formatter]") {
     CHECK(formatted.find("\n  task b();\n") != std::string::npos);
 }
 
+TEST_CASE("formatter: fork join variants open and close indentation scopes", "[formatter]") {
+    FormatOptions opts;
+
+    const std::string input = "module top;\n"
+                              "initial begin\n"
+                              "fork\n"
+                              "foo();\n"
+                              "bar();\n"
+                              "join_any\n"
+                              "disable fork;\n"
+                              "fork\n"
+                              "baz();\n"
+                              "join_none\n"
+                              "end\n"
+                              "endmodule\n";
+
+    const std::string expected = "module top;\n"
+                                 "  initial begin\n"
+                                 "    fork\n"
+                                 "      foo();\n"
+                                 "      bar();\n"
+                                 "    join_any\n"
+                                 "    disable fork;\n"
+                                 "    fork\n"
+                                 "      baz();\n"
+                                 "    join_none\n"
+                                 "  end\n"
+                                 "endmodule\n";
+
+    const std::string formatted = format_source(input, opts);
+    CHECK(formatted == expected);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
 TEST_CASE("formatter: expression macros in nested call arguments are idempotent", "[formatter]") {
     Config cfg = load_config(".");
 
