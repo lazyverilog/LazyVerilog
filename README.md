@@ -1,7 +1,7 @@
 <h1 align="center">⚡ LazyVerilog</h1>
 
 <p align="center">
-  <b>A fast, practical SystemVerilog LSP for everyday RTL coding.</b>
+  <b>A fast, practical SystemVerilog LSP for RTL coding.</b>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
   ·
   <a href="#-why-lazyverilog">Why</a>
   ·
-  <a href="#-feature-matrix">Feature matrix</a>
+  <a href="#-features">Features</a>
   ·
   <a href="#-installation">Installation</a>
   ·
@@ -183,7 +183,7 @@
 
 &nbsp;
 
-## 📊 Feature matrix
+## 📊 Features
 
 What LazyVerilog currently supports. Coverage varies by construct and project setup — if something
 doesn't work for your codebase, bug reports are welcome.
