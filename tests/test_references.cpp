@@ -334,6 +334,197 @@ endmodule
     std::filesystem::remove(closed_path);
 }
 
+TEST_CASE("references: module-local subroutine stays scoped when current file is indexed",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_module_subroutine";
+    std::filesystem::create_directories(dir);
+
+    const auto top_path = dir / "top.sv";
+    const auto other_path = dir / "other.sv";
+
+    const std::string top = R"(module top;
+    task add_number();
+    endtask
+
+    initial begin
+        add_number();
+    end
+endmodule
+)";
+    const std::string other = R"(task add_number();
+endtask
+
+module other;
+    task add_number();
+    endtask
+
+    initial add_number();
+endmodule
+)";
+
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+    {
+        std::ofstream out(other_path);
+        REQUIRE(out.good());
+        out << other;
+    }
+
+    Analyzer analyzer;
+    // Include the open file in the project snapshot on purpose.  This mirrors a
+    // real filelist-backed LSP session, where the current buffer is open but the
+    // same disk file can also have a published background index shard.  The
+    // reference engine must therefore use the owner-qualified subroutine ID
+    // (`module_subroutine::top::add_number`), not the weak textual
+    // `name:add_number` fallback from the project shard.
+    analyzer.set_extra_files({top_path.string(), other_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = "file://" + top_path.string();
+    analyzer.open(top_uri, top);
+
+    const auto [line, col] = find_position(top, "add_number();");
+    const auto refs = analyzer.find_references(top_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    CHECK(refs[0].uri == top_uri);
+    CHECK(refs[0].line == 1);
+    CHECK(refs[0].col == 9);
+    CHECK(refs[1].uri == top_uri);
+    CHECK(refs[1].line == 5);
+    CHECK(refs[1].col == 8);
+
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(other_path);
+    std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: package-local subroutine excludes same-name package subroutine",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_package_subroutine";
+    std::filesystem::create_directories(dir);
+
+    const auto p_path = dir / "p.sv";
+    const auto q_path = dir / "q.sv";
+
+    const std::string p = R"(package p;
+    task add_number();
+    endtask
+
+    function void use();
+        add_number();
+    endfunction
+endpackage
+)";
+    const std::string q = R"(package q;
+    task add_number();
+    endtask
+
+    function void use();
+        add_number();
+    endfunction
+endpackage
+)";
+
+    {
+        std::ofstream out(p_path);
+        REQUIRE(out.good());
+        out << p;
+    }
+    {
+        std::ofstream out(q_path);
+        REQUIRE(out.good());
+        out << q;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({p_path.string(), q_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string p_uri = "file://" + p_path.string();
+    analyzer.open(p_uri, p);
+
+    const auto [line, col] = find_position(p, "add_number();");
+    const auto refs = analyzer.find_references(p_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == p_uri);
+    CHECK(refs[0].line == 1);
+    CHECK(refs[0].col == 9);
+    CHECK(refs[1].line == 5);
+    CHECK(refs[1].col == 8);
+
+    std::filesystem::remove(p_path);
+    std::filesystem::remove(q_path);
+    std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: class method excludes same-name method in another class", "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_class_method";
+    std::filesystem::create_directories(dir);
+
+    const auto a_path = dir / "a.sv";
+    const auto b_path = dir / "b.sv";
+
+    const std::string a = R"(class A;
+    function int calc();
+        return 1;
+    endfunction
+
+    function void use();
+        int value = calc();
+    endfunction
+endclass
+)";
+    const std::string b = R"(class B;
+    function int calc();
+        return 2;
+    endfunction
+
+    function void use();
+        int value = calc();
+    endfunction
+endclass
+)";
+
+    {
+        std::ofstream out(a_path);
+        REQUIRE(out.good());
+        out << a;
+    }
+    {
+        std::ofstream out(b_path);
+        REQUIRE(out.good());
+        out << b;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({a_path.string(), b_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string a_uri = "file://" + a_path.string();
+    analyzer.open(a_uri, a);
+
+    const auto [line, col] = find_position(a, "calc();");
+    const auto refs = analyzer.find_references(a_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == a_uri);
+    CHECK(refs[0].line == 1);
+    CHECK(refs[0].col == 17);
+    CHECK(refs[1].line == 6);
+    CHECK(refs[1].col == 20);
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: changed watched file refreshes only that project shard", "[references]") {
     const auto path =
         std::filesystem::temp_directory_path() / "lazyverilog_refs_watched_refresh.sv";
@@ -810,10 +1001,14 @@ endmodule
     const auto [line, col] = find_position(top, "add_number();");
     const auto refs = analyzer.find_references(top_uri, line, col, true);
 
-    REQUIRE(refs.size() == 1);
-    CHECK(refs[0].uri == top_uri);
-    CHECK(refs[0].line == 2);
-    CHECK(refs[0].col == 12);
+    const std::string header_uri = "file://" + header_path.string();
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == header_uri && ref.line == 0 && ref.col == 5;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 2 && ref.col == 12;
+    }));
     for (const auto& ref : refs)
         CHECK(ref.uri != closed_uri);
 

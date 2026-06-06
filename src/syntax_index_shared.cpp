@@ -222,6 +222,52 @@ std::string simple_identifier_from_expr_node(const ExpressionSyntax* expr) {
     return {};
 }
 
+slang::parsing::Token last_identifier_token(const SyntaxNode& node) {
+    slang::parsing::Token result;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (token && token.kind == slang::parsing::TokenKind::Identifier)
+            result = token;
+    }
+    return result;
+}
+
+std::string subroutine_symbol_kind(std::string_view owner_kind) {
+    if (owner_kind == "module")
+        return "module_subroutine";
+    if (owner_kind == "interface")
+        return "interface_subroutine";
+    if (owner_kind == "program")
+        return "program_subroutine";
+    if (owner_kind == "package")
+        return "package_subroutine";
+    if (owner_kind == "class")
+        return "class_method";
+    if (owner_kind == "checker")
+        return "checker_subroutine";
+    return "unit_subroutine";
+}
+
+std::string subroutine_symbol_id(std::string_view owner_kind, std::string_view owner_name,
+                                 std::string_view name) {
+    const auto kind = subroutine_symbol_kind(owner_kind);
+    if (kind == "unit_subroutine")
+        return symbol_canonical(kind, {}, std::string(name));
+    return symbol_canonical(kind, std::string(owner_name), std::string(name));
+}
+
+std::string subroutine_scope_key(std::string_view owner_kind, std::string_view owner_name,
+                                 std::string_view name) {
+    return std::string(owner_kind) + "\n" + std::string(owner_name) + "\n" + std::string(name);
+}
+
+std::string final_name_from_qualified_name(std::string_view qualified_name) {
+    const size_t last_scope = qualified_name.rfind("::");
+    if (last_scope == std::string_view::npos)
+        return std::string(qualified_name);
+    return std::string(qualified_name.substr(last_scope + 2));
+}
+
 std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
@@ -261,6 +307,7 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
     std::unordered_set<std::string> ambiguous_enum_members;
     std::unordered_map<std::string, std::string> unique_type_ids;
     std::unordered_set<std::string> ambiguous_type_names;
+    std::unordered_set<std::string> declared_subroutines;
 
     for (const auto& value : index.values) {
         if (value.parent_scope.empty())
@@ -329,6 +376,128 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
                             source_file_id_for_token(index, sm, token),
                             std::move(canonical_id), line, col);
     };
+
+    auto module_owner_kind = [](SyntaxKind kind) -> std::string {
+        // slang represents module, interface, program, and package declarations
+        // with ModuleDeclarationSyntax.  Keep their SymbolIDs distinct so a
+        // package helper `foo`, an interface task `foo`, and a module task
+        // `foo` do not collapse back to a textual name match.
+        if (kind == SyntaxKind::PackageDeclaration)
+            return "package";
+        if (kind == SyntaxKind::InterfaceDeclaration)
+            return "interface";
+        if (kind == SyntaxKind::ProgramDeclaration)
+            return "program";
+        return "module";
+    };
+
+    auto resolve_subroutine_owner_from_qualified_name =
+        [&](std::string_view qualified_name,
+            std::string_view fallback_kind,
+            std::string_view fallback_name) -> std::pair<std::string, std::string> {
+        const size_t last_scope = qualified_name.rfind("::");
+        if (last_scope == std::string_view::npos)
+            return {std::string(fallback_kind), std::string(fallback_name)};
+
+        const std::string owner(qualified_name.substr(0, last_scope));
+        if (index.package_names.contains(owner))
+            return {"package", owner};
+
+        // Out-of-block class methods are commonly spelled `function C::f;`.
+        // They are not lexically inside the class declaration, so recover the
+        // class owner from the qualified prototype name.  If the qualifier is
+        // package-qualified (`pkg::C::f`) keep the full qualifier as the class
+        // method owner; this mirrors how class scopes are represented elsewhere
+        // in the reference index.
+        return {"class", owner};
+    };
+
+    struct SubroutineDeclarationCollector : SyntaxVisitor<SubroutineDeclarationCollector> {
+        const slang::SourceManager& sm;
+        std::unordered_set<std::string>& declared_subroutines;
+        const decltype(module_owner_kind)& module_kind_fn;
+        const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_owner;
+        std::string current_owner_kind{"unit"};
+        std::string current_owner_name;
+        std::string current_package;
+        std::string current_class;
+
+        SubroutineDeclarationCollector(
+            const slang::SourceManager& sm,
+            std::unordered_set<std::string>& declared_subroutines,
+            const decltype(module_owner_kind)& module_owner_kind,
+            const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_owner)
+            : sm(sm), declared_subroutines(declared_subroutines),
+              module_kind_fn(module_owner_kind), resolve_owner(resolve_owner) {}
+
+        void handle(const ModuleDeclarationSyntax& node) {
+            const auto previous_kind = current_owner_kind;
+            const auto previous_name = current_owner_name;
+            const auto previous_package = current_package;
+
+            current_owner_kind = module_kind_fn(node.kind);
+            current_owner_name = std::string(node.header->name.valueText());
+            if (node.kind == SyntaxKind::PackageDeclaration)
+                current_package = current_owner_name;
+
+            visitDefault(node);
+
+            current_owner_kind = previous_kind;
+            current_owner_name = previous_name;
+            current_package = previous_package;
+        }
+
+        void handle(const CheckerDeclarationSyntax& node) {
+            const auto previous_kind = current_owner_kind;
+            const auto previous_name = current_owner_name;
+            current_owner_kind = "checker";
+            current_owner_name = std::string(node.name.valueText());
+            visitDefault(node);
+            current_owner_kind = previous_kind;
+            current_owner_name = previous_name;
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            const auto previous_kind = current_owner_kind;
+            const auto previous_name = current_owner_name;
+            const auto previous_class = current_class;
+
+            const std::string class_name(node.name.valueText());
+            if (!current_class.empty())
+                current_class += "::" + class_name;
+            else if (!current_package.empty())
+                current_class = current_package + "::" + class_name;
+            else
+                current_class = class_name;
+
+            current_owner_kind = "class";
+            current_owner_name = current_class;
+            visitDefault(node);
+
+            current_owner_kind = previous_kind;
+            current_owner_name = previous_name;
+            current_class = previous_class;
+        }
+
+        void handle(const FunctionDeclarationSyntax& node) {
+            if (!node.prototype || !node.prototype->name)
+                return;
+
+            const auto qualified_name = render_syntax_node_text(sm, *node.prototype->name);
+            const auto name = final_name_from_qualified_name(qualified_name);
+            if (!name.empty()) {
+                auto [owner_kind, owner_name] =
+                    resolve_owner(qualified_name, current_owner_kind, current_owner_name);
+                declared_subroutines.insert(subroutine_scope_key(owner_kind, owner_name, name));
+            }
+
+            visitDefault(node);
+        }
+    };
+
+    SubroutineDeclarationCollector subroutines(sm, declared_subroutines, module_owner_kind,
+                                               resolve_subroutine_owner_from_qualified_name);
+    root.visit(subroutines);
 
     // Declarations are already extracted into the index.  Add owner-qualified
     // declaration references from those tables so closed-file reference search
@@ -419,7 +588,11 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
         const std::unordered_map<std::string, std::string>& unique_typedef_scopes;
         const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
         const std::unordered_map<std::string, std::string>& unique_type_ids;
+        const std::unordered_set<std::string>& declared_subroutines;
+        const decltype(module_owner_kind)& module_kind_fn;
+        const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_subroutine_owner;
         std::string current_module;
+        std::string current_module_kind;
         std::string current_package;
         std::string current_class;
 
@@ -432,13 +605,17 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
                 const std::unordered_set<std::string>& typedef_fields,
                 const std::unordered_map<std::string, std::string>& unique_typedef_scopes,
                 const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
-                const std::unordered_map<std::string, std::string>& unique_type_ids)
+                const std::unordered_map<std::string, std::string>& unique_type_ids,
+                const std::unordered_set<std::string>& declared_subroutines,
+                const decltype(module_owner_kind)& module_owner_kind,
+                const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_subroutine_owner)
             : index(index), sm(sm), add_ref(add_reference), module_values(module_values),
               module_value_types(module_value_types), package_values(package_values),
               class_fields(class_fields), typedef_fields(typedef_fields),
               unique_typedef_scopes(unique_typedef_scopes),
-              unique_enum_member_ids(unique_enum_member_ids),
-              unique_type_ids(unique_type_ids) {}
+              unique_enum_member_ids(unique_enum_member_ids), unique_type_ids(unique_type_ids),
+              declared_subroutines(declared_subroutines), module_kind_fn(module_owner_kind),
+              resolve_subroutine_owner(resolve_subroutine_owner) {}
 
         void handle(const ModuleDeclarationSyntax& node) {
             const std::string module_name(node.header->name.valueText());
@@ -446,16 +623,30 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
                 add_ref(node.header->name, symbol_canonical("module", {}, module_name));
 
             auto previous_module = current_module;
+            auto previous_module_kind = current_module_kind;
             auto previous_package = current_package;
             if (node.kind == SyntaxKind::PackageDeclaration) {
                 current_package = module_name;
                 current_module.clear();
+                current_module_kind.clear();
             } else {
                 current_module = module_name;
+                current_module_kind = module_kind_fn(node.kind);
             }
             visitDefault(node);
             current_module = std::move(previous_module);
+            current_module_kind = std::move(previous_module_kind);
             current_package = std::move(previous_package);
+        }
+
+        void handle(const CheckerDeclarationSyntax& node) {
+            auto previous_module = current_module;
+            auto previous_module_kind = current_module_kind;
+            current_module = std::string(node.name.valueText());
+            current_module_kind = "checker";
+            visitDefault(node);
+            current_module = std::move(previous_module);
+            current_module_kind = std::move(previous_module_kind);
         }
 
         void handle(const ClassDeclarationSyntax& node) {
@@ -465,9 +656,98 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
                 add_ref(node.name, symbol_canonical("class", parent_scope, class_name));
 
             auto previous_class = current_class;
-            current_class = parent_scope.empty() ? class_name : parent_scope + "::" + class_name;
+            if (!current_class.empty())
+                current_class += "::" + class_name;
+            else
+                current_class = parent_scope.empty() ? class_name : parent_scope + "::" + class_name;
             visitDefault(node);
             current_class = std::move(previous_class);
+        }
+
+        std::optional<std::string> subroutine_id_for_unqualified_name(std::string_view name) const {
+            // SystemVerilog subroutines live in several lexical owners:
+            // compilation-unit, packages, modules/interfaces/programs,
+            // checkers, and classes.  Closed-file references cannot ask slang's
+            // semantic model which declaration a call bound to, but they can
+            // safely use a syntactic owner when the declaration and call are in
+            // the same lexical owner.  This prevents weak `name:<id>` matches
+            // from merging unrelated local tasks/functions with the same name.
+            if (!current_class.empty()) {
+                const auto key = subroutine_scope_key("class", current_class, name);
+                if (declared_subroutines.contains(key))
+                    return subroutine_symbol_id("class", current_class, name);
+            }
+            if (!current_module.empty()) {
+                const auto kind = current_module_kind.empty() ? std::string("module")
+                                                              : current_module_kind;
+                const auto key = subroutine_scope_key(kind, current_module, name);
+                if (declared_subroutines.contains(key))
+                    return subroutine_symbol_id(kind, current_module, name);
+            }
+            if (!current_package.empty()) {
+                const auto key = subroutine_scope_key("package", current_package, name);
+                if (declared_subroutines.contains(key))
+                    return subroutine_symbol_id("package", current_package, name);
+            }
+
+            const auto key = subroutine_scope_key("unit", {}, name);
+            if (declared_subroutines.contains(key))
+                return subroutine_symbol_id("unit", {}, name);
+            return std::nullopt;
+        }
+
+        std::optional<std::string> subroutine_id_for_invocation_name(
+            std::string_view rendered_name) const {
+            const size_t last_scope = rendered_name.rfind("::");
+            if (last_scope == std::string_view::npos)
+                return subroutine_id_for_unqualified_name(rendered_name);
+
+            const auto callee = final_name_from_qualified_name(rendered_name);
+            auto [owner_kind, owner_name] =
+                resolve_subroutine_owner(rendered_name, std::string_view("unit"),
+                                         std::string_view{});
+            const auto key = subroutine_scope_key(owner_kind, owner_name, callee);
+            if (!declared_subroutines.contains(key))
+                return std::nullopt;
+            return subroutine_symbol_id(owner_kind, owner_name, callee);
+        }
+
+        void handle(const FunctionDeclarationSyntax& node) {
+            if (node.prototype && node.prototype->name) {
+                const auto qualified_name = render_syntax_node_text(sm, *node.prototype->name);
+                const auto name_token = last_identifier_token(*node.prototype->name);
+                if (name_token) {
+                    const auto name = std::string(name_token.valueText());
+                    auto [owner_kind, owner_name] =
+                        resolve_subroutine_owner(qualified_name,
+                                                 current_class.empty()
+                                                     ? (current_module.empty()
+                                                            ? (current_package.empty()
+                                                                   ? std::string_view("unit")
+                                                                   : std::string_view("package"))
+                                                            : std::string_view(current_module_kind))
+                                                     : std::string_view("class"),
+                                                 current_class.empty()
+                                                     ? (current_module.empty()
+                                                            ? std::string_view(current_package)
+                                                            : std::string_view(current_module))
+                                                     : std::string_view(current_class));
+                    add_ref(name_token, subroutine_symbol_id(owner_kind, owner_name, name));
+                }
+            }
+            visitDefault(node);
+        }
+
+        void handle(const InvocationExpressionSyntax& node) {
+            if (node.left) {
+                const auto name_token = last_identifier_token(*node.left);
+                if (name_token) {
+                    const auto rendered_name = render_syntax_node_text(sm, *node.left);
+                    if (auto id = subroutine_id_for_invocation_name(rendered_name))
+                        add_ref(name_token, *id);
+                }
+            }
+            visitDefault(node);
         }
 
         void handle(const TypedefDeclarationSyntax& node) {
@@ -632,6 +912,7 @@ void collect_reference_occurrences(const SyntaxNode& root, SyntaxIndex& index,
 
     Visitor visitor(index, sm, add_reference, module_values, module_value_types, package_values,
                     class_fields, typedef_fields, unique_typedef_scopes, unique_enum_member_ids,
-                    unique_type_ids);
+                    unique_type_ids, declared_subroutines, module_owner_kind,
+                    resolve_subroutine_owner_from_qualified_name);
     root.visit(visitor);
 }
