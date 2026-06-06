@@ -47,62 +47,26 @@ static std::unordered_map<std::string, PortEntry> build_port_map(const ModuleEnt
     return ports;
 }
 
-static std::string padded(std::string text, size_t width) {
-    if (text.size() < width)
-        text.append(width - text.size(), ' ');
-    return text;
-}
-
 static std::string display_port_direction(const std::string& direction) {
     // Keep the semantic direction stored in SyntaxIndex unchanged
     // (`input`/`output`/`inout`/`unknown`) and translate only the inlay-hint
-    // presentation label here.  The short bracketed labels reduce visual noise
-    // at instance connections:
+    // presentation label here.  Port inlay hints intentionally show direction
+    // only; type/range text belongs in hover/definition where it does not add
+    // inline visual noise.  Every visible direction label is a single glyph:
     //
-    //   .req(req)  ◀ logic
-    //   .ack(ack)  ▶ logic
+    //   .req ◀ (req)
+    //   .ack ▶ (ack)
+    //   .bus ↔ (bus)
     //
-    // The user request only called out input and output, so `inout` remains
-    // spelled out for now rather than silently choosing an abbreviation such as
-    // `[IO]` that may not match user expectations.
     if (direction == "input")
         return "◀";
     if (direction == "output")
         return "▶";
+    if (direction == "inout")
+        return "↔";
     if (direction == "unknown")
-        return {};
-    return direction;
-}
-
-static std::string display_port_type(std::string type) {
-    // Many port declarations spell out the default net/type keyword
-    // explicitly (`logic` or `wire`) even when that keyword does not add much
-    // value to the inlay hint.  Keep the more informative suffix — for
-    // example a packed dimension — but drop the redundant leading keyword.
-    //
-    // Examples:
-    //   "logic"           -> ""
-    //   "wire"            -> ""
-    //   "logic [7:0]"     -> "[7:0]"
-    //   "wire [5:0]"      -> "[5:0]"
-    //
-    // We intentionally keep other type names intact (e.g. `bit`, `int`,
-    // `struct`, user-defined types) because they convey meaningful information.
-    auto strip_prefix = [&](const char* prefix) -> bool {
-        constexpr size_t prefix_len = 0; // placeholder to keep lambda local-only
-        (void)prefix_len;
-        const size_t len = std::char_traits<char>::length(prefix);
-        if (type.rfind(prefix, 0) != 0)
-            return false;
-        type.erase(0, len);
-        while (!type.empty() && type.front() == ' ')
-            type.erase(type.begin());
-        return true;
-    };
-
-    strip_prefix("logic");
-    strip_prefix("wire");
-    return type;
+        return "?";
+    return {};
 }
 
 } // namespace
@@ -134,7 +98,6 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
             int line{0};
             int col{0};
             std::string direction;
-            std::string type;
         };
         std::vector<Candidate> candidates;
         std::unordered_set<std::string> connected;
@@ -147,36 +110,32 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
                 continue;
 
             auto port_it = port_map.find(conn.port_name);
-            if (port_it == port_map.end())
-                continue;
+            const std::string direction = port_it == port_map.end()
+                                              ? std::string("?")
+                                              : display_port_direction(port_it->second.direction);
 
             candidates.push_back(Candidate{
                 .line = line,
-                // Place the inlay hint immediately after the named port token,
-                // not inside the connection parentheses.
+                // Place the inlay hint immediately before the named port token,
+                // which means between the dot and the port name:
                 //
-                // Slang gives us both:
-                //   conn.col      -> the first character of the port name
-                //                    in `.port_name(...)`
+                //   .◀i_clk    (clk)
+                //
+                // Slang/index data gives us:
+                //   conn.col      -> the first character of the port name in
+                //                    `.port_name(...)`; this is exactly the
+                //                    insertion point after the dot.
                 //   conn.hint_col -> the first character of the connected
-                //                    expression inside the parentheses
+                //                    expression inside the parentheses.
                 //
-                // The old inlay position used conn.hint_col, which rendered
-                // the direction/type hint here:
-                //
-                //   .i_clk              (|hint ...)
-                //
-                // For aligned instance lists that is visually noisy because
-                // the hint appears after a long run of alignment spaces.  For
-                // inlay presentation, the useful anchor is the port itself:
-                //
-                //   .i_clk |hint        ( ... )
-                //
-                // Keep conn.hint_col unchanged for connection-edit features
-                // that still need to locate/replace the expression text.
-                .col = conn.col + static_cast<int>(conn.port_name.size()) + 1,
-                .direction = display_port_direction(port_it->second.direction),
-                .type = display_port_type(port_it->second.type),
+                // Keep conn.hint_col unchanged for connection-edit features.
+                .col = conn.col,
+                // A missing port means the instance connection is stale/extra
+                // relative to the resolved module declaration.  Render the
+                // same single-glyph unknown marker used for known ports whose
+                // direction cannot be determined, instead of silently hiding
+                // the connection.
+                .direction = direction,
             });
         }
 
@@ -204,57 +163,36 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
         if (candidates.empty())
             continue;
 
-        size_t max_dir = 0;
-        size_t max_type = 0;
-        for (const auto& candidate : candidates) {
-            max_dir = std::max(max_dir, candidate.direction.size());
-            max_type = std::max(max_type, candidate.type.size());
-        }
-
         struct Label {
             int line{0};
             int col{0};
             std::string text;
         };
         std::vector<Label> labels;
-        size_t max_label = 0;
         for (const auto& candidate : candidates) {
-            std::vector<std::string> parts;
-            auto dir = padded(candidate.direction, max_dir);
-            if (dir.find_first_not_of(' ') != std::string::npos)
-                parts.push_back(std::move(dir));
-
-            if (max_type > 0) {
-                auto type = padded(candidate.type, max_type);
-                if (type.find_first_not_of(' ') != std::string::npos)
-                    parts.push_back(std::move(type));
-            }
-
-            std::string label;
-            for (size_t i = 0; i < parts.size(); ++i) {
-                if (i > 0)
-                    label += ' ';
-                label += parts[i];
-            }
-
-            if (label.find_first_not_of(' ') == std::string::npos)
+            if (candidate.direction.empty())
                 continue;
 
-            max_label = std::max(max_label, label.size());
             labels.push_back(Label{
                 .line = candidate.line,
                 .col = candidate.col,
-                .text = std::move(label),
+                .text = candidate.direction,
             });
         }
 
         for (auto& label : labels) {
             lsInlayHint hint;
             hint.position = lsPosition(label.line, label.col);
-            hint.label = padded(std::move(label.text), max_label);
+            // Do not re-pad labels to a shared width.  Older code did this to
+            // make labels visually column-like, but those spaces become part of
+            // the LSP label and show up as unwanted trailing padding after
+            // direction-only hints such as "◀".
+            hint.label = std::move(label.text);
             hint.kind = optional<lsInlayHintKind>(lsInlayHintKind::Type);
             hint.paddingLeft = optional<bool>(false);
-            hint.paddingRight = optional<bool>(true);
+            // The desired rendering is `.◀i_clk`, not `. ◀ i_clk`; disable
+            // client-side padding on both sides of the single-glyph label.
+            hint.paddingRight = optional<bool>(false);
             hints.push_back(std::move(hint));
         }
     }
