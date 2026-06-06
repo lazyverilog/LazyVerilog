@@ -216,7 +216,8 @@ class Analyzer {
     /// ProjectIndexSnapshot, background queues, or open-buffer state.  Open
     /// project buffers are returned from their live DocumentState snapshots so
     /// unsaved edits participate in the command.
-    std::vector<std::shared_ptr<const DocumentState>> project_file_states_sync() const;
+    std::vector<std::shared_ptr<const DocumentState>> project_file_states_sync(
+        std::function<void(size_t current, size_t total, const std::string& path)> progress = {}) const;
 
     /// Refresh project-index shards for files that the client reports changed.
     ///

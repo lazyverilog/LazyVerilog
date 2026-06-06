@@ -1602,7 +1602,28 @@ void LazyVerilogServer::register_handlers() {
                     states.push_back(std::move(state));
                 lint_result_json(states);
             } else if (cmd == "lazyverilog.lintAll") {
-                lint_result_json(analyzer_.project_file_states_sync());
+                size_t last_reported = 0;
+                size_t report_step = 1;
+                auto progress = [remote, &last_reported, &report_step](
+                                    size_t current, size_t total, const std::string& path) {
+                    if (total == 0)
+                        return;
+                    report_step = std::max<size_t>(1, total / 10);
+                    const bool should_report = current == 1 || current == total ||
+                                               current >= last_reported + report_step;
+                    if (!should_report)
+                        return;
+
+                    last_reported = current;
+                    Notify_ShowMessage::notify note;
+                    note.params.type = lsMessageType::Info;
+                    note.params.message =
+                        "LintAll: parsing " + std::to_string(current) + "/" +
+                        std::to_string(total) + " (" +
+                        std::filesystem::path(path).filename().string() + ")";
+                    remote->sendNotification(note);
+                };
+                lint_result_json(analyzer_.project_file_states_sync(progress));
             } else if (cmd == "lazyverilog.format") {
                 std::string uri = get_string(0);
                 std::string mode = get_string(1);

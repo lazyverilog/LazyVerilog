@@ -358,7 +358,8 @@ std::vector<std::string> Analyzer::extra_files() const {
     return extra_files_;
 }
 
-std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_sync() const {
+std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_sync(
+    std::function<void(size_t current, size_t total, const std::string& path)> progress) const {
     const auto start = Clock::now();
 
     std::vector<std::string> paths;
@@ -391,8 +392,12 @@ std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_
     std::unordered_set<std::string> seen_paths;
     seen_paths.reserve(paths.size());
 
-    for (const auto& raw_path : paths) {
+    const size_t total = paths.size();
+    for (size_t i = 0; i < paths.size(); ++i) {
+        const auto& raw_path = paths[i];
         const auto normalized_path = normalize_filesystem_path(raw_path).string();
+        if (progress)
+            progress(i + 1, total, normalized_path);
         if (!seen_paths.insert(normalized_path).second)
             continue;
 
