@@ -1265,6 +1265,8 @@ signal_min_width = 0
 
 Controls how user-defined macros are classified for formatting purposes. Macro classification affects wrapping, indentation, and spacing decisions. See [`macros.md`](macros.md) for the full option reference, available role lists, and examples.
 
+By default, `whitespace_sensitive` contains `DV_CHECK_FATAL`. This preserves the exact argument spelling for that macro unless you override the list in `lazyverilog.toml`.
+
 ---
 
 ## Disable regions
