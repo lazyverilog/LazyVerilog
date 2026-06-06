@@ -266,6 +266,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
         invalidate_extra_snapshots_locked();
+        invalidate_opened_files_index_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
     }
 
@@ -293,6 +294,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
         invalidate_extra_snapshots_locked();
+        invalidate_opened_files_index_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
 
         auto depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
@@ -347,6 +349,7 @@ void Analyzer::close(const std::string& uri) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_.erase(uri);
     invalidate_extra_snapshots_locked();
+    invalidate_opened_files_index_locked();
     // If the closed file is also in the filelist cache, replace its live shard
     // with a disk-backed parse in the background.  Keeping this asynchronous is
     // important for large buffers: closing a split should not synchronously
@@ -2219,6 +2222,15 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
     extra_index_snapshot_cache_.reset();
 }
 
+void Analyzer::invalidate_opened_files_index_locked() const {
+    // Open-buffer indexes are keyed by the current URI because that URI must be
+    // excluded from the merge: the active request derives current-file facts
+    // directly from its live AST.  Any didOpen/didChange/didClose replaces the
+    // open-buffer layer, so all per-current-URI variants become stale together.
+    opened_files_index_cache_.clear();
+    ++opened_files_index_generation_;
+}
+
 std::shared_ptr<const std::vector<ExtraFileInfo>>
 Analyzer::build_extra_file_snapshot_locked() const {
     auto result = std::make_shared<std::vector<ExtraFileInfo>>();
@@ -2315,21 +2327,39 @@ void Analyzer::set_project_index_publish_callback(std::function<void()> callback
 
 std::shared_ptr<const SyntaxIndex>
 Analyzer::opened_files_index(const std::string& current_uri) const {
-    std::vector<std::shared_ptr<const DocumentState>> states;
-    {
-        std::lock_guard<std::mutex> lock(map_mutex_);
-        states.reserve(docs_.size());
-        for (const auto& [uri, state] : docs_) {
-            if (uri == current_uri || !state)
-                continue;
-            states.push_back(state);
-        }
-    }
+    for (;;) {
+        std::vector<std::shared_ptr<const DocumentState>> states;
+        uint64_t generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (auto cached = opened_files_index_cache_.find(current_uri);
+                cached != opened_files_index_cache_.end())
+                return cached->second;
 
-    auto merged = std::make_shared<SyntaxIndex>();
-    for (const auto& state : states)
-        merged->merge(get_dynamic_index(*state));
-    return merged;
+            generation = opened_files_index_generation_;
+            states.reserve(docs_.size());
+            for (const auto& [uri, state] : docs_) {
+                if (uri == current_uri || !state)
+                    continue;
+                states.push_back(state);
+            }
+        }
+
+        // Build outside map_mutex_: get_dynamic_index() may lazily walk an AST
+        // for a newly opened buffer.  The generation check below prevents this
+        // off-lock work from publishing a stale merge after a concurrent edit.
+        auto merged = std::make_shared<SyntaxIndex>();
+        for (const auto& state : states)
+            merged->merge(get_dynamic_index(*state));
+
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (generation != opened_files_index_generation_)
+            continue;
+
+        auto [it, inserted] = opened_files_index_cache_.emplace(current_uri, merged);
+        (void)inserted;
+        return it->second;
+    }
 }
 
 CompilationSnapshot Analyzer::compilation_snapshot() const {

@@ -206,7 +206,7 @@ class Analyzer {
     /// it must be non-blocking and must not call back into Analyzer.
     void set_project_index_publish_callback(std::function<void()> callback);
 
-    /// Return a merged dynamic/file index for other open buffers.
+    /// Return a cached merged dynamic/file index for other open buffers.
     ///
     /// This is the clangd "dynamic" layer: files that have been opened/parsed
     /// during this editor session, including unsaved edits.  The current file
@@ -263,6 +263,7 @@ class Analyzer {
     void publish_extra_project_index_locked() const;
     void clear_extra_project_index_locked() const;
     void invalidate_extra_snapshots_locked() const;
+    void invalidate_opened_files_index_locked() const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state,
@@ -289,6 +290,12 @@ class Analyzer {
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
     mutable std::function<void()> project_index_publish_callback_;
+    // Per-current-URI merged dynamic layer for "other open files".  The key is
+    // necessary because current/open file facts must come from the caller's AST,
+    // so the current URI is excluded from the cached merge.
+    mutable std::unordered_map<std::string, std::shared_ptr<const SyntaxIndex>>
+        opened_files_index_cache_;
+    mutable uint64_t opened_files_index_generation_{0};
 
     // clangd-style background index state.
     //
