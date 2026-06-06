@@ -16,6 +16,7 @@ class SourceManager;
 namespace syntax {
 class ExpressionSyntax;
 class PropertyExprSyntax;
+class SyntaxTree;
 }
 }
 
@@ -78,3 +79,8 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
 /// two paths.
 void collect_reference_occurrences(const slang::syntax::SyntaxNode& root, SyntaxIndex& index,
                                    const slang::SourceManager& sm);
+
+/// Add macro declaration and invocation ReferenceEntry records.  Macro
+/// definitions are preprocessor facts rather than normal SyntaxNode children,
+/// so this helper accepts the whole SyntaxTree.
+void collect_macro_reference_occurrences(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index);
