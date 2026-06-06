@@ -1940,12 +1940,22 @@ class MemberProvider : public CompletionProvider {
                 CompletionContext inner = ctx;
                 inner.scope_name = td.resolved;
                 // Depth-limit prevents infinite recursion on mutually-aliased typedefs.
+                // Keep the counter exception-safe even though completion providers
+                // normally return errors as empty lists: a future throwing provider
+                // must not leave this thread permanently closer to the recursion
+                // limit.  That would make later, unrelated completions silently
+                // stop resolving typedef aliases.
                 static thread_local int typedef_depth = 0;
+                struct TypedefDepthGuard {
+                    int& depth;
+                    explicit TypedefDepthGuard(int& d) : depth(d) { ++depth; }
+                    ~TypedefDepthGuard() { --depth; }
+                    TypedefDepthGuard(const TypedefDepthGuard&) = delete;
+                    TypedefDepthGuard& operator=(const TypedefDepthGuard&) = delete;
+                };
                 if (typedef_depth >= 8) return items;
-                ++typedef_depth;
-                auto result = provide(inner, index, CancellationToken{});
-                --typedef_depth;
-                return result;
+                TypedefDepthGuard guard(typedef_depth);
+                return provide(inner, index, CancellationToken{});
             }
         }
 
