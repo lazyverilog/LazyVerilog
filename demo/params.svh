@@ -11,6 +11,12 @@ function packet_t sum(
 );
     return packet_t'({40'b0, i_a} + i_b);
 endfunction
+typedef enum logic [1:0] {
+    IDLE       = 2'd0        ,
+    FETCH                    ,
+    EXECUTE    = 2'd2        ,
+    ERROR
+} state_t;
 
 task add_number(
     input int a,
@@ -21,14 +27,7 @@ task add_number(
 endtask
 
 package cpu_pkg;
-
 // State machine states
-typedef enum logic [1:0] {
-    IDLE       = 2'd0        ,
-    FETCH                    ,
-    EXECUTE    = 2'd2        ,
-    ERROR
-} state_t;
 
 // Instruction opcode
 typedef enum logic [2:0] {
@@ -38,8 +37,37 @@ typedef enum logic [2:0] {
     OP_AND     = 3'b011      ,
     OP_OR      = 3'b100
 } opcode_t;
+endpackage
 
 // Shared constant
 parameter int DATA_WIDTH = 32;
 
-endpackage
+task req_data();
+    $display("%0d", data);
+endtask
+
+class Packet;
+
+    int                 data                                ;
+
+    function void set_data(
+        int d
+    );
+        data       = d;
+    endfunction
+
+    function int get_data();
+        return data;
+    endfunction
+
+`ifdef FOO
+    task print_data();
+        $display("%0d", data);
+    endtask
+    task req_data();
+`elsif BAR
+        $display("%0d", data);
+    endtask
+`endif
+
+endclass

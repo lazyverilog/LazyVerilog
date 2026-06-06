@@ -1,31 +1,41 @@
 `include "params.svh"
 
-module memory_top #(
-    parameter int WIDTH = 4,
-    parameter int DEPTH = 8
-)(
-    i_clk, i_rst_n, i_data,
-    i_data2, i_data3, i_dd,
-    i_dd22222, dd22222, i_d33333,
-    i_d44333, i_dd44321, i_d44334,
-    VDD, VSS
+module memory_top(
+    input     looooooooong_t [LOOOOOOOOOONG:0] i_clk        [1:0]         ,
+    input     packet_t   [1:0]       i_diveeeeeeeee [1:0][3:0][1:0][3:1],
+    output    logic      [1:0]       o_mul        [1:0][3:0][1:0][3:1]
 );
-logic               bridge_wire                         ;
 
-memory #(.DEPTH(4), .WIDTH(3)) u_mem2 (
+parameter int DATA_WIDTH = 32;
+
+logic               [`BB-1:0]           mem2_to_mem3                        ;
+looooooooooooog_packet_t [`BB-1:0]      mem3_to_mem4        [1:0] = 33333333333333;
+logic               [`BB-1:0]           mem4_to_mem5                        ;
+
+memory u_mem2 (
     .i_clk              (                              ),
     .address            (                              ),
-    .i_data             (eqoo                          ),
-    .o_data             (                              ),
-    .i_test             (bridge_wire                   )
+    .i_data             (                              ),
+    .o_data             (mem2_to_mem3                  )
 );
 
 memory u_mem3 (
     .i_clk              (                              ),
+`ifdef FOO
     .address            (                              ),
-    .i_data             (                              ),
+    .i_data             (mem2_to_mem3                  ),
+`elsif BAR
     .o_data             (eqoo                          ),
-    .o_test             (bridge_wire                   )
+`endif
+    .o_test             (bridge_wir                    )
 );
+
+always_comb begin
+    Packet              p                                   ;
+    if (1) begin
+        add_number();
+    end
+    p.req_data();
+end
 
 endmodule

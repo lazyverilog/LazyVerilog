@@ -8,13 +8,14 @@
 //       .i(a),
 //       .o(y)
 //   );
-module inv (
-    input  logic i,
-    output logic o
+module inv(
+    input     logic      i,
+    output    logic      o
 );
 
-    // Invert the input continuously; no clock or reset is required for this
-    // purely combinational RTL block.
-    assign o = ~i;
+state_t             state                               ;
+// Invert the input continuously; no clock or reset is required for this
+// purely combinational RTL block.
+assign o          = ~i;
 
 endmodule
