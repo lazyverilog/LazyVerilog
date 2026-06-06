@@ -2368,7 +2368,76 @@ function M.connect(module1, module2)
 	_try_connect(3)
 end
 
---- Internal: request lint results and populate quickfix.
+--- Internal: show lint results in a vertical split.
+---
+--- The split is deliberately a plain nofile buffer instead of quickfix.  The
+--- diagnostics are produced by the LazyVerilog server command and may include
+--- parse, lint, and optional semantic diagnostics; keeping them in a dedicated
+--- buffer makes `:Lint` a self-contained inspection command that does not
+--- clobber the user's project quickfix list.  Press <CR> on an entry to jump to
+--- its location, or q/Esc to close the list.
+local function _show_lint_split(items, label)
+	local lines = {
+		string.format("%s diagnostics (%d)", label, #items),
+		"",
+	}
+	for _, item in ipairs(items) do
+		table.insert(lines, string.format(
+			"%s:%d:%d: [%s] %s",
+			item.filename,
+			item.lnum,
+			item.col,
+			item.type,
+			item.text
+		))
+	end
+
+	local source_win = vim.api.nvim_get_current_win()
+	local buf = vim.api.nvim_create_buf(false, true)
+	vim.bo[buf].buftype = "nofile"
+	vim.bo[buf].bufhidden = "wipe"
+	vim.bo[buf].buflisted = false
+	vim.bo[buf].swapfile = false
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+	vim.bo[buf].modifiable = false
+	vim.b[buf].lazyverilog_lint_items = items
+
+	vim.cmd("rightbelow vertical new")
+	local win = vim.api.nvim_get_current_win()
+	vim.api.nvim_win_set_buf(win, buf)
+	vim.wo[win].wrap = false
+	vim.wo[win].number = false
+	vim.wo[win].relativenumber = false
+	vim.bo[buf].filetype = "lazyverilog-lint"
+
+	local function close()
+		if vim.api.nvim_win_is_valid(win) then
+			vim.api.nvim_win_close(win, true)
+		end
+	end
+
+	local function jump()
+		local row = vim.api.nvim_win_get_cursor(0)[1]
+		local item = vim.b[buf].lazyverilog_lint_items[row - 2]
+		if not item then
+			return
+		end
+		if vim.api.nvim_win_is_valid(source_win) then
+			vim.api.nvim_set_current_win(source_win)
+		else
+			vim.cmd("wincmd p")
+		end
+		vim.cmd("edit " .. vim.fn.fnameescape(item.filename))
+		vim.api.nvim_win_set_cursor(0, { item.lnum, math.max(item.col - 1, 0) })
+	end
+
+	local map_opts = { buffer = buf, noremap = true, silent = true }
+	vim.keymap.set("n", "q", close, map_opts)
+	vim.keymap.set("n", "<Esc>", close, map_opts)
+	vim.keymap.set("n", "<CR>", jump, map_opts)
+end
+
+--- Internal: request lint results and display them in a vertical split.
 --- @param filter_file string|nil  absolute path to restrict results to, or nil for all files
 --- @param label string            prefix for notify messages (e.g. "Lint" or "LintAll")
 local function _run_lint(filter_file, label)
@@ -2419,8 +2488,7 @@ local function _run_lint(filter_file, label)
 				vim.notify("[LazyVerilog] " .. label .. ": no violations found", vim.log.levels.INFO)
 				return
 			end
-			vim.fn.setqflist(items, "r")
-			vim.cmd("copen")
+			_show_lint_split(items, label)
 			vim.notify(
 				string.format("[LazyVerilog] %s: %d violation(s)", label, #items),
 				vim.log.levels.INFO

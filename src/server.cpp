@@ -1371,6 +1371,74 @@ void LazyVerilogServer::register_handlers() {
                 return out;
             };
 
+            auto lint_result_json = [&](const std::string& uri) {
+                auto state = analyzer_.get_state(uri);
+                if (!state) {
+                    rsp.result.SetJsonString("[]", lsp::Any::kArrayType);
+                    return;
+                }
+
+                std::vector<std::pair<std::string, ParseDiagInfo>> diagnostics;
+                auto add_diag = [&](ParseDiagInfo diag) {
+                    const std::string target_uri = diag.uri.empty() ? uri : diag.uri;
+                    diag.uri.clear();
+                    diagnostics.emplace_back(target_uri, std::move(diag));
+                };
+
+                for (auto diag : state->parse_diagnostics)
+                    add_diag(std::move(diag));
+
+                std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
+                if (config_.lint.module.stale_autoinst_diagnostic)
+                    project_lint_index = analyzer_.project_index_snapshot();
+
+                auto lint_diags = run_lint(*state, config_.lint, project_lint_index.get());
+                for (auto diag : lint_diags)
+                    add_diag(std::move(diag));
+
+                if (config_.compilation.background_compilation) {
+                    auto semantic_diags = analyzer_.semantic_diagnostics(uri);
+                    for (auto diag : semantic_diags)
+                        add_diag(std::move(diag));
+                }
+
+                auto severity_text = [](int severity) -> std::string_view {
+                    switch (severity) {
+                    case 1:
+                        return "Error";
+                    case 2:
+                        return "Warning";
+                    case 4:
+                        return "Hint";
+                    default:
+                        return "Information";
+                    }
+                };
+                auto uri_to_file = [](std::string uri) {
+                    constexpr std::string_view prefix = "file://";
+                    if (uri.starts_with(prefix))
+                        uri.erase(0, prefix.size());
+                    return uri;
+                };
+
+                std::string json = "[";
+                for (size_t i = 0; i < diagnostics.size(); ++i) {
+                    if (i > 0)
+                        json += ",";
+                    const auto& [diag_uri, diag] = diagnostics[i];
+                    json += "{";
+                    json += "\"uri\":" + json_string(diag_uri);
+                    json += ",\"file\":" + json_string(uri_to_file(diag_uri));
+                    json += ",\"line\":" + std::to_string(diag.line + 1);
+                    json += ",\"col\":" + std::to_string(diag.col + 1);
+                    json += ",\"severity\":" + json_string(severity_text(diag.severity));
+                    json += ",\"message\":" + json_string(diag.message);
+                    json += "}";
+                }
+                json += "]";
+                rsp.result.SetJsonString(json, lsp::Any::kArrayType);
+            };
+
             auto preview_ff_result = [&](const AutoffResult& result) {
                 // The Neovim client-side AutoFF command expects a small JSON object:
                 //   { "pairs": [{ "src": "...", "dst": "...", ... }] }
@@ -1504,7 +1572,9 @@ void LazyVerilogServer::register_handlers() {
                     lsp::Any::kObjectType);
             };
 
-            if (cmd == "lazyverilog.format") {
+            if (cmd == "lazyverilog.lint") {
+                lint_result_json(get_string(0));
+            } else if (cmd == "lazyverilog.format") {
                 std::string uri = get_string(0);
                 std::string mode = get_string(1);
                 auto state = analyzer_.get_state(uri);
@@ -1687,8 +1757,9 @@ void LazyVerilogServer::register_handlers() {
                 std::string inst_name = get_string(1);
                 rsp.result.SetJsonString(single_interface_json(analyzer_, uri, inst_name),
                                          lsp::Any::kObjectType);
+            } else {
+                std::cerr << "[lazyverilog] unknown executeCommand: " << cmd << "\n";
             }
-            // Other commands (lint) — return null for now
             if (rsp.result.GetType() == lsp::Any::Type::kUnKnown) {
                 lsp::Any null_result;
                 null_result.SetJsonString("null", lsp::Any::kNullType);
