@@ -714,6 +714,32 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
     }
 }
 
+void LazyVerilogServer::clear_published_diagnostics_for_owner(const std::string& owner_uri) {
+    // LSP diagnostics are client-owned state: once the server has published a
+    // diagnostic for a URI, many clients keep displaying it until the same
+    // server publishes an empty diagnostics array for that URI.  Closing the
+    // owner document removes our local DocumentState, so this helper snapshots
+    // every URI that the owner previously published (including include-file /
+    // semantic diagnostics routed to a different target URI) before erasing the
+    // ownership record.
+    std::unordered_set<std::string> uris_to_clear;
+    uris_to_clear.insert(owner_uri);
+
+    if (auto it = diagnostic_uris_by_owner_.find(owner_uri);
+        it != diagnostic_uris_by_owner_.end()) {
+        uris_to_clear.insert(it->second.begin(), it->second.end());
+        diagnostic_uris_by_owner_.erase(it);
+    }
+
+    for (const auto& target_uri : uris_to_clear) {
+        Notify_TextDocumentPublishDiagnostics::notify notif;
+        notif.params.uri.raw_uri_ = target_uri;
+        // Intentionally leave diagnostics empty: this is the LSP "clear"
+        // operation for diagnostics previously published by this server.
+        impl_->remote_endpoint.sendNotification(notif);
+    }
+}
+
 void LazyVerilogServer::register_handlers() {
     auto* remote = &impl_->remote_endpoint;
     auto& ep = *remote;
@@ -1058,6 +1084,7 @@ void LazyVerilogServer::register_handlers() {
             const auto& uri = note.params.textDocument.uri.raw_uri_;
             analyzer_.close(uri);
             document_versions_.erase(uri);
+            clear_published_diagnostics_for_owner(uri);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didClose error: " << e.what() << "\n";
         }
