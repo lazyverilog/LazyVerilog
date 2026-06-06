@@ -157,7 +157,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     // project files remain index-authoritative structurally.  Keep only their
     // path here; edit helpers call file_text() lazily for the small subset of
     // closed files that actually receive WorkspaceEdits.
-    for (const auto& extra : analyzer.extra_file_snapshots()) {
+    for (const auto& extra : *analyzer.extra_file_snapshot_ptr()) {
         if (!seen.insert(extra.uri).second)
             continue;
         if (extra.state) {

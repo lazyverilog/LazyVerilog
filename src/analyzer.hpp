@@ -183,6 +183,7 @@ class Analyzer {
     /// Historical note: this used to return cached closed-file DocumentState
     /// objects as well.  It now keeps DocumentState only for open buffers, so
     /// callers must treat `state` as optional and use `index` for closed files.
+    std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_ptr() const;
     std::vector<ExtraFileInfo> extra_file_snapshots() const;
 
     /// Return per-file project index shards without exposing full SyntaxTrees.
@@ -190,6 +191,7 @@ class Analyzer {
     /// Cross-file features should prefer this over extra_file_snapshots() when
     /// they only need indexed structural data.  This supports the indexing
     /// philosophy: current file uses AST, project files use index.
+    std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
     std::vector<ExtraIndexInfo> extra_index_snapshots() const;
 
     /// Append cached extra-file modules to an existing SyntaxIndex.
@@ -263,6 +265,9 @@ class Analyzer {
     void background_index_loop(std::stop_token stop) const;
     void publish_extra_project_index_locked() const;
     void clear_extra_project_index_locked() const;
+    void invalidate_extra_snapshots_locked() const;
+    std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
+    std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state,
                                                   SyntaxIndex index);
 
@@ -283,6 +288,8 @@ class Analyzer {
     // didOpen/didChange critical section from scanning large filelists.
     mutable std::unordered_set<std::string> extra_file_set_;
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> extra_cache_;
+    mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_cache_;
+    mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::shared_ptr<const SyntaxIndex> extra_project_index_cache_;
     mutable std::function<void()> project_index_publish_callback_;
 

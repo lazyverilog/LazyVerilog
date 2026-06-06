@@ -74,7 +74,7 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
             append_index_symbols(get_structural_index(*state), uri, query, symbols);
     });
 
-    for (const auto& extra : analyzer.extra_index_snapshots())
+    for (const auto& extra : *analyzer.extra_index_snapshot_ptr())
         append_index_symbols(extra.index, extra.uri, query, symbols);
 
     return symbols;

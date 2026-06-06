@@ -265,6 +265,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
+        invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
     }
 
@@ -291,6 +292,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
+        invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
 
         auto depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
@@ -344,6 +346,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 void Analyzer::close(const std::string& uri) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     docs_.erase(uri);
+    invalidate_extra_snapshots_locked();
     // If the closed file is also in the filelist cache, replace its live shard
     // with a disk-backed parse in the background.  Keeping this asynchronous is
     // important for large buffers: closing a split should not synchronously
@@ -1718,19 +1721,19 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                          : DefinitionTarget{};
     auto target_def = definition_of_state(*state, uri, line, col, extra_files);
     if (!target_def && target_info.kind == DefinitionTargetKind::Instance) {
-        for (const auto& extra : extra_index_snapshots()) {
+        for (const auto& extra : *extra_index_snapshot_ptr()) {
             if ((target_def = find_module_definition(extra.index, extra.uri,
                                                      target_info.module_name)))
                 break;
         }
     } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedPort) {
-        for (const auto& extra : extra_index_snapshots()) {
+        for (const auto& extra : *extra_index_snapshot_ptr()) {
             if ((target_def = find_port_definition(extra.index, extra.uri,
                                                    target_info.module_name, target_info.name)))
                 break;
         }
     } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedParameter) {
-        for (const auto& extra : extra_index_snapshots()) {
+        for (const auto& extra : *extra_index_snapshot_ptr()) {
             if ((target_def = find_port_definition(extra.index, extra.uri,
                                                    target_info.module_name, target_info.name)))
                 break;
@@ -1793,7 +1796,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 target_symbol_debug = *id;
         }
         if (target_symbol_debug.empty()) {
-            for (const auto& extra : extra_index_snapshots()) {
+            for (const auto& extra : *extra_index_snapshot_ptr()) {
                 if (extra.uri != target_def->uri)
                     continue;
                 if (auto id = symbol_id_for_index_location(extra.index, *target_def))
@@ -1827,7 +1830,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             }
         }
         if (fallback_symbol_debug.empty()) {
-            for (const auto& extra : extra_index_snapshots()) {
+            for (const auto& extra : *extra_index_snapshot_ptr()) {
                 if (extra.uri != target_def->uri)
                     continue;
                 if (auto id = symbol_id_for_index_location(extra.index, *target_def, true);
@@ -1978,7 +1981,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
 
     // Closed project files are represented by compact reference-occurrence
     // shards.  We intentionally do not load or walk their full SyntaxTrees here.
-    for (const auto& extra : extra_index_snapshots()) {
+    for (const auto& extra : *extra_index_snapshot_ptr()) {
         if (open_uris.contains(extra.uri))
             continue;
         if (!target_symbol_id && !fallback_symbol_id)
@@ -2044,6 +2047,7 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     defines_ = defines;
     // Invalidate extra-file cache so reopened files pick up the new defines.
     extra_cache_.clear();
+    invalidate_extra_snapshots_locked();
     clear_extra_project_index_locked();
     if (!extra_files_.empty())
         schedule_background_reindex_locked();
@@ -2060,6 +2064,7 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     // cache even if the filelist itself did not change, otherwise a newly added
     // UVM include directory would not be visible until the next source edit.
     extra_cache_.clear();
+    invalidate_extra_snapshots_locked();
     clear_extra_project_index_locked();
     if (!extra_files_.empty())
         schedule_background_reindex_locked();
@@ -2072,6 +2077,7 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     extra_files_.clear();
     extra_file_set_.clear();
     extra_cache_.clear();
+    invalidate_extra_snapshots_locked();
     extra_files_.reserve(paths.size());
     extra_file_set_.reserve(paths.size());
     for (const auto& path : paths) {
@@ -2118,6 +2124,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     }
 
     extra_cache_.clear();
+    invalidate_extra_snapshots_locked();
     clear_extra_project_index_locked();
 
     if (!extra_files_.empty())
@@ -2145,6 +2152,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         if (path.empty() || !extra_file_set_.contains(path))
             continue;
         extra_cache_.erase(uri_from_path(path));
+        invalidate_extra_snapshots_locked();
         removed_deleted_file = true;
     }
 
@@ -2186,20 +2194,20 @@ void Analyzer::wait_for_background_index_idle() const {
     });
 }
 
-std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
-    const auto start = Clock::now();
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    // Do not poll the .f file mtime on request paths.  The filelist is treated
-    // as configuration loaded at startup / config reload.  This avoids metadata
-    // I/O in HPC environments and keeps edits to listed open buffers
-    // incremental through update_extra_cache_for_live_state_locked().
-    // Request paths must remain read-only with respect to parsing.  If the
-    // cache is still warming or some configured files failed to parse, return
-    // the shards currently available instead of synchronously parsing missing
-    // files under map_mutex_.
+void Analyzer::invalidate_extra_snapshots_locked() const {
+    // Both snapshot vectors summarize extra_cache_.  The ExtraFileInfo variant
+    // also records which project files are currently open by consulting docs_,
+    // so document open/change/close paths must invalidate these caches too.
+    // This helper is intentionally tiny and must only be called while
+    // map_mutex_ is held by the mutating path.
+    extra_file_snapshot_cache_.reset();
+    extra_index_snapshot_cache_.reset();
+}
 
-    std::vector<ExtraFileInfo> result;
-    result.reserve(extra_cache_.size());
+std::shared_ptr<const std::vector<ExtraFileInfo>>
+Analyzer::build_extra_file_snapshot_locked() const {
+    auto result = std::make_shared<std::vector<ExtraFileInfo>>();
+    result->reserve(extra_cache_.size());
     for (const auto& [key, entry] : extra_cache_) {
         // Closed project files intentionally have no DocumentState here.  They
         // are represented only by the compact SyntaxIndex shard.  If the file
@@ -2212,7 +2220,7 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
         // Rebuilding while map_mutex_ is held would make hover/definition/RTL
         // requests serialize behind AST-derived indexing work.
         if (const auto it = docs_.find(entry.uri); it != docs_.end() && it->second) {
-            result.push_back(ExtraFileInfo{
+            result->push_back(ExtraFileInfo{
                 .path = entry.path,
                 .uri = entry.uri,
                 .state = it->second,
@@ -2220,36 +2228,70 @@ std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
             });
             continue;
         }
-        result.push_back(ExtraFileInfo{
+        result->push_back(ExtraFileInfo{
             .path = entry.path,
             .uri = entry.uri,
             .state = nullptr,
             .index = entry.index,
         });
     }
-    log_perf("extra_file_snapshots files=" + std::to_string(result.size()), start);
     return result;
 }
 
-std::vector<ExtraIndexInfo> Analyzer::extra_index_snapshots() const {
-    const auto start = Clock::now();
-    std::lock_guard<std::mutex> lock(map_mutex_);
-
-    std::vector<ExtraIndexInfo> result;
-    result.reserve(extra_cache_.size());
+std::shared_ptr<const std::vector<ExtraIndexInfo>>
+Analyzer::build_extra_index_snapshot_locked() const {
+    auto result = std::make_shared<std::vector<ExtraIndexInfo>>();
+    result->reserve(extra_cache_.size());
     for (const auto& [key, entry] : extra_cache_) {
-        result.push_back(ExtraIndexInfo{
+        result->push_back(ExtraIndexInfo{
             .path = entry.path,
             .uri = entry.uri,
             .index = entry.index,
         });
     }
-    log_perf("extra_index_snapshots files=" + std::to_string(result.size()), start);
     return result;
 }
 
+std::shared_ptr<const std::vector<ExtraFileInfo>>
+Analyzer::extra_file_snapshot_ptr() const {
+    const auto start = Clock::now();
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    // Do not poll the .f file mtime on request paths.  The filelist is treated
+    // as configuration loaded at startup / config reload.  This avoids metadata
+    // I/O in HPC environments and keeps edits to listed open buffers
+    // incremental through update_extra_cache_for_live_state_locked().
+    // Request paths must remain read-only with respect to parsing.  If the
+    // cache is still warming or some configured files failed to parse, return
+    // the shards currently available instead of synchronously parsing missing
+    // files under map_mutex_.
+    if (!extra_file_snapshot_cache_)
+        extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
+    log_perf("extra_file_snapshot_ptr files=" + std::to_string(extra_file_snapshot_cache_->size()), start);
+    return extra_file_snapshot_cache_;
+}
+
+std::vector<ExtraFileInfo> Analyzer::extra_file_snapshots() const {
+    const auto snapshot = extra_file_snapshot_ptr();
+    return snapshot ? *snapshot : std::vector<ExtraFileInfo>{};
+}
+
+std::shared_ptr<const std::vector<ExtraIndexInfo>>
+Analyzer::extra_index_snapshot_ptr() const {
+    const auto start = Clock::now();
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (!extra_index_snapshot_cache_)
+        extra_index_snapshot_cache_ = build_extra_index_snapshot_locked();
+    log_perf("extra_index_snapshot_ptr files=" + std::to_string(extra_index_snapshot_cache_->size()), start);
+    return extra_index_snapshot_cache_;
+}
+
+std::vector<ExtraIndexInfo> Analyzer::extra_index_snapshots() const {
+    const auto snapshot = extra_index_snapshot_ptr();
+    return snapshot ? *snapshot : std::vector<ExtraIndexInfo>{};
+}
+
 void Analyzer::merge_extra_file_modules(SyntaxIndex& index) const {
-    for (const auto& extra : extra_index_snapshots())
+    for (const auto& extra : *extra_index_snapshot_ptr())
         index.merge(extra.index);
 }
 
@@ -2410,7 +2452,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
         if (state_snapshot && state_snapshot->tree)
             add_rtl_index_file(view, seen_uris, state_uri, get_structural_index(*state_snapshot));
     });
-    for (const auto& extra : extra_file_snapshots())
+    for (const auto& extra : *extra_file_snapshot_ptr())
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
 
     const auto* root = &state_index.modules.front();
@@ -2469,7 +2511,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
         if (state_snapshot && state_snapshot->tree)
             add_rtl_index_file(view, seen_uris, state_uri, get_structural_index(*state_snapshot));
     });
-    for (const auto& extra : extra_file_snapshots())
+    for (const auto& extra : *extra_file_snapshot_ptr())
         add_rtl_index_file(view, seen_uris, extra.uri, extra.index);
 
     const auto* target = &state_index.modules.front();
@@ -2636,12 +2678,14 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
             if (generation == background_generation_) {
                 if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second == live_doc) {
                     docs_[uri] = reparsed_live_doc;
+                    invalidate_extra_snapshots_locked();
                     if (extra_file_set_.contains(path_string)) {
                         extra_cache_[uri] = ExtraFileCacheEntry{
                             .path = path_string,
                             .uri = uri,
                             .index = std::move(live_index),
                         };
+                        invalidate_extra_snapshots_locked();
                         background_publish_requested_ = true;
                     }
                 }
@@ -2685,6 +2729,7 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
                 .uri = uri,
                 .index = std::move(committed_index),
             };
+            invalidate_extra_snapshots_locked();
 
             // ProjectIndex is an immutable merged view derived from shards.
             // Do not rebuild that merged view after every single file while the
@@ -2738,6 +2783,7 @@ void Analyzer::update_extra_cache_for_live_state_locked(
         .uri = uri,
         .index = std::move(index),
     };
+    invalidate_extra_snapshots_locked();
 
     // This is the Option-B shard replacement point: b.sv's shard is replaced
     // when b.sv receives didOpen/didChange.  The merged project view is
