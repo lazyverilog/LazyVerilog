@@ -910,6 +910,7 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         }
     }
 
+    index.rebuild_reference_location_lookup();
     return index;
 }
 
@@ -930,6 +931,19 @@ std::string SyntaxIndex::source_uri(SourceFileID file_id) const {
     if (file_id == kInvalidSourceFileID || file_id >= source_files.size())
         return {};
     return source_files[file_id];
+}
+
+void SyntaxIndex::rebuild_reference_location_lookup() {
+    references_by_location.clear();
+    references_by_location.reserve(references.size());
+    for (size_t i = 0; i < references.size(); ++i) {
+        const auto& ref = references[i];
+        references_by_location[ReferenceLocationKey{
+            .file_id = ref.file_id,
+            .line = ref.line,
+            .col = ref.col,
+        }].push_back(i);
+    }
 }
 
 static SourceFileID remap_file_id(const std::vector<SourceFileID>& remap, SourceFileID id) {
@@ -1029,4 +1043,5 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
         if (include_seen.insert(uri).second)
             include_dependencies.push_back(uri);
     }
+    rebuild_reference_location_lookup();
 }

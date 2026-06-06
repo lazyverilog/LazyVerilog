@@ -583,20 +583,46 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
 static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex& index,
                                                                const Location& loc,
                                                                bool allow_name_fallback = false) {
-    for (const auto& ref : index.references) {
-        if (!ref.symbol_id)
-            continue;
-        if (!allow_name_fallback && ref.symbol_debug.starts_with("name:"))
-            continue;
-        // ReferenceEntry no longer stores a URI string directly.  It stores a
-        // compact FileID that is local to the SyntaxIndex shard, so always
-        // resolve through the shard's file table before comparing locations.
-        const auto ref_uri = index.source_uri(ref.file_id);
-        if (!ref_uri.empty() && ref_uri != loc.uri)
-            continue;
-        if (to_lsp_line(ref.line) == loc.line && ref.col == loc.col)
-            return ref.symbol_debug;
+    auto acceptable = [&](const ReferenceEntry& ref) {
+        return ref.symbol_id && (allow_name_fallback || !ref.symbol_debug.starts_with("name:"));
+    };
+
+    auto best_from_bucket = [&](const ReferenceLocationKey& key, size_t& best_index) {
+        const auto bucket = index.references_by_location.find(key);
+        if (bucket == index.references_by_location.end())
+            return;
+        for (const size_t ref_index : bucket->second) {
+            if (ref_index >= index.references.size())
+                continue;
+            const auto& ref = index.references[ref_index];
+            if (acceptable(ref) && ref_index < best_index)
+                best_index = ref_index;
+        }
+    };
+
+    // ReferenceEntry stores locations as shard-local FileIDs plus 1-based lines.
+    // Convert the requested LSP location to the same compact key and probe both
+    // the exact file bucket and the legacy invalid-file bucket.  Invalid FileID
+    // entries historically meant "owning shard URI" and matched by line/column
+    // only, so keeping that bucket preserves behavior for synthesized/older
+    // occurrences without scanning the entire reference vector.
+    const int reference_line = loc.line + 1;
+    size_t best_index = index.references.size();
+    if (const auto file_it = index.source_file_ids.find(loc.uri); file_it != index.source_file_ids.end()) {
+        best_from_bucket(ReferenceLocationKey{
+            .file_id = file_it->second,
+            .line = reference_line,
+            .col = loc.col,
+        }, best_index);
     }
+    best_from_bucket(ReferenceLocationKey{
+        .file_id = kInvalidSourceFileID,
+        .line = reference_line,
+        .col = loc.col,
+    }, best_index);
+
+    if (best_index < index.references.size())
+        return index.references[best_index].symbol_debug;
     return std::nullopt;
 }
 
