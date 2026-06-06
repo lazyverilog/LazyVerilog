@@ -306,10 +306,24 @@ static std::string whole_document_workspace_edit_json(const std::string& uri,
                                                       const std::string& old_text,
                                                       const std::string& new_text) {
     const auto end = document_end_position(old_text);
-    return "{\"changes\":{" + json_string(uri) +
-           ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":" +
-           std::to_string(end.line) + ",\"character\":" + std::to_string(end.character) +
-           "}},\"newText\":" + json_string(new_text) + "}]}}";
+    const auto escaped_uri = json_string(uri);
+    const auto escaped_text = json_string(new_text);
+    const auto end_line = std::to_string(end.line);
+    const auto end_character = std::to_string(end.character);
+
+    std::string out;
+    out.reserve(escaped_uri.size() + escaped_text.size() + end_line.size() +
+                end_character.size() + 128);
+    out += "{\"changes\":{";
+    out += escaped_uri;
+    out += ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":";
+    out += end_line;
+    out += ",\"character\":";
+    out += end_character;
+    out += "}},\"newText\":";
+    out += escaped_text;
+    out += "}]}}";
+    return out;
 }
 
 static std::string slice_lsp_range(const std::string& text, const lsRange& range) {
