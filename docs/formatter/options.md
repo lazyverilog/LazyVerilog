@@ -1164,11 +1164,11 @@ typedef enum logic [1:0] {
 } state_t;
 
 // align = true
-// align_adaptive = true
+// align_adaptive = false
 typedef enum logic [1:0] {
-    IDLE    = 2'b00,
-    ACTIVE  = 2'b01,
-    DONE    = 2'b10
+    IDLE           = 2'b00,
+    ACTIVE         = 2'b01,
+    DONE           = 2'b10,
     VERY_LONG_TEXT = 2'b11
 } state_t;
 ```
