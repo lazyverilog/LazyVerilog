@@ -278,6 +278,49 @@ TEST_CASE("definition: generic lookup uses open extra file AST", "[definition]")
     std::filesystem::remove(extra_path);
 }
 
+TEST_CASE("definition: package members included as text require import", "[definition]") {
+    Analyzer analyzer;
+    const auto header_path =
+        write_temp_sv("lazyverilog_definition_package_member.svh",
+                      "package cpu_pkg;\n"
+                      "task add_number(input int a, input int b, output int result);\n"
+                      "    result = a + b;\n"
+                      "endtask\n"
+                      "endpackage\n");
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_member_top.sv";
+
+    // Including a header that contains a package declaration makes the package
+    // syntax visible to slang's parsed tree, but it does not import the package
+    // members into the following module scope.  Go-to-definition / references
+    // must therefore not treat cpu_pkg::add_number as an unqualified
+    // add_number declaration in top_no_import.
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_package_member.svh\"\n"
+                           "module top_no_import;\n"
+                           "    initial begin\n"
+                           "        add_number();\n"
+                           "    end\n"
+                           "endmodule\n");
+    CHECK_FALSE(analyzer.definition_of(top_uri, 3, 11).has_value());
+
+    // A wildcard import in the module makes the package task visible at the
+    // call site, so the same unqualified name should now resolve to the header
+    // declaration.
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_package_member.svh\"\n"
+                           "module top_with_import;\n"
+                           "    import cpu_pkg::*;\n"
+                           "    initial begin\n"
+                           "        add_number();\n"
+                           "    end\n"
+                           "endmodule\n");
+    auto imported = analyzer.definition_of(top_uri, 4, 11);
+    REQUIRE(imported.has_value());
+    CHECK(imported->uri == "file://" + header_path.string());
+    CHECK(imported->line == 1);
+    CHECK(imported->col == 5);
+
+    std::filesystem::remove(header_path);
+}
+
 TEST_CASE("definition: nested include cursor matching is file-aware", "[definition]") {
     Analyzer analyzer;
     const auto b_path = write_temp_sv("B_nested_collision.svh",

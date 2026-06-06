@@ -910,18 +910,62 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     const std::string& uri;
     const std::string& name;
     const std::string& preferred_module;
+    const std::string& preferred_package;
+    const std::vector<ImportEntry>& visible_imports;
+    int use_line_one_based{0};
     std::string current_module;
+    std::string current_package;
     std::optional<Location> first_result;
     std::optional<Location> scoped_result;
 
     GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
-                             const std::string& name, const std::string& preferred_module)
-        : sm(sm), uri(uri), name(name), preferred_module(preferred_module) {}
+                             const std::string& name, const std::string& preferred_module,
+                             const std::string& preferred_package,
+                             const std::vector<ImportEntry>& visible_imports,
+                             int use_line_one_based)
+        : sm(sm), uri(uri), name(name), preferred_module(preferred_module),
+          preferred_package(preferred_package), visible_imports(visible_imports),
+          use_line_one_based(use_line_one_based) {}
 
     std::optional<Location> result() const { return scoped_result ? scoped_result : first_result; }
 
+    bool package_member_visible(std::string_view package_name, std::string_view symbol_name) const {
+        if (package_name.empty())
+            return true;
+
+        // A symbol declared inside a package is visible without an import only
+        // while resolving another identifier from that same package body.  It is
+        // not injected into modules that merely `include the package text:
+        //
+        //   `include "params.svh"       // contains: package cpu_pkg; task add_number; ...
+        //   module memory_top;
+        //       add_number();           // must not jump to cpu_pkg::add_number
+        //   endmodule
+        //
+        // SystemVerilog package members are reached by qualification
+        // (cpu_pkg::add_number) or import (cpu_pkg::* / cpu_pkg::add_number).
+        if (preferred_package == package_name)
+            return true;
+
+        for (const auto& import : visible_imports) {
+            if (import.package_name != package_name)
+                continue;
+            if (!import.parent_scope.empty() && import.parent_scope != preferred_module)
+                continue;
+            if (import.start_line > 0 && use_line_one_based < import.start_line)
+                continue;
+            if (import.end_line > 0 && use_line_one_based > import.end_line)
+                continue;
+            if (import.wildcard || import.symbol_name == symbol_name)
+                return true;
+        }
+        return false;
+    }
+
     void maybe_set(slang::parsing::Token token, bool scope_sensitive = true) {
         if (!token || token.valueText() != name)
+            return;
+        if (!package_member_visible(current_package, token.valueText()))
             return;
 
         auto loc = location_from_token_actual_uri(sm, uri, token);
@@ -936,9 +980,14 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         maybe_set(node.header->name, false);
 
         auto previous_module = current_module;
+        auto previous_package = current_package;
+        const bool is_package = node.kind == slang::syntax::SyntaxKind::PackageDeclaration;
         current_module = std::string(node.header->name.valueText());
+        if (is_package)
+            current_package = current_module;
         visitDefault(node);
         current_module = std::move(previous_module);
+        current_package = std::move(previous_package);
     }
 
     void handle(const slang::syntax::ClassDeclarationSyntax& node) {
@@ -978,8 +1027,12 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
 static std::optional<Location> find_generic_definition(const slang::syntax::SyntaxTree& tree,
                                                        const std::string& uri,
                                                        const std::string& name,
-                                                       const std::string& preferred_module) {
-    GenericDefinitionVisitor visitor(tree.sourceManager(), uri, name, preferred_module);
+                                                       const std::string& preferred_module,
+                                                       const std::string& preferred_package,
+                                                       const std::vector<ImportEntry>& visible_imports,
+                                                       int use_line_one_based) {
+    GenericDefinitionVisitor visitor(tree.sourceManager(), uri, name, preferred_module,
+                                     preferred_package, visible_imports, use_line_one_based);
     tree.root().visit(visitor);
     return visitor.result();
 }
@@ -1363,6 +1416,7 @@ struct DefinitionTarget {
     std::string module_name;
     std::string subroutine_name;
     std::string scope_module;
+    std::string scope_package;
 };
 
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
@@ -1372,6 +1426,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     int col;
     DefinitionTarget target;
     std::string current_module;
+    std::string current_package;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
                             int col)
@@ -1384,13 +1439,19 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(node.header->name.valueText());
             target.scope_module = current_module;
+            target.scope_package = current_package;
             return;
         }
 
         auto previous_module = current_module;
+        auto previous_package = current_package;
+        const bool is_package = node.kind == slang::syntax::SyntaxKind::PackageDeclaration;
         current_module = std::string(node.header->name.valueText());
+        if (is_package)
+            current_package = current_module;
         visitDefault(node);
         current_module = std::move(previous_module);
+        current_package = std::move(previous_package);
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
@@ -1399,6 +1460,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.name = std::string(node.type.valueText());
             target.module_name = target.name;
             target.scope_module = current_module;
+            target.scope_package = current_package;
             return;
         }
 
@@ -1415,6 +1477,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
                     target.scope_module = current_module;
+                    target.scope_package = current_package;
                     return;
                 }
             }
@@ -1429,6 +1492,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.name = std::string(instance->decl->name.valueText());
                 target.module_name = module_name;
                 target.scope_module = current_module;
+                target.scope_package = current_package;
                 return;
             }
 
@@ -1441,6 +1505,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
                     target.scope_module = current_module;
+                    target.scope_package = current_package;
                     return;
                 }
             }
@@ -1467,6 +1532,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.name = std::string(named->name.valueText());
                 target.subroutine_name = subroutine_name;
                 target.scope_module = current_module;
+                target.scope_package = current_package;
                 return;
             }
         }
@@ -1481,6 +1547,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(identifier->identifier.valueText());
             target.scope_module = current_module;
+            target.scope_package = current_package;
             return;
         }
         visitDefault(node);
@@ -1500,6 +1567,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.kind = DefinitionTargetKind::Macro;
                 target.name = std::string(macro_name);
                 target.scope_module = current_module;
+                target.scope_package = current_package;
             }
             return;
         }
@@ -1509,6 +1577,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
+            target.scope_package = current_package;
         }
     }
 };
@@ -1756,7 +1825,14 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return std::nullopt;
     }
 
-    if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module))
+    std::vector<ImportEntry> visible_imports;
+    if (state.tree)
+        visible_imports = get_dynamic_index(state).imports;
+    const int use_line_one_based = line + 1;
+
+    if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module,
+                                           target.scope_package, visible_imports,
+                                           use_line_one_based))
         return loc;
     for (const auto& extra : extra_files) {
         if (skip_extra(extra))
@@ -1764,7 +1840,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (!extra.state || !extra.state->tree)
             continue;
         if (auto loc = find_generic_definition(*extra.state->tree, extra.uri, target.name,
-                                               target.scope_module))
+                                               target.scope_module, target.scope_package,
+                                               visible_imports, use_line_one_based))
             return loc;
     }
 
