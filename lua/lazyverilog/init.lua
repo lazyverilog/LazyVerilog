@@ -2402,7 +2402,10 @@ local function _show_lint_split(items, label)
 	vim.bo[buf].modifiable = false
 	vim.b[buf].lazyverilog_lint_items = items
 
-	vim.cmd("rightbelow vertical new")
+	-- Split the current window, then replace the split's buffer.  `:vnew`
+	-- would create an extra unnamed buffer before we install the lint buffer,
+	-- leaving a stray listed [No Name] buffer behind.
+	vim.cmd("rightbelow vertical split")
 	local win = vim.api.nvim_get_current_win()
 	vim.api.nvim_win_set_buf(win, buf)
 	vim.wo[win].wrap = false
