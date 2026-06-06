@@ -2,6 +2,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "syntax_index.hpp"
@@ -36,7 +37,10 @@ struct DocumentState {
     std::vector<ParseDiagInfo> parse_diagnostics;
     // Normalized file:// URIs of files included while parsing this document.
     // Used to reparse open dependents when an included open buffer changes.
+    // Keep both ordered vector data for published indexes/snapshots and a set
+    // for O(1) dependency checks on the didChange path while map_mutex_ is held.
     std::vector<std::string> include_dependencies;
+    std::unordered_set<std::string> include_dependency_set;
     // Derived syntax index built once per immutable document snapshot.
     SyntaxIndex index;
     // Lazy structural index cache — populated on first call to get_structural_index().

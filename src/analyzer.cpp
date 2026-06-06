@@ -144,6 +144,8 @@ make_file_state_with_options(const std::filesystem::path& path,
     state->source_manager = std::move(sm);
     state->tree = std::move(*tree_or_error);
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
+    state->include_dependency_set.insert(state->include_dependencies.begin(),
+                                         state->include_dependencies.end());
     if (state->tree) {
         state->index = SyntaxIndex::build(*state->tree, state->text, IndexDepth::Declarations);
         state->index.include_dependencies = state->include_dependencies;
@@ -211,6 +213,8 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
+    state->include_dependency_set.insert(state->include_dependencies.begin(),
+                                         state->include_dependencies.end());
     // clangd-style current-file layer:
     //
     // Do not materialize any current-file SyntaxIndex on didOpen/didChange.
@@ -295,14 +299,17 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         invalidate_opened_files_index_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
 
-        auto depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
+        auto depends_on_changed_uri = [&](const DocumentState& doc) {
+            return doc.include_dependency_set.contains(uri);
+        };
+        auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
             return std::find(deps.begin(), deps.end(), uri) != deps.end();
         };
 
         bool queued_dependent = false;
         for (const auto& [other_uri, other_state] : docs_) {
             if (other_uri == uri || !other_state ||
-                !depends_on_changed_uri(other_state->include_dependencies))
+                !depends_on_changed_uri(*other_state))
                 continue;
 
             std::string other_path = other_uri;
@@ -320,7 +327,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         }
 
         for (const auto& [extra_uri, entry] : extra_cache_) {
-            if (docs_.contains(extra_uri) || !depends_on_changed_uri(entry.index.include_dependencies))
+            if (docs_.contains(extra_uri) || !index_depends_on_changed_uri(entry.index.include_dependencies))
                 continue;
             background_pending_files_.push_front(entry.path);
             queued_dependent = true;
