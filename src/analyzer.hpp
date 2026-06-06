@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -248,7 +249,8 @@ class Analyzer {
     std::shared_ptr<DocumentState> make_file_state(const std::filesystem::path& path) const;
     std::optional<Location>
     definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                        const std::vector<ExtraFileInfo>& extra_files) const;
+                        std::span<const ExtraFileInfo> extra_files,
+                        const std::string* skip_extra_uri = nullptr) const;
 
     struct ExtraFileCacheEntry {
         std::string path;

@@ -1463,12 +1463,14 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         return std::nullopt;
 
     auto target = definition_target_at(*state->tree, uri, line, col);
-    auto extra_files = extra_file_snapshots();
+    auto extra_files = extra_file_snapshot_ptr();
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto info = find_macro_info(*state->tree, uri, target.name))
             return info;
-        for (const auto& extra : extra_files) {
+        for (const auto& extra : *extra_files) {
+            if (extra.uri == uri)
+                continue;
             if (!extra.state || !extra.state->tree)
                 continue;
             if (auto info = find_macro_info(*extra.state->tree, extra.uri, target.name))
@@ -1482,19 +1484,14 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // definition_of() here would collect the same snapshot again, and for open
     // filelist entries that can mean repeating live-buffer index work during a
     // single user-visible hover request.
-    auto definition_extra_files = extra_files;
-    definition_extra_files.erase(
-        std::remove_if(definition_extra_files.begin(), definition_extra_files.end(),
-                       [&uri](const ExtraFileInfo& e) { return e.uri == uri; }),
-        definition_extra_files.end());
-    auto definition = definition_of_state(*state, uri, line, col, definition_extra_files);
+    auto definition = definition_of_state(*state, uri, line, col, *extra_files, &uri);
     if (definition) {
         std::string name = target.name.empty() ? ident : target.name;
         if (definition->uri == uri) {
             if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
                 return info;
         } else {
-            for (const auto& extra : extra_files) {
+            for (const auto& extra : *extra_files) {
                 if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
                     continue;
                 if (auto info = symbol_info_from_definition(*extra.state->tree, extra.uri, name,
@@ -1590,9 +1587,14 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
 
 std::optional<Location>
 Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                              const std::vector<ExtraFileInfo>& extra_files) const {
+                              std::span<const ExtraFileInfo> extra_files,
+                              const std::string* skip_extra_uri) const {
     if (!state.tree)
         return std::nullopt;
+
+    auto skip_extra = [&](const ExtraFileInfo& extra) {
+        return skip_extra_uri && extra.uri == *skip_extra_uri;
+    };
 
     auto target = definition_target_at(*state.tree, uri, line, col);
 
@@ -1605,6 +1607,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
             return loc;
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (!extra.state || !extra.state->tree)
                 continue;
             if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, ident->text))
@@ -1617,6 +1621,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (auto loc = find_macro_definition(*state.tree, uri, target.name))
             return loc;
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (!extra.state || !extra.state->tree)
                 continue;
             if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, target.name))
@@ -1631,6 +1637,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
 
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (auto loc =
                     find_port_definition(extra.index, extra.uri, target.module_name, target.name))
                 return loc;
@@ -1644,6 +1652,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
 
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (auto loc =
                     find_port_definition(extra.index, extra.uri, target.module_name, target.name))
                 return loc;
@@ -1657,6 +1667,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
 
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (!extra.state || !extra.state->tree)
                 continue;
             if (auto loc = find_subroutine_argument_definition(*extra.state->tree, extra.uri,
@@ -1670,6 +1682,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
             return loc;
         for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
             if (auto loc = find_module_definition(extra.index, extra.uri, target.module_name))
                 return loc;
         }
@@ -1679,6 +1693,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module))
         return loc;
     for (const auto& extra : extra_files) {
+        if (skip_extra(extra))
+            continue;
         if (!extra.state || !extra.state->tree)
             continue;
         if (auto loc = find_generic_definition(*extra.state->tree, extra.uri, target.name,
