@@ -59,7 +59,7 @@ trailing_whitespace = true
 
 [rtltree]
 show_instance_name = true   # show "cpu (u_cpu)" instead of just "cpu"
-show_file = false             # show "[rtl/cpu.sv]" after module name
+show_file = true             # show "[rtl/cpu.sv]" after module name
 
 [format]
 safe_mode = true # verify no non-whitespace content changed after format
@@ -149,7 +149,7 @@ align_adaptive = true                  # if true, per-line gap; if false, all po
 
 
 [inlay_hint]
-enable = false  # set false to disable all inlay hints
+enable = true  # set false to disable all inlay hints
 
 [autoff]
 register_pattern = "^r_"  # regex — signal matching this is the register (dst); the other is the source
