@@ -664,19 +664,20 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // rather than in the current buffer (for example demo/memory_top.sv
             // instantiates memory from demo/memory.sv).
             //
-            // Build the merged index only when that rule is enabled. The
-            // project portion comes from the latest background-published index
-            // snapshot, so diagnostics do not synchronously parse or merge the
-            // full design filelist on every edit.
-            SyntaxIndex lint_index;
+            // Build only the current-buffer structural index when that rule is
+            // enabled.  The project portion comes from the latest immutable
+            // background-published index snapshot and is queried separately, so
+            // diagnostics do not synchronously parse, copy, or merge the full
+            // design filelist on every edit.
             const SyntaxIndex* lint_index_ptr = nullptr;
+            std::shared_ptr<const SyntaxIndex> project_lint_index;
             if (config_.lint.module.stale_autoinst_diagnostic) {
-                lint_index = get_structural_index(*state);
-                lint_index.merge(*analyzer_.extra_project_index());
-                lint_index_ptr = &lint_index;
+                lint_index_ptr = &get_structural_index(*state);
+                project_lint_index = analyzer_.extra_project_index();
             }
 
-            auto lint_diags = run_lint(*state, config_.lint, lint_index_ptr);
+            auto lint_diags = run_lint(*state, config_.lint, lint_index_ptr,
+                                       project_lint_index.get());
             for (auto diag : lint_diags)
                 add_diag(std::move(diag));
         }

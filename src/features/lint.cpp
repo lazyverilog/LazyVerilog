@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <regex>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 
 using namespace slang;
@@ -154,7 +155,8 @@ static bool has_latch_risk(const SyntaxNode& node) {
 
 struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     const LintConfig&          cfg;
-    const SyntaxIndex&         index;
+    const SyntaxIndex*         current_index;
+    const SyntaxIndex*         project_index;
     SourceManager&             sm;
     std::vector<ParseDiagInfo> diags;
     bool in_always_ff_{false};
@@ -175,8 +177,10 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     std::optional<std::regex> parameter_re_;
     std::optional<std::regex> localparam_re_;
 
-    LintVisitor(const LintConfig& c, const SyntaxIndex& idx, SourceManager& s, std::string file_stem)
-        : cfg(c), index(idx), sm(s), file_stem_(std::move(file_stem)) {
+    LintVisitor(const LintConfig& c, const SyntaxIndex* current, const SyntaxIndex* project,
+                SourceManager& s, std::string file_stem)
+        : cfg(c), current_index(current), project_index(project), sm(s),
+          file_stem_(std::move(file_stem)) {
         if (cfg.naming.enable) {
             module_re_      = compile_re(cfg.naming.module_pattern);
             input_port_re_  = compile_re(cfg.naming.input_port_pattern);
@@ -279,6 +283,24 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         visitDefault(node);
     }
 
+    const ModuleEntry* find_module_entry(std::string_view module_name) const {
+        // Prefer the current buffer's index so unsaved edits to a module
+        // declaration immediately affect stale-autoinst diagnostics.  Fall
+        // back to the immutable background-published project snapshot for
+        // modules declared in closed filelist files.
+        auto lookup = [&](const SyntaxIndex* idx) -> const ModuleEntry* {
+            if (!idx)
+                return nullptr;
+            auto it = idx->module_by_name.find(std::string(module_name));
+            if (it == idx->module_by_name.end() || it->second >= idx->modules.size())
+                return nullptr;
+            return &idx->modules[it->second];
+        };
+        if (const auto* module = lookup(current_index))
+            return module;
+        return lookup(project_index);
+    }
+
     // ── module_instantiation_style: "named" | "positional" | "both" ─────────
     void handle(const HierarchyInstantiationSyntax& node) {
         const auto& style = cfg.module.module_instantiation_style;
@@ -307,9 +329,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             }
         }
         if (cfg.module.stale_autoinst_diagnostic) {
-            auto module_it = index.module_by_name.find(std::string(node.type.valueText()));
-            if (module_it != index.module_by_name.end() && module_it->second < index.modules.size()) {
-                const auto& module = index.modules[module_it->second];
+            if (const auto* module = find_module_entry(std::string_view(node.type.valueText()))) {
                 for (uint32_t i = 0; i < node.instances.size(); ++i) {
                     const auto* inst = node.instances[i];
                     if (!inst) continue;
@@ -323,11 +343,11 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                         if (!seen.insert(port).second)
                             diags.push_back(make_diag(sm, named->name.location(), module_sev(),
                                 "[module] duplicate autoinst connection for port '" + port + "'"));
-                        else if (!module.port_by_name.count(port))
+                        else if (!module->port_by_name.count(port))
                             diags.push_back(make_diag(sm, named->name.location(), module_sev(),
                                 "[module] stale autoinst connection for unknown port '" + port + "'"));
                     }
-                    for (const auto& port : module.ports) {
+                    for (const auto& port : module->ports) {
                         if (!seen.count(port.name) && inst->decl)
                             diags.push_back(make_diag(sm, inst->decl->name.location(), module_sev(),
                                 "[module] autoinst connection missing port '" + port.name + "'"));
@@ -540,7 +560,8 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 };
 
 std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig& config,
-                                    const SyntaxIndex* merged_index) {
+                                    const SyntaxIndex* current_index,
+                                    const SyntaxIndex* project_index) {
     std::vector<ParseDiagInfo> diags;
     if (!config.enable)
         return diags;
@@ -577,22 +598,20 @@ std::vector<ParseDiagInfo> run_lint(const DocumentState& state, const LintConfig
     auto& sm = state.tree->sourceManager();
     // Most lint rules are pure SyntaxTree walks.  Do not synthesize a broad
     // file index just because lint is running on didChange; that puts indexing
-    // back on the editing hot path.  The only current rule that needs an index
-    // is stale_autoinst_diagnostic, and server.cpp passes a merged index only
-    // when that rule is enabled.
+    // back on the editing hot path.  The only current rule that needs indexes
+    // is stale_autoinst_diagnostic.  It can query the current-file index and
+    // the background-published project index separately, avoiding a per-edit
+    // copy/merge of the full project index.
     SyntaxIndex local_stale_index;
-    SyntaxIndex empty_index;
-    const SyntaxIndex* index_for_rules = merged_index;
-    if (!index_for_rules && config.module.stale_autoinst_diagnostic) {
-        // Standalone/unit-test path: no Analyzer is available to provide a
-        // merged project index, but the stale-autoinst rule still needs at
-        // least same-file module declarations.  Build this only for that rule,
-        // never for ordinary didChange lint.
+    if (!current_index && config.module.stale_autoinst_diagnostic) {
+        // Standalone/unit-test path: no Analyzer is available to provide the
+        // current-file structural index, but the stale-autoinst rule still
+        // needs at least same-file module declarations.  Build this only for
+        // that rule, never for ordinary didChange lint.
         local_stale_index = get_structural_index(state);
-        index_for_rules = &local_stale_index;
+        current_index = &local_stale_index;
     }
-    LintVisitor v(config, index_for_rules ? *index_for_rules : empty_index, sm,
-                  file_stem_from_uri(state.uri));
+    LintVisitor v(config, current_index, project_index, sm, file_stem_from_uri(state.uri));
     state.tree->root().visit(v);
     v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {
         return !diag.uri.empty() && diag.uri != state.uri;
