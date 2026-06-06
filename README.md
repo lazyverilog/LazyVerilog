@@ -28,6 +28,8 @@
   ·
   <a href="#-installation">Installation</a>
   ·
+  <a href="#-usage">Usage</a>
+  ·
   <a href="#-configuration">Configuration</a>
   ·
   <a href="#-build">Build</a>
@@ -236,6 +238,79 @@ require("lazyverilog").setup({
   cmd = "/path/to/lazyverilog-lsp",
 })
 ```
+
+## 🚀 Usage
+
+### 1. Open a SystemVerilog project
+
+Start Neovim in your project root, then open a Verilog/SystemVerilog file:
+
+```bash
+nvim rtl/top.sv
+```
+
+The Neovim plugin starts the LazyVerilog LSP automatically for `verilog` and `systemverilog` buffers.
+Use `:LspInfo` to confirm that the `lazyverilog` client is attached.
+
+### 2. Add a project config
+
+Create `lazyverilog.toml` in the project root.  At minimum, point `design.vcode` to a filelist so
+LazyVerilog can index modules, packages, ports, and cross-file references:
+
+```toml
+[design]
+vcode = "rtl/vcode.f"
+define = ["RTL_SIM"]
+
+[format]
+enable_format_on_save = true
+indent_size = 4
+
+[lint]
+enable = true
+
+[inlay_hint]
+enable = true
+```
+
+Example `rtl/vcode.f`:
+
+```text
+rtl/pkg.sv
+rtl/memory.sv
+rtl/top.sv
+```
+
+After saving `lazyverilog.toml`, the plugin notifies the server to reload the config.
+
+### 3. Use standard LSP actions
+
+LazyVerilog provides normal Neovim LSP features.  Use your existing LSP keymaps, or add mappings
+like this:
+
+```lua
+vim.keymap.set("n", "gd", vim.lsp.buf.definition)
+vim.keymap.set("n", "gr", vim.lsp.buf.references)
+vim.keymap.set("n", "K", vim.lsp.buf.hover)
+vim.keymap.set("n", "<leader>rn", vim.lsp.buf.rename)
+vim.keymap.set({ "n", "v" }, "<leader>ca", vim.lsp.buf.code_action)
+```
+
+Code actions include RTL helpers such as AutoInst, AutoWire, AutoArg, AutoFunc, and AutoFF when the
+cursor is on a supported construct.
+
+### 4. Use LazyVerilog commands
+
+| Command | Description |
+|---------|-------------|
+| `:Format` | Format the current buffer or visual range |
+| `:Lint` | Show diagnostics for the current buffer |
+| `:LintAll` | Show diagnostics for indexed project files |
+| `:RtlTree` | Open the module instantiation hierarchy |
+| `:RtlTreeReverse` | Open reverse hierarchy from the current module |
+| `:Interface <inst>` | Inspect one instance interface |
+| `:Interface <inst1> <inst2>` | Inspect and edit connections between two instances |
+| `:Connect <module1> <module2>` | Interactively connect module instances through the hierarchy |
 
 ## 🏗️ Build
 
