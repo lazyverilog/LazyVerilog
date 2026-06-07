@@ -50,8 +50,19 @@ jobs:
              "lazyverilog-lsp-${{ github.ref_name }}-${{ matrix.platform }}"
           strip "lazyverilog-lsp-${{ github.ref_name }}-${{ matrix.platform }}"
 
+      - name: Resolve release notes
+        id: notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          f="docs/releases/${{ github.ref_name }}.md"
+          if [[ -f "$f" ]]; then
+            echo "body_path=$f" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: "lazyverilog-lsp-${{ github.ref_name }}-${{ matrix.platform }}"
+          body_path: ${{ steps.notes.outputs.body_path }}
+          generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
