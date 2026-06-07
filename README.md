@@ -259,8 +259,8 @@ LazyVerilog can index modules, packages, ports, and cross-file references:
 
 ```toml
 [design]
-vcode = "rtl/vcode.f"
-define = ["RTL_SIM"]
+vcode = "path/to/vcode/file"
+define = ["FAST_SIM", "MY_DEFINE"]
 
 [format]
 enable_format_on_save = true
@@ -273,12 +273,12 @@ enable = true
 enable = true
 ```
 
-Example `rtl/vcode.f`:
+Example `vcode.f`:
 
 ```text
-rtl/pkg.sv
-rtl/memory.sv
-rtl/top.sv
+path/to/rtl1
+path/to/rtl2
+path/to/rtl3
 ```
 
 After saving `lazyverilog.toml`, the plugin notifies the server to reload the config.
