@@ -3,11 +3,14 @@
 3. Implement formatter option 'max_lengh_per_line'.
 
 Example:
+```systemverilog
+// Input:
 assign y = a + b + c + d + e;
 
-Formatted:
+// Formatted:
 assign y = a + b + c
          + d + e;
+```
 
 Implementing feature needs careful DAG change of formatter.
 
