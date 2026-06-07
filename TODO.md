@@ -1,3 +1,6 @@
+0. rewrite README.md.
+- Current README.md is too hard for beginners. Must be rewritten user-friendly. Even for people who don't know what LSP is.
+- Current README.md does not look attractive enough to choose Lazyverilog over other LSPs.
 1. Provide option for positional argument when doing AutoInst. Current implementation of AutoInst only provides named argument.
 2. Update TOML file value sanity check.
 3. Implement formatter option 'max_lengh_per_line'.
