@@ -241,7 +241,9 @@ local function _auto_install(on_done)
 		vim.system({ "curl", "-fsSL", "-o", bin_path, url }, {}, function(dl)
 			if dl.code ~= 0 then
 				_fail_install_waiters(
-					"[LazyVerilog] download failed: " .. (dl.stderr or "unknown error")
+					"[LazyVerilog] download failed: "
+					.. (dl.stderr or "unknown error")
+					.. " URL: " .. url
 				)
 				return
 			end
