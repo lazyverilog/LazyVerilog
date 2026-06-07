@@ -5,6 +5,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/hxxdev/LazyVerilog/actions/workflows/release.yml"><img src="https://github.com/hxxdev/LazyVerilog/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/hxxdev/LazyVerilog/stargazers">
     <img alt="GitHub stars" src="https://img.shields.io/github/stars/hxxdev/LazyVerilog?style=for-the-badge&logo=starship&label=%E2%AD%90%20Stars&color=ffd166&labelColor=2b2d42">
   </a>
