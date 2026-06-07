@@ -65,6 +65,43 @@ TEST_CASE("formatter: member function calls support hanging layout", "[formatter
           "             .lsb_pos(0));\n");
 }
 
+TEST_CASE("formatter: hanging function calls use rendered spacing for prefix width", "[formatter]") {
+    FormatOptions opts;
+    opts.function_call.break_policy = "auto";
+    opts.function_call.arg_count = 3;
+    opts.function_call.line_length = 100;
+    opts.function_call.layout = "hanging";
+    opts.function_call.space_before_paren = false;
+    opts.function_call.space_inside_paren = false;
+
+    const std::string src =
+        "class c;\n"
+        "  function void f();\n"
+        "    if (!uvm_config_db #(dma_sys_tl_vif)::get(this,\n"
+        "                                             \"\",\n"
+        "                                             \"dma_sys_tl_vif\",\n"
+        "                                             cfg.dma_sys_tl_vif)) begin\n"
+        "      `uvm_fatal(`gfn, \"failed to get dma_sys_tl_vif from uvm_config_db\")\n"
+        "    end\n"
+        "  endfunction\n"
+        "endclass\n";
+
+    const std::string expected =
+        "class c;\n"
+        "  function void f();\n"
+        "    if (!uvm_config_db #(dma_sys_tl_vif)::get(this,\n"
+        "                                              \"\",\n"
+        "                                              \"dma_sys_tl_vif\",\n"
+        "                                              cfg.dma_sys_tl_vif)) begin\n"
+        "      `uvm_fatal(`gfn, \"failed to get dma_sys_tl_vif from uvm_config_db\")\n"
+        "    end\n"
+        "  endfunction\n"
+        "endclass\n";
+
+    CHECK(format_source(src, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
+}
+
 TEST_CASE("formatter: function call pass ignores hidden source whitespace", "[formatter]") {
     FormatOptions opts;
     opts.default_indent_level_inside_outmost_block = 0;

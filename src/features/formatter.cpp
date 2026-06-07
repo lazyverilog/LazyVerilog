@@ -87,10 +87,10 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     svfmt::SyntaxPass syntax; syntax.run(tokens);
     svfmt::MacroPass macro(opts); macro.run(tokens);
     svfmt::WrapPass wrap(opts); wrap.run(tokens);
-    svfmt::IndentPass indent(opts); indent.run(tokens);
-    svfmt::AlignPass align(opts); align.run(tokens);
     svfmt::CommentPass comment; comment.run(tokens);
     svfmt::SpacingPass spacing(opts); spacing.run(tokens);
+    svfmt::IndentPass indent(opts); indent.run(tokens);
+    svfmt::AlignPass align(opts); align.run(tokens);
     svfmt::BlankLinePass blank(opts); blank.run(tokens);
 
     svfmt::write_log(opts, "98_token_stream_final.log", tokens);

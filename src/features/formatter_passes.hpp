@@ -2011,15 +2011,41 @@ public:
         auto column_before = [&](size_t idx) {
             size_t s = line_start_of(idx);
             int base = tokens[s].mutable_.indent.base_indent;
-            int col = base + compact_width(tokens, s, idx);
-            size_t prev = prev_code(tokens, idx);
-            bool call_or_hash_paren =
-                kind_is(tokens[idx], TK::OpenParenthesis) && prev != npos &&
-                (is_identifier_like(tokens[prev]) || kind_is(tokens[prev], TK::Hash));
-            if (idx != s && prev != npos && prev >= s &&
-                !call_or_hash_paren &&
-                !no_space_before(tokens[idx].lex.kind) && !no_space_after(tokens[prev].lex.kind))
-                ++col;
+            int col = base;
+
+            // Indentation is now intentionally downstream of spacing.  The
+            // old implementation used compact_width(), which reimplemented a
+            // small subset of spacing policy and therefore drifted from the
+            // actual renderer.  For example, compact_width() counted the line
+            // prefix below as if it contained a space after unary `!`:
+            //
+            //   if (! uvm_config_db #(T)::get(
+            //
+            // while SpacingPass and the renderer correctly emit:
+            //
+            //   if (!uvm_config_db #(T)::get(
+            //
+            // That one phantom space made hanging-call continuation arguments
+            // start one column too far right.  Use the already-computed
+            // SpaceMetadata here so "column before token" means the same thing
+            // to IndentPass as it later means to render_tokens().
+            for (size_t k = s; k < idx && k < tokens.size(); ++k) {
+                const Tok& tok = tokens[k];
+                if (!is_code_token(tok))
+                    continue;
+                if (k != s) {
+                    col += tok.mutable_.space.suppress_space
+                        ? 0
+                        : tok.mutable_.space.spaces_before;
+                }
+                col += token_width(tok);
+            }
+            if (idx != s && idx < tokens.size() && is_code_token(tokens[idx])) {
+                const Tok& tok = tokens[idx];
+                col += tok.mutable_.space.suppress_space
+                    ? 0
+                    : tok.mutable_.space.spaces_before;
+            }
             return col;
         };
         auto set_item_indent = [&](size_t first, size_t last, int indent) {
