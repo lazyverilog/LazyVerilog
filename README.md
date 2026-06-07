@@ -387,6 +387,7 @@ enable = true
 **For Developers**
 - [`docs/dev/test.md`](docs/dev/test.md) — build, tests, and RTL format sweep.
 - [`docs/dev/files.md`](docs/dev/files.md) — design filelist cache and extra-file mtime behavior.
+- [`TODO.md`](TODO.md) — planned features and known issues.
 
 &nbsp;
 
