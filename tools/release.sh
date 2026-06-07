@@ -221,6 +221,8 @@ push_branch() {
 trigger_build_test() {
     [[ "$DO_BUILD_TEST" == 1 && "$DO_PUSH" == 1 ]] || return 0
 
+    confirm "Run pre-release build test via workflow_dispatch?" || return 0
+
     local branch
     branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
 
