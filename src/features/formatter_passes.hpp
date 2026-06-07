@@ -731,8 +731,91 @@ inline size_t module_header_parameter_hash_owner(const TokenStream& tokens, size
 }
 
 inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
-    auto follows_sv_item_boundary = [&](size_t prev) {
+    auto is_basic_sv_item_boundary = [&](size_t prev) {
         if (prev == npos)
+            return true;
+
+        return kind_is(tokens[prev], TK::Semicolon) ||
+               kind_is(tokens[prev], TK::BeginKeyword) ||
+               kind_is(tokens[prev], TK::EndKeyword) ||
+               kind_is(tokens[prev], TK::GenerateKeyword) ||
+               kind_is(tokens[prev], TK::EndGenerateKeyword) ||
+               // Module items may appear immediately after a subroutine body.
+               // For example, demo/memory_top.sv declares a module-local task
+               // and then instantiates `memory u_mem2 (...)`.  `endtask` and
+               // `endfunction` are therefore valid item boundaries just like a
+               // declaration semicolon.  Without these explicit boundaries the
+               // instance's top-level port list falls through to function-call
+               // wrapping, which indents named ports relative to the instance
+               // name column instead of using the configured instance-port
+               // indentation.
+               kind_is(tokens[prev], TK::EndTaskKeyword) ||
+               kind_is(tokens[prev], TK::EndFunctionKeyword);
+    };
+
+    auto follows_named_generate_boundary = [&](size_t prev) {
+        if (prev == npos)
+            return false;
+
+        if (is_identifier_like(tokens[prev])) {
+            size_t colon = prev_code(tokens, prev);
+            size_t opener = colon == npos ? npos : prev_code(tokens, colon);
+            if (colon != npos && kind_is(tokens[colon], TK::Colon) &&
+                opener != npos &&
+                (kind_is(tokens[opener], TK::BeginKeyword) ||
+                 kind_is(tokens[opener], TK::ForkKeyword)))
+                return true;
+        }
+
+        if (kind_is(tokens[prev], TK::Colon)) {
+            size_t label = prev_code(tokens, prev);
+            size_t before_label = label == npos ? npos : prev_code(tokens, label);
+            if (label != npos && is_identifier_like(tokens[label]) &&
+                is_basic_sv_item_boundary(before_label))
+                return true;
+        }
+
+        return false;
+    };
+
+    auto is_macro_item_boundary = [&](size_t prev) {
+        if (prev == npos)
+            return false;
+
+        // Some project macros expand to complete module items but are invoked
+        // without a trailing semicolon.  OpenTitan's DV alert helper is a
+        // representative example:
+        //
+        //   `DV_ALERT_IF_CONNECT()
+        //
+        //   dma #(...) dut (...);
+        //
+        // The token before `dma` is the macro call's closing parenthesis, not a
+        // semicolon.  If we reject that close parenthesis as an item boundary,
+        // the DUT port list is misclassified as a function-call argument list
+        // and gets hanging-call indentation.  Accept only a *completed macro
+        // invocation* whose macro token itself starts where a module item could
+        // start; this keeps ordinary expression calls such as `foo(`MACRO())`
+        // from becoming instantiation boundaries.
+        size_t macro = npos;
+        if (kind_is(tokens[prev], TK::MacroUsage)) {
+            macro = prev;
+        } else if (kind_is(tokens[prev], TK::CloseParenthesis)) {
+            size_t open = tokens[prev].immutable.syntax.matching_token;
+            macro = open == npos ? npos : prev_code(tokens, open);
+            if (macro == npos || !kind_is(tokens[macro], TK::MacroUsage))
+                return false;
+        } else {
+            return false;
+        }
+
+        size_t before_macro = prev_code(tokens, macro);
+        return is_basic_sv_item_boundary(before_macro) ||
+               follows_named_generate_boundary(before_macro);
+    };
+
+    auto follows_sv_item_boundary = [&](size_t prev) {
+        if (is_basic_sv_item_boundary(prev))
             return true;
 
         // A module/interface instantiation is a module item / generate item.
@@ -757,46 +840,11 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
         // Accept those label forms as boundaries, but keep the check structural
         // (TokenKind only) so we do not mistake arbitrary identifier pairs for
         // instantiations.
-        if (kind_is(tokens[prev], TK::Semicolon) ||
-            kind_is(tokens[prev], TK::BeginKeyword) ||
-            kind_is(tokens[prev], TK::EndKeyword) ||
-            kind_is(tokens[prev], TK::GenerateKeyword) ||
-            kind_is(tokens[prev], TK::EndGenerateKeyword) ||
-            // Module items may appear immediately after a subroutine body.
-            // For example, demo/memory_top.sv declares a module-local task
-            // and then instantiates `memory u_mem2 (...)`.  `endtask` and
-            // `endfunction` are therefore valid item boundaries just like a
-            // declaration semicolon.  Without these explicit boundaries the
-            // instance's top-level port list falls through to function-call
-            // wrapping, which indents named ports relative to the instance
-            // name column instead of using the configured instance-port
-            // indentation.
-            kind_is(tokens[prev], TK::EndTaskKeyword) ||
-            kind_is(tokens[prev], TK::EndFunctionKeyword))
+        if (follows_named_generate_boundary(prev))
             return true;
 
-        if (is_identifier_like(tokens[prev])) {
-            size_t colon = prev_code(tokens, prev);
-            size_t opener = colon == npos ? npos : prev_code(tokens, colon);
-            if (colon != npos && kind_is(tokens[colon], TK::Colon) &&
-                opener != npos &&
-                (kind_is(tokens[opener], TK::BeginKeyword) ||
-                 kind_is(tokens[opener], TK::ForkKeyword)))
-                return true;
-        }
-
-        if (kind_is(tokens[prev], TK::Colon)) {
-            size_t label = prev_code(tokens, prev);
-            size_t before_label = label == npos ? npos : prev_code(tokens, label);
-            if (label != npos && is_identifier_like(tokens[label]) &&
-                (before_label == npos ||
-                 kind_is(tokens[before_label], TK::Semicolon) ||
-                 kind_is(tokens[before_label], TK::BeginKeyword) ||
-                 kind_is(tokens[before_label], TK::EndKeyword) ||
-                 kind_is(tokens[before_label], TK::GenerateKeyword) ||
-                 kind_is(tokens[before_label], TK::EndGenerateKeyword)))
-                return true;
-        }
+        if (is_macro_item_boundary(prev))
+            return true;
 
         return false;
     };

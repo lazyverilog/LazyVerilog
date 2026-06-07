@@ -1169,6 +1169,47 @@ TEST_CASE("formatter: macro calls with empty arguments are preserved", "[formatt
     CHECK(formatted.find("`DV_CHECK_FATAL(expr, , msg_id)") != std::string::npos);
 }
 
+TEST_CASE("formatter: instance after semicolonless macro call keeps instance layout", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 1;
+    opts.instance.instance_port_between_paren_width = 0;
+
+    // OpenTitan-style module-item helper macros are commonly invoked without a
+    // trailing semicolon.  The macro call's closing parenthesis is therefore
+    // the previous code token before the following instantiation.  That close
+    // parenthesis must still count as an item boundary; otherwise `dut(...)`
+    // falls through to function-call wrapping and receives hanging-call
+    // indentation under the `(` column.
+    const std::string src =
+        "module top;\n"
+        "`DV_ALERT_IF_CONNECT()\n"
+        "dma #(\n"
+        "  .EnableDataIntgGen (1)\n"
+        ") dut (\n"
+        "  .clk_i (clk),\n"
+        "  .rst_ni (rst_n)\n"
+        ");\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top;\n"
+        "`DV_ALERT_IF_CONNECT()\n"
+        "dma #(.EnableDataIntgGen(1)) dut (\n"
+        "    .clk_i (clk),\n"
+        "    .rst_ni (rst_n)\n"
+        ");\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == expected);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
 TEST_CASE("formatter: function-like macro call without semicolon is formatted", "[formatter]") {
     FormatOptions opts;
     opts.default_indent_level_inside_outmost_block = 0;
