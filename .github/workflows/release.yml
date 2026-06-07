@@ -15,10 +15,12 @@ jobs:
             platform: linux-x64
           - os: ubuntu-22.04-arm
             platform: linux-arm64
-          - os: macos-14-large
+          - os: macos-15
             platform: darwin-x64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
           - os: macos-15
             platform: darwin-arm64
+            cmake_extra: ""
 
     runs-on: ${{ matrix.os }}
 
@@ -27,12 +29,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Pin Xcode 15.2 (darwin-x64)
-        if: matrix.platform == 'darwin-x64'
-        run: sudo xcode-select -s /Applications/Xcode_15.2.app
-
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
 
       - name: Build
         run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
