@@ -219,11 +219,54 @@ inline bool is_fork_block_open(const TokenStream& tokens, size_t fork_idx) {
             !kind_is(tokens[prev], TK::DisableKeyword));
 }
 
+inline bool is_covergroup_sample_function_header(const TokenStream& tokens, size_t function_idx) {
+    if (function_idx >= tokens.size() || !kind_is(tokens[function_idx], TK::FunctionKeyword))
+        return false;
+
+    // SystemVerilog has a contextual `function` use in covergroup headers:
+    //
+    //   covergroup cg with function sample(...);
+    //   covergroup cg @(posedge clk) with function sample(...);
+    //
+    // That `function` declares the covergroup's sample method signature.  It is
+    // not a function body and has no matching `endfunction`, so treating it as
+    // the ordinary `function ... endfunction` block opener leaves the formatter
+    // with one stale indent level until `endgroup`.
+    //
+    // Keep the recognition deliberately structural and narrow:
+    //   * the immediate previous code token must be `with`;
+    //   * scanning backward within the same semicolon-delimited header must
+    //     reach `covergroup`.
+    //
+    // This avoids suppressing real function declarations elsewhere, and it also
+    // avoids broad "inside covergroup" heuristics that could misclassify a
+    // future/extension construct in the covergroup body.
+    size_t with_idx = prev_code(tokens, function_idx);
+    if (with_idx == npos || !kind_is(tokens[with_idx], TK::WithKeyword))
+        return false;
+
+    for (size_t n = with_idx; n > 0; --n) {
+        size_t i = n - 1;
+        if (!is_code_token(tokens[i]))
+            continue;
+        if (kind_is(tokens[i], TK::Semicolon) ||
+            kind_is(tokens[i], TK::EndGroupKeyword) ||
+            is_outer_close(tokens[i].lex.kind) ||
+            is_close_block(tokens[i].lex.kind))
+            return false;
+        if (kind_is(tokens[i], TK::CoverGroupKeyword))
+            return true;
+    }
+    return false;
+}
+
 inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     if (idx >= tokens.size())
         return false;
     if (kind_is(tokens[idx], TK::ForkKeyword))
         return is_fork_block_open(tokens, idx);
+    if (is_covergroup_sample_function_header(tokens, idx))
+        return false;
     return is_open_block(tokens[idx].lex.kind);
 }
 

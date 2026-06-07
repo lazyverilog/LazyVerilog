@@ -3376,6 +3376,28 @@ TEST_CASE("formatter: coverpoint macro body stays multiline", "[formatter]") {
     CHECK(format_source(formatted, cfg.format) == formatted);
 }
 
+TEST_CASE("formatter: covergroup sample function header does not add stale indent",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+
+    const std::string input =
+        "covergroup dma_config_cg with function sample(bit initial_transfer);\n"
+        "option.per_instance = 1;\n"
+        "option.name = \"dma_config_cg\";\n"
+        "endgroup\n";
+
+    const std::string expected =
+        "covergroup dma_config_cg with function sample(bit initial_transfer);\n"
+        "    option.per_instance = 1;\n"
+        "    option.name = \"dma_config_cg\";\n"
+        "endgroup\n";
+
+    CHECK(format_source(input, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
+}
+
 TEST_CASE("formatter: coverpoint blocks follow statement begin_newline option",
           "[formatter]") {
     FormatOptions opts;
