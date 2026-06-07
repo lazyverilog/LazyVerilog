@@ -1254,6 +1254,88 @@ public:
     explicit WrapPass(const FormatOptions& opts) : opts_(opts) {}
     const char* name() const override { return "wrap"; }
     void run(TokenStream& tokens) override {
+        std::vector<bool> procedural_context(tokens.size(), false);
+        {
+            // Bare-unknown-macro fallback below is intentionally limited to
+            // procedural statement contexts.  A bare macro in module/class item
+            // space can be a declaration prefix, attribute wrapper, item
+            // generator, or expression fragment:
+            //
+            //   `MY_ATTR logic a;
+            //   `MY_DECL_PREFIX my_type x;
+            //   `MY_MODULE_ITEM_HELPER
+            //
+            // Inside procedural code, a macro that appears where a statement
+            // can start is much more likely to be a semicolonless statement
+            // helper.  Precompute a conservative token-kind context once here
+            // instead of asking macro classification to guess each unknown
+            // macro's semantic role.  The unknown-macro fallback below is
+            // deliberately *only* a procedural formatting policy:
+            //
+            //   if unknown macro is at procedural statement start:
+            //       if it has (...) break after the matching ')'
+            //       else break after the macro token
+            //   else:
+            //       keep object-like expression behavior
+            bool in_import = false;
+            bool in_extern = false;
+            bool in_typedef = false;
+            int subroutine_depth = 0;
+
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (!is_code_token(tokens[i]))
+                    continue;
+
+                procedural_context[i] = subroutine_depth > 0;
+
+                if (kind_is(tokens[i], TK::ImportKeyword))
+                    in_import = true;
+                if (kind_is(tokens[i], TK::ExternKeyword))
+                    in_extern = true;
+                if (kind_is(tokens[i], TK::TypedefKeyword))
+                    in_typedef = true;
+
+                const bool qualifier_fn_task =
+                    (in_import || in_extern) &&
+                    (kind_is(tokens[i], TK::FunctionKeyword) ||
+                     kind_is(tokens[i], TK::TaskKeyword));
+                if (!qualifier_fn_task &&
+                    !is_covergroup_sample_function_header(tokens, i) &&
+                    (kind_is(tokens[i], TK::FunctionKeyword) ||
+                     kind_is(tokens[i], TK::TaskKeyword))) {
+                    ++subroutine_depth;
+                    procedural_context[i] = true;
+                } else if ((kind_is(tokens[i], TK::EndFunctionKeyword) ||
+                            kind_is(tokens[i], TK::EndTaskKeyword)) &&
+                           subroutine_depth > 0) {
+                    procedural_context[i] = true;
+                    --subroutine_depth;
+                }
+
+                if (kind_is(tokens[i], TK::Semicolon)) {
+                    in_import = false;
+                    in_extern = false;
+                    in_typedef = false;
+                }
+            }
+
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (!is_code_token(tokens[i]) ||
+                    !is_procedural_block_keyword(tokens[i].lex.kind))
+                    continue;
+                size_t body = procedural_body_start(tokens, i);
+                if (body == npos || body >= tokens.size())
+                    continue;
+                size_t body_end = simple_statement_end_from(tokens, body);
+                if (body_end == npos || body_end >= tokens.size())
+                    body_end = tokens[i].immutable.syntax.stmt_end;
+                if (body_end == npos || body_end >= tokens.size())
+                    continue;
+                for (size_t k = body; k <= body_end; ++k)
+                    procedural_context[k] = true;
+            }
+        }
+
         int group = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
@@ -1299,16 +1381,70 @@ public:
                 tokens[break_at].mutable_.wrap.must_break_after = true;
             }
             if (kind_is(t, TK::MacroUsage) && !t.mutable_.macro.force_line_break) {
+                auto completed_macro_invocation_is_statement_boundary = [&](size_t prev) {
+                    if (prev == npos || prev >= tokens.size())
+                        return false;
+
+                    // A macro in UVM / OpenTitan style often has no semicolon
+                    // in source:
+                    //
+                    //   `uvm_info(...)
+                    //   `DV_CHEESE
+                    //   `DV_CHECK_EQ(...)
+                    //
+                    // This is a formatting-policy boundary, not macro
+                    // classification.  Known statement-like macros set
+                    // force_line_break.  Unknown macros that were previously
+                    // accepted as procedural statement-start fallback set
+                    // must_break_after on either their bare macro token or on
+                    // the invocation's closing parenthesis.  A following
+                    // unknown macro may use that already-decided line boundary
+                    // as its own statement-start boundary.
+                    //
+                    // Keep this boundary recognition macro-structural: accept a
+                    // bare line-ending macro token, or the matching close
+                    // parenthesis of a macro invocation that is line-ending.
+                    // This lets conservative unknown-macro fallback boundaries
+                    // chain after a known statement-like macro:
+                    //
+                    //   `uvm_info(...)          // known statement-like
+                    //   `PROJECT_BARE
+                    //   `PROJECT_CHECK(...)
+                    if (kind_is(tokens[prev], TK::MacroUsage))
+                        return tokens[prev].mutable_.macro.force_line_break ||
+                               tokens[prev].mutable_.wrap.must_break_after;
+
+                    if (!kind_is(tokens[prev], TK::CloseParenthesis))
+                        return false;
+
+                    size_t open = tokens[prev].immutable.syntax.matching_token;
+                    if (open == npos || open >= tokens.size())
+                        return false;
+                    size_t macro = prev_code(tokens, open);
+                    if (macro == npos || !kind_is(tokens[macro], TK::MacroUsage))
+                        return false;
+
+                    return tokens[macro].mutable_.macro.force_line_break ||
+                           tokens[prev].mutable_.wrap.must_break_after;
+                };
+
                 size_t prev = prev_code(tokens, i);
                 bool statement_position =
-                    prev == npos || kind_is(tokens[prev], TK::Semicolon) ||
-                    kind_is(tokens[prev], TK::BeginKeyword) || is_close_block(tokens[prev].lex.kind) ||
-                    is_outer_close(tokens[prev].lex.kind);
+                    i < procedural_context.size() && procedural_context[i] &&
+                    (prev == npos || kind_is(tokens[prev], TK::Semicolon) ||
+                     kind_is(tokens[prev], TK::BeginKeyword) ||
+                     is_close_block(tokens[prev].lex.kind) ||
+                     is_outer_close(tokens[prev].lex.kind) ||
+                     completed_macro_invocation_is_statement_boundary(prev));
                 size_t open = next_code(tokens, i + 1, tokens.size());
-                if (statement_position && open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
-                    size_t close = tokens[open].immutable.syntax.matching_token;
-                    if (close != npos && close < tokens.size())
-                        tokens[close].mutable_.wrap.must_break_after = true;
+                if (statement_position) {
+                    if (open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
+                        size_t close = tokens[open].immutable.syntax.matching_token;
+                        if (close != npos && close < tokens.size())
+                            tokens[close].mutable_.wrap.must_break_after = true;
+                    } else {
+                        t.mutable_.wrap.must_break_after = true;
+                    }
                 }
             }
             if (i > 0 &&

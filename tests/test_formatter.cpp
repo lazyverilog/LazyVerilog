@@ -1214,6 +1214,7 @@ TEST_CASE("formatter: instance after semicolonless macro call keeps instance lay
     opts.instance.align_adaptive = true;
     opts.instance.instance_port_name_width = 1;
     opts.instance.instance_port_between_paren_width = 0;
+    opts.macros.declaration_like.push_back("DV_ALERT_IF_CONNECT");
 
     // OpenTitan-style module-item helper macros are commonly invoked without a
     // trailing semicolon.  The macro call's closing parenthesis is therefore
@@ -1243,6 +1244,82 @@ TEST_CASE("formatter: instance after semicolonless macro call keeps instance lay
 
     std::string formatted;
     REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == expected);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: configured RTL macros provide declaration statement and block boundaries",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.instance.align = true;
+    opts.instance.align_adaptive = true;
+    opts.instance.instance_port_name_width = 1;
+    opts.instance.instance_port_between_paren_width = 0;
+    opts.macros.declaration_like.push_back("RTL_ALERT_CONNECT");
+    opts.macros.statement_like.push_back("RTL_CHECK_EQ");
+    opts.macros.block_begin_like.push_back("RTL_PIPE_STAGE_BEGIN");
+    opts.macros.block_end_like.push_back("RTL_PIPE_STAGE_END");
+
+    // This intentionally looks like real integration RTL rather than a tiny
+    // macro-only snippet:
+    //
+    // * `RTL_ALERT_CONNECT() is a semicolonless module-item helper before an
+    //   instance.  It must render as its own item and act as an instantiation
+    //   boundary.
+    // * `RTL_CHECK_EQ(...) is a semicolonless procedural check statement.
+    // * `RTL_PIPE_STAGE_BEGIN / END are project macros that create a logical
+    //   formatting block around ordinary sequential assignments.
+    //
+    // The test proves these behaviours come from explicit macro configuration,
+    // not from unknown-macro role inference.
+    const std::string input =
+        "module dma_irq_ctrl(input logic clk_i, input logic rst_ni, input logic irq_i, "
+        "output logic irq_o);\n"
+        "`RTL_ALERT_CONNECT()\n"
+        "irq_status u_irq_status(.clk_i(clk_i),.rst_ni(rst_ni),.irq_i(irq_i),.irq_o(irq_o));\n"
+        "always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+        "if (!rst_ni) begin\n"
+        "irq_o <= 1'b0;\n"
+        "end else begin\n"
+        "`RTL_CHECK_EQ(irq_i, irq_o, \"irq mismatch\")\n"
+        "`RTL_PIPE_STAGE_BEGIN\n"
+        "irq_o <= irq_i;\n"
+        "`RTL_PIPE_STAGE_END\n"
+        "end\n"
+        "end\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module dma_irq_ctrl(\n"
+        "    input     logic               clk_i,\n"
+        "    input     logic               rst_ni,\n"
+        "    input     logic               irq_i,\n"
+        "    output    logic               irq_o\n"
+        ");\n"
+        "`RTL_ALERT_CONNECT()\n"
+        "irq_status u_irq_status (\n"
+        "    .clk_i (clk_i),\n"
+        "    .rst_ni (rst_ni),\n"
+        "    .irq_i (irq_i),\n"
+        "    .irq_o (irq_o)\n"
+        ");\n"
+        "always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+        "    if (!rst_ni) begin\n"
+        "        irq_o <= 1'b0;\n"
+        "    end\n"
+        "    else begin\n"
+        "        `RTL_CHECK_EQ(irq_i, irq_o, \"irq mismatch\")\n"
+        "        `RTL_PIPE_STAGE_BEGIN\n"
+        "            irq_o <= irq_i;\n"
+        "        `RTL_PIPE_STAGE_END\n"
+        "    end\n"
+        "end\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(input, opts));
     CHECK(formatted == expected);
     CHECK(format_source(formatted, opts) == formatted);
 }
@@ -1315,6 +1392,7 @@ TEST_CASE("formatter: multiline macro calls with comments are preserved and idem
 
 TEST_CASE("formatter: function-like macro preserves following statement newline", "[formatter]") {
     FormatOptions opts;
+    opts.macros.statement_like.push_back("DV_CHECK_STD_RANDOMIZE_WITH_FATAL");
 
     const std::string src =
         "`DV_CHECK_STD_RANDOMIZE_WITH_FATAL(\n"
@@ -1327,6 +1405,49 @@ TEST_CASE("formatter: function-like macro preserves following statement newline"
           "BkdrRegPathRtlShadow};)\n"
           "origin_val = csr_peek(.ptr(shadowed_csr), .kind(kind));\n"
           "err_val = get_shadow_reg_diff_val(shadowed_csr, origin_val);\n");
+}
+
+TEST_CASE("formatter: known statement macro is boundary for following semicolonless macros",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `uvm_info is built in as statement_like, while PROJECT_BARE and
+    // PROJECT_CHECK_EQ are left deliberately unknown here.  The completed
+    // `uvm_info(...) invocation must still act as a statement boundary for the
+    // following semicolonless macro.  Once an unknown macro is accepted in a
+    // procedural statement-start slot, its own completed formatter unit should
+    // become the boundary for the next macro, even when the first unknown macro
+    // has no parenthesized argument list.  This mirrors OpenTitan's adjacent
+    // `DV_CHEESE / `DV_CHECK_EQ(...) style without hardcoding those
+    // project-specific check macros into the source.
+    const std::string input =
+        "module top;\n"
+        "initial begin\n"
+        "`uvm_info(`gfn, \"msg\", UVM_HIGH)\n"
+        "`PROJECT_BARE\n"
+        "`PROJECT_CHECK_EQ(a, b, \"first\")\n"
+        "`PROJECT_CHECK_EQ(c, d, \"second\")\n"
+        "end\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top;\n"
+        "initial begin\n"
+        "    `uvm_info(`gfn, \"msg\", UVM_HIGH)\n"
+        "    `PROJECT_BARE\n"
+        "    `PROJECT_CHECK_EQ(\n"
+        "        a,\n"
+        "        b,\n"
+        "        \"first\"\n"
+        "    )\n"
+        "    `PROJECT_CHECK_EQ(c, d, \"second\")\n"
+        "end\n"
+        "endmodule\n";
+
+    CHECK(format_source(input, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
 }
 
 TEST_CASE("formatter: macro arg call after blank line is idempotent", "[formatter]") {

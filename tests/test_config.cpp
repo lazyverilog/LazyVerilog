@@ -1,5 +1,6 @@
 #include "config.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 
@@ -110,6 +111,16 @@ space_inside_paren = true
 layout = "hanging"
 line_length = 70
 space_before_paren = true
+
+[format.macros]
+object_like_expr = ["RTL_STATUS_WIDTH"]
+function_like_expr = ["RTL_MASKED"]
+statement_like = ["RTL_CHECK_EQ"]
+declaration_like = ["RTL_ALERT_CONNECT"]
+control_flow_like = ["RTL_IF_ENABLED"]
+block_begin_like = ["RTL_PIPE_STAGE_BEGIN"]
+block_end_like = ["RTL_PIPE_STAGE_END"]
+whitespace_sensitive = ["RTL_LITERAL_PASTE"]
 
 [format.spacing]
 control_keyword_space = false
@@ -246,6 +257,17 @@ autoarg_on_save = true
     CHECK(cfg.format.function_declaration.layout == "hanging");
     CHECK(cfg.format.function_declaration.line_length == 70);
     CHECK(cfg.format.function_declaration.space_before_paren == true);
+    auto has_macro = [](const std::vector<std::string>& names, const char* name) {
+        return std::find(names.begin(), names.end(), name) != names.end();
+    };
+    CHECK(has_macro(cfg.format.macros.object_like_expr, "RTL_STATUS_WIDTH"));
+    CHECK(has_macro(cfg.format.macros.function_like_expr, "RTL_MASKED"));
+    CHECK(has_macro(cfg.format.macros.statement_like, "RTL_CHECK_EQ"));
+    CHECK(has_macro(cfg.format.macros.declaration_like, "RTL_ALERT_CONNECT"));
+    CHECK(has_macro(cfg.format.macros.control_flow_like, "RTL_IF_ENABLED"));
+    CHECK(has_macro(cfg.format.macros.block_begin_like, "RTL_PIPE_STAGE_BEGIN"));
+    CHECK(has_macro(cfg.format.macros.block_end_like, "RTL_PIPE_STAGE_END"));
+    CHECK(has_macro(cfg.format.macros.whitespace_sensitive, "RTL_LITERAL_PASTE"));
 
     CHECK(cfg.format.spacing.control_keyword_space == false);
     CHECK(cfg.format.spacing.space_inside_parens == true);
