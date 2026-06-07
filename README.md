@@ -11,8 +11,8 @@
   <a href="https://github.com/hxxdev/LazyVerilog/releases/latest">
     <img alt="Latest release" src="https://img.shields.io/github/v/release/hxxdev/LazyVerilog?style=for-the-badge&logo=github">
   </a>
-  <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/hxxdev/LazyVerilog?style=for-the-badge">
+  <a href="https://github.com/hxxdev/LazyVerilog/issues">
+    <img alt="GitHub issues" src="https://img.shields.io/github/issues/hxxdev/LazyVerilog?style=for-the-badge">
   </a>
   <a href="https://github.com/MikePopoloski/slang">
     <img alt="Powered by slang" src="https://img.shields.io/badge/parser-slang-blueviolet?style=for-the-badge">
