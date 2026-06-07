@@ -32,12 +32,7 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.2.app
 
       - name: Configure
-        run: |
-          EXTRA=""
-          if [[ "${{ matrix.platform }}" == "darwin-arm64" ]]; then
-            EXTRA="-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"
-          fi
-          cmake -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)

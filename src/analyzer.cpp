@@ -196,8 +196,12 @@ make_file_state_with_options(const std::filesystem::path& path,
 
 Analyzer::~Analyzer() {
     if (background_indexer_.joinable()) {
-        background_indexer_.request_stop();
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            background_stop_.store(true);
+        }
         background_cv_.notify_all();
+        background_indexer_.join();
     }
 }
 
@@ -3079,8 +3083,8 @@ void Analyzer::start_background_indexer_locked() const {
     if (background_indexer_.joinable())
         return;
 
-    background_indexer_ = std::jthread([this](std::stop_token stop) {
-        background_index_loop(stop);
+    background_indexer_ = std::thread([this] {
+        background_index_loop();
     });
 }
 
@@ -3105,8 +3109,8 @@ void Analyzer::schedule_background_project_publish_locked() const {
     background_cv_.notify_all();
 }
 
-void Analyzer::background_index_loop(std::stop_token stop) const {
-    while (!stop.stop_requested()) {
+void Analyzer::background_index_loop() const {
+    while (!background_stop_.load()) {
         std::string path_string;
         std::string uri;
         std::vector<std::string> defines;
@@ -3117,18 +3121,18 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
 
         {
             std::unique_lock<std::mutex> lock(map_mutex_);
-            background_cv_.wait(lock, stop, [&] {
-                return stop.stop_requested() || !background_pending_files_.empty() ||
+            background_cv_.wait(lock, [&] {
+                return background_stop_.load() || !background_pending_files_.empty() ||
                        background_publish_requested_;
             });
-            if (stop.stop_requested())
+            if (background_stop_.load())
                 break;
 
             if (background_publish_requested_ && background_pending_files_.empty()) {
                 const auto now = Clock::now();
                 if (background_publish_due_time_ > now) {
-                    background_cv_.wait_until(lock, stop, background_publish_due_time_, [&] {
-                        return stop.stop_requested() || !background_pending_files_.empty() ||
+                    background_cv_.wait_until(lock, background_publish_due_time_, [&] {
+                        return background_stop_.load() || !background_pending_files_.empty() ||
                                background_publish_due_time_ <= Clock::now();
                     });
                     continue;
@@ -3206,7 +3210,7 @@ void Analyzer::background_index_loop(std::stop_token stop) const {
 
         auto state = make_file_state_with_options(path_string, defines, include_dirs,
                                                   open_overlays);
-        if (stop.stop_requested() || !state || !state->tree) {
+        if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             background_index_active_ = false;
             background_cv_.notify_all();

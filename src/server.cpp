@@ -533,7 +533,19 @@ struct LazyVerilogServer::Impl {
     std::mutex diag_pending_mutex;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> diag_pending;
     std::condition_variable_any diag_cv;
-    std::jthread diag_thread;
+    std::atomic<bool> diag_stop_{false};
+    std::thread diag_thread;
+
+    ~Impl() {
+        if (diag_thread.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(diag_pending_mutex);
+                diag_stop_.store(true);
+            }
+            diag_cv.notify_all();
+            diag_thread.join();
+        }
+    }
 };
 
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
@@ -563,8 +575,8 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     // user-visible diagnostic latency is controlled by [lint].diagnostic_debounce_ms.
     analyzer_.set_project_index_publish_debounce_ms(250);
     impl_->diag_debounce_ms = config_.lint.diagnostic_debounce_ms;
-    impl_->diag_thread = std::jthread([this](std::stop_token stop) {
-        diag_debounce_loop(stop);
+    impl_->diag_thread = std::thread([this] {
+        diag_debounce_loop();
     });
     background_compiler_ = std::make_unique<BackgroundCompiler>(
         [this] { return analyzer_.compilation_snapshot(); },
@@ -759,12 +771,14 @@ void LazyVerilogServer::schedule_diagnostics(const std::string& uri) {
     impl_->diag_cv.notify_one();
 }
 
-void LazyVerilogServer::diag_debounce_loop(std::stop_token stop) {
+void LazyVerilogServer::diag_debounce_loop() {
     using Clock = std::chrono::steady_clock;
-    while (!stop.stop_requested()) {
+    while (!impl_->diag_stop_.load()) {
         std::unique_lock<std::mutex> lock(impl_->diag_pending_mutex);
-        impl_->diag_cv.wait(lock, stop, [&] { return !impl_->diag_pending.empty(); });
-        if (stop.stop_requested())
+        impl_->diag_cv.wait(lock, [&] {
+            return impl_->diag_stop_.load() || !impl_->diag_pending.empty();
+        });
+        if (impl_->diag_stop_.load())
             break;
 
         // Find soonest due time across all pending URIs.
@@ -773,7 +787,9 @@ void LazyVerilogServer::diag_debounce_loop(std::stop_token stop) {
             if (due < soonest) soonest = due;
 
         if (soonest > Clock::now()) {
-            impl_->diag_cv.wait_until(lock, stop, soonest, [] { return false; });
+            impl_->diag_cv.wait_until(lock, soonest, [&] {
+                return impl_->diag_stop_.load();
+            });
             continue;
         }
 

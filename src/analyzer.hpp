@@ -1,6 +1,7 @@
 #pragma once
 #include "document_state.hpp"
 #include "syntax_index.hpp"
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -316,7 +317,7 @@ class Analyzer {
     void start_background_indexer_locked() const;
     void schedule_background_reindex_locked() const;
     void schedule_background_project_publish_locked() const;
-    void background_index_loop(std::stop_token stop) const;
+    void background_index_loop() const;
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
     void invalidate_extra_snapshots_locked() const;
@@ -364,7 +365,8 @@ class Analyzer {
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
     mutable uint64_t background_generation_{0};
-    mutable std::jthread background_indexer_;
+    mutable std::thread background_indexer_;
+    mutable std::atomic<bool> background_stop_{false};
 
     std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
 };
