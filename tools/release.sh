@@ -174,6 +174,16 @@ validate_version() {
     fi
 }
 
+check_release_note() {
+    local note="${REPO_ROOT}/docs/releases/${VERSION}.md"
+    if [[ -f "$note" ]]; then
+        printf 'Release note found: %s\n' "${note#$REPO_ROOT/}"
+    else
+        printf 'WARNING: no release note found at docs/releases/%s.md\n' "$VERSION"
+        confirm "Continue without a release note?" || die "aborted — add docs/releases/${VERSION}.md first"
+    fi
+}
+
 update_version_file() {
     [[ -f "$VERSION_FILE" ]] || die "missing version file: $VERSION_FILE"
 
@@ -286,6 +296,8 @@ main() {
 
     printf 'Release version: %s\n' "$VERSION"
     printf '\n'
+
+    check_release_note
 
     confirm "Proceed with release?" || die "aborted by user"
 
