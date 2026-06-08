@@ -252,26 +252,49 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
     std::unordered_set<std::string> seen;
     std::vector<std::string> result;
 
-    auto add_path = [&](const std::filesystem::path& path) {
-        if (path.empty())
-            return;
-        const auto uri = uri_from_path(path);
-        if (uri == owning_uri)
-            return;
-        if (seen.insert(uri).second)
-            result.push_back(uri);
-    };
-
+    // Find the owning file's BufferID so we can distinguish its real `include
+    // children from open-buffer overlays that were pre-loaded into the same
+    // SourceManager.  Overlays are injected via assignText() with no
+    // includedFrom, making them indistinguishable from root files without this
+    // anchor check.
+    slang::BufferID owning_buffer;
     for (auto buffer : sm.getAllBuffers()) {
         const auto& full_path = sm.getFullPath(buffer);
-        if (!full_path.empty()) {
-            add_path(full_path);
-            continue;
+        if (!full_path.empty() && uri_from_path(full_path) == owning_uri) {
+            owning_buffer = buffer;
+            break;
         }
+    }
+    if (!owning_buffer.valid())
+        return result;
 
-        const auto raw_name = sm.getRawFileName(buffer);
-        if (!raw_name.empty())
-            add_path(std::filesystem::path(std::string(raw_name)));
+    // For each buffer, walk the includedFrom chain to its root.  Only buffers
+    // whose chain roots at owning_buffer are genuine `include dependencies.
+    // Buffers with no includedFrom (overlays, unrelated roots) are skipped.
+    for (auto buffer : sm.getAllBuffers()) {
+        const auto loc = sm.getIncludedFrom(buffer);
+        if (!loc.valid())
+            continue;  // root buffer — owning file or a pre-loaded overlay
+
+        // Walk to the root of the include chain.
+        slang::BufferID current = buffer;
+        while (true) {
+            const auto parent = sm.getIncludedFrom(current);
+            if (!parent.valid())
+                break;
+            current = parent.buffer();
+        }
+        if (current != owning_buffer)
+            continue;  // rooted at an overlay, not the owning file
+
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        const auto uri = uri_from_path(full_path);
+        if (uri == owning_uri)
+            continue;
+        if (seen.insert(uri).second)
+            result.push_back(uri);
     }
 
     return result;
