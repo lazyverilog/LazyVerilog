@@ -191,8 +191,7 @@
 
 ## 📊 Features
 
-What LazyVerilog currently supports. Coverage varies by construct and project setup — if something
-doesn't work for your codebase, bug reports are welcome.
+What LazyVerilog currently supports:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -221,8 +220,6 @@ Using <a href="https://github.com/folke/lazy.nvim"><code>lazy.nvim</code></a>:
 ```lua
 {
   "hxxdev/lazyverilog",
-  -- The repository contains large RTL test corpora as submodules; users do not
-  -- need them for the editor plugin.
   submodules = false,
   ft = { "systemverilog", "verilog" },
   config = function()
@@ -250,17 +247,29 @@ require("lazyverilog").setup({
 Create `lazyverilog.toml` in the project root.  At minimum, point `design.vcode` to a filelist so
 LazyVerilog can index modules, packages, ports, and cross-file references:
 
+For full configuration, refer to [`lazyverilog.toml`](lazyverilog.toml) — complete example configuration.
+
 ```toml
 [design]
 vcode = "path/to/vcode/file"
-define = ["FAST_SIM", "MY_DEFINE"]
+define = ["VERILATOR", "MY_DEFINE"]
+
+[compilation]
+background_compilation = true   # run semantic compilation in background workers (richer diagnostics)
+                                # Caution: can be laggy on slow machines.
 
 [format]
-enable_format_on_save = true
+enable_format_on_save = true # auto-formatting on file save.
 indent_size = 4
 
 [lint]
+enable = true # show lint diagnostics
+
+[lint.naming]
 enable = true
+severity = "warning"
+input_port_pattern = "^i_.*$"  # regex; input ports should start with i_
+output_port_pattern = "^o_.*$" # regex; output ports should start with o_
 
 [inlay_hint]
 enable = true
