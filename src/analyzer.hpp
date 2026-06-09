@@ -82,6 +82,7 @@ struct CompilationSnapshot {
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
     std::vector<std::string> open_uris;
+    std::unordered_map<std::string, uint64_t> uri_versions;
 };
 
 struct RtlTreeNode {
@@ -284,7 +285,8 @@ class Analyzer {
 
     /// Replace cached semantic diagnostics from the background compiler.
     void set_semantic_diagnostics(
-        std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics);
+        std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics,
+        const std::unordered_map<std::string, uint64_t>& snapshot_versions);
 
     /// Drop cached semantic diagnostics for one URI because its text changed.
     void clear_semantic_diagnostics(const std::string& uri);
@@ -372,7 +374,11 @@ class Analyzer {
     mutable std::thread background_indexer_;
     mutable std::atomic<bool> background_stop_{false};
 
-    std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
+    struct VersionedSemanticDiags {
+        uint64_t version{0};
+        std::vector<ParseDiagInfo> diags;
+    };
+    std::unordered_map<std::string, VersionedSemanticDiags> semantic_diagnostics_;
 
     // Async parse worker state.
     struct ParseJob {

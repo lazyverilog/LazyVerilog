@@ -17,6 +17,7 @@ struct BackgroundCompileResult {
     uint64_t generation{0};
     std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics_by_uri;
     std::vector<std::string> open_uris;
+    std::unordered_map<std::string, uint64_t> uri_versions;
 };
 
 struct BackgroundCompilerConfig {

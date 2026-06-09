@@ -374,6 +374,7 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = std::move(state);
         latest_version_[uri] = version;
+        semantic_diagnostics_.erase(uri);
         invalidate_extra_snapshots_locked();
     }
     {
@@ -470,6 +471,7 @@ void Analyzer::close(const std::string& uri) {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_.erase(uri);
         latest_version_.erase(uri);
+        semantic_diagnostics_.erase(uri);
         invalidate_extra_snapshots_locked();
         // If the closed file is also in the filelist cache, replace its live shard
         // with a disk-backed parse in the background.  Keeping this asynchronous is
@@ -2894,6 +2896,8 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         snapshot.open_uris.push_back(uri);
         seen_uris.insert(uri);
         seen_paths.insert(state->normalized_path);
+        if (const auto it = latest_version_.find(uri); it != latest_version_.end())
+            snapshot.uri_versions[uri] = it->second;
     }
 
     for (const auto& path_string : extra_files_) {
@@ -2921,9 +2925,24 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
 }
 
 void Analyzer::set_semantic_diagnostics(
-    std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics) {
+    std::unordered_map<std::string, std::vector<ParseDiagInfo>> diagnostics,
+    const std::unordered_map<std::string, uint64_t>& snapshot_versions) {
     std::lock_guard<std::mutex> lock(map_mutex_);
-    semantic_diagnostics_ = std::move(diagnostics);
+    for (auto& [uri, diags] : diagnostics) {
+        // Check version only for open buffers that have a tracked version.
+        // Closed/filelist-only files have no entry in latest_version_ and
+        // no entry in snapshot_versions — commit their diagnostics unconditionally.
+        const auto snap_it = snapshot_versions.find(uri);
+        const auto cur_it = latest_version_.find(uri);
+        const bool is_open_buffer = (snap_it != snapshot_versions.end());
+        if (is_open_buffer && cur_it != latest_version_.end()
+            && snap_it->second != cur_it->second)
+            continue;  // open buffer was edited since snapshot — stale
+        semantic_diagnostics_[uri] = VersionedSemanticDiags{
+            .version = (cur_it != latest_version_.end()) ? cur_it->second : 0,
+            .diags = std::move(diags),
+        };
+    }
 }
 
 void Analyzer::clear_semantic_diagnostics(const std::string& uri) {
@@ -2941,7 +2960,12 @@ std::vector<ParseDiagInfo> Analyzer::semantic_diagnostics(const std::string& uri
     const auto it = semantic_diagnostics_.find(uri);
     if (it == semantic_diagnostics_.end())
         return {};
-    return it->second;
+    const auto cur_it = latest_version_.find(uri);
+    if (cur_it == latest_version_.end())
+        return {};
+    if (it->second.version != cur_it->second)
+        return {};  // stale cache entry — don't publish
+    return it->second.diags;
 }
 
 std::vector<std::string> Analyzer::semantic_diagnostic_uris() const {

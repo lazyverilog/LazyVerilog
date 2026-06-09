@@ -386,6 +386,8 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
         }
     }
 
+    result.uri_versions = std::move(snapshot.uri_versions);
+
     const bool log_timing = log_timing_.load(std::memory_order_relaxed);
     if (log_timing) {
         const auto elapsed =

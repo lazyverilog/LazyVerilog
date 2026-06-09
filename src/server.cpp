@@ -557,6 +557,7 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     analyzer_.set_project_index_publish_debounce_ms(250);
     analyzer_.set_parse_complete_callback([this](const std::string& uri) {
         publish_diagnostics(uri);
+        schedule_background_compilation();
     });
     background_compiler_ = std::make_unique<BackgroundCompiler>(
         [this] { return analyzer_.compilation_snapshot(); },
@@ -580,7 +581,8 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
                 publish_if_open(uri);
             for (const auto& [uri, _] : result.diagnostics_by_uri)
                 publish_if_open(uri);
-            analyzer_.set_semantic_diagnostics(std::move(result.diagnostics_by_uri));
+            analyzer_.set_semantic_diagnostics(std::move(result.diagnostics_by_uri),
+                                               result.uri_versions);
             for (const auto& uri : uris_to_publish)
                 publish_diagnostics(uri);
         });
