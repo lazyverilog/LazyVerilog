@@ -795,3 +795,115 @@ endmodule
           "    i_data2\n"
           ");");
 }
+
+// Cross-file go-to-def fixtures.
+// kCrossDefLib is registered as a closed extra file (not opened as a document)
+// so all three lookups go through the SyntaxIndex path, not the AST fallback.
+static const std::string kCrossDefLib = R"(`define LIB_WIDTH 8
+
+typedef logic [7:0] byte_t;
+
+package util_pkg;
+    typedef logic [15:0] word_t;
+
+    function automatic int clamp(input int val, input int lo, input int hi);
+        return val < lo ? lo : val > hi ? hi : val;
+    endfunction
+
+    task delay_n(input int n);
+    endtask
+endpackage
+
+module adder #(
+    parameter int WIDTH = 8
+)(
+    input  logic [WIDTH-1:0] i_a,
+    input  logic [WIDTH-1:0] i_b,
+    output logic [WIDTH-1:0] o_sum
+);
+    assign o_sum = i_a + i_b;
+endmodule
+)";
+
+// module top; import util_pkg::*; then instantiate adder and call clamp/delay_n
+static const std::string kCrossDefTop = R"(module top;
+    import util_pkg::*;
+    adder #(.WIDTH(8)) u_adder (.i_a(8'h0), .i_b(8'h0), .o_sum());
+    initial begin
+        clamp(0, 0, 255);
+        delay_n(5);
+    end
+endmodule
+)";
+
+TEST_CASE("definition: module resolves to closed extra file via index", "[definition]") {
+    const auto lib_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_xdef_lib_module.sv";
+    {
+        std::ofstream out(lib_path);
+        out << kCrossDefLib;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_xdef_top_module.sv";
+    analyzer.set_extra_files({lib_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kCrossDefTop);
+
+    // cursor on "adder" at line 2, col 4
+    auto loc = analyzer.definition_of(top_uri, 2, 4);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->line == 15);
+    CHECK(loc->col == 7);
+
+    std::filesystem::remove(lib_path);
+}
+
+TEST_CASE("definition: package function resolves to closed extra file via index", "[definition]") {
+    const auto lib_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_xdef_lib_func.sv";
+    {
+        std::ofstream out(lib_path);
+        out << kCrossDefLib;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_xdef_top_func.sv";
+    analyzer.set_extra_files({lib_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kCrossDefTop);
+
+    // cursor on "clamp" at line 4, col 8
+    auto loc = analyzer.definition_of(top_uri, 4, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->line == 7);
+    CHECK(loc->col == 27);
+
+    std::filesystem::remove(lib_path);
+}
+
+TEST_CASE("definition: package task resolves to closed extra file via index", "[definition]") {
+    const auto lib_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_xdef_lib_task.sv";
+    {
+        std::ofstream out(lib_path);
+        out << kCrossDefLib;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_xdef_top_task.sv";
+    analyzer.set_extra_files({lib_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kCrossDefTop);
+
+    // cursor on "delay_n" at line 5, col 8
+    auto loc = analyzer.definition_of(top_uri, 5, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->line == 11);
+    CHECK(loc->col == 9);
+
+    std::filesystem::remove(lib_path);
+}

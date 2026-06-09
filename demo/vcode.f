@@ -1,4 +1,5 @@
 ./memory.sv
+./xdef_lib.sv
 ./memory_top.sv
 ./folding_demo.sv
 ./demo.sv
