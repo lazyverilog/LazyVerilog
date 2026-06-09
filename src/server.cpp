@@ -1523,7 +1523,6 @@ void LazyVerilogServer::register_handlers() {
 
             auto apply_ff_edits = [&](const AutoffResult& result, const std::string& uri) {
                 if (result.has_error || (result.edits.empty() && result.warn)) {
-                    // Return null result
                     lsp::Any null_result;
                     null_result.SetJsonString("null", lsp::Any::kNullType);
                     rsp.result = std::move(null_result);
@@ -1532,82 +1531,29 @@ void LazyVerilogServer::register_handlers() {
                 if (result.edits.empty())
                     return;
 
-                auto state = analyzer_.get_state(uri);
-                if (!state)
-                    return;
-
-                // Split once and build the final text in append order.  The
-                // previous implementation inserted into the middle of a vector
-                // for every edit; many flip-flop declarations could therefore
-                // shift the same tail lines repeatedly.
-                std::vector<std::string_view> lines;
-                {
-                    const std::string_view tv = state->text;
-                    size_t start = 0;
-                    while (start <= tv.size()) {
-                        size_t end = tv.find('\n', start);
-                        if (end == std::string_view::npos) {
-                            lines.push_back(tv.substr(start));
-                            break;
-                        }
-                        lines.push_back(tv.substr(start, end - start));
-                        start = end + 1;
-                    }
-                }
-
-                std::vector<const AutoffEdit*> edits;
-                edits.reserve(result.edits.size());
+                // Each AutoffEdit is a pure insertion at (line, 0).  AutoFF
+                // already uses the surrounding indentation from the source block,
+                // so no whole-file reformat is needed — emit one insert TextEdit
+                // per AutoffEdit and leave the rest of the file untouched.
+                std::string json;
+                json += "{\"changes\":{";
+                json += json_string(uri);
+                json += ":[";
+                bool first = true;
                 for (const auto& edit : result.edits) {
-                    if (edit.line >= 0 && edit.line <= static_cast<int>(lines.size()))
-                        edits.push_back(&edit);
+                    if (!first) json += ',';
+                    first = false;
+                    const auto line_str = std::to_string(edit.line);
+                    json += "{\"range\":{\"start\":{\"line\":";
+                    json += line_str;
+                    json += ",\"character\":0},\"end\":{\"line\":";
+                    json += line_str;
+                    json += ",\"character\":0}},\"newText\":";
+                    json += json_string(edit.text);
+                    json += '}';
                 }
-                std::sort(edits.begin(), edits.end(), [](const AutoffEdit* a, const AutoffEdit* b) {
-                    return a->line < b->line;
-                });
-
-                size_t next_line = 0;
-                std::string new_text;
-                new_text.reserve(state->text.size() + 256);
-                bool emitted_line = false;
-                auto append_line = [&](std::string_view line) {
-                    if (emitted_line)
-                        new_text += '\n';
-                    new_text += line;
-                    emitted_line = true;
-                };
-                auto append_edit_text = [&](std::string_view text) {
-                    size_t pos = 0;
-                    while (pos <= text.size()) {
-                        const size_t nl = text.find('\n', pos);
-                        if (nl == std::string_view::npos) {
-                            if (pos < text.size())
-                                append_line(text.substr(pos));
-                            break;
-                        }
-                        append_line(text.substr(pos, nl - pos));
-                        pos = nl + 1;
-                    }
-                };
-                for (const auto* edit : edits) {
-                    const auto edit_line = static_cast<size_t>(edit->line);
-                    while (next_line < edit_line)
-                        append_line(lines[next_line++]);
-                    append_edit_text(edit->text);
-                }
-                while (next_line < lines.size())
-                    append_line(lines[next_line++]);
-
-                new_text = format_source(new_text, config_.format);
-
-                // Build workspace edit JSON and set as result
-                lsWorkspaceEdit we;
-                lsTextEdit text_edit = whole_document_edit(*state, new_text);
-                we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
-                (*we.changes)[uri] = {text_edit};
-
-                rsp.result.SetJsonString(
-                    whole_document_workspace_edit_json(uri, *state, new_text),
-                    lsp::Any::kObjectType);
+                json += "]}}";
+                rsp.result.SetJsonString(json, lsp::Any::kObjectType);
             };
 
             if (cmd == "lazyverilog.lint") {

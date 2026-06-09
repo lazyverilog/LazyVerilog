@@ -193,13 +193,19 @@ struct FfFinder : public SyntaxVisitor<FfFinder> {
             return;
         }
 
+        // Infer one indent level from how deep 'if' is relative to the outer
+        // 'end'.  Example: outer end at col 0, 'if' at col 2 → indent_size 2.
+        const int outer_end_col = token_col(sm, outer->end);
+        const int if_col = token_col(sm, conditional->ifKeyword);
+        const int indent_size = std::max(if_col - outer_end_col, 2);
+
         FfBlock ff;
         ff.if_begin_line = token_line(sm, if_block->begin);
         ff.if_insert_line = token_line(sm, if_block->end);
-        ff.if_indent = std::string((size_t)token_col(sm, if_block->begin) + 4, ' ');
+        ff.if_indent = std::string((size_t)(token_col(sm, if_block->end) + indent_size), ' ');
         ff.else_begin_line = token_line(sm, else_block->begin);
         ff.else_insert_line = token_line(sm, else_block->end);
-        ff.else_indent = std::string((size_t)token_col(sm, else_block->begin) + 4, ' ');
+        ff.else_indent = std::string((size_t)(token_col(sm, else_block->end) + indent_size), ' ');
         ff.if_block = if_block;
         ff.else_block = else_block;
         block = ff;
