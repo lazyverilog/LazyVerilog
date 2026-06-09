@@ -1,9 +1,14 @@
+#include "document_state.hpp"
+#include "dynamic_file_index.hpp"
+#include "syntax_index.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <slang/syntax/SyntaxTree.h>
@@ -18,6 +23,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+double ms_since(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
 double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
@@ -28,6 +37,7 @@ struct Options {
     fs::path verible_bin;
     bool build_verible{false};
     bool ignore_missing{false};
+    bool verbose{false};
 };
 
 std::string shell_quote(const std::string& text) {
@@ -167,7 +177,7 @@ VeribleResult run_verible(const fs::path& verible_bin, const std::vector<fs::pat
 void print_usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " <filelist.f> [--verible-root ~/dev/verible]"
-                 " [--verible-bin PATH] [--build-verible] [--ignore-missing]\n";
+                 " [--verible-bin PATH] [--build-verible] [--ignore-missing] [--verbose]\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -184,6 +194,8 @@ Options parse_args(int argc, char** argv) {
             options.build_verible = true;
         } else if (arg == "--ignore-missing") {
             options.ignore_missing = true;
+        } else if (arg == "--verbose") {
+            options.verbose = true;
         } else if (arg.starts_with("--")) {
             throw std::runtime_error("unknown option: " + arg);
         } else if (options.filelist.empty()) {
@@ -196,6 +208,49 @@ Options parse_args(int argc, char** argv) {
     if (options.filelist.empty())
         throw std::runtime_error("missing filelist");
     return options;
+}
+
+struct FileResult {
+    fs::path path;
+    double parse_ms{0};
+    double index_ms{0};
+    bool parse_ok{false};
+};
+
+void print_stats(const char* label, const std::vector<FileResult>& results,
+                 bool use_parse, const std::vector<fs::path>& files) {
+    double total_ms = 0;
+    double max_ms = 0;
+    size_t max_i = 0;
+    size_t count = 0;
+    size_t failed = 0;
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
+        if (!r.parse_ok && use_parse) {
+            ++failed;
+            continue;
+        }
+        if (!r.parse_ok)
+            continue;
+        const double ms = use_parse ? r.parse_ms : r.index_ms;
+        total_ms += ms;
+        ++count;
+        if (ms > max_ms) {
+            max_ms = ms;
+            max_i = i;
+        }
+    }
+
+    std::cout << label << ":\n";
+    std::cout << "  total:  " << std::fixed << std::setprecision(3) << total_ms / 1000.0 << "s";
+    if (count > 0)
+        std::cout << "  avg: " << std::setprecision(2) << total_ms / count << "ms"
+                  << "  max: " << std::setprecision(2) << max_ms << "ms"
+                  << " (" << files[max_i].filename().string() << ")";
+    if (use_parse && failed > 0)
+        std::cout << "  failed: " << failed;
+    std::cout << "\n";
 }
 
 } // namespace
@@ -212,39 +267,63 @@ int main(int argc, char** argv) {
 
     try {
         auto files = parse_filelist(options.filelist);
-        std::vector<fs::path> existing;
-        for (const auto& file : files) {
-            if (fs::exists(file)) {
-                existing.push_back(file);
-            } else {
-                std::cerr << "missing file: " << file << "\n";
-                if (!options.ignore_missing)
-                    return 2;
+        {
+            std::vector<fs::path> existing;
+            for (const auto& file : files) {
+                if (fs::exists(file)) {
+                    existing.push_back(file);
+                } else {
+                    std::cerr << "missing file: " << file << "\n";
+                    if (!options.ignore_missing)
+                        return 2;
+                }
             }
+            files = std::move(existing);
         }
-        files = std::move(existing);
         if (files.empty()) {
             std::cerr << "no source files to parse\n";
             return 2;
         }
 
         std::cout << "filelist: " << fs::absolute(options.filelist).lexically_normal() << "\n";
-        std::cout << "files:    " << files.size() << "\n";
+        std::cout << "files:    " << files.size() << "\n\n";
 
-        size_t slang_ok = 0;
-        size_t slang_failed = 0;
+        // Combined parse + dynamic-index pass (single SourceManager for all files).
         slang::SourceManager source_manager;
-        auto slang_start = Clock::now();
-        for (const auto& file : files) {
-            auto tree = slang::syntax::SyntaxTree::fromFile(file.string(), source_manager);
-            if (tree)
-                ++slang_ok;
-            else
-                ++slang_failed;
+        std::vector<FileResult> results;
+        results.reserve(files.size());
+
+        for (size_t i = 0; i < files.size(); ++i) {
+            FileResult r;
+            r.path = files[i];
+
+            auto t0 = Clock::now();
+            auto tree_result = slang::syntax::SyntaxTree::fromFile(files[i].string(), source_manager);
+            r.parse_ms = ms_since(t0);
+            r.parse_ok = tree_result.has_value();
+
+            if (tree_result) {
+                auto tree = tree_result.value();
+                DocumentState state("file://" + files[i].string(), std::string{}, tree);
+                auto t1 = Clock::now();
+                build_dynamic_file_index(state);
+                r.index_ms = ms_since(t1);
+            }
+
+            results.push_back(r);
+
+            if (options.verbose) {
+                std::cout << std::fixed << std::setprecision(2)
+                          << "  parse=" << r.parse_ms << "ms"
+                          << "  index=" << r.index_ms << "ms"
+                          << "  " << files[i].filename().string()
+                          << (r.parse_ok ? "" : "  [FAILED]") << "\n";
+            }
         }
-        const double slang_seconds = seconds_since(slang_start);
-        std::cout << "lazyverilog/slang: " << slang_seconds << "s"
-                  << " parsed=" << slang_ok << " failed=" << slang_failed << "\n";
+
+        print_stats("parse (slang)", results, true, files);
+        print_stats("dynamic-index", results, false, files);
+        std::cout << "\n";
 
         auto verible_bin = find_verible_bin(options);
         if (!verible_bin) {
@@ -253,9 +332,11 @@ int main(int argc, char** argv) {
         }
 
         const auto verible = run_verible(*verible_bin, files);
-        std::cout << "verible:           " << verible.seconds << "s"
-                  << " batches=" << verible.batches << " failed_batches=" << verible.failed_batches
-                  << " last_status=" << verible.last_status << "\n";
+        std::cout << "verible:\n"
+                  << "  total:  " << std::fixed << std::setprecision(3) << verible.seconds << "s"
+                  << "  batches=" << verible.batches
+                  << "  failed_batches=" << verible.failed_batches
+                  << "  last_status=" << verible.last_status << "\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
         return 1;

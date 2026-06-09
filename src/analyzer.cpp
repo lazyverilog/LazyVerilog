@@ -410,14 +410,6 @@ void Analyzer::parse_worker_loop() {
         auto state = make_state(job.uri, job.text); // outside all locks
         state->doc_version = job.version;
 
-        // Pre-warm the dynamic index while still on the parse worker thread
-        // and before publishing the state.  go-to-def and hover call
-        // get_dynamic_index() on the hot path; warming here means the
-        // call_once is already done by the time any LSP request arrives,
-        // so those handlers never pay the AST walk cost inline.
-        if (state->tree)
-            get_dynamic_index(*state);
-
         bool committed = false;
         bool listed_extra = false;
         {

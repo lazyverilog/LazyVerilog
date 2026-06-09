@@ -207,7 +207,12 @@ target_link_libraries(lazyverilog-tests
 include(Catch)
 catch_discover_tests(lazyverilog-tests)
 
-add_executable(parse-bench tools/parse_bench.cpp)
+add_executable(parse-bench
+    tools/parse_bench.cpp
+    src/dynamic_file_index.cpp
+    src/syntax_index.cpp
+    src/syntax_index_shared.cpp)
+target_include_directories(parse-bench PRIVATE src)
 target_link_libraries(parse-bench PRIVATE slang::slang)
 
 add_executable(lazyverilog-fmt tools/fmt_file.cpp src/features/formatter.cpp src/config.cpp)
