@@ -110,10 +110,14 @@ class Analyzer {
     /// Update text for uri, creating a new immutable DocumentState snapshot.
     void change(const std::string& uri, const std::string& text);
 
-    /// Update text immediately without reparsing (tree will be null until
-    /// the next change() call).  Use on every didChange so get_state()->text
-    /// is always current; call change() on debounce to build the AST.
-    void update_text(const std::string& uri, const std::string& text);
+    /// Replaces update_text() + change().  Immediately stores null-tree state
+    /// with current text, assigns a monotonically increasing version, enqueues
+    /// async parse.  Returns assigned version.
+    uint64_t enqueue_parse(const std::string& uri, const std::string& text);
+
+    /// Server registers this once.  Called on worker thread after a parse commits.
+    void set_parse_complete_callback(
+        std::function<void(const std::string& uri)> cb);
 
     /// Remove document from cache.
     void close(const std::string& uri);
@@ -369,4 +373,26 @@ class Analyzer {
     mutable std::atomic<bool> background_stop_{false};
 
     std::unordered_map<std::string, std::vector<ParseDiagInfo>> semantic_diagnostics_;
+
+    // Async parse worker state.
+    struct ParseJob {
+        std::string uri;
+        std::string text;
+        uint64_t version;
+    };
+
+    std::function<void(const std::string&)> parse_complete_cb_;
+
+    // Version tracking — under map_mutex_
+    std::unordered_map<std::string, uint64_t> latest_version_;
+    std::atomic<uint64_t> version_counter_{0};
+
+    // Parse job queue — coalesced per URI
+    std::unordered_map<std::string, ParseJob> parse_pending_;
+    std::mutex parse_mutex_;
+    std::condition_variable parse_cv_;
+    std::atomic<bool> parse_stop_{false};
+    std::thread parse_worker_;
+
+    void parse_worker_loop();
 };

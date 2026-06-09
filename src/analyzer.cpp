@@ -195,6 +195,14 @@ make_file_state_with_options(const std::filesystem::path& path,
 }
 
 Analyzer::~Analyzer() {
+    if (parse_worker_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(parse_mutex_);
+            parse_stop_.store(true);
+        }
+        parse_cv_.notify_all();
+        parse_worker_.join();
+    }
     if (background_indexer_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
@@ -351,31 +359,131 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 
 }
 
-void Analyzer::update_text(const std::string& uri, const std::string& text) {
+uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text) {
+    uint64_t version = ++version_counter_;
+
     std::string path = uri;
     if (path.starts_with("file://"))
         path = path.substr(7);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalize_filesystem_path(path).string();
     cache_document_end_position(*state);
-    // tree remains null — full reparse deferred to the next change() call
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    docs_[uri] = std::move(state);
-    invalidate_extra_snapshots_locked();
+    state->doc_version = version;
+
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        docs_[uri] = std::move(state);
+        latest_version_[uri] = version;
+        invalidate_extra_snapshots_locked();
+    }
+    {
+        std::lock_guard<std::mutex> lock(parse_mutex_);
+        parse_pending_[uri] = ParseJob{uri, text, version};
+        if (!parse_worker_.joinable())
+            parse_worker_ = std::thread([this] { parse_worker_loop(); });
+    }
+    parse_cv_.notify_one();
+    return version;
+}
+
+void Analyzer::set_parse_complete_callback(
+    std::function<void(const std::string& uri)> cb) {
+    parse_complete_cb_ = std::move(cb);
+}
+
+void Analyzer::parse_worker_loop() {
+    while (true) {
+        ParseJob job;
+        {
+            std::unique_lock<std::mutex> lock(parse_mutex_);
+            parse_cv_.wait(lock, [&] {
+                return parse_stop_.load() || !parse_pending_.empty();
+            });
+            if (parse_stop_.load())
+                break;
+            auto it = parse_pending_.begin();
+            job = std::move(it->second);
+            parse_pending_.erase(it);
+        }
+
+        auto state = make_state(job.uri, job.text); // outside all locks
+        state->doc_version = job.version;
+
+        bool committed = false;
+        bool listed_extra = false;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            auto it = latest_version_.find(job.uri);
+            if (it != latest_version_.end() && it->second == job.version) {
+                docs_[job.uri] = state;
+                invalidate_extra_snapshots_locked();
+                listed_extra = extra_file_set_.contains(state->normalized_path);
+
+                // Replicate dependent-reparse logic from change()
+                auto depends_on_changed_uri = [&](const DocumentState& doc) {
+                    return doc.include_dependency_set.contains(job.uri);
+                };
+                auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
+                    return std::find(deps.begin(), deps.end(), job.uri) != deps.end();
+                };
+
+                bool queued_dependent = false;
+                for (const auto& [other_uri, other_state] : docs_) {
+                    if (other_uri == job.uri || !other_state ||
+                        !depends_on_changed_uri(*other_state))
+                        continue;
+                    background_pending_files_.push_front(other_state->normalized_path);
+                    queued_dependent = true;
+                }
+                for (const auto& [extra_uri, entry] : extra_cache_) {
+                    if (docs_.contains(extra_uri) || !index_depends_on_changed_uri(entry.index ? entry.index->include_dependencies : std::vector<std::string>{}))
+                        continue;
+                    background_pending_files_.push_front(entry.path);
+                    queued_dependent = true;
+                }
+                if (queued_dependent) {
+                    ++background_generation_;
+                    start_background_indexer_locked();
+                    background_cv_.notify_all();
+                }
+
+                committed = true;
+            }
+            // else: stale, discard
+        }
+
+        if (committed) {
+            if (listed_extra) {
+                auto index = get_dynamic_index(*state);
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (const auto it = docs_.find(job.uri); it != docs_.end() && it->second == state)
+                    update_extra_cache_for_live_state_locked(state, std::move(index));
+            }
+            if (parse_complete_cb_)
+                parse_complete_cb_(job.uri);
+        }
+    }
 }
 
 void Analyzer::close(const std::string& uri) {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-    docs_.erase(uri);
-    invalidate_extra_snapshots_locked();
-    // If the closed file is also in the filelist cache, replace its live shard
-    // with a disk-backed parse in the background.  Keeping this asynchronous is
-    // important for large buffers: closing a split should not synchronously
-    // parse an include-heavy RTL file on the UI path.
-    if (const auto it = extra_cache_.find(uri); it != extra_cache_.end()) {
-        background_pending_files_.push_back(it->second.path);
-        start_background_indexer_locked();
-        background_cv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        docs_.erase(uri);
+        latest_version_.erase(uri);
+        invalidate_extra_snapshots_locked();
+        // If the closed file is also in the filelist cache, replace its live shard
+        // with a disk-backed parse in the background.  Keeping this asynchronous is
+        // important for large buffers: closing a split should not synchronously
+        // parse an include-heavy RTL file on the UI path.
+        if (const auto it = extra_cache_.find(uri); it != extra_cache_.end()) {
+            background_pending_files_.push_back(it->second.path);
+            start_background_indexer_locked();
+            background_cv_.notify_all();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(parse_mutex_);
+        parse_pending_.erase(uri);
     }
 }
 

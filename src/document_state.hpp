@@ -77,6 +77,7 @@ struct DocumentState {
     // gets a new DocumentState and therefore a fresh once_flag/cache pair.
     mutable std::once_flag dynamic_index_once_;
     mutable SyntaxIndex dynamic_index_cache_;
+    uint64_t doc_version{0};
     DocumentState() = default;
     DocumentState(std::string uri, std::string text,
                   std::shared_ptr<slang::syntax::SyntaxTree> tree)

@@ -27,8 +27,6 @@ class LazyVerilogServer {
     void request_inlay_hint_refresh();
     void configure_background_compiler();
     void schedule_background_compilation();
-    void schedule_diagnostics(const std::string& uri);
-    void diag_debounce_loop();
 
     std::filesystem::path root_;
     bool config_found_{false};
