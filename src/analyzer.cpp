@@ -2019,12 +2019,29 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             }
         }
 
-        if (target.kind == DefinitionTargetKind::Instance)
+        if (target.kind == DefinitionTargetKind::Instance) {
+            // symbol_info_from_definition requires a live SyntaxTree which closed
+            // files don't have.  Fall back to the SyntaxIndex shard: module_doc_from_entry
+            // already formats a port table from ModuleEntry, so hover still shows ports.
+            std::string doc;
+            for (const auto& extra : *extra_files) {
+                if (extra.uri != definition->uri)
+                    continue;
+                for (const auto& mod : extra.index_ref().modules) {
+                    if (mod.name == target.module_name) {
+                        doc = module_doc_from_entry(mod);
+                        break;
+                    }
+                }
+                break;
+            }
             return SymbolInfo{.name = target.module_name,
                               .kind = "module",
                               .detail = "module",
+                              .doc = std::move(doc),
                               .line = definition->line,
                               .col = definition->col};
+        }
         if (target.kind == DefinitionTargetKind::NamedArgument)
             return SymbolInfo{.name = target.name,
                               .kind = "argument",
