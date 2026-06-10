@@ -49,6 +49,7 @@ struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {
     int target_line;
     std::string name;
     LineRange range;
+    BufferID host_buffer{};
     bool found{false};
 
     TargetModuleRangeFinder(const SourceManager& sm, int target_line)
@@ -62,6 +63,7 @@ struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {
             return;
         name = std::string(node.header->name.valueText());
         range = candidate;
+        host_buffer = node.getFirstToken().location().buffer();
         found = true;
     }
 };
@@ -71,12 +73,19 @@ struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {
 struct DeclCollector : public SyntaxVisitor<DeclCollector> {
     const SourceManager& sm;
     LineRange range;
+    BufferID host_buffer;
     std::set<std::string> declared;
 
-    DeclCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+    DeclCollector(const SourceManager& sm, LineRange range, BufferID host_buffer)
+        : sm(sm), range(range), host_buffer(host_buffer) {}
+
+    bool in_host_range(const slang::parsing::Token& tok) const {
+        return tok.location().buffer() == host_buffer &&
+               in_range(token_line(sm, tok), range);
+    }
 
     void handle(const DataDeclarationSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (!in_host_range(node.getFirstToken()))
             return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
@@ -86,7 +95,7 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const NetDeclarationSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (!in_host_range(node.getFirstToken()))
             return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
@@ -96,7 +105,7 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const PortDeclarationSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (!in_host_range(node.getFirstToken()))
             return;
         for (uint32_t i = 0; i < node.declarators.size(); ++i) {
             const auto* d = node.declarators[i];
@@ -106,7 +115,7 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const ParameterDeclarationSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (!in_host_range(node.getFirstToken()))
             return;
         for (const auto* declarator : node.declarators) {
             if (declarator)
@@ -115,7 +124,7 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
         visitDefault(node);
     }
     void handle(const ImplicitAnsiPortSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (!in_host_range(node.getFirstToken()))
             return;
         if (node.declarator)
             declared.insert(std::string(node.declarator->name.valueText()));
@@ -128,12 +137,15 @@ struct DeclCollector : public SyntaxVisitor<DeclCollector> {
 struct AssignLhsCollector : public SyntaxVisitor<AssignLhsCollector> {
     const SourceManager& sm;
     LineRange range;
+    BufferID host_buffer;
     std::vector<std::string> signals;
 
-    AssignLhsCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+    AssignLhsCollector(const SourceManager& sm, LineRange range, BufferID host_buffer)
+        : sm(sm), range(range), host_buffer(host_buffer) {}
 
     void handle(const ContinuousAssignSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (node.getFirstToken().location().buffer() != host_buffer ||
+            !in_range(token_line(sm, node.getFirstToken()), range))
             return;
         for (uint32_t i = 0; i < node.assignments.size(); ++i) {
             const auto* expr = node.assignments[i];
@@ -158,13 +170,16 @@ struct AssignLhsCollector : public SyntaxVisitor<AssignLhsCollector> {
 struct CombLhsCollector : public SyntaxVisitor<CombLhsCollector> {
     const SourceManager& sm;
     LineRange range;
+    BufferID host_buffer;
     std::vector<std::string> signals;
     bool in_comb{false};
 
-    CombLhsCollector(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+    CombLhsCollector(const SourceManager& sm, LineRange range, BufferID host_buffer)
+        : sm(sm), range(range), host_buffer(host_buffer) {}
 
     void handle(const ProceduralBlockSyntax& node) {
-        if (!in_range(token_line(sm, node.getFirstToken()), range))
+        if (node.getFirstToken().location().buffer() != host_buffer ||
+            !in_range(token_line(sm, node.getFirstToken()), range))
             return;
         if (node.kind == SyntaxKind::AlwaysCombBlock) {
             bool was = in_comb;
@@ -440,6 +455,7 @@ static std::vector<InstSignal> collect_inst_signals(const DocumentState& state,
 struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     const SourceManager& sm;
     LineRange range;
+    BufferID host_buffer;
     int body_start{0};
     int end_module{0};
     int last_decl = -1;
@@ -447,7 +463,8 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     int first_proc = -1;
     bool found_module{false};
 
-    InsertionLineFinder(const SourceManager& sm, LineRange range) : sm(sm), range(range) {}
+    InsertionLineFinder(const SourceManager& sm, LineRange range, BufferID host_buffer)
+        : sm(sm), range(range), host_buffer(host_buffer) {}
 
     void handle(const ModuleDeclarationSyntax& node) {
         if (found_module)
@@ -462,20 +479,30 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
         visitDefault(node);
     }
     void handle(const DataDeclarationSyntax& node) {
-        last_decl = std::max(last_decl, token_line(sm, node.getFirstToken()));
+        if (node.getFirstToken().location().buffer() != host_buffer)
+            return;
+        int line = token_line(sm, node.getFirstToken());
+        last_decl = std::max(last_decl, line);
         visitDefault(node);
     }
     void handle(const NetDeclarationSyntax& node) {
-        last_decl = std::max(last_decl, token_line(sm, node.getFirstToken()));
+        if (node.getFirstToken().location().buffer() != host_buffer)
+            return;
+        int line = token_line(sm, node.getFirstToken());
+        last_decl = std::max(last_decl, line);
         visitDefault(node);
     }
     void handle(const HierarchyInstantiationSyntax& node) {
+        if (node.getFirstToken().location().buffer() != host_buffer)
+            return;
         int line = token_line(sm, node.getFirstToken());
         if (first_inst < 0 || line < first_inst)
             first_inst = line;
         visitDefault(node);
     }
     void handle(const ProceduralBlockSyntax& node) {
+        if (node.keyword.location().buffer() != host_buffer)
+            return;
         int line = token_line(sm, node.keyword);
         if (first_proc < 0 || line < first_proc)
             first_proc = line;
@@ -483,10 +510,10 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
     }
 };
 
-static int find_insertion_line(const DocumentState& state, LineRange range) {
+static int find_insertion_line(const DocumentState& state, LineRange range, BufferID host_buffer) {
     if (!state.tree)
         return 0;
-    InsertionLineFinder finder(state.tree->sourceManager(), range);
+    InsertionLineFinder finder(state.tree->sourceManager(), range, host_buffer);
     state.tree->root().visit(finder);
     if (finder.last_decl >= 0)
         return finder.last_decl + 1;
@@ -569,14 +596,14 @@ static std::vector<SignalDecl> compute_new_signals(const DocumentState& state,
         return {};
 
     // Collect declared signals in the module where AutoWire inserts declarations.
-    DeclCollector decl_coll(state.tree->sourceManager(), module_finder.range);
+    DeclCollector decl_coll(state.tree->sourceManager(), module_finder.range, module_finder.host_buffer);
     state.tree->root().visit(decl_coll);
     // Collect assign LHS in the same module.
-    AssignLhsCollector assign_coll(state.tree->sourceManager(), module_finder.range);
+    AssignLhsCollector assign_coll(state.tree->sourceManager(), module_finder.range, module_finder.host_buffer);
     state.tree->root().visit(assign_coll);
 
     // Collect always_comb LHS in the same module.
-    CombLhsCollector comb_coll(state.tree->sourceManager(), module_finder.range);
+    CombLhsCollector comb_coll(state.tree->sourceManager(), module_finder.range, module_finder.host_buffer);
     state.tree->root().visit(comb_coll);
 
     // Collect instantiation signals in the same parent module.
@@ -630,7 +657,9 @@ static std::string apply_signal_declarations(const DocumentState& state,
     std::string decl_text = format_declarations(new_sigs, options);
     TargetModuleRangeFinder module_finder(state.tree->sourceManager(), target_line);
     state.tree->root().visit(module_finder);
-    int insert_line = module_finder.found ? find_insertion_line(state, module_finder.range) : 0;
+    int insert_line = module_finder.found
+                          ? find_insertion_line(state, module_finder.range, module_finder.host_buffer)
+                          : 0;
 
     std::vector<std::string> out_lines;
     out_lines.insert(out_lines.end(), lines.begin(), lines.begin() + insert_line);
