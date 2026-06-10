@@ -55,7 +55,7 @@ struct TargetModuleRangeFinder : public SyntaxVisitor<TargetModuleRangeFinder> {
         : sm(sm), target_line(target_line) {}
 
     void handle(const ModuleDeclarationSyntax& node) {
-        if (found)
+        if (found || !node.header)
             return;
         LineRange candidate{token_line(sm, node.getFirstToken()), token_line(sm, node.endmodule)};
         if (target_line >= 0 && !in_range(target_line, candidate))
