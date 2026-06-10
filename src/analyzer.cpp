@@ -2817,6 +2817,38 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     }
     const SymbolID target_symbol_id = SymbolID::from_canonical(target_symbol_debug);
     const SymbolID fallback_symbol_id = SymbolID::from_canonical(fallback_symbol_debug);
+    const bool allow_include_name_bridge =
+        target && target_info.scope_package.empty() &&
+        !target_symbol_debug.starts_with("class_method::");
+    const SymbolID include_bridge_name_id =
+        allow_include_name_bridge ? SymbolID::from_canonical("name:" + target->name) : SymbolID{};
+
+    auto index_includes_target_source = [&](const SyntaxIndex& index) {
+        // Included-file declarations can be seen under two different syntactic
+        // worlds: the standalone header that the user opened, and every parsed
+        // includer shard.  If a shard lists the definition URI as an include
+        // dependency, unresolved `name:<identifier>` occurrences in that shard
+        // are plausible references to the clicked header declaration.
+        //
+        // Important: do not treat `source_files` alone as a match.  The root
+        // file is also present there, and enabling a name bridge for ordinary
+        // same-file symbols revives the broad fallback false positives that the
+        // owner-qualified SymbolID path is designed to avoid.
+        return target_def &&
+               std::find(index.include_dependencies.begin(), index.include_dependencies.end(),
+                         target_def->uri) != index.include_dependencies.end();
+    };
+
+    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref) {
+        if (target_symbol_id && ref.symbol_id == target_symbol_id)
+            return true;
+        if (fallback_symbol_id && ref.symbol_id == fallback_symbol_id)
+            return true;
+        if (include_bridge_name_id && ref.symbol_id == include_bridge_name_id &&
+            index_includes_target_source(index))
+            return true;
+        return false;
+    };
 
     std::vector<Location> result;
     std::set<std::tuple<std::string, int, int>> seen;
@@ -2944,8 +2976,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // SymbolID path avoids that by matching `module:memory` directly.
             const auto open_index = get_structural_index(*state);
             for (const auto& ref : open_index.references) {
-                if (ref.symbol_id == target_symbol_id ||
-                    (fallback_symbol_id && ref.symbol_id == fallback_symbol_id))
+                if (reference_matches_target(open_index, ref))
                     add_indexed_reference(state_uri, open_index, ref);
             }
             if (target_info.kind == DefinitionTargetKind::ClassMember &&
@@ -2961,7 +2992,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     for (const auto& extra : *extra_idx) {
         if (open_uris.contains(extra.uri))
             continue;
-        if (!target_symbol_id && !fallback_symbol_id)
+        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -2969,8 +3000,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // closer to the v1.0.4 model; explicit references / rename requests pay
         // the linear scan cost over compact ReferenceEntry records instead.
         for (const auto& ref : extra.index_ref().references) {
-            if (ref.symbol_id == target_symbol_id ||
-                (fallback_symbol_id && ref.symbol_id == fallback_symbol_id))
+            if (reference_matches_target(extra.index_ref(), ref))
                 add_indexed_reference(extra.uri, extra.index_ref(), ref);
         }
     }

@@ -1061,6 +1061,97 @@ endmodule
     std::filesystem::remove(dir);
 }
 
+TEST_CASE("references: included header declarations bridge unresolved includer names",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     "lazyverilog_refs_include_symbol_bridge";
+    std::filesystem::create_directories(dir);
+
+    const auto header_path = dir / "params.svh";
+    const auto top_path = dir / "memory_top.sv";
+
+    const std::string header = R"(typedef enum logic [1:0] {
+    IDLE,
+    RUN
+} state_t;
+
+typedef struct packed {
+    logic valid;
+} packet_t;
+
+class Packet;
+    int data;
+endclass
+
+parameter int DATA_WIDTH = 32;
+logic [3:0] global_arr;
+)";
+    const std::string top = R"(`include "params.svh"
+
+module memory_top;
+    state_t state;
+    packet_t pkt;
+    Packet p;
+    logic [DATA_WIDTH-1:0] bus;
+
+    initial begin
+        state = RUN;
+        bus = global_arr[0];
+        bus = pkt.valid;
+        p.data = bus;
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(header_path);
+        REQUIRE(out.good());
+        out << header;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({top_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string header_uri = "file://" + header_path.string();
+    const std::string top_uri = "file://" + top_path.string();
+    analyzer.open(header_uri, header);
+
+    auto has_top_reference = [&](std::string_view declaration_needle,
+                                 std::string_view use_needle) {
+        const auto [decl_line, decl_col] = find_position(header, declaration_needle);
+        const auto [use_line, use_col] = find_position(top, use_needle);
+        const auto refs = analyzer.find_references(header_uri, decl_line, decl_col, false);
+        return std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+            return ref.uri == top_uri && ref.line == use_line && ref.col == use_col;
+        });
+    };
+
+    // Each declaration lives in the standalone opened header, while each use is
+    // in a closed project shard that only sees the declarations through
+    // `include.  If the includer cannot classify a token precisely, it records
+    // `name:<identifier>`; find-references must bridge those unresolved names
+    // only for shards that actually include the declaration source file.
+    CHECK(has_top_reference("state_t;", "state_t state"));
+    CHECK(has_top_reference("RUN", "RUN"));
+    CHECK(has_top_reference("packet_t;", "packet_t pkt"));
+    CHECK(has_top_reference("valid;", "valid"));
+    CHECK(has_top_reference("Packet;", "Packet p"));
+    CHECK(has_top_reference("data;", "data ="));
+    CHECK(has_top_reference("DATA_WIDTH", "DATA_WIDTH"));
+    CHECK(has_top_reference("global_arr", "global_arr"));
+
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: included subroutine declaration matches closed includer call",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() /
