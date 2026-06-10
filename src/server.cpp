@@ -79,6 +79,37 @@
 DEFINE_REQUEST_RESPONSE_TYPE(wp_inlayHintRefresh, JsonNull, JsonNull,
                              "workspace/inlayHint/refresh");
 
+// Local types for client/registerCapability with file watcher options.
+// LibLsp's Registration struct omits registerOptions, so we define our own.
+struct FileSystemWatcher {
+    std::string globPattern;
+    MAKE_SWAP_METHOD(FileSystemWatcher, globPattern);
+};
+MAKE_REFLECT_STRUCT(FileSystemWatcher, globPattern);
+
+struct DidChangeWatchedFilesRegistrationOptions {
+    std::vector<FileSystemWatcher> watchers;
+    MAKE_SWAP_METHOD(DidChangeWatchedFilesRegistrationOptions, watchers);
+};
+MAKE_REFLECT_STRUCT(DidChangeWatchedFilesRegistrationOptions, watchers);
+
+struct RegistrationWithOptions {
+    std::string id;
+    std::string method;
+    DidChangeWatchedFilesRegistrationOptions registerOptions;
+    MAKE_SWAP_METHOD(RegistrationWithOptions, id, method, registerOptions);
+};
+MAKE_REFLECT_STRUCT(RegistrationWithOptions, id, method, registerOptions);
+
+struct RegistrationParamsWithOptions {
+    std::vector<RegistrationWithOptions> registrations;
+    MAKE_SWAP_METHOD(RegistrationParamsWithOptions, registrations);
+};
+MAKE_REFLECT_STRUCT(RegistrationParamsWithOptions, registrations);
+
+DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterFileWatchers, RegistrationParamsWithOptions,
+                             JsonNull, "client/registerCapability");
+
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
     std::string what() override { return {}; }
@@ -934,7 +965,23 @@ void LazyVerilogServer::register_handlers() {
 
     // ── initialized ───────────────────────────────────────────────────────────
     ep.registerHandler([&](const Notify_InitializedNotification::notify&) {
-        // no-op: client signals ready, server can dynamically register here
+        // Register file watchers so the client sends workspace/didChangeWatchedFiles
+        // when SV/V/header/filelist files change on disk (e.g. git revert, checkout).
+        try {
+            auto req =
+                impl_->remote_endpoint.createRequest<Req_ClientRegisterFileWatchers::request>();
+            RegistrationWithOptions reg;
+            reg.id = "lazyverilog-file-watcher";
+            reg.method = "workspace/didChangeWatchedFiles";
+            reg.registerOptions.watchers = {
+                {"**/*.sv"}, {"**/*.v"},  {"**/*.svh"}, {"**/*.vh"},
+                {"**/*.f"},  {"**/*.vf"}, {"**/*.svi"},
+            };
+            req.params.registrations = {std::move(reg)};
+            (void)impl_->remote_endpoint.send(req);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
+        }
     });
 
     // ── shutdown ──────────────────────────────────────────────────────────────
