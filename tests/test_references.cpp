@@ -1041,7 +1041,6 @@ endmodule
     analyzer.set_include_dirs({dir.string()});
     analyzer.set_extra_files({top_path.string()});
     analyzer.wait_for_background_index_idle();
-
     const std::string header_uri = "file://" + header_path.string();
     analyzer.open(header_uri, header);
 
@@ -1058,6 +1057,67 @@ endmodule
 
     std::filesystem::remove(top_path);
     std::filesystem::remove(header_path);
+    std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: included class method declaration matches closed member call",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     "lazyverilog_refs_include_class_method";
+    std::filesystem::create_directories(dir);
+
+    const auto header_path = dir / "params.svh";
+    const auto top_path = dir / "memory_top.sv";
+
+    const std::string header = R"(class Packet;
+    int data;
+    task req_data();
+    endtask
+endclass
+)";
+    const std::string top = R"(`include "params.svh"
+
+module memory_top;
+    always_comb begin
+        Packet p;
+        p.req_data();
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(header_path);
+        REQUIRE(out.good());
+        out << header;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({top_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string header_uri = "file://" + header_path.string();
+    const std::string top_uri = "file://" + top_path.string();
+    analyzer.open(header_uri, header);
+
+    const auto [line, col] = find_position(header, "req_data");
+    const auto refs = analyzer.find_references(header_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == header_uri && ref.line == 2 && ref.col == 9;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 5 && ref.col == 10;
+    }));
+
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(top_path);
     std::filesystem::remove(dir);
 }
 

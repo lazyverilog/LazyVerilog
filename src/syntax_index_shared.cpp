@@ -649,6 +649,17 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         decltype(add_reference)& add_ref;
         const std::unordered_set<std::string>& module_values;
         const std::unordered_map<std::string, std::string>& module_value_types;
+        // Request-local declaration types discovered during this combined tree
+        // walk.  Declarations-depth project indexes intentionally skip block
+        // locals to keep background indexing cheap, but reference classification
+        // still needs simple local object types for member calls such as:
+        //
+        //     Packet p;
+        //     p.req_data();
+        //
+        // Store them here instead of promoting every local variable into the
+        // persistent SyntaxIndex value table.
+        std::unordered_map<std::string, std::string> walked_value_types;
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
         const std::unordered_set<std::string>& typedef_fields;
@@ -1038,16 +1049,73 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             visitDefault(node);
         }
 
+        void remember_current_module_value_type(const slang::syntax::DataTypeSyntax* type,
+                                                const slang::syntax::SeparatedSyntaxList<slang::syntax::DeclaratorSyntax>& declarators) {
+            if (!type || current_module.empty() || !current_class.empty())
+                return;
+            const std::string canonical_type =
+                canonical_type_name_for_references(render_syntax_node_text(sm, *type));
+            if (canonical_type.empty())
+                return;
+            for (const auto* decl : declarators) {
+                if (!decl || decl->name.valueText().empty())
+                    continue;
+                scope_key = current_module;
+                scope_key += '\n';
+                scope_key += std::string(decl->name.valueText());
+                walked_value_types[scope_key] = canonical_type;
+            }
+        }
+
+        void handle(const LocalVariableDeclarationSyntax& node) {
+            remember_current_module_value_type(node.type, node.declarators);
+            visitDefault(node);
+        }
+
+        void handle(const DataDeclarationSyntax& node) {
+            remember_current_module_value_type(node.type, node.declarators);
+            visitDefault(node);
+        }
+
+        std::optional<std::string> current_module_object_type(std::string_view object_name) {
+            if (current_module.empty() || object_name.empty())
+                return std::nullopt;
+            scope_key = current_module;
+            scope_key += '\n';
+            scope_key.append(object_name);
+            if (const auto it = walked_value_types.find(scope_key); it != walked_value_types.end())
+                return it->second;
+            if (const auto it = module_value_types.find(scope_key); it != module_value_types.end())
+                return it->second;
+            return std::nullopt;
+        }
+
         void handle(const MemberAccessExpressionSyntax& node) {
             const std::string field_name(node.name.valueText());
             const std::string object_name = simple_identifier_from_expr(node.left);
+            if (!field_name.empty() && !object_name.empty()) {
+                if (auto object_type = current_module_object_type(object_name)) {
+                    const auto method_key =
+                        subroutine_scope_key(SubroutineOwnerKind::Class, *object_type, field_name);
+                    if (declared_subroutines.contains(method_key)) {
+                        add_ref(node.name, subroutine_symbol_id(SubroutineOwnerKind::Class,
+                                                                *object_type, field_name));
+                        if (node.left)
+                            node.left->visit(*this);
+                        return;
+                    }
+                }
+            }
             if (!current_module.empty() && !field_name.empty() && !object_name.empty()) {
                 scope_key = current_module;
                 scope_key += '\n';
                 scope_key += object_name;
-                const auto value_it = module_value_types.find(scope_key);
-                if (value_it != module_value_types.end()) {
-                    std::string typedef_scope = value_it->second;
+                const auto value_it = walked_value_types.find(scope_key);
+                const auto indexed_value_it = module_value_types.find(scope_key);
+                if (value_it != walked_value_types.end() || indexed_value_it != module_value_types.end()) {
+                    std::string typedef_scope = value_it != walked_value_types.end()
+                                                    ? value_it->second
+                                                    : indexed_value_it->second;
                     if (const auto scope_it = unique_typedef_scopes.find(typedef_scope);
                         scope_it != unique_typedef_scopes.end())
                         typedef_scope = scope_it->second;
@@ -1088,6 +1156,32 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::string(source.substr(i, end - i));
         }
 
+        bool try_add_class_method_reference(const slang::parsing::Token& token,
+                                            std::string_view method_name) {
+            // Some call forms are not represented as MemberAccessExpressionSyntax
+            // by slang's parsed syntax tree, so classify simple object-method
+            // tokens from the token fallback as well.  This mirrors the typedef
+            // field fallback below and keeps closed includer shards precise:
+            //
+            //     Packet p;
+            //     p.req_data();  // class_method::Packet::req_data
+            if (method_name.empty())
+                return false;
+            const auto object_name = object_before_member_dot(token);
+            if (object_name.empty())
+                return false;
+            auto object_type = current_module_object_type(object_name);
+            if (!object_type)
+                return false;
+            const auto method_key =
+                subroutine_scope_key(SubroutineOwnerKind::Class, *object_type, method_name);
+            if (!declared_subroutines.contains(method_key))
+                return false;
+            add_ref(token, subroutine_symbol_id(SubroutineOwnerKind::Class, *object_type,
+                                                std::string(method_name)));
+            return true;
+        }
+
         bool try_add_typedef_field_reference(const slang::parsing::Token& token,
                                              std::string_view field_name) {
             // Check the cheap module-context guard before the expensive source-text scan.
@@ -1099,10 +1193,13 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             scope_key = current_module;
             scope_key += '\n';
             scope_key += object_name;
-            const auto value_it = module_value_types.find(scope_key);
-            if (value_it == module_value_types.end())
+            const auto value_it = walked_value_types.find(scope_key);
+            const auto indexed_value_it = module_value_types.find(scope_key);
+            if (value_it == walked_value_types.end() && indexed_value_it == module_value_types.end())
                 return false;
-            std::string typedef_scope = value_it->second;
+            std::string typedef_scope = value_it != walked_value_types.end()
+                                            ? value_it->second
+                                            : indexed_value_it->second;
             if (const auto scope_it = unique_typedef_scopes.find(typedef_scope);
                 scope_it != unique_typedef_scopes.end())
                 typedef_scope = scope_it->second;
@@ -1156,6 +1253,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return;
             const std::string name(token.valueText());
             if (name.empty())
+                return;
+            if (try_add_class_method_reference(token, name))
                 return;
             if (try_add_typedef_field_reference(token, name))
                 return;
