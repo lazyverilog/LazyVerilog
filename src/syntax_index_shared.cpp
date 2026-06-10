@@ -835,6 +835,51 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             visitDefault(node);
         }
 
+        void add_subroutine_invocation_ref(const slang::parsing::Token& name_token,
+                                           std::string_view rendered_name,
+                                           std::string_view module_ctx,
+                                           SubroutineOwnerKind module_kind_ctx,
+                                           const std::string& resolved_id) {
+            add_ref(name_token, resolved_id);
+
+            // If the subroutine resolved to a non-unit scope (module/interface/
+            // program/etc.) but its declaration came from a different source
+            // file than the call site, also emit a unit_subroutine SymbolID for
+            // the call.  This is the important include-file bridge:
+            //
+            //   // params.svh, opened standalone by the user
+            //   task add_number(); endtask        -> unit_subroutine::add_number
+            //
+            //   // memory_top.sv project shard
+            //   `include "params.svh"             -> declaration token may be
+            //                                        indexed as memory_top-local
+            //   initial add_number();             -> module_subroutine::memory_top::add_number
+            //
+            // A find-references request started from params.svh uses the unit
+            // SymbolID.  Without this extra occurrence on the call token, the
+            // compact closed-file shard cannot match the call without an AST
+            // re-walk.  Apply this to both immediate and deferred invocations;
+            // the original c63ba94 fix only covered the deferred path, so calls
+            // after their included declaration still missed this bridge ID.
+            if (module_ctx.empty())
+                return;
+
+            const auto callee = final_name_from_qualified_name(rendered_name);
+            const auto mkey = subroutine_scope_key(module_kind_ctx, module_ctx, callee);
+            auto dit = declared_subroutines.find(mkey);
+            if (dit == declared_subroutines.end())
+                return;
+
+            const auto call_fid = file_ids.for_token(index, sm, name_token);
+            if (dit->second == call_fid || dit->second == kInvalidSourceFileID ||
+                call_fid == kInvalidSourceFileID)
+                return;
+
+            const auto unit_id = subroutine_symbol_id(SubroutineOwnerKind::Unit, {}, callee);
+            if (unit_id != resolved_id)
+                add_ref(name_token, unit_id);
+        }
+
         void handle(const InvocationExpressionSyntax& node) {
             if (node.left) {
                 slang::parsing::Token name_token;
@@ -851,7 +896,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 }
                 if (name_token && !rendered_name.empty()) {
                     if (auto id = subroutine_id_for_invocation_name(rendered_name)) {
-                        add_ref(name_token, *id);
+                        add_subroutine_invocation_ref(name_token, rendered_name, current_module,
+                                                      current_module_kind, *id);
                     } else {
                         deferred_invocations.push_back({name_token, std::move(rendered_name),
                                                         current_class, current_module,
@@ -868,33 +914,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 current_module = inv.module_ctx;
                 current_module_kind = inv.module_kind_ctx;
                 current_package = inv.package_ctx;
-                if (auto id = subroutine_id_for_invocation_name(inv.rendered_name)) {
-                    add_ref(inv.name_token, *id);
-                    // If the subroutine resolved to a non-unit scope (module/
-                    // interface/etc.) but its declaration came from a different
-                    // source file than the call site (e.g. `include inside a
-                    // module body), also emit a unit_subroutine SymbolID for the
-                    // call. This allows find-references from the included file —
-                    // where the task is unit-scope — to match this call site.
-                    if (!inv.module_ctx.empty()) {
-                        const auto callee = final_name_from_qualified_name(inv.rendered_name);
-                        const auto mkey = subroutine_scope_key(inv.module_kind_ctx,
-                                                                inv.module_ctx, callee);
-                        auto dit = declared_subroutines.find(mkey);
-                        if (dit != declared_subroutines.end()) {
-                            const auto call_fid =
-                                file_ids.for_token(index, sm, inv.name_token);
-                            if (dit->second != call_fid &&
-                                dit->second != kInvalidSourceFileID &&
-                                call_fid != kInvalidSourceFileID) {
-                                const auto unit_id =
-                                    subroutine_symbol_id(SubroutineOwnerKind::Unit, {}, callee);
-                                if (unit_id != *id)
-                                    add_ref(inv.name_token, unit_id);
-                            }
-                        }
-                    }
-                }
+                if (auto id = subroutine_id_for_invocation_name(inv.rendered_name))
+                    add_subroutine_invocation_ref(inv.name_token, inv.rendered_name,
+                                                  inv.module_ctx, inv.module_kind_ctx, *id);
             }
             deferred_invocations.clear();
         }

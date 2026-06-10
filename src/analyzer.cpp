@@ -1207,6 +1207,17 @@ static std::optional<Location> find_generic_definition_from_index(
             return make_loc(td.file_id, td.line, td.col);
     }
 
+    // Enum members are ordinary named constants at use sites.  They live under
+    // their typedef entry in SyntaxIndex rather than in the flat value table.
+    for (const auto& td : index.typedefs) {
+        if (!pkg_visible(td.parent_scope, name))
+            continue;
+        for (const auto& member : td.enum_members) {
+            if (member.name == name)
+                return make_loc(member.file_id, member.line, member.col);
+        }
+    }
+
     // Values: variables, nets, functions, tasks, parameters, ports.
     // Linear scan but over a flat POD-like vector — far cheaper than an AST
     // visitor walk.  Prefer a scoped hit (same module as cursor) over a generic
@@ -1351,6 +1362,30 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
     return visitor.result;
 }
 
+static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& index,
+                                                            const std::string& uri,
+                                                            std::string_view type_name,
+                                                            std::string_view field_name) {
+    if (type_name.empty() || field_name.empty())
+        return std::nullopt;
+
+    for (const auto& td : index.typedefs) {
+        const std::string scoped_name =
+            td.parent_scope.empty() ? td.name : td.parent_scope + "::" + td.name;
+        if (td.name != type_name && scoped_name != type_name)
+            continue;
+        for (const auto& field : td.fields) {
+            if (field.name != field_name || field.line <= 0)
+                continue;
+            const std::string actual_uri = index.source_uri(field.file_id);
+            const int line = to_lsp_line(field.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
+                            field.col + (int)field.name.size()};
+        }
+    }
+    return std::nullopt;
+}
+
 static std::optional<Location> find_class_method_definition(const SyntaxIndex& index,
                                                             const std::string& uri,
                                                             std::string_view class_name,
@@ -1365,6 +1400,44 @@ static std::optional<Location> find_class_method_definition(const SyntaxIndex& i
             continue;
         for (const auto& method : cls.methods) {
             if (method.name != method_name || method.line <= 0)
+                continue;
+            const std::string actual_uri = index.source_uri(method.file_id);
+            const int line = to_lsp_line(method.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
+                            method.col + (int)method.name.size()};
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<Location> find_class_member_definition(const SyntaxIndex& index,
+                                                            const std::string& uri,
+                                                            std::string_view class_name,
+                                                            std::string_view member_name) {
+    if (class_name.empty() || member_name.empty())
+        return std::nullopt;
+
+    for (const auto& cls : index.classes) {
+        const std::string class_scope =
+            cls.parent_scope.empty() ? cls.name : cls.parent_scope + "::" + cls.name;
+        if (class_scope != class_name && cls.name != class_name)
+            continue;
+
+        // Class properties and class methods share the same member-access
+        // syntax at the use site (`obj.member`).  Closed files are represented
+        // only by SyntaxIndex shards, so both member families must be resolved
+        // from compact index facts here; otherwise hover falls through to the
+        // generic "symbol" fallback even though the definition location is known.
+        for (const auto& field : cls.fields) {
+            if (field.name != member_name || field.line <= 0)
+                continue;
+            const std::string actual_uri = index.source_uri(field.file_id);
+            const int line = to_lsp_line(field.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
+                            field.col + (int)field.name.size()};
+        }
+        for (const auto& method : cls.methods) {
+            if (method.name != member_name || method.line <= 0)
                 continue;
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
@@ -1972,9 +2045,159 @@ static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tr
     return visitor.target;
 }
 
+static bool index_entry_location_matches(const SyntaxIndex& idx, SourceFileID file_id,
+                                         int line_one_based, int col_zero_based,
+                                         const Location& definition) {
+    if (line_one_based <= 0)
+        return false;
+
+    // `Location` is LSP-shaped (0-based line) while SyntaxIndex entries keep
+    // 1-based source lines.  Match both the normalized URI and token column so
+    // same-spelled symbols in a closed file do not borrow wrong hover metadata.
+    // If a shard cannot map the SourceFileID back to a URI, keep the comparison
+    // permissive for legacy/in-memory shards and rely on line/column.
+    const auto actual_uri = idx.source_uri(file_id);
+    if (!actual_uri.empty() && actual_uri != definition.uri)
+        return false;
+    return to_lsp_line(line_one_based) == definition.line && col_zero_based == definition.col;
+}
+
+static SymbolInfo symbol_info_for_value_entry(const ValueEntry& value, const std::string& name,
+                                             const Location& definition) {
+    std::string doc;
+    if ((value.kind == "function" || value.kind == "task") && !value.signature.empty())
+        doc = value.signature;
+
+    return SymbolInfo{.name = name,
+                      .kind = value.kind.empty() ? "variable" : value.kind,
+                      .detail = value.kind == "function" || value.kind == "task" ? value.kind
+                                                                                   : value.type,
+                      .doc = std::move(doc),
+                      .line = definition.line,
+                      .col = definition.col};
+}
+
+static SymbolInfo symbol_info_for_typedef_entry(const TypedefEntry& td, const std::string& name,
+                                               const Location& definition) {
+    std::string detail;
+    if (td.is_enum) {
+        detail = "enum " + td.resolved;
+        if (!td.enum_members.empty()) {
+            detail += " {";
+            for (size_t i = 0; i < td.enum_members.size(); ++i) {
+                if (i)
+                    detail += ", ";
+                detail += td.enum_members[i].name;
+            }
+            detail += "}";
+        }
+    } else if (td.is_struct) {
+        // SyntaxIndex currently stores both struct and union typedef members in
+        // the same compact shape.  Keep the historical display string here; the
+        // important closed-file hover behavior is to surface fields instead of
+        // falling back to the bare "symbol" kind.
+        detail = "struct packed";
+        if (!td.fields.empty()) {
+            detail += " {";
+            for (const auto& f : td.fields)
+                detail += " " + f.type + " " + f.name + ";";
+            detail += " }";
+        }
+    } else {
+        detail = td.resolved;
+    }
+
+    return SymbolInfo{.name = name,
+                      .kind = "typedef",
+                      .detail = detail,
+                      .line = definition.line,
+                      .col = definition.col};
+}
+
 static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                                                         const DefinitionTarget& target,
                                                         const Location& definition) {
+    // First try an exact definition-location lookup.  This is the most robust
+    // path for closed project files because the clicked token may be classified
+    // only as a generic identifier, while `definition_of_state()` has already
+    // resolved the exact declaration in a SyntaxIndex shard.
+    for (const auto& module : idx.modules) {
+        if (index_entry_location_matches(idx, module.file_id, module.line, module.col, definition))
+            return SymbolInfo{.name = module.name,
+                              .kind = "module",
+                              .detail = "module",
+                              .doc = module_doc_from_entry(module),
+                              .line = definition.line,
+                              .col = definition.col};
+        for (const auto& port : module.ports) {
+            if (!index_entry_location_matches(idx, port.file_id, port.line, port.col, definition))
+                continue;
+            const bool is_parameter =
+                port.direction == "parameter" || port.direction == "localparam";
+            std::string detail =
+                is_parameter ? port.type : (port.decl_type.empty() ? port.type : port.decl_type);
+            if (is_parameter && !port.default_value.empty())
+                detail += " = " + port.default_value;
+            return SymbolInfo{.name = port.name,
+                              .kind = is_parameter ? "parameter" : "port",
+                              .detail = std::move(detail),
+                              .line = definition.line,
+                              .col = definition.col};
+        }
+    }
+    for (const auto& value : idx.values) {
+        if (index_entry_location_matches(idx, value.file_id, value.line, value.col, definition))
+            return symbol_info_for_value_entry(value, value.name, definition);
+    }
+    for (const auto& td : idx.typedefs) {
+        if (index_entry_location_matches(idx, td.file_id, td.line, td.col, definition))
+            return symbol_info_for_typedef_entry(td, td.name, definition);
+        for (const auto& field : td.fields) {
+            if (index_entry_location_matches(idx, field.file_id, field.line, field.col, definition))
+                return SymbolInfo{.name = field.name,
+                                  .kind = "variable",
+                                  .detail = field.type,
+                                  .line = definition.line,
+                                  .col = definition.col};
+        }
+        for (const auto& member : td.enum_members) {
+            if (index_entry_location_matches(idx, member.file_id, member.line, member.col, definition))
+                return SymbolInfo{.name = member.name,
+                                  .kind = "enum_member",
+                                  .detail = "enum member",
+                                  .line = definition.line,
+                                  .col = definition.col};
+        }
+    }
+    for (const auto& cls : idx.classes) {
+        if (index_entry_location_matches(idx, cls.file_id, cls.line, cls.col, definition))
+            return SymbolInfo{.name = cls.name,
+                              .kind = "class",
+                              .detail = "class",
+                              .line = definition.line,
+                              .col = definition.col};
+        for (const auto& field : cls.fields) {
+            if (index_entry_location_matches(idx, field.file_id, field.line, field.col, definition))
+                return SymbolInfo{.name = field.name,
+                                  .kind = "variable",
+                                  .detail = field.type,
+                                  .line = definition.line,
+                                  .col = definition.col};
+        }
+        for (const auto& method : cls.methods) {
+            if (index_entry_location_matches(idx, method.file_id, method.line, method.col, definition))
+                return SymbolInfo{.name = method.name,
+                                  .kind = method.is_task ? "task" : "function",
+                                  .detail = method.is_task ? "task" : "function",
+                                  .doc = method.is_task
+                                             ? ("```\ntask " + method.name + "()\n```")
+                                             : ("```\nfunction " + method.return_type + " " +
+                                                method.name + "()\n```"),
+                                  .line = definition.line,
+                                  .col = definition.col};
+        }
+    }
+
     if (target.kind == DefinitionTargetKind::Instance) {
         auto it = idx.module_by_name.find(target.module_name);
         if (it == idx.module_by_name.end())
@@ -2143,10 +2366,27 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     auto definition = definition_of_state(*state, uri, line, col, *extra_files, &uri);
     if (definition) {
         std::string name = target.name.empty() ? ident : target.name;
-        if (definition->uri == uri) {
-            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
-                return info;
-        } else {
+
+        // The current document's SyntaxTree may contain tokens whose actual
+        // source URI is an included file, for example:
+        //
+        //     // memory_top.sv
+        //     `include "params.svh"   // defines typedef enum ... state_t;
+        //     state_t state;
+        //
+        // `definition_of_state()` correctly reports the typedef location as
+        // params.svh, but that declaration is still inside this live SyntaxTree.
+        // Restricting the rich AST hover path to `definition->uri == uri` made
+        // included-file typedefs, parameters, variables, and class members fall
+        // through to the bare "symbol" fallback whenever the include file was
+        // not also listed as an extra/project file.  Always try the current tree
+        // first; token_at_location() matches exact URI/line/column, so this does
+        // not steal metadata for definitions that only exist in a different
+        // shard.
+        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+            return info;
+
+        if (definition->uri != uri) {
             for (const auto& extra : *extra_files) {
                 if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
                     continue;
@@ -2335,8 +2575,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
     if (target.kind == DefinitionTargetKind::ClassMember) {
         // Resolve simple object member calls by first identifying the object's
-        // declared class type in the current lexical module, then looking up
-        // the requested method inside that class.  This intentionally runs
+        // declared object type in the current lexical module, then looking up
+        // the requested member inside that class/aggregate.  This intentionally runs
         // before the generic definition fallback so:
         //
         //   Packet p;
@@ -2352,14 +2592,22 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                 *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
         }
         if (class_type) {
+            // The object type may name either a class or a typedef'd aggregate.
+            // Search both compact index families so `obj.field` works for
+            // closed-file classes as well as structs/unions.
             if (auto loc =
-                    find_class_method_definition(current_index, uri, *class_type, target.name))
+                    find_class_member_definition(current_index, uri, *class_type, target.name))
+                return loc;
+            if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
             for (const auto& extra : extra_files) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_class_method_definition(extra.index_ref(), extra.uri, *class_type,
+                if (auto loc = find_class_member_definition(extra.index_ref(), extra.uri, *class_type,
                                                             target.name))
+                    return loc;
+                if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
+                                                             *class_type, target.name))
                     return loc;
             }
         }

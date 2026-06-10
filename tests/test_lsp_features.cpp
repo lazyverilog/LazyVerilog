@@ -316,6 +316,42 @@ endmodule
           "**o_d** — *port*\n\n---\n\n```\noutput logic [9:0]\n```");
 }
 
+TEST_CASE("hover: enriches typedefs defined by current-file includes", "[hover]") {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "lazyverilog_hover_include_params.svh";
+    {
+        std::ofstream out(path);
+        out << R"SV(typedef enum logic [1:0] {
+    IDLE,
+    RUN
+} state_t;
+)SV";
+    }
+
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_hover_include_user.sv";
+    const std::string text = R"SV(`include "lazyverilog_hover_include_params.svh"
+
+module top;
+    state_t state;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 5);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value.find("**state_t**") != std::string::npos);
+    CHECK(hover->contents.second->value.find("*typedef*") != std::string::npos);
+    CHECK(hover->contents.second->value.find("IDLE") != std::string::npos);
+
+    std::filesystem::remove(path);
+}
+
 TEST_CASE("hover: resolves instance module names through extra files", "[hover]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_child.sv";
     {
@@ -342,6 +378,107 @@ endmodule
     REQUIRE(hover->contents.second.has_value());
     CHECK(hover->contents.second->value.find("**child**") != std::string::npos);
     CHECK(hover->contents.second->value.find("*module*") != std::string::npos);
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("hover: enriches closed-file index symbols beyond bare symbol", "[hover]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_index_symbols.sv";
+    {
+        std::ofstream out(path);
+        out << R"SV(
+package hover_idx_pkg;
+    parameter int PKT_W = 32;
+    logic [3:0] pkg_var;
+
+    typedef enum logic [1:0] {
+        IDLE,
+        RUN
+    } state_e;
+
+    typedef struct packed {
+        logic [7:0] addr;
+        logic       valid;
+    } packet_s;
+
+    class packet_c;
+        int count;
+        function int size();
+            return count;
+        endfunction
+    endclass
+endpackage
+
+module hover_idx_defs #(
+    parameter int WIDTH = 8
+)();
+endmodule
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/hover_index_user.sv";
+    const std::string text = R"SV(
+import hover_idx_pkg::*;
+
+module top;
+    packet_s pkt;
+    packet_c obj;
+    state_e st;
+    logic [PKT_W-1:0] bus;
+
+    initial begin
+        st = RUN;
+        bus = pkg_var;
+        bus = pkt.addr;
+        obj.count = obj.size();
+    end
+
+    hover_idx_defs #(.WIDTH(16)) u_defs();
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto position_of = [&](std::string_view needle) {
+        const auto offset = text.find(needle);
+        REQUIRE(offset != std::string::npos);
+
+        int line = 0;
+        int col = 0;
+        for (size_t i = 0; i < offset; ++i) {
+            if (text[i] == '\n') {
+                ++line;
+                col = 0;
+            } else {
+                ++col;
+            }
+        }
+        return lsPosition(line, col);
+    };
+
+    auto hover_value = [&](std::string_view needle) {
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = position_of(needle);
+        auto hover = provide_hover(analyzer, params);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        return hover->contents.second->value;
+    };
+
+    CHECK(hover_value("PKT_W").find("*parameter*") != std::string::npos);
+    CHECK(hover_value("PKT_W").find("int") != std::string::npos);
+    CHECK(hover_value("packet_s pkt").find("*typedef*") != std::string::npos);
+    CHECK(hover_value("packet_s pkt").find("addr") != std::string::npos);
+    CHECK(hover_value("RUN").find("*enum_member*") != std::string::npos);
+    CHECK(hover_value("pkg_var").find("logic [3:0]") != std::string::npos);
+    CHECK(hover_value("addr;").find("logic [7:0]") != std::string::npos);
+    CHECK(hover_value("count =").find("int") != std::string::npos);
+    CHECK(hover_value("WIDTH(16)").find("*parameter*") != std::string::npos);
+    CHECK(hover_value("WIDTH(16)").find("= 8") != std::string::npos);
 
     std::filesystem::remove(path);
 }
