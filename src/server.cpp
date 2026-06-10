@@ -1658,19 +1658,32 @@ void LazyVerilogServer::register_handlers() {
                         json += "]";
                         rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
                     } else {
-                        std::string new_source =
+                        const std::string new_source =
                             autowire_apply(*state, opened_shards, project.get(),
                                            config_.autowire, target_line);
-                        if (new_source != state->text)
-                            new_source = format_source(new_source, config_.format);
                         if (new_source != state->text) {
-                            lsWorkspaceEdit we;
-                            lsTextEdit text_edit = whole_document_edit(*state, new_source);
-                            we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
-                            (*we.changes)[uri] = {text_edit};
-                            rsp.result.SetJsonString(
-                                whole_document_workspace_edit_json(uri, *state, new_source),
-                                lsp::Any::kObjectType);
+                            const std::string formatted =
+                                format_source(new_source, config_.format);
+                            // Find insertion point: first line that differs old→new.
+                            const auto old_sv = split_lines_view(state->text);
+                            const auto new_sv = split_lines_view(new_source);
+                            int first_ins = 0;
+                            while (first_ins < (int)std::min(old_sv.size(), new_sv.size()) &&
+                                   old_sv[first_ins] == new_sv[first_ins])
+                                ++first_ins;
+                            const int n_ins = (int)new_sv.size() - (int)old_sv.size();
+                            if (n_ins > 0) {
+                                lsTextEdit edit;
+                                // Zero-width range = pure insertion in the client document.
+                                edit.range = lsRange(lsPosition(first_ins, 0),
+                                                     lsPosition(first_ins, 0));
+                                edit.newText = slice_lsp_range(
+                                    formatted,
+                                    lsRange(lsPosition(first_ins, 0),
+                                            lsPosition(first_ins + n_ins, 0)));
+                                rsp.result.SetJsonString(workspace_edit_json(uri, edit),
+                                                         lsp::Any::kObjectType);
+                            }
                         }
                     }
                 }
