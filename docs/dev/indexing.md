@@ -99,3 +99,16 @@ because cross-file lint rules such as stale-AutoInst can change when a module
 port list in another file changes.  Keep this refresh path lightweight: project
 indexing still happens in the background, and request handlers should not
 synchronously merge or parse project files.
+
+
+### How Go-to-def works
+
+┌────────────────┬──────────────────────┬────────────────────────────┬─────────────────────────┐
+│   File type    │ Module/Port/Instance │ Typedef/Variable (generic) │ Function/Task (generic) │
+├────────────────┼──────────────────────┼────────────────────────────┼─────────────────────────┤
+│ Current file   │ ✓ (AST)              │ ✓ (AST)                    │ ✓ (AST)                 │
+├────────────────┼──────────────────────┼────────────────────────────┼─────────────────────────┤
+│ Open .f file   │ ✓ (index)            │ ✓ (index, faster)          │ ✓ (AST fallback)        │
+├────────────────┼──────────────────────┼────────────────────────────┼─────────────────────────┤
+│ Closed .f file │ ✓ (index)            │ ✓ (index, new)             │ ✗ not indexed yet       │
+└────────────────┴──────────────────────┴────────────────────────────┴─────────────────────────┘

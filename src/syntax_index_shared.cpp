@@ -444,7 +444,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_map<std::string, std::string> unique_type_ids;
     std::unordered_set<std::string> ambiguous_type_names;
     std::unordered_map<std::string, std::string> package_type_ids;
-    std::unordered_set<std::string> declared_subroutines;
+    std::unordered_map<std::string, SourceFileID> declared_subroutines;
 
     for (const auto& value : index.values) {
         if (value.parent_scope.empty())
@@ -656,7 +656,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
         const std::unordered_map<std::string, std::string>& unique_type_ids;
         const std::unordered_map<std::string, std::string>& package_type_ids;
-        std::unordered_set<std::string>& declared_subroutines;
+        std::unordered_map<std::string, SourceFileID>& declared_subroutines;
         const decltype(module_owner_kind)& module_kind_fn;
         const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_subroutine_owner;
         std::string current_module;
@@ -703,7 +703,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
                         const std::unordered_map<std::string, std::string>& unique_type_ids,
                         const std::unordered_map<std::string, std::string>& package_type_ids,
-                        std::unordered_set<std::string>& declared_subroutines,
+                        std::unordered_map<std::string, SourceFileID>& declared_subroutines,
                         const decltype(module_owner_kind)& module_owner_kind,
                         const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_subroutine_owner,
                         decltype(add_macro_ref)& add_macro_ref,
@@ -826,8 +826,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                 ? (current_module.empty() ? std::string_view(current_package)
                                                           : std::string_view(current_module))
                                 : std::string_view(current_class));
-                    declared_subroutines.insert(
-                        subroutine_scope_key(owner_kind, owner_name, name));
+                    declared_subroutines.insert_or_assign(
+                        subroutine_scope_key(owner_kind, owner_name, name),
+                        file_ids.for_token(index, sm, name_token));
                     add_ref(name_token, subroutine_symbol_id(owner_kind, owner_name, name));
                 }
             }
@@ -867,8 +868,33 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 current_module = inv.module_ctx;
                 current_module_kind = inv.module_kind_ctx;
                 current_package = inv.package_ctx;
-                if (auto id = subroutine_id_for_invocation_name(inv.rendered_name))
+                if (auto id = subroutine_id_for_invocation_name(inv.rendered_name)) {
                     add_ref(inv.name_token, *id);
+                    // If the subroutine resolved to a non-unit scope (module/
+                    // interface/etc.) but its declaration came from a different
+                    // source file than the call site (e.g. `include inside a
+                    // module body), also emit a unit_subroutine SymbolID for the
+                    // call. This allows find-references from the included file —
+                    // where the task is unit-scope — to match this call site.
+                    if (!inv.module_ctx.empty()) {
+                        const auto callee = final_name_from_qualified_name(inv.rendered_name);
+                        const auto mkey = subroutine_scope_key(inv.module_kind_ctx,
+                                                                inv.module_ctx, callee);
+                        auto dit = declared_subroutines.find(mkey);
+                        if (dit != declared_subroutines.end()) {
+                            const auto call_fid =
+                                file_ids.for_token(index, sm, inv.name_token);
+                            if (dit->second != call_fid &&
+                                dit->second != kInvalidSourceFileID &&
+                                call_fid != kInvalidSourceFileID) {
+                                const auto unit_id =
+                                    subroutine_symbol_id(SubroutineOwnerKind::Unit, {}, callee);
+                                if (unit_id != *id)
+                                    add_ref(inv.name_token, unit_id);
+                            }
+                        }
+                    }
+                }
             }
             deferred_invocations.clear();
         }
