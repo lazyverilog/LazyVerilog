@@ -8,6 +8,24 @@
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
+
+static std::pair<int, int> lsp_feature_position_of(std::string_view text,
+                                                   std::string_view needle) {
+    const auto offset = text.find(needle);
+    REQUIRE(offset != std::string_view::npos);
+    int line = 0;
+    int col = 0;
+    for (size_t i = 0; i < offset; ++i) {
+        if (text[i] == '\n') {
+            ++line;
+            col = 0;
+        } else {
+            ++col;
+        }
+    }
+    return {line, col};
+}
 
 
 TEST_CASE("autoinst: skips module parameters from project index", "[autoinst]") {
@@ -329,7 +347,9 @@ TEST_CASE("hover: enriches typedefs defined by current-file includes", "[hover]"
     }
 
     Analyzer analyzer;
-    const std::string uri = "file:///tmp/lazyverilog_hover_include_user.sv";
+    const auto user_path = std::filesystem::temp_directory_path() /
+                           "lazyverilog_hover_include_user.sv";
+    const std::string uri = "file://" + user_path.string();
     const std::string text = R"SV(`include "lazyverilog_hover_include_params.svh"
 
 module top;
@@ -717,6 +737,143 @@ endmodule
     REQUIRE(parameter_hover->contents.second.has_value());
     CHECK(parameter_hover->contents.second->value ==
           "**DEPTH** — *parameter*\n\n---\n\n```\nint = 8\n```");
+}
+
+TEST_CASE("hover: shows package parameter values from closed project index", "[hover]") {
+    const auto package_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_package_param_pkg.sv";
+    {
+        std::ofstream out(package_path);
+        REQUIRE(out.good());
+        out << R"SV(package hover_pkg;
+    parameter int WIDTH = 32;
+endpackage
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_hover_package_param_top.sv";
+    const std::string text = R"SV(module top;
+    logic [hover_pkg::WIDTH-1:0] data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [line, col] = lsp_feature_position_of(text, "WIDTH-1");
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**WIDTH** — *parameter*\n\n---\n\n```\nint = 32\n```");
+
+    std::filesystem::remove(package_path);
+}
+
+TEST_CASE("hover: evaluates chained package parameter values from closed project index", "[hover]") {
+    const auto package_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_eval_package_param_pkg.sv";
+    {
+        std::ofstream out(package_path);
+        REQUIRE(out.good());
+        out << R"SV(package hover_eval_pkg;
+    parameter int N_BITS = 17;
+    parameter int B = $clog2(N_BITS);
+    parameter int A = B * 2;
+endpackage
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_hover_eval_package_param_top.sv";
+    const std::string text = R"SV(module top;
+    logic [hover_eval_pkg::A-1:0] data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [line, col] = lsp_feature_position_of(text, "A-1");
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**A** — *parameter*\n\n---\n\n```\nint = B*2\nevaluates to 10\n```");
+
+    std::filesystem::remove(package_path);
+}
+
+TEST_CASE("hover: evaluates chained current-file parameter values", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_hover_eval_current_param.sv";
+    const std::string text = R"SV(module top;
+    parameter int N_BITS = 17;
+    parameter int B = $clog2(N_BITS);
+    parameter int A = B * 2;
+    logic [A-1:0] data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [line, col] = lsp_feature_position_of(text, "A-1");
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**A** — *parameter*\n\n---\n\n```\nint = B * 2\nevaluates to 10\n```");
+}
+
+TEST_CASE("hover: shows package typedef from closed project index", "[hover]") {
+    const auto package_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_package_type_pkg.sv";
+    {
+        std::ofstream out(package_path);
+        REQUIRE(out.good());
+        out << R"SV(package hover_type_pkg;
+    typedef logic [7:0] byte_t;
+endpackage
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_hover_package_type_top.sv";
+    const std::string text = R"SV(module top;
+    hover_type_pkg::byte_t data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [line, col] = lsp_feature_position_of(text, "byte_t data");
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**byte_t** — *typedef*\n\n---\n\n```\nlogic [7:0]\n```");
+
+    std::filesystem::remove(package_path);
 }
 
 TEST_CASE("signature help: returns function argument labels and active parameter", "[signature]") {

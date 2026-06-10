@@ -987,6 +987,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             node.left->visit(*this);
                             return;
                         }
+                        if (package_values.contains(scope_key)) {
+                            add_ref(rname->identifier,
+                                    symbol_canonical("package_value", scope_sv, name_sv));
+                            node.left->visit(*this);
+                            return;
+                        }
                     }
                     visitDefault(node);
                     return;
@@ -1001,6 +1007,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 if (const auto it = package_type_ids.find(scope + "\n" + name);
                     it != package_type_ids.end()) {
                     add_ref(name_token, it->second);
+                    node.left->visit(*this);
+                    return;
+                }
+                if (package_values.contains(scope + "\n" + name)) {
+                    add_ref(name_token, symbol_canonical("package_value", scope, name));
                     node.left->visit(*this);
                     return;
                 }
