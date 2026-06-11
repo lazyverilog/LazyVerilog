@@ -4,21 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release asset version to build, for example v1.2.6"
-        required: false
+        description: "Release version to build and publish, for example v1.2.6"
+        required: true
         type: string
-  push:
-    tags:
-      - "v[0-9].[0-9].[0-9]*"
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
-
     strategy:
       matrix:
         include:
@@ -46,6 +44,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Validate version
+        shell: bash
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Invalid release version: ${{ inputs.version }}" >&2
+            exit 1
+          fi
+
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
 
@@ -54,81 +60,138 @@ jobs:
 
       - name: Strip and rename artifact
         run: |
-          cp build/lazyverilog-lsp \
-             "lazyverilog-lsp-${RELEASE_TAG}-${{ matrix.platform }}"
-          strip "lazyverilog-lsp-${RELEASE_TAG}-${{ matrix.platform }}"
+          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}"
+          cp build/lazyverilog-lsp "$asset"
+          strip "$asset"
 
       - name: Generate checksum
         run: |
-          asset="lazyverilog-lsp-${RELEASE_TAG}-${{ matrix.platform }}"
+          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}"
           shasum -a 256 "$asset" > "$asset.sha256"
 
-      - name: Upload checksum artifact
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lazyverilog-checksum-${{ env.RELEASE_TAG }}-${{ matrix.platform }}
-          path: lazyverilog-lsp-${{ env.RELEASE_TAG }}-${{ matrix.platform }}.sha256
+          name: lazyverilog-release-${{ inputs.version }}-${{ matrix.platform }}
+          path: |
+            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}
+            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}.sha256
 
-      - name: Verify checksum lock
-        if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download built release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lazyverilog-release-${{ inputs.version }}-*
+          path: dist-release
+          merge-multiple: true
+
+      - name: Update version and checksum lock
         run: |
-          asset="lazyverilog-lsp-${RELEASE_TAG}-${{ matrix.platform }}"
-          actual="$(awk '{print $1}' "$asset.sha256")"
-          python3 - "${RELEASE_TAG}" "${{ matrix.platform }}" "$actual" <<'PY'
+          python3 - "${{ inputs.version }}" <<'PY'
+          import pathlib
           import re
           import sys
 
-          version, platform, actual = sys.argv[1:4]
-          with open("lua/lazyverilog/checksums.lua", "r", encoding="utf-8") as f:
-              text = f.read()
+          version = sys.argv[1]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z][0-9A-Za-z.-]*)?", version):
+              raise SystemExit(f"invalid release version: {version}")
+
+          platforms = [
+              "linux-x64",
+              "linux-arm64",
+              "linux-x64-static",
+              "linux-arm64-static",
+              "darwin-x64",
+              "darwin-arm64",
+          ]
+
+          release_dir = pathlib.Path("dist-release")
+          checksums = {}
+          for platform in platforms:
+              asset = release_dir / f"lazyverilog-lsp-{version}-{platform}"
+              checksum = release_dir / f"lazyverilog-lsp-{version}-{platform}.sha256"
+              if not asset.is_file():
+                  raise SystemExit(f"missing release artifact: {asset}")
+              if not checksum.is_file():
+                  raise SystemExit(f"missing checksum artifact: {checksum}")
+              digest = checksum.read_text(encoding="utf-8").split()[0].lower()
+              if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                  raise SystemExit(f"invalid SHA-256 digest in {checksum}: {digest!r}")
+              checksums[platform] = digest
+
+          pathlib.Path("lua/lazyverilog/version.lua").write_text(
+              f'return "{version}"\n', encoding="utf-8"
+          )
+
+          checksum_file = pathlib.Path("lua/lazyverilog/checksums.lua")
+          text = checksum_file.read_text(encoding="utf-8")
+
+          entry_lines = [f'\t["{version}"] = {{']
+          for platform in platforms:
+              entry_lines.append(f'\t\t["{platform}"] = "{checksums[platform]}",')
+          entry_lines.append("\t},")
+          entry = "\n".join(entry_lines)
 
           version_re = re.compile(
-              r'\["' + re.escape(version) + r'"\]\s*=\s*{(?P<body>.*?)\n\s*},',
+              r'\t\["' + re.escape(version) + r'"\]\s*=\s*\{.*?\n\t\},\n?',
               re.DOTALL,
           )
-          version_match = version_re.search(text)
-          if not version_match:
-              raise SystemExit(
-                  f"missing checksum lock entry for {version}; "
-                  "update lua/lazyverilog/checksums.lua before tagging"
-              )
+          if version_re.search(text):
+              text = version_re.sub(entry + "\n", text, count=1)
+          else:
+              marker = "return {\n"
+              if marker not in text:
+                  raise SystemExit("checksum lock file does not contain expected 'return {' marker")
+              text = text.replace(marker, marker + entry + "\n\n", 1)
 
-          platform_re = re.compile(
-              r'\["' + re.escape(platform) + r'"\]\s*=\s*"(?P<digest>[0-9a-fA-F]{64})"'
-          )
-          platform_match = platform_re.search(version_match.group("body"))
-          if not platform_match:
-              raise SystemExit(
-                  f"missing checksum lock entry for {version} {platform}; "
-                  "update lua/lazyverilog/checksums.lua before tagging"
-              )
-
-          expected = platform_match.group("digest").lower()
-          if actual.lower() != expected:
-              raise SystemExit(
-                  f"checksum lock mismatch for {version} {platform}: "
-                  f"expected {expected}, built {actual.lower()}"
-              )
-
-          print(f"checksum lock verified for {version} {platform}: {actual.lower()}")
+          checksum_file.write_text(text, encoding="utf-8")
           PY
+
+      - name: Commit release metadata and create tag
+        run: |
+          version="${{ inputs.version }}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${version}" >/dev/null 2>&1; then
+            echo "Tag ${version} already exists on origin" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add lua/lazyverilog/version.lua lua/lazyverilog/checksums.lua
+          if git diff --cached --quiet; then
+            echo "No release metadata changes to commit."
+          else
+            git commit -m "Release ${version}"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+          git tag -a "${version}" -m "Release ${version}"
+          git push origin "refs/tags/${version}"
 
       - name: Resolve release notes
         id: notes
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          f="docs/releases/${{ github.ref_name }}.md"
+          f="docs/releases/${{ inputs.version }}.md"
           if [[ -f "$f" ]]; then
             echo "body_path=$f" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.version }}
           files: |
-            lazyverilog-lsp-${{ env.RELEASE_TAG }}-${{ matrix.platform }}
-            lazyverilog-lsp-${{ env.RELEASE_TAG }}-${{ matrix.platform }}.sha256
+            dist-release/lazyverilog-lsp-${{ inputs.version }}-*
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
