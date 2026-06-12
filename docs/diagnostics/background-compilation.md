@@ -36,6 +36,8 @@ Recommended HPC settings:
 background_compilation = true
 background_compilation_threads = 1
 background_compilation_debounce_ms = 1500
+nice_value = 10
+log_timing = false
 ```
 
 Increasing `background_compilation_threads` can allow a newer snapshot to start
@@ -46,3 +48,7 @@ at `1` unless the machine has enough spare resources.
 worker thread starts. Increasing it lowers the worker's scheduling priority on
 platforms that honor POSIX nice values. Lowering the value below the current
 process priority can require extra OS privileges and may be ignored or fail.
+
+`log_timing` emits background compilation timing lines to the LSP log. Keep it
+`false` for normal use; enable it temporarily when profiling parse or semantic
+compilation latency.

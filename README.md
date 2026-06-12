@@ -363,7 +363,6 @@ define = ["RTL_SIM"]
 [format]
 enable_format_on_save = true
 indent_size = 4
-safe_mode = true
 
 [lint]
 enable = true

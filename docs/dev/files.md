@@ -126,9 +126,9 @@ For listed files that are open in the editor, `didOpen` / `didChange` update the
 cached shard from unsaved in-memory text. The expensive AST-derived shard build is
 done outside the analyzer mutex, then committed under the mutex.  Updating this
 live shard schedules an asynchronous project-index snapshot publish; the edit path
-itself does not wait for the whole-project merge.  The publish request is
-coalesced by `[design].project_index_publish_debounce_ms` so rapid typing merges
-and refreshes diagnostics once per burst instead of once per keystroke.
+itself does not wait for the whole-project merge.  Publish requests are
+coalesced internally so rapid typing merges and refreshes diagnostics once per
+burst instead of once per keystroke.
 
 When a listed file is closed, the analyzer schedules an asynchronous disk-backed
 reindex for that file so the project shard eventually returns to saved contents
@@ -136,7 +136,7 @@ without blocking the close notification.
 
 ## Stale AutoInst diagnostics
 
-`stale_autoinst_diagnostic` validates an instance's named port connections
+`stale_instance_diagnostic` validates an instance's named port connections
 against the instantiated module's port list. For example, `demo/memory_top.sv`
 instantiates `memory`, but `memory` is declared in `demo/memory.sv`, so this rule
 needs the current-file structural index plus the background-published project
@@ -145,8 +145,8 @@ index.
 When this rule is enabled:
 
 ```toml
-[lint.module]
-stale_autoinst_diagnostic = true
+[lint.instance]
+stale_instance_diagnostic = true
 ```
 
 the diagnostic publishing path builds a current-file lint index and consults the

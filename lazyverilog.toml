@@ -6,6 +6,7 @@ define = ["RTL_SIM"]   # preprocessor defines passed to slang for parsing
 background_compilation = false # run semantic compilation in background workers (slower, richer diagnostics)
 background_compilation_threads = 1 # max background semantic compilation workers; keep at 1 on shared/HPC systems
 background_compilation_debounce_ms = 10000 # wait after edits before starting semantic compilation
+nice_value = 10 # POSIX nice value for background workers; higher = lower priority
 log_timing = false              # emit [compilation] timing lines to the LSP log for profiling
 
 [lint]
@@ -72,6 +73,7 @@ tab_align = false
 enable_format_on_save = true
 format_off_comment_pattern = '//\s*verilog[-_]format\s*:\s*off\b'
 format_on_comment_pattern = '//\s*verilog[-_]format\s*:\s*on\b'
+log_path = "" # optional directory for formatter per-pass debug logs
 
 [format.spacing]
 control_keyword_space = true
@@ -171,6 +173,7 @@ enable = true  # set false to disable all inlay hints
 register_pattern = "^r_"  # regex — signal matching this is the register (dst); the other is the source
 
 [autofunc]
+indent_size = 4
 use_named_arguments = true
 
 [autoarg]
