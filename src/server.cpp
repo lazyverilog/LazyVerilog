@@ -1735,8 +1735,6 @@ void LazyVerilogServer::register_handlers() {
                             autowire_apply(*state, opened_shards, project.get(),
                                            config_.autowire, target_line);
                         if (new_source != state->text) {
-                            const std::string formatted =
-                                format_source(new_source, config_.format);
                             // Find insertion point: first line that differs old→new.
                             const auto old_sv = split_lines_view(state->text);
                             const auto new_sv = split_lines_view(new_source);
@@ -1750,8 +1748,16 @@ void LazyVerilogServer::register_handlers() {
                                 // Zero-width range = pure insertion in the client document.
                                 edit.range = lsRange(lsPosition(first_ins, 0),
                                                      lsPosition(first_ins, 0));
+
+                                // Keep the inserted declaration block in the same coordinate
+                                // system used to find `first_ins`: the unformatted AutoWire
+                                // result.  This mirrors the AutoFF fix above.  Formatting the
+                                // temporary whole document before slicing is unsafe because the
+                                // formatter may add/remove/reflow lines before the insertion
+                                // point, causing this slice to return stale neighbouring text or
+                                // an empty string even though the preview listed the right wires.
                                 edit.newText = slice_lsp_range(
-                                    formatted,
+                                    new_source,
                                     lsRange(lsPosition(first_ins, 0),
                                             lsPosition(first_ins + n_ins, 0)));
                                 rsp.result.SetJsonString(workspace_edit_json(uri, edit),
