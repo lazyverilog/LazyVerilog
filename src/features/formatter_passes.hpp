@@ -2026,6 +2026,26 @@ public:
             size_t body = next_code(tokens, i + 1, tokens.size());
             if (body == npos || body >= tokens.size())
                 continue;
+            // An `else if` chain is syntactically an `else` whose body is
+            // another `if` statement, but indentation should be owned by that
+            // nested `if` and by its own body opener (`begin`, `{`, or a
+            // single-statement body).
+            //
+            // Treating the `if` token as a generic non-block `else` body adds
+            // a temporary extra indent level until the whole nested `if`
+            // statement ends.  For a block-form chain such as:
+            //
+            //   else if (cond) begin
+            //       a = 1;
+            //   end
+            //
+            // that stale extra level makes `a = 1;` render one indent too
+            // deep and makes the matching `end` render at the statement-body
+            // level instead of the `if` level.  Skip `IfKeyword` here so the
+            // ordinary control-expression / block-scope machinery below is
+            // the single source of indentation for the nested conditional.
+            if (kind_is(tokens[body], TK::IfKeyword))
+                continue;
             if (kind_is(tokens[body], TK::BeginKeyword) ||
                 kind_is(tokens[body], TK::ForkKeyword) ||
                 kind_is(tokens[body], TK::OpenBrace))

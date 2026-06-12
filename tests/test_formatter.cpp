@@ -4470,6 +4470,54 @@ TEST_CASE("formatter: else if stays on same line", "[formatter][wrap]") {
     CHECK(format_source(result, opts) == result);
 }
 
+TEST_CASE("formatter: else-if block body does not inherit stale else-body indent", "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.statement.wrap_end_else_clauses = true;
+
+    // Regression for stale indentation in `else if (...) begin ... end`.
+    //
+    // Token-wise, SystemVerilog parses `else if` as an `else` whose body is a
+    // nested `if` statement.  The formatter also has special handling for
+    // non-block `else` bodies so that shapes like `else a = 1;` receive one
+    // extra indent.  The bug was that this generic `else`-body indent also
+    // wrapped the nested `if` in an `else if` chain.  When that nested `if`
+    // opened its own `begin` block, the body received two active indentation
+    // owners: the stale outer `else` body and the real nested `if` block.
+    //
+    // The intentionally over-indented input below used to keep `a = 3;` one
+    // level too deep after formatting.  The expected output proves that the
+    // nested `if` owns its own block indentation, while the outer `else` does
+    // not add a second level for the entire chain.
+    const std::string input =
+        "module top;\n"
+        "always_comb begin\n"
+        "if (1) begin\n"
+        "end\n"
+        "else if (1) begin\n"
+        "        a          = 3;\n"
+        "    end\n"
+        "end\n"
+        "endmodule\n";
+
+    const std::string expected =
+        "module top;\n"
+        "always_comb begin\n"
+        "    if (1) begin\n"
+        "    end\n"
+        "    else if (1) begin\n"
+        "        a = 3;\n"
+        "    end\n"
+        "end\n"
+        "endmodule\n";
+
+    const std::string result = format_source(input, opts);
+    INFO("formatted:\n" << result);
+    CHECK(result == expected);
+    CHECK(format_source(result, opts) == result);
+}
+
 TEST_CASE("formatter: named begin block keeps label on same line as begin", "[formatter][wrap]") {
     FormatOptions opts;
     opts.default_indent_level_inside_outmost_block = 0;
