@@ -4,7 +4,7 @@ local M = {}
 
 local RELEASE_VERSION = require("lazyverilog.version")
 local RELEASE_CHECKSUMS = require("lazyverilog.checksums")
-local RELEASE_BASE_URL = "https://github.com/hxxdev/LazyVerilog/releases/download"
+local RELEASE_BASE_URL = "https://github.com/lazyverilog/LazyVerilog/releases/download"
 
 -- ---------------------------------------------------------------------------
 -- lazyverilog.toml change notification

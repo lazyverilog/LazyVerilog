@@ -189,7 +189,7 @@ function M.setup(user_config)
 	-- A user may install LazyVerilog as an ft-lazy plugin:
 	--
 	--   {
-	--     "hxxdev/lazyverilog",
+	--     "lazyverilog/LazyVerilog",
 	--     ft = { "systemverilog", "verilog" },
 	--     config = function() require("lazyverilog").setup() end,
 	--   }

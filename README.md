@@ -9,18 +9,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/hxxdev/LazyVerilog/actions/workflows/release.yml"><img src="https://github.com/hxxdev/LazyVerilog/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/lazyverilog/LazyVerilog/actions/workflows/release.yml"><img src="https://github.com/lazyverilog/LazyVerilog/actions/workflows/release.yml/badge.svg" alt="Release"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/hxxdev/LazyVerilog/stargazers">
-    <img alt="GitHub stars" src="https://img.shields.io/github/stars/hxxdev/LazyVerilog?style=for-the-badge&logo=starship&label=%E2%AD%90%20Stars&color=ffd166&labelColor=2b2d42">
+  <a href="https://github.com/lazyverilog/LazyVerilog/stargazers">
+    <img alt="GitHub stars" src="https://img.shields.io/github/stars/lazyverilog/LazyVerilog?style=for-the-badge&logo=starship&label=%E2%AD%90%20Stars&color=ffd166&labelColor=2b2d42">
   </a>
-  <a href="https://github.com/hxxdev/LazyVerilog/releases/latest">
-    <img alt="Latest release" src="https://img.shields.io/github/v/release/hxxdev/LazyVerilog?style=for-the-badge&logo=github">
+  <a href="https://github.com/lazyverilog/LazyVerilog/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/lazyverilog/LazyVerilog?style=for-the-badge&logo=github">
   </a>
-  <a href="https://github.com/hxxdev/LazyVerilog/issues">
-    <img alt="GitHub issues" src="https://img.shields.io/github/issues/hxxdev/LazyVerilog?style=for-the-badge">
+  <a href="https://github.com/lazyverilog/LazyVerilog/issues">
+    <img alt="GitHub issues" src="https://img.shields.io/github/issues/lazyverilog/LazyVerilog?style=for-the-badge">
   </a>
   <a href="https://github.com/MikePopoloski/slang">
     <img alt="Powered by slang" src="https://img.shields.io/badge/parser-slang-blueviolet?style=for-the-badge">
@@ -223,7 +223,7 @@ What LazyVerilog currently supports:
 
 ```lua
 {
-  "hxxdev/lazyverilog",
+  "lazyverilog/LazyVerilog",
   submodules = false,
   ft = { "systemverilog", "verilog" },
   config = function()

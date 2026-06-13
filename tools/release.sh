@@ -37,7 +37,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 RELEASE_WORKFLOW="release.yml"
-RELEASE_REPO="hxxdev/LazyVerilog"
+RELEASE_REPO="lazyverilog/LazyVerilog"
 
 VERSION=""
 DO_COMMIT=1

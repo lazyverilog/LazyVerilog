@@ -19,7 +19,7 @@
 # What is intentionally NOT done:
 #   This script does not prepend this repository to 'runtimepath'.  Using the
 #   local checkout would test developer state, not the documented installation
-#   path.  By default lazy.nvim clones hxxdev/lazyverilog into the isolated
+#   path.  By default lazy.nvim clones lazyverilog/LazyVerilog into the isolated
 #   data directory, then LazyVerilog's own plugin code resolves/auto-installs
 #   lazyverilog-lsp as described in README.md.  The README shows ft-based lazy
 #   loading for normal users; this test script loads the plugin eagerly so a
@@ -138,7 +138,7 @@ local lazyverilog_setup = {}
 
 -- A clean Neovim profile intentionally does not load the user's normal
 -- keymaps.  Mirror the LSP mappings from:
---   /home/hxxdev/dotfiles/nvim/.config/nvim/lua/plugins/lsp.lua
+--   /home/user/dotfiles/nvim/.config/nvim/lua/plugins/lsp.lua
 --
 -- The dotfiles use Telescope for some picker-style LSP navigation, but this
 -- clean profile intentionally uses only Neovim built-ins so it stays minimal
@@ -198,7 +198,7 @@ cat >> "${init_lua}" <<'LUA'
 require("lazy").setup({
   spec = {
     {
-      "hxxdev/lazyverilog",
+      "lazyverilog/LazyVerilog",
       -- LazyVerilog keeps large RTL corpora as test submodules.  End users do
       -- not need those corpora when installing the Neovim plugin, so match the
       -- README and tell lazy.nvim not to fetch submodules.
@@ -229,7 +229,7 @@ LUA
 
 echo "Starting clean Neovim profile: ${profile_root}" >&2
 echo "Generated init.lua: ${init_lua}" >&2
-echo "LazyVerilog plugin install: lazy.nvim spec hxxdev/lazyverilog (eager clean-test load)" >&2
+echo "LazyVerilog plugin install: lazy.nvim spec lazyverilog/LazyVerilog (eager clean-test load)" >&2
 if [[ -n "${LAZYVERILOG_LSP:-}" ]]; then
     echo "LazyVerilog LSP override: ${LAZYVERILOG_LSP}" >&2
 else
