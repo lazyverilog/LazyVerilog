@@ -44,7 +44,11 @@ jobs:
             cmake_extra: ""
           - os: windows-2022
             platform: windows-x64
-            cmake_extra: ""
+            # Use MSVC through Ninja instead of the Visual Studio generator.
+            # LspCpp's vendored CMake has a Visual-Studio-generator-only NuGet
+            # Boost .targets path that is brittle on hosted runners; Ninja keeps
+            # the compiler toolchain the same while avoiding that dependency.
+            cmake_extra: -G Ninja
             executable_suffix: .exe
 
     runs-on: ${{ matrix.os }}
