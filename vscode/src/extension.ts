@@ -7,6 +7,7 @@ import {
 import { resolveServerPath, autoInstall } from "./installer";
 import { createConfigWatcher, clearAllDebounceHandles } from "./watcher";
 import { registerCommands } from "./commands";
+import { registerRtlTree } from "./rtltree";
 
 let client: LanguageClient | undefined;
 
@@ -47,6 +48,7 @@ export async function activate(
   await client.start();
 
   registerCommands(context, client);
+  registerRtlTree(context, client);
 
   // Set up per-workspace-folder lazyverilog.toml watchers
   for (const folder of vscode.workspace.workspaceFolders ?? []) {

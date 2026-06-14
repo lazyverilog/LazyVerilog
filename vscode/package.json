@@ -25,6 +25,23 @@
         "aliases": ["Verilog"]
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lazyverilog",
+          "title": "LazyVerilog",
+          "icon": "$(circuit-board)"
+        }
+      ]
+    },
+    "views": {
+      "lazyverilog": [
+        {
+          "id": "lazyverilog.rtlTree",
+          "name": "RTL Hierarchy"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "lazyverilog.lintCommand",
@@ -37,8 +54,30 @@
       {
         "command": "lazyverilog.formatCommand",
         "title": "LazyVerilog: Format Document"
+      },
+      {
+        "command": "lazyverilog.rtlTree",
+        "title": "LazyVerilog: Show RTL Hierarchy"
+      },
+      {
+        "command": "lazyverilog.rtlTreeReverse",
+        "title": "LazyVerilog: Show RTL Hierarchy (Reverse)"
+      },
+      {
+        "command": "lazyverilog.rtlTreeRefresh",
+        "title": "LazyVerilog: Refresh RTL Tree",
+        "icon": "$(refresh)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "lazyverilog.rtlTreeRefresh",
+          "when": "view == lazyverilog.rtlTree",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "LazyVerilog",
       "properties": {
