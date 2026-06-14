@@ -119,10 +119,13 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p .",
-    "watch": "tsc -watch -p .",
-    "package": "vsce package",
-    "lint": "tsc --noEmit"
+    "vscode:prepublish": "npm run lint && npm run bundle:release",
+    "compile": "npm run lint && npm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --outfile=out/extension.js --sourcemap",
+    "bundle:release": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --outfile=out/extension.js --minify",
+    "watch": "esbuild src/extension.ts --bundle --platform=node --target=node18 --format=cjs --external:vscode --outfile=out/extension.js --sourcemap --watch",
+    "package": "vsce package --no-dependencies",
+    "lint": "tsc --noEmit -p ."
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.0"
@@ -131,6 +134,15 @@
     "@types/vscode": "^1.80.0",
     "@types/node": "^20.0.0",
     "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lazyverilog/LazyVerilog.git"
+  },
+  "homepage": "https://github.com/lazyverilog/LazyVerilog#readme",
+  "bugs": {
+    "url": "https://github.com/lazyverilog/LazyVerilog/issues"
   }
 }

@@ -15,6 +15,9 @@
 #      updates Lua and VS Code release metadata, builds the VSIX from that
 #      updated metadata, commits the metadata, tags that new commit, and uploads
 #      the binaries plus VSIX to the GitHub Release.
+#   6. After a successful watched workflow, fast-forward the local branch to the
+#      workflow's release-metadata commit, rebuild the Marketplace VSIX locally,
+#      and print the manual Visual Studio Marketplace upload instructions.
 #
 # Assumptions:
 #   - Release tags use a leading "v" SemVer-ish spelling, such as v1.0.2.
@@ -39,6 +42,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 RELEASE_WORKFLOW="release.yml"
 RELEASE_REPO="lazyverilog/LazyVerilog"
+MARKETPLACE_PUBLISHER="lazyverilog"
+MARKETPLACE_MANAGE_URL="https://marketplace.visualstudio.com/manage/publishers/lazyverilog"
 
 VERSION=""
 DO_COMMIT=1
@@ -111,6 +116,29 @@ parse_args() {
                 ;;
         esac
     done
+}
+
+
+require_vscode_tools() {
+    local missing=()
+    local tool
+    for tool in node npm npx; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "missing required VS Code packaging tool(s): ${missing[*]}"
+    fi
+}
+
+vscode_semver() {
+    printf '%s\n' "${VERSION#v}"
+}
+
+vscode_vsix_name() {
+    printf 'lazyverilog-%s.vsix\n' "$(vscode_semver)"
 }
 
 require_tools() {
@@ -259,6 +287,67 @@ trigger_release_workflow() {
         || die "release workflow failed"
 }
 
+refresh_release_metadata_and_build_vscode_vsix() {
+    # The workflow is responsible for computing checksums and updating
+    # vscode/src/version.ts, vscode/src/checksums.ts, package.json, and
+    # package-lock.json.  A Marketplace VSIX built before that commit would have
+    # stale server-download metadata, so only build locally after the watched
+    # workflow has completed successfully and after this branch has fast-forwarded
+    # to the workflow's release commit.
+    if [[ "$DRY_RUN" == 1 ]]; then
+        return 0
+    fi
+
+    if [[ "$DO_WATCH" != 1 ]]; then
+        printf '\nVS Code Marketplace publish step skipped locally because --no-watch was used.\n'
+        printf 'After the GitHub Release finishes, publish the VSIX asset manually from:\n'
+        printf '  https://github.com/%s/releases/tag/%s\n' "$RELEASE_REPO" "$VERSION"
+        print_marketplace_publish_instructions "lazyverilog-${VERSION}.vsix" "GitHub Release asset"
+        return 0
+    fi
+
+    local branch
+    branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+    [[ "$branch" != "HEAD" ]] || die "cannot refresh release metadata from detached HEAD"
+
+    printf '\nRefreshing local branch with workflow-generated release metadata...\n'
+    run git -C "$REPO_ROOT" pull --ff-only origin "$branch"
+
+    require_vscode_tools
+
+    local expected_version
+    local actual_version
+    expected_version="$(vscode_semver)"
+    actual_version="$(node -e "console.log(require(process.argv[1]).version)" "${REPO_ROOT}/vscode/package.json")"
+    [[ "$actual_version" == "$expected_version" ]] || \
+        die "vscode/package.json version is ${actual_version}, expected ${expected_version} after workflow metadata update"
+
+    printf '\nBuilding local VS Code Marketplace VSIX for %s...\n' "$expected_version"
+    run npm --prefix "${REPO_ROOT}/vscode" ci
+    run npm --prefix "${REPO_ROOT}/vscode" run package
+
+    local vsix_path="${REPO_ROOT}/vscode/$(vscode_vsix_name)"
+    [[ -f "$vsix_path" ]] || die "expected VSIX was not created: ${vsix_path#$REPO_ROOT/}"
+
+    print_marketplace_publish_instructions "$vsix_path" "local file"
+}
+
+print_marketplace_publish_instructions() {
+    local vsix_ref="$1"
+    local source_label="$2"
+
+    printf '\nVS Code Marketplace manual publish\n'
+    printf '---------------------------------\n'
+    printf 'Publisher: %s\n' "$MARKETPLACE_PUBLISHER"
+    printf 'Manage page: %s\n' "$MARKETPLACE_MANAGE_URL"
+    printf 'VSIX (%s): %s\n' "$source_label" "$vsix_ref"
+    printf '\nManual steps:\n'
+    printf '  1. Open %s\n' "$MARKETPLACE_MANAGE_URL"
+    printf '  2. Choose the %s publisher.\n' "$MARKETPLACE_PUBLISHER"
+    printf '  3. Upload the VSIX above as the new Visual Studio Code extension version.\n'
+    printf '  4. Verify the Marketplace version is %s before announcing the release.\n' "$(vscode_semver)"
+}
+
 main() {
     parse_args "$@"
     require_tools
@@ -276,6 +365,7 @@ main() {
     commit_release_note
     push_branch
     trigger_release_workflow
+    refresh_release_metadata_and_build_vscode_vsix
 
     printf '\nRelease workflow dispatched for %s.\n' "$VERSION"
     printf 'The workflow will commit checksums, create the tag, and publish the GitHub Release.\n'

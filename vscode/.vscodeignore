@@ -1,9 +1,28 @@
+# Source TypeScript and compiler configuration are development-only. The
+# extension ships the bundled JavaScript entry point generated from src/.
 src/**
 tsconfig.json
-node_modules/@types/**
-node_modules/typescript/**
-.vscode/**
 
+# Stale per-module tsc outputs can remain in a working tree, but they are not
+# needed at runtime once esbuild has inlined the extension's local modules into
+# out/extension.js.
+out/checksums.js
+out/commands.js
+out/connect.js
+out/installer.js
+out/interface.js
+out/rtltree.js
+out/version.js
+out/watcher.js
+out/**/*.map
+
+# The runtime dependency graph is bundled into out/extension.js. Keeping
+# node_modules out of the VSIX removes hundreds of small JavaScript files and
+# avoids the vsce performance warning.
+node_modules/**
+
+# Local/editor/agent state and generated VSIX archives are not extension assets.
+.vscode/**
 .omc/**
 .gitignore
-out/**/*.map
+*.vsix

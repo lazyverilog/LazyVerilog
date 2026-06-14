@@ -273,7 +273,7 @@ jobs:
           cd vscode
           npm ci
           npm run compile
-          npx vsce package -o lazyverilog-${{ inputs.version }}.vsix
+          npx vsce package --no-dependencies -o lazyverilog-${{ inputs.version }}.vsix
           mkdir -p ../dist-release
           cp lazyverilog-${{ inputs.version }}.vsix ../dist-release/
 
