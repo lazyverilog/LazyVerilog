@@ -48,13 +48,17 @@ jobs:
             # LspCpp's vendored CMake has a Visual-Studio-generator-only NuGet
             # Boost .targets path that is brittle on hosted runners; Ninja keeps
             # the compiler toolchain the same while avoiding that dependency.
-            cmake_extra: -G Ninja
+            cmake_extra: -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
             executable_suffix: .exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Validate version
         shell: bash
