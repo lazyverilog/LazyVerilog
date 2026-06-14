@@ -43,6 +43,7 @@
   <a href="#-build">Build</a>
 </p>
 
+
 <p align="center">
   LazyVerilog is a C++ Language Server Protocol server with a companion Neovim plugin.
   It provides formatting, linting, navigation, hover, completion, inlay hints, and RTL code actions for real SystemVerilog projects.
@@ -217,48 +218,9 @@ What LazyVerilog currently supports:
 
 ## 📦 Installation
 
-### VS Code
-
-#### 1. Marketplace (recommended)
-
-Install LazyVerilog from the Visual Studio Marketplace:
-
-https://marketplace.visualstudio.com/items?itemName=lazyverilog.lazyverilog
-
-Then open a `.sv`, `.svh`, `.v`, or `.vh` file. The extension starts LazyVerilog automatically
-for Verilog/SystemVerilog buffers and installs the matching `lazyverilog-lsp` release binary when
-needed.
-
-If you already have a locally built server binary, set it explicitly in VS Code settings:
-
-```json
-{
-  "lazyverilog.serverPath": "/path/to/lazyverilog-lsp"
-}
-```
-
-#### 2. Manual install from GitHub Releases
-
-If the Marketplace version is not available yet, download the VSIX from the latest GitHub Release:
-
-https://github.com/lazyverilog/LazyVerilog/releases/latest
-
-Install it from the command line:
-
-```bash
-code --install-extension lazyverilog-<version>.vsix
-```
-
-Or install it from VS Code:
-
-1. Open the Extensions view.
-2. Select `...` / `Views and More Actions...`.
-3. Choose `Install from VSIX...`.
-4. Select the downloaded `lazyverilog-<version>.vsix` file.
-
----
-
-### Neovim plugin
+<a id="neovim-installation"></a>
+<details>
+<summary><b>Neovim installation</b></summary>
 
 💤 Using <a href="https://github.com/folke/lazy.nvim"><code>lazy.nvim</code></a>:
 
@@ -285,7 +247,41 @@ require("lazyverilog").setup({
 })
 ```
 
----
+</details>
+
+<a id="vscode-installation"></a>
+<details>
+<summary><b>VS Code installation</b></summary>
+
+#### 1. Marketplace (recommended)
+
+Install LazyVerilog from the Visual Studio Marketplace:
+
+https://marketplace.visualstudio.com/items?itemName=lazyverilog.lazyverilog
+
+Then open a `.sv`, `.svh`, `.v`, or `.vh` file. The extension starts LazyVerilog automatically
+for Verilog/SystemVerilog buffers and installs the matching `lazyverilog-lsp` release binary when
+needed.
+
+If you already have a locally built server binary, set it explicitly in VS Code settings:
+
+```json
+{
+  "lazyverilog.serverPath": "/path/to/lazyverilog-lsp"
+}
+```
+
+#### 2. Manual install from GitHub Releases
+
+If the Marketplace version is not available yet, download the VSIX from the latest [GitHub Release](https://github.com/lazyverilog/LazyVerilog/releases/latest).
+
+Then install it from VS Code:
+
+1. Press `Ctrl+Shift+P` to open the Command Palette.
+2. Run `Extensions: Install from VSIX...`.
+3. Select the downloaded `lazyverilog-<version>.vsix` file.
+
+</details>
 
 ## 🚀 Usage
 
@@ -390,7 +386,7 @@ Use the Command Palette for LazyVerilog commands such as:
 - `LazyVerilog: Show RTL Hierarchy`
 - `LazyVerilog: Show RTL Hierarchy (Reverse)`
 
-See the [VS Code installation instructions](#vs-code) above for installation and `lazyverilog.serverPath` setup.
+See the [VS Code installation instructions](#vscode-installation) above for installation and `lazyverilog.serverPath` setup.
 
 ## 🏗️ Build
 
