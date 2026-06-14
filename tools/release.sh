@@ -12,8 +12,9 @@
 #      release note.
 #   4. Trigger .github/workflows/release.yml with the requested version.
 #   5. Watch the workflow.  The workflow builds binaries, computes checksums,
-#      commits version.lua/checksums.lua, tags that new commit, and uploads the
-#      already-built binaries to the GitHub Release.
+#      updates Lua and VS Code release metadata, builds the VSIX from that
+#      updated metadata, commits the metadata, tags that new commit, and uploads
+#      the binaries plus VSIX to the GitHub Release.
 #
 # Assumptions:
 #   - Release tags use a leading "v" SemVer-ish spelling, such as v1.0.2.

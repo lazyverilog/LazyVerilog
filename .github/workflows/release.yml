@@ -132,7 +132,7 @@ jobs:
             lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
 
   publish:
-    needs: build
+    needs: [build]
     runs-on: ubuntu-22.04
 
     steps:
@@ -210,7 +210,72 @@ jobs:
               text = text.replace(marker, marker + entry + "\n\n", 1)
 
           checksum_file.write_text(text, encoding="utf-8")
+
+          # --- Generate vscode/src/version.ts ---
+          pathlib.Path("vscode/src/version.ts").write_text(
+              f'export const RELEASE_VERSION = "{version}";\n',
+              encoding="utf-8",
+          )
+
+          # --- Generate vscode/src/checksums.ts ---
+          ts_lines = [
+              "// SHA-256 checksums keyed by version then platform.",
+              "// Updated by CI alongside lua/lazyverilog/checksums.lua.",
+              'export const RELEASE_CHECKSUMS: Record<string, Record<string, string>> = {',
+          ]
+          ts_lines.append(f'  "{version}": {{')
+          for platform in platforms:
+              if platform in checksums:
+                  ts_lines.append(f'    "{platform}": "{checksums[platform]}",')
+          ts_lines.append("  },")
+          ts_lines.append("};")
+          ts_lines.append("")
+
+          pathlib.Path("vscode/src/checksums.ts").write_text(
+              "\n".join(ts_lines), encoding="utf-8",
+          )
+
+          # VS Code extension manifests use plain SemVer without the leading
+          # release-tag "v". Keep package-lock.json in sync so `npm ci` and
+          # `vsce package` publish a VSIX whose manifest matches this release.
+          vscode_version = version[1:]
+          package_json = pathlib.Path("vscode/package.json")
+          package_text = package_json.read_text(encoding="utf-8")
+          package_text, package_count = re.subn(
+              r'("version"\s*:\s*")[^"]+(")',
+              lambda m: f'{m.group(1)}{vscode_version}{m.group(2)}',
+              package_text,
+              count=1,
+          )
+          if package_count != 1:
+              raise SystemExit("failed to update vscode/package.json version")
+          package_json.write_text(package_text, encoding="utf-8")
+
+          package_lock = pathlib.Path("vscode/package-lock.json")
+          lock_text = package_lock.read_text(encoding="utf-8")
+          lock_text, lock_count = re.subn(
+              r'("version"\s*:\s*")[^"]+(")',
+              lambda m: f'{m.group(1)}{vscode_version}{m.group(2)}',
+              lock_text,
+              count=2,
+          )
+          if lock_count != 2:
+              raise SystemExit("failed to update vscode/package-lock.json root versions")
+          package_lock.write_text(lock_text, encoding="utf-8")
           PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build VS Code extension
+        run: |
+          cd vscode
+          npm ci
+          npm run compile
+          npx vsce package -o lazyverilog-${{ inputs.version }}.vsix
+          mkdir -p ../dist-release
+          cp lazyverilog-${{ inputs.version }}.vsix ../dist-release/
 
       - name: Commit release metadata and create tag
         if: ${{ !inputs.dry_run }}
@@ -225,7 +290,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add lua/lazyverilog/version.lua lua/lazyverilog/checksums.lua
+          git add lua/lazyverilog/version.lua lua/lazyverilog/checksums.lua vscode/src/version.ts vscode/src/checksums.ts vscode/package.json vscode/package-lock.json
           if git diff --cached --quiet; then
             echo "No release metadata changes to commit."
           else
@@ -251,5 +316,6 @@ jobs:
           tag_name: ${{ inputs.version }}
           files: |
             dist-release/lazyverilog-lsp-${{ inputs.version }}-*
+            dist-release/lazyverilog-${{ inputs.version }}.vsix
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}

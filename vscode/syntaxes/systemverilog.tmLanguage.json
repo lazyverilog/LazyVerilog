@@ -1,0 +1,174 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SystemVerilog",
+  "scopeName": "source.systemverilog",
+  "fileTypes": [
+    "sv",
+    "svh"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#compiler-directives"
+    },
+    {
+      "include": "#system-tasks"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#declaration-names"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.systemverilog",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "name": "storage.type.annotation.todo.systemverilog",
+              "match": "\\b(TODO|FIXME|NOTE|BUG|HACK)\\b"
+            }
+          ]
+        },
+        {
+          "name": "comment.line.double-slash.systemverilog",
+          "begin": "//",
+          "end": "$",
+          "patterns": [
+            {
+              "name": "storage.type.annotation.todo.systemverilog",
+              "match": "\\b(TODO|FIXME|NOTE|BUG|HACK)\\b"
+            }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.systemverilog",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.systemverilog",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "compiler-directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.systemverilog",
+          "match": "`(?:begin_keywords|celldefine|default_nettype|define|else|elsif|end_keywords|endcelldefine|endif|ifdef|ifndef|include|line|nounconnected_drive|pragma|resetall|timescale|undef|unconnected_drive)\\b"
+        },
+        {
+          "name": "entity.name.function.preprocessor.systemverilog",
+          "match": "`[A-Za-z_][A-Za-z0-9_$]*"
+        }
+      ]
+    },
+    "system-tasks": {
+      "patterns": [
+        {
+          "name": "support.function.system-task.systemverilog",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_$]*\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.based.systemverilog",
+          "match": "\\b\\d*'[sS]?[bBoOdDhH][0-9a-fA-F_xXzZ?]+\\b"
+        },
+        {
+          "name": "constant.numeric.real.systemverilog",
+          "match": "\\b\\d+(?:_\\d+)*(?:\\.\\d+(?:_\\d+)*)?(?:[eE][+-]?\\d+(?:_\\d+)*)\\b"
+        },
+        {
+          "name": "constant.numeric.integer.systemverilog",
+          "match": "\\b\\d+(?:_\\d+)*\\b"
+        }
+      ]
+    },
+    "declaration-names": {
+      "patterns": [
+        {
+          "name": "entity.name.type.module.systemverilog",
+          "match": "\\b(?:module|macromodule|interface|program|primitive|package|class|checker|config)\\s+([A-Za-z_][A-Za-z0-9_$]*)",
+          "captures": {
+            "1": {
+              "name": "entity.name.type.systemverilog"
+            }
+          }
+        },
+        {
+          "name": "entity.name.function.systemverilog",
+          "match": "\\b(?:function|task)\\s+(?:automatic\\s+|static\\s+)?(?:[A-Za-z_][A-Za-z0-9_$]*\\s+)?([A-Za-z_][A-Za-z0-9_$]*)",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.systemverilog"
+            }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.systemverilog",
+          "match": "\\b(?:always|always_comb|always_ff|always_latch|and|assign|assume|automatic|before|begin|bind|bins|binsof|break|case|casex|casez|cell|chandle|clocking|config|constraint|context|continue|cover|covergroup|coverpoint|cross|deassign|default|defparam|disable|dist|do|edge|else|end|endcase|endchecker|endclass|endclocking|endconfig|endfunction|endgenerate|endgroup|endinterface|endmodule|endpackage|endprimitive|endprogram|endproperty|endspecify|endsequence|endtable|endtask|eventually|expect|export|extends|extern|final|first_match|force|foreach|forever|fork|forkjoin|generate|genvar|global|if|iff|ifnone|ignore_bins|illegal_bins|implies|import|incdir|include|initial|inside|interconnect|intersect|join|join_any|join_none|let|liblist|library|local|matches|modport|new|nexttime|not|or|package|packed|priority|program|property|protected|pure|rand|randc|randcase|randsequence|ref|release|repeat|restrict|return|s_always|s_eventually|s_nexttime|s_until|s_until_with|scalared|sequence|showcancelled|solve|specify|specparam|static|strong|super|sync_accept_on|sync_reject_on|table|tagged|throughout|timeprecision|timeunit|type|typedef|union|unique|unique0|until|until_with|use|uwire|var|vectored|virtual|wait|wait_order|weak|while|wildcard|with|within)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.systemverilog",
+          "match": "\\b(?:bit|byte|class|cmos|const|enum|event|function|highz0|highz1|inout|input|integer|interface|large|localparam|logic|longint|medium|module|nand|negedge|nmos|nor|output|parameter|pmos|posedge|pull0|pull1|pulldown|pullup|rcmos|real|realtime|reg|rnmos|rpmos|rtran|rtranif0|rtranif1|shortint|shortreal|signed|small|string|struct|supply0|supply1|task|time|tran|tranif0|tranif1|tri|tri0|tri1|triand|trior|trireg|unsigned|void|wand|wire|wor)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.systemverilog",
+          "match": "\\b(?:null|this|super)\\b|(?<![A-Za-z0-9_$])'[01xXzZ]"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.systemverilog",
+          "match": "(?:===|!==|==\\?|!=\\?|->>|->|=>|\\*\\*|<<<?|>>>?|<=|>=|==|!=|&&|\\|\\||[+\\-*/%&|^~!=<>?:#@])"
+        }
+      ]
+    }
+  }
+}

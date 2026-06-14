@@ -3,3 +3,7 @@ tsconfig.json
 node_modules/@types/**
 node_modules/typescript/**
 .vscode/**
+
+.omc/**
+.gitignore
+out/**/*.map
