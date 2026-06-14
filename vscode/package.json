@@ -25,6 +25,20 @@
         "aliases": ["Verilog"]
       }
     ],
+    "commands": [
+      {
+        "command": "lazyverilog.lintCommand",
+        "title": "LazyVerilog: Lint Current File"
+      },
+      {
+        "command": "lazyverilog.lintAllCommand",
+        "title": "LazyVerilog: Lint All Files"
+      },
+      {
+        "command": "lazyverilog.formatCommand",
+        "title": "LazyVerilog: Format Document"
+      }
+    ],
     "configuration": {
       "title": "LazyVerilog",
       "properties": {
