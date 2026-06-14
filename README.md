@@ -285,7 +285,8 @@ Then install it from VS Code:
 
 ## 🚀 Usage
 
-### Neovim
+<details>
+<summary><b>Neovim usage</b></summary>
 
 #### 1. Add a project config to your RTL project root.
 
@@ -343,7 +344,6 @@ nvim path/to/rtl.sv
 The Neovim plugin downloads LazyVerilog release if it is your first launch. Then Neovim plugin starts the LazyVerilog LSP automatically for `verilog` and `systemverilog` buffers.
 Use `:LspInfo` to confirm that the `lazyverilog` client is attached.
 
-
 #### 3. Use standard LSP actions
 
 LazyVerilog provides normal Neovim LSP features.  Use your existing LSP keymaps, or add mappings
@@ -373,7 +373,10 @@ cursor is on a supported construct.
 | `:Interface <inst1> <inst2>` | Inspect and edit connections between two instances |
 | `:Connect <module1> <module2>` | Interactively connect module instances through the hierarchy |
 
-### VS Code
+</details>
+
+<details>
+<summary><b>VS Code usage</b></summary>
 
 Open a Verilog/SystemVerilog RTL file in VS Code after installing the extension. The extension starts
 LazyVerilog automatically for `verilog` and `systemverilog` buffers.
@@ -387,6 +390,8 @@ Use the Command Palette for LazyVerilog commands such as:
 - `LazyVerilog: Show RTL Hierarchy (Reverse)`
 
 See the [VS Code installation instructions](#vscode-installation) above for installation and `lazyverilog.serverPath` setup.
+
+</details>
 
 ## 🏗️ Build
 
