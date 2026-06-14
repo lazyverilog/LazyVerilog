@@ -255,7 +255,7 @@ require("lazyverilog").setup({
 
 #### 1. Marketplace (recommended)
 
-Install LazyVerilog from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=lazyverilog.lazyverilog)
+Install LazyVerilog from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=lazyverilog.lazyverilog-vscode)
 
 Then open a `.sv`, `.svh`, `.v`, or `.vh` file. The extension starts LazyVerilog automatically
 for Verilog/SystemVerilog buffers and installs the matching `lazyverilog-lsp` release binary when
