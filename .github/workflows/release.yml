@@ -37,6 +37,10 @@ jobs:
           - os: macos-15
             platform: darwin-arm64
             cmake_extra: ""
+          - os: windows-2022
+            platform: windows-x64
+            cmake_extra: ""
+            executable_suffix: .exe
 
     runs-on: ${{ matrix.os }}
 
@@ -57,26 +61,59 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
 
       - name: Build
-        run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.logicalcpu)
+        shell: bash
+        run: cmake --build build --config Release --parallel
 
       - name: Strip and rename artifact
+        shell: bash
         run: |
-          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}"
-          cp build/lazyverilog-lsp "$asset"
-          strip "$asset"
+          # Keep the published asset names predictable while still handling both
+          # single-config generators (Linux/macOS: build/lazyverilog-lsp) and
+          # multi-config generators (Windows/MSVC: build/Release/lazyverilog-lsp.exe).
+          suffix="${{ matrix.executable_suffix }}"
+          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${suffix}"
+          binary="build/lazyverilog-lsp${suffix}"
+          if [[ ! -f "$binary" && -f "build/Release/lazyverilog-lsp${suffix}" ]]; then
+            binary="build/Release/lazyverilog-lsp${suffix}"
+          fi
+          if [[ ! -f "$binary" ]]; then
+            echo "Built binary not found: $binary" >&2
+            find build -type f -name "lazyverilog-lsp*" -print >&2
+            exit 1
+          fi
+          cp "$binary" "$asset"
+
+          # MSVC-produced Windows executables cannot be stripped with the Unix
+          # strip tool available in Git Bash.  Linux/macOS release binaries keep
+          # the existing strip behavior.
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            strip "$asset"
+          fi
 
       - name: Generate checksum
+        shell: bash
         run: |
-          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}"
-          shasum -a 256 "$asset" > "$asset.sha256"
+          suffix="${{ matrix.executable_suffix }}"
+          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${suffix}"
+          python - "$asset" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          pathlib.Path(str(path) + ".sha256").write_text(
+              f"{digest}  {path.name}\n", encoding="utf-8"
+          )
+          PY
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: lazyverilog-release-${{ inputs.version }}-${{ matrix.platform }}
           path: |
-            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}
-            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}.sha256
+            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}
+            lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
 
   publish:
     needs: build
@@ -113,13 +150,15 @@ jobs:
               "linux-arm64-static",
               "darwin-x64",
               "darwin-arm64",
+              "windows-x64",
           ]
 
           release_dir = pathlib.Path("dist-release")
           checksums = {}
           for platform in platforms:
-              asset = release_dir / f"lazyverilog-lsp-{version}-{platform}"
-              checksum = release_dir / f"lazyverilog-lsp-{version}-{platform}.sha256"
+              suffix = ".exe" if platform.startswith("windows-") else ""
+              asset = release_dir / f"lazyverilog-lsp-{version}-{platform}{suffix}"
+              checksum = release_dir / f"lazyverilog-lsp-{version}-{platform}{suffix}.sha256"
               if not asset.is_file():
                   raise SystemExit(f"missing release artifact: {asset}")
               if not checksum.is_file():

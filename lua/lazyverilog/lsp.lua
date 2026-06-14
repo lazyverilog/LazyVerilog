@@ -149,8 +149,16 @@ local function _bin_dir()
 	return vim.fn.stdpath("data") .. "/lazyverilog/bin"
 end
 
+local function _is_windows()
+	return vim.uv.os_uname().sysname:lower():find("windows") ~= nil
+end
+
 local function _managed_bin()
-	return _bin_dir() .. "/lazyverilog-lsp"
+	-- Windows executable lookup is most reliable when the managed binary keeps
+	-- its native .exe suffix.  Unix-like platforms intentionally keep the
+	-- historical extensionless path so existing installations continue to work.
+	local suffix = _is_windows() and ".exe" or ""
+	return _bin_dir() .. "/lazyverilog-lsp" .. suffix
 end
 
 local function _remove_file(path)
@@ -180,6 +188,7 @@ local function _sha256_file(path, on_done)
 	--
 	--   * Linux: sha256sum
 	--   * macOS: shasum -a 256
+	--   * Windows: certutil -hashfile ... SHA256
 	--   * Fallback: openssl dgst -sha256 -r
 	--
 	-- The command output is intentionally parsed as "first 64 hex characters"
@@ -191,6 +200,9 @@ local function _sha256_file(path, on_done)
 	end
 	if vim.fn.executable("shasum") == 1 then
 		table.insert(commands, { "shasum", "-a", "256", path })
+	end
+	if vim.fn.executable("certutil") == 1 then
+		table.insert(commands, { "certutil", "-hashfile", path, "SHA256" })
 	end
 	if vim.fn.executable("openssl") == 1 then
 		table.insert(commands, { "openssl", "dgst", "-sha256", "-r", path })
@@ -210,10 +222,16 @@ local function _sha256_file(path, on_done)
 			-- `vim.fn.delete()`, which are illegal from fast events.
 			vim.schedule(function()
 				if result.code == 0 then
-					local digest = (result.stdout or ""):match("([0-9a-fA-F]+)")
-					if digest and #digest == 64 then
-						on_done(digest:lower(), nil)
-						return
+					-- Some tools print labels before the digest, for example
+					-- certutil starts with "SHA256 hash of ...".  Do not trust
+					-- the first hex-looking token; scan until a full 64-digit
+					-- SHA-256 candidate is found.
+					local output = (result.stdout or "") .. (result.stderr or "")
+					for digest in output:gmatch("[0-9a-fA-F]+") do
+						if #digest == 64 then
+							on_done(digest:lower(), nil)
+							return
+						end
 					end
 				end
 
@@ -235,6 +253,8 @@ local function _platform()
 		os_part = "linux"
 	elseif sys:find("darwin") then
 		os_part = "darwin"
+	elseif sys:find("windows") then
+		os_part = "windows"
 	else
 		return nil
 	end
@@ -321,7 +341,8 @@ local function _auto_install(on_done)
 			return
 		end
 
-		local asset    = "lazyverilog-lsp-" .. RELEASE_VERSION .. "-" .. asset_platform
+		local asset_suffix = asset_platform:find("^windows") and ".exe" or ""
+		local asset    = "lazyverilog-lsp-" .. RELEASE_VERSION .. "-" .. asset_platform .. asset_suffix
 		local url      = RELEASE_BASE_URL .. "/" .. RELEASE_VERSION .. "/" .. asset
 		local tmp_path = bin_path .. ".download." .. tostring(vim.uv.hrtime())
 
@@ -363,6 +384,15 @@ local function _auto_install(on_done)
 					if vim.fn.rename(tmp_path, bin_path) ~= 0 then
 						_remove_file(tmp_path)
 						_fail_install_waiters("[LazyVerilog] failed to install verified binary")
+						return
+					end
+
+					-- Windows executable permissions are encoded by the .exe
+					-- file type rather than POSIX mode bits, and chmod is not a
+					-- required tool there.  Skip directly to the compatibility
+					-- checks after installing the verified file.
+					if _is_windows() then
+						on_success()
 						return
 					end
 
@@ -446,7 +476,11 @@ local function resolve_cmd(cfg)
 	end
 
 	-- Case 3: fallback
-	for _, candidate in ipairs({ "lazyverilog-lsp", _managed_bin() }) do
+	local candidates = { "lazyverilog-lsp", _managed_bin() }
+	if _is_windows() then
+		table.insert(candidates, 2, "lazyverilog-lsp.exe")
+	end
+	for _, candidate in ipairs(candidates) do
 		if vim.fn.executable(candidate) == 1 then
 			local cmd = { candidate }
 			vim.list_extend(cmd, cfg.cmd_args or {})
