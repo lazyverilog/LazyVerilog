@@ -219,9 +219,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // Pass URI as name (display label) and stripped filesystem path as path
     // (used by SourceManager::assignText for include resolution relative to
     // the file's directory, not the server CWD).
-    std::string path = uri;
-    if (path.starts_with("file://"))
-        path = path.substr(7);
+    std::string path = path_from_file_uri(uri);
     // Fresh SourceManager per document snapshot: avoids "path already assigned"
     // errors when the same file is re-parsed on didChange, and prevents the
     // static singleton from accumulating stale buffers across edits.
@@ -362,9 +360,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text) {
     uint64_t version = ++version_counter_;
 
-    std::string path = uri;
-    if (path.starts_with("file://"))
-        path = path.substr(7);
+    std::string path = path_from_file_uri(uri);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalize_filesystem_path(path).string();
     cache_document_end_position(*state);
@@ -3151,7 +3147,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
                                            const std::vector<std::string>& deleted_uris) {
     auto normalized_project_path = [](std::string uri) -> std::string {
         if (uri.starts_with("file://"))
-            uri = uri.substr(7);
+            uri = path_from_file_uri(uri);
         if (uri.empty())
             return {};
         return normalize_filesystem_path(uri).string();
@@ -3385,7 +3381,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         // Keeping this path-to-URI conversion allocation-only prevents large
         // project snapshots from extending the analyzer critical section with
         // redundant per-file path work.
-        const auto uri = "file://" + path_string;
+        const auto uri = uri_from_path(path_string);
         if (seen_uris.contains(uri) || seen_paths.contains(path_string))
             continue;
 

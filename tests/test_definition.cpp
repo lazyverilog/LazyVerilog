@@ -44,6 +44,23 @@ TEST_CASE("definition: named port resolves to port declaration", "[definition]")
     CHECK(loc->end_col == 19);
 }
 
+TEST_CASE("definition: current-file lookup accepts Windows-style file URI", "[definition][path][uri]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///C:/lazyverilog/definition_windows_uri.sv";
+    analyzer.open(uri,
+                  "module top;\n"
+                  "    logic ready;\n"
+                  "    assign ready = 1'b1;\n"
+                  "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 2, 11);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri);
+    CHECK(loc->line == 1);
+    CHECK(loc->col == 10);
+    CHECK(loc->end_col == 15);
+}
+
 static std::string read_text(const std::string& path) {
     std::ifstream input(path);
     REQUIRE(input.good());

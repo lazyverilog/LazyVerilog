@@ -99,8 +99,105 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     return absolute.lexically_normal();
 }
 
+inline bool is_windows_drive_path(std::string_view text) {
+    return text.size() >= 2 && std::isalpha(static_cast<unsigned char>(text[0])) &&
+           text[1] == ':';
+}
+
+inline int uri_hex_value(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+inline std::string percent_decode_uri_path(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '%' && i + 2 < text.size()) {
+            const int hi = uri_hex_value(text[i + 1]);
+            const int lo = uri_hex_value(text[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(text[i]);
+    }
+    return out;
+}
+
+/// Convert an LSP `file://` URI to an OS path string.
+///
+/// LSP clients such as VS Code send Windows paths as `file:///C:/repo/top.sv`.
+/// A plain `substr(7)` conversion turns that into `/C:/repo/top.sv`, which is
+/// not the same path on Windows and can make SourceManager file names disagree
+/// with the document URI used by go-to-definition.  This helper keeps the POSIX
+/// behavior unchanged (`file:///tmp/a.sv` -> `/tmp/a.sv`) while accepting common
+/// Windows forms:
+///
+///   file:///C:/repo/top.sv     -> C:/repo/top.sv
+///   file://server/share/a.sv   -> //server/share/a.sv
+///
+/// The returned string intentionally uses forward slashes for Windows paths;
+/// `std::filesystem::path` accepts them on Windows, and keeping slashes stable
+/// prevents URI/path round-trips from depending on the caller's formatting.
+inline std::string path_from_file_uri(std::string_view uri) {
+    constexpr std::string_view prefix = "file://";
+    if (!uri.starts_with(prefix))
+        return std::string(uri);
+
+    std::string_view rest = uri.substr(prefix.size());
+
+    // URI form with an authority, usually UNC: file://server/share/file.sv.
+    // Drive-letter URIs are normally file:///C:/..., but tolerate file://C:/...
+    // as a local path rather than interpreting "C:" as an authority.
+    if (!rest.empty() && rest.front() != '/' && !is_windows_drive_path(rest)) {
+        const auto slash = rest.find('/');
+        const auto authority = slash == std::string_view::npos ? rest : rest.substr(0, slash);
+        if (authority == "localhost") {
+            std::string path = slash == std::string_view::npos
+                                   ? std::string{}
+                                   : percent_decode_uri_path(rest.substr(slash));
+            if (path.size() >= 3 && path[0] == '/' &&
+                is_windows_drive_path(std::string_view(path).substr(1)))
+                path.erase(path.begin());
+            return path;
+        }
+        if (slash == std::string_view::npos)
+            return "//" + percent_decode_uri_path(authority);
+        return "//" + percent_decode_uri_path(authority) +
+               percent_decode_uri_path(rest.substr(slash));
+    }
+
+    std::string path = percent_decode_uri_path(rest);
+
+    // Windows local drive URI: file:///C:/repo/top.sv.  Remove the URI-only
+    // leading slash so std::filesystem sees a drive path instead of a POSIX
+    // absolute path named "/C:/...".  On POSIX this only affects Windows-style
+    // file URIs, not native paths like file:///tmp/top.sv.
+    if (path.size() >= 3 && path[0] == '/' && is_windows_drive_path(std::string_view(path).substr(1)))
+        path.erase(path.begin());
+
+    return path;
+}
+
 inline std::string uri_from_path(const std::filesystem::path& path) {
-    return "file://" + normalize_filesystem_path(path).string();
+    std::string normalized = normalize_filesystem_path(path).string();
+    std::replace(normalized.begin(), normalized.end(), '\\', '/');
+
+    // Windows absolute paths stringify as "C:/repo/top.sv" (or "C:\\..." before
+    // slash normalization).  File URIs require an extra slash before the drive:
+    // "file:///C:/repo/top.sv".  POSIX absolute paths already start with '/', so
+    // the historical Linux result remains exactly "file:///tmp/top.sv".
+    if (is_windows_drive_path(normalized))
+        return "file:///" + normalized;
+    return "file://" + normalized;
 }
 
 /// Split source text into logical lines without copying.  The returned

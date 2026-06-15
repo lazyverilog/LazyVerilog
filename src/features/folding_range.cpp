@@ -2,6 +2,7 @@
 #include "document_state.hpp"
 #include "formatter_lexer.hpp"
 #include "formatter_token.hpp"
+#include "string_utils.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -112,9 +113,7 @@ static void emit_token_fold(std::vector<FoldingRange>& out, const LineTable& lt,
 static std::optional<BufferID> find_current_buffer(const SourceManager& sm,
                                                    std::string_view text,
                                                    const std::string& uri) {
-    std::string path = uri;
-    if (path.rfind("file://", 0) == 0)
-        path = path.substr(7);
+    std::string path = path_from_file_uri(uri);
 
     for (BufferID buffer : sm.getAllBuffers()) {
         if (sm.getIncludedFrom(buffer).valid())

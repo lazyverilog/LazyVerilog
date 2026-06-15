@@ -161,6 +161,7 @@ enable_testing()
 set(LAZYVERILOG_TEST_SOURCES
     tests/test_main.cpp
     tests/test_config.cpp
+    tests/test_path_uri.cpp
     tests/test_document_sync.cpp
     tests/test_syntax_index.cpp
     tests/test_formatter.cpp

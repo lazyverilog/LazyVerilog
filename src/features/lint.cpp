@@ -1,6 +1,7 @@
 #include "lint.hpp"
 #include "../analyzer.hpp"
 #include "../dynamic_file_index.hpp"
+#include "../string_utils.hpp"
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -31,7 +32,7 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
             if (!file_name.empty()) {
                 d.uri = std::string(file_name);
                 if (!d.uri.starts_with("file://"))
-                    d.uri = "file://" + std::filesystem::absolute(d.uri).lexically_normal().string();
+                    d.uri = uri_from_path(d.uri);
             }
         } catch (const std::exception& e) {
             // URI attribution failures should not drop the diagnostic, but they
@@ -167,10 +168,7 @@ static bool is_blocking_assignment(SyntaxKind kind) {
 }
 
 static std::string file_stem_from_uri(const std::string& uri) {
-    std::string path = uri;
-    constexpr std::string_view prefix = "file://";
-    if (path.rfind(prefix, 0) == 0)
-        path.erase(0, prefix.size());
+    std::string path = path_from_file_uri(uri);
     return std::filesystem::path(path).stem().string();
 }
 

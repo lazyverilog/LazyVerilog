@@ -70,6 +70,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -448,17 +449,34 @@ static std::string apply_incremental_change(std::string text,
     return text;
 }
 
+static std::optional<size_t> find_filelist_slash_comment(std::string_view line) {
+    // Filelists use // for comments, but LSP/VS Code users sometimes paste
+    // file URIs such as file:///C:/repo/rtl/top.sv.  Treat a double slash that
+    // immediately follows ':' as part of a URI/scheme (or a Windows-ish path)
+    // rather than as a comment opener.  Ordinary trailing comments still work:
+    //
+    //   rtl/top.sv // comment       -> comment
+    //   file:///C:/repo/top.sv      -> path
+    for (size_t pos = line.find("//"); pos != std::string_view::npos;
+         pos = line.find("//", pos + 2)) {
+        if (pos > 0 && line[pos - 1] == ':')
+            continue;
+        return pos;
+    }
+    return std::nullopt;
+}
+
 static std::string resolve_vcode_path(const std::filesystem::path& root, const Config& config) {
     if (config.design.vcode.empty())
         return {};
-    auto filelist = std::filesystem::path(config.design.vcode);
+    auto filelist = std::filesystem::path(path_from_file_uri(config.design.vcode));
     if (filelist.is_relative())
         filelist = root / filelist;
     return std::filesystem::absolute(filelist).lexically_normal().string();
 }
 
 static std::string path_to_file_uri(const std::filesystem::path& path) {
-    return "file://" + std::filesystem::absolute(path).lexically_normal().string();
+    return uri_from_path(path);
 }
 
 struct VcodeResult {
@@ -481,8 +499,8 @@ static VcodeResult load_vcode(const std::filesystem::path& root, const Config& c
     std::string line;
     while (std::getline(input, line)) {
         // Strip // and # comments
-        if (auto pos = line.find("//"); pos != std::string::npos)
-            line.erase(pos);
+        if (auto pos = find_filelist_slash_comment(line))
+            line.erase(*pos);
         if (auto pos = line.find('#'); pos != std::string::npos)
             line.erase(pos);
 
@@ -504,7 +522,7 @@ static VcodeResult load_vcode(const std::filesystem::path& root, const Config& c
             while (!rest.empty()) {
                 const auto plus = rest.find('+');
                 auto dir_text = plus == std::string_view::npos ? rest : rest.substr(0, plus);
-                auto dir = std::filesystem::path(std::string(dir_text));
+                auto dir = std::filesystem::path(path_from_file_uri(dir_text));
                 if (!dir.empty()) {
                     if (dir.is_relative())
                         dir = filelist_dir / dir;
@@ -523,7 +541,7 @@ static VcodeResult load_vcode(const std::filesystem::path& root, const Config& c
             continue;
 
         // Regular file path
-        auto path = std::filesystem::path(item);
+        auto path = std::filesystem::path(path_from_file_uri(item));
         if (path.is_relative())
             path = filelist_dir / path;
         result.files.push_back(std::filesystem::absolute(path).lexically_normal().string());
@@ -884,9 +902,7 @@ void LazyVerilogServer::register_handlers() {
 
             // Extract workspace root from initialize params
             auto uri_to_path = [](const std::string& uri) -> std::filesystem::path {
-                if (uri.starts_with("file://"))
-                    return {uri.substr(7)};
-                return {uri};
+                return {path_from_file_uri(uri)};
             };
 
             // Apply the workspace root selected by either the modern LSP
@@ -1027,7 +1043,7 @@ void LazyVerilogServer::register_handlers() {
                     std::string config_file = did_change_config_file(note.params.settings);
                     if (!config_file.empty()) {
                         if (config_file.starts_with("file://"))
-                            config_file = config_file.substr(7);
+                            config_file = path_from_file_uri(config_file);
                         std::filesystem::path config_path(config_file);
                         if (config_path.is_relative())
                             config_path = root_ / config_path;
@@ -1103,7 +1119,7 @@ void LazyVerilogServer::register_handlers() {
             if (!config_found_) {
                 auto uri = td.uri.raw_uri_;
                 if (uri.starts_with("file://"))
-                    uri = uri.substr(7);
+                    uri = path_from_file_uri(uri);
                 auto found = find_config_root(uri);
                 if (!found.empty()) {
                     root_ = found;
@@ -1459,10 +1475,7 @@ void LazyVerilogServer::register_handlers() {
                 };
 
                 auto uri_to_file = [](std::string uri) {
-                    constexpr std::string_view prefix = "file://";
-                    if (uri.starts_with(prefix))
-                        uri.erase(0, prefix.size());
-                    return uri;
+                    return path_from_file_uri(uri);
                 };
 
                 std::vector<std::pair<std::string, ParseDiagInfo>> diagnostics;
