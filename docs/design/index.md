@@ -15,11 +15,14 @@ define = ["RTL_SIM"]
 
 ## Filelist format
 
-One source file path per line. Paths are relative to the `.f` file's directory.
+One source file path per line. Paths are relative to the filelist's directory.
+Nested filelists are supported with `-f`; nested relative paths are resolved
+relative to the parent filelist that contains the `-f` entry.
 
 ```text
 rtl/m_alu.sv
 rtl/m_adder.sv
+-f ../shared/shared.vc
 +incdir+rtl/include
 vendor/uvm/src/uvm_pkg.sv
 ```
@@ -30,12 +33,17 @@ Parsing rules:
 |--------|--------|
 | `// ...` | Line comment |
 | `# ...` | Line comment |
+| `-f <filelist>` | Load a nested filelist; relative paths are resolved from the parent filelist |
 | `+incdir+<dir>` | Add include search directory; `<dir>` is relative to the `.f` file |
 | `+incdir+<dir_a>+<dir_b>` | Add multiple include search directories |
 | `+<option>` | Other compiler options are silently ignored |
 | `-<flag>` | Compiler flags are silently ignored |
 
 `+incdir+` entries are **not** parsed as source files. They are passed to slang's include resolver so explicit source files can resolve `` `include "..." `` directives.
+
+Environment variables in filelist, source, and include-directory paths are expanded
+in `$VAR` and `${VAR}` form when the variable is defined. Undefined variables are
+left unchanged.
 
 ## Include-heavy libraries
 

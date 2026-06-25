@@ -116,6 +116,7 @@ set(LAZYVERILOG_SOURCES
     src/main.cpp
     src/server.cpp
     src/config.cpp
+    src/filelist.cpp
     src/analyzer.cpp
     src/dynamic_file_index.cpp
     src/background_compiler.cpp
@@ -162,6 +163,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_main.cpp
     tests/test_config.cpp
     tests/test_path_uri.cpp
+    tests/test_filelist.cpp
     tests/test_document_sync.cpp
     tests/test_syntax_index.cpp
     tests/test_formatter.cpp
@@ -182,6 +184,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/autoinst.cpp
     src/features/autoarg.cpp
     src/config.cpp
+    src/filelist.cpp
     src/analyzer.cpp
     src/dynamic_file_index.cpp
     src/syntax_index.cpp
