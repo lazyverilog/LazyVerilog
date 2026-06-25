@@ -411,6 +411,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             .kind = (p.direction == "parameter" || p.direction == "localparam")
                         ? p.direction
                         : std::string("port"),
+            .default_value = p.default_value,
             .parent_scope = entry.name,
             .file_id = p.file_id,
             .line = p.line,
@@ -441,6 +442,28 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .line = vl,
                     .col = vc,
                 });
+            }
+        } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
+            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+                const std::string type_text = render_syntax_node_text(sm, *param->type);
+                const std::string kind_text = token_value_text(param->keyword);
+                for (const auto* decl : param->declarators) {
+                    if (!decl)
+                        continue;
+                    auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                    index.values.push_back(ValueEntry{
+                        .name = token_value_text(decl->name),
+                        .type = with_declarator_dimensions(sm, type_text, *decl),
+                        .kind = kind_text,
+                        .default_value = decl->initializer
+                                             ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                             : std::string{},
+                        .parent_scope = entry.name,
+                        .file_id = source_file_id_for_token(index, sm, decl->name),
+                        .line = vl,
+                        .col = vc,
+                    });
+                }
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto& proto = *fn->prototype;
@@ -731,6 +754,9 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                             .name = token_value_text(decl->name),
                             .type = type_text,
                             .kind = token_value_text(param->keyword),
+                            .default_value = decl->initializer
+                                                 ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                                 : std::string{},
                             .parent_scope = pkg_name,
                             .file_id = source_file_id_for_token(index, sm, decl->name),
                             .line = vl,

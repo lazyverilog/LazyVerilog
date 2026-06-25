@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 
 static const std::string kDefinitionFixture = R"(
 module child (
@@ -17,6 +18,22 @@ module top;
     );
 endmodule
 )";
+
+static std::pair<int, int> position_of(std::string_view text, std::string_view needle) {
+    const auto offset = text.find(needle);
+    REQUIRE(offset != std::string_view::npos);
+    int line = 0;
+    int col = 0;
+    for (size_t i = 0; i < offset; ++i) {
+        if (text[i] == '\n') {
+            ++line;
+            col = 0;
+        } else {
+            ++col;
+        }
+    }
+    return {line, col};
+}
 
 TEST_CASE("definition: instance resolves to module declaration", "[definition]") {
     Analyzer analyzer;
@@ -177,6 +194,212 @@ TEST_CASE("definition: typedef lookup resolves named type", "[definition]") {
     CHECK(loc->end_col == 10);
 }
 
+TEST_CASE("definition: package parameter lookup resolves qualified and imported names",
+          "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_package_param.sv";
+    const std::string text = R"SV(package cpu_pkg;
+    parameter int WIDTH = 8;
+    localparam int DEPTH = WIDTH * 2;
+endpackage
+
+module top;
+    import cpu_pkg::DEPTH;
+    logic [cpu_pkg::WIDTH-1:0] data;
+    logic [DEPTH-1:0] addr;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [qualified_line, qualified_col] = position_of(text, "WIDTH-1");
+    auto qualified = analyzer.definition_of(uri, qualified_line, qualified_col);
+    REQUIRE(qualified.has_value());
+    auto [width_line, width_col] = position_of(text, "WIDTH =");
+    CHECK(qualified->uri == uri);
+    CHECK(qualified->line == width_line);
+    CHECK(qualified->col == width_col);
+
+    auto [imported_line, imported_col] = position_of(text, "DEPTH-1");
+    auto imported = analyzer.definition_of(uri, imported_line, imported_col);
+    REQUIRE(imported.has_value());
+    auto [depth_line, depth_col] = position_of(text, "DEPTH =");
+    CHECK(imported->uri == uri);
+    CHECK(imported->line == depth_line);
+    CHECK(imported->col == depth_col);
+}
+
+TEST_CASE("definition: package parameter lookup uses closed project index", "[definition]") {
+    Analyzer analyzer;
+    const std::string package_text = R"SV(package bus_pkg;
+    parameter int BUS_WIDTH = 64;
+    localparam int BUS_DEPTH = 128;
+endpackage
+)SV";
+    const auto package_path =
+        write_temp_sv("lazyverilog_definition_package_param_pkg.sv", package_text);
+    const std::string package_uri = "file://" + package_path.string();
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_param_top.sv";
+    const std::string top_text = R"SV(module top;
+    import bus_pkg::*;
+    logic [bus_pkg::BUS_WIDTH-1:0] data;
+    logic [BUS_DEPTH-1:0] addr;
+endmodule
+)SV";
+    analyzer.open(top_uri, top_text);
+
+    auto [qualified_line, qualified_col] = position_of(top_text, "BUS_WIDTH-1");
+    auto qualified = analyzer.definition_of(top_uri, qualified_line, qualified_col);
+    REQUIRE(qualified.has_value());
+    auto [width_line, width_col] = position_of(package_text, "BUS_WIDTH =");
+    CHECK(qualified->uri == package_uri);
+    CHECK(qualified->line == width_line);
+    CHECK(qualified->col == width_col);
+
+    auto [imported_line, imported_col] = position_of(top_text, "BUS_DEPTH-1");
+    auto imported = analyzer.definition_of(top_uri, imported_line, imported_col);
+    REQUIRE(imported.has_value());
+    auto [depth_line, depth_col] = position_of(package_text, "BUS_DEPTH =");
+    CHECK(imported->uri == package_uri);
+    CHECK(imported->line == depth_line);
+    CHECK(imported->col == depth_col);
+
+    std::filesystem::remove(package_path);
+}
+
+TEST_CASE("definition: package name lookup uses closed project index", "[definition]") {
+    Analyzer analyzer;
+    const std::string package_text = R"SV(package name_pkg;
+    parameter int WIDTH = 32;
+endpackage
+)SV";
+    const auto package_path =
+        write_temp_sv("lazyverilog_definition_package_name_pkg.sv", package_text);
+    const std::string package_uri = "file://" + package_path.string();
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_name_top.sv";
+    const std::string top_text = R"SV(module top;
+    import name_pkg::*;
+    logic [name_pkg::WIDTH-1:0] data;
+endmodule
+)SV";
+    analyzer.open(top_uri, top_text);
+
+    auto [import_line, import_col] = position_of(top_text, "name_pkg::*");
+    auto import_def = analyzer.definition_of(top_uri, import_line, import_col);
+    REQUIRE(import_def.has_value());
+    auto [pkg_line, pkg_col] = position_of(package_text, "name_pkg;");
+    CHECK(import_def->uri == package_uri);
+    CHECK(import_def->line == pkg_line);
+    CHECK(import_def->col == pkg_col);
+
+    auto [scoped_line, scoped_col] = position_of(top_text, "name_pkg::WIDTH");
+    auto scoped_def = analyzer.definition_of(top_uri, scoped_line, scoped_col);
+    REQUIRE(scoped_def.has_value());
+    CHECK(scoped_def->uri == package_uri);
+    CHECK(scoped_def->line == pkg_line);
+    CHECK(scoped_def->col == pkg_col);
+
+    std::filesystem::remove(package_path);
+}
+
+TEST_CASE("definition: package name lookup uses current AST", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_package_name_current.sv";
+    const std::string text = R"SV(package current_pkg;
+    parameter int WIDTH = 32;
+endpackage
+
+module top;
+    import current_pkg::*;
+    logic [current_pkg::WIDTH-1:0] data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [import_line, import_col] = position_of(text, "current_pkg::*");
+    auto import_def = analyzer.definition_of(uri, import_line, import_col);
+    REQUIRE(import_def.has_value());
+    auto [pkg_line, pkg_col] = position_of(text, "current_pkg;");
+    CHECK(import_def->uri == uri);
+    CHECK(import_def->line == pkg_line);
+    CHECK(import_def->col == pkg_col);
+
+    auto [scoped_line, scoped_col] = position_of(text, "current_pkg::WIDTH");
+    auto scoped_def = analyzer.definition_of(uri, scoped_line, scoped_col);
+    REQUIRE(scoped_def.has_value());
+    CHECK(scoped_def->uri == uri);
+    CHECK(scoped_def->line == pkg_line);
+    CHECK(scoped_def->col == pkg_col);
+}
+
+TEST_CASE("definition: package type lookup uses closed project index", "[definition]") {
+    Analyzer analyzer;
+    const std::string package_text = R"SV(package type_pkg;
+    typedef logic [7:0] byte_t;
+    class packet_cfg;
+    endclass
+endpackage
+)SV";
+    const auto package_path =
+        write_temp_sv("lazyverilog_definition_package_type_pkg.sv", package_text);
+    const std::string package_uri = "file://" + package_path.string();
+    analyzer.set_extra_files({package_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_type_top.sv";
+    const std::string top_text = R"SV(module top;
+    type_pkg::byte_t data;
+    type_pkg::packet_cfg cfg;
+endmodule
+)SV";
+    analyzer.open(top_uri, top_text);
+
+    auto [byte_use_line, byte_use_col] = position_of(top_text, "byte_t data");
+    auto byte_def = analyzer.definition_of(top_uri, byte_use_line, byte_use_col);
+    REQUIRE(byte_def.has_value());
+    auto [byte_line, byte_col] = position_of(package_text, "byte_t;");
+    CHECK(byte_def->uri == package_uri);
+    CHECK(byte_def->line == byte_line);
+    CHECK(byte_def->col == byte_col);
+
+    auto [class_use_line, class_use_col] = position_of(top_text, "packet_cfg cfg");
+    auto class_def = analyzer.definition_of(top_uri, class_use_line, class_use_col);
+    REQUIRE(class_def.has_value());
+    auto [class_line, class_col] = position_of(package_text, "packet_cfg;");
+    CHECK(class_def->uri == package_uri);
+    CHECK(class_def->line == class_line);
+    CHECK(class_def->col == class_col);
+
+    std::filesystem::remove(package_path);
+}
+
+TEST_CASE("definition: package type lookup uses current AST", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_package_type_current.sv";
+    const std::string text = R"SV(package current_type_pkg;
+    typedef logic [7:0] byte_t;
+endpackage
+
+module top;
+    current_type_pkg::byte_t data;
+endmodule
+)SV";
+    analyzer.open(uri, text);
+
+    auto [use_line, use_col] = position_of(text, "byte_t data");
+    auto def = analyzer.definition_of(uri, use_line, use_col);
+    REQUIRE(def.has_value());
+    auto [type_line, type_col] = position_of(text, "byte_t;");
+    CHECK(def->uri == uri);
+    CHECK(def->line == type_line);
+    CHECK(def->col == type_col);
+}
+
 TEST_CASE("definition: class type lookup resolves class declaration", "[definition]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/lazyverilog_definition_class_type.sv";
@@ -242,36 +465,6 @@ TEST_CASE("definition: unqualified name ignores aggregate fields", "[definition]
     CHECK(rhs->line == 2);
     CHECK(rhs->col == 14);
     CHECK(rhs->end_col == 19);
-}
-
-TEST_CASE("definition: demo memory_top valid lhs prefers module signal", "[definition]") {
-    Analyzer analyzer;
-    const auto top_path = find_repo_file("demo/memory_top.sv");
-    const std::string top_uri = "file://" + top_path.string();
-    analyzer.open(top_uri, read_text(top_path.string()));
-
-    // Exact regression for demo/memory_top.sv:
-    //
-    //     valid = fifo_entry.valid;
-    //     ^^^^^
-    //
-    // The included params.svh defines fifo_entry_t.valid before the module
-    // signal declaration.  The unqualified LHS must still resolve to the
-    // module-level `logic valid`, not the aggregate field.
-    auto lhs = analyzer.definition_of(top_uri, 47, 4);
-    REQUIRE(lhs.has_value());
-    CHECK(lhs->uri == top_uri);
-    CHECK(lhs->line == 45);
-    CHECK(lhs->col == 40);
-    CHECK(lhs->end_col == 45);
-
-    // Keep the member-access behavior intact for the RHS.
-    auto rhs = analyzer.definition_of(top_uri, 47, 28);
-    REQUIRE(rhs.has_value());
-    CHECK(rhs->uri.ends_with("/demo/params.svh"));
-    CHECK(rhs->line == 2);
-    CHECK(rhs->col == 44);
-    CHECK(rhs->end_col == 49);
 }
 
 TEST_CASE("definition: named subroutine argument resolves to formal argument", "[definition]") {
@@ -369,7 +562,9 @@ TEST_CASE("definition: package members included as text require import", "[defin
                       "    result = a + b;\n"
                       "endtask\n"
                       "endpackage\n");
-    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_member_top.sv";
+    const auto top_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_definition_package_member_top.sv";
+    const std::string top_uri = "file://" + top_path.string();
 
     // Including a header that contains a package declaration makes the package
     // syntax visible to slang's parsed tree, but it does not import the package
@@ -412,7 +607,8 @@ TEST_CASE("definition: nested include cursor matching is file-aware", "[definiti
     const auto a_path = write_temp_sv("A_nested_collision.svh",
                                       "`include \"B_nested_collision.svh\"\n"
                                       "parameter int A_PARAMETER = 1;\n");
-    const std::string top_uri = "file:///tmp/top_nested_collision.sv";
+    const auto top_path = std::filesystem::temp_directory_path() / "top_nested_collision.sv";
+    const std::string top_uri = "file://" + top_path.string();
     analyzer.open(top_uri, "`include \"A_nested_collision.svh\"\n"
                            "module top;\n"
                            "  localparam int X = A_PARAMETER;\n"

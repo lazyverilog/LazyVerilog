@@ -198,6 +198,9 @@ struct ValueEntry {
     std::string name;
     std::string type;
     std::string kind; // variable/net/function/task/parameter/localparam/port
+    // Default value text for parameter/localparam values. Empty for values that
+    // either do not have an initializer or do not expose one in hover text.
+    std::string default_value;
     std::string parent_scope; // module/interface/package/class name when known
     SourceFileID file_id{kInvalidSourceFileID};
     // 1-based lexical visibility range for block-local declarations.  A zero

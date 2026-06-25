@@ -87,13 +87,14 @@ std::string with_dims(const slang::SourceManager& sm, std::string type,
 
 ValueEntry* add_value(SyntaxIndex& index, const slang::SourceManager& sm,
                       const slang::parsing::Token& name, std::string type, std::string kind,
-                      std::string parent_scope) {
+                      std::string parent_scope, std::string default_value = {}) {
     if (!name)
         return nullptr;
     auto [line, col] = token_pos_line1_col0(sm, name);
     index.values.push_back(ValueEntry{.name = token_value_text(name),
                                       .type = std::move(type),
                                       .kind = std::move(kind),
+                                      .default_value = std::move(default_value),
                                       .parent_scope = std::move(parent_scope),
                                       .file_id = source_file_id_for_token(index, sm, name),
                                       .line = line,
@@ -108,6 +109,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, const slang::SourceManage
     if (!name)
         return;
     auto [line, col] = token_pos_line1_col0(sm, name);
+    const std::string value_default = default_value;
     module.ports.push_back(PortEntry{.name = token_value_text(name),
                                      .file_id = source_file_id_for_token(index, sm, name),
                                      .direction = direction,
@@ -123,6 +125,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, const slang::SourceManage
                                       .kind = (direction == "parameter" || direction == "localparam")
                                                   ? direction
                                                   : std::string("port"),
+                                      .default_value = std::move(value_default),
                                       .parent_scope = module.name,
                                       .file_id = source_file_id_for_token(index, sm, name),
                                       .line = line,
@@ -261,8 +264,8 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *method->declaration->prototype;
             auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
-            entry.methods.push_back(MethodEntry{.name = node_text_raw(sm, *proto.name),
-                                                .return_type = node_text_raw(sm, *proto.returnType),
+            entry.methods.push_back(MethodEntry{.name = render_syntax_node_text(sm, *proto.name),
+                                                .return_type = render_syntax_node_text(sm, *proto.returnType),
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
                                                 .file_id = source_file_id_for_token(index, sm, proto.keyword),
@@ -392,6 +395,19 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                     add_value(index, sm, decl->name, with_dims(sm, type, *decl), "variable",
                               module.name);
             }
+        } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
+            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+                const auto type = node_text_raw(sm, *param->type);
+                const auto kind = token_value_text(param->keyword);
+                for (const auto* decl : param->declarators) {
+                    if (!decl)
+                        continue;
+                    add_value(index, sm, decl->name, with_dims(sm, type, *decl), kind,
+                              module.name,
+                              decl->initializer ? node_text_raw(sm, *decl->initializer->expr)
+                                                : std::string{});
+                }
+            }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             if (auto* value = add_value(index, sm, fn->prototype->keyword,
                                         node_text_raw(sm, *fn->prototype->returnType), "function",
@@ -467,6 +483,9 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                     index.values.push_back(ValueEntry{.name = token_value_text(decl->name),
                                                       .type = type,
                                                       .kind = token_value_text(param->keyword),
+                                                      .default_value = decl->initializer
+                                                                           ? node_text_raw(sm, *decl->initializer->expr)
+                                                                           : std::string{},
                                                       .parent_scope = module.name,
                                                       .file_id = source_file_id_for_token(index, sm, decl->name),
                                                       .line = pl,

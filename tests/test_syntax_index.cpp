@@ -147,6 +147,32 @@ endmodule
     CHECK(has_ref("state", "module_signal::top::state"));
 }
 
+TEST_CASE("syntax_index: scoped package parameter use has package value SymbolID", "[index]") {
+    const std::string text = R"(
+package p1;
+    parameter int WIDTH = 8;
+endpackage
+
+module top;
+    logic [p1::WIDTH-1:0] data;
+endmodule
+)";
+    auto tree = slang::syntax::SyntaxTree::fromText(text);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, text);
+
+    const auto count = std::count_if(idx.references.begin(), idx.references.end(),
+                                     [](const ReferenceEntry& ref) {
+                                         return ref.name == "WIDTH" &&
+                                                ref.symbol_debug == "package_value::p1::WIDTH" &&
+                                                ref.symbol_id == SymbolID::from_canonical(
+                                                                     "package_value::p1::WIDTH");
+                                     });
+
+    CHECK(count >= 2);
+}
+
 TEST_CASE("syntax_index: typedef struct fields have typedef-scoped SymbolIDs", "[index]") {
     const std::string text = R"(
 typedef struct {

@@ -674,6 +674,13 @@ find_module_definition(const SyntaxIndex& index, const std::string& uri, const s
                     module.col + (int)module.name.size()};
 }
 
+static std::optional<Location>
+find_package_definition(const SyntaxIndex& index, const std::string& uri, const std::string& name) {
+    if (!index.package_names.contains(name))
+        return std::nullopt;
+    return find_module_definition(index, uri, name);
+}
+
 static const ModuleEntry* find_module_entry(const SyntaxIndex& index, const std::string& name) {
     auto it = index.module_by_name.find(name);
     if (it == index.module_by_name.end() || it->second >= index.modules.size())
@@ -707,6 +714,121 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
     const int line = to_lsp_line(port->line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, port->col, line,
                     port->col + (int)port->name.size()};
+}
+
+static bool is_package_value_entry(const SyntaxIndex& index, const ValueEntry& value) {
+    return !value.parent_scope.empty() && index.package_names.contains(value.parent_scope) &&
+           (value.kind == "parameter" || value.kind == "localparam");
+}
+
+static const ValueEntry* find_package_value_entry(const SyntaxIndex& index,
+                                                  std::string_view package_name,
+                                                  std::string_view value_name) {
+    if (package_name.empty() || value_name.empty())
+        return nullptr;
+
+    for (const auto& value : index.values) {
+        if (!is_package_value_entry(index, value))
+            continue;
+        if (value.parent_scope == package_name && value.name == value_name)
+            return &value;
+    }
+    return nullptr;
+}
+
+static std::optional<Location> location_from_value_entry(const SyntaxIndex& index,
+                                                         const std::string& fallback_uri,
+                                                         const ValueEntry& value) {
+    if (value.line <= 0 || value.name.empty())
+        return std::nullopt;
+    const auto actual_uri = index.source_uri(value.file_id);
+    const int line = to_lsp_line(value.line);
+    return Location{actual_uri.empty() ? fallback_uri : actual_uri, line, value.col, line,
+                    value.col + (int)value.name.size()};
+}
+
+static std::optional<Location> find_package_value_definition(const SyntaxIndex& index,
+                                                             const std::string& uri,
+                                                             std::string_view package_name,
+                                                             std::string_view value_name) {
+    const auto* value = find_package_value_entry(index, package_name, value_name);
+    if (!value)
+        return std::nullopt;
+    return location_from_value_entry(index, uri, *value);
+}
+
+static std::optional<Location>
+location_from_type_entry(const SyntaxIndex& index, const std::string& fallback_uri,
+                         SourceFileID file_id, int line_one_based, int col, size_t name_size) {
+    if (line_one_based <= 0 || name_size == 0)
+        return std::nullopt;
+    const auto actual_uri = index.source_uri(file_id);
+    const int line = to_lsp_line(line_one_based);
+    return Location{actual_uri.empty() ? fallback_uri : actual_uri, line, col, line,
+                    col + static_cast<int>(name_size)};
+}
+
+static std::optional<Location> find_package_type_definition(const SyntaxIndex& index,
+                                                            const std::string& uri,
+                                                            std::string_view package_name,
+                                                            std::string_view type_name) {
+    if (package_name.empty() || type_name.empty() ||
+        !index.package_names.contains(std::string(package_name)))
+        return std::nullopt;
+
+    for (const auto& td : index.typedefs) {
+        if (td.parent_scope == package_name && td.name == type_name)
+            return location_from_type_entry(index, uri, td.file_id, td.line, td.col,
+                                            td.name.size());
+    }
+    for (const auto& cls : index.classes) {
+        if (cls.parent_scope == package_name && cls.name == type_name)
+            return location_from_type_entry(index, uri, cls.file_id, cls.line, cls.col,
+                                            cls.name.size());
+    }
+    return std::nullopt;
+}
+
+static bool package_value_visible(std::string_view package_name, std::string_view symbol_name,
+                                  std::string_view preferred_package,
+                                  const std::vector<ImportEntry>& visible_imports,
+                                  std::string_view preferred_module, int use_line_one_based) {
+    if (package_name.empty())
+        return true;
+    if (preferred_package == package_name)
+        return true;
+
+    for (const auto& import : visible_imports) {
+        if (import.package_name != package_name)
+            continue;
+        if (!import.parent_scope.empty() && import.parent_scope != preferred_module)
+            continue;
+        if (import.start_line > 0 && use_line_one_based < import.start_line)
+            continue;
+        if (import.end_line > 0 && use_line_one_based > import.end_line)
+            continue;
+        if (import.wildcard || import.symbol_name == symbol_name)
+            return true;
+    }
+    return false;
+}
+
+static std::optional<Location> find_visible_package_value_definition(
+    const SyntaxIndex& index, const std::string& uri, std::string_view value_name,
+    std::string_view preferred_module, std::string_view preferred_package,
+    const std::vector<ImportEntry>& visible_imports, int use_line_one_based) {
+    if (value_name.empty())
+        return std::nullopt;
+
+    for (const auto& value : index.values) {
+        if (!is_package_value_entry(index, value) || value.name != value_name)
+            continue;
+        if (!package_value_visible(value.parent_scope, value.name, preferred_package,
+                                   visible_imports, preferred_module, use_line_one_based))
+            continue;
+        return location_from_value_entry(index, uri, value);
+    }
+    return std::nullopt;
 }
 
 static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex& index,
@@ -979,6 +1101,620 @@ static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree
                           .detail = body.empty() ? "(empty)" : body,
                           .line = loc.line,
                           .col = loc.col};
+    }
+    return std::nullopt;
+}
+
+static bool is_integer_parameter_kind(std::string_view kind) {
+    return kind == "parameter" || kind == "localparam";
+}
+
+static bool is_integer_parameter_entry(const ValueEntry& value) {
+    return is_integer_parameter_kind(value.kind);
+}
+
+static std::string strip_sv_numeric_separators(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        if (c != '_')
+            out += c;
+    }
+    return out;
+}
+
+static std::optional<int64_t> parse_sv_integer_literal(std::string_view text) {
+    auto s = trim_copy(std::string(text));
+    if (s.empty())
+        return std::nullopt;
+
+    bool negative = false;
+    if (s.front() == '+' || s.front() == '-') {
+        negative = s.front() == '-';
+        s.erase(s.begin());
+    }
+    s = strip_sv_numeric_separators(s);
+    if (s.empty())
+        return std::nullopt;
+
+    int base = 10;
+    std::string digits = s;
+    if (auto quote = s.find('\''); quote != std::string::npos) {
+        auto suffix = s.substr(quote + 1);
+        if (suffix.empty())
+            return std::nullopt;
+        size_t digit_start = 0;
+        if (suffix[digit_start] == 's' || suffix[digit_start] == 'S')
+            ++digit_start;
+        if (digit_start >= suffix.size())
+            return std::nullopt;
+
+        switch (std::tolower(static_cast<unsigned char>(suffix[digit_start]))) {
+        case 'b':
+            base = 2;
+            break;
+        case 'o':
+            base = 8;
+            break;
+        case 'd':
+            base = 10;
+            break;
+        case 'h':
+            base = 16;
+            break;
+        default:
+            return std::nullopt;
+        }
+        digits = suffix.substr(digit_start + 1);
+        if (digits.empty())
+            return std::nullopt;
+    }
+
+    uint64_t value = 0;
+    for (char c : digits) {
+        if (c == 'x' || c == 'X' || c == 'z' || c == 'Z' || c == '?')
+            return std::nullopt;
+        int digit = -1;
+        if (c >= '0' && c <= '9')
+            digit = c - '0';
+        else if (c >= 'a' && c <= 'f')
+            digit = 10 + c - 'a';
+        else if (c >= 'A' && c <= 'F')
+            digit = 10 + c - 'A';
+        else
+            return std::nullopt;
+        if (digit < 0 || digit >= base)
+            return std::nullopt;
+        value = value * static_cast<uint64_t>(base) + static_cast<uint64_t>(digit);
+    }
+
+    if (negative) {
+        if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1)
+            return std::nullopt;
+        if (value == static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1)
+            return std::numeric_limits<int64_t>::min();
+        return -static_cast<int64_t>(value);
+    }
+    if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        return std::nullopt;
+    return static_cast<int64_t>(value);
+}
+
+struct ParameterEvalContext {
+    std::vector<const SyntaxIndex*> indexes;
+};
+
+struct ParameterEvalKey {
+    std::string scope;
+    std::string name;
+
+    bool operator==(const ParameterEvalKey& other) const {
+        return scope == other.scope && name == other.name;
+    }
+};
+
+struct ParameterEvalKeyHash {
+    size_t operator()(const ParameterEvalKey& key) const {
+        return std::hash<std::string>{}(key.scope) ^ (std::hash<std::string>{}(key.name) << 1);
+    }
+};
+
+static const ValueEntry* find_value_for_eval(const ParameterEvalContext& context,
+                                             std::string_view scope,
+                                             std::string_view name) {
+    if (name.empty())
+        return nullptr;
+
+    for (const auto* index : context.indexes) {
+        if (!index)
+            continue;
+        for (const auto& candidate : index->values) {
+            if (!is_integer_parameter_entry(candidate) || candidate.name != name)
+                continue;
+            if (!scope.empty() && candidate.parent_scope != scope)
+                continue;
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+static int64_t clog2_value(int64_t value) {
+    if (value <= 1)
+        return 0;
+    --value;
+    int64_t result = 0;
+    while (value > 0) {
+        value >>= 1;
+        ++result;
+    }
+    return result;
+}
+
+class ConstantExpressionParser {
+  public:
+    ConstantExpressionParser(std::string_view text, const ParameterEvalContext& context,
+                             std::string_view current_scope,
+                             std::unordered_set<ParameterEvalKey, ParameterEvalKeyHash>& active)
+        : text_(text), context_(context), current_scope_(current_scope), active_(active) {}
+
+    std::optional<int64_t> parse() {
+        auto value = parse_conditional();
+        skip_ws();
+        if (pos_ != text_.size())
+            return std::nullopt;
+        return value;
+    }
+
+  private:
+    std::string_view text_;
+    const ParameterEvalContext& context_;
+    std::string current_scope_;
+    std::unordered_set<ParameterEvalKey, ParameterEvalKeyHash>& active_;
+    size_t pos_{0};
+
+    void skip_ws() {
+        while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_])))
+            ++pos_;
+    }
+
+    bool consume(std::string_view op) {
+        skip_ws();
+        if (!text_.substr(pos_).starts_with(op))
+            return false;
+        pos_ += op.size();
+        return true;
+    }
+
+    std::optional<std::string> consume_identifier() {
+        skip_ws();
+        if (pos_ >= text_.size())
+            return std::nullopt;
+        const char first = text_[pos_];
+        if (!(std::isalpha(static_cast<unsigned char>(first)) || first == '_' || first == '$'))
+            return std::nullopt;
+        const size_t start = pos_++;
+        while (pos_ < text_.size()) {
+            const char c = text_[pos_];
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$'))
+                break;
+            ++pos_;
+        }
+        return std::string(text_.substr(start, pos_ - start));
+    }
+
+    std::optional<int64_t> parse_number() {
+        skip_ws();
+        const size_t start = pos_;
+        bool saw_digit = false;
+        while (pos_ < text_.size()) {
+            const char c = text_[pos_];
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '\'' || c == '?') {
+                if (std::isdigit(static_cast<unsigned char>(c)))
+                    saw_digit = true;
+                ++pos_;
+                continue;
+            }
+            break;
+        }
+        if (!saw_digit) {
+            pos_ = start;
+            return std::nullopt;
+        }
+        auto literal = text_.substr(start, pos_ - start);
+        if (auto parsed = parse_sv_integer_literal(literal))
+            return parsed;
+        pos_ = start;
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> resolve_identifier(std::string scope, std::string name) {
+        auto* value = find_value_for_eval(context_, scope, name);
+        if (!value || value->default_value.empty())
+            return std::nullopt;
+
+        ParameterEvalKey key{.scope = value->parent_scope, .name = value->name};
+        if (active_.contains(key))
+            return std::nullopt;
+        active_.insert(key);
+        ConstantExpressionParser parser(value->default_value, context_, value->parent_scope, active_);
+        auto result = parser.parse();
+        active_.erase(key);
+        return result;
+    }
+
+    std::optional<int64_t> parse_primary() {
+        skip_ws();
+        if (consume("(")) {
+            auto value = parse_conditional();
+            if (!value || !consume(")"))
+                return std::nullopt;
+            return value;
+        }
+        if (auto number = parse_number())
+            return number;
+
+        const size_t before_ident = pos_;
+        auto ident = consume_identifier();
+        if (!ident)
+            return std::nullopt;
+
+        if (*ident == "$clog2") {
+            if (!consume("("))
+                return std::nullopt;
+            auto arg = parse_conditional();
+            if (!arg || !consume(")"))
+                return std::nullopt;
+            return clog2_value(*arg);
+        }
+
+        std::string scope;
+        std::string name = *ident;
+        if (consume("::")) {
+            scope = name;
+            auto rhs = consume_identifier();
+            if (!rhs)
+                return std::nullopt;
+            name = *rhs;
+        } else {
+            scope = current_scope_;
+        }
+
+        if (auto value = resolve_identifier(scope, name))
+            return value;
+
+        // If a module-local lookup failed, allow unqualified package values as a
+        // best-effort hover aid. Definition/import checks still happen in the
+        // definition layer before hover asks for this value.
+        if (!scope.empty()) {
+            pos_ = before_ident + ident->size();
+            if (auto value = resolve_identifier({}, name))
+                return value;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> parse_unary() {
+        if (consume("+"))
+            return parse_unary();
+        if (consume("-")) {
+            auto value = parse_unary();
+            return value ? std::optional<int64_t>(-*value) : std::nullopt;
+        }
+        if (consume("!")) {
+            auto value = parse_unary();
+            return value ? std::optional<int64_t>(*value == 0 ? 1 : 0) : std::nullopt;
+        }
+        if (consume("~")) {
+            auto value = parse_unary();
+            return value ? std::optional<int64_t>(~*value) : std::nullopt;
+        }
+        return parse_primary();
+    }
+
+    std::optional<int64_t> parse_mul() {
+        auto lhs = parse_unary();
+        while (lhs) {
+            if (consume("*")) {
+                auto rhs = parse_unary();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs *= *rhs;
+            } else if (consume("/")) {
+                auto rhs = parse_unary();
+                if (!rhs || *rhs == 0)
+                    return std::nullopt;
+                *lhs /= *rhs;
+            } else if (consume("%")) {
+                auto rhs = parse_unary();
+                if (!rhs || *rhs == 0)
+                    return std::nullopt;
+                *lhs %= *rhs;
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_add() {
+        auto lhs = parse_mul();
+        while (lhs) {
+            if (consume("+")) {
+                auto rhs = parse_mul();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs += *rhs;
+            } else if (consume("-")) {
+                auto rhs = parse_mul();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs -= *rhs;
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_shift() {
+        auto lhs = parse_add();
+        while (lhs) {
+            if (consume("<<")) {
+                auto rhs = parse_add();
+                if (!rhs || *rhs < 0 || *rhs >= 63)
+                    return std::nullopt;
+                *lhs <<= *rhs;
+            } else if (consume(">>")) {
+                auto rhs = parse_add();
+                if (!rhs || *rhs < 0 || *rhs >= 63)
+                    return std::nullopt;
+                *lhs >>= *rhs;
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_relational() {
+        auto lhs = parse_shift();
+        while (lhs) {
+            if (consume("<=")) {
+                auto rhs = parse_shift();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs <= *rhs ? 1 : 0;
+            } else if (consume(">=")) {
+                auto rhs = parse_shift();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs >= *rhs ? 1 : 0;
+            } else if (consume("<")) {
+                auto rhs = parse_shift();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs < *rhs ? 1 : 0;
+            } else if (consume(">")) {
+                auto rhs = parse_shift();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs > *rhs ? 1 : 0;
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_equality() {
+        auto lhs = parse_relational();
+        while (lhs) {
+            if (consume("==")) {
+                auto rhs = parse_relational();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs == *rhs ? 1 : 0;
+            } else if (consume("!=")) {
+                auto rhs = parse_relational();
+                if (!rhs)
+                    return std::nullopt;
+                *lhs = *lhs != *rhs ? 1 : 0;
+            } else {
+                break;
+            }
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_bit_and() {
+        auto lhs = parse_equality();
+        while (lhs) {
+            skip_ws();
+            if (text_.substr(pos_).starts_with("&&") || !consume("&"))
+                break;
+            auto rhs = parse_equality();
+            if (!rhs)
+                return std::nullopt;
+            *lhs &= *rhs;
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_bit_xor() {
+        auto lhs = parse_bit_and();
+        while (lhs && consume("^")) {
+            auto rhs = parse_bit_and();
+            if (!rhs)
+                return std::nullopt;
+            *lhs ^= *rhs;
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_bit_or() {
+        auto lhs = parse_bit_xor();
+        while (lhs) {
+            skip_ws();
+            if (text_.substr(pos_).starts_with("||") || !consume("|"))
+                break;
+            auto rhs = parse_bit_xor();
+            if (!rhs)
+                return std::nullopt;
+            *lhs |= *rhs;
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_logical_and() {
+        auto lhs = parse_bit_or();
+        while (lhs && consume("&&")) {
+            auto rhs = parse_bit_or();
+            if (!rhs)
+                return std::nullopt;
+            *lhs = (*lhs != 0 && *rhs != 0) ? 1 : 0;
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_logical_or() {
+        auto lhs = parse_logical_and();
+        while (lhs && consume("||")) {
+            auto rhs = parse_logical_and();
+            if (!rhs)
+                return std::nullopt;
+            *lhs = (*lhs != 0 || *rhs != 0) ? 1 : 0;
+        }
+        return lhs;
+    }
+
+    std::optional<int64_t> parse_conditional() {
+        auto cond = parse_logical_or();
+        if (!cond || !consume("?"))
+            return cond;
+        auto when_true = parse_conditional();
+        if (!when_true || !consume(":"))
+            return std::nullopt;
+        auto when_false = parse_conditional();
+        if (!when_false)
+            return std::nullopt;
+        return *cond != 0 ? when_true : when_false;
+    }
+};
+
+static std::optional<int64_t> evaluate_parameter_value(const ValueEntry& value,
+                                                       const ParameterEvalContext* context) {
+    if (!context || value.default_value.empty() || !is_integer_parameter_entry(value))
+        return std::nullopt;
+
+    std::unordered_set<ParameterEvalKey, ParameterEvalKeyHash> active;
+    active.insert(ParameterEvalKey{.scope = value.parent_scope, .name = value.name});
+    ConstantExpressionParser parser(value.default_value, *context, value.parent_scope, active);
+    return parser.parse();
+}
+
+static bool evaluated_value_adds_information(const std::string& expression, int64_t value) {
+    const auto direct = parse_sv_integer_literal(expression);
+    return !direct || *direct != value || trim_copy(expression) != std::to_string(value);
+}
+
+static std::string value_hover_detail(const ValueEntry& value,
+                                      const ParameterEvalContext* eval_context = nullptr) {
+    std::string detail = value.type;
+    if (!value.default_value.empty()) {
+        detail += (detail.empty() ? "" : " ") + std::string("= ") + value.default_value;
+        if (auto evaluated = evaluate_parameter_value(value, eval_context);
+            evaluated && evaluated_value_adds_information(value.default_value, *evaluated)) {
+            detail += "\nevaluates to " + std::to_string(*evaluated);
+        }
+    }
+    return detail;
+}
+
+static bool value_matches_location(const SyntaxIndex& index, const std::string& fallback_uri,
+                                   const ValueEntry& value, const Location& loc) {
+    if (value.line <= 0 || value.col != loc.col || to_lsp_line(value.line) != loc.line)
+        return false;
+
+    const auto actual_uri = index.source_uri(value.file_id);
+    return (actual_uri.empty() ? fallback_uri : actual_uri) == loc.uri;
+}
+
+static bool type_entry_matches_location(const SyntaxIndex& index, const std::string& fallback_uri,
+                                        SourceFileID file_id, int line_one_based, int col,
+                                        const Location& loc) {
+    if (line_one_based <= 0 || col != loc.col || to_lsp_line(line_one_based) != loc.line)
+        return false;
+
+    const auto actual_uri = index.source_uri(file_id);
+    return (actual_uri.empty() ? fallback_uri : actual_uri) == loc.uri;
+}
+
+static std::string typedef_hover_detail(const TypedefEntry& td) {
+    if (!td.resolved.empty())
+        return td.resolved;
+    if (td.is_struct) {
+        std::string detail = "struct";
+        if (!td.fields.empty()) {
+            detail += " {";
+            for (const auto& field : td.fields)
+                detail += " " + field.type + " " + field.name + ";";
+            detail += " }";
+        }
+        return detail;
+    }
+    if (td.is_enum) {
+        std::string detail = "enum";
+        if (!td.enum_members.empty()) {
+            detail += " {";
+            for (size_t i = 0; i < td.enum_members.size(); ++i) {
+                if (i > 0)
+                    detail += ", ";
+                detail += td.enum_members[i].name;
+            }
+            detail += "}";
+        }
+        return detail;
+    }
+    return "typedef";
+}
+
+static std::optional<SymbolInfo> symbol_info_from_index_location(const SyntaxIndex& index,
+                                                                 const std::string& fallback_uri,
+                                                                 const Location& definition,
+                                                                 const ParameterEvalContext* eval_context = nullptr) {
+    for (const auto& td : index.typedefs) {
+        if (td.name.empty() ||
+            !type_entry_matches_location(index, fallback_uri, td.file_id, td.line, td.col,
+                                         definition))
+            continue;
+        return SymbolInfo{.name = td.name,
+                          .kind = "typedef",
+                          .detail = typedef_hover_detail(td),
+                          .line = definition.line,
+                          .col = definition.col};
+    }
+
+    for (const auto& cls : index.classes) {
+        if (cls.name.empty() ||
+            !type_entry_matches_location(index, fallback_uri, cls.file_id, cls.line, cls.col,
+                                         definition))
+            continue;
+        return SymbolInfo{.name = cls.name,
+                          .kind = "class",
+                          .detail = "class",
+                          .line = definition.line,
+                          .col = definition.col};
+    }
+
+    for (const auto& value : index.values) {
+        if (value.name.empty() || !value_matches_location(index, fallback_uri, value, definition))
+            continue;
+        return SymbolInfo{.name = value.name,
+                          .kind = value.kind.empty() ? "symbol" : value.kind,
+                          .detail = value_hover_detail(value, eval_context),
+                          .line = definition.line,
+                          .col = definition.col};
     }
     return std::nullopt;
 }
@@ -1893,6 +2629,8 @@ enum class DefinitionTargetKind {
     NamedParameter,
     NamedArgument,
     ClassMember,
+    Package,
+    PackageMember,
     Macro,
     Generic,
 };
@@ -1903,6 +2641,7 @@ struct DefinitionTarget {
     std::string module_name;
     std::string subroutine_name;
     std::string object_name;
+    std::string package_name;
     std::string scope_module;
     std::string scope_package;
 };
@@ -2058,6 +2797,53 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
+        }
+        visitDefault(node);
+    }
+
+    void handle(const slang::syntax::ScopedNameSyntax& node) {
+        if (!node.left || !node.right) {
+            visitDefault(node);
+            return;
+        }
+        if (node.separator.kind != slang::parsing::TokenKind::DoubleColon) {
+            visitDefault(node);
+            return;
+        }
+
+        if (const auto* left = node.left->as_if<slang::syntax::IdentifierNameSyntax>();
+            left && token_contains_position_in_uri(sm, left->identifier, uri, line, col)) {
+            target.kind = DefinitionTargetKind::Package;
+            target.name = std::string(left->identifier.valueText());
+            target.scope_module = current_module;
+            target.scope_package = current_package;
+            return;
+        }
+
+        if (const auto* right = node.right->as_if<slang::syntax::IdentifierNameSyntax>();
+            right && token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
+            target.kind = DefinitionTargetKind::PackageMember;
+            target.name = std::string(right->identifier.valueText());
+            target.package_name = render_syntax_node_text(sm, *node.left);
+            target.scope_module = current_module;
+            target.scope_package = current_package;
+            return;
+        }
+
+        visitDefault(node);
+    }
+
+    void handle(const slang::syntax::PackageImportDeclarationSyntax& node) {
+        for (const auto* item : node.items) {
+            if (!item)
+                continue;
+            if (token_contains_position_in_uri(sm, item->package, uri, line, col)) {
+                target.kind = DefinitionTargetKind::Package;
+                target.name = std::string(item->package.valueText());
+                target.scope_module = current_module;
+                target.scope_package = current_package;
+                return;
+            }
         }
         visitDefault(node);
     }
@@ -2440,33 +3226,46 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // single user-visible hover request.
     auto definition = definition_of_state(*state, uri, line, col, *extra_files, &uri);
     if (definition) {
+        ParameterEvalContext extra_eval_context;
+        extra_eval_context.indexes.reserve(extra_files->size());
+        for (const auto& extra : *extra_files)
+            extra_eval_context.indexes.push_back(&extra.index_ref());
+
         std::string name = target.name.empty() ? ident : target.name;
+        const auto& state_index = get_dynamic_index(*state);
+        const bool definition_in_current_tree =
+            definition->uri == uri || state_index.source_file_ids.contains(definition->uri);
+        if (definition_in_current_tree) {
+            ParameterEvalContext state_eval_context;
+            state_eval_context.indexes.reserve(extra_files->size() + 1);
+            state_eval_context.indexes.push_back(&state_index);
+            for (const auto& extra : *extra_files)
+                state_eval_context.indexes.push_back(&extra.index_ref());
 
-        // The current document's SyntaxTree may contain tokens whose actual
-        // source URI is an included file, for example:
-        //
-        //     // memory_top.sv
-        //     `include "params.svh"   // defines typedef enum ... state_t;
-        //     state_t state;
-        //
-        // `definition_of_state()` correctly reports the typedef location as
-        // params.svh, but that declaration is still inside this live SyntaxTree.
-        // Restricting the rich AST hover path to `definition->uri == uri` made
-        // included-file typedefs, parameters, variables, and class members fall
-        // through to the bare "symbol" fallback whenever the include file was
-        // not also listed as an extra/project file.  Always try the current tree
-        // first; token_at_location() matches exact URI/line/column, so this does
-        // not steal metadata for definitions that only exist in a different
-        // shard.
-        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
-            return info;
-
-        if (definition->uri != uri) {
+            if (auto info = symbol_info_from_index_location(state_index, uri, *definition,
+                                                            &state_eval_context);
+                info && is_integer_parameter_kind(info->kind))
+                return info;
+            if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+                return info;
+            if (auto info = symbol_info_from_index_location(state_index, uri, *definition,
+                                                            &state_eval_context))
+                return info;
+        } else {
             for (const auto& extra : *extra_files) {
                 if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
                     continue;
+                if (auto info = symbol_info_from_index_location(extra.index_ref(), extra.uri,
+                                                                *definition, &extra_eval_context);
+                    info && is_integer_parameter_kind(info->kind))
+                    return info;
                 if (auto info = symbol_info_from_definition(*extra.state->tree, extra.uri, name,
                                                             *definition, &extra.index_ref()))
+                    return info;
+            }
+            for (const auto& extra : *extra_files) {
+                if (auto info = symbol_info_from_index_location(extra.index_ref(), extra.uri,
+                                                                *definition, &extra_eval_context))
                     return info;
             }
         }
@@ -2647,12 +3446,57 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     const int use_line_one_based = line + 1;
-    const auto& current_index = get_structural_index(state);
+    const SyntaxIndex* current_structural_index = nullptr;
+    const SyntaxIndex* current_dynamic_index = nullptr;
+    auto structural_index = [&]() -> const SyntaxIndex& {
+        if (!current_structural_index)
+            current_structural_index = &get_structural_index(state);
+        return *current_structural_index;
+    };
+    auto dynamic_index = [&]() -> const SyntaxIndex& {
+        if (!current_dynamic_index)
+            current_dynamic_index = &get_dynamic_index(state);
+        return *current_dynamic_index;
+    };
 
     if (target.kind == DefinitionTargetKind::Generic) {
         if (auto loc =
-                find_aggregate_field_declaration_at(current_index, uri, target.name, line, col))
+                find_aggregate_field_declaration_at(structural_index(), uri, target.name, line, col))
             return loc;
+    }
+
+    if (target.kind == DefinitionTargetKind::Package) {
+        const auto& current_index = dynamic_index();
+        if (auto loc = find_package_definition(current_index, uri, target.name))
+            return loc;
+        for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
+            if (auto loc = find_package_definition(extra.index_ref(), extra.uri, target.name))
+                return loc;
+        }
+        return std::nullopt;
+    }
+
+    if (target.kind == DefinitionTargetKind::PackageMember) {
+        const auto& current_index = dynamic_index();
+        if (auto loc = find_package_value_definition(current_index, uri, target.package_name,
+                                                     target.name))
+            return loc;
+        if (auto loc = find_package_type_definition(current_index, uri, target.package_name,
+                                                    target.name))
+            return loc;
+        for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
+            if (auto loc = find_package_value_definition(extra.index_ref(), extra.uri,
+                                                         target.package_name, target.name))
+                return loc;
+            if (auto loc = find_package_type_definition(extra.index_ref(), extra.uri,
+                                                        target.package_name, target.name))
+                return loc;
+        }
+        return std::nullopt;
     }
 
     if (target.kind == DefinitionTargetKind::ClassMember) {
@@ -2666,6 +3510,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         //
         // jumps to `class Packet::req_data`, not to an unrelated unit-level
         // `task req_data`.
+        const auto& current_index = structural_index();
         auto class_type = class_type_for_object_reference(current_index, target.scope_module,
                                                           target.object_name, use_line_one_based);
         if (!class_type) {
@@ -2696,7 +3541,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
     std::vector<ImportEntry> visible_imports;
     if (state.tree)
-        visible_imports = get_dynamic_index(state).imports;
+        visible_imports = dynamic_index().imports;
 
     if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module,
                                            target.scope_package, visible_imports,
@@ -2708,6 +3553,19 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (auto loc = find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
                                                           target.scope_module, target.scope_package,
                                                           visible_imports, use_line_one_based))
+            return loc;
+    }
+
+    if (auto loc = find_visible_package_value_definition(
+            dynamic_index(), uri, target.name, target.scope_module, target.scope_package,
+            visible_imports, use_line_one_based))
+        return loc;
+    for (const auto& extra : extra_files) {
+        if (skip_extra(extra))
+            continue;
+        if (auto loc = find_visible_package_value_definition(
+                extra.index_ref(), extra.uri, target.name, target.scope_module,
+                target.scope_package, visible_imports, use_line_one_based))
             return loc;
     }
 
@@ -3889,6 +4747,7 @@ void Analyzer::background_index_loop() const {
                             .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
                         };
                         invalidate_extra_snapshots_locked();
+                        clear_project_index_snapshot_locked();
                         schedule_background_project_publish_locked();
                     }
                 }
@@ -3933,6 +4792,7 @@ void Analyzer::background_index_loop() const {
                 .index = std::make_shared<SyntaxIndex>(std::move(committed_index)),
             };
             invalidate_extra_snapshots_locked();
+            clear_project_index_snapshot_locked();
 
             // ProjectIndex is an immutable view derived from per-file shards.
             // Do not publish after every single file while the initial .f cache
@@ -4007,12 +4867,12 @@ void Analyzer::update_extra_cache_for_live_state_locked(
         .index = std::make_shared<SyntaxIndex>(std::move(index)),
     };
     invalidate_extra_snapshots_locked();
+    (void)publish_project_index_snapshot_locked();
 
     // The per-file shard changed, so the published merged project snapshot is
-    // stale until the background indexer republishes it.  Publish asynchronously
-    // instead of merging synchronously on the edit/open path; this preserves the
-    // HPC-friendly rule that request/edit handlers do not rebuild whole-project
-    // state inline.
+    // refreshed immediately to keep request-time completion from reading stale
+    // package/module symbols after opening or editing a project file.  Keep the
+    // debounced async publish as the notification path for downstream listeners.
     schedule_background_project_publish_locked();
 
 }
