@@ -5,6 +5,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -77,28 +78,21 @@ std::string expand_env_vars(std::string_view text) {
 
 std::filesystem::path resolve_from_filelist_dir(const std::filesystem::path& filelist_dir,
                                                 std::string_view text) {
-    auto path = std::filesystem::path(expand_env_vars(text));
+    auto path = std::filesystem::path(path_from_file_uri(expand_env_vars(text)));
     if (path.is_relative())
         path = filelist_dir / path;
     return std::filesystem::absolute(path).lexically_normal();
 }
 
+// Backslashes are literal path characters (Windows paths such as
+// C:\repo\top.sv), not escapes.  Line continuations are stripped before
+// tokenizing; paths containing whitespace must be quoted.
 std::vector<std::string> tokenize_filelist_line(std::string_view line) {
     std::vector<std::string> tokens;
     std::string current;
     char quote = '\0';
-    bool escape = false;
 
     for (const char c : line) {
-        if (escape) {
-            current.push_back(c);
-            escape = false;
-            continue;
-        }
-        if (c == '\\') {
-            escape = true;
-            continue;
-        }
         if (quote != '\0') {
             if (c == quote)
                 quote = '\0';
@@ -119,8 +113,6 @@ std::vector<std::string> tokenize_filelist_line(std::string_view line) {
         }
         current.push_back(c);
     }
-    if (escape)
-        current.push_back('\\');
     if (!current.empty())
         tokens.push_back(std::move(current));
     return tokens;
@@ -143,19 +135,34 @@ bool option_takes_non_source_argument(std::string_view option) {
     return options.contains(option);
 }
 
-void load_vcode_file(const std::filesystem::path& filelist,
-                     VcodeResult& result,
-                     std::unordered_set<std::string>& active_filelists) {
+struct VcodeLoader {
+    VcodeResult result;
+    std::unordered_set<std::string> visited_filelists;
+    std::unordered_set<std::string> seen_files;
+    std::unordered_set<std::string> seen_include_dirs;
+};
+
+void add_file(VcodeLoader& loader, std::string path) {
+    if (loader.seen_files.insert(path).second)
+        loader.result.files.push_back(std::move(path));
+}
+
+void add_include_dir(VcodeLoader& loader, std::string dir) {
+    if (loader.seen_include_dirs.insert(dir).second)
+        loader.result.include_dirs.push_back(std::move(dir));
+}
+
+void load_vcode_file(const std::filesystem::path& filelist, VcodeLoader& loader) {
     const auto normalized_filelist =
         std::filesystem::absolute(filelist).lexically_normal().string();
-    if (!active_filelists.insert(normalized_filelist).second)
+    // The visited set is persistent, not a recursion stack: it breaks -f
+    // cycles and also skips re-parsing a filelist reachable from two parents.
+    if (!loader.visited_filelists.insert(normalized_filelist).second)
         return;
 
     std::ifstream input(filelist);
-    if (!input) {
-        active_filelists.erase(normalized_filelist);
+    if (!input)
         return;
-    }
 
     const auto filelist_dir = filelist.parent_path();
     std::string line;
@@ -198,7 +205,7 @@ void load_vcode_file(const std::filesystem::path& filelist,
             if (token == "-f" || token == "-F") {
                 if (i + 1 < tokens.size())
                     load_vcode_file(resolve_from_filelist_dir(filelist_dir, tokens[++i]),
-                                    result, active_filelists);
+                                    loader);
                 continue;
             }
             if ((token.starts_with("-f") || token.starts_with("-F")) && token.size() > 2) {
@@ -208,7 +215,7 @@ void load_vcode_file(const std::filesystem::path& filelist,
                     nested_text.remove_prefix(1);
                 if (!nested_text.empty()) {
                     load_vcode_file(resolve_from_filelist_dir(filelist_dir, nested_text),
-                                    result, active_filelists);
+                                    loader);
                     continue;
                 }
             }
@@ -230,7 +237,8 @@ void load_vcode_file(const std::filesystem::path& filelist,
                     auto dir_text =
                         plus == std::string_view::npos ? rest : rest.substr(0, plus);
                     if (!dir_text.empty()) {
-                        result.include_dirs.push_back(
+                        add_include_dir(
+                            loader,
                             resolve_from_filelist_dir(filelist_dir, dir_text).string());
                     }
                     if (plus == std::string_view::npos)
@@ -245,8 +253,8 @@ void load_vcode_file(const std::filesystem::path& filelist,
             // needed by navigation and lint.
             if (token == "-v") {
                 if (i + 1 < tokens.size())
-                    result.files.push_back(
-                        resolve_from_filelist_dir(filelist_dir, tokens[++i]).string());
+                    add_file(loader,
+                             resolve_from_filelist_dir(filelist_dir, tokens[++i]).string());
                 continue;
             }
 
@@ -261,11 +269,9 @@ void load_vcode_file(const std::filesystem::path& filelist,
             if (token.starts_with("+"))
                 continue;
 
-            result.files.push_back(resolve_from_filelist_dir(filelist_dir, token).string());
+            add_file(loader, resolve_from_filelist_dir(filelist_dir, token).string());
         }
     }
-
-    active_filelists.erase(normalized_filelist);
 }
 
 } // namespace
@@ -273,19 +279,18 @@ void load_vcode_file(const std::filesystem::path& filelist,
 std::string resolve_vcode_path(const std::filesystem::path& root, const Config& config) {
     if (config.design.vcode.empty())
         return {};
-    auto filelist = std::filesystem::path(expand_env_vars(config.design.vcode));
+    auto filelist =
+        std::filesystem::path(path_from_file_uri(expand_env_vars(config.design.vcode)));
     if (filelist.is_relative())
         filelist = root / filelist;
     return std::filesystem::absolute(filelist).lexically_normal().string();
 }
 
 VcodeResult load_vcode(const std::filesystem::path& root, const Config& config) {
-    VcodeResult result;
     if (config.design.vcode.empty())
-        return result;
+        return {};
 
-    std::unordered_set<std::string> active_filelists;
-    load_vcode_file(std::filesystem::path(resolve_vcode_path(root, config)),
-                    result, active_filelists);
-    return result;
+    VcodeLoader loader;
+    load_vcode_file(std::filesystem::path(resolve_vcode_path(root, config)), loader);
+    return std::move(loader.result);
 }

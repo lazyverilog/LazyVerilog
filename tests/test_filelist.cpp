@@ -154,3 +154,75 @@ TEST_CASE("filelist: quoted paths and line continuations are tokenized",
     REQUIRE(result.include_dirs.size() == 1);
     CHECK(result.include_dirs[0] == norm(root / "include dir"));
 }
+
+TEST_CASE("filelist: file:// URI entries and vcode are converted to paths",
+          "[filelist]") {
+    const auto root = make_temp_dir("lv_filelist_uri");
+    write_text(root / "top.vc",
+               "file://" + norm(root / "rtl/top.sv") + "\n"
+               "+incdir+file://" + norm(root / "inc") + "\n");
+
+    Config cfg;
+    cfg.design.vcode = "file://" + norm(root / "top.vc");
+    auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "rtl/top.sv"));
+    REQUIRE(result.include_dirs.size() == 1);
+    CHECK(result.include_dirs[0] == norm(root / "inc"));
+}
+
+TEST_CASE("filelist: backslashes in paths are literal, not escapes", "[filelist]") {
+    const auto root = make_temp_dir("lv_filelist_backslash");
+    write_text(root / "top.vc", "C:\\repo\\top.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "C:\\repo\\top.sv"));
+}
+
+TEST_CASE("filelist: filelist included from two parents is loaded once",
+          "[filelist]") {
+    const auto root = make_temp_dir("lv_filelist_diamond");
+    write_text(root / "top.vc",
+               "-f a.vc\n"
+               "-f b.vc\n");
+    write_text(root / "a.vc", "-f common.vc\n");
+    write_text(root / "b.vc", "-f common.vc\n");
+    write_text(root / "common.vc",
+               "common.sv\n"
+               "+incdir+inc\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 1);
+    CHECK(result.files[0] == norm(root / "common.sv"));
+    REQUIRE(result.include_dirs.size() == 1);
+    CHECK(result.include_dirs[0] == norm(root / "inc"));
+}
+
+TEST_CASE("filelist: repeated source and incdir entries are deduplicated",
+          "[filelist]") {
+    const auto root = make_temp_dir("lv_filelist_dedup");
+    write_text(root / "top.vc",
+               "dup.sv\n"
+               "+incdir+inc\n"
+               "dup.sv\n"
+               "+incdir+inc\n"
+               "other.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 2);
+    CHECK(result.files[0] == norm(root / "dup.sv"));
+    CHECK(result.files[1] == norm(root / "other.sv"));
+    REQUIRE(result.include_dirs.size() == 1);
+    CHECK(result.include_dirs[0] == norm(root / "inc"));
+}
