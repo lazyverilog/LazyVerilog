@@ -244,34 +244,46 @@ TEST_CASE("definition: unqualified name ignores aggregate fields", "[definition]
     CHECK(rhs->end_col == 19);
 }
 
-TEST_CASE("definition: demo memory_top valid lhs prefers module signal", "[definition]") {
+TEST_CASE("definition: included aggregate field does not shadow module signal", "[definition]") {
     Analyzer analyzer;
-    const auto top_path = find_repo_file("demo/memory_top.sv");
+    const auto header_path = write_temp_sv("lazyverilog_definition_valid_params.svh",
+                                           "typedef struct packed {\n"
+                                           "    logic valid;\n"
+                                           "    logic [31:0] data;\n"
+                                           "} fifo_entry_t;\n");
+    const auto top_path =
+        write_temp_sv("lazyverilog_definition_valid_top.sv",
+                      "module memory_top;\n"
+                      "`include \"lazyverilog_definition_valid_params.svh\"\n"
+                      "fifo_entry_t fifo_entry;\n"
+                      "logic valid;\n"
+                      "always_comb begin\n"
+                      "    valid = fifo_entry.valid;\n"
+                      "end\n"
+                      "endmodule\n");
     const std::string top_uri = "file://" + top_path.string();
     analyzer.open(top_uri, read_text(top_path.string()));
 
-    // Exact regression for demo/memory_top.sv:
-    //
-    //     valid = fifo_entry.valid;
-    //     ^^^^^
-    //
-    // The included params.svh defines fifo_entry_t.valid before the module
-    // signal declaration.  The unqualified LHS must still resolve to the
-    // module-level `logic valid`, not the aggregate field.
-    auto lhs = analyzer.definition_of(top_uri, 47, 4);
+    // The included header defines fifo_entry_t.valid before the module signal
+    // declaration.  The unqualified LHS must still resolve to the module-level
+    // `logic valid`, not the aggregate field.
+    auto lhs = analyzer.definition_of(top_uri, 5, 4);
     REQUIRE(lhs.has_value());
     CHECK(lhs->uri == top_uri);
-    CHECK(lhs->line == 45);
-    CHECK(lhs->col == 40);
-    CHECK(lhs->end_col == 45);
+    CHECK(lhs->line == 3);
+    CHECK(lhs->col == 6);
+    CHECK(lhs->end_col == 11);
 
     // Keep the member-access behavior intact for the RHS.
-    auto rhs = analyzer.definition_of(top_uri, 47, 28);
+    auto rhs = analyzer.definition_of(top_uri, 5, 23);
     REQUIRE(rhs.has_value());
-    CHECK(rhs->uri.ends_with("/demo/params.svh"));
-    CHECK(rhs->line == 2);
-    CHECK(rhs->col == 44);
-    CHECK(rhs->end_col == 49);
+    CHECK(rhs->uri == "file://" + header_path.string());
+    CHECK(rhs->line == 1);
+    CHECK(rhs->col == 10);
+    CHECK(rhs->end_col == 15);
+
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(top_path);
 }
 
 TEST_CASE("definition: named subroutine argument resolves to formal argument", "[definition]") {
