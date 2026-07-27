@@ -4,6 +4,7 @@
 #include "background_compiler.hpp"
 #include "config.hpp"
 #include "dynamic_file_index.hpp"
+#include "filelist.hpp"
 
 // LspCpp headers
 #include "LibLsp/JsonRpc/Condition.h"
@@ -449,104 +450,8 @@ static std::string apply_incremental_change(std::string text,
     return text;
 }
 
-static std::optional<size_t> find_filelist_slash_comment(std::string_view line) {
-    // Filelists use // for comments, but LSP/VS Code users sometimes paste
-    // file URIs such as file:///C:/repo/rtl/top.sv.  Treat a double slash that
-    // immediately follows ':' as part of a URI/scheme (or a Windows-ish path)
-    // rather than as a comment opener.  Ordinary trailing comments still work:
-    //
-    //   rtl/top.sv // comment       -> comment
-    //   file:///C:/repo/top.sv      -> path
-    for (size_t pos = line.find("//"); pos != std::string_view::npos;
-         pos = line.find("//", pos + 2)) {
-        if (pos > 0 && line[pos - 1] == ':')
-            continue;
-        return pos;
-    }
-    return std::nullopt;
-}
-
-static std::string resolve_vcode_path(const std::filesystem::path& root, const Config& config) {
-    if (config.design.vcode.empty())
-        return {};
-    auto filelist = std::filesystem::path(path_from_file_uri(config.design.vcode));
-    if (filelist.is_relative())
-        filelist = root / filelist;
-    return std::filesystem::absolute(filelist).lexically_normal().string();
-}
-
 static std::string path_to_file_uri(const std::filesystem::path& path) {
     return uri_from_path(path);
-}
-
-struct VcodeResult {
-    std::vector<std::string> files;
-    std::vector<std::string> include_dirs;
-};
-
-static VcodeResult load_vcode(const std::filesystem::path& root, const Config& config) {
-    VcodeResult result;
-    if (config.design.vcode.empty())
-        return result;
-
-    const auto filelist = std::filesystem::path(resolve_vcode_path(root, config));
-    std::ifstream input(filelist);
-    if (!input)
-        return result;
-
-    const auto filelist_dir = filelist.parent_path();
-
-    std::string line;
-    while (std::getline(input, line)) {
-        // Strip // and # comments
-        if (auto pos = find_filelist_slash_comment(line))
-            line.erase(*pos);
-        if (auto pos = line.find('#'); pos != std::string::npos)
-            line.erase(pos);
-
-        auto item = trim_copy(line);
-        if (item.empty())
-            continue;
-
-        // Recognize simulator-style include-directory entries in the filelist.
-        // The directory is not parsed as a source file; it is passed to slang's
-        // SourceManager so explicit source files can resolve `include "..."`.
-        //
-        // Supported forms:
-        //   +incdir+rtl/include
-        //   +incdir+/abs/include
-        //   +incdir+dir_a+dir_b
-        if (item.starts_with("+incdir+")) {
-            std::string_view rest(item);
-            rest.remove_prefix(std::string_view("+incdir+").size());
-            while (!rest.empty()) {
-                const auto plus = rest.find('+');
-                auto dir_text = plus == std::string_view::npos ? rest : rest.substr(0, plus);
-                auto dir = std::filesystem::path(path_from_file_uri(dir_text));
-                if (!dir.empty()) {
-                    if (dir.is_relative())
-                        dir = filelist_dir / dir;
-                    result.include_dirs.push_back(
-                        std::filesystem::absolute(dir).lexically_normal().string());
-                }
-                if (plus == std::string_view::npos)
-                    break;
-                rest.remove_prefix(plus + 1);
-            }
-            continue;
-        }
-
-        // Skip other compiler options / flags.
-        if (item.starts_with("+") || item.starts_with("-"))
-            continue;
-
-        // Regular file path
-        auto path = std::filesystem::path(path_from_file_uri(item));
-        if (path.is_relative())
-            path = filelist_dir / path;
-        result.files.push_back(std::filesystem::absolute(path).lexically_normal().string());
-    }
-    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
