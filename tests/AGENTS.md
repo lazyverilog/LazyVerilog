@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-28 | Updated: 2026-05-28 -->
+<!-- Generated: 2026-05-28 | Updated: 2026-07-29 -->
 
 # tests
 
@@ -19,9 +19,15 @@ Unit and integration tests for all lazyverilog LSP features. Uses Catch2 framewo
 | `test_references.cpp` | Find-all-references tests |
 | `test_rename.cpp` | Symbol rename tests |
 | `test_syntax_index.cpp` | Syntax index lookup tests |
+| `test_completion.cpp` | Completion tests |
+| `test_connect.cpp` | Auto-wire / auto-connect tests |
+| `test_folding_ranges.cpp` | Folding range tests |
+| `test_filelist.cpp` | Filelist (`.f`) parsing and resolution tests |
+| `test_path_uri.cpp` | Path / URI normalization tests |
 | `test_document_sync.cpp` | Document sync / incremental update tests |
 | `test_lsp_features.cpp` | General LSP feature integration tests |
 | `test_inlay_hints.cpp` | Inlay hints tests |
+| `test_opentitan_benchmark.cpp` | OpenTitan corpus parse/index benchmark (hidden `[.benchmark]` tag) |
 | `rtl_format_sweep.cpp` | Large-scale formatter performance sweep against real RTL |
 | `test.sv` | SystemVerilog fixture used by tests |
 

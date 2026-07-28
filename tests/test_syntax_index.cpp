@@ -451,6 +451,61 @@ TEST_CASE("syntax_index: package parameters are indexed exactly once", "[index]"
     CHECK(width_count == 1);
 }
 
+TEST_CASE("syntax_index: package members are indexed exactly once", "[index]") {
+    // process_package() collects exported symbol names only; process_module()
+    // owns every entry.  Processing the same members in both would duplicate
+    // each one, which also duplicates the reference occurrences synthesized
+    // from index.values.
+    const std::string text = R"(package dup_pkg;
+    typedef logic [3:0] dup_t;
+    typedef enum logic [1:0] { DUP_A, DUP_B } dup_e;
+    class dup_c;
+    endclass
+    function int dup_f(); return 0; endfunction
+    logic [7:0] dup_v;
+    parameter int DUP_P = 1;
+endpackage
+)";
+    auto tree = slang::syntax::SyntaxTree::fromText(text);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, text);
+
+    auto count_named = [](const auto& entries, std::string_view name) {
+        return std::count_if(entries.begin(), entries.end(),
+                             [&](const auto& e) { return e.name == name; });
+    };
+
+    CHECK(count_named(idx.typedefs, "dup_t") == 1);
+    CHECK(count_named(idx.typedefs, "dup_e") == 1);
+    CHECK(count_named(idx.classes, "dup_c") == 1);
+    CHECK(count_named(idx.values, "dup_f") == 1);
+    CHECK(count_named(idx.values, "dup_v") == 1);
+    CHECK(count_named(idx.values, "DUP_P") == 1);
+
+    // Exported-symbol bookkeeping must survive the de-duplication, including
+    // enum members, which are not package-body members in their own right.
+    const auto& symbols = idx.package_symbols["dup_pkg"];
+    auto exported = [&](std::string_view n) {
+        return std::find(symbols.begin(), symbols.end(), n) != symbols.end();
+    };
+    CHECK(exported("dup_t"));
+    CHECK(exported("dup_e"));
+    CHECK(exported("DUP_A"));
+    CHECK(exported("DUP_B"));
+    CHECK(exported("dup_c"));
+    CHECK(exported("dup_f"));
+    CHECK(exported("dup_v"));
+    CHECK(exported("DUP_P"));
+
+    // The scoped maps must still resolve every member kind.
+    CHECK(idx.package_type_by_scoped_name.contains(package_scoped_key("dup_pkg", "dup_t")));
+    CHECK(idx.package_class_by_scoped_name.contains(package_scoped_key("dup_pkg", "dup_c")));
+    CHECK(idx.package_value_by_scoped_name.contains(package_scoped_key("dup_pkg", "dup_f")));
+    CHECK(idx.package_value_by_scoped_name.contains(package_scoped_key("dup_pkg", "dup_v")));
+    CHECK(idx.package_value_by_scoped_name.contains(package_scoped_key("dup_pkg", "DUP_P")));
+}
+
 TEST_CASE("syntax_index: qualified package value uses share the declaration SymbolID",
           "[index]") {
     const std::string text = R"(package p1;

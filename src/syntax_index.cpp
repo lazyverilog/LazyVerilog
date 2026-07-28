@@ -718,14 +718,23 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
     index.package_names.insert(pkg_name);
     process_module(pkg, index, sm, source, depth);
 
-    // Collect exported symbol names and index nested declarations globally.
+    // Collect exported symbol names only.
+    //
+    // process_module() above already walked these same members and owns every
+    // resulting entry: typedefs and classes through process_typedef() /
+    // process_class(), and functions, variables, and parameters as ValueEntry.
+    // Re-processing them here would duplicate each one in index.typedefs /
+    // index.classes / index.values, which in turn duplicates the synthetic
+    // reference occurrences built from index.values.
     std::vector<std::string> symbols;
     for (const auto* member : pkg.members) {
         if (!member)
             continue;
         if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             symbols.push_back(token_value_text(td->name));
-            process_typedef(*td, index, sm, pkg_name);
+            // Enum members are exported alongside the typedef that declares
+            // them, but they are not separate members of the package body, so
+            // process_module() never sees them.
             if (const auto* enum_type = td->type->as_if<EnumTypeSyntax>()) {
                 for (const auto* enum_member : enum_type->members) {
                     if (enum_member)
@@ -734,46 +743,17 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
             }
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             symbols.push_back(token_value_text(cls->name));
-            process_class(*cls, index, sm, pkg_name);
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
-            const auto fn_name = id_name ? std::string(id_name->identifier.valueText())
-                                         : render_syntax_node_text(sm, *proto.name);
-            symbols.push_back(fn_name);
-            auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
-            index.values.push_back(ValueEntry{
-                .name = fn_name,
-                .type = render_syntax_node_text(sm, *proto.returnType),
-                .kind = std::string(proto.keyword.valueText()),
-                .parent_scope = pkg_name,
-                .file_id = source_file_id_for_token(index, sm, name_tok),
-                .line = nl,
-                .col = nc,
-                .signature = make_fn_signature(proto, fn_name, sm),
-            });
+            symbols.push_back(id_name ? std::string(id_name->identifier.valueText())
+                                      : render_syntax_node_text(sm, *proto.name));
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const std::string type_text = render_syntax_node_text(sm, *data->type);
             for (const auto* decl : data->declarators) {
-                if (decl) {
+                if (decl)
                     symbols.push_back(token_value_text(decl->name));
-                    auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
-                    index.values.push_back(ValueEntry{
-                        .name = token_value_text(decl->name),
-                        .type = with_declarator_dimensions(sm, type_text, *decl),
-                        .kind = "variable",
-                        .parent_scope = pkg_name,
-                        .file_id = source_file_id_for_token(index, sm, decl->name),
-                        .line = vl,
-                        .col = vc,
-                    });
-                }
             }
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
-            // The ValueEntry is pushed by process_module() above, which owns
-            // body parameters for modules and packages alike.  Only the exported
-            // symbol name is recorded here.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
                 for (const auto* decl : param->declarators) {
                     if (decl)
