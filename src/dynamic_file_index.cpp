@@ -118,12 +118,14 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, const slang::SourceManage
                                      .default_value = std::move(default_value),
                                      .line = line,
                                      .col = col});
+    const bool is_parameter = direction == "parameter" || direction == "localparam";
     index.values.push_back(ValueEntry{.name = token_value_text(name),
                                       .type = std::move(type),
-                                      .kind = (direction == "parameter" || direction == "localparam")
-                                                  ? direction
-                                                  : std::string("port"),
+                                      .kind = is_parameter ? direction : std::string("port"),
                                       .parent_scope = module.name,
+                                      .default_value = is_parameter
+                                                           ? module.ports.back().default_value
+                                                           : std::string{},
                                       .file_id = source_file_id_for_token(index, sm, name),
                                       .line = line,
                                       .col = col});
@@ -270,6 +272,9 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                                                 .col = mc});
         }
     }
+    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+        index.package_class_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
     index.classes.push_back(std::move(entry));
 }
@@ -317,6 +322,9 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         entry.resolved = node_text_raw(sm, *td.type);
     }
 
+    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+        index.package_type_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
     index.typedefs.push_back(std::move(entry));
 }
@@ -397,6 +405,22 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                                         node_text_raw(sm, *fn->prototype->returnType), "function",
                                         module.name))
                 value->name = node_text_raw(sm, *fn->prototype->name);
+        } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
+            // Body parameters (`localparam DEPTH = 1;`), as opposed to header
+            // `#(...)` parameters handled above.  Mirrors the same branch in
+            // syntax_index.cpp so open buffers and closed shards agree.
+            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+                const auto type = node_text_raw(sm, *param->type);
+                const auto kind = token_value_text(param->keyword);
+                for (const auto* decl : param->declarators) {
+                    if (!decl)
+                        continue;
+                    if (auto* value = add_value(index, sm, decl->name, type, kind, module.name))
+                        value->default_value =
+                            decl->initializer ? node_text_raw(sm, *decl->initializer->expr)
+                                              : std::string{};
+                }
+            }
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             // Module-scoped class declarations are valid SystemVerilog symbols.
             // Keep their parent scope so member-access lookup can distinguish
@@ -454,6 +478,9 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
+                index.package_value_by_scoped_name.try_emplace(
+                    package_scoped_key(module.name, token_value_text(decl->name)),
+                    index.values.size());
                 add_value(index, sm, decl->name, with_dims(sm, type, *decl), "variable", module.name);
                 index.package_symbols[module.name].push_back(token_value_text(decl->name));
             }
@@ -464,10 +491,17 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                     if (!decl)
                         continue;
                     auto [pl, pc] = token_pos_line1_col0(sm, decl->name);
+                    index.package_value_by_scoped_name.try_emplace(
+                        package_scoped_key(module.name, token_value_text(decl->name)),
+                        index.values.size());
                     index.values.push_back(ValueEntry{.name = token_value_text(decl->name),
                                                       .type = type,
                                                       .kind = token_value_text(param->keyword),
                                                       .parent_scope = module.name,
+                                                      .default_value =
+                                                          decl->initializer
+                                                              ? node_text_raw(sm, *decl->initializer->expr)
+                                                              : std::string{},
                                                       .file_id = source_file_id_for_token(index, sm, decl->name),
                                                       .line = pl,
                                                       .col = pc});
@@ -476,6 +510,8 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto name = node_text_raw(sm, *fn->prototype->name);
+            index.package_value_by_scoped_name.try_emplace(
+                package_scoped_key(module.name, name), index.values.size());
             index.values.push_back(ValueEntry{.name = name,
                                               .type = node_text_raw(sm, *fn->prototype->returnType),
                                               .kind = "function",

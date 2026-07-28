@@ -405,13 +405,13 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         entry.port_by_name.try_emplace(entry.ports[i].name, i);
 
     for (const auto& p : entry.ports) {
+        const bool is_parameter = p.direction == "parameter" || p.direction == "localparam";
         index.values.push_back(ValueEntry{
             .name = p.name,
             .type = p.type,
-            .kind = (p.direction == "parameter" || p.direction == "localparam")
-                        ? p.direction
-                        : std::string("port"),
+            .kind = is_parameter ? p.direction : std::string("port"),
             .parent_scope = entry.name,
+            .default_value = is_parameter ? p.default_value : std::string{},
             .file_id = p.file_id,
             .line = p.line,
             .col = p.col,
@@ -423,6 +423,16 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     // pass over top-level members only, no tree walk.  LocalVariableVisitor
     // below (block-local vars inside always/initial/function bodies) is the
     // expensive full-tree walk and is skipped for Declarations depth.
+    // Packages reach this loop through process_package(), which registers the
+    // package name first.  Members of a package additionally get a scoped-name
+    // entry so `pkg::member` resolves in O(1) without a linear value scan.
+    const bool in_package = index.package_names.count(entry.name) > 0;
+    auto note_package_member = [&](std::string_view member_name) {
+        if (in_package)
+            index.package_value_by_scoped_name.try_emplace(
+                package_scoped_key(entry.name, member_name), index.values.size());
+    };
+
     for (const auto* member : module.members) {
         if (!member)
             continue;
@@ -432,6 +442,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 if (!decl)
                     continue;
                 auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                note_package_member(token_value_text(decl->name));
                 index.values.push_back(ValueEntry{
                     .name = token_value_text(decl->name),
                     .type = with_declarator_dimensions(sm, type_text, *decl),
@@ -449,6 +460,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             const auto fn_name = id_name ? std::string(id_name->identifier.valueText())
                                          : render_syntax_node_text(sm, *proto.name);
             auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
+            note_package_member(fn_name);
             index.values.push_back(ValueEntry{
                 .name = fn_name,
                 .type = render_syntax_node_text(sm, *proto.returnType),
@@ -459,6 +471,35 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 .col = nc,
                 .signature = make_fn_signature(proto, fn_name, sm),
             });
+        } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
+            // Body parameters (`localparam DEPTH = 1;`) as opposed to header
+            // `#(...)` parameters.  Without these a closed file's body
+            // parameters are absent from the shard entirely, so neither
+            // go-to-definition nor hover can see them.  This is also the sole
+            // owner of package parameter values: process_package() delegates
+            // here rather than pushing its own duplicate ValueEntry.
+            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+                const std::string type_text = render_syntax_node_text(sm, *param->type);
+                const std::string kind = token_value_text(param->keyword);
+                for (const auto* decl : param->declarators) {
+                    if (!decl)
+                        continue;
+                    auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                    note_package_member(token_value_text(decl->name));
+                    index.values.push_back(ValueEntry{
+                        .name = token_value_text(decl->name),
+                        .type = type_text,
+                        .kind = kind,
+                        .parent_scope = entry.name,
+                        .default_value = decl->initializer
+                                             ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                             : std::string{},
+                        .file_id = source_file_id_for_token(index, sm, decl->name),
+                        .line = vl,
+                        .col = vc,
+                    });
+                }
+            }
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             // Closed/project files are represented by compact SyntaxIndex
             // shards, so module-local types must be present in the shard too.
@@ -607,6 +648,9 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         }
     }
 
+    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+        index.package_class_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
     index.classes.push_back(std::move(entry));
 }
@@ -657,6 +701,9 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         entry.resolved = render_syntax_node_text(sm, *td.type);
     }
 
+    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+        index.package_type_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
     index.typedefs.push_back(std::move(entry));
 }
@@ -665,8 +712,11 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                              const slang::SourceManager& sm, std::string_view source,
                              IndexDepth depth = IndexDepth::Full) {
     const std::string pkg_name = token_value_text(pkg.header->name);
-    process_module(pkg, index, sm, source, depth);
+    // Register the package name before walking members: process_module() indexes
+    // package parameters, typedefs, and classes, and the package-scoped lookup
+    // maps are only filled for parent scopes already known to be packages.
     index.package_names.insert(pkg_name);
+    process_module(pkg, index, sm, source, depth);
 
     // Collect exported symbol names and index nested declarations globally.
     std::vector<std::string> symbols;
@@ -721,22 +771,13 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                 }
             }
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
+            // The ValueEntry is pushed by process_module() above, which owns
+            // body parameters for modules and packages alike.  Only the exported
+            // symbol name is recorded here.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                const std::string type_text = render_syntax_node_text(sm, *param->type);
                 for (const auto* decl : param->declarators) {
-                    if (decl) {
+                    if (decl)
                         symbols.push_back(token_value_text(decl->name));
-                        auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
-                        index.values.push_back(ValueEntry{
-                            .name = token_value_text(decl->name),
-                            .type = type_text,
-                            .kind = token_value_text(param->keyword),
-                            .parent_scope = pkg_name,
-                            .file_id = source_file_id_for_token(index, sm, decl->name),
-                            .line = vl,
-                            .col = vc,
-                        });
-                    }
                 }
             }
         }
@@ -973,24 +1014,39 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
     for (const auto& [pkg, syms] : other.package_symbols)
         package_symbols.try_emplace(pkg, syms);
 
-    // classes
+    // classes.  Bare-name dedup stays first-wins, but an entry must still be
+    // appended when its package-scoped key is new: two packages may declare the
+    // same class name, and dropping the second would make `pkg_b::foo`
+    // unresolvable.
     for (const auto& c : other.classes) {
-        if (!class_by_name.count(c.name)) {
-            auto copy = c;
-            remap_class(copy);
-            class_by_name[c.name] = classes.size();
-            classes.push_back(std::move(copy));
-        }
+        const bool scoped =
+            !c.parent_scope.empty() && other.package_names.count(c.parent_scope) > 0;
+        const auto scoped_key = scoped ? package_scoped_key(c.parent_scope, c.name) : std::string{};
+        const bool scoped_is_new = scoped && !package_class_by_scoped_name.count(scoped_key);
+        if (class_by_name.count(c.name) && !scoped_is_new)
+            continue;
+        auto copy = c;
+        remap_class(copy);
+        if (scoped_is_new)
+            package_class_by_scoped_name.emplace(scoped_key, classes.size());
+        class_by_name.try_emplace(c.name, classes.size());
+        classes.push_back(std::move(copy));
     }
 
-    // typedefs
+    // typedefs — same scoped-key rule as classes above.
     for (const auto& t : other.typedefs) {
-        if (!typedef_by_name.count(t.name)) {
-            auto copy = t;
-            remap_typedef(copy);
-            typedef_by_name[t.name] = typedefs.size();
-            typedefs.push_back(std::move(copy));
-        }
+        const bool scoped =
+            !t.parent_scope.empty() && other.package_names.count(t.parent_scope) > 0;
+        const auto scoped_key = scoped ? package_scoped_key(t.parent_scope, t.name) : std::string{};
+        const bool scoped_is_new = scoped && !package_type_by_scoped_name.count(scoped_key);
+        if (typedef_by_name.count(t.name) && !scoped_is_new)
+            continue;
+        auto copy = t;
+        remap_typedef(copy);
+        if (scoped_is_new)
+            package_type_by_scoped_name.emplace(scoped_key, typedefs.size());
+        typedef_by_name.try_emplace(t.name, typedefs.size());
+        typedefs.push_back(std::move(copy));
     }
 
     for (auto macro : other.macros) {
@@ -999,6 +1055,9 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
     }
     for (auto value : other.values) {
         value.file_id = remap_file_id(file_remap, value.file_id);
+        if (!value.parent_scope.empty() && other.package_names.count(value.parent_scope))
+            package_value_by_scoped_name.try_emplace(
+                package_scoped_key(value.parent_scope, value.name), values.size());
         values.push_back(std::move(value));
     }
     for (auto import : other.imports) {

@@ -1044,3 +1044,105 @@ TEST_CASE("definition: package task resolves to closed extra file via index", "[
 
     std::filesystem::remove(lib_path);
 }
+
+// ── Package member hover (F2, F4, F5) ────────────────────────────────────────
+
+static const std::string kHoverCpuPkg = R"(package cpu_pkg;
+    parameter  int      WIDTH = 8;
+    localparam int      DEPTH = WIDTH * 2;
+    typedef logic [7:0] byte_t;
+endpackage
+)";
+
+static const std::string kHoverTop = R"(module top;
+logic [cpu_pkg::WIDTH-1:0] data;
+cpu_pkg::byte_t b;
+endmodule
+)";
+
+TEST_CASE("hover: qualified package parameter shows type and default value", "[hover]") {
+    const auto path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_pkg_param.sv";
+    {
+        std::ofstream out(path);
+        out << kHoverCpuPkg;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_hover_pkg_top.sv";
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kHoverTop);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = top_uri;
+    params.position = lsPosition(1, 16); // WIDTH in cpu_pkg::WIDTH
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    // F2 -- exact format, including the fenced detail block.
+    CHECK(hover->contents.second->value == "**WIDTH** — *parameter*\n\n---\n\n```\nint = 8\n```");
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("hover: qualified package typedef shows its resolved type", "[hover]") {
+    const auto path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_pkg_typedef.sv";
+    {
+        std::ofstream out(path);
+        out << kHoverCpuPkg;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_hover_pkg_td_top.sv";
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kHoverTop);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = top_uri;
+    params.position = lsPosition(2, 12); // byte_t in cpu_pkg::byte_t
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    // F4
+    CHECK(hover->contents.second->value ==
+          "**byte_t** — *typedef*\n\n---\n\n```\nlogic [7:0]\n```");
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("hover: imported parameter shows its default value", "[hover]") {
+    const auto path =
+        std::filesystem::temp_directory_path() / "lazyverilog_hover_pkg_import.sv";
+    {
+        std::ofstream out(path);
+        out << kHoverCpuPkg;
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_hover_pkg_import_top.sv";
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, R"(module top;
+import cpu_pkg::DEPTH;
+logic [DEPTH-1:0] addr;
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = top_uri;
+    params.position = lsPosition(2, 7); // unqualified DEPTH use
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    // F5 -- previously showed a bare `int` with no value.
+    CHECK(hover->contents.second->value ==
+          "**DEPTH** — *localparam*\n\n---\n\n```\nint = WIDTH*2\n```");
+
+    std::filesystem::remove(path);
+}

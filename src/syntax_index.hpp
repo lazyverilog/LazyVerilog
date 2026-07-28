@@ -199,6 +199,9 @@ struct ValueEntry {
     std::string type;
     std::string kind; // variable/net/function/task/parameter/localparam/port
     std::string parent_scope; // module/interface/package/class name when known
+    // Initializer text for parameter/localparam kinds (empty for other kinds).
+    // Mirrors PortEntry::default_value so hover can render `int = 8`.
+    std::string default_value;
     SourceFileID file_id{kInvalidSourceFileID};
     // 1-based lexical visibility range for block-local declarations.  A zero
     // range means the symbol is visible throughout parent_scope.
@@ -284,6 +287,17 @@ enum class IndexDepth {
                   ///< Used for .f extra-file states.
 };
 
+/// Key for the package-scoped lookup maps below.
+///
+/// The "package\nsymbol" spelling matches the `package_values` convention
+/// already used by collect_combined_occurrences() in syntax_index_shared.cpp.
+inline std::string package_scoped_key(std::string_view package, std::string_view symbol) {
+    std::string key(package);
+    key += '\n';
+    key.append(symbol);
+    return key;
+}
+
 struct SyntaxIndex {
     // Per-index file table.  All source-backed entries store SourceFileID
     // instead of repeating URI strings.  merge() remaps IDs from shard-local
@@ -333,6 +347,19 @@ struct SyntaxIndex {
     // semantic imports.  Completion uses them to avoid flattening package
     // libraries such as UVM into files that did not import them.
     std::vector<ImportEntry> imports;
+
+    // Package-scoped lookup for qualified names (`pkg::WIDTH`, `pkg::byte_t`,
+    // `pkg::my_class`).  Keyed by package_scoped_key(); values are indices into
+    // `values` / `typedefs` / `classes`.
+    //
+    // The bare-name `typedef_by_name` / `class_by_name` maps cannot serve this
+    // role: they are first-wins, so two packages declaring the same type name
+    // would resolve `pkg_b::foo_t` to pkg_a's declaration.  Qualified resolution
+    // must be exact, and must stay O(1) because it runs on the request path for
+    // every identifier that fails earlier resolution.
+    std::unordered_map<std::string, size_t> package_value_by_scoped_name;
+    std::unordered_map<std::string, size_t> package_type_by_scoped_name;
+    std::unordered_map<std::string, size_t> package_class_by_scoped_name;
 
     // Identifier occurrences for scalable cross-file references / rename.
     // These are syntactic occurrences, not a full semantic xref graph.  Current

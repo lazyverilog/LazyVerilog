@@ -973,6 +973,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
 
             // Fast path: scope::name where both sides are simple identifiers.
             // Avoids token iteration and string construction in render_syntax_node_text.
+            // Only `::` is a package qualification.  slang also models dotted
+            // member/hierarchical names as ScopedNameSyntax.
+            const bool package_scope =
+                node.separator.kind == slang::parsing::TokenKind::DoubleColon;
+
             if (const auto* lname = node.left->as_if<IdentifierNameSyntax>()) {
                 if (const auto* rname = node.right->as_if<IdentifierNameSyntax>()) {
                     const std::string_view scope_sv = lname->identifier.valueText();
@@ -987,6 +992,16 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             node.left->visit(*this);
                             return;
                         }
+                        // A qualified package value (`p1::WIDTH`) must carry the
+                        // same SymbolID as its declaration so find-references
+                        // groups the two.  Without this it falls through to the
+                        // unresolved `name:<ident>` fallback.
+                        if (package_scope && package_values.contains(scope_key)) {
+                            add_ref(rname->identifier,
+                                    symbol_canonical("package_value", scope_sv, name_sv));
+                            node.left->visit(*this);
+                            return;
+                        }
                     }
                     visitDefault(node);
                     return;
@@ -998,9 +1013,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             const auto name_token = last_identifier_token(*node.right);
             if (!scope.empty() && name_token) {
                 const std::string name(name_token.valueText());
-                if (const auto it = package_type_ids.find(scope + "\n" + name);
-                    it != package_type_ids.end()) {
+                const auto key = scope + "\n" + name;
+                if (const auto it = package_type_ids.find(key); it != package_type_ids.end()) {
                     add_ref(name_token, it->second);
+                    node.left->visit(*this);
+                    return;
+                }
+                if (package_scope && package_values.contains(key)) {
+                    add_ref(name_token, symbol_canonical("package_value", scope, name));
                     node.left->visit(*this);
                     return;
                 }
