@@ -1,6 +1,7 @@
 #include "analyzer.hpp"
 #include "syntax_index.hpp"
 #include <algorithm>
+#include <set>
 #include <catch2/catch_test_macros.hpp>
 #include <slang/syntax/SyntaxTree.h>
 
@@ -350,4 +351,193 @@ TEST_CASE("syntax_index: standalone class and typedef roots are indexed", "[inde
         auto idx = SyntaxIndex::build(*tree, text);
         CHECK(idx.typedef_by_name.contains("standalone_packet_t"));
     }
+}
+
+static const std::string kPackageScoped = R"(
+package cpu_pkg;
+    parameter  int      WIDTH = 8;
+    localparam int      DEPTH = WIDTH * 2;
+    typedef logic [7:0] byte_t;
+    class packet_cfg;
+    endclass
+endpackage
+
+module top #(
+    parameter int STAGES = 3
+);
+    localparam int LOCAL_DEPTH = 4;
+endmodule
+)";
+
+TEST_CASE("syntax_index: package members get scoped-name lookup keys", "[index]") {
+    auto tree = slang::syntax::SyntaxTree::fromText(kPackageScoped);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, kPackageScoped);
+    REQUIRE(idx.package_names.contains("cpu_pkg"));
+
+    const auto width_key = package_scoped_key("cpu_pkg", "WIDTH");
+    auto value_it = idx.package_value_by_scoped_name.find(width_key);
+    REQUIRE(value_it != idx.package_value_by_scoped_name.end());
+    REQUIRE(value_it->second < idx.values.size());
+    CHECK(idx.values[value_it->second].name == "WIDTH");
+    CHECK(idx.values[value_it->second].kind == "parameter");
+    CHECK(idx.values[value_it->second].default_value == "8");
+
+    const auto depth_key = package_scoped_key("cpu_pkg", "DEPTH");
+    auto depth_it = idx.package_value_by_scoped_name.find(depth_key);
+    REQUIRE(depth_it != idx.package_value_by_scoped_name.end());
+    CHECK(idx.values[depth_it->second].kind == "localparam");
+    CHECK(idx.values[depth_it->second].default_value == "WIDTH*2");
+
+    const auto type_key = package_scoped_key("cpu_pkg", "byte_t");
+    auto type_it = idx.package_type_by_scoped_name.find(type_key);
+    REQUIRE(type_it != idx.package_type_by_scoped_name.end());
+    REQUIRE(type_it->second < idx.typedefs.size());
+    CHECK(idx.typedefs[type_it->second].name == "byte_t");
+    CHECK(idx.typedefs[type_it->second].resolved == "logic [7:0]");
+
+    const auto class_key = package_scoped_key("cpu_pkg", "packet_cfg");
+    auto class_it = idx.package_class_by_scoped_name.find(class_key);
+    REQUIRE(class_it != idx.package_class_by_scoped_name.end());
+    REQUIRE(class_it->second < idx.classes.size());
+    CHECK(idx.classes[class_it->second].name == "packet_cfg");
+
+    // Module members must not leak into the package-scoped maps.
+    CHECK_FALSE(idx.package_value_by_scoped_name.contains(package_scoped_key("top", "STAGES")));
+}
+
+TEST_CASE("syntax_index: module parameters carry default values", "[index]") {
+    auto tree = slang::syntax::SyntaxTree::fromText(kPackageScoped);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, kPackageScoped);
+
+    auto find_value = [&](std::string_view scope, std::string_view name) -> const ValueEntry* {
+        for (const auto& v : idx.values) {
+            if (v.parent_scope == scope && v.name == name)
+                return &v;
+        }
+        return nullptr;
+    };
+
+    // Header #(...) parameter.
+    const auto* stages = find_value("top", "STAGES");
+    REQUIRE(stages != nullptr);
+    CHECK(stages->kind == "parameter");
+    CHECK(stages->default_value == "3");
+
+    // Body parameter -- previously absent from the index entirely.
+    const auto* local_depth = find_value("top", "LOCAL_DEPTH");
+    REQUIRE(local_depth != nullptr);
+    CHECK(local_depth->kind == "localparam");
+    CHECK(local_depth->type == "int");
+    CHECK(local_depth->default_value == "4");
+}
+
+TEST_CASE("syntax_index: package parameters are indexed exactly once", "[index]") {
+    auto tree = slang::syntax::SyntaxTree::fromText(kPackageScoped);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, kPackageScoped);
+
+    // process_package() delegates parameter values to process_module(); a
+    // duplicate here would double-count in every linear value scan.
+    const auto width_count = std::count_if(idx.values.begin(), idx.values.end(),
+                                           [](const ValueEntry& v) {
+                                               return v.parent_scope == "cpu_pkg" &&
+                                                      v.name == "WIDTH";
+                                           });
+    CHECK(width_count == 1);
+}
+
+TEST_CASE("syntax_index: qualified package value uses share the declaration SymbolID",
+          "[index]") {
+    const std::string text = R"(package p1;
+    parameter int WIDTH = 8;
+endpackage
+
+module top;
+    logic [p1::WIDTH-1:0] data;
+endmodule
+)";
+    auto tree = slang::syntax::SyntaxTree::fromText(text);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, text);
+
+    const auto matching = std::count_if(idx.references.begin(), idx.references.end(),
+                                        [](const ReferenceEntry& r) {
+                                            return r.name == "WIDTH" &&
+                                                   r.symbol_debug == "package_value::p1::WIDTH";
+                                        });
+    // Distinct source locations carrying the package_value ID: the declaration
+    // and the qualified use.  Counting locations rather than raw entries keeps
+    // this independent of the pre-existing duplicate occurrence emitted for a
+    // package parameter declaration.
+    std::set<std::pair<int, int>> locations;
+    for (const auto& r : idx.references) {
+        if (r.name == "WIDTH" && r.symbol_debug == "package_value::p1::WIDTH")
+            locations.emplace(r.line, r.col);
+    }
+    CHECK(locations.size() == 2);
+    CHECK(matching >= 2);
+
+    // No occurrence may fall back to the unresolved form.
+    const auto unresolved = std::count_if(idx.references.begin(), idx.references.end(),
+                                          [](const ReferenceEntry& r) {
+                                              return r.name == "WIDTH" &&
+                                                     r.symbol_debug == "name:WIDTH";
+                                          });
+    CHECK(unresolved == 0);
+}
+
+TEST_CASE("syntax_index: merge keeps same-named types from different packages", "[index]") {
+    const std::string a_text = R"(package pkg_a;
+    typedef logic [3:0] shared_t;
+    parameter int SHARED_P = 1;
+    class shared_c;
+    endclass
+endpackage
+)";
+    const std::string b_text = R"(package pkg_b;
+    typedef logic [7:0] shared_t;
+    parameter int SHARED_P = 2;
+    class shared_c;
+    endclass
+endpackage
+)";
+
+    auto a_tree = slang::syntax::SyntaxTree::fromText(a_text);
+    auto b_tree = slang::syntax::SyntaxTree::fromText(b_text);
+    REQUIRE(a_tree != nullptr);
+    REQUIRE(b_tree != nullptr);
+
+    auto merged = SyntaxIndex::build(*a_tree, a_text);
+    merged.merge(SyntaxIndex::build(*b_tree, b_text));
+
+    // The bare-name maps stay first-wins, so they cannot distinguish the two.
+    // The scoped maps must resolve each package's own declaration.
+    auto type_a = merged.package_type_by_scoped_name.find(package_scoped_key("pkg_a", "shared_t"));
+    auto type_b = merged.package_type_by_scoped_name.find(package_scoped_key("pkg_b", "shared_t"));
+    REQUIRE(type_a != merged.package_type_by_scoped_name.end());
+    REQUIRE(type_b != merged.package_type_by_scoped_name.end());
+    CHECK(type_a->second != type_b->second);
+    CHECK(merged.typedefs[type_a->second].resolved == "logic [3:0]");
+    CHECK(merged.typedefs[type_b->second].resolved == "logic [7:0]");
+
+    auto class_a = merged.package_class_by_scoped_name.find(package_scoped_key("pkg_a", "shared_c"));
+    auto class_b = merged.package_class_by_scoped_name.find(package_scoped_key("pkg_b", "shared_c"));
+    REQUIRE(class_a != merged.package_class_by_scoped_name.end());
+    REQUIRE(class_b != merged.package_class_by_scoped_name.end());
+    CHECK(class_a->second != class_b->second);
+    CHECK(merged.classes[class_a->second].parent_scope == "pkg_a");
+    CHECK(merged.classes[class_b->second].parent_scope == "pkg_b");
+
+    auto value_a = merged.package_value_by_scoped_name.find(package_scoped_key("pkg_a", "SHARED_P"));
+    auto value_b = merged.package_value_by_scoped_name.find(package_scoped_key("pkg_b", "SHARED_P"));
+    REQUIRE(value_a != merged.package_value_by_scoped_name.end());
+    REQUIRE(value_b != merged.package_value_by_scoped_name.end());
+    CHECK(merged.values[value_a->second].default_value == "1");
+    CHECK(merged.values[value_b->second].default_value == "2");
 }

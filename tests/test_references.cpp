@@ -1421,3 +1421,31 @@ endmodule
     std::filesystem::remove(header_path);
     std::filesystem::remove(dir);
 }
+
+TEST_CASE("references: package parameter declaration finds qualified uses", "[references]") {
+    const std::string text = R"(package p1;
+    parameter int WIDTH = 8;
+endpackage
+
+module top;
+    logic [p1::WIDTH-1:0] data;
+    logic [p1::WIDTH-1:0] more;
+endmodule
+)";
+
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_pkg_param.sv";
+    analyzer.open(uri, text);
+
+    // Invoke from the declaration itself.
+    auto [line, col] = find_position_after(text, "WIDTH", "parameter int ");
+    auto refs = analyzer.find_references(uri, line, col, true);
+
+    // Declaration plus both qualified uses.
+    REQUIRE(refs.size() == 3);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == uri);
+    CHECK(refs[0].line == 1);
+    CHECK(refs[1].line == 5);
+    CHECK(refs[2].line == 6);
+}

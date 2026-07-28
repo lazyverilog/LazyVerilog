@@ -1,7 +1,9 @@
 #include "analyzer.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 
 static const std::string kDefinitionFixture = R"(
 module child (
@@ -480,4 +482,215 @@ TEST_CASE("extra file cache refreshes on explicit filelist reset and drops remov
     snapshots = analyzer.extra_file_snapshot_ptr();
     REQUIRE(snapshots != nullptr);
     CHECK(snapshots->empty());
+}
+
+// ── Package-qualified resolution (D1, F1, F3) ────────────────────────────────
+
+// Closed extra file: never opened, so every lookup goes through SyntaxIndex.
+static const std::string kCpuPkg = R"(package cpu_pkg;
+    parameter  int      WIDTH = 8;
+    localparam int      DEPTH = WIDTH * 2;
+    typedef logic [7:0] byte_t;
+    class packet_cfg;
+    endclass
+endpackage
+)";
+
+static const std::string kTopUsingCpuPkg = R"(module top;
+localparam DEPTH = 1;
+import cpu_pkg::DEPTH;
+logic [cpu_pkg::WIDTH-1:0] data;
+logic [DEPTH-1:0] addr;
+cpu_pkg::byte_t b;
+cpu_pkg::packet_cfg cfg;
+endmodule
+)";
+
+TEST_CASE("definition: qualified package parameter resolves to closed extra file",
+          "[definition]") {
+    auto pkg_path = write_temp_sv("lazyverilog_def_cpu_pkg_closed.sv", kCpuPkg);
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_def_top_closed.sv";
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kTopUsingCpuPkg);
+
+    // F1 -- cursor on WIDTH in `cpu_pkg::WIDTH`
+    auto loc = analyzer.definition_of(top_uri, 3, 16);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == "file://" + pkg_path.string());
+    CHECK(loc->line == 1);
+
+    // F3 -- cursor on byte_t in `cpu_pkg::byte_t`
+    auto type_loc = analyzer.definition_of(top_uri, 5, 12);
+    REQUIRE(type_loc.has_value());
+    CHECK(type_loc->uri == "file://" + pkg_path.string());
+    CHECK(type_loc->line == 3);
+
+    // A qualified class must still resolve now that the generic bare-name
+    // fallback no longer runs for qualified names.
+    auto class_loc = analyzer.definition_of(top_uri, 6, 12);
+    REQUIRE(class_loc.has_value());
+    CHECK(class_loc->uri == "file://" + pkg_path.string());
+    CHECK(class_loc->line == 4);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: qualified package member does not resolve to a local declaration",
+          "[definition]") {
+    auto pkg_path = write_temp_sv("lazyverilog_def_cpu_pkg_shadow.sv", kCpuPkg);
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_def_top_shadow.sv";
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kTopUsingCpuPkg);
+
+    // D1, qualified half: `import cpu_pkg::DEPTH;` names the package's DEPTH,
+    // even though module top declares its own `localparam DEPTH = 1` first.
+    auto qualified = analyzer.definition_of(top_uri, 2, 17);
+    REQUIRE(qualified.has_value());
+    CHECK(qualified->uri == "file://" + pkg_path.string());
+    CHECK(qualified->line == 2);
+
+    // D1, unqualified half: a bare DEPTH use still resolves to the local
+    // declaration in the current file.
+    auto unqualified = analyzer.definition_of(top_uri, 4, 7);
+    REQUIRE(unqualified.has_value());
+    CHECK(unqualified->uri == top_uri);
+    CHECK(unqualified->line == 1);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: qualified package parameter resolves when package is an open buffer",
+          "[definition]") {
+    // "Open buffer" in this codebase means a project file that is *also* open in
+    // the editor, i.e. ExtraFileInfo::state is non-null (analyzer.hpp:48-51).
+    // That exercises the live-index branch rather than the closed-shard branch.
+    auto pkg_path = write_temp_sv("lazyverilog_def_cpu_pkg_open.sv", kCpuPkg);
+    const std::string pkg_uri = "file://" + pkg_path.string();
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_def_top_open.sv";
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(pkg_uri, kCpuPkg);
+    analyzer.open(top_uri, kTopUsingCpuPkg);
+
+    auto loc = analyzer.definition_of(top_uri, 3, 16);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == pkg_uri);
+    CHECK(loc->line == 1);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: qualified package parameter resolves within a single file",
+          "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_def_same_file_pkg.sv";
+    analyzer.open(uri, kCpuPkg + "\n" + kTopUsingCpuPkg);
+
+    // `cpu_pkg::WIDTH` on the `logic [cpu_pkg::WIDTH-1:0]` line.
+    auto loc = analyzer.definition_of(uri, 11, 16);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri);
+    CHECK(loc->line == 1);
+}
+
+TEST_CASE("definition: unqualified name does not leak into another module's parameters",
+          "[definition]") {
+    // D1's original repro: module top has no DEPTH and no import, so DEPTH is
+    // unresolvable.  It must not silently resolve into an unrelated module's
+    // header parameter in a closed project file.
+    auto other_path = write_temp_sv("lazyverilog_def_other_module.sv",
+                                    "module other_mod #(\n"
+                                    "    parameter int DEPTH = 16\n"
+                                    ")();\n"
+                                    "endmodule\n");
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_def_leak_top.sv";
+    analyzer.set_extra_files({other_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri,
+                  "module top;\n"
+                  "logic [DEPTH-1:0] addr;\n"
+                  "endmodule\n");
+
+    auto loc = analyzer.definition_of(top_uri, 1, 7);
+    CHECK_FALSE(loc.has_value());
+
+    std::filesystem::remove(other_path);
+}
+
+// ── Performance guard ────────────────────────────────────────────────────────
+
+// Qualified-name resolution must stay keyed.  The obvious implementation --
+// scanning every ValueEntry across the current index and every project shard --
+// is invisible in functional tests and only shows up at project scale, so this
+// guards the shape of the lookup rather than any single feature.
+//
+// The probe is an *unresolvable* identifier because that is the worst case: it
+// exhausts every resolution path before returning nothing.
+TEST_CASE("definition: unresolvable identifier stays fast on a large project",
+          "[definition][performance]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_perf_pkgs";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    constexpr int kPackages = 300;
+    constexpr int kParamsPerPackage = 40;
+
+    std::vector<std::string> paths;
+    paths.reserve(kPackages);
+    for (int p = 0; p < kPackages; ++p) {
+        std::string text = "package perf_pkg_" + std::to_string(p) + ";\n";
+        for (int v = 0; v < kParamsPerPackage; ++v) {
+            text += "    parameter int P_" + std::to_string(p) + "_" + std::to_string(v) + " = " +
+                    std::to_string(v) + ";\n";
+        }
+        text += "endpackage\n";
+
+        const auto path = dir / ("perf_pkg_" + std::to_string(p) + ".sv");
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+        out.close();
+        paths.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    const std::string top_uri = "file:///tmp/lazyverilog_perf_top.sv";
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri,
+                  "module perf_top;\n"
+                  "logic [NOT_DECLARED_ANYWHERE-1:0] addr;\n"
+                  "endmodule\n");
+
+    // Warm up caches so the measurement reflects steady-state request cost.
+    for (int i = 0; i < 20; ++i)
+        (void)analyzer.definition_of(top_uri, 1, 7);
+
+    constexpr int kIterations = 200;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < kIterations; ++i) {
+        auto loc = analyzer.definition_of(top_uri, 1, 7);
+        CHECK_FALSE(loc.has_value());
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double mean_us =
+        std::chrono::duration<double, std::micro>(elapsed).count() / kIterations;
+
+    INFO("mean go-to-definition on unresolvable identifier: " << mean_us << " us");
+    // Deliberately loose.  A linear scan over 12,000 values measured ~172 us
+    // against a ~62 us keyed baseline; this catches that regression without
+    // being a flake generator on a loaded CI machine.
+    CHECK(mean_us < 120.0);
+
+    std::filesystem::remove_all(dir);
 }

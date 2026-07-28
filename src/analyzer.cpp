@@ -709,6 +709,57 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
                     port->col + (int)port->name.size()};
 }
 
+// Resolve `package_name::member` through the package-scoped lookup maps.
+//
+// Three O(1) map probes, no linear scan: this runs on the request path for every
+// qualified identifier, and CLAUDE.md forbids whole-project walks there.
+static std::optional<Location> find_package_member(const SyntaxIndex& index,
+                                                   const std::string& uri,
+                                                   const std::string& package_name,
+                                                   const std::string& member_name) {
+    if (package_name.empty() || member_name.empty())
+        return std::nullopt;
+    if (!index.package_names.count(package_name))
+        return std::nullopt;
+
+    const auto key = package_scoped_key(package_name, member_name);
+    auto make_loc = [&](SourceFileID file_id, int line, int col) {
+        const auto actual_uri = index.source_uri(file_id);
+        const int lsp_line = to_lsp_line(line);
+        return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
+                        col + (int)member_name.size()};
+    };
+
+    if (auto it = index.package_value_by_scoped_name.find(key);
+        it != index.package_value_by_scoped_name.end() && it->second < index.values.size()) {
+        const auto& value = index.values[it->second];
+        return make_loc(value.file_id, value.line, value.col);
+    }
+    if (auto it = index.package_type_by_scoped_name.find(key);
+        it != index.package_type_by_scoped_name.end() && it->second < index.typedefs.size()) {
+        const auto& td = index.typedefs[it->second];
+        return make_loc(td.file_id, td.line, td.col);
+    }
+    if (auto it = index.package_class_by_scoped_name.find(key);
+        it != index.package_class_by_scoped_name.end() && it->second < index.classes.size()) {
+        const auto& cls = index.classes[it->second];
+        return make_loc(cls.file_id, cls.line, cls.col);
+    }
+
+    // Enum members live under their typedef entry rather than in the value
+    // table, so `pkg::IDLE` needs this extra step.
+    for (const auto& td : index.typedefs) {
+        if (td.parent_scope != package_name)
+            continue;
+        for (const auto& member : td.enum_members) {
+            if (member.name == member_name)
+                return make_loc(member.file_id, member.line, member.col);
+        }
+    }
+
+    return std::nullopt;
+}
+
 static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex& index,
                                                                const Location& loc,
                                                                bool allow_name_fallback = false) {
@@ -1243,6 +1294,26 @@ static std::optional<Location> find_generic_definition_from_index(
         }
     }
 
+    // Returns false for a symbol that belongs to some *other* module's scope.
+    //
+    // A parameter, port, or variable declared in module `foo` is not visible
+    // inside module `bar`; reaching it requires hierarchical or port
+    // connection, not a bare identifier.  Without this check an unresolvable
+    // name in the current file silently resolves to any same-named declaration
+    // in any project file — e.g. `logic [DEPTH-1:0]` in a module with no DEPTH
+    // jumping into an unrelated module's `#(parameter int DEPTH = 16)`.
+    //
+    // An empty parent_scope is compilation-unit scope and stays visible, as do
+    // package members, which pkg_visible() gates on imports instead.
+    auto module_scope_visible = [&](std::string_view parent_scope) -> bool {
+        if (parent_scope.empty() || parent_scope == preferred_module)
+            return true;
+        const std::string scope(parent_scope);
+        if (index.package_names.count(scope))
+            return true; // package member — pkg_visible() owns this decision
+        return !index.module_by_name.count(scope);
+    };
+
     // Values: variables, nets, functions, tasks, parameters, ports.
     // Linear scan but over a flat POD-like vector — far cheaper than an AST
     // visitor walk.  Prefer a scoped hit (same module as cursor) over a generic
@@ -1253,6 +1324,8 @@ static std::optional<Location> find_generic_definition_from_index(
         if (v.name != name)
             continue;
         if (!pkg_visible(v.parent_scope, name))
+            continue;
+        if (!module_scope_visible(v.parent_scope))
             continue;
         auto loc = make_loc(v.file_id, v.line, v.col);
         if (!first_hit)
@@ -1894,6 +1967,7 @@ enum class DefinitionTargetKind {
     NamedArgument,
     ClassMember,
     Macro,
+    PackageMember,
     Generic,
 };
 
@@ -1903,6 +1977,10 @@ struct DefinitionTarget {
     std::string module_name;
     std::string subroutine_name;
     std::string object_name;
+    // Left-hand side of a `pkg::name` qualification, verbatim.  The visitor only
+    // has the syntax tree, so it cannot know whether this really names a
+    // package; definition_of_state() decides that against the index.
+    std::string package_qualifier;
     std::string scope_module;
     std::string scope_package;
 };
@@ -2050,6 +2128,58 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
     }
 
+    // `pkg::WIDTH`, `pkg::byte_t`, `pkg::my_class`.
+    //
+    // Without this handler the qualifier is lost: NamedTypeSyntax's as_if to
+    // IdentifierNameSyntax fails for a scoped name, so the cursor falls through
+    // to visitToken() and is reported as a bare Generic identifier, which then
+    // happily resolves to a same-named local declaration.
+    //
+    // Only the right-hand identifier becomes a PackageMember.  A cursor on the
+    // left half is a reference to the package itself and already resolves, so it
+    // must keep going through the default walk.
+    void handle(const slang::syntax::ScopedNameSyntax& node) {
+        // slang uses ScopedNameSyntax for both `pkg::name` and dotted
+        // hierarchical/member names such as `fifo_entry.valid`.  Only the `::`
+        // form is a package qualification; the dotted form belongs to the
+        // member-access path and must not be intercepted here.
+        if (!node.left || !node.right ||
+            node.separator.kind != slang::parsing::TokenKind::DoubleColon) {
+            visitDefault(node);
+            return;
+        }
+
+        const auto* left = node.left->as_if<slang::syntax::IdentifierNameSyntax>();
+        const auto* right = node.right->as_if<slang::syntax::IdentifierNameSyntax>();
+        if (left && right &&
+            token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
+            target.kind = DefinitionTargetKind::PackageMember;
+            target.name = std::string(right->identifier.valueText());
+            target.package_qualifier = std::string(left->identifier.valueText());
+            target.scope_module = current_module;
+            target.scope_package = current_package;
+            return;
+        }
+
+        visitDefault(node);
+    }
+
+    // `import pkg::NAME;` — a PackageImportItemSyntax carries bare tokens rather
+    // than a ScopedNameSyntax, so it needs its own handler.  This is the case
+    // where a package-qualified name would otherwise resolve to a local
+    // declaration of the same name.
+    void handle(const slang::syntax::PackageImportItemSyntax& node) {
+        if (token_contains_position_in_uri(sm, node.item, uri, line, col)) {
+            target.kind = DefinitionTargetKind::PackageMember;
+            target.name = std::string(node.item.valueText());
+            target.package_qualifier = std::string(node.package.valueText());
+            target.scope_module = current_module;
+            target.scope_package = current_package;
+            return;
+        }
+        visitDefault(node);
+    }
+
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
         if (token_contains_position_in_uri(sm, node.name, uri, line, col)) {
             target.kind = DefinitionTargetKind::ClassMember;
@@ -2143,10 +2273,17 @@ static SymbolInfo symbol_info_for_value_entry(const ValueEntry& value, const std
     if ((value.kind == "function" || value.kind == "task") && !value.signature.empty())
         doc = value.signature;
 
+    const bool is_subroutine = value.kind == "function" || value.kind == "task";
+    std::string detail = is_subroutine ? value.kind : value.type;
+    // Parameters render as `int = 8`, matching how PortEntry parameters are
+    // already rendered in symbol_info_from_index().
+    if (!is_subroutine && !value.default_value.empty() &&
+        (value.kind == "parameter" || value.kind == "localparam"))
+        detail += " = " + value.default_value;
+
     return SymbolInfo{.name = name,
                       .kind = value.kind.empty() ? "variable" : value.kind,
-                      .detail = value.kind == "function" || value.kind == "task" ? value.kind
-                                                                                   : value.type,
+                      .detail = std::move(detail),
                       .doc = std::move(doc),
                       .line = definition.line,
                       .col = definition.col};
@@ -2648,6 +2785,24 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
     const int use_line_one_based = line + 1;
     const auto& current_index = get_structural_index(state);
+
+    if (target.kind == DefinitionTargetKind::PackageMember) {
+        if (auto loc =
+                find_package_member(current_index, uri, target.package_qualifier, target.name))
+            return loc;
+        for (const auto& extra : extra_files) {
+            if (skip_extra(extra))
+                continue;
+            if (auto loc = find_package_member(extra.index_ref(), extra.uri,
+                                                target.package_qualifier, target.name))
+                return loc;
+        }
+
+        // Deliberately no generic fallback.  A qualified name that the package
+        // does not export must report "no definition" rather than silently
+        // resolving to a same-named local or other-module declaration.
+        return std::nullopt;
+    }
 
     if (target.kind == DefinitionTargetKind::Generic) {
         if (auto loc =
