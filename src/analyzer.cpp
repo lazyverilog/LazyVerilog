@@ -3,6 +3,7 @@
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -3051,6 +3052,31 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             }
         }
     }
+    // A module port is indexed under two identities at the same declaration
+    // location: `module_port::M::P` (also emitted for `.P(...)` named port
+    // connections at instantiation sites) and `module_signal::M::P` (emitted for
+    // ordinary body references, because ports are module values too).  Parameter
+    // ports pair `module_param::M::P` with `module_signal::M::P` the same way.
+    // Whichever identity the clicked location resolves to, references/rename must
+    // match both, otherwise renaming a port declaration misses every use of it in
+    // the module body.  `module_port::M::P` exists only when M declares port P,
+    // so aliasing a plain module signal cannot collide with an unrelated symbol.
+    constexpr std::array<std::string_view, 3> kModuleMemberPrefixes = {
+        "module_port::", "module_param::", "module_signal::"};
+    std::vector<SymbolID> alias_symbol_ids;
+    for (const auto prefix : kModuleMemberPrefixes) {
+        if (!target_symbol_debug.starts_with(prefix))
+            continue;
+        const auto qualified_name = target_symbol_debug.substr(prefix.size());
+        for (const auto alias_prefix : kModuleMemberPrefixes) {
+            if (alias_prefix == prefix)
+                continue;
+            alias_symbol_ids.push_back(
+                SymbolID::from_canonical(std::string(alias_prefix) + qualified_name));
+        }
+        break;
+    }
+
     const SymbolID target_symbol_id = SymbolID::from_canonical(target_symbol_debug);
     const SymbolID fallback_symbol_id = SymbolID::from_canonical(fallback_symbol_debug);
     const bool allow_include_name_bridge =
@@ -3077,6 +3103,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
 
     auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref) {
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
+            return true;
+        if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
+            alias_symbol_ids.end())
             return true;
         if (fallback_symbol_id && ref.symbol_id == fallback_symbol_id)
             return true;

@@ -702,6 +702,15 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // Deduplication for macro expansion sites. Key = (expansion_buf_id << 32) | expansion_offset.
         // Avoids recording the same macro invocation multiple times when it expands to many tokens.
         std::unordered_set<uint64_t> seen_expansions;
+        // Token locations whose identity is already fully decided by a specific
+        // handler, so the generic name fallback in visitToken() must not add a
+        // second, wrong identity for them.  Key = (buf_id << 32) | offset.
+        std::unordered_set<uint64_t> classified_tokens;
+
+        static uint64_t token_key(const slang::parsing::Token& token) {
+            return (static_cast<uint64_t>(token.location().buffer().getId()) << 32) |
+                   static_cast<uint64_t>(token.location().offset());
+        }
 
         CombinedVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
                         decltype(add_reference)& add_reference,
@@ -1040,9 +1049,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     if (!named)
                         continue;
                     const std::string param_name(named->name.valueText());
-                    if (!module_name.empty() && !param_name.empty())
+                    if (!module_name.empty() && !param_name.empty()) {
                         add_ref(named->name,
                                 symbol_canonical("module_param", module_name, param_name));
+                        classified_tokens.insert(token_key(named->name));
+                    }
                 }
             }
 
@@ -1061,8 +1072,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     if (!named)
                         continue;
                     const std::string port_name(named->name.valueText());
-                    if (!module_name.empty() && !port_name.empty())
+                    if (!module_name.empty() && !port_name.empty()) {
                         add_ref(named->name, symbol_canonical("module_port", module_name, port_name));
+                        // `.p(expr)` names a port of the instantiated module.  It is
+                        // not a reference to a same-named signal of the enclosing
+                        // module, so keep the generic fallback from also tagging it
+                        // `module_signal::<enclosing>::p`.
+                        classified_tokens.insert(token_key(named->name));
+                    }
                 }
             }
 
@@ -1273,6 +1290,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return;
             const std::string name(token.valueText());
             if (name.empty())
+                return;
+            if (classified_tokens.contains(token_key(token)))
                 return;
             if (try_add_class_method_reference(token, name))
                 return;
