@@ -231,6 +231,64 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
     }
 }
 
+bool is_generate_construct(const MemberSyntax& member) {
+    switch (member.kind) {
+        case SyntaxKind::GenerateRegion:
+        case SyntaxKind::GenerateBlock:
+        case SyntaxKind::LoopGenerate:
+        case SyntaxKind::IfGenerate:
+        case SyntaxKind::CaseGenerate:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Instantiations also live inside generate constructs, which the parser keeps
+// as nested member lists rather than splicing into the enclosing module.  Walk
+// those bodies for instances only; every other member kind stays scoped to the
+// module-level loop in process_module().  Mirrors extract_instances() in
+// syntax_index.cpp so open buffers and closed shards agree.
+void process_generate_instances(const MemberSyntax& member, SyntaxIndex& index,
+                                const slang::SourceManager& sm,
+                                const std::vector<std::string_view>& lines,
+                                const std::string& parent_module) {
+    if (const auto* hierarchy = member.as_if<HierarchyInstantiationSyntax>()) {
+        process_hierarchy(*hierarchy, index, sm, lines, parent_module);
+    } else if (const auto* region = member.as_if<GenerateRegionSyntax>()) {
+        for (const auto* child : region->members) {
+            if (child)
+                process_generate_instances(*child, index, sm, lines, parent_module);
+        }
+    } else if (const auto* block = member.as_if<GenerateBlockSyntax>()) {
+        for (const auto* child : block->members) {
+            if (child)
+                process_generate_instances(*child, index, sm, lines, parent_module);
+        }
+    } else if (const auto* loop = member.as_if<LoopGenerateSyntax>()) {
+        process_generate_instances(*loop->block, index, sm, lines, parent_module);
+    } else if (const auto* cond = member.as_if<IfGenerateSyntax>()) {
+        process_generate_instances(*cond->block, index, sm, lines, parent_module);
+        // `else` arms and case-item bodies are typed as bare SyntaxNode because
+        // they can also hold non-member syntax; only member-shaped clauses can
+        // contain instantiations.
+        if (cond->elseClause) {
+            if (const auto* arm = cond->elseClause->clause->as_if<MemberSyntax>())
+                process_generate_instances(*arm, index, sm, lines, parent_module);
+        }
+    } else if (const auto* sel = member.as_if<CaseGenerateSyntax>()) {
+        for (const auto* item : sel->items) {
+            const SyntaxNode* body = nullptr;
+            if (const auto* standard = item->as_if<StandardCaseItemSyntax>())
+                body = standard->clause;
+            else if (const auto* def = item->as_if<DefaultCaseItemSyntax>())
+                body = def->clause;
+            if (const auto* arm = body ? body->as_if<MemberSyntax>() : nullptr)
+                process_generate_instances(*arm, index, sm, lines, parent_module);
+        }
+    }
+}
+
 void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                    const slang::SourceManager& sm, std::string parent_scope = {}) {
     ClassEntry entry;
@@ -441,6 +499,8 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             process_typedef(*td, index, sm, module.name);
         } else if (const auto* hierarchy = member->as_if<HierarchyInstantiationSyntax>()) {
             process_hierarchy(*hierarchy, index, sm, lines, module.name);
+        } else if (is_generate_construct(*member)) {
+            process_generate_instances(*member, index, sm, lines, module.name);
         } else if (const auto* modport = member->as_if<ModportDeclarationSyntax>()) {
             for (const auto* item : modport->items) {
                 if (!item)

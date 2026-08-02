@@ -511,6 +511,37 @@ endmodule
     CHECK(tree->children[0].children[0].inst == "u_leaf");
 }
 
+TEST_CASE("rtltree: includes instances nested in generate constructs", "[rtltree]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rtltree_generate_top.sv";
+    analyzer.open(uri, R"(
+module top #(parameter int N = 2);
+    for (genvar i = 0; i < N; i++) begin : gen_harts
+        core u_core();
+    end
+
+    if (N > 1) begin : gen_wide
+        wide u_wide();
+    end
+endmodule
+
+module core;
+endmodule
+
+module wide;
+endmodule
+)");
+
+    auto tree = analyzer.rtl_tree(uri);
+    REQUIRE(tree.has_value());
+    CHECK(tree->name == "top");
+    REQUIRE(tree->children.size() == 2);
+    CHECK(tree->children[0].name == "core");
+    CHECK(tree->children[0].inst == "u_core");
+    CHECK(tree->children[1].name == "wide");
+    CHECK(tree->children[1].inst == "u_wide");
+}
+
 TEST_CASE("rtltree: builds reverse hierarchy through extra files", "[rtltree]") {
     const auto top_path = std::filesystem::temp_directory_path() / "lazyverilog_rtltree_top.sv";
     {

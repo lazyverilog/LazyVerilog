@@ -281,22 +281,63 @@ static int syntax_end_line0(const slang::SourceManager& sm, const SyntaxNode& no
     return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
 }
 
-static void extract_instances(const SyntaxList<MemberSyntax>& members,
-                              std::vector<InstanceEntry>& out, SyntaxIndex& index,
-                              const slang::SourceManager& sm,
-                              std::string_view source, std::string_view parent_module) {
-    // Split lines once here so find_instance_end_line doesn't re-split per instance.
-    const auto lines = source.empty() ? std::vector<std::string_view>{} : split_lines_view(source);
+namespace {
 
-    for (const auto* member : members) {
-        if (!member)
-            continue;
-        const auto* hierarchy = member->as_if<HierarchyInstantiationSyntax>();
-        if (!hierarchy)
-            continue;
+struct InstanceScan {
+    std::vector<InstanceEntry>* out;
+    SyntaxIndex* index;
+    const slang::SourceManager* sm;
+    std::string_view source;
+    std::vector<std::string_view> lines;
+    std::string_view parent_module;
 
-        const std::string module_name = token_value_text(hierarchy->type);
-        for (const auto* instance : hierarchy->instances) {
+    void members(const SyntaxList<MemberSyntax>& list) {
+        for (const auto* member : list) {
+            if (member)
+                member_node(*member);
+        }
+    }
+
+    void member_node(const MemberSyntax& member) {
+        if (const auto* hierarchy = member.as_if<HierarchyInstantiationSyntax>()) {
+            hierarchy_node(*hierarchy);
+            return;
+        }
+        // Instantiations also live inside generate constructs.  The parser keeps
+        // those bodies as nested member lists rather than splicing them into the
+        // enclosing module, so descend into every generate form to index them
+        // the same way as direct module members.
+        if (const auto* region = member.as_if<GenerateRegionSyntax>()) {
+            members(region->members);
+        } else if (const auto* block = member.as_if<GenerateBlockSyntax>()) {
+            members(block->members);
+        } else if (const auto* loop = member.as_if<LoopGenerateSyntax>()) {
+            member_node(*loop->block);
+        } else if (const auto* cond = member.as_if<IfGenerateSyntax>()) {
+            member_node(*cond->block);
+            if (cond->elseClause)
+                clause(*cond->elseClause->clause);
+        } else if (const auto* sel = member.as_if<CaseGenerateSyntax>()) {
+            for (const auto* item : sel->items) {
+                if (const auto* standard = item->as_if<StandardCaseItemSyntax>())
+                    clause(*standard->clause);
+                else if (const auto* def = item->as_if<DefaultCaseItemSyntax>())
+                    clause(*def->clause);
+            }
+        }
+    }
+
+    // `else` arms and case-item bodies are typed as bare SyntaxNode because they
+    // can also hold non-member syntax; only member-shaped clauses can contain
+    // instantiations.
+    void clause(const SyntaxNode& node) {
+        if (const auto* member = node.as_if<MemberSyntax>())
+            member_node(*member);
+    }
+
+    void hierarchy_node(const HierarchyInstantiationSyntax& hierarchy) {
+        const std::string module_name = token_value_text(hierarchy.type);
+        for (const auto* instance : hierarchy.instances) {
             if (!instance)
                 continue;
 
@@ -305,8 +346,8 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
             entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = token_value_text(instance->decl->name);
-                entry.file_id = source_file_id_for_token(index, sm, instance->decl->name);
-                entry.line = token_pos_line1_col0(sm, instance->decl->name).first;
+                entry.file_id = source_file_id_for_token(*index, *sm, instance->decl->name);
+                entry.line = token_pos_line1_col0(*sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
             // Use the parsed hierarchy range when available.  A raw ';' search
@@ -315,7 +356,7 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
             const int fallback_end_line = source.empty()
                                               ? entry.start_line
                                               : find_instance_end_line(lines, entry.start_line);
-            entry.end_line = syntax_end_line0(sm, *hierarchy, fallback_end_line);
+            entry.end_line = syntax_end_line0(*sm, hierarchy, fallback_end_line);
 
             for (const auto* connection : instance->connections) {
                 if (!connection)
@@ -324,20 +365,38 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
                 if (!named)
                     continue;
 
-                auto [line, col] = token_pos_line1_col0(sm, named->name);
-                auto [paren_line, paren_col] = token_pos_line1_col0(sm, named->openParen);
+                auto [line, col] = token_pos_line1_col0(*sm, named->name);
+                auto [paren_line, paren_col] = token_pos_line1_col0(*sm, named->openParen);
                 entry.connections.push_back(NamedPortConn{
                     .port_name = token_value_text(named->name),
                     .signal_name = simple_identifier_from_expr(named->expr),
-                    .file_id = source_file_id_for_token(index, sm, named->name),
+                    .file_id = source_file_id_for_token(*index, *sm, named->name),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,
                 });
             }
-            out.push_back(std::move(entry));
+            out->push_back(std::move(entry));
         }
     }
+};
+
+} // namespace
+
+static void extract_instances(const SyntaxList<MemberSyntax>& members,
+                              std::vector<InstanceEntry>& out, SyntaxIndex& index,
+                              const slang::SourceManager& sm,
+                              std::string_view source, std::string_view parent_module) {
+    InstanceScan scan{
+        .out = &out,
+        .index = &index,
+        .sm = &sm,
+        .source = source,
+        // Split lines once here so find_instance_end_line doesn't re-split per instance.
+        .lines = source.empty() ? std::vector<std::string_view>{} : split_lines_view(source),
+        .parent_module = parent_module,
+    };
+    scan.members(members);
 }
 
 static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
