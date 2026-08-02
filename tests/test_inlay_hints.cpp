@@ -199,6 +199,36 @@ endmodule
     std::filesystem::remove(extra_path);
 }
 
+TEST_CASE("inlay hints: covers instances inside generate blocks", "[inlay]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/inlay_generate_top.sv";
+    analyzer.open(uri, R"(module child(
+    input logic req,
+    output logic ack
+);
+endmodule
+
+module top;
+    for (genvar i = 0; i < 2; i++) begin : gen_loop
+        child u_child (
+            .req(sig_req),
+            .ack(sig_ack)
+        );
+    end
+endmodule
+)");
+
+    auto hints = provide_inlay_hints(analyzer, uri, 0, 20);
+
+    REQUIRE(hints.size() == 3);
+    CHECK(hints[0].position.line == 8);
+    CHECK(hints[0].label == "2/2 ports");
+    CHECK(hints[1].position.line == 9);
+    CHECK(hints[1].label == "◀");
+    CHECK(hints[2].position.line == 10);
+    CHECK(hints[2].label == "▶");
+}
+
 TEST_CASE("inlay hints: each label is placed at its own connection expression", "[inlay]") {
     const auto extra_path = std::filesystem::temp_directory_path() / "lazyverilog_inlay_wide.sv";
     {

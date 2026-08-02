@@ -71,6 +71,93 @@ TEST_CASE("syntax_index: finds memory instantiation in top", "[index]") {
     CHECK(it->parent_module == "top");
 }
 
+TEST_CASE("syntax_index: finds instantiations nested in generate constructs", "[index]") {
+    const std::string text = R"(
+module child(input logic clk);
+endmodule
+
+module top #(parameter int N = 2) (input logic clk);
+    for (genvar i = 0; i < N; i++) begin : gen_loop
+        child u_loop (.clk(clk));
+    end
+
+    if (N > 1) begin : gen_if
+        child u_if (.clk(clk));
+    end else begin : gen_else
+        child u_else (.clk(clk));
+    end
+
+    case (N)
+        1: begin : gen_case_one
+            child u_case_one (.clk(clk));
+        end
+        default: begin : gen_case_default
+            child u_case_default (.clk(clk));
+        end
+    endcase
+
+    generate
+        begin : gen_region
+            child u_region (.clk(clk));
+        end
+    endgenerate
+
+    for (genvar j = 0; j < N; j++) begin : gen_outer
+        if (N > 1) begin : gen_inner
+            child u_nested (.clk(clk));
+        end
+    end
+endmodule
+)";
+    auto tree = slang::syntax::SyntaxTree::fromText(text);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, text);
+
+    std::set<std::string> names;
+    for (const auto& inst : idx.instances) {
+        CHECK(inst.module_name == "child");
+        CHECK(inst.parent_module == "top");
+        names.insert(inst.instance_name);
+    }
+
+    CHECK(names == std::set<std::string>{"u_case_default", "u_case_one", "u_else", "u_if",
+                                         "u_loop", "u_nested", "u_region"});
+}
+
+TEST_CASE("syntax_index: generate-nested instances keep connection metadata", "[index]") {
+    const std::string text = R"(
+module child(input logic clk, output logic done);
+endmodule
+
+module top(input logic clk);
+    logic done;
+    for (genvar i = 0; i < 2; i++) begin : gen_loop
+        child u_loop (
+            .clk  (clk),
+            .done (done)
+        );
+    end
+endmodule
+)";
+    auto tree = slang::syntax::SyntaxTree::fromText(text);
+    REQUIRE(tree != nullptr);
+
+    auto idx = SyntaxIndex::build(*tree, text);
+
+    REQUIRE(idx.instances.size() == 1);
+    const auto& inst = idx.instances.front();
+    REQUIRE(inst.connections.size() == 2);
+    CHECK(inst.connections[0].port_name == "clk");
+    CHECK(inst.connections[0].signal_name == "clk");
+    CHECK(inst.connections[1].port_name == "done");
+    CHECK(inst.connections[1].signal_name == "done");
+    // The instance body spans the connection lines so range-limited features
+    // (inlay hints, stale-instance lint) see the whole instantiation.
+    CHECK(inst.start_line < inst.connections[0].line - 1);
+    CHECK(inst.end_line >= inst.connections[1].line - 1);
+}
+
 TEST_CASE("syntax_index: reference occurrences carry owner-qualified symbol IDs", "[index]") {
     const std::string text = R"(
 module memory #(parameter WIDTH = 8) (input logic clk);
