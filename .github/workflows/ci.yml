@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64
+          - os: ubuntu-22.04
+            platform: linux-x64-static
+            cmake_extra: -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64-static
+            cmake_extra: -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+          - os: macos-15
+            platform: darwin-x64
+            cmake_extra: -DCMAKE_OSX_ARCHITECTURES=x86_64
+          - os: macos-15
+            platform: darwin-arm64
+            cmake_extra: ""
+          - os: windows-2022
+            platform: windows-x64
+            # See release.yml for why Ninja+MSVC is used instead of the Visual
+            # Studio generator here.
+            cmake_extra: -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up MSVC developer environment
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_extra }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build --build-config Release --output-on-failure
