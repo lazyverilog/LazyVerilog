@@ -69,7 +69,11 @@ TEST_CASE("filelist: nested -f and source paths expand environment variables",
           "[filelist]") {
     const auto root = make_temp_dir("lv_filelist_env");
     const auto env_dir = root / "env";
+#ifdef _WIN32
+    _putenv_s("LV_FILELIST_ENV_DIR", env_dir.string().c_str());
+#else
     setenv("LV_FILELIST_ENV_DIR", env_dir.c_str(), 1);
+#endif
 
     write_text(root / "top.vc", "-f $LV_FILELIST_ENV_DIR/nested.vc\n");
     write_text(env_dir / "nested.vc", "${LV_FILELIST_ENV_DIR}/from_env.sv\n");
