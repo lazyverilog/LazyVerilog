@@ -27,6 +27,8 @@ task add_number(
 endtask
 
 package cpu_pkg;
+parameter int WIDTH2 = 8;
+parameter int DEPTH = 16;
 // State machine states
 
 // Instruction opcode
@@ -48,7 +50,7 @@ endtask
 
 class Packet;
 
-    int                 data                                ;
+    int                                     data                                ;
 
     function void set_data(
         int d
