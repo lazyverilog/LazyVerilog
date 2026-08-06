@@ -41,6 +41,25 @@ ctest --test-dir build                          # all tests
 ./build/lazyverilog-tests "test name here"      # single named test
 ```
 
+### Releasing a New Version
+```bash
+ctest --test-dir build                          # test gate — must pass first
+./tools/release.sh --version vX.Y.Z              # commits release note, pushes, dispatches CI
+```
+- Write release notes at `docs/releases/vX.Y.Z.md` before running the script (script warns and
+  asks to confirm if missing). Follow the format of prior files in that directory.
+- `tools/release.sh` is interactive (confirms before push/dispatch); it commits the release note,
+  pushes the current branch, triggers `.github/workflows/release.yml` via `workflow_dispatch`, and
+  watches the run. CI builds all platform binaries, computes checksums, bumps
+  `lua/lazyverilog/{version,checksums}.lua` and `vscode/{package.json,package-lock.json,src/version.ts,src/checksums.ts}`,
+  commits that metadata, tags, and publishes the GitHub Release.
+- The VS Code Marketplace upload is **not** part of CI — publish `lazyverilog-vscode` manually by
+  downloading the `.vsix` asset from the GitHub Release and uploading it at
+  https://marketplace.visualstudio.com/manage/publishers/lazyverilog (web upload; no Azure
+  DevOps org or PAT needed — that's a separate, unrelated flow, don't go down that path).
+- Windows CI build has no POSIX libc — don't add POSIX-only calls (e.g. `setenv`) to code that
+  compiles there (tests included) without an `#ifdef _WIN32` guard.
+
 ### Working In This Directory
 - Core formatting logic: `src/features/formatter.cpp` → `format_source()`
 - Config options documented: `docs/formatter/options.md`
