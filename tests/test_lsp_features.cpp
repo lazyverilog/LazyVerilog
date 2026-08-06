@@ -5,6 +5,7 @@
 #include "features/hover.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
+#include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
@@ -1021,7 +1022,7 @@ TEST_CASE("definition: module resolves to closed extra file via index", "[defini
     // cursor on "adder" at line 2, col 4
     auto loc = analyzer.definition_of(top_uri, 2, 4);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->uri == uri_from_path(lib_path));
     CHECK(loc->line == 15);
     CHECK(loc->col == 7);
 
@@ -1045,7 +1046,7 @@ TEST_CASE("definition: package function resolves to closed extra file via index"
     // cursor on "clamp" at line 4, col 8
     auto loc = analyzer.definition_of(top_uri, 4, 8);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->uri == uri_from_path(lib_path));
     CHECK(loc->line == 7);
     CHECK(loc->col == 27);
 
@@ -1069,7 +1070,7 @@ TEST_CASE("definition: package task resolves to closed extra file via index", "[
     // cursor on "delay_n" at line 5, col 8
     auto loc = analyzer.definition_of(top_uri, 5, 8);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + lib_path.string());
+    CHECK(loc->uri == uri_from_path(lib_path));
     CHECK(loc->line == 11);
     CHECK(loc->col == 9);
 

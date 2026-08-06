@@ -1,6 +1,7 @@
 #include "analyzer.hpp"
 #include "features/connect.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <filesystem>
 #include <fstream>
 
 TEST_CASE("connect: reports modules, ports, and hierarchical instances", "[connect]") {
@@ -329,8 +330,10 @@ endmodule
 
 
 TEST_CASE("connect: edits closed filelist child module text", "[connect]") {
-    const std::string inv_path = "/tmp/lv_connect_closed_inv.sv";
-    const std::string mem_path = "/tmp/lv_connect_closed_memory.sv";
+    const std::string inv_path =
+        (std::filesystem::temp_directory_path() / "lv_connect_closed_inv.sv").string();
+    const std::string mem_path =
+        (std::filesystem::temp_directory_path() / "lv_connect_closed_memory.sv").string();
     {
         std::ofstream inv(inv_path);
         inv << R"(module inv(input logic i, output logic o);

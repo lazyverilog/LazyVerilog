@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <filesystem>
@@ -126,7 +127,7 @@ TEST_CASE("definition: module lookup uses vcode extra files", "[definition]") {
 
     auto loc = analyzer.definition_of(top_uri, 2, 11);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + extra_path.string());
+    CHECK(loc->uri == uri_from_path(extra_path));
     CHECK(loc->line == 6);
     CHECK(loc->col == 7);
 
@@ -144,7 +145,7 @@ TEST_CASE("definition: named port lookup uses vcode extra files", "[definition]"
 
     auto loc = analyzer.definition_of(top_uri, 3, 10);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + extra_path.string());
+    CHECK(loc->uri == uri_from_path(extra_path));
     CHECK(loc->line == 6);
     CHECK(loc->col == 25);
 
@@ -154,7 +155,7 @@ TEST_CASE("definition: named port lookup uses vcode extra files", "[definition]"
 TEST_CASE("definition: macro lookup resolves local define", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     auto loc = analyzer.definition_of(top_uri, 52, 24);
@@ -168,7 +169,7 @@ TEST_CASE("definition: macro lookup resolves local define", "[definition]") {
 TEST_CASE("definition: typedef lookup resolves named type", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     auto loc = analyzer.definition_of(top_uri, 20, 12);
@@ -201,7 +202,7 @@ TEST_CASE("definition: class type lookup resolves class declaration", "[definiti
 TEST_CASE("definition: variable lookup prefers same module scope", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     auto loc = analyzer.definition_of(top_uri, 84, 11);
@@ -263,7 +264,7 @@ TEST_CASE("definition: included aggregate field does not shadow module signal", 
                       "    valid = fifo_entry.valid;\n"
                       "end\n"
                       "endmodule\n");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     // The included header defines fifo_entry_t.valid before the module signal
@@ -279,7 +280,7 @@ TEST_CASE("definition: included aggregate field does not shadow module signal", 
     // Keep the member-access behavior intact for the RHS.
     auto rhs = analyzer.definition_of(top_uri, 5, 23);
     REQUIRE(rhs.has_value());
-    CHECK(rhs->uri == "file://" + header_path.string());
+    CHECK(rhs->uri == uri_from_path(header_path));
     CHECK(rhs->line == 1);
     CHECK(rhs->col == 10);
     CHECK(rhs->end_col == 15);
@@ -307,7 +308,7 @@ TEST_CASE("definition: included function formal does not shadow module port", "[
                       "    foo(.i_data(i_data));\n"
                       "end\n"
                       "endmodule\n");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     // The included function declares a formal named `i_data` before the module
@@ -323,7 +324,7 @@ TEST_CASE("definition: included function formal does not shadow module port", "[
     // The named-argument label keeps resolving to the formal.
     auto label = analyzer.definition_of(top_uri, 6, 10);
     REQUIRE(label.has_value());
-    CHECK(label->uri == "file://" + header_path.string());
+    CHECK(label->uri == uri_from_path(header_path));
     CHECK(label->line == 1);
     CHECK(label->col == 22);
     CHECK(label->end_col == 28);
@@ -362,7 +363,7 @@ TEST_CASE("definition: function formal visible only inside its body", "[definiti
 TEST_CASE("definition: named subroutine argument resolves to formal argument", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, read_text(top_path.string()));
 
     auto loc = analyzer.definition_of(top_uri, 182, 17);
@@ -377,7 +378,7 @@ TEST_CASE("definition: macro lookup uses open extra file AST", "[definition]") {
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_macro.sv", kExtraDefinitionFixture);
-    const std::string extra_uri = "file://" + extra_path.string();
+    const std::string extra_uri = uri_from_path(extra_path);
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_macro.sv";
     analyzer.set_extra_files({extra_path.string()});
     analyzer.wait_for_background_index_idle();
@@ -386,7 +387,7 @@ TEST_CASE("definition: macro lookup uses open extra file AST", "[definition]") {
 
     auto loc = analyzer.definition_of(top_uri, 9, 13);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + extra_path.string());
+    CHECK(loc->uri == uri_from_path(extra_path));
     CHECK(loc->line == 0);
     CHECK(loc->col == 8);
     CHECK(loc->end_col == 19);
@@ -409,7 +410,7 @@ TEST_CASE("definition: named subroutine argument lookup uses open extra file AST
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_arg.sv", kExtraDefinitionFixture);
-    const std::string extra_uri = "file://" + extra_path.string();
+    const std::string extra_uri = uri_from_path(extra_path);
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_arg.sv";
     analyzer.set_extra_files({extra_path.string()});
     analyzer.wait_for_background_index_idle();
@@ -418,7 +419,7 @@ TEST_CASE("definition: named subroutine argument lookup uses open extra file AST
 
     auto loc = analyzer.definition_of(top_uri, 7, 15);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + extra_path.string());
+    CHECK(loc->uri == uri_from_path(extra_path));
     CHECK(loc->line == 2);
     CHECK(loc->col == 28);
 
@@ -429,7 +430,7 @@ TEST_CASE("definition: generic lookup uses open extra file AST", "[definition]")
     Analyzer analyzer;
     const auto extra_path =
         write_temp_sv("lazyverilog_definition_extra_generic.sv", kExtraDefinitionFixture);
-    const std::string extra_uri = "file://" + extra_path.string();
+    const std::string extra_uri = uri_from_path(extra_path);
     const std::string top_uri = "file:///tmp/lazyverilog_definition_top_generic.sv";
     analyzer.set_extra_files({extra_path.string()});
     analyzer.wait_for_background_index_idle();
@@ -438,7 +439,7 @@ TEST_CASE("definition: generic lookup uses open extra file AST", "[definition]")
 
     auto loc = analyzer.definition_of(top_uri, 10, 6);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + extra_path.string());
+    CHECK(loc->uri == uri_from_path(extra_path));
     CHECK(loc->line == 1);
     CHECK(loc->col == 20);
 
@@ -481,7 +482,7 @@ TEST_CASE("definition: package members included as text require import", "[defin
                            "endmodule\n");
     auto imported = analyzer.definition_of(top_uri, 4, 11);
     REQUIRE(imported.has_value());
-    CHECK(imported->uri == "file://" + header_path.string());
+    CHECK(imported->uri == uri_from_path(header_path));
     CHECK(imported->line == 1);
     CHECK(imported->col == 5);
 
@@ -509,7 +510,7 @@ TEST_CASE("definition: nested include cursor matching is file-aware", "[definiti
 
     auto loc = analyzer.definition_of(top_uri, 2, 22);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + a_path.string());
+    CHECK(loc->uri == uri_from_path(a_path));
     CHECK(loc->line == 1);
     CHECK(loc->col == 14);
 
@@ -590,20 +591,20 @@ TEST_CASE("definition: qualified package parameter resolves to closed extra file
     // F1 -- cursor on WIDTH in `cpu_pkg::WIDTH`
     auto loc = analyzer.definition_of(top_uri, 3, 16);
     REQUIRE(loc.has_value());
-    CHECK(loc->uri == "file://" + pkg_path.string());
+    CHECK(loc->uri == uri_from_path(pkg_path));
     CHECK(loc->line == 1);
 
     // F3 -- cursor on byte_t in `cpu_pkg::byte_t`
     auto type_loc = analyzer.definition_of(top_uri, 5, 12);
     REQUIRE(type_loc.has_value());
-    CHECK(type_loc->uri == "file://" + pkg_path.string());
+    CHECK(type_loc->uri == uri_from_path(pkg_path));
     CHECK(type_loc->line == 3);
 
     // A qualified class must still resolve now that the generic bare-name
     // fallback no longer runs for qualified names.
     auto class_loc = analyzer.definition_of(top_uri, 6, 12);
     REQUIRE(class_loc.has_value());
-    CHECK(class_loc->uri == "file://" + pkg_path.string());
+    CHECK(class_loc->uri == uri_from_path(pkg_path));
     CHECK(class_loc->line == 4);
 
     std::filesystem::remove(pkg_path);
@@ -623,7 +624,7 @@ TEST_CASE("definition: qualified package member does not resolve to a local decl
     // even though module top declares its own `localparam DEPTH = 1` first.
     auto qualified = analyzer.definition_of(top_uri, 2, 17);
     REQUIRE(qualified.has_value());
-    CHECK(qualified->uri == "file://" + pkg_path.string());
+    CHECK(qualified->uri == uri_from_path(pkg_path));
     CHECK(qualified->line == 2);
 
     // D1, unqualified half: a bare DEPTH use still resolves to the local
@@ -642,7 +643,7 @@ TEST_CASE("definition: qualified package parameter resolves when package is an o
     // the editor, i.e. ExtraFileInfo::state is non-null (analyzer.hpp:48-51).
     // That exercises the live-index branch rather than the closed-shard branch.
     auto pkg_path = write_temp_sv("lazyverilog_def_cpu_pkg_open.sv", kCpuPkg);
-    const std::string pkg_uri = "file://" + pkg_path.string();
+    const std::string pkg_uri = uri_from_path(pkg_path);
 
     Analyzer analyzer;
     const std::string top_uri = "file:///tmp/lazyverilog_def_top_open.sv";
