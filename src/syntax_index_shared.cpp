@@ -29,16 +29,6 @@ std::string uri_from_source_location(const slang::SourceManager& sm,
     return uri_from_file_name(file_name);
 }
 
-SourceFileID source_file_id_for_token(SyntaxIndex& index, const slang::SourceManager& sm,
-                                      const slang::parsing::Token& token) {
-    if (!token || !token.location().valid())
-        return kInvalidSourceFileID;
-    auto uri = uri_from_source_location(sm, token.location());
-    if (uri.empty())
-        return kInvalidSourceFileID;
-    return index.intern_source_file(std::move(uri));
-}
-
 SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                                          slang::SourceLocation location) {
     auto uri = uri_from_source_location(sm, location);

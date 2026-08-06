@@ -85,11 +85,12 @@ static bool index_macro_has_user_source_location(const slang::SourceManager& sm,
     return name && name.location().valid() && sm.isFileLoc(name.location());
 }
 
-static MacroEntry macro_entry_from_define(SyntaxIndex& index, const slang::SourceManager& sm,
+static MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                                          const slang::SourceManager& sm,
                                           const DefineDirectiveSyntax& def) {
     MacroEntry mac;
     mac.name = std::string(def.name.valueText());
-    mac.file_id = source_file_id_for_token(index, sm, def.name);
+    mac.file_id = resolver.for_token(index, sm, def.name);
     if (def.formalArguments) {
         mac.is_function_like = true;
         for (const auto* arg : def.formalArguments->args) {
@@ -194,7 +195,7 @@ static std::string with_declarator_dimensions(const slang::SourceManager& sm, st
 }
 
 static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
-                     const slang::SourceManager& sm,
+                     SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                      const slang::parsing::Token& name, std::string direction, std::string type,
                      std::string decl_type, std::string signal_decl_type,
                      std::string default_value = {}) {
@@ -204,7 +205,7 @@ static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
     auto [line, col] = token_pos_line1_col0(sm, name);
     ports.push_back(PortEntry{
         .name = token_value_text(name),
-        .file_id = source_file_id_for_token(index, sm, name),
+        .file_id = resolver.for_token(index, sm, name),
         .direction = std::move(direction),
         .type = std::move(type),
         .decl_type = std::move(decl_type),
@@ -216,13 +217,14 @@ static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
 }
 
 static void extract_ansi_ports(const AnsiPortListSyntax& port_list, std::vector<PortEntry>& ports,
-                               SyntaxIndex& index, const slang::SourceManager& sm) {
+                               SyntaxIndex& index, SourceFileIdResolver& resolver,
+                               const slang::SourceManager& sm) {
     for (const auto* member : port_list.ports) {
         if (!member)
             continue;
 
         if (const auto* implicit = member->as_if<ImplicitAnsiPortSyntax>()) {
-            add_port(ports, index, sm, implicit->declarator->name, direction_of(*implicit->header),
+            add_port(ports, index, resolver, sm, implicit->declarator->name, direction_of(*implicit->header),
                      with_declarator_dimensions(sm, type_of(sm, *implicit->header),
                                                 *implicit->declarator),
                      with_declarator_dimensions(sm, decl_type_of(sm, *implicit->header),
@@ -231,7 +233,7 @@ static void extract_ansi_ports(const AnsiPortListSyntax& port_list, std::vector<
                                                 *implicit->declarator));
         } else if (const auto* explicit_port = member->as_if<ExplicitAnsiPortSyntax>()) {
             auto direction = token_value_text(explicit_port->direction);
-            add_port(ports, index, sm, explicit_port->name,
+            add_port(ports, index, resolver, sm, explicit_port->name,
                      direction.empty() ? std::string("unknown") : std::move(direction), {}, {}, {});
         }
     }
@@ -239,6 +241,7 @@ static void extract_ansi_ports(const AnsiPortListSyntax& port_list, std::vector<
 
 static void extract_port_declarations(const SyntaxList<MemberSyntax>& members,
                                       std::vector<PortEntry>& ports, SyntaxIndex& index,
+                                      SourceFileIdResolver& resolver,
                                       const slang::SourceManager& sm) {
     for (const auto* member : members) {
         if (!member)
@@ -253,7 +256,7 @@ static void extract_port_declarations(const SyntaxList<MemberSyntax>& members,
         const auto signal_decl_type = signal_decl_type_of(sm, *declaration->header);
         for (const auto* declarator : declaration->declarators) {
             if (declarator)
-                add_port(ports, index, sm, declarator->name, direction,
+                add_port(ports, index, resolver, sm, declarator->name, direction,
                          with_declarator_dimensions(sm, type, *declarator),
                          with_declarator_dimensions(sm, decl_type, *declarator),
                          with_declarator_dimensions(sm, signal_decl_type, *declarator));
@@ -286,6 +289,7 @@ namespace {
 struct InstanceScan {
     std::vector<InstanceEntry>* out;
     SyntaxIndex* index;
+    SourceFileIdResolver* resolver;
     const slang::SourceManager* sm;
     std::string_view source;
     std::vector<std::string_view> lines;
@@ -346,7 +350,7 @@ struct InstanceScan {
             entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = token_value_text(instance->decl->name);
-                entry.file_id = source_file_id_for_token(*index, *sm, instance->decl->name);
+                entry.file_id = resolver->for_token(*index, *sm, instance->decl->name);
                 entry.line = token_pos_line1_col0(*sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -370,7 +374,7 @@ struct InstanceScan {
                 entry.connections.push_back(NamedPortConn{
                     .port_name = token_value_text(named->name),
                     .signal_name = simple_identifier_from_expr(named->expr),
-                    .file_id = source_file_id_for_token(*index, *sm, named->name),
+                    .file_id = resolver->for_token(*index, *sm, named->name),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,
@@ -385,11 +389,12 @@ struct InstanceScan {
 
 static void extract_instances(const SyntaxList<MemberSyntax>& members,
                               std::vector<InstanceEntry>& out, SyntaxIndex& index,
-                              const slang::SourceManager& sm,
+                              SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                               std::string_view source, std::string_view parent_module) {
     InstanceScan scan{
         .out = &out,
         .index = &index,
+        .resolver = &resolver,
         .sm = &sm,
         .source = source,
         // Split lines once here so find_instance_end_line doesn't re-split per instance.
@@ -400,17 +405,19 @@ static void extract_instances(const SyntaxList<MemberSyntax>& members,
 }
 
 static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
-                          const slang::SourceManager& sm, std::string parent_scope);
+                          SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                          std::string parent_scope);
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
-                            const slang::SourceManager& sm, std::string parent_scope);
+                            SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                            std::string parent_scope);
 
 static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& index,
-                           const slang::SourceManager& sm, std::string_view source,
-                           IndexDepth depth = IndexDepth::Full) {
+                           SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                           std::string_view source, IndexDepth depth = IndexDepth::Full) {
     ModuleEntry entry;
     entry.name = token_value_text(module.header->name);
-    entry.file_id = source_file_id_for_token(index, sm, module.header->name);
+    entry.file_id = resolver.for_token(index, sm, module.header->name);
     auto [line, col] = token_pos_line1_col0(sm, module.header->name);
     entry.line = line;
     entry.col = col;
@@ -431,7 +438,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 std::string default_val;
                 if (decl->initializer)
                     default_val = render_syntax_node_text(sm, *decl->initializer->expr);
-                add_port(entry.ports, index, sm, decl->name, direction, type_text, type_text, {},
+                add_port(entry.ports, index, resolver, sm, decl->name, direction, type_text, type_text, {},
                          std::move(default_val));
             }
         }
@@ -439,10 +446,10 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     if (module.header->ports) {
         if (const auto* ansi = module.header->ports->as_if<AnsiPortListSyntax>())
-            extract_ansi_ports(*ansi, entry.ports, index, sm);
+            extract_ansi_ports(*ansi, entry.ports, index, resolver, sm);
     }
-    extract_port_declarations(module.members, entry.ports, index, sm);
-    extract_instances(module.members, index.instances, index, sm, source, entry.name);
+    extract_port_declarations(module.members, entry.ports, index, resolver, sm);
+    extract_instances(module.members, index.instances, index, resolver, sm, source, entry.name);
     for (const auto* member : module.members) {
         if (!member)
             continue;
@@ -453,7 +460,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 auto [ml, mc] = token_pos_line1_col0(sm, item->name);
                 entry.modports.push_back(ModportEntry{
                     .name = token_value_text(item->name),
-                    .file_id = source_file_id_for_token(index, sm, item->name),
+                    .file_id = resolver.for_token(index, sm, item->name),
                     .line = ml,
                     .col = mc,
                 });
@@ -507,7 +514,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = entry.name,
-                    .file_id = source_file_id_for_token(index, sm, decl->name),
+                    .file_id = resolver.for_token(index, sm, decl->name),
                     .line = vl,
                     .col = vc,
                 });
@@ -525,7 +532,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 .type = render_syntax_node_text(sm, *proto.returnType),
                 .kind = std::string(proto.keyword.valueText()),
                 .parent_scope = entry.name,
-                .file_id = source_file_id_for_token(index, sm, name_tok),
+                .file_id = resolver.for_token(index, sm, name_tok),
                 .line = nl,
                 .col = nc,
                 .signature = make_fn_signature(proto, fn_name, sm),
@@ -553,7 +560,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                         .default_value = decl->initializer
                                              ? render_syntax_node_text(sm, *decl->initializer->expr)
                                              : std::string{},
-                        .file_id = source_file_id_for_token(index, sm, decl->name),
+                        .file_id = resolver.for_token(index, sm, decl->name),
                         .line = vl,
                         .col = vc,
                     });
@@ -565,25 +572,27 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // This mirrors the live dynamic index and lets member access in
             // another file resolve `top::Packet` / `Packet` fields and methods
             // without retaining the closed file AST.
-            process_class(*cls, index, sm, entry.name);
+            process_class(*cls, index, resolver, sm, entry.name);
         } else if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             // Store module-scoped typedefs, including struct/union fields, so
             // `obj.field` can resolve through find_typedef_field_definition().
             // The generic AST definition visitor intentionally skips aggregate
             // field declarators; member access is the correct path for fields.
-            process_typedef(*td, index, sm, entry.name);
+            process_typedef(*td, index, resolver, sm, entry.name);
         }
     }
 
     struct LocalVariableVisitor : public SyntaxVisitor<LocalVariableVisitor> {
         SyntaxIndex& index;
+        SourceFileIdResolver& resolver;
         const slang::SourceManager& sm;
         const std::string& parent_scope;
         std::vector<std::pair<int, int>> scope_stack;
 
-        LocalVariableVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
-                             const std::string& parent_scope, std::pair<int, int> module_range)
-            : index(index), sm(sm), parent_scope(parent_scope) {
+        LocalVariableVisitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                             const slang::SourceManager& sm, const std::string& parent_scope,
+                             std::pair<int, int> module_range)
+            : index(index), resolver(resolver), sm(sm), parent_scope(parent_scope) {
             scope_stack.push_back(module_range);
         }
 
@@ -612,7 +621,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = source_file_id_for_token(index, sm, decl->name),
+                    .file_id = resolver.for_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -639,7 +648,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = source_file_id_for_token(index, sm, decl->name),
+                    .file_id = resolver.for_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -651,7 +660,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     };
 
     if (depth == IndexDepth::Full) {
-        LocalVariableVisitor locals(index, sm, entry.name,
+        LocalVariableVisitor locals(index, resolver, sm, entry.name,
                                     source_range_lines(sm, module.sourceRange()));
         module.visit(locals);
     }
@@ -663,10 +672,11 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 // ── New extraction functions ──────────────────────────────────────────────────
 
 static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
-                           const slang::SourceManager& sm, std::string parent_scope = {}) {
+                           SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                           std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = token_value_text(cls.name);
-    entry.file_id = source_file_id_for_token(index, sm, cls.name);
+    entry.file_id = resolver.for_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos_line1_col0(sm, cls.name);
     entry.line = line;
@@ -688,7 +698,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     entry.fields.push_back(
                         FieldEntry{.name = token_value_text(decl->name),
                                    .type = type_text,
-                                   .file_id = source_file_id_for_token(index, sm, decl->name),
+                                   .file_id = resolver.for_token(index, sm, decl->name),
                                    .line = fl,
                                    .col = fc});
                 }
@@ -699,7 +709,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             m.name = render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
-            m.file_id = source_file_id_for_token(index, sm, proto.keyword);
+            m.file_id = resolver.for_token(index, sm, proto.keyword);
             auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
             m.line = ml;
             m.col = mc;
@@ -715,11 +725,12 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 }
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
-                             const slang::SourceManager& sm, std::string parent_scope = {}) {
+                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                             std::string parent_scope = {}) {
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = source_file_id_for_token(index, sm, td.name);
+    entry.file_id = resolver.for_token(index, sm, td.name);
     auto [td_line, td_col] = token_pos_line1_col0(sm, td.name);
     entry.line = td_line;
     entry.col = td_col;
@@ -731,7 +742,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 auto [em_line, em_col] = token_pos_line1_col0(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = token_value_text(member->name),
-                    .file_id = source_file_id_for_token(index, sm, member->name),
+                    .file_id = resolver.for_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -750,7 +761,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 entry.fields.push_back(FieldEntry{
                     .name = token_value_text(decl->name),
                     .type = with_declarator_dimensions(sm, type_text, *decl),
-                    .file_id = source_file_id_for_token(index, sm, decl->name),
+                    .file_id = resolver.for_token(index, sm, decl->name),
                     .line = fl,
                     .col = fc,
                 });
@@ -768,14 +779,14 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
 }
 
 static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
-                             const slang::SourceManager& sm, std::string_view source,
-                             IndexDepth depth = IndexDepth::Full) {
+                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                             std::string_view source, IndexDepth depth = IndexDepth::Full) {
     const std::string pkg_name = token_value_text(pkg.header->name);
     // Register the package name before walking members: process_module() indexes
     // package parameters, typedefs, and classes, and the package-scoped lookup
     // maps are only filled for parent scopes already known to be packages.
     index.package_names.insert(pkg_name);
-    process_module(pkg, index, sm, source, depth);
+    process_module(pkg, index, resolver, sm, source, depth);
 
     // Collect exported symbol names only.
     //
@@ -825,26 +836,26 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
 }
 
 static void process_member(const MemberSyntax& member, SyntaxIndex& index,
-                            const slang::SourceManager& sm, std::string_view source,
-                            IndexDepth depth = IndexDepth::Full) {
+                            SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                            std::string_view source, IndexDepth depth = IndexDepth::Full) {
     if (const auto* mod = member.as_if<ModuleDeclarationSyntax>()) {
         if (member.kind == SyntaxKind::InterfaceDeclaration) {
-            process_module(*mod, index, sm, source, depth);
+            process_module(*mod, index, resolver, sm, source, depth);
             index.interface_names.insert(token_value_text(mod->header->name));
         } else if (member.kind == SyntaxKind::PackageDeclaration) {
-            process_package(*mod, index, sm, source, depth);
+            process_package(*mod, index, resolver, sm, source, depth);
         } else {
-            process_module(*mod, index, sm, source, depth);
+            process_module(*mod, index, resolver, sm, source, depth);
         }
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
-        process_class(*cls, index, sm);
+        process_class(*cls, index, resolver, sm);
     } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
-        process_typedef(*td, index, sm);
+        process_typedef(*td, index, resolver, sm);
     }
 }
 
 static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
-                            const slang::SourceManager& sm) {
+                            SourceFileIdResolver& resolver, const slang::SourceManager& sm) {
     struct ScopeFrame {
         std::string name;
         int end_line{0};
@@ -852,11 +863,13 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
 
     struct ImportVisitor : public SyntaxVisitor<ImportVisitor> {
         SyntaxIndex& index;
+        SourceFileIdResolver& resolver;
         const slang::SourceManager& sm;
         std::vector<ScopeFrame> scope_stack;
 
-        ImportVisitor(SyntaxIndex& index, const slang::SourceManager& sm) :
-            index(index), sm(sm) {}
+        ImportVisitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                      const slang::SourceManager& sm) :
+            index(index), resolver(resolver), sm(sm) {}
 
         std::string current_scope() const {
             return scope_stack.empty() ? std::string{} : scope_stack.back().name;
@@ -898,7 +911,7 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
                 if (!entry.wildcard)
                     entry.symbol_name = token_value_text(item->item);
                 entry.parent_scope = current_scope();
-                entry.file_id = source_file_id_for_token(index, sm, item->package);
+                entry.file_id = resolver.for_token(index, sm, item->package);
                 entry.start_line = decl_line;
                 entry.end_line = current_end_line();
 
@@ -910,7 +923,7 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
         }
     };
 
-    ImportVisitor visitor(index, sm);
+    ImportVisitor visitor(index, resolver, sm);
     root.visit(visitor);
 }
 
@@ -919,13 +932,14 @@ static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
 SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::string_view source,
                                IndexDepth depth) {
     SyntaxIndex index;
+    SourceFileIdResolver resolver;
     const auto& sm = tree.sourceManager();
     const auto& root = tree.root();
 
     if (const auto* compilation_unit = root.as_if<CompilationUnitSyntax>()) {
         for (const auto* member : compilation_unit->members) {
             if (member)
-                process_member(*member, index, sm, source, depth);
+                process_member(*member, index, resolver, sm, source, depth);
         }
     } else if (const auto* member = root.as_if<MemberSyntax>()) {
         // slang can expose a single-file design element directly as the
@@ -943,11 +957,11 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         // identity.  A direct-root member must use the same dispatch path;
         // otherwise live-open standalone files reached by go-to-definition can
         // be indexed differently from their disk extra-file snapshots.
-        process_member(*member, index, sm, source, depth);
+        process_member(*member, index, resolver, sm, source, depth);
     }
 
     if (depth == IndexDepth::Full)
-        collect_imports(root, index, sm);
+        collect_imports(root, index, resolver, sm);
 
     collect_combined_occurrences(tree, root, index, sm);
     if (!index.source_files.empty())
@@ -968,7 +982,7 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
             if (!index_macro_has_user_source_location(sm, def->name))
                 continue;
 
-            MacroEntry mac = macro_entry_from_define(index, sm, *def);
+            MacroEntry mac = macro_entry_from_define(index, resolver, sm, *def);
             if (mac.name.empty())
                 continue;
 
