@@ -154,8 +154,8 @@ endmodule
     analyzer.set_extra_files({memory_path.string(), top_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string memory_uri = "file://" + memory_path.string();
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string memory_uri = uri_from_path(memory_path);
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(memory_uri, memory);
     analyzer.open(top_uri, top);
 
@@ -383,7 +383,7 @@ endmodule
     analyzer.set_extra_files({top_path.string(), other_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(top_uri, top);
 
     const auto [line, col] = find_position(top, "add_number();");
@@ -444,7 +444,7 @@ endpackage
     analyzer.set_extra_files({p_path.string(), q_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string p_uri = "file://" + p_path.string();
+    const std::string p_uri = uri_from_path(p_path);
     analyzer.open(p_uri, p);
 
     const auto [line, col] = find_position(p, "add_number();");
@@ -506,7 +506,7 @@ endclass
     analyzer.set_extra_files({a_path.string(), b_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string a_uri = "file://" + a_path.string();
+    const std::string a_uri = uri_from_path(a_path);
     analyzer.open(a_uri, a);
 
     const auto [line, col] = find_position(a, "calc();");
@@ -568,8 +568,8 @@ endmodule
     analyzer.set_extra_files({header_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string top_uri = "file://" + top_path.string();
-    const std::string header_uri = "file://" + header_path.string();
+    const std::string top_uri = uri_from_path(top_path);
+    const std::string header_uri = uri_from_path(header_path);
     analyzer.open(top_uri, top);
 
     const auto [line, col] = find_position(top, "req_data();");
@@ -1041,7 +1041,7 @@ endmodule
     analyzer.set_include_dirs({dir.string()});
     analyzer.set_extra_files({top_path.string()});
     analyzer.wait_for_background_index_idle();
-    const std::string header_uri = "file://" + header_path.string();
+    const std::string header_uri = uri_from_path(header_path);
     analyzer.open(header_uri, header);
 
     const auto [line, col] = find_position_after(header, "id;", "[3:0]");
@@ -1051,7 +1051,7 @@ endmodule
     CHECK(refs[0].uri == header_uri);
     CHECK(refs[0].line == 2);
     CHECK(refs[0].col == 16);
-    CHECK(refs[1].uri == "file://" + top_path.string());
+    CHECK(refs[1].uri == uri_from_path(top_path));
     CHECK(refs[1].line == 4);
     CHECK(refs[1].col == 13);
 
@@ -1101,8 +1101,8 @@ endmodule
     analyzer.set_extra_files({top_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string header_uri = "file://" + header_path.string();
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string header_uri = uri_from_path(header_path);
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(header_uri, header);
 
     const auto [line, col] = find_position(header, "req_data");
@@ -1179,8 +1179,8 @@ endmodule
     analyzer.set_extra_files({top_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string header_uri = "file://" + header_path.string();
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string header_uri = uri_from_path(header_path);
+    const std::string top_uri = uri_from_path(top_path);
     analyzer.open(header_uri, header);
 
     auto has_top_reference = [&](std::string_view declaration_needle,
@@ -1249,13 +1249,13 @@ endmodule
     analyzer.set_extra_files({top_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string header_uri = "file://" + header_path.string();
+    const std::string header_uri = uri_from_path(header_path);
     analyzer.open(header_uri, header);
 
     const auto [line, col] = find_position(header, "add_number");
     const auto refs = analyzer.find_references(header_uri, line, col, true);
 
-    const std::string top_uri = "file://" + top_path.string();
+    const std::string top_uri = uri_from_path(top_path);
     REQUIRE(refs.size() == 2);
     CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
         return ref.uri == header_uri && ref.line == 0 && ref.col == 5;
@@ -1328,18 +1328,18 @@ endmodule
         (*snapshots)[0].index_ref().references.begin(), (*snapshots)[0].index_ref().references.end(),
         [&](const ReferenceEntry& ref) {
             return ref.name == "add_number" &&
-                   (*snapshots)[0].index_ref().source_uri(ref.file_id) == "file://" + header_path.string();
+                   (*snapshots)[0].index_ref().source_uri(ref.file_id) == uri_from_path(header_path);
         });
     REQUIRE(indexed_add_number != (*snapshots)[0].index_ref().references.end());
 
-    const std::string top_uri = "file://" + top_path.string();
-    const std::string closed_uri = "file://" + closed_path.string();
+    const std::string top_uri = uri_from_path(top_path);
+    const std::string closed_uri = uri_from_path(closed_path);
     analyzer.open(top_uri, top);
 
     const auto [line, col] = find_position(top, "add_number();");
     const auto refs = analyzer.find_references(top_uri, line, col, true);
 
-    const std::string header_uri = "file://" + header_path.string();
+    const std::string header_uri = uri_from_path(header_path);
     REQUIRE(refs.size() == 2);
     CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
         return ref.uri == header_uri && ref.line == 0 && ref.col == 5;
@@ -1392,8 +1392,8 @@ endmodule
     analyzer.set_extra_files({includer_path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string header_uri = "file://" + header_path.string();
-    const std::string includer_uri = "file://" + includer_path.string();
+    const std::string header_uri = uri_from_path(header_path);
+    const std::string includer_uri = uri_from_path(includer_path);
     analyzer.open(header_uri, header);
 
     const auto snapshots = analyzer.extra_index_snapshot_ptr();

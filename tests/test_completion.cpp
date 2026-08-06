@@ -1,5 +1,6 @@
 #include "analyzer.hpp"
 #include "features/completion.hpp"
+#include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
@@ -968,8 +969,8 @@ TEST_CASE("completion: package scope survives opening package definition file", 
 
     analyzer.set_extra_files({use.string(), lib.string()});
     analyzer.wait_for_background_index_idle();
-    const std::string use_uri = "file://" + use.string();
-    const std::string lib_uri = "file://" + lib.string();
+    const std::string use_uri = uri_from_path(use);
+    const std::string lib_uri = uri_from_path(lib);
     analyzer.open(use_uri, use_text);
 
     auto [line, col] = pos_of(use_text, "nav_pkg::");
@@ -1024,8 +1025,8 @@ TEST_CASE("completion: project index shard follows live edits to extra file", "[
 
     analyzer.set_extra_files({use.string(), lib.string()});
     analyzer.wait_for_background_index_idle();
-    const std::string use_uri = "file://" + use.string();
-    const std::string lib_uri = "file://" + lib.string();
+    const std::string use_uri = uri_from_path(use);
+    const std::string lib_uri = uri_from_path(lib);
     analyzer.open(use_uri, use_text);
 
     // Opening/changing the library file replaces only that file's project-index
@@ -1149,7 +1150,7 @@ TEST_CASE("completion: current file listed in extra files is not duplicated", "[
     analyzer.set_extra_files({path.string()});
     analyzer.wait_for_background_index_idle();
 
-    const std::string uri = "file://" + path.string();
+    const std::string uri = uri_from_path(path);
     analyzer.open(uri, text);
 
     auto result = complete_at(engine, analyzer, uri, 2, 4);

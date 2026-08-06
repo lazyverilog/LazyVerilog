@@ -1096,7 +1096,8 @@ endmodule
 
 TEST_CASE("foldingRange: AST folds from included files are not emitted for current document",
           "[folding]") {
-    const std::string include_path = "/tmp/lazyverilog_folding_include.svh";
+    const std::string include_path =
+        (std::filesystem::temp_directory_path() / "lazyverilog_folding_include.svh").string();
     {
         std::ofstream out(include_path);
         out << R"(module included_fold_target #(

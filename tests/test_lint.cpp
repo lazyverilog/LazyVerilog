@@ -2,6 +2,7 @@
 #include "analyzer.hpp"
 #include "dynamic_file_index.hpp"
 #include "features/lint.hpp"
+#include "string_utils.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -200,7 +201,7 @@ TEST_CASE("lint: included files are skipped", "[lint]") {
     }
 
     const auto top_path = dir / "lazyverilog_lint_top.sv";
-    const auto top_uri = "file://" + top_path.string();
+    const auto top_uri = uri_from_path(top_path);
     Analyzer analyzer;
     analyzer.open(top_uri, "`include \"lazyverilog_lint_include.svh\"\nmodule top;\nendmodule\n");
     auto state = analyzer.get_state(top_uri);
