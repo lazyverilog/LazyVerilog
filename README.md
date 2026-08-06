@@ -45,7 +45,7 @@
 
 
 <p align="center">
-  LazyVerilog is a C++ Language Server Protocol server with a companion Neovim plugin.
+  LazyVerilog is a SystemVerilog LSP written in C++ with neovim and vscode support.
   It provides formatting, linting, navigation, hover, completion, inlay hints, and RTL code actions for real SystemVerilog projects.
 </p>
 
