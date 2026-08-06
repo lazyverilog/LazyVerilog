@@ -54,14 +54,20 @@ SourceFileID SourceFileIdResolver::for_location(SyntaxIndex& index, const slang:
     if (auto it = by_buffer_.find(buffer_id); it != by_buffer_.end())
         return it->second;
 
-    auto uri = uri_from_source_location(sm, location);
-    if (uri.empty()) {
-        by_buffer_.emplace(buffer_id, kInvalidSourceFileID);
-        return kInvalidSourceFileID;
+    // Resolve through the file name before canonicalizing: macro expansions
+    // each get their own buffer id but share the name of the file they expand
+    // in, so this is what keeps weakly_canonical() off the per-token path.
+    const auto file_name = sm.getFileName(location);
+    if (auto it = by_name_.find(file_name); it != by_name_.end()) {
+        by_buffer_.emplace(buffer_id, it->second);
+        return it->second;
     }
 
-    const auto file_id = index.intern_source_file(std::move(uri));
+    auto uri = uri_from_file_name(file_name);
+    const auto file_id = uri.empty() ? kInvalidSourceFileID
+                                     : index.intern_source_file(std::move(uri));
     by_buffer_.emplace(buffer_id, file_id);
+    by_name_.emplace(std::string(file_name), file_id);
     return file_id;
 }
 

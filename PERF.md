@@ -372,3 +372,248 @@ expect noticeably less than 4× from 4 threads.
   If it shows up, batch commits.
 - **CPU politeness** — a shared workstation or HPC login node should not see
   the LSP grab 4 cores unannounced; hence the conservative default and `nice`.
+
+---
+
+# Round 2 analysis: where the remaining 3.37M `readlink` calls go
+
+Investigated after the `SourceFileIdResolver` fix landed. Tooling: `strace`
+7.0 and `perf` 7.1.6, both fetched as Arch packages and extracted into a
+scratch dir (no root; `perf` also needs `libpfm` extracted alongside it).
+
+**Headline: the premise that `collect_include_dependency_uris` is the next big
+win is wrong.** It is 0.6% of remaining `readlink` calls and 0.17% of user
+time. The real remainder is cache misses inside the resolver added in round 1.
+
+## Measured baseline (post-round-1)
+
+| Metric | Value |
+|---|---|
+| Wall / user / sys | 5.77 s / 2.90 s / 2.87 s |
+| `readlink` | 3,366,123 (835 per file) |
+| `openat` | ~1–2.6 per file |
+
+Cost calibration, derived from the round-1 before/after pair (9.53M→3.37M
+readlinks, 11.8 s→5.77 s wall): **≈0.97 µs of wall per `readlink`**, of which
+≈0.79 µs is sys. Used for every prediction below.
+
+## Per-corpus `readlink` rates (measured)
+
+Three corpora, each run through the real analyzer path by placing a
+`tests/rtl/opentitan` tree in the benchmark's cwd:
+
+| Corpus | Files | `readlink`/file | `openat`/file |
+|---|---|---|---|
+| Synthetic, no macros or includes | 200 | **148** | 1.05 |
+| `hw/ip/prim/rtl` (macro-light RTL) | 269 | 305 | 2.6 |
+| `otbn/dv/uvm/env` (macro-heavy UVM) | 17 | **30,564** | 2.3 |
+| Full OpenTitan | 4031 | 835 | ~1.5 |
+
+`openat` per file is essentially constant across all four while `readlink`
+varies 200×. Whatever drives the cost is therefore **not** file or include
+count — it scales with something else entirely.
+
+## Root cause (measured, stack-resolved)
+
+That something is **macro-expansion buffers**. slang allocates a fresh
+`BufferID` for every macro expansion, and `SourceFileIdResolver` keys its cache
+on the raw `location.buffer()`. In macro-heavy code almost every token sits in
+a distinct expansion buffer, so the cache misses on nearly every token and
+re-canonicalizes a path that resolves to the same file every time.
+
+`strace -k` on a 189-file macro-heavy corpus, background-indexer thread only,
+53,599 `readlink` events, frames resolved with `gdb info symbol`:
+
+| Share | Path |
+|---|---|
+| **96.3%** | `SourceFileIdResolver::for_location` → `uri_from_file_name` → `uri_from_path` |
+| 1.0% | `collect_parse_diagnostics` |
+| 0.6% | `collect_include_dependency_uris` |
+| 0.5% | slang `SourceManager::cacheBuffer` |
+| 0.3% | slang `SourceManager::openCached` |
+
+The 148/file floor from the synthetic corpus is the fixed per-file cost
+(≈8 canonicalizations × ~18 path components). Full-corpus excess over that
+floor is 835 − 148 = **687 readlinks/file ≈ 2.77M calls (82% of the
+remainder)**.
+
+## Why `collect_include_dependency_uris` is *not* the problem
+
+It does canonicalize without memoization, twice over:
+
+- the first loop scans `sm.getAllBuffers()` calling `uri_from_path` on each
+  buffer until it finds the one matching `owning_uri` — a linear URI-compare
+  scan just to identify the root buffer;
+- the second loop calls `uri_from_path` again for each dependency buffer;
+- and because every file gets a fresh `SourceManager`, nothing is reused across
+  files even though the same headers recur thousands of times.
+
+But it is cheap in practice: `sm.getFullPath()` returns empty for
+macro-expansion buffers, so the `full_path.empty()` guard skips exactly the
+buffers that are numerous. Only real file buffers reach `uri_from_path`, ~2–3
+per file.
+
+**Estimated saving if fully optimized: 36–54 readlinks/file ≈ 145k–218k calls
+(4–6% of the remainder) ≈ 0.14–0.21 s wall, ~0.11–0.17 s sys, ~0.03–0.04 s
+user.** Worth doing as cleanup, not as a performance play.
+
+## Recommended fix for the real remainder
+
+Two-level lookup in `SourceFileIdResolver::for_location`:
+
+1. `by_buffer_` — existing integral fast path.
+2. On miss, call `sm.getFileName(location)` and consult a new
+   `by_name_` map keyed on that name. On hit, backfill `by_buffer_` and return.
+3. Only on a name miss, canonicalize via `uri_from_file_name`, intern, and
+   populate both maps.
+
+**Why this is the safe design:** the resulting URI is a pure function of the
+file name, so output is byte-identical — all expansion buffers of one file
+already produce the same name and therefore the same URI. The tempting
+alternative, keying on `sm.getFullyExpandedLoc(loc).buffer()`, is **not** safe:
+it would change which file a macro-expanded token is attributed to when the
+macro is defined in a different file, altering go-to-definition and references.
+
+Store `std::string` keys rather than `string_view` (a few dozen per build) so
+the cache cannot outlive SourceManager-owned storage.
+
+**Predicted:** canonicalizations per file fall from `1 + #expansion buffers` to
+`1 + #distinct file names`, i.e. toward the measured 148/file floor. Removing
+~2.6M calls ≈ **2.5 s wall (≈2.0 s sys, ≈0.5 s user)**, taking 5.77 s → **~3.3 s**.
+
+## Ranked opportunities
+
+Impact is predicted; the evidence column says what it rests on.
+
+| # | Change | Predicted saving | Risk | Confidence | Evidence |
+|---|---|---|---|---|---|
+| 1 | Name-keyed second level in `SourceFileIdResolver` | **~2.5 s** | Medium — touches every file-id lookup; needs full test run | **High** | 96.3% stack attribution + 148/file floor + µs/call calibration |
+| 2 | Process-wide memo inside `normalize_filesystem_path` | ~0.3 s (subsumes 3 and 4) | Medium — process-lifetime staleness if symlinks change mid-session | Medium | Floor decomposition |
+| 3 | `collect_include_dependency_uris`: pass the owning `BufferID` in (drop loop 1) and memoize loop 2 | 0.14–0.21 s | **Low** — caller already computes the root buffer | High | 0.6% attribution + 0.17% user time |
+| 4 | Drop double canonicalization in `make_file_state_with_options` (`uri_from_path` re-normalizes an already-normalized path) | ~0.07 s | **Very low** — one-line | High | Floor decomposition (1 of ~8 canonicalizations) |
+| 5 | slang `setDisableProximatePaths(true)` | ~0.15 s | Medium-high — changes how slang spells buffer names; affects diagnostics and URI mapping | Medium | 0.8% attribution (`cacheBuffer` + `openCached`) |
+| 6 | Skip `collect_parse_diagnostics` on the index path | <0.1 s | Low | Medium | 1.0% attribution; absent from user profile above 0.15% |
+
+Items 3–6 together are worth roughly 0.5 s. Item 1 is worth five times all of
+them combined and should be done first.
+
+## User-time profile (measured, full corpus)
+
+`perf record -e cpu-clock:u`, 2925 samples. **No dominant hotspot** — the
+profile is flat, so after item 1 there is no further single-change win on the
+user side:
+
+| Share | Symbol |
+|---|---|
+| 4.1% | `mi_new` (mimalloc) |
+| 3.4% | `add_reference_entry` |
+| 3.0% / 1.7% / 1.7% | `readlink` / `realpath` / `path::_M_split_cmpts` — 6.4% combined, the user-side half of canonicalization |
+| 3.4% / 2.8% / 2.5% | slang `visitSyntaxNode` / `getChildCount` / `Lexer::lexToken` |
+| 1.9% / 1.6% | slang `getRawLineNumber` / `getColumnNumber` |
+
+Roughly 15% is slang lex/parse/visit and ~5% is our reference indexing. Beyond
+item 1, the next real lever on user time is parallelization (deferred), not
+micro-optimization.
+
+DWARF call-graph unwinding was attempted for full-corpus caller attribution and
+**failed** — the Release build yields ~1.4 usable frames per sample. The
+attribution above therefore comes from `strace -k` on a smaller corpus; treat
+the 96.3% as measured on macro-heavy code and the full-corpus split as inferred
+from the floor arithmetic.
+
+## Recommended next steps
+
+1. Implement item 1; re-measure wall/user/sys and `readlink` count; confirm
+   `indexed_shards=3999` and all 454 tests still pass.
+2. Then items 4 and 3 (cheap, low risk) as a single cleanup commit.
+3. Re-evaluate items 2 and 5 only if the numbers after step 1 justify the risk.
+4. Revisit parse/index parallelization once canonicalization is no longer
+   distorting the profile — at ~3.3 s with a flat user profile, the thread pool
+   becomes the dominant remaining lever.
+
+Note for that work: `collect_include_dependency_uris` calls
+`sm.getAllBuffers()`, which slang documents as **not thread safe**. It is safe
+today only because each worker owns its `SourceManager`; any design that shares
+one across threads must revisit this.
+
+---
+
+# Round 3: item 1 applied — measured result and a corrected prediction
+
+## What changed
+
+`SourceFileIdResolver` now does a two-level lookup: `by_buffer_` (integral fast
+path) in front of a new `by_name_` keyed on `sm.getFileName(location)` with a
+transparent hash, so the name lookup needs no per-miss allocation.
+Canonicalization runs only on a name miss. Output is unchanged by construction
+— the URI is a pure function of the file name.
+
+## Measured
+
+| Metric | Round 1 | Round 2 (item 1) | Change |
+|---|---|---|---|
+| Wall | 5.77 s | **4.78 s** | −17% |
+| user | 2.90 s | 2.71 s | −0.19 s |
+| sys | 2.87 s | 2.06 s | −0.81 s |
+| `readlink` | 3,366,123 | 2,319,634 | −31% |
+| maxRSS | 439 MB | 440 MB | — |
+| shards | 3999 | 3999 | identical |
+
+454/454 tests pass. Cumulative from the original baseline: **11.8 s → 4.78 s,
+2.47× faster**, sys 7.75 s → 2.06 s.
+
+## The prediction was wrong, and why
+
+I predicted ~2.5 s saved; the actual figure is ~1.0 s. The mechanism was right
+but the extrapolation was not.
+
+On the macro-heavy corpus the fix does exactly what was predicted:
+
+| Corpus | Before | After |
+|---|---|---|
+| 189-file macro-heavy | 745,533 readlinks / 13.64 s | **60,113 / 1.58 s** (−92%, 8.6× faster) |
+| Full OpenTitan | 3,366,123 / 5.77 s | 2,319,634 / 4.78 s (−31%) |
+
+**The error:** I measured caller shares on a macro-heavy corpus (where
+`for_location` was 96.3%) and applied that ratio to the whole corpus. The full
+corpus is mostly *not* macro-heavy, so the resolver was never 96% of its
+readlinks. The 148/file floor arithmetic was sound; the attribution transfer
+was not. Lesson for the next round: attribute on the corpus you intend to
+predict for, even when tracing it is more expensive.
+
+## Corrected attribution (full corpus, post-fix)
+
+`strace -k`, background-indexer thread, 51,110 sampled events, frames resolved
+with `gdb info symbol`:
+
+| Share | Caller |
+|---|---|
+| **46%** | `collect_parse_diagnostics` → `uri_from_file_name` → `uri_from_path` |
+| 12% | `SourceFileIdResolver::for_location` (genuine first-time misses) |
+| 12% | `collect_include_dependency_uris` |
+| 9.5% | slang `SourceManager::cacheBuffer` |
+| 3.5% | slang `SourceManager::openCached` |
+| 3.5% | `make_file_state_with_options` → `normalize_filesystem_path` |
+
+Separately, the main thread spends ~78k readlinks (3% of the total) in
+`Analyzer::set_extra_files` normalizing 4031 filelist paths once at startup.
+
+## Revised ranking of what is left
+
+| # | Change | Predicted saving | Risk | Confidence |
+|---|---|---|---|---|
+| A | Skip `collect_parse_diagnostics` on the index path (results are discarded — the background loop commits only `state->index`) | **~0.9 s** | Low | Medium-high |
+| B | `collect_include_dependency_uris`: pass the owning `BufferID` in, memoize loop 2 | ~0.25 s | Low | High |
+| C | slang `setDisableProximatePaths(true)` (`cacheBuffer` + `openCached` = 13%) | ~0.25 s | Med-high | Medium |
+| D | Drop double canonicalization in `make_file_state_with_options` | ~0.07 s | Very low | High |
+
+**Important caveat on A:** this benchmark configures no include directories, so
+all 3148 `` `include `` directives fail and generate a diagnostic each. A real
+`+incdir+` setup produces far fewer diagnostics, so A's real-world saving is
+likely smaller than 0.9 s. The underlying waste is real either way — the
+background index path formats and canonicalizes diagnostics it then throws
+away — but the measured number here is an upper bound, not a typical case.
+
+Ranking A–D by confidence-adjusted value, A is still first, but it should be
+measured with include directories configured before being treated as a ~0.9 s
+win.
