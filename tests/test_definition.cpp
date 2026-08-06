@@ -288,6 +288,77 @@ TEST_CASE("definition: included aggregate field does not shadow module signal", 
     std::filesystem::remove(top_path);
 }
 
+TEST_CASE("definition: included function formal does not shadow module port", "[definition]") {
+    Analyzer analyzer;
+    const auto header_path = write_temp_sv("lazyverilog_definition_func_arg.svh",
+                                           "function automatic logic [7:0] foo(\n"
+                                           "    input logic [7:0] i_data\n"
+                                           ");\n"
+                                           "    foo = i_data;\n"
+                                           "endfunction\n");
+    const auto top_path =
+        write_temp_sv("lazyverilog_definition_func_arg_top.sv",
+                      "module test (\n"
+                      "    i_data\n"
+                      ");\n"
+                      "`include \"lazyverilog_definition_func_arg.svh\"\n"
+                      "input logic [7:0] i_data;\n"
+                      "always_comb begin\n"
+                      "    foo(.i_data(i_data));\n"
+                      "end\n"
+                      "endmodule\n");
+    const std::string top_uri = "file://" + top_path.string();
+    analyzer.open(top_uri, read_text(top_path.string()));
+
+    // The included function declares a formal named `i_data` before the module
+    // port declaration.  The connected expression must still resolve to the
+    // module port, not the function formal.
+    auto expr = analyzer.definition_of(top_uri, 6, 17);
+    REQUIRE(expr.has_value());
+    CHECK(expr->uri == top_uri);
+    CHECK(expr->line == 4);
+    CHECK(expr->col == 18);
+    CHECK(expr->end_col == 24);
+
+    // The named-argument label keeps resolving to the formal.
+    auto label = analyzer.definition_of(top_uri, 6, 10);
+    REQUIRE(label.has_value());
+    CHECK(label->uri == "file://" + header_path.string());
+    CHECK(label->line == 1);
+    CHECK(label->col == 22);
+    CHECK(label->end_col == 28);
+
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(top_path);
+}
+
+TEST_CASE("definition: function formal visible only inside its body", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_func_scope.sv";
+    analyzer.open(uri,
+                  "module m;\n"
+                  "    function automatic logic [7:0] foo(input logic [7:0] arg_data);\n"
+                  "        foo = arg_data;\n"
+                  "    endfunction\n"
+                  "    logic [7:0] arg_data;\n"
+                  "    assign arg_data = foo(8'd1);\n"
+                  "endmodule\n");
+
+    // Inside the function body the formal wins.
+    auto inside = analyzer.definition_of(uri, 2, 15);
+    REQUIRE(inside.has_value());
+    CHECK(inside->line == 1);
+    CHECK(inside->col == 57);
+    CHECK(inside->end_col == 65);
+
+    // Outside the function the module-level declaration wins.
+    auto outside = analyzer.definition_of(uri, 5, 12);
+    REQUIRE(outside.has_value());
+    CHECK(outside->line == 4);
+    CHECK(outside->col == 16);
+    CHECK(outside->end_col == 24);
+}
+
 TEST_CASE("definition: named subroutine argument resolves to formal argument", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
