@@ -30,8 +30,6 @@ std::string uri_from_file_name(std::string_view file_name);
 std::string uri_from_source_location(const slang::SourceManager& sm,
                                      slang::SourceLocation location);
 
-SourceFileID source_file_id_for_token(SyntaxIndex& index, const slang::SourceManager& sm,
-                                      const slang::parsing::Token& token);
 SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                                          slang::SourceLocation location);
 
