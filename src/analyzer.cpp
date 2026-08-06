@@ -1217,6 +1217,22 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         if (const auto* identifier =
                 node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
             maybe_set(identifier->identifier);
+
+        // Subroutine formals and locals are not visible as unqualified names in
+        // the surrounding scope, and included subroutine text is parsed under
+        // the including module, so descending unconditionally lets a formal
+        // (e.g. `input i_data`) shadow a same-named module declaration.  Only
+        // expose the body's declarations when the cursor is lexically inside
+        // this subroutine.
+        const auto range = node.sourceRange();
+        if (!range.start().valid() || !range.end().valid())
+            return;
+        if (uri_from_source_location(sm, range.start()) != uri)
+            return;
+        const int start_line = (int)sm.getLineNumber(range.start());
+        const int end_line = (int)sm.getLineNumber(range.end());
+        if (use_line_one_based < start_line || use_line_one_based > end_line)
+            return;
         visitDefault(node);
     }
 
