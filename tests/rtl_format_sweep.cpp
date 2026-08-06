@@ -103,8 +103,19 @@ static CommandResult run_formatter(const fs::path& formatter, const fs::path& in
     const fs::path stdout_path = base.string() + ".out";
     const fs::path stderr_path = base.string() + ".err";
 
-    const std::string command = shell_quote(formatter) + " " + shell_quote(input) + " > " +
-                                shell_quote(stdout_path) + " 2> " + shell_quote(stderr_path);
+    std::string command = shell_quote(formatter) + " " + shell_quote(input) + " > " +
+                          shell_quote(stdout_path) + " 2> " + shell_quote(stderr_path);
+#ifdef _WIN32
+    // cmd.exe strips the outer quote pair whenever a command line both starts
+    // and ends with '"' (its heuristic for "the whole thing is one quoted
+    // program path"). Our command starts with the quoted formatter path and
+    // ends with the quoted stderr path, so it hits that rule and cmd drops the
+    // wrong quotes, breaking the trailing redirection ("The filename,
+    // directory name, or volume label syntax is incorrect."). Wrapping the
+    // whole line in one more quote pair gives cmd's heuristic that outer pair
+    // to strip instead, leaving the real argument quoting intact.
+    command = "\"" + command + "\"";
+#endif
     const int status = std::system(command.c_str());
 
     CommandResult result;

@@ -92,7 +92,18 @@ inline std::string read_file_text_or_empty(const std::filesystem::path& path) {
 }
 
 inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path) {
+    // weakly_canonical resolves the longest existing prefix through canonical(),
+    // which collapses symlinks (e.g. macOS /tmp -> /private/tmp) and Windows 8.3
+    // short names (e.g. RUNNER~1 -> runneradmin) to a single stable spelling.
+    // Any non-existing remainder (unsaved/virtual paths) is appended lexically.
+    // Without this, two code paths that resolve the same on-disk file through
+    // different OS APIs can disagree on its URI string even though they name
+    // the same file.
     std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(path, ec);
+    if (!ec)
+        return canonical.lexically_normal();
+
     auto absolute = std::filesystem::absolute(path, ec);
     if (ec)
         absolute = path;
