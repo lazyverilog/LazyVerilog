@@ -455,7 +455,8 @@ TEST_CASE("definition: package members included as text require import", "[defin
                       "    result = a + b;\n"
                       "endtask\n"
                       "endpackage\n");
-    const std::string top_uri = "file:///tmp/lazyverilog_definition_package_member_top.sv";
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_package_member_top.sv");
 
     // Including a header that contains a package declaration makes the package
     // syntax visible to slang's parsed tree, but it does not import the package
@@ -498,7 +499,8 @@ TEST_CASE("definition: nested include cursor matching is file-aware", "[definiti
     const auto a_path = write_temp_sv("A_nested_collision.svh",
                                       "`include \"B_nested_collision.svh\"\n"
                                       "parameter int A_PARAMETER = 1;\n");
-    const std::string top_uri = "file:///tmp/top_nested_collision.sv";
+    const std::string top_uri =
+        uri_from_path(std::filesystem::temp_directory_path() / "top_nested_collision.sv");
     analyzer.open(top_uri, "`include \"A_nested_collision.svh\"\n"
                            "module top;\n"
                            "  localparam int X = A_PARAMETER;\n"

@@ -330,7 +330,8 @@ TEST_CASE("hover: enriches typedefs defined by current-file includes", "[hover]"
     }
 
     Analyzer analyzer;
-    const std::string uri = "file:///tmp/lazyverilog_hover_include_user.sv";
+    const std::string uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                          "lazyverilog_hover_include_user.sv");
     const std::string text = R"SV(`include "lazyverilog_hover_include_params.svh"
 
 module top;
