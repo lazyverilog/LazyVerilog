@@ -42,6 +42,14 @@ SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::Source
 /// resolver instead of repeatedly normalizing the same path.  The cache is
 /// intentionally transient: SyntaxIndex stores compact SourceFileIDs, not this
 /// build-only helper.
+///
+/// The lookup is two-level because slang allocates a fresh BufferID for every
+/// macro expansion, while every one of those buffers reports the same file
+/// name.  Keying only on the buffer therefore misses on almost every token in
+/// macro-heavy code and re-canonicalizes a path that always resolves to the
+/// same file.  The name level absorbs those misses; the buffer level stays in
+/// front of it because getFileName() itself walks the expansion chain under a
+/// SourceManager lock.
 class SourceFileIdResolver {
 public:
     SourceFileID for_token(SyntaxIndex& index, const slang::SourceManager& sm,
@@ -50,7 +58,17 @@ public:
                               slang::SourceLocation location);
 
 private:
+    // Transparent hash so the name lookup can be done on the string_view
+    // returned by getFileName() without allocating a std::string per miss.
+    struct TransparentStringHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view text) const noexcept {
+            return std::hash<std::string_view>{}(text);
+        }
+    };
+
     std::unordered_map<uint32_t, SourceFileID> by_buffer_;
+    std::unordered_map<std::string, SourceFileID, TransparentStringHash, std::equal_to<>> by_name_;
 };
 
 /// Safely return a token's user-facing value text, or an empty string for a
