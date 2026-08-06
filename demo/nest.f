@@ -1,3 +1,0 @@
-./params.svh
-./memory.sv
-
