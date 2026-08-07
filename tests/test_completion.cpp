@@ -1054,6 +1054,57 @@ TEST_CASE("completion: project index shard follows live edits to extra file", "[
     std::filesystem::remove(use);
 }
 
+TEST_CASE("completion: repeated live edits to an extra file keep project shards alive",
+          "[completion]") {
+    // Each open()/change() of a filelist member replaces that file's shard in
+    // the analyzer cache and schedules a background republish of the project
+    // snapshot.  A completion running in that window may hold the last
+    // reference to the previously published snapshot, so it must keep that
+    // snapshot alive for as long as it uses raw shard pointers.
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto lib = std::filesystem::temp_directory_path() / "completion_shard_lifetime_lib.sv";
+    const auto use = std::filesystem::temp_directory_path() / "completion_shard_lifetime_use.sv";
+    const std::string use_text =
+        "module top;\n"
+        "    race_pkg::\n"
+        "endmodule\n";
+
+    {
+        std::ofstream out(lib);
+        REQUIRE(out.good());
+        out << "package race_pkg;\n    parameter int RACE_VALUE_0 = 0;\nendpackage\n";
+    }
+    {
+        std::ofstream out(use);
+        REQUIRE(out.good());
+        out << use_text;
+    }
+
+    analyzer.set_extra_files({use.string(), lib.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string use_uri = uri_from_path(use);
+    const std::string lib_uri = uri_from_path(lib);
+    analyzer.open(use_uri, use_text);
+    analyzer.open(lib_uri, "package race_pkg;\n    parameter int RACE_VALUE_0 = 0;\nendpackage\n");
+
+    auto [line, col] = pos_of(use_text, "race_pkg::");
+    const int query_col = col + (int)std::string("race_pkg::").size();
+
+    for (int i = 1; i <= 50; ++i) {
+        const std::string value = "RACE_VALUE_" + std::to_string(i);
+        analyzer.change(lib_uri,
+                        "package race_pkg;\n    parameter int " + value + " = " +
+                            std::to_string(i) + ";\nendpackage\n");
+        auto result = complete_at(engine, analyzer, use_uri, line, query_col);
+        CHECK(has_label(result, value));
+    }
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(use);
+}
+
 TEST_CASE("completion: identifier completion requires package import", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
