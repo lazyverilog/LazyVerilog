@@ -2692,9 +2692,15 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     // each immutable DocumentState's cached dynamic SyntaxIndex.
     SyntaxIndex completion_index = std::move(current_index);
     auto opened_shards = analyzer.opened_file_index_shards(params.textDocument.uri.raw_uri_);
+    // The snapshot owns the only guaranteed reference to these shards: a
+    // concurrent didOpen/didChange replaces the per-file shard in the analyzer
+    // cache and the background publish replaces the snapshot itself.  Keep the
+    // snapshot alive for as long as the raw shard pointers are used.
+    std::shared_ptr<const ProjectIndexSnapshot> project_index;
     std::vector<const SyntaxIndex*> project_shards;
     if (completion_context_needs_project_index(ctx.kind)) {
-        if (auto project_index = analyzer.project_index_snapshot()) {
+        project_index = analyzer.project_index_snapshot();
+        if (project_index) {
             project_shards.reserve(project_index->shards.size());
             for (const auto& shard : project_index->shards) {
                 if (shard.index)
