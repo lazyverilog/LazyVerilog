@@ -4,11 +4,15 @@
 
 `initialize` → `load_config` + `load_vcode` (cheap, synchronous) →
 `Analyzer::set_project_config` clears caches, bumps the generation, and fills
-`background_pending_files_` with every filelist entry → a **single**
-`background_indexer_` thread pops one path at a time → per file: fresh
+`background_pending_files_` with every filelist entry → a **pool** of
+`background_indexers_` threads pops paths concurrently → per file: fresh
 `SourceManager`, `SyntaxTree::fromFile`, `SyntaxIndex::build(Declarations)`,
 diagnostic collection → shard committed into `extra_cache_` → one debounced
-`ProjectIndexSnapshot` publish after the queue drains.
+`ProjectIndexSnapshot` publish after the queue drains *and* every worker goes
+idle.
+
+(The pool landed in round 4; rounds 1–3 below describe the single-threaded
+server they were measured against.)
 
 `initialized` only registers file watchers. Semantic background compilation
 (`src/background_compiler.cpp`) is off by default; when enabled it parses the
@@ -27,21 +31,22 @@ whole design a second time.
    `SourceFileIdResolver`: **11.8 s → 5.77 s**. See "The sys-time
    investigation" below.
 
-1. **Parallelize the background indexer** — `background_indexer_` is one thread
-   (`src/analyzer.cpp` `start_background_indexer_locked`). Per-file parse is
-   independent; commits are already generation-checked under `map_mutex_`.
-   Worker pool like `BackgroundCompiler` (capped ~4, nice'd, HPC-safe).
+1. **Parallelize the background indexer** — ✅ **DONE (round 4)**. Worker pool
+   sized from the CPU slice the process may actually use, capped at 8, nice'd.
+   See "Round 4" below.
 
 2. **Persistent on-disk shard cache (clangd-style)** — every launch reparses
    unchanged files. Serialize `SyntaxIndex` per file keyed by
    `(path, mtime+size, hash(defines+incdirs))`; on startup load hits, parse
    only misses. Biggest win for repeated startups on large designs.
 
-3. **Cut redundant include I/O** — each file gets a fresh `SourceManager`, so
-   shared headers are opened and read once per source file — O(files ×
-   includes) filesystem traffic (painful on NFS). Cache raw header text once
-   per generation (path→text, seed via `assignText`). Re-preprocessing per file
-   is still required for correctness; the disk I/O is not.
+3. **Cut redundant include I/O** — partially addressed in round 4. The
+   *probe* cost is gone (`setDisableProximatePaths(true)` stopped slang
+   canonicalizing every candidate path it tries), but each file still gets a
+   fresh `SourceManager`, so shared headers are still opened and read once per
+   source file. Caching raw header text once per generation (path→text, seed
+   via `assignText`) remains open. Re-preprocessing per file is required for
+   correctness; the disk I/O is not.
 
 4. **Skip wasted diagnostics in the index path** —
    `make_file_state_with_options` calls `collect_parse_diagnostics` (formats
@@ -280,12 +285,12 @@ just spend more cores on work that should not exist.
 
 ## State changes (`src/analyzer.hpp`)
 
-| Now | After |
-|-----|-------|
-| `std::thread background_indexer_` | `std::vector<std::thread> background_indexers_` |
-| `bool background_index_active_` | `int background_active_workers_{0}` |
-| — | `std::unordered_set<std::string> background_in_flight_` |
-| — | `int background_index_threads_` (from config) |
+| Now | After | Landed as (round 4) |
+|-----|-------|---------------------|
+| `std::thread background_indexer_` | `std::vector<std::thread> background_indexers_` | as planned |
+| `bool background_index_active_` | `int background_active_workers_{0}` | kept the name `background_index_active_`, changed to `int` |
+| — | `std::unordered_set<std::string> background_in_flight_` | **not done** |
+| — | `int background_index_threads_` (from config) | **no config**; `available_cpu_count()` at first use |
 
 ## Steps
 
@@ -320,13 +325,14 @@ if graceful shrink-on-config-reload is wanted; a fixed pool sized at first use
 is enough for v1. Destructor joins all; `background_stop_` + `notify_all`
 already wake every waiter.
 
-Config: add `[design] index_threads`, defaulting to
-`min(4, max(1, hardware_concurrency / 2))`, and apply the existing
-`nice_value` treatment from `apply_background_worker_priority()` — the codebase
-is deliberately conservative about CPU on shared/HPC machines, and warm-up
-should stay a background citizen.
-*Verify:* `index_threads = 1` must reproduce the baseline exactly; then
-measure 2/4/8.
+Config: *(superseded in round 4 — no knob was added.)* The pool sizes itself
+from `available_cpu_count()` (`src/cpu_budget.cpp`), which is the CPU slice the
+process may actually use rather than the size of the machine, capped at 8.
+Workers renice themselves through `apply_background_thread_nice()` — the
+codebase is deliberately conservative about CPU on shared/HPC machines, and
+warm-up should stay a background citizen.
+*Verify:* a 1-CPU budget must reproduce the baseline exactly; then measure
+2/4/8.
 
 **5. Schedule longest-first.** The tail is the whole game: 100 files are 53% of
 the time and the worst single file is 627 ms. FIFO order will strand one
@@ -488,10 +494,10 @@ Impact is predicted; the evidence column says what it rests on.
 | # | Change | Predicted saving | Risk | Confidence | Evidence |
 |---|---|---|---|---|---|
 | 1 | Name-keyed second level in `SourceFileIdResolver` | **~2.5 s** | Medium — touches every file-id lookup; needs full test run | **High** | 96.3% stack attribution + 148/file floor + µs/call calibration |
-| 2 | Process-wide memo inside `normalize_filesystem_path` | ~0.3 s (subsumes 3 and 4) | Medium — process-lifetime staleness if symlinks change mid-session | Medium | Floor decomposition |
+| 2 | Process-wide memo inside `normalize_filesystem_path` — ✅ **DONE (round 4)** | ~0.3 s (subsumes 3 and 4) | Medium — process-lifetime staleness if symlinks change mid-session | Medium | Floor decomposition |
 | 3 | `collect_include_dependency_uris`: pass the owning `BufferID` in (drop loop 1) and memoize loop 2 | 0.14–0.21 s | **Low** — caller already computes the root buffer | High | 0.6% attribution + 0.17% user time |
 | 4 | Drop double canonicalization in `make_file_state_with_options` (`uri_from_path` re-normalizes an already-normalized path) | ~0.07 s | **Very low** — one-line | High | Floor decomposition (1 of ~8 canonicalizations) |
-| 5 | slang `setDisableProximatePaths(true)` | ~0.15 s | Medium-high — changes how slang spells buffer names; affects diagnostics and URI mapping | Medium | 0.8% attribution (`cacheBuffer` + `openCached`) |
+| 5 | slang `setDisableProximatePaths(true)` — ✅ **DONE (round 4)** | ~0.15 s | Medium-high — changes how slang spells buffer names; affects diagnostics and URI mapping | Medium | 0.8% attribution (`cacheBuffer` + `openCached`) |
 | 6 | Skip `collect_parse_diagnostics` on the index path | <0.1 s | Low | Medium | 1.0% attribution; absent from user profile above 0.15% |
 
 Items 3–6 together are worth roughly 0.5 s. Item 1 is worth five times all of
@@ -604,7 +610,7 @@ Separately, the main thread spends ~78k readlinks (3% of the total) in
 |---|---|---|---|---|
 | A | Skip `collect_parse_diagnostics` on the index path (results are discarded — the background loop commits only `state->index`) | **~0.9 s** | Low | Medium-high |
 | B | `collect_include_dependency_uris`: pass the owning `BufferID` in, memoize loop 2 | ~0.25 s | Low | High |
-| C | slang `setDisableProximatePaths(true)` (`cacheBuffer` + `openCached` = 13%) | ~0.25 s | Med-high | Medium |
+| C | slang `setDisableProximatePaths(true)` (`cacheBuffer` + `openCached` = 13%) — ✅ **DONE (round 4)** | ~0.25 s | Med-high | Medium |
 | D | Drop double canonicalization in `make_file_state_with_options` | ~0.07 s | Very low | High |
 
 **Important caveat on A:** this benchmark configures no include directories, so
@@ -617,3 +623,151 @@ away — but the measured number here is an upper bound, not a typical case.
 Ranking A–D by confidence-adjusted value, A is still first, but it should be
 measured with include directories configured before being treated as a ~0.9 s
 win.
+
+---
+
+# Round 4: parallel pool + the rest of the canonicalization tail
+
+Branch `perf/project-index-startup`, commits `000d603`, `56d1dbd`, `528a9cc`.
+Measured against `f0ccb75` (the round-3 endpoint) on the same machine.
+
+Motivating report: ~60 RTL files took **11 s** to index on a shared HPC node,
+with a single `+incdir+` and every module `` `include ``-ing two large headers.
+Not reproducible on the dev workstation, so the work was driven by a synthetic
+corpus of that shape plus syscall counting.
+
+## What changed
+
+**1. The indexer is a worker pool.** `background_index_active_` became a count,
+the publish condition became `pending.empty() && active == 0`, and
+`start_background_indexer_locked()` spawns up to `available_cpu_count()`
+workers (cap 8), growing but never shrinking. Steps 1, 2 and 4 of the plan
+above; step 3 (in-flight set) and step 5 (longest-first) are **not** done.
+
+**2. Worker count comes from the CPU slice, not the machine.**
+`std::thread::hardware_concurrency()` is `sysconf(_SC_NPROCESSORS_ONLN)` on
+libstdc++ and `GetMaximumProcessorCount()` on MSVC — neither honours affinity
+masks or cgroup quotas, so on a batch-scheduled or containerised node it
+over-reports badly. `available_cpu_count()` (`src/cpu_budget.cpp`) takes the
+minimum of every restriction that exists: Linux `sched_getaffinity`, cgroup v2
+`cpu.max` / v1 `cpu.cfs_quota_us` walked from the leaf to the mount root,
+Windows `GetProcessAffinityMask`, and the `SLURM_CPUS_PER_TASK` /
+`LSB_DJOB_NUMPROC` / `NCPUS` / `PBS_NUM_PPN` / `OMP_NUM_THREADS` family.
+Absent signals are skipped, so an unconstrained desktop lands on
+`hardware_concurrency()` exactly as before.
+
+Verified by counting live threads (peak = 1 main + N workers):
+
+| Constraint | Workers |
+|---|---|
+| unconstrained (12 CPUs) | 8 (cap) |
+| `taskset -c 0,1` | 2 |
+| systemd `CPUQuota=200%` | 2 |
+| systemd `CPUQuota=400%` | 4 |
+| `SLURM_CPUS_PER_TASK=3` | 3 |
+| `OMP_NUM_THREADS=99` | 8 (clamped to hardware) |
+
+**3. `normalize_filesystem_path` memoizes** by input spelling (round-2 item 2).
+
+**4. `setDisableProximatePaths(true)`** on every parse (round-2 item 5 /
+round-3 item C). This is the one that matters for include-heavy designs: slang
+runs `weakly_canonical()` on *each candidate path it probes* while resolving an
+`` `include ``, and a probe that misses walks the entire directory prefix
+through `canonical()` — about 10 `stat`s per miss on an 8-deep path, more on
+the deeper trees typical of HPC checkouts. With N include directories that is
+N canonicalisations per include per file.
+
+Because the flag also makes `getFileName()` return a bare filename, URI
+derivation moved onto buffer full paths (`uri_from_source_buffer()`), with
+`getFileName()` still preferred when it already yields a `file://` URI so the
+current document keeps its exact client spelling.
+
+**5. Two config knobs retired** — `[compilation].background_compilation_threads`
+and `[compilation].nice_value`, both fixed at their former defaults. Worker
+nice is now one shared `apply_background_thread_nice()` that only ever *raises*
+the value; the old code asked for a lower nice than a `nice`-started server
+already had, failing with `EACCES` and logging once per worker.
+
+## Measured
+
+Ryzen 5 5600X (6C/12T), ext4 on NVMe, RelWithDebInfo, page cache warm, idle
+machine, 3 runs each.
+
+**OpenTitan corpus — the same benchmark rounds 1–3 used:**
+
+| | f0ccb75 | 528a9cc |
+|---|---|---|
+| Wall | 4.92 / 4.94 / 4.90 s | **0.654 / 0.648 / 0.661 s** |
+| indexed shards | 3999 | 3999 (identical) |
+
+**7.5× faster.** Cumulative from the original 11.8 s baseline: **18×**.
+
+**Synthetic 60-file corpus modelling the HPC report** — every module includes
+`params.svh` + `func.svh`; `stat` counted with an `LD_PRELOAD` interposer:
+
+| Corpus | f0ccb75 | 528a9cc | Speedup | `stat` before | `stat` after |
+|---|---|---|---|---|---|
+| 2 small headers, 1 incdir | 477 ms | 96 ms | 5.0× | 3,002 | 185 |
+| 29k header lines, 1 incdir | 5,651 ms | 1,055 ms | 5.4× | 3,002 | 185 |
+| 2 small headers, 31 incdirs | 554 ms | 103 ms | 5.4× | 46,232 | 3,815 |
+
+## Which fix mattered for which cost
+
+The two levers are close to orthogonal, and conflating them is easy:
+
+- **Wall time on a warm local filesystem is all parallelism.** The
+  normalization memo alone moved 60 files from 470 ms to 468 ms — 30% fewer
+  `stat`s, ~0% wall — because a warm `stat` is ~1 µs, so 3,000 of them are 3 ms
+  out of 5.2 s. Every second of local speedup came from the pool.
+- **`stat` count is what a network filesystem charges for.** At NFS latencies
+  the 46,232→3,815 reduction is the dominant term, and it is invisible here.
+
+For the reported HPC case specifically — one `+incdir+`, huge headers — the
+CPU term dominates: 5.65 s for that shape on a fast desktop core maps
+plausibly onto 11 s on a slower shared one, at only ~3,000 `stat`s. The
+syscall work pays off for wider `+incdir+` lists and deeper paths.
+
+## Open risk: the resolver's second cache level
+
+Round 2 argued that keying `SourceFileIdResolver` on
+`getFullyExpandedLoc(loc).buffer()` is unsafe, and chose a name-keyed level
+instead. Round 4 replaced that name key with an expanded-buffer key, because
+`setDisableProximatePaths(true)` makes `getFileName()` return a bare filename —
+which collides across two same-named headers in different include directories.
+
+That trade swapped one hazard for another. `getFileName()` consults
+`` `line `` directives, so it is a function of *(buffer, line)*, not of buffer
+alone: a file carrying its own `` `line `` directive mid-file can legitimately
+report different names on different lines, and an expanded-buffer key would
+serve the first-seen URI for all of them. Generated RTL does emit `` `line ``.
+The 457-test suite does not cover it.
+
+The clean fix is to drop the second level entirely and rely on `by_buffer_`
+plus the now-memoized `normalize_filesystem_path` — the memo removes the very
+`weakly_canonical` cost the name level existed to avoid, so the second level
+has become largely redundant. Not yet done.
+
+## Still open from earlier rounds
+
+- Round-3 item A (skip `collect_parse_diagnostics` on the index path, ~0.9 s
+  upper bound), item B (`collect_include_dependency_uris`), item D (double
+  canonicalization in `make_file_state_with_options`).
+- Plan step 3: an in-flight path set. Two workers can now parse the same path
+  concurrently when it is queued twice; the generation and `doc->second ==
+  live_doc` checks make the second commit a no-op, so it is correctness-neutral
+  but wasteful.
+- Plan step 5: longest-first scheduling. Still FIFO, so the 627 ms tail file
+  can strand one worker while the rest idle.
+- Plan step 6: no ThreadSanitizer run has been done on the pool.
+- Improvement 3's header text cache (each file still re-reads shared headers).
+
+## Reproduce
+
+```bash
+cmake --build build -j$(nproc)
+./build/lazyverilog-tests "benchmark: OpenTitan initial parse/index wall time"
+
+# arbitrary project, without an editor
+./build/index-bench <project-root-containing-lazyverilog.toml> 3
+LAZYVERILOG_TRACE_PERF=1 ./build/index-bench <project-root> 1
+```
