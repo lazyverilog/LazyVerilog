@@ -55,14 +55,8 @@ static std::string diagnostic_uri(const slang::SourceManager& sm, const std::str
         return fallback_uri;
 
     try {
-        auto file_name = sm.getFileName(location);
-        if (file_name.empty())
-            return fallback_uri;
-
-        std::string text(file_name);
-        if (text.starts_with("file://"))
-            return text;
-        return uri_from_path(text);
+        auto uri = uri_from_source_location(sm, location);
+        return uri.empty() ? fallback_uri : uri;
     } catch (...) {
         return fallback_uri;
     }
@@ -322,7 +316,7 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     result.generation = generation;
     result.open_uris = std::move(snapshot.open_uris);
 
-    auto source_manager = std::make_unique<slang::SourceManager>();
+    auto source_manager = make_lsp_source_manager();
     for (const auto& dir : snapshot.include_dirs) {
         if (!dir.empty())
             (void)source_manager->addUserDirectories(dir);

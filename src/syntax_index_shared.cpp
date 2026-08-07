@@ -21,11 +21,43 @@ std::string uri_from_file_name(std::string_view file_name) {
     return uri_from_path(file);
 }
 
+std::unique_ptr<slang::SourceManager> make_lsp_source_manager() {
+    auto sm = std::make_unique<slang::SourceManager>();
+    sm->setDisableProximatePaths(true);
+    return sm;
+}
+
+std::string uri_from_source_buffer(const slang::SourceManager& sm, slang::BufferID buffer) {
+    // Prefer the buffer's full path over getFileName().  getFileName() reports
+    // the "proximate" spelling slang computed when the buffer was cached, which
+    // is relative to the server's working directory and is therefore only
+    // resolvable while that directory stays put.  The full path is absolute,
+    // and it stays available when proximate-path computation is disabled to
+    // keep include lookups off the filesystem-metadata path.
+    if (!buffer.valid())
+        return {};
+    const auto& full_path = sm.getFullPath(buffer);
+    if (full_path.empty())
+        return {};
+    return uri_from_path(full_path);
+}
+
 std::string uri_from_source_location(const slang::SourceManager& sm,
                                      slang::SourceLocation location) {
     if (!location.valid())
         return {};
+
+    // The current document is parsed from client text under a `line directive
+    // that names its client URI.  Keep that exact spelling: features compare the
+    // result against the document URI they were handed, and re-deriving it from
+    // the path would silently rewrite a non-canonical client URI.
     const auto file_name = sm.getFileName(location);
+    if (file_name.starts_with("file://"))
+        return std::string(file_name);
+
+    auto uri = uri_from_source_buffer(sm, sm.getFullyExpandedLoc(location).buffer());
+    if (!uri.empty())
+        return uri;
     return uri_from_file_name(file_name);
 }
 
@@ -54,20 +86,21 @@ SourceFileID SourceFileIdResolver::for_location(SyntaxIndex& index, const slang:
     if (auto it = by_buffer_.find(buffer_id); it != by_buffer_.end())
         return it->second;
 
-    // Resolve through the file name before canonicalizing: macro expansions
-    // each get their own buffer id but share the name of the file they expand
-    // in, so this is what keeps weakly_canonical() off the per-token path.
-    const auto file_name = sm.getFileName(location);
-    if (auto it = by_name_.find(file_name); it != by_name_.end()) {
+    // Resolve through the expanded buffer before canonicalizing: macro
+    // expansions each get their own buffer id but all expand within one file
+    // buffer, so this is what keeps weakly_canonical() off the per-token path.
+    const auto expanded_buffer = sm.getFullyExpandedLoc(location).buffer();
+    if (auto it = by_expanded_buffer_.find(expanded_buffer.getId());
+        it != by_expanded_buffer_.end()) {
         by_buffer_.emplace(buffer_id, it->second);
         return it->second;
     }
 
-    auto uri = uri_from_file_name(file_name);
+    auto uri = uri_from_source_location(sm, location);
     const auto file_id = uri.empty() ? kInvalidSourceFileID
                                      : index.intern_source_file(std::move(uri));
     by_buffer_.emplace(buffer_id, file_id);
-    by_name_.emplace(std::string(file_name), file_id);
+    by_expanded_buffer_.emplace(expanded_buffer.getId(), file_id);
     return file_id;
 }
 

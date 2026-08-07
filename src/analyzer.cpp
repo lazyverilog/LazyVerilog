@@ -1,8 +1,11 @@
 #include "analyzer.hpp"
+#include "cpu_budget.hpp"
 #include "dynamic_file_index.hpp"
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -22,6 +25,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
 namespace {
 
 bool perf_trace_enabled() {
@@ -36,6 +43,38 @@ using Clock = std::chrono::steady_clock;
 
 constexpr size_t kMaxRtlTreeDepth = 256;
 
+constexpr unsigned kMaxBackgroundIndexThreads = 8;
+
+// Milder than the background compiler's default of 10.  Project index warmup
+// gates when cross-file features start answering, so it should yield to
+// interactive work without being starved outright.
+constexpr int kBackgroundIndexNiceValue = 5;
+
+void apply_background_index_priority() {
+#ifdef __linux__
+    // Linux keeps the nice value per thread, so this renices only the calling
+    // index worker and leaves the LSP request thread at its original priority.
+    // Deliberately not done on macOS, where the same call is process-wide and
+    // would slow down request handling along with indexing.
+    errno = 0;
+    const int current = getpriority(PRIO_PROCESS, 0);
+    if (current == -1 && errno != 0)
+        return;
+
+    // Only ever become more polite.  A server already started under `nice` may
+    // sit above this value, and lowering a nice value needs CAP_SYS_NICE, so
+    // asking would just fail and log noise once per worker.
+    if (current >= kBackgroundIndexNiceValue)
+        return;
+
+    errno = 0;
+    if (setpriority(PRIO_PROCESS, 0, kBackgroundIndexNiceValue) != 0) {
+        std::cerr << "[lazyverilog] background indexer setpriority("
+                  << kBackgroundIndexNiceValue << ") failed: " << std::strerror(errno) << "\n";
+    }
+#endif
+}
+
 void log_perf(std::string_view label, Clock::time_point start) {
     if (!perf_trace_enabled())
         return;
@@ -46,7 +85,14 @@ void log_perf(std::string_view label, Clock::time_point start) {
 
 } // namespace
 
-static std::string file_name_to_uri(std::string_view file_name, const std::string& fallback_uri);
+/// Resolve the URI a location belongs to, falling back to the owning document
+/// when the location is not backed by a real file (macro internals, memory
+/// buffers).
+static std::string location_to_uri(const slang::SourceManager& sm, slang::SourceLocation location,
+                                   const std::string& fallback_uri) {
+    auto uri = uri_from_source_location(sm, location);
+    return uri.empty() ? fallback_uri : uri;
+}
 
 static int saturating_lsp_int(size_t value) {
     constexpr auto max_int = static_cast<size_t>(std::numeric_limits<int>::max());
@@ -94,7 +140,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
         ParseDiagInfo info;
         try {
             auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;
-            info.uri = file_name_to_uri(sm.getFileName(loc), fallback_uri);
+            info.uri = location_to_uri(sm, loc, fallback_uri);
             if (loc.valid() && sm.isFileLoc(loc)) {
                 size_t ln = sm.getLineNumber(loc);
                 size_t col = sm.getColumnNumber(loc);
@@ -156,7 +202,7 @@ make_file_state_with_options(const std::filesystem::path& path,
     const auto norm = normalize_filesystem_path(path);
     const std::string uri = uri_from_path(norm);
 
-    auto sm = std::make_unique<slang::SourceManager>();
+    auto sm = make_lsp_source_manager();
     add_include_dirs(*sm, include_dirs);
     preload_open_text_overlays(*sm, open_overlays, norm.string());
     slang::parsing::PreprocessorOptions ppo;
@@ -204,13 +250,16 @@ Analyzer::~Analyzer() {
         parse_cv_.notify_all();
         parse_worker_.join();
     }
-    if (background_indexer_.joinable()) {
+    if (!background_indexers_.empty()) {
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             background_stop_.store(true);
         }
         background_cv_.notify_all();
-        background_indexer_.join();
+        for (auto& worker : background_indexers_) {
+            if (worker.joinable())
+                worker.join();
+        }
     }
 }
 
@@ -246,7 +295,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         }
     }
 
-    auto sm = std::make_unique<slang::SourceManager>();
+    auto sm = make_lsp_source_manager();
     add_include_dirs(*sm, include_dirs);
     preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
@@ -654,14 +703,6 @@ static bool is_define_identifier(std::string_view src, int line, int ident_start
 
 static int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line - 1 : 0; }
 
-static std::string file_name_to_uri(std::string_view file_name, const std::string& fallback_uri) {
-    if (file_name.empty())
-        return fallback_uri;
-
-    auto uri = uri_from_file_name(file_name);
-    return uri.empty() ? fallback_uri : uri;
-}
-
 static std::optional<Location>
 find_module_definition(const SyntaxIndex& index, const std::string& uri, const std::string& name) {
     auto it = index.module_by_name.find(name);
@@ -898,8 +939,7 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
                                                const std::string& fallback_uri,
                                                const slang::parsing::Token& token) {
-    auto loc = location_from_token(
-        sm, file_name_to_uri(sm.getFileName(token.location()), fallback_uri), token);
+    auto loc = location_from_token(sm, location_to_uri(sm, token.location(), fallback_uri), token);
     return loc;
 }
 
@@ -1961,7 +2001,7 @@ static bool range_starts_in_uri(const slang::SourceManager& sm, slang::SourceRan
                                 const std::string& uri) {
     if (!range.start().valid())
         return false;
-    return file_name_to_uri(sm.getFileName(range.start()), uri) == uri;
+    return location_to_uri(sm, range.start(), uri) == uri;
 }
 
 static bool contains_position_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
@@ -3494,7 +3534,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
 void Analyzer::wait_for_background_index_idle() const {
     std::unique_lock<std::mutex> lock(map_mutex_);
     background_cv_.wait(lock, [&] {
-        return background_pending_files_.empty() && !background_index_active_ &&
+        return background_pending_files_.empty() && background_index_active_ == 0 &&
                !background_publish_requested_;
     });
 }
@@ -3970,12 +4010,34 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
 }
 
 void Analyzer::start_background_indexer_locked() const {
-    if (background_indexer_.joinable())
+    // Project indexing is CPU-bound and embarrassingly parallel: every
+    // configured file is parsed and indexed from its own SourceManager, and an
+    // include-heavy design re-preprocesses the same headers once per file.  A
+    // single worker made a cold start scale linearly with the filelist, so fan
+    // the queue out over a small pool.
+    //
+    // available_cpu_count() reports the slice this process may actually use
+    // rather than the size of the machine, which matters on batch-scheduled and
+    // containerised nodes.  It is sampled once: re-reading it per schedule would
+    // make the pool size depend on when indexing happened to be triggered.
+    static const unsigned cpu_budget =
+        std::clamp(available_cpu_count(), 1u, kMaxBackgroundIndexThreads);
+
+    // Never spawn more workers than there is queued work.  Closing one buffer
+    // queues a single reparse and should not start a whole pool.  The pool only
+    // ever grows, so a later full reindex still reaches the CPU budget.
+    const auto queued = std::max<size_t>(background_pending_files_.size(), 1);
+    const auto desired = static_cast<size_t>(std::min<size_t>(cpu_budget, queued));
+    if (background_indexers_.size() >= desired)
         return;
 
-    background_indexer_ = std::thread([this] {
-        background_index_loop();
-    });
+    background_indexers_.reserve(desired);
+    while (background_indexers_.size() < desired) {
+        background_indexers_.emplace_back([this] {
+            apply_background_index_priority();
+            background_index_loop();
+        });
+    }
 }
 
 void Analyzer::schedule_background_reindex_locked() const {
@@ -4039,7 +4101,7 @@ void Analyzer::background_index_loop() const {
 
             path_string = std::move(background_pending_files_.front());
             background_pending_files_.pop_front();
-            background_index_active_ = true;
+            ++background_index_active_;
             const auto path = normalize_filesystem_path(path_string);
             path_string = path.string();
             uri = uri_from_path(path);
@@ -4093,7 +4155,7 @@ void Analyzer::background_index_loop() const {
                     }
                 }
             }
-            background_index_active_ = false;
+            --background_index_active_;
             background_cv_.notify_all();
             continue;
         }
@@ -4102,7 +4164,7 @@ void Analyzer::background_index_loop() const {
                                                   open_overlays);
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            background_index_active_ = false;
+            --background_index_active_;
             background_cv_.notify_all();
             continue;
         }
@@ -4110,7 +4172,7 @@ void Analyzer::background_index_loop() const {
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
-                background_index_active_ = false;
+                --background_index_active_;
                 background_cv_.notify_all();
                 continue;
             }
@@ -4120,7 +4182,7 @@ void Analyzer::background_index_loop() const {
             // didChange path builds and commits that live shard outside this
             // mutex, so do not build it here while holding map_mutex_.
             if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
-                background_index_active_ = false;
+                --background_index_active_;
                 background_cv_.notify_all();
                 continue;
             }
@@ -4140,9 +4202,11 @@ void Analyzer::background_index_loop() const {
             // partially warmed snapshots.  Request one debounced publish only
             // after the queue drains so [design].project_index_publish_debounce_ms
             // applies consistently to disk-backed reindex and live edit paths.
-            if (background_pending_files_.empty())
+            // With several workers draining the queue, "drained" also requires
+            // that no sibling worker is still parsing a file.
+            --background_index_active_;
+            if (background_pending_files_.empty() && background_index_active_ == 0)
                 schedule_background_project_publish_locked();
-            background_index_active_ = false;
             background_cv_.notify_all();
         }
     }
