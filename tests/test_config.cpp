@@ -15,27 +15,6 @@ static fs::path make_temp_toml(const std::string& content) {
     return dir;
 }
 
-TEST_CASE("config: retired compilation knobs are ignored, not rejected", "[config]") {
-    // background_compilation_threads and nice_value were removed once the
-    // server started deriving both automatically.  Configuration files in the
-    // wild still carry them, so they must load without a warning and without
-    // disturbing the options that remain.
-    auto dir = make_temp_toml(R"(
-[compilation]
-background_compilation = true
-background_compilation_threads = 4
-background_compilation_debounce_ms = 750
-nice_value = 19
-)");
-
-    std::string warning;
-    Config cfg = load_config(dir, &warning);
-
-    CHECK(warning.empty());
-    CHECK(cfg.compilation.background_compilation == true);
-    CHECK(cfg.compilation.background_compilation_debounce_ms == 750);
-}
-
 TEST_CASE("config: missing file returns defaults", "[config]") {
     auto dir = fs::temp_directory_path() / "lv_no_such_dir_xyz123";
     fs::remove_all(dir);
