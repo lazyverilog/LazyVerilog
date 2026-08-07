@@ -573,10 +573,8 @@ void LazyVerilogServer::configure_background_compiler() {
 
     background_compiler_->configure(BackgroundCompilerConfig{
         .enabled = config_.compilation.background_compilation,
-        .thread_count = config_.compilation.background_compilation_threads,
         .debounce_ms = config_.compilation.background_compilation_debounce_ms,
         .log_timing = config_.compilation.log_timing,
-        .nice_value = config_.compilation.nice_value,
     });
 
     if (!config_.compilation.background_compilation)

@@ -23,3 +23,15 @@
 /// would change the result on an idle-but-busy desktop, and it makes the worker
 /// count depend on whatever else the user happens to be running.
 unsigned available_cpu_count();
+
+/// Make the calling background worker thread yield to interactive work.
+///
+/// Linux keeps the nice value per thread, so this affects only the caller and
+/// leaves the LSP request thread at its original priority.  It is a no-op
+/// elsewhere: on macOS the same call is process-wide and would slow down
+/// request handling along with background work, and Windows has no POSIX nice.
+///
+/// Only ever raises the nice value.  A server started under `nice` may already
+/// sit above the requested value, and lowering one needs CAP_SYS_NICE, so
+/// asking would fail and log once per worker.
+void apply_background_thread_nice(int nice_value);

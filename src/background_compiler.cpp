@@ -1,11 +1,10 @@
 #include "background_compiler.hpp"
+#include "cpu_budget.hpp"
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,37 +16,19 @@
 #include <slang/util/Bag.h>
 #include <unordered_set>
 
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Keep optional semantic compilation conservative by default.  This is a
-// background diagnostic path, not a throughput benchmark; high worker counts can
-// consume large amounts of CPU and memory on shared/HPC machines.
+// Keep optional semantic compilation conservative.  This is a background
+// diagnostic path, not a throughput benchmark; every worker compiles the whole
+// design, so extra workers multiply peak memory rather than splitting work.
 constexpr int kMaxBackgroundCompilerThreads = 4;
-constexpr int kMinNiceValue = 0;
-constexpr int kMaxNiceValue = 19;
 
-static void apply_background_worker_priority(int nice_value) {
-#ifdef _WIN32
-    // Windows does not provide POSIX nice / setpriority().  Keep the option as
-    // a harmless no-op on Windows so the same configuration file remains
-    // portable across platforms.  If Windows-specific background priority is
-    // needed later, this is the single place to map the user-facing nice value
-    // to SetThreadPriority() values.
-    (void)nice_value;
-#else
-    errno = 0;
-    if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {
-        std::cerr << "[lazyverilog] background compiler setpriority(" << nice_value
-                  << ") failed: " << std::strerror(errno) << "\n";
-    }
-#endif
-}
+// Semantic compilation is the most deferrable work the server does: nothing
+// waits on it, and it is the heaviest thing running.  Yield harder than the
+// project indexer, which gates when cross-file features start answering.
+constexpr int kBackgroundCompilerNiceValue = 10;
 
 static std::string diagnostic_uri(const slang::SourceManager& sm, const std::string& fallback_uri,
                                   slang::SourceLocation location) {
@@ -149,7 +130,6 @@ std::vector<std::thread> BackgroundCompiler::collect_exited_workers_locked() {
 void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
     config.thread_count = std::clamp(config.thread_count, 1, kMaxBackgroundCompilerThreads);
     config.debounce_ms = std::max(0, config.debounce_ms);
-    config.nice_value = std::clamp(config.nice_value, kMinNiceValue, kMaxNiceValue);
 
     std::vector<std::thread> exited_threads;
     {
@@ -157,7 +137,6 @@ void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
         enabled_ = config.enabled;
         log_timing_ = config.log_timing;
         debounce_ms_ = config.debounce_ms;
-        nice_value_ = config.nice_value;
 
         exited_threads = collect_exited_workers_locked();
 
@@ -178,8 +157,8 @@ void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
 
             while (static_cast<int>(workers_.size()) < config.thread_count) {
                 auto slot = std::make_shared<WorkerSlot>(next_worker_id_++);
-                slot->thread = std::thread([this, slot, nice_value = config.nice_value] {
-                    apply_background_worker_priority(nice_value);
+                slot->thread = std::thread([this, slot] {
+                    apply_background_thread_nice(kBackgroundCompilerNiceValue);
                     worker_loop(std::move(slot));
                 });
                 workers_.push_back(std::move(slot));
