@@ -4,8 +4,6 @@
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
-#include <cerrno>
-#include <cstring>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -24,10 +22,6 @@
 #include <slang/text/SourceManager.h>
 #include <unordered_map>
 #include <unordered_set>
-
-#ifdef __linux__
-#include <sys/resource.h>
-#endif
 
 namespace {
 
@@ -50,30 +44,6 @@ constexpr unsigned kMaxBackgroundIndexThreads = 8;
 // interactive work without being starved outright.
 constexpr int kBackgroundIndexNiceValue = 5;
 
-void apply_background_index_priority() {
-#ifdef __linux__
-    // Linux keeps the nice value per thread, so this renices only the calling
-    // index worker and leaves the LSP request thread at its original priority.
-    // Deliberately not done on macOS, where the same call is process-wide and
-    // would slow down request handling along with indexing.
-    errno = 0;
-    const int current = getpriority(PRIO_PROCESS, 0);
-    if (current == -1 && errno != 0)
-        return;
-
-    // Only ever become more polite.  A server already started under `nice` may
-    // sit above this value, and lowering a nice value needs CAP_SYS_NICE, so
-    // asking would just fail and log noise once per worker.
-    if (current >= kBackgroundIndexNiceValue)
-        return;
-
-    errno = 0;
-    if (setpriority(PRIO_PROCESS, 0, kBackgroundIndexNiceValue) != 0) {
-        std::cerr << "[lazyverilog] background indexer setpriority("
-                  << kBackgroundIndexNiceValue << ") failed: " << std::strerror(errno) << "\n";
-    }
-#endif
-}
 
 void log_perf(std::string_view label, Clock::time_point start) {
     if (!perf_trace_enabled())
@@ -4034,7 +4004,7 @@ void Analyzer::start_background_indexer_locked() const {
     background_indexers_.reserve(desired);
     while (background_indexers_.size() < desired) {
         background_indexers_.emplace_back([this] {
-            apply_background_index_priority();
+            apply_background_thread_nice(kBackgroundIndexNiceValue);
             background_index_loop();
         });
     }

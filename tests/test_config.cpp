@@ -15,6 +15,27 @@ static fs::path make_temp_toml(const std::string& content) {
     return dir;
 }
 
+TEST_CASE("config: retired compilation knobs are ignored, not rejected", "[config]") {
+    // background_compilation_threads and nice_value were removed once the
+    // server started deriving both automatically.  Configuration files in the
+    // wild still carry them, so they must load without a warning and without
+    // disturbing the options that remain.
+    auto dir = make_temp_toml(R"(
+[compilation]
+background_compilation = true
+background_compilation_threads = 4
+background_compilation_debounce_ms = 750
+nice_value = 19
+)");
+
+    std::string warning;
+    Config cfg = load_config(dir, &warning);
+
+    CHECK(warning.empty());
+    CHECK(cfg.compilation.background_compilation == true);
+    CHECK(cfg.compilation.background_compilation_debounce_ms == 750);
+}
+
 TEST_CASE("config: missing file returns defaults", "[config]") {
     auto dir = fs::temp_directory_path() / "lv_no_such_dir_xyz123";
     fs::remove_all(dir);
@@ -22,9 +43,7 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.design.vcode.empty());
     CHECK(cfg.design.define.empty());
     CHECK(cfg.compilation.background_compilation == false);
-    CHECK(cfg.compilation.background_compilation_threads == 1);
     CHECK(cfg.compilation.background_compilation_debounce_ms == 1500);
-    CHECK(cfg.compilation.nice_value == 10);
     CHECK(cfg.compilation.log_timing == false);
     CHECK(cfg.inlay_hint.enable == true);
     CHECK(cfg.format.indent_size == 2);
@@ -57,9 +76,7 @@ define = ["RTL_SIM", "FAST_MODEL"]
 
 [compilation]
 background_compilation = true
-background_compilation_threads = 2
 background_compilation_debounce_ms = 750
-nice_value = 15
 log_timing = true
 
 [inlay_hint]
@@ -215,9 +232,7 @@ autoarg_on_save = true
     CHECK(cfg.design.define[1] == "FAST_MODEL");
 
     CHECK(cfg.compilation.background_compilation == true);
-    CHECK(cfg.compilation.background_compilation_threads == 2);
     CHECK(cfg.compilation.background_compilation_debounce_ms == 750);
-    CHECK(cfg.compilation.nice_value == 15);
     CHECK(cfg.compilation.log_timing == true);
 
     CHECK(cfg.inlay_hint.enable == false);
@@ -363,9 +378,7 @@ define = ["RTL_SIM", 123, false]
 
 [compilation]
 background_compilation = "yes"
-background_compilation_threads = 0
 background_compilation_debounce_ms = -1
-nice_value = 20
 log_timing = 1
 
 [format]
@@ -437,8 +450,6 @@ use_named_arguments = "yes"
     CHECK(has_error("[design].define[1]: expected string, got integer"));
     CHECK(has_error("[design].define[2]: expected string, got boolean"));
     CHECK(has_error("[compilation].background_compilation: expected boolean, got string"));
-    CHECK(has_error("[compilation].background_compilation_threads: integer 0 out of range [1, 1024]"));
-    CHECK(has_error("[compilation].nice_value: integer 20 out of range [-20, 19]"));
     CHECK(has_error("[format].indent_size: integer 0 out of range [1, 64]"));
     CHECK(has_error("[format].default_indent_level_inside_outmost_block: integer 2 out of range [0, 1]"));
     CHECK(has_error("[format].format_off_comment_pattern: expected string, got boolean"));
@@ -457,8 +468,6 @@ use_named_arguments = "yes"
     REQUIRE(cfg.design.define.size() == 1);
     CHECK(cfg.design.define[0] == "RTL_SIM");
     CHECK(cfg.compilation.background_compilation == false);
-    CHECK(cfg.compilation.background_compilation_threads == 1);
-    CHECK(cfg.compilation.nice_value == 10);
     CHECK(cfg.format.indent_size == 2);
     CHECK(cfg.format.default_indent_level_inside_outmost_block == 1);
     CHECK(cfg.format.function_call.arg_count == -1);

@@ -20,12 +20,17 @@ struct BackgroundCompileResult {
     std::unordered_map<std::string, uint64_t> uri_versions;
 };
 
+/// Worker count and thread priority are not user-configurable.  Every worker
+/// compiles the whole design rather than sharing one compile, so a second
+/// worker only lets a newer snapshot start before an older one finishes -- at
+/// the cost of a duplicated full-design compilation whose result the generation
+/// check usually discards.  CPU count is not the binding resource here, peak
+/// memory is, so the useful value is 1 on every machine size.
 struct BackgroundCompilerConfig {
     bool enabled{false};
     int thread_count{1};
     int debounce_ms{1500};
     bool log_timing{false};
-    int nice_value{10};
 };
 
 class BackgroundCompiler {
@@ -65,7 +70,6 @@ class BackgroundCompiler {
     bool enabled_{false};
     std::atomic<bool> log_timing_{false};
     int debounce_ms_{1500};
-    int nice_value_{10};
     size_t next_worker_id_{0};
     uint64_t latest_generation_{0};
     bool pending_{false};

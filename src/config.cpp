@@ -264,14 +264,9 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
             read_bool(p, "background_compilation",
                       "[compilation].background_compilation",
                       cfg.compilation.background_compilation, value_errors);
-            read_int(p, "background_compilation_threads",
-                     "[compilation].background_compilation_threads", 1, 1024,
-                     cfg.compilation.background_compilation_threads, value_errors);
             read_int(p, "background_compilation_debounce_ms",
                      "[compilation].background_compilation_debounce_ms", 0, 600000,
                      cfg.compilation.background_compilation_debounce_ms, value_errors);
-            read_int(p, "nice_value", "[compilation].nice_value", -20, 19,
-                     cfg.compilation.nice_value, value_errors);
             read_bool(p, "log_timing", "[compilation].log_timing",
                       cfg.compilation.log_timing, value_errors);
         }

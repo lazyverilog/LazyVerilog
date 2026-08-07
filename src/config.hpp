@@ -11,9 +11,7 @@ struct DesignConfig {
 
 struct CompilationConfig {
     bool background_compilation{false};
-    int background_compilation_threads{1};
     int background_compilation_debounce_ms{1500};
-    int nice_value{10};
     bool log_timing{false};
 };
 

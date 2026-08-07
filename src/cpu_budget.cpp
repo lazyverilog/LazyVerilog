@@ -7,9 +7,13 @@
 #include <thread>
 
 #ifdef __linux__
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <sched.h>
+#include <sys/resource.h>
 #endif
 
 #ifdef _WIN32
@@ -243,4 +247,23 @@ unsigned available_cpu_count() {
         return std::min(limit, hardware);
     }
     return limit == kUnlimited ? 1u : limit;
+}
+
+void apply_background_thread_nice(int nice_value) {
+#ifdef __linux__
+    errno = 0;
+    const int current = getpriority(PRIO_PROCESS, 0);
+    if (current == -1 && errno != 0)
+        return;
+    if (current >= nice_value)
+        return;
+
+    errno = 0;
+    if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {
+        std::cerr << "[lazyverilog] background worker setpriority(" << nice_value
+                  << ") failed: " << std::strerror(errno) << "\n";
+    }
+#else
+    (void)nice_value;
+#endif
 }
