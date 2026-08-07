@@ -2,6 +2,7 @@
 #include "../analyzer.hpp"
 #include "../dynamic_file_index.hpp"
 #include "../string_utils.hpp"
+#include "../syntax_index_shared.hpp"
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -28,12 +29,7 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
     d.message  = std::move(msg);
     if (loc.valid()) {
         try {
-            auto file_name = sm.getFileName(loc);
-            if (!file_name.empty()) {
-                d.uri = std::string(file_name);
-                if (!d.uri.starts_with("file://"))
-                    d.uri = uri_from_path(d.uri);
-            }
+            d.uri = uri_from_source_location(sm, loc);
         } catch (const std::exception& e) {
             // URI attribution failures should not drop the diagnostic, but they
             // also should not be invisible: clients will fall back to the

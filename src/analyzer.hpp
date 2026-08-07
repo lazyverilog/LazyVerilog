@@ -378,12 +378,14 @@ class Analyzer {
     // blocking behind a full .f parse.
     mutable std::condition_variable_any background_cv_;
     mutable std::deque<std::string> background_pending_files_;
-    mutable bool background_index_active_{false};
+    // Number of workers currently parsing a file.  Idle/publish decisions need
+    // the count, not a flag, because several workers drain the queue at once.
+    mutable int background_index_active_{0};
     mutable bool background_publish_requested_{false};
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
     mutable uint64_t background_generation_{0};
-    mutable std::thread background_indexer_;
+    mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 
     struct VersionedSemanticDiags {

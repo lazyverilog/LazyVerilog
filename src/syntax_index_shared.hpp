@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,6 +26,21 @@ class SyntaxTree;
 /// for in-memory buffers; real file paths are normalised through uri_from_path().
 std::string uri_from_file_name(std::string_view file_name);
 
+/// Create a SourceManager configured the way every lazyverilog parse wants it.
+///
+/// slang otherwise runs weakly_canonical() on each candidate path it probes
+/// while resolving an `include, and a miss walks the whole directory prefix
+/// with canonical().  With N include directories that is N canonicalisations
+/// per include per parsed file, which on a shared/HPC filesystem turns project
+/// indexing into a metadata-call storm.  Disabling proximate paths keeps the
+/// probe down to the failed open itself; buffer paths stay absolute and are
+/// canonicalised once by uri_from_source_buffer().
+std::unique_ptr<slang::SourceManager> make_lsp_source_manager();
+
+/// Convert a SourceManager buffer to a URI using its absolute full path,
+/// returning an empty string for invalid or non-file-backed buffers.
+std::string uri_from_source_buffer(const slang::SourceManager& sm, slang::BufferID buffer);
+
 /// Convert a SourceManager location to a URI, returning an empty string for
 /// invalid or non-file-backed locations.
 std::string uri_from_source_location(const slang::SourceManager& sm,
@@ -44,12 +60,12 @@ SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::Source
 /// build-only helper.
 ///
 /// The lookup is two-level because slang allocates a fresh BufferID for every
-/// macro expansion, while every one of those buffers reports the same file
-/// name.  Keying only on the buffer therefore misses on almost every token in
-/// macro-heavy code and re-canonicalizes a path that always resolves to the
-/// same file.  The name level absorbs those misses; the buffer level stays in
-/// front of it because getFileName() itself walks the expansion chain under a
-/// SourceManager lock.
+/// macro expansion, while every one of those buffers expands inside the same
+/// file buffer.  Keying only on the raw buffer therefore misses on almost every
+/// token in macro-heavy code and re-canonicalizes a path that always resolves
+/// to the same file.  The expanded-buffer level absorbs those misses; the raw
+/// buffer level stays in front of it because walking the expansion chain takes
+/// a SourceManager lock.
 class SourceFileIdResolver {
 public:
     SourceFileID for_token(SyntaxIndex& index, const slang::SourceManager& sm,
@@ -58,17 +74,8 @@ public:
                               slang::SourceLocation location);
 
 private:
-    // Transparent hash so the name lookup can be done on the string_view
-    // returned by getFileName() without allocating a std::string per miss.
-    struct TransparentStringHash {
-        using is_transparent = void;
-        size_t operator()(std::string_view text) const noexcept {
-            return std::hash<std::string_view>{}(text);
-        }
-    };
-
     std::unordered_map<uint32_t, SourceFileID> by_buffer_;
-    std::unordered_map<std::string, SourceFileID, TransparentStringHash, std::equal_to<>> by_name_;
+    std::unordered_map<uint32_t, SourceFileID> by_expanded_buffer_;
 };
 
 /// Safely return a token's user-facing value text, or an empty string for a

@@ -122,7 +122,8 @@ static std::optional<BufferID> find_current_buffer(const SourceManager& sm,
             return buffer;
         if (sm.getRawFileName(buffer) == uri || sm.getRawFileName(buffer) == path)
             return buffer;
-        if (sm.getFullPath(buffer).string() == path)
+        if (const auto& full_path = sm.getFullPath(buffer);
+            !full_path.empty() && normalize_filesystem_path(full_path).string() == path)
             return buffer;
     }
     return std::nullopt;

@@ -116,6 +116,7 @@ set(LAZYVERILOG_SOURCES
     src/main.cpp
     src/server.cpp
     src/config.cpp
+    src/cpu_budget.cpp
     src/filelist.cpp
     src/analyzer.cpp
     src/dynamic_file_index.cpp
@@ -162,6 +163,7 @@ enable_testing()
 set(LAZYVERILOG_TEST_SOURCES
     tests/test_main.cpp
     tests/test_config.cpp
+    tests/test_cpu_budget.cpp
     tests/test_path_uri.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
@@ -184,6 +186,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/autoinst.cpp
     src/features/autoarg.cpp
     src/config.cpp
+    src/cpu_budget.cpp
     src/filelist.cpp
     src/analyzer.cpp
     src/dynamic_file_index.cpp
@@ -227,6 +230,18 @@ add_executable(parse-bench
     src/syntax_index_shared.cpp)
 target_include_directories(parse-bench PRIVATE src)
 target_link_libraries(parse-bench PRIVATE slang::slang)
+
+add_executable(index-bench
+    tools/index_bench.cpp
+    src/analyzer.cpp
+    src/config.cpp
+    src/cpu_budget.cpp
+    src/filelist.cpp
+    src/dynamic_file_index.cpp
+    src/syntax_index.cpp
+    src/syntax_index_shared.cpp)
+target_include_directories(index-bench PRIVATE src)
+target_link_libraries(index-bench PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
 add_executable(lazyverilog-fmt tools/fmt_file.cpp src/features/formatter.cpp src/config.cpp)
 target_include_directories(lazyverilog-fmt PRIVATE src)

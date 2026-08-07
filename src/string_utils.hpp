@@ -3,9 +3,11 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 inline std::string trim_copy(std::string text) {
@@ -99,15 +101,41 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     // Without this, two code paths that resolve the same on-disk file through
     // different OS APIs can disagree on its URI string even though they name
     // the same file.
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(path, ec);
-    if (!ec)
-        return canonical.lexically_normal();
+    //
+    // weakly_canonical stats every component of the path, so a deep project path
+    // costs a whole chain of metadata calls.  On shared/HPC filesystems each of
+    // those is a network round trip, and startup normalizes the same filelist,
+    // include, and buffer paths over and over (once per configured file, again
+    // per background parse, again per URI conversion).  Memoize by input
+    // spelling: a path that resolves on disk does not change spelling while the
+    // server is alive, and a not-yet-created file resolves through its existing
+    // parent directory, so its result is stable across creation too.
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, std::string> cache;
 
-    auto absolute = std::filesystem::absolute(path, ec);
-    if (ec)
-        absolute = path;
-    return absolute.lexically_normal();
+    auto key = path.string();
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (const auto it = cache.find(key); it != cache.end())
+            return std::filesystem::path(it->second);
+    }
+
+    std::error_code ec;
+    auto result = std::filesystem::weakly_canonical(path, ec);
+    if (!ec) {
+        result = result.lexically_normal();
+    } else {
+        result = std::filesystem::absolute(path, ec);
+        if (ec)
+            result = path;
+        result = result.lexically_normal();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.insert_or_assign(std::move(key), result.string());
+    }
+    return result;
 }
 
 inline bool is_windows_drive_path(std::string_view text) {
