@@ -771,3 +771,174 @@ cmake --build build -j$(nproc)
 ./build/index-bench <project-root-containing-lazyverilog.toml> 3
 LAZYVERILOG_TRACE_PERF=1 ./build/index-bench <project-root> 1
 ```
+
+# Round 5: the round-4 header cache had a scaling cost, plus four smaller leaks
+
+Branch `perf/project-index-startup`, commits `bda38ec`, `2b4cf18`, `2991fb5`,
+`3f43c92`, `f2b3b26`, `6a06623`.  Measured against `5b3a363` (the round-4
+endpoint) on the same machine.  Per-commit numbers are in `PERF_COMP.md`.
+
+This round started from a review of the branch rather than from a user report,
+so the first job was building a corpus that could show what OpenTitan hides.
+
+## The corpus OpenTitan was hiding
+
+OpenTitan has 39 `.svh` files totalling 732 KB, so anything whose cost scales
+with *total header bytes* is invisible there.  `hdr100` and `hdr200` are 300
+generated modules that each `` `include `` two of 100 (9.7 MB) or 200 (19.6 MB)
+distinct headers.  Same file count, same shard count; only the header
+population differs — which makes a header-bytes term show up as the difference
+between the two.
+
+## 1. Seeding offered every cached header to every file (`3f43c92`)
+
+Round 4's improvement 3 (`910eb6d`) caches header text for the duration of an
+indexing burst so a shared header is read once instead of once per including
+file.  `preload_cached_header_texts()` offered the **whole** cache to **every**
+parse, and `slang::SourceManager::assignText` copies the text into that parse's
+SourceManager.  Cost was therefore `O(files x total cached header bytes)`,
+bounded only by the cache's 32 MB cap, while the benefit only ever applied to
+the headers a file actually includes.
+
+Measured by disabling the preload behind a temporary env flag:
+
+| corpus | preload on | preload off |
+|---|---|---|
+| opentitan | 296 ms, 1.68 s user, 392 MB | 295 ms, 1.62 s user, 386 MB |
+| hdr100 | 435 ms, 3.18 s user, 389 MB | 343 ms, 2.51 s user, 281 MB |
+| hdr200 | 537 ms, 3.84 s user, 508 MB | 350 ms, 2.55 s user, 279 MB |
+
+Doubling header bytes left the preload-off column flat and cost the preload-on
+column +100 ms and +120 MB.  PERF_COMP.md's reading of `910eb6d` as "free, and
+not visible here" was right for the corpora it was measured on and wrong in
+general.
+
+The fix keeps the cache and narrows the offer.  `HeaderTextCache` now counts
+parses per burst and hits per header, and `seed_candidates()` returns only
+headers that at least half the burst's parses included.  A header every file
+includes stays on offer, which is the HPC shape the cache was built for; a
+header that one file of hundreds included drops off, which is the fan-out that
+cost the copies.  Deciding this per file from the file's own prior shard was the
+other option, but that seeds nothing on a cold burst, which is exactly when the
+saved reads matter.
+
+The result beats both extremes — hdr200 lands at 342 ms against 350 ms with the
+cache disabled outright — because shared headers are still seeded.
+
+## 2. Shards were deep-copied under the global lock (`bda38ec`)
+
+`background_index_loop()` did `SyntaxIndex committed_index = state->index;`
+while holding `map_mutex_`.  `state` is a local `shared_ptr` dropped on the next
+line, so this copied every vector and hash map in the shard — the largest object
+the indexer produces — inside the one mutex every worker and every request
+handler shares.  It is now moved out of the dying `DocumentState` and wrapped
+*before* the lock is taken.
+
+Worth 20-40 ms and 8-20 MB on every corpus, which makes it the second largest
+item of the round despite being a one-line change.
+
+## 3. Include fanout re-queued dependents per keystroke (`2991fb5`)
+
+`change()` and `parse_worker_loop()` push every dependent open buffer and every
+dependent shard onto `background_pending_files_` on each parse commit, and the
+deque had no membership test.  A header included by 300 files queued 300
+reparses per keystroke; ten characters queued 3000.  The same commit path bumps
+`background_generation_` — discarding in-flight worker results and the header
+cache — and re-arms the publish debounce, so a fast typist could keep the
+project index from ever republishing.
+
+`queue_background_file_locked()` now keeps a membership set beside the deque.  A
+path leaves the set when a worker *pops* it rather than when the parse commits,
+so an edit that lands mid-parse still re-queues the file.
+
+This is the round-4 plan's step 3, recorded there as "correctness-neutral but
+wasteful"; the per-keystroke amplification is the larger half of it.
+
+## 4. A conditional expression that deep-copied a vector (`2b4cf18`)
+
+Both dependent-scan loops read:
+
+```cpp
+entry.index ? entry.index->include_dependencies : std::vector<std::string>{}
+```
+
+The operands are a `const vector&` and a prvalue `vector`, so the common type is
+a prvalue: every shard's dependency list was copied on every commit, under
+`map_mutex_`.  1082 copies per edit on OpenTitan.  Now a null check and an
+in-place read.
+
+## 5. Diagnostics formatted for files that discard them (`f2b3b26`)
+
+Round-3 item A, open until now.  `make_file_state_with_options()` always ran
+`collect_parse_diagnostics()`, which renders every message through
+`DiagnosticEngine::formatMessage` and resolves its line — and the background
+index path keeps only `state->index` and drops the rest.  Now gated behind a
+`collect_diagnostics` parameter, false from the indexer.
+
+Round 3 estimated a 0.9 s upper bound.  The real figure depends entirely on how
+many diagnostics the project produces: OpenTitan parses clean and moves ~9 ms,
+while `hdr200` moves 385 -> 344 ms and 2.86 -> 2.56 s of user CPU.  A checkout
+with missing defines or `+incdir+` entries is the case that pays.
+
+## 6. Parse config re-copied per file (`6a06623`)
+
+The dequeue block copied `defines_` and `include_dirs_` for each of the
+thousands of filelist entries, inside `map_mutex_`.  Every writer of those
+vectors bumps the background generation before any later work can be queued, so
+the worker now keeps one copy per generation.  Flat on these corpora, which
+configure 0 defines and 1 include dir; it scales with config size, not with file
+count.
+
+## Measured
+
+Ryzen 5 5600X (6C/12T), ext4 on NVMe, RelWithDebInfo, page cache warm, idle
+machine, 3 runs each, `5b3a363` -> `6a06623`:
+
+| Corpus | all CPUs | 1 CPU | user | maxRSS |
+|---|---|---|---|---|
+| opentitan (1082 shards) | 305 -> **279 ms** | 1340 -> **1301 ms** | 1.67 -> **1.61 s** | 384 -> **374 MB** |
+| hdr100 (300 shards) | 443 -> **340 ms** | 1990 -> **1781 ms** | 3.21 -> **2.52 s** | 391 -> **275 MB** |
+| hdr200 (300 shards) | 571 -> **342 ms** | 2243 -> **1795 ms** | 4.07 -> **2.54 s** | 509 -> **285 MB** |
+| shared2 (60 shards) | 206 -> **190 ms** | 948 -> **954 ms** | 1.45 -> **1.34 s** | 269 -> **250 MB** |
+
+Shard counts were identical at every commit and configuration.
+
+hdr200 is the headline: 1.7x faster and 1.8x smaller, and it no longer costs
+more than hdr100, so the header-bytes term is gone rather than reduced.
+
+Items 3 and 4 are edit-path costs.  A cold-startup benchmark queues each file
+once and applies no edits, so both measure flat here by construction; their
+evidence is the code path, not these numbers.
+
+## What was investigated and left alone
+
+`normalize_filesystem_path()` memoizes behind one process-global mutex and
+allocates twice per hit, and it is called from the per-file dequeue while
+`map_mutex_` is already held.  It looked like a candidate for why eight workers
+buy 4.5x rather than 8x.  Counting the calls with a temporary atomic settled it:
+**31,216 calls for a whole OpenTitan run**, about 29 per file, so at most ~5% of
+user CPU including the allocations, and negligible contention at that rate.
+Left unchanged.
+
+## Still open from earlier rounds
+
+- Round-3 item B (`collect_include_dependency_uris`), item D (double
+  canonicalization in `make_file_state_with_options`).
+- The resolver's second cache level and its `` `line `` hazard (round 4).
+- Plan step 5: longest-first scheduling.  Still FIFO, so the tail file can
+  strand one worker while the rest idle.
+- Plan step 6: no ThreadSanitizer run has been done on the pool.
+
+## Reproduce
+
+```bash
+cmake --build build -j$(nproc)
+tools/startup_bench.py                      # opentitan, full CPU
+tools/startup_bench.py --cpus 0             # one-CPU slice
+```
+
+The `hdr100` / `hdr200` / `shared2` corpora are generated, not checked in: N
+modules each including two of M headers, one `+incdir+`.  Any generator of that
+shape reproduces the header-bytes term.  The property that matters is many
+distinct headers with low per-header fan-in, which is what separates hdr100 and
+hdr200 from `shared2`.
