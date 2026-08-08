@@ -1,7 +1,9 @@
 #include "analyzer.hpp"
 #include "features/folding_range.hpp"
+#include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <tuple>
@@ -1134,4 +1136,61 @@ endmodule
     // document's coordinates.
     CHECK(has_fold_kind(folds, 3, 4, "declarations"));
     CHECK_FALSE(has_fold(folds, 0, 4));
+}
+
+TEST_CASE("foldingRange: AST folds survive a symlinked document directory", "[folding]") {
+    // Locating the document's buffer compares the client's path spelling against
+    // the SourceManager's.  Those two must be canonicalized the same way, or the
+    // lookup fails and every AST-derived fold silently disappears while
+    // token-scan folds keep working.
+    //
+    // This is not hypothetical: macOS resolves /tmp to /private/tmp and Windows
+    // resolves a drive-relative path to a drive-qualified one, so on those
+    // platforms an uncanonicalized comparison never matches.  A symlinked
+    // directory reproduces the same mismatch on Linux.
+    namespace fs = std::filesystem;
+    const auto real_dir = fs::temp_directory_path() / "lazyverilog_fold_symlink_real";
+    const auto link_dir = fs::temp_directory_path() / "lazyverilog_fold_symlink_link";
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
+    fs::create_directories(real_dir);
+    std::error_code ec;
+    fs::create_directory_symlink(real_dir, link_dir, ec);
+    if (ec)
+        SUCCEED("symlinks unavailable on this platform");
+    else {
+        Analyzer analyzer;
+        // Build the URI from the uncanonicalized spelling on purpose.  A client
+        // sends the path the user opened, not its resolved form, and
+        // uri_from_path() would canonicalize the symlink away and hide the very
+        // mismatch under test.
+        const std::string uri = "file://" + link_dir.string() + "/fold_symlinked.sv";
+        analyzer.open(uri, R"(package types_pkg;
+    typedef struct packed {
+        logic valid;
+        logic [7:0] data;
+    } payload_t;
+endpackage
+
+module top;
+    typedef enum logic [1:0] {
+        IDLE,
+        BUSY
+    } state_e;
+
+    state_e              state_q;
+    types_pkg::payload_t payload_q;
+    logic                valid_q;
+endmodule
+)");
+        auto folds = provide_folding_range(analyzer, make_params(uri));
+
+        // Identifier-led user-defined declarations only fold through the AST
+        // pass, so this range is exactly the one that vanishes when buffer
+        // lookup fails.
+        CHECK(has_fold_kind(folds, 13, 15, "declarations"));
+    }
+
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
 }
