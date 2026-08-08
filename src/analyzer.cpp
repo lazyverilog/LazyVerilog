@@ -428,7 +428,12 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         }
 
         for (const auto& [extra_uri, entry] : extra_cache_) {
-            if (docs_.contains(extra_uri) || !index_depends_on_changed_uri(entry.index ? entry.index->include_dependencies : std::vector<std::string>{}))
+            // Test the shard's dependency list in place.  Offering a
+            // `std::vector<std::string>{}` fallback made the conditional
+            // expression a prvalue, so every shard's list was deep-copied on
+            // every edit, under map_mutex_.
+            if (docs_.contains(extra_uri) || !entry.index ||
+                !index_depends_on_changed_uri(entry.index->include_dependencies))
                 continue;
             background_pending_files_.push_front(entry.path);
             queued_dependent = true;
@@ -527,7 +532,10 @@ void Analyzer::parse_worker_loop() {
                     queued_dependent = true;
                 }
                 for (const auto& [extra_uri, entry] : extra_cache_) {
-                    if (docs_.contains(extra_uri) || !index_depends_on_changed_uri(entry.index ? entry.index->include_dependencies : std::vector<std::string>{}))
+                    // See change(): the vector fallback in the conditional
+                    // expression deep-copied every shard's dependency list.
+                    if (docs_.contains(extra_uri) || !entry.index ||
+                        !index_depends_on_changed_uri(entry.index->include_dependencies))
                         continue;
                     background_pending_files_.push_front(entry.path);
                     queued_dependent = true;
