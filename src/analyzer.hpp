@@ -18,6 +18,69 @@
 #include <utility>
 #include <vector>
 
+/// Text of `include`d headers seen during the current background indexing burst.
+///
+/// Every project file is parsed through its own SourceManager, so a header that
+/// hundreds of files include is opened and read once per including file.  slang
+/// consults its own lookup cache before touching the filesystem
+/// (SourceManager::openCached), so seeding known header text with assignText()
+/// removes that repeated I/O.  On a workstation this is nearly free either way;
+/// on a shared/HPC filesystem each avoided open is a network round trip.
+///
+/// The cache deliberately lives no longer than one indexing burst and is cleared
+/// when the queue drains.  A header edited while the server is idle is therefore
+/// always re-read from disk on the next parse, so cached text can never outlive
+/// the work it was collected for.
+struct HeaderTextCache {
+    /// Total cached bytes allowed.  A design whose headers exceed this keeps the
+    /// first ones seen; seeding is an optimization, and a partial cache is
+    /// simply a partial win.
+    static constexpr size_t kMaxBytes = 32u << 20;
+
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> texts;
+    size_t bytes{0};
+    /// Background generation these texts were collected under.  Every path that
+    /// invalidates parse results — config reload, a changed header, a changed
+    /// open buffer — already bumps that counter, so comparing it is enough to
+    /// drop text that a newer generation must re-read.  Workers do the dropping
+    /// themselves, which keeps this mutex off map_mutex_'s lock order.
+    uint64_t generation{0};
+
+    void store(uint64_t gen, const std::string& path, std::string_view text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        discard_stale(gen);
+        if (bytes + text.size() > kMaxBytes || texts.contains(path))
+            return;
+        bytes += text.size();
+        texts.emplace(path, std::make_shared<const std::string>(text));
+    }
+
+    /// Copy out shared pointers so seeding does not hold the lock while slang
+    /// copies text into a SourceManager.
+    std::vector<std::pair<std::string, std::shared_ptr<const std::string>>>
+    snapshot(uint64_t gen) {
+        std::lock_guard<std::mutex> lock(mutex);
+        discard_stale(gen);
+        return {texts.begin(), texts.end()};
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        texts.clear();
+        bytes = 0;
+    }
+
+private:
+    void discard_stale(uint64_t gen) {
+        if (gen == generation)
+            return;
+        texts.clear();
+        bytes = 0;
+        generation = gen;
+    }
+};
+
 struct SymbolInfo {
     std::string name;
     std::string kind; // module, port, signal, instance, etc.
@@ -385,6 +448,9 @@ class Analyzer {
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
     mutable uint64_t background_generation_{0};
+    // Guarded by its own mutex, never by map_mutex_: workers touch it while
+    // parsing, which happens outside the analyzer lock.
+    mutable HeaderTextCache background_header_texts_;
     mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 
