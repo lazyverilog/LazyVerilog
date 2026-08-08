@@ -1033,6 +1033,11 @@ TEST_CASE("completion: project index shard follows live edits to extra file", "[
     // shard.  The stale old_live_pkg symbols from the original disk parse
     // should not survive in project-aware completion.
     analyzer.open(lib_uri, new_lib_text);
+    // Replacing a shard republishes the project index asynchronously, after the
+    // configured debounce.  Completion answers from the last published snapshot,
+    // so querying without waiting races that publish and can still observe the
+    // pre-edit shard.
+    analyzer.wait_for_background_index_idle();
 
     auto [line, col] = pos_of(use_text, "new_live_pkg::");
     auto result = complete_at(engine, analyzer, use_uri, line,
@@ -1045,6 +1050,7 @@ TEST_CASE("completion: project index shard follows live edits to extra file", "[
         "    old_live_pkg::\n"
         "endmodule\n";
     analyzer.change(use_uri, stale_query_text);
+    analyzer.wait_for_background_index_idle();
     auto [old_line, old_col] = pos_of(stale_query_text, "old_live_pkg::");
     auto stale_result = complete_at(engine, analyzer, use_uri, old_line,
                                     old_col + (int)std::string("old_live_pkg::").size());
