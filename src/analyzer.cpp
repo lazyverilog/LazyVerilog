@@ -4221,6 +4221,11 @@ void Analyzer::background_index_loop() const {
             continue;
         }
 
+        // Take the shard out of the dying DocumentState and wrap it before
+        // locking.  Copying it under map_mutex_ deep-copied every vector and
+        // map in the index while all workers and request handlers waited.
+        auto committed_index = std::make_shared<SyntaxIndex>(std::move(state->index));
+
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
@@ -4239,12 +4244,10 @@ void Analyzer::background_index_loop() const {
                 continue;
             }
 
-            SyntaxIndex committed_index = state->index;
-
             extra_cache_[uri] = ExtraFileCacheEntry{
                 .path = path_string,
                 .uri = uri,
-                .index = std::make_shared<SyntaxIndex>(std::move(committed_index)),
+                .index = std::move(committed_index),
             };
             invalidate_extra_snapshots_locked();
 
