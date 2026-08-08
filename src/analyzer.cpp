@@ -188,7 +188,7 @@ header_cache_excluded_paths(const std::vector<OpenTextOverlay>& open_overlays,
 
 /// Seed already-known header text so slang resolves `include from its own cache
 /// instead of the filesystem.  See HeaderTextCache for why this is scoped to one
-/// indexing burst.
+/// indexing burst, and why only headers the burst widely shares are offered.
 ///
 /// The exclusion check is not redundant with store_header_texts() skipping open
 /// buffers: a file can be opened *during* a burst, and didOpen does not bump the
@@ -197,7 +197,7 @@ header_cache_excluded_paths(const std::vector<OpenTextOverlay>& open_overlays,
 static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCache& cache,
                                         uint64_t generation,
                                         const std::unordered_set<std::string_view>& excluded) {
-    for (const auto& [header_path, text] : cache.snapshot(generation)) {
+    for (const auto& [header_path, text] : cache.seed_candidates(generation)) {
         if (!text || excluded.contains(header_path))
             continue;
         sm.assignText(std::string_view(header_path), std::string_view(*text));
@@ -209,6 +209,7 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 static void store_header_texts(const slang::SourceManager& sm, const DocumentState& state,
                                HeaderTextCache& cache, uint64_t generation,
                                const std::unordered_set<std::string_view>& excluded) {
+    cache.note_parse(generation);
     for (const auto buffer : sm.getAllBuffers()) {
         const auto& full_path = sm.getFullPath(buffer);
         if (full_path.empty())
