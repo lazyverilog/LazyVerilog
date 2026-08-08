@@ -233,7 +233,8 @@ make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<OpenTextOverlay>& open_overlays = {},
                              bool retain_text = false,
                              HeaderTextCache* header_texts = nullptr,
-                             uint64_t generation = 0) {
+                             uint64_t generation = 0,
+                             bool collect_diagnostics = true) {
     const auto start = Clock::now();
     const auto norm = normalize_filesystem_path(path);
     const std::string norm_string = norm.string();
@@ -281,7 +282,11 @@ make_file_state_with_options(const std::filesystem::path& path,
         state->index = SyntaxIndex::build(*state->tree, sm_source, IndexDepth::Declarations);
         state->index.include_dependencies = state->include_dependencies;
     }
-    collect_parse_diagnostics(*state, uri);
+    // Formatting a diagnostic renders its message and resolves its line, and the
+    // background index path throws the result away: only the shard is committed.
+    // A project that parses with errors would pay that per file for nothing.
+    if (collect_diagnostics)
+        collect_parse_diagnostics(*state, uri);
     log_perf("make_file_state_with_options " + uri, start);
     return state;
 }
@@ -4236,7 +4241,8 @@ void Analyzer::background_index_loop() const {
 
         auto state = make_file_state_with_options(path_string, defines, include_dirs,
                                                   open_overlays, false,
-                                                  &background_header_texts_, generation);
+                                                  &background_header_texts_, generation,
+                                                  /*collect_diagnostics=*/false);
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             --background_index_active_;
