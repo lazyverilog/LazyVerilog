@@ -423,7 +423,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
             // AST / background-project-index split and can lag badly on shared
             // HPC filesystems.  The worker reparses live open buffers from
             // their in-memory text and open include overlays.
-            background_pending_files_.push_front(other_path);
+            queue_background_file_locked(other_path, /*front=*/true);
             queued_dependent = true;
         }
 
@@ -435,7 +435,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
             if (docs_.contains(extra_uri) || !entry.index ||
                 !index_depends_on_changed_uri(entry.index->include_dependencies))
                 continue;
-            background_pending_files_.push_front(entry.path);
+            queue_background_file_locked(entry.path, /*front=*/true);
             queued_dependent = true;
         }
         if (queued_dependent) {
@@ -528,7 +528,7 @@ void Analyzer::parse_worker_loop() {
                     if (other_uri == job.uri || !other_state ||
                         !depends_on_changed_uri(*other_state))
                         continue;
-                    background_pending_files_.push_front(other_state->normalized_path);
+                    queue_background_file_locked(other_state->normalized_path, /*front=*/true);
                     queued_dependent = true;
                 }
                 for (const auto& [extra_uri, entry] : extra_cache_) {
@@ -537,7 +537,7 @@ void Analyzer::parse_worker_loop() {
                     if (docs_.contains(extra_uri) || !entry.index ||
                         !index_depends_on_changed_uri(entry.index->include_dependencies))
                         continue;
-                    background_pending_files_.push_front(entry.path);
+                    queue_background_file_locked(entry.path, /*front=*/true);
                     queued_dependent = true;
                 }
                 if (queued_dependent) {
@@ -576,7 +576,7 @@ void Analyzer::close(const std::string& uri) {
         // important for large buffers: closing a split should not synchronously
         // parse an include-heavy RTL file on the UI path.
         if (const auto it = extra_cache_.find(uri); it != extra_cache_.end()) {
-            background_pending_files_.push_back(it->second.path);
+            queue_background_file_locked(it->second.path, /*front=*/false);
             start_background_indexer_locked();
             background_cv_.notify_all();
         }
@@ -3563,7 +3563,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         // whole-design rescan and does not perform metadata checks for every
         // filelist entry.  The background worker will parse disk contents for a
         // closed file, or use the live DocumentState if the file is open.
-        background_pending_files_.push_front(path);
+        queue_background_file_locked(path, /*front=*/true);
         queued_changed_file = true;
     }
 
@@ -4061,6 +4061,15 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
     return build(target->name, 0, seen);
 }
 
+void Analyzer::queue_background_file_locked(std::string path, bool front) const {
+    if (!background_pending_set_.insert(path).second)
+        return;
+    if (front)
+        background_pending_files_.push_front(std::move(path));
+    else
+        background_pending_files_.push_back(std::move(path));
+}
+
 void Analyzer::start_background_indexer_locked() const {
     // Project indexing is CPU-bound and embarrassingly parallel: every
     // configured file is parsed and indexed from its own SourceManager, and an
@@ -4099,8 +4108,9 @@ void Analyzer::schedule_background_reindex_locked() const {
     // state.
     ++background_generation_;
     background_pending_files_.clear();
+    background_pending_set_.clear();
     for (const auto& path : extra_files_)
-        background_pending_files_.push_back(path);
+        queue_background_file_locked(path, /*front=*/false);
     start_background_indexer_locked();
     background_cv_.notify_all();
 }
@@ -4160,6 +4170,10 @@ void Analyzer::background_index_loop() const {
 
             path_string = std::move(background_pending_files_.front());
             background_pending_files_.pop_front();
+            // Drop membership before parsing, not after committing: an edit that
+            // lands while this parse is in flight must be able to re-queue the
+            // file rather than be swallowed as a duplicate.
+            background_pending_set_.erase(path_string);
             ++background_index_active_;
             const auto path = normalize_filesystem_path(path_string);
             path_string = path.string();
