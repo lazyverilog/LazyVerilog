@@ -395,6 +395,10 @@ class Analyzer {
         std::shared_ptr<const SyntaxIndex> index;
     };
 
+    /// Append @p path to the background queue unless it is already waiting.
+    /// @p front puts it ahead of the cold-start filelist backlog, which is what
+    /// edit-driven refreshes want.
+    void queue_background_file_locked(std::string path, bool front) const;
     void start_background_indexer_locked() const;
     void schedule_background_reindex_locked() const;
     void schedule_background_project_publish_locked() const;
@@ -441,6 +445,12 @@ class Analyzer {
     // blocking behind a full .f parse.
     mutable std::condition_variable_any background_cv_;
     mutable std::deque<std::string> background_pending_files_;
+    // Membership mirror for background_pending_files_.  Include fanout queues
+    // one entry per dependent file per commit, so editing a widely included
+    // header would otherwise append the same path once per keystroke.  A path
+    // leaves the set when a worker pops it, so an edit that lands mid-parse
+    // still re-queues the file.
+    mutable std::unordered_set<std::string> background_pending_set_;
     // Number of workers currently parsing a file.  Idle/publish decisions need
     // the count, not a flag, because several workers drain the queue at once.
     mutable int background_index_active_{0};
