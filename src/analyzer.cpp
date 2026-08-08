@@ -880,7 +880,7 @@ static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex
     }
 
     if (best_index < index.references.size())
-        return index.references[best_index].symbol_debug.str();
+        return index.references[best_index].symbol_debug;
     return std::nullopt;
 }
 
