@@ -13,7 +13,7 @@
 ///   * Linux CPU affinity mask (taskset, numactl, Slurm --cpu-bind)
 ///   * cgroup v2 cpu.max / cgroup v1 cpu.cfs_quota_us, including ancestors
 ///   * Windows process affinity mask
-///   * batch scheduler environment (Slurm, LSF, PBS) and OMP_NUM_THREADS
+///   * batch scheduler environment (Slurm, LSF, PBS)
 ///
 /// Signals that do not exist on a platform are skipped, so an unconstrained
 /// desktop falls through to hardware_concurrency() and behaves exactly as
@@ -22,6 +22,11 @@
 /// Deliberately excluded: system load average.  It is the only signal that
 /// would change the result on an idle-but-busy desktop, and it makes the worker
 /// count depend on whatever else the user happens to be running.
+///
+/// Also deliberately excluded: OMP_NUM_THREADS.  It states an OpenMP compute
+/// budget rather than the CPU slice this process owns, and HPC shell profiles
+/// commonly set it to 1 for unrelated tools; an editor inherits that and would
+/// index with a single worker.
 unsigned available_cpu_count();
 
 /// Make the calling background worker thread yield to interactive work.
