@@ -68,6 +68,57 @@ struct SymbolIDHash {
     }
 };
 
+/// Append-only process-wide pool backing InternedString.
+///
+/// Reference occurrences repeat the same few strings enormously: an OpenTitan
+/// warm-up produces 1.07M references holding only 73k distinct names and 129k
+/// distinct canonical IDs, so the per-entry std::string members cost ~110 MB to
+/// store ~13 MB of text.  Interning replaces both members with 32-bit handles.
+///
+/// Entries are never removed.  The pool is therefore bounded by the number of
+/// distinct identifiers the process has ever indexed, which is a property of the
+/// design being edited rather than of how long the server has run.
+namespace string_pool {
+
+/// Handle for the empty string.  Interning "" always yields this.
+inline constexpr uint32_t kEmptyId = 0;
+
+uint32_t intern(std::string_view text);
+std::string_view view(uint32_t id);
+
+} // namespace string_pool
+
+/// A string stored once in the process-wide pool, referenced by handle.
+///
+/// Converts to std::string_view implicitly so read sites look unchanged.
+/// Equality between two handles is an integer compare; comparing against text
+/// resolves the handle first.
+struct InternedString {
+    uint32_t id{string_pool::kEmptyId};
+
+    InternedString() = default;
+    InternedString(std::string_view text) : id(string_pool::intern(text)) {}
+    InternedString(const char* text) : id(string_pool::intern(text ? text : "")) {}
+    InternedString(const std::string& text) : id(string_pool::intern(text)) {}
+
+    std::string_view view() const { return string_pool::view(id); }
+    operator std::string_view() const { return view(); }
+    std::string str() const { return std::string(view()); }
+    bool empty() const { return id == string_pool::kEmptyId; }
+    bool starts_with(std::string_view prefix) const { return view().starts_with(prefix); }
+
+    friend bool operator==(const InternedString& a, const InternedString& b) {
+        return a.id == b.id;
+    }
+    friend bool operator==(const InternedString& a, std::string_view b) { return a.view() == b; }
+    // Exact match for string literals.  Without it, `entry.name == "clk"` is
+    // ambiguous: the literal converts equally well to std::string_view and to
+    // InternedString, and both are one user-defined conversion away.
+    friend bool operator==(const InternedString& a, const char* b) {
+        return a.view() == std::string_view(b ? b : "");
+    }
+};
+
 struct PortEntry {
     std::string name;
     SourceFileID file_id{kInvalidSourceFileID};
@@ -226,7 +277,7 @@ struct ImportEntry {
 };
 
 struct ReferenceEntry {
-    std::string name;
+    InternedString name;
     // Actual source file for this occurrence when the token came from another
     // file via `include`.
     //
@@ -267,7 +318,7 @@ struct ReferenceEntry {
     // Keep this non-authoritative string while the codebase migrates away from
     // string IDs.  It makes tests and logs understandable and lets us recognize
     // unresolved fallback IDs (`name:<identifier>`) without reversing a hash.
-    std::string symbol_debug;
+    InternedString symbol_debug;
     int line{0};    // 1-based, 0 if unknown
     int col{0};     // 0-based
     int end_col{0}; // 0-based exclusive

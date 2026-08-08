@@ -687,6 +687,31 @@ endpackage
     CHECK(merged.values[value_b->second].default_value == "2");
 }
 
+TEST_CASE("interned strings: equal text shares one handle", "[index]") {
+    // Reference entries hold handles rather than strings.  Two properties have
+    // to hold for that to be invisible to every consumer: equal text must give
+    // equal handles, and a handle must round-trip back to its exact text.
+    const InternedString a{"module_signal::memory::state"};
+    const InternedString b{std::string("module_signal::memory::state")};
+    const InternedString c{"module_signal::memory::other"};
+
+    CHECK(a == b);
+    CHECK(a.id == b.id);
+    CHECK_FALSE(a == c);
+    CHECK(a.view() == "module_signal::memory::state");
+    CHECK(a.str() == "module_signal::memory::state");
+    CHECK(a == "module_signal::memory::state");
+    CHECK(a.starts_with("module_signal::"));
+
+    // The empty string is the reserved zero handle, so a default-constructed
+    // entry keeps behaving like an empty std::string did.
+    const InternedString empty;
+    CHECK(empty.empty());
+    CHECK(empty.view().empty());
+    CHECK(empty == InternedString{""});
+    CHECK_FALSE(a.empty());
+}
+
 TEST_CASE("header text cache: a new generation drops previously cached text", "[index]") {
     // Every path that invalidates parse results bumps the background generation:
     // config reload, a changed header, a changed open buffer.  Cached text from
