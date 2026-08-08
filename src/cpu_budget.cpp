@@ -37,17 +37,23 @@ unsigned to_cpu_count(long long value) {
     return static_cast<unsigned>(std::min(value, max_value));
 }
 
-/// Batch schedulers publish the per-task CPU allocation, and OMP_NUM_THREADS is
-/// the convention HPC users already set for every tool on the node.  Only plain
-/// integer variables are read: SLURM_JOB_CPUS_PER_NODE can be written as
-/// "4(x2)", which does not describe this task's share.
+/// Batch schedulers publish the per-task CPU allocation.  Only plain integer
+/// variables are read: SLURM_JOB_CPUS_PER_NODE can be written as "4(x2)", which
+/// does not describe this task's share.
+///
+/// OMP_NUM_THREADS is deliberately not consulted.  It is an OpenMP compute
+/// budget, not a statement about the CPU slice this process owns, and HPC users
+/// routinely export OMP_NUM_THREADS=1 from a shell profile so that unrelated
+/// tools stay single-threaded.  An editor inherits that environment, and honouring
+/// it collapsed the index pool to one worker: measured 283 ms -> 1450 ms for a
+/// 60-file include-heavy project.  The scheduler variables below describe the
+/// allocation itself and are still authoritative.
 unsigned cpu_count_from_environment() {
     static constexpr const char* kVariables[] = {
         "SLURM_CPUS_PER_TASK", // Slurm
         "LSB_DJOB_NUMPROC",    // LSF
         "NCPUS",               // PBS Pro
         "PBS_NUM_PPN",         // Torque
-        "OMP_NUM_THREADS",     // de-facto convention
     };
 
     unsigned limit = kUnlimited;
@@ -239,8 +245,8 @@ unsigned available_cpu_count() {
     // Every signal above describes a restriction on what this process may use,
     // so the machine itself is still the ceiling.  Environment variables are
     // the one source that can name a larger number than the hardware offers
-    // (OMP_NUM_THREADS is routinely set optimistically); clamp rather than
-    // trust it.
+    // (a scheduler variable can survive into a shell on another node); clamp
+    // rather than trust it.
     if (const unsigned hardware = std::thread::hardware_concurrency(); hardware != 0) {
         if (limit == kUnlimited)
             return hardware;

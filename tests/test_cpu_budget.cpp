@@ -1,5 +1,6 @@
 #include "cpu_budget.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <cstdlib>
 #include <thread>
 
 TEST_CASE("cpu budget: reports a usable worker count on every platform", "[cpu]") {
@@ -19,4 +20,22 @@ TEST_CASE("cpu budget: repeated queries agree", "[cpu]") {
     // The worker pool samples this once and never resizes downward, so an
     // unstable answer would make pool sizing depend on call timing.
     CHECK(available_cpu_count() == available_cpu_count());
+}
+
+TEST_CASE("cpu budget: OMP_NUM_THREADS does not shrink the pool", "[cpu]") {
+    // HPC shell profiles routinely export OMP_NUM_THREADS=1 so unrelated tools
+    // stay single-threaded.  An editor inherits that environment, and treating
+    // it as a CPU allocation collapsed project indexing to one worker.
+    const unsigned before = available_cpu_count();
+#ifdef _WIN32
+    _putenv_s("OMP_NUM_THREADS", "1");
+#else
+    setenv("OMP_NUM_THREADS", "1", 1);
+#endif
+    CHECK(available_cpu_count() == before);
+#ifdef _WIN32
+    _putenv_s("OMP_NUM_THREADS", "");
+#else
+    unsetenv("OMP_NUM_THREADS");
+#endif
 }
