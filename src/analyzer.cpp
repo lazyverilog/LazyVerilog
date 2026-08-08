@@ -162,19 +162,90 @@ static void preload_open_text_overlays(slang::SourceManager& sm,
     }
 }
 
+/// Paths that the header text cache must not touch, in either direction.
+///
+/// The file being parsed belongs here because it must come from disk — a
+/// filelist entry can also be a header somewhere else.  Open-buffer paths belong
+/// here for two reasons: SourceManager throws if the same path is assigned
+/// twice, and unsaved editor text must win over anything cached.
+///
+/// Excluding overlays from *storing* as well keeps the invariant simple: the
+/// cache only ever holds on-disk text.  Caching unsaved text would otherwise
+/// survive the buffer being closed, since closing a file that is not itself a
+/// filelist entry does not bump the background generation.
+static std::unordered_set<std::string_view>
+header_cache_excluded_paths(const std::vector<OpenTextOverlay>& open_overlays,
+                            const std::string& own_path) {
+    std::unordered_set<std::string_view> excluded;
+    excluded.reserve(open_overlays.size() + 1);
+    excluded.insert(own_path);
+    for (const auto& overlay : open_overlays) {
+        if (!overlay.path.empty())
+            excluded.insert(overlay.path);
+    }
+    return excluded;
+}
+
+/// Seed already-known header text so slang resolves `include from its own cache
+/// instead of the filesystem.  See HeaderTextCache for why this is scoped to one
+/// indexing burst.
+///
+/// The exclusion check is not redundant with store_header_texts() skipping open
+/// buffers: a file can be opened *during* a burst, and didOpen does not bump the
+/// background generation, so the cache can still hold that path's disk text when
+/// the next file in the same burst is parsed.
+static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCache& cache,
+                                        uint64_t generation,
+                                        const std::unordered_set<std::string_view>& excluded) {
+    for (const auto& [header_path, text] : cache.snapshot(generation)) {
+        if (!text || excluded.contains(header_path))
+            continue;
+        sm.assignText(std::string_view(header_path), std::string_view(*text));
+    }
+}
+
+/// Record the headers this parse pulled in, so sibling files in the same burst
+/// can be seeded from memory instead of re-reading them.
+static void store_header_texts(const slang::SourceManager& sm, const DocumentState& state,
+                               HeaderTextCache& cache, uint64_t generation,
+                               const std::unordered_set<std::string_view>& excluded) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        const auto path_string = full_path.string();
+        if (excluded.contains(path_string))
+            continue;
+        // Only genuine `include dependencies of this parse.  Seeded buffers and
+        // open-buffer overlays also live in this SourceManager, and the
+        // dependency set is what distinguishes them.
+        if (!state.include_dependency_set.contains(uri_from_path(full_path)))
+            continue;
+        cache.store(generation, path_string, sm.getSourceText(buffer));
+    }
+}
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
                              const std::vector<std::string>& include_dirs,
                              const std::vector<OpenTextOverlay>& open_overlays = {},
-                             bool retain_text = false) {
+                             bool retain_text = false,
+                             HeaderTextCache* header_texts = nullptr,
+                             uint64_t generation = 0) {
     const auto start = Clock::now();
     const auto norm = normalize_filesystem_path(path);
+    const std::string norm_string = norm.string();
     const std::string uri = uri_from_path(norm);
 
     auto sm = make_lsp_source_manager();
     add_include_dirs(*sm, include_dirs);
-    preload_open_text_overlays(*sm, open_overlays, norm.string());
+    std::unordered_set<std::string_view> header_cache_excluded;
+    if (header_texts) {
+        header_cache_excluded = header_cache_excluded_paths(open_overlays, norm_string);
+        preload_cached_header_texts(*sm, *header_texts, generation, header_cache_excluded);
+    }
+    preload_open_text_overlays(*sm, open_overlays, norm_string);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
     slang::Bag bag;
@@ -202,6 +273,9 @@ make_file_state_with_options(const std::filesystem::path& path,
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
     state->include_dependency_set.insert(state->include_dependencies.begin(),
                                          state->include_dependencies.end());
+    if (header_texts)
+        store_header_texts(*state->source_manager, *state, *header_texts, generation,
+                           header_cache_excluded);
     if (state->tree) {
         state->index = SyntaxIndex::build(*state->tree, sm_source, IndexDepth::Declarations);
         state->index.include_dependencies = state->include_dependencies;
@@ -4064,6 +4138,13 @@ void Analyzer::background_index_loop() const {
                 auto publish_callback = publish_project_index_snapshot_locked();
                 background_cv_.notify_all();
                 lock.unlock();
+                // The queue has drained, so this burst is over.  Dropping the
+                // header text here keeps the cache from outliving the work it
+                // was collected for: the next burst re-reads whatever it needs
+                // and therefore always sees current disk contents.  Done after
+                // unlocking because the cache has its own mutex and must never
+                // be taken under map_mutex_.
+                background_header_texts_.clear();
                 if (publish_callback)
                     publish_callback();
                 continue;
@@ -4131,7 +4212,8 @@ void Analyzer::background_index_loop() const {
         }
 
         auto state = make_file_state_with_options(path_string, defines, include_dirs,
-                                                  open_overlays);
+                                                  open_overlays, false,
+                                                  &background_header_texts_, generation);
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             --background_index_active_;

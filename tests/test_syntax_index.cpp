@@ -1,6 +1,9 @@
 #include "analyzer.hpp"
+#include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <catch2/catch_test_macros.hpp>
 #include <slang/syntax/SyntaxTree.h>
@@ -682,4 +685,98 @@ endpackage
     REQUIRE(value_b != merged.package_value_by_scoped_name.end());
     CHECK(merged.values[value_a->second].default_value == "1");
     CHECK(merged.values[value_b->second].default_value == "2");
+}
+
+TEST_CASE("header text cache: a new generation drops previously cached text", "[index]") {
+    // Every path that invalidates parse results bumps the background generation:
+    // config reload, a changed header, a changed open buffer.  Cached text from
+    // an older generation must never be handed to a parse running under a newer
+    // one, or a shard would be built from text the edit already replaced.
+    HeaderTextCache cache;
+    cache.store(1, "/proj/shared.svh", "localparam int W = 8;\n");
+    REQUIRE(cache.snapshot(1).size() == 1);
+
+    auto after_bump = cache.snapshot(2);
+    CHECK(after_bump.empty());
+
+    // The cache is usable again under the new generation.
+    cache.store(2, "/proj/shared.svh", "localparam int W = 32;\n");
+    auto refilled = cache.snapshot(2);
+    REQUIRE(refilled.size() == 1);
+    CHECK(*refilled.front().second == "localparam int W = 32;\n");
+}
+
+TEST_CASE("project index: shared header text is indexed once per including file", "[index]") {
+    // Background indexing seeds already-known header text into each file's
+    // SourceManager so a shared header is not re-read once per including file.
+    // Seeding must not change what lands in a shard, and unsaved editor text
+    // must still win over anything the cache holds.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_header_text_cache";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    const auto header_path = dir / "shared.svh";
+    const auto first_path = dir / "first.sv";
+    const auto second_path = dir / "second.sv";
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    auto shared_width = [](const ProjectIndexSnapshot& snapshot) -> std::string {
+        // Every shard carries the header's declarations, so any shard answers.
+        for (const auto& shard : snapshot.shards) {
+            if (!shard.index)
+                continue;
+            for (const auto& value : shard.index->values) {
+                if (value.name == "SHARED_W")
+                    return value.default_value;
+            }
+        }
+        return {};
+    };
+
+    write_file(header_path, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    write_file(first_path, "`include \"shared.svh\"\n"
+                           "module first;\n    logic [shared_pkg::SHARED_W-1:0] a;\nendmodule\n");
+    write_file(second_path, "`include \"shared.svh\"\n"
+                            "module second;\n    logic [shared_pkg::SHARED_W-1:0] b;\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({first_path.string(), second_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // Both files include the same header, so whichever parses second in the
+    // burst is served from the cache rather than from disk.  It must still see
+    // the header's declarations.
+    const auto header_uri = uri_from_path(header_path);
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(snapshot->shards.size() == 2);
+    for (const auto& shard : snapshot->shards) {
+        REQUIRE(shard.index);
+        CHECK(std::find(shard.index->include_dependencies.begin(),
+                        shard.index->include_dependencies.end(),
+                        header_uri) != shard.index->include_dependencies.end());
+    }
+    CHECK(shared_width(*snapshot) == "8");
+
+    // Editing the header through an open buffer must reach both dependents.
+    // Cached disk text may never shadow the unsaved overlay.
+    analyzer.open(header_uri, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    analyzer.change(header_uri,
+                    "package shared_pkg;\n    localparam int SHARED_W = 32;\nendpackage\n");
+    analyzer.wait_for_background_index_idle();
+
+    auto reparsed = analyzer.project_index_snapshot();
+    REQUIRE(reparsed);
+    REQUIRE(reparsed->shards.size() == 2);
+    CHECK(shared_width(*reparsed) == "32");
+
+    fs::remove_all(dir);
 }
