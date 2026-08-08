@@ -41,6 +41,18 @@ ctest --test-dir build                          # all tests
 ./build/lazyverilog-tests "test name here"      # single named test
 ```
 
+### Startup Performance
+```bash
+tools/startup_bench.py                          # cold project-index startup, 3 runs
+tools/startup_bench.py --cpus 0                 # emulate a 1-CPU (HPC/container) slice
+tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest first
+```
+- Report all four numbers, not just wall time: index ms at full CPU, index ms at
+  `--cpus 0`, user CPU, and maxRSS.  A change can leave desktop wall time flat while
+  adding user CPU, which is exactly what hurts a node that granted one core.
+- Worker count comes from the CPU slice (`src/cpu_budget.cpp`), capped at 8.
+- Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
+
 ### Releasing a New Version
 ```bash
 ctest --test-dir build                          # test gate — must pass first
