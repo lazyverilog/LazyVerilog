@@ -435,16 +435,16 @@ std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsi
     return {line > 0 ? static_cast<int>(line) : 0, col > 0 ? static_cast<int>(col) - 1 : 0};
 }
 
-void add_reference_entry(SyntaxIndex& index, std::string_view name, SourceFileID file_id,
-                         std::string_view canonical_id, int line, int col) {
+void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file_id,
+                         std::string canonical_id, int line, int col) {
     if (name.empty())
         return;
     const auto end_col = col + static_cast<int>(name.size());
     index.references.push_back(ReferenceEntry{
-        .name = name,
+        .name = std::move(name),
         .file_id = file_id,
         .symbol_id = SymbolID::from_canonical(canonical_id),
-        .symbol_debug = canonical_id,
+        .symbol_debug = std::move(canonical_id),
         .line = line,
         .col = col,
         .end_col = end_col,
@@ -647,15 +647,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     }
 
     // === Macro preamble ===
-    auto add_macro_ref = [&](std::string_view name, SourceFileID file_id, int line, int col) {
+    auto add_macro_ref = [&](std::string name, SourceFileID file_id, int line, int col) {
         if (name.empty())
             return;
-        const std::string canonical_id = "macro::" + std::string(name);
         index.references.push_back(ReferenceEntry{
             .name = name,
             .file_id = file_id,
-            .symbol_id = SymbolID::from_canonical(canonical_id),
-            .symbol_debug = canonical_id,
+            .symbol_id = SymbolID::from_canonical("macro::" + name),
+            .symbol_debug = "macro::" + name,
             .line = line,
             .col = col,
             .end_col = col + (int)name.size(),
