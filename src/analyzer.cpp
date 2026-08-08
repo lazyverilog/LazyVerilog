@@ -4130,11 +4130,17 @@ void Analyzer::schedule_background_project_publish_locked() const {
 }
 
 void Analyzer::background_index_loop() const {
+    // Hold the parse config across files instead of copying both vectors under
+    // map_mutex_ once per filelist entry.  Every writer of defines_ /
+    // include_dirs_ bumps the background generation before any later work can
+    // be queued, so a matching generation means the copy is still current.
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+    uint64_t config_generation = std::numeric_limits<uint64_t>::max();
+
     while (!background_stop_.load()) {
         std::string path_string;
         std::string uri;
-        std::vector<std::string> defines;
-        std::vector<std::string> include_dirs;
         std::vector<OpenTextOverlay> open_overlays;
         std::shared_ptr<const DocumentState> live_doc;
         uint64_t generation = 0;
@@ -4185,8 +4191,11 @@ void Analyzer::background_index_loop() const {
             path_string = path.string();
             uri = uri_from_path(path);
             generation = background_generation_;
-            defines = defines_;
-            include_dirs = include_dirs_;
+            if (config_generation != generation) {
+                defines = defines_;
+                include_dirs = include_dirs_;
+                config_generation = generation;
+            }
             open_overlays.reserve(docs_.size());
             for (const auto& [open_uri, open_state] : docs_) {
                 if (!open_state || open_uri == uri)
