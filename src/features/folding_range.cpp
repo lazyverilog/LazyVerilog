@@ -113,17 +113,32 @@ static void emit_token_fold(std::vector<FoldingRange>& out, const LineTable& lt,
 static std::optional<BufferID> find_current_buffer(const SourceManager& sm,
                                                    std::string_view text,
                                                    const std::string& uri) {
-    std::string path = path_from_file_uri(uri);
+    const std::string path = path_from_file_uri(uri);
+    // Compare canonical spellings on both sides.  The client sends whatever path
+    // the user opened, while SourceManager reports the path it was handed, and
+    // the two only look alike on a filesystem that resolves paths to themselves.
+    // macOS resolves /tmp to /private/tmp and Windows resolves a drive-relative
+    // path to a drive-qualified one, so normalizing only one side finds nothing
+    // there -- and every AST-derived fold is silently dropped, because the
+    // visitors below skip nodes outside the buffer this returns.
+    const std::string normalized_path = normalize_filesystem_path(path).string();
 
     for (BufferID buffer : sm.getAllBuffers()) {
         if (sm.getIncludedFrom(buffer).valid())
             continue;
         if (sm.getSourceText(buffer) == text)
             return buffer;
+        // Note that getRawFileName() is a bare filename for buffers created
+        // through make_lsp_source_manager(): slang only computes a fuller
+        // "proximate" name when proximate paths are enabled, and they are
+        // deliberately disabled to keep include resolution off the metadata
+        // path.  So this matches only the assignText() spellings that already
+        // carry a full path or URI.
         if (sm.getRawFileName(buffer) == uri || sm.getRawFileName(buffer) == path)
             return buffer;
         if (const auto& full_path = sm.getFullPath(buffer);
-            !full_path.empty() && normalize_filesystem_path(full_path).string() == path)
+            !full_path.empty() &&
+            normalize_filesystem_path(full_path).string() == normalized_path)
             return buffer;
     }
     return std::nullopt;
