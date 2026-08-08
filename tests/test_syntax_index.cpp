@@ -693,17 +693,38 @@ TEST_CASE("header text cache: a new generation drops previously cached text", "[
     // an older generation must never be handed to a parse running under a newer
     // one, or a shard would be built from text the edit already replaced.
     HeaderTextCache cache;
+    cache.note_parse(1);
     cache.store(1, "/proj/shared.svh", "localparam int W = 8;\n");
-    REQUIRE(cache.snapshot(1).size() == 1);
+    REQUIRE(cache.seed_candidates(1).size() == 1);
 
-    auto after_bump = cache.snapshot(2);
+    auto after_bump = cache.seed_candidates(2);
     CHECK(after_bump.empty());
 
     // The cache is usable again under the new generation.
+    cache.note_parse(2);
     cache.store(2, "/proj/shared.svh", "localparam int W = 32;\n");
-    auto refilled = cache.snapshot(2);
+    auto refilled = cache.seed_candidates(2);
     REQUIRE(refilled.size() == 1);
     CHECK(*refilled.front().second == "localparam int W = 32;\n");
+}
+
+TEST_CASE("header text cache: only widely shared headers are offered for seeding", "[index]") {
+    // Seeding copies text into the target SourceManager, so it pays off only for
+    // headers the next parse is likely to include.  A header every file pulls in
+    // stays on offer; one that a single file of many pulled in drops off, which
+    // is what keeps a design with hundreds of distinct headers from copying all
+    // of them into every file's SourceManager.
+    HeaderTextCache cache;
+    for (int parse = 0; parse < 10; ++parse) {
+        cache.note_parse(1);
+        cache.store(1, "/proj/common.svh", "localparam int W = 8;\n");
+        if (parse == 0)
+            cache.store(1, "/proj/onlyone.svh", "localparam int X = 1;\n");
+    }
+
+    const auto candidates = cache.seed_candidates(1);
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates.front().first == "/proj/common.svh");
 }
 
 TEST_CASE("project index: shared header text is indexed once per including file", "[index]") {

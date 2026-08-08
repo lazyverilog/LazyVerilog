@@ -37,9 +37,17 @@ struct HeaderTextCache {
     /// simply a partial win.
     static constexpr size_t kMaxBytes = 32u << 20;
 
+    struct Entry {
+        std::shared_ptr<const std::string> text;
+        /// Parses in this burst that included this header.
+        size_t hits{0};
+    };
+
     mutable std::mutex mutex;
-    std::unordered_map<std::string, std::shared_ptr<const std::string>> texts;
+    std::unordered_map<std::string, Entry> texts;
     size_t bytes{0};
+    /// Parses in this burst, the denominator for the popularity rule below.
+    size_t parses{0};
     /// Background generation these texts were collected under.  Every path that
     /// invalidates parse results — config reload, a changed header, a changed
     /// open buffer — already bumps that counter, so comparing it is enough to
@@ -47,28 +55,55 @@ struct HeaderTextCache {
     /// themselves, which keeps this mutex off map_mutex_'s lock order.
     uint64_t generation{0};
 
+    /// Count one parse against the burst, whether or not it stored anything.
+    void note_parse(uint64_t gen) {
+        std::lock_guard<std::mutex> lock(mutex);
+        discard_stale(gen);
+        ++parses;
+    }
+
     void store(uint64_t gen, const std::string& path, std::string_view text) {
         std::lock_guard<std::mutex> lock(mutex);
         discard_stale(gen);
-        if (bytes + text.size() > kMaxBytes || texts.contains(path))
+        if (const auto it = texts.find(path); it != texts.end()) {
+            ++it->second.hits;
+            return;
+        }
+        if (bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
-        texts.emplace(path, std::make_shared<const std::string>(text));
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
     }
 
-    /// Copy out shared pointers so seeding does not hold the lock while slang
-    /// copies text into a SourceManager.
+    /// Headers worth seeding into the next parse, as shared pointers so seeding
+    /// does not hold the lock while slang copies text into a SourceManager.
+    ///
+    /// Seeding is not free: slang copies the text into the target
+    /// SourceManager, so offering every header the burst has seen costs
+    /// O(files x cached bytes) and buys a saved read only for the files that
+    /// actually include it.  A header at least half the burst's parses pulled
+    /// in is nearly certain to be needed again; a header one file included is
+    /// nearly certain not to be.  Restricting the offer to the former keeps the
+    /// shared-header win and drops the fan-out cost on designs with many
+    /// distinct headers.
     std::vector<std::pair<std::string, std::shared_ptr<const std::string>>>
-    snapshot(uint64_t gen) {
+    seed_candidates(uint64_t gen) {
         std::lock_guard<std::mutex> lock(mutex);
         discard_stale(gen);
-        return {texts.begin(), texts.end()};
+        std::vector<std::pair<std::string, std::shared_ptr<const std::string>>> candidates;
+        candidates.reserve(texts.size());
+        for (const auto& [path, entry] : texts) {
+            if (entry.hits * 2 >= parses)
+                candidates.emplace_back(path, entry.text);
+        }
+        return candidates;
     }
 
     void clear() {
         std::lock_guard<std::mutex> lock(mutex);
         texts.clear();
         bytes = 0;
+        parses = 0;
     }
 
 private:
@@ -77,6 +112,7 @@ private:
             return;
         texts.clear();
         bytes = 0;
+        parses = 0;
         generation = gen;
     }
 };
