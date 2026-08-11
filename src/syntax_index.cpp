@@ -503,24 +503,19 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         if (!member)
             continue;
         if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const bool any_wanted =
-                std::any_of(data->declarators.begin(), data->declarators.end(),
-                            [&](const DeclaratorSyntax* decl) {
-                                return decl && resolver.wants_declaration(index, sm, decl->name);
-                            });
-            if (!any_wanted)
-                continue;
-            const std::string type_text = render_syntax_node_text(sm, *data->type);
+            std::optional<std::string> type_text;
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
                 if (!resolver.wants_declaration(index, sm, decl->name))
                     continue;
+                if (!type_text)
+                    type_text = render_syntax_node_text(sm, *data->type);
                 auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
                 note_package_member(token_value_text(decl->name));
                 index.values.push_back(ValueEntry{
                     .name = token_value_text(decl->name),
-                    .type = with_declarator_dimensions(sm, type_text, *decl),
+                    .type = with_declarator_dimensions(sm, *type_text, *decl),
                     .kind = "variable",
                     .parent_scope = entry.name,
                     .file_id = resolver.for_token(index, sm, decl->name),
@@ -554,29 +549,25 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // owner of package parameter values: process_package() delegates
             // here rather than pushing its own duplicate ValueEntry.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                // Decided before anything is rendered: a shared header's
-                // parameter bulk would otherwise pay type and initializer
-                // rendering once per including file.
-                const bool any_wanted =
-                    std::any_of(param->declarators.begin(), param->declarators.end(),
-                                [&](const DeclaratorSyntax* decl) {
-                                    return decl &&
-                                           resolver.wants_declaration(index, sm, decl->name);
-                                });
-                if (!any_wanted)
-                    continue;
-                const std::string type_text = render_syntax_node_text(sm, *param->type);
-                const std::string kind = token_value_text(param->keyword);
+                // Rendered on the first declarator that is actually kept: a
+                // shared header's parameter bulk would otherwise pay type and
+                // initializer rendering once per including file.
+                std::optional<std::string> type_text;
+                std::string kind;
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
                     if (!resolver.wants_declaration(index, sm, decl->name))
                         continue;
+                    if (!type_text) {
+                        type_text = render_syntax_node_text(sm, *param->type);
+                        kind = token_value_text(param->keyword);
+                    }
                     auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
                     note_package_member(token_value_text(decl->name));
                     index.values.push_back(ValueEntry{
                         .name = token_value_text(decl->name),
-                        .type = type_text,
+                        .type = *type_text,
                         .kind = kind,
                         .parent_scope = entry.name,
                         .default_value = decl->initializer
@@ -975,21 +966,19 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     std::unordered_set<std::string_view> mentioned_names;
     bool mentions_ready = false;
     std::string_view scoped_text;
-    size_t included_bytes = 0;
     if (!restrict_to_uri.empty()) {
         resolver.restrict_to_uri(std::string(restrict_to_uri));
 
-        const auto scoped_path = path_from_file_uri(std::string(restrict_to_uri));
-        size_t total_bytes = 0;
-        for (const auto buffer : sm.getAllBuffers()) {
-            const auto text = sm.getSourceText(buffer);
-            total_bytes += text.size();
-            // getFullPath() normalizes, so stop asking once the scoped buffer
-            // has been identified.
-            if (scoped_text.empty() && sm.getFullPath(buffer) == scoped_path)
-                scoped_text = text;
-        }
-        included_bytes = total_bytes - scoped_text.size();
+        // @p source is the scoped file's own text only when this build owns the
+        // tree.  A header shard is built from an *includer's* tree and handed
+        // the header's text instead, and it must keep every declaration it
+        // finds, because it is the shard everyone else resolves against.
+        // Comparing against the buffer the tree root starts in tells the two
+        // apart in O(1), without normalizing any path.
+        const auto root_text = sm.getSourceText(root.sourceRange().start().buffer());
+        if (!source.empty() && root_text.data() == source.data() &&
+            root_text.size() == source.size())
+            scoped_text = source;
     }
     auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {
         if (!mentions_ready) {
@@ -998,17 +987,8 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         }
         return &mentioned_names;
     };
-
-    // Dropping header declarations has to be decided before they are collected,
-    // so it cannot look at how many there turned out to be.  Included *bytes*
-    // are the only signal available that early, and they are a loose proxy:
-    // headers heavy in macros, assertions and comments carry few declarations
-    // per byte, and filtering those costs a scan that buys nothing.  Requiring
-    // the included text to dwarf the file keeps this to the case it was built
-    // for — a file whose declaration set is almost entirely someone else's.
-    constexpr size_t kIncludeDominanceRatio = 8;
-    if (!scoped_text.empty() && included_bytes > kIncludeDominanceRatio * scoped_text.size())
-        resolver.set_mentioned_names(ensure_mentions());
+    if (!scoped_text.empty())
+        resolver.set_mentions_provider(ensure_mentions);
 
     if (const auto* compilation_unit = root.as_if<CompilationUnitSyntax>()) {
         for (const auto* member : compilation_unit->members) {
@@ -1037,12 +1017,11 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     if (depth == IndexDepth::Full)
         collect_imports(root, index, resolver, sm);
 
-    // The occurrence tables are built after collection, so here the number of
-    // values that survived is known and is exactly what the filter would trim.
-    const bool filter_tables =
-        !scoped_text.empty() && (mentions_ready || index.values.size() > scoped_text.size() / 8);
+    // Only filter the tables when collection already found something foreign to
+    // drop.  If it did not, every value in the index is this file's own and
+    // there is nothing the filter could remove.
     collect_combined_occurrences(tree, root, index, sm, restrict_to_uri,
-                                 filter_tables ? ensure_mentions() : nullptr);
+                                 mentions_ready ? &mentioned_names : nullptr);
     if (!index.source_files.empty())
         index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
 

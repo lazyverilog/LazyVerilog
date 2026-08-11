@@ -99,10 +99,12 @@ bool SourceFileIdResolver::accepts(SyntaxIndex& index, const slang::SourceManage
 
 bool SourceFileIdResolver::wants_declaration(SyntaxIndex& index, const slang::SourceManager& sm,
                                              const slang::parsing::Token& name_token) {
-    if (only_uri_.empty() || !mentioned_names_)
+    if (only_uri_.empty() || !mentions_provider_)
         return true;
     if (accepts(index, sm, name_token))
         return true;
+    if (!mentioned_names_)
+        mentioned_names_ = mentions_provider_();
     return mentioned_names_->contains(name_token.valueText());
 }
 
