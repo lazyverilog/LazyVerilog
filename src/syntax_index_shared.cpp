@@ -97,6 +97,15 @@ bool SourceFileIdResolver::accepts(SyntaxIndex& index, const slang::SourceManage
     return for_location(index, sm, location) == only_file_id_;
 }
 
+bool SourceFileIdResolver::wants_declaration(SyntaxIndex& index, const slang::SourceManager& sm,
+                                             const slang::parsing::Token& name_token) {
+    if (only_uri_.empty() || !mentioned_names_)
+        return true;
+    if (accepts(index, sm, name_token))
+        return true;
+    return mentioned_names_->contains(name_token.valueText());
+}
+
 SourceFileID SourceFileIdResolver::for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                                                 slang::SourceLocation location) {
     if (!location.valid())

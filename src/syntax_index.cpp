@@ -503,9 +503,18 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         if (!member)
             continue;
         if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
+            const bool any_wanted =
+                std::any_of(data->declarators.begin(), data->declarators.end(),
+                            [&](const DeclaratorSyntax* decl) {
+                                return decl && resolver.wants_declaration(index, sm, decl->name);
+                            });
+            if (!any_wanted)
+                continue;
             const std::string type_text = render_syntax_node_text(sm, *data->type);
             for (const auto* decl : data->declarators) {
                 if (!decl)
+                    continue;
+                if (!resolver.wants_declaration(index, sm, decl->name))
                     continue;
                 auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
                 note_package_member(token_value_text(decl->name));
@@ -545,10 +554,23 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // owner of package parameter values: process_package() delegates
             // here rather than pushing its own duplicate ValueEntry.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+                // Decided before anything is rendered: a shared header's
+                // parameter bulk would otherwise pay type and initializer
+                // rendering once per including file.
+                const bool any_wanted =
+                    std::any_of(param->declarators.begin(), param->declarators.end(),
+                                [&](const DeclaratorSyntax* decl) {
+                                    return decl &&
+                                           resolver.wants_declaration(index, sm, decl->name);
+                                });
+                if (!any_wanted)
+                    continue;
                 const std::string type_text = render_syntax_node_text(sm, *param->type);
                 const std::string kind = token_value_text(param->keyword);
                 for (const auto* decl : param->declarators) {
                     if (!decl)
+                        continue;
+                    if (!resolver.wants_declaration(index, sm, decl->name))
                         continue;
                     auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
                     note_package_member(token_value_text(decl->name));
@@ -933,10 +955,60 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
                                IndexDepth depth, std::string_view restrict_to_uri) {
     SyntaxIndex index;
     SourceFileIdResolver resolver;
-    if (!restrict_to_uri.empty())
-        resolver.restrict_to_uri(std::string(restrict_to_uri));
     const auto& sm = tree.sourceManager();
     const auto& root = tree.root();
+
+    // The words of the scoped file bound both what its occurrence tables can be
+    // asked for and which of another file's declarations it could ever resolve
+    // against.  An unrestricted build indexes every buffer the tree covers and
+    // has no such bound, so it keeps everything.
+    //
+    // The text is looked up by path rather than taken from @p source so the
+    // filter cannot be wrong about which file it is bounding.  Callers do pass
+    // the scoped file's text today, but @p source is documented only as the
+    // text to resolve instantiation end lines against, and a filter that
+    // silently drops names when that assumption stops holding would degrade
+    // resolution quietly rather than fail.  getAllBuffers() is documented as
+    // not thread safe, which is why this stays behind the restricted-build
+    // check — those run on background workers that each own their
+    // SourceManager, while unrestricted current-file builds may share one.
+    std::unordered_set<std::string_view> mentioned_names;
+    bool mentions_ready = false;
+    std::string_view scoped_text;
+    size_t included_bytes = 0;
+    if (!restrict_to_uri.empty()) {
+        resolver.restrict_to_uri(std::string(restrict_to_uri));
+
+        const auto scoped_path = path_from_file_uri(std::string(restrict_to_uri));
+        size_t total_bytes = 0;
+        for (const auto buffer : sm.getAllBuffers()) {
+            const auto text = sm.getSourceText(buffer);
+            total_bytes += text.size();
+            // getFullPath() normalizes, so stop asking once the scoped buffer
+            // has been identified.
+            if (scoped_text.empty() && sm.getFullPath(buffer) == scoped_path)
+                scoped_text = text;
+        }
+        included_bytes = total_bytes - scoped_text.size();
+    }
+    auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {
+        if (!mentions_ready) {
+            mentioned_names = collect_mentioned_names(scoped_text, tree);
+            mentions_ready = true;
+        }
+        return &mentioned_names;
+    };
+
+    // Dropping header declarations has to be decided before they are collected,
+    // so it cannot look at how many there turned out to be.  Included *bytes*
+    // are the only signal available that early, and they are a loose proxy:
+    // headers heavy in macros, assertions and comments carry few declarations
+    // per byte, and filtering those costs a scan that buys nothing.  Requiring
+    // the included text to dwarf the file keeps this to the case it was built
+    // for — a file whose declaration set is almost entirely someone else's.
+    constexpr size_t kIncludeDominanceRatio = 8;
+    if (!scoped_text.empty() && included_bytes > kIncludeDominanceRatio * scoped_text.size())
+        resolver.set_mentioned_names(ensure_mentions());
 
     if (const auto* compilation_unit = root.as_if<CompilationUnitSyntax>()) {
         for (const auto* member : compilation_unit->members) {
@@ -965,41 +1037,12 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     if (depth == IndexDepth::Full)
         collect_imports(root, index, resolver, sm);
 
-    // The words of the scoped file bound what its occurrence tables can ever be
-    // asked for.  An unrestricted build indexes every buffer the tree covers and
-    // has no such bound, so it keeps the full tables.
-    //
-    // The text is looked up by path rather than taken from @p source so the
-    // filter cannot be wrong about which file it is bounding.  Callers do pass
-    // the scoped file's text today, but @p source is documented only as the
-    // text to resolve instantiation end lines against, and a filter that
-    // silently drops names when that assumption stops holding would degrade
-    // resolution quietly rather than fail.  getAllBuffers() is documented as
-    // not thread safe, which is why this stays behind the restricted-build
-    // check — those run on background workers that each own their
-    // SourceManager, while unrestricted current-file builds may share one.
-    std::unordered_set<std::string_view> mentioned_names;
-    bool bound_by_mentions = false;
-    if (!restrict_to_uri.empty()) {
-        const auto scoped_path = path_from_file_uri(std::string(restrict_to_uri));
-        std::string_view scoped_text;
-        for (const auto buffer : sm.getAllBuffers()) {
-            if (sm.getFullPath(buffer) != scoped_path)
-                continue;
-            scoped_text = sm.getSourceText(buffer);
-            break;
-        }
-        // The filter costs one scan of the scoped file and saves two hash
-        // entries per value it removes, so it pays off only once the value table
-        // is large relative to the file being scanned.  A file that `include`s
-        // little has a small table and would only pay the scan.
-        if (!scoped_text.empty() && index.values.size() > scoped_text.size() / 8) {
-            mentioned_names = collect_mentioned_names(scoped_text, tree);
-            bound_by_mentions = true;
-        }
-    }
+    // The occurrence tables are built after collection, so here the number of
+    // values that survived is known and is exactly what the filter would trim.
+    const bool filter_tables =
+        !scoped_text.empty() && (mentions_ready || index.values.size() > scoped_text.size() / 8);
     collect_combined_occurrences(tree, root, index, sm, restrict_to_uri,
-                                 bound_by_mentions ? &mentioned_names : nullptr);
+                                 filter_tables ? ensure_mentions() : nullptr);
     if (!index.source_files.empty())
         index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
 

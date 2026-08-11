@@ -960,10 +960,10 @@ TEST_CASE("project index: a header-heavy file still resolves every name it can r
         out << text;
     };
 
-    // Enough declarations that the mention filter is worth engaging for files
-    // this small; the padding is what a real shared header contributes in bulk.
+    // The headers have to dwarf the files including them, which is the shape the
+    // filter engages for and the shape a real shared header has.
     std::string padding;
-    for (int i = 0; i < 60; ++i)
+    for (int i = 0; i < 200; ++i)
         padding += "localparam int PAD" + std::to_string(i) + " = " + std::to_string(i) + ";\n";
 
     write_file(dir / "bigdefs.svh", "logic \\esc.sig ;\n" + padding);
@@ -1042,6 +1042,24 @@ TEST_CASE("project index: a header-heavy file still resolves every name it can r
     const auto enum_member = resolved_in(scoped_uri, "HDR_IDLE");
     CHECK_FALSE(enum_member.empty());
     CHECK(enum_member != "name:HDR_IDLE");
+
+    // Where the header's declarations end up.  A name user.sv resolves against
+    // is kept in user.sv's shard; the rest of the header's bulk lives only in
+    // the header's own shard, which is what stops N includers holding N copies.
+    auto declares = [&](const std::string& uri, std::string_view name) {
+        for (const auto& shard : snapshot->shards) {
+            if (!shard.index || shard.uri != uri)
+                continue;
+            return std::any_of(shard.index->values.begin(), shard.index->values.end(),
+                               [&](const ValueEntry& value) { return value.name == name; });
+        }
+        return false;
+    };
+    const auto bigdefs_uri = uri_from_path(dir / "bigdefs.svh");
+
+    CHECK(declares(user_uri, "PAD7"));
+    CHECK_FALSE(declares(user_uri, "PAD3"));
+    CHECK(declares(bigdefs_uri, "PAD3"));
 
     fs::remove_all(dir);
 }

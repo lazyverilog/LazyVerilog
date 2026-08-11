@@ -98,11 +98,30 @@ public:
     bool accepts(SyntaxIndex& index, const slang::SourceManager& sm,
                  const slang::parsing::Token& token);
 
+    /// Restrict which out-of-scope declarations this build records.  @p names
+    /// must outlive the resolver; passing nullptr (the default) records them
+    /// all.  See collect_mentioned_names().
+    void set_mentioned_names(const std::unordered_set<std::string_view>* names) {
+        mentioned_names_ = names;
+    }
+
+    /// Whether a declaration of @p name_token belongs in this build's shard.
+    ///
+    /// Declarations in scope always do.  One from an `include`d header is kept
+    /// only when the scoped file mentions its name, because the sole reason a
+    /// scoped build carries another file's declarations is to resolve its own
+    /// tokens against them — the header's own shard is what records them for
+    /// everyone else.  A header shared by N files otherwise costs N copies of
+    /// its whole declaration set, rendered type text and all.
+    bool wants_declaration(SyntaxIndex& index, const slang::SourceManager& sm,
+                           const slang::parsing::Token& name_token);
+
 private:
     std::unordered_map<uint32_t, SourceFileID> by_buffer_;
     std::unordered_map<uint32_t, SourceFileID> by_expanded_buffer_;
     std::string only_uri_;
     SourceFileID only_file_id_{kInvalidSourceFileID};
+    const std::unordered_set<std::string_view>* mentioned_names_{nullptr};
 };
 
 /// Safely return a token's user-facing value text, or an empty string for a
