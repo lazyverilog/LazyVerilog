@@ -80,56 +80,71 @@ jobs:
           # and can exceed memory on smaller hosted runners.
           cmake --build build --config Release --parallel 2
 
-      - name: Strip and rename artifact
+      - name: Strip and rename artifacts
         shell: bash
         run: |
           # Keep the published asset names predictable while still handling both
-          # single-config generators (Linux/macOS: build/lazyverilog-lsp) and
-          # multi-config generators (Windows/MSVC: build/Release/lazyverilog-lsp.exe).
+          # single-config generators (Linux/macOS: build/<binary>) and
+          # multi-config generators (Windows/MSVC: build/Release/<binary>.exe).
           suffix="${{ matrix.executable_suffix }}"
-          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${suffix}"
-          binary="build/lazyverilog-lsp${suffix}"
-          if [[ ! -f "$binary" && -f "build/Release/lazyverilog-lsp${suffix}" ]]; then
-            binary="build/Release/lazyverilog-lsp${suffix}"
-          fi
-          if [[ ! -f "$binary" ]]; then
-            echo "Built binary not found: $binary" >&2
-            find build -type f -name "lazyverilog-lsp*" -print >&2
-            exit 1
-          fi
-          cp "$binary" "$asset"
+          for binary_name in lazyverilog-lsp lazyverilog-fmt lazyverilog-lint lazyverilog-rtltree; do
+            asset="${binary_name}-${{ inputs.version }}-${{ matrix.platform }}${suffix}"
+            binary="build/${binary_name}${suffix}"
+            if [[ ! -f "$binary" && -f "build/Release/${binary_name}${suffix}" ]]; then
+              binary="build/Release/${binary_name}${suffix}"
+            fi
+            if [[ ! -f "$binary" ]]; then
+              echo "Built binary not found: $binary" >&2
+              find build -type f -name "${binary_name}*" -print >&2
+              exit 1
+            fi
+            cp "$binary" "$asset"
 
-          # MSVC-produced Windows executables cannot be stripped with the Unix
-          # strip tool available in Git Bash.  Linux/macOS release binaries keep
-          # the existing strip behavior.
-          if [[ "${{ runner.os }}" != "Windows" ]]; then
-            strip "$asset"
-          fi
+            # MSVC-produced Windows executables cannot be stripped with the Unix
+            # strip tool available in Git Bash.  Linux/macOS release binaries keep
+            # the existing strip behavior.
+            if [[ "${{ runner.os }}" != "Windows" ]]; then
+              strip "$asset"
+            fi
+          done
 
-      - name: Generate checksum
+      - name: Generate checksums
         shell: bash
         run: |
+          # Single python invocation over every asset path (rather than one per
+          # binary inside the loop above) so this heredoc's indentation stays
+          # flush with the rest of the run block regardless of binary count.
           suffix="${{ matrix.executable_suffix }}"
-          asset="lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${suffix}"
-          python - "$asset" <<'PY'
+          assets=()
+          for binary_name in lazyverilog-lsp lazyverilog-fmt lazyverilog-lint lazyverilog-rtltree; do
+            assets+=("${binary_name}-${{ inputs.version }}-${{ matrix.platform }}${suffix}")
+          done
+          python - "${assets[@]}" <<'PY'
           import hashlib
           import pathlib
           import sys
 
-          path = pathlib.Path(sys.argv[1])
-          digest = hashlib.sha256(path.read_bytes()).hexdigest()
-          pathlib.Path(str(path) + ".sha256").write_text(
-              f"{digest}  {path.name}\n", encoding="utf-8"
-          )
+          for arg in sys.argv[1:]:
+              path = pathlib.Path(arg)
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              pathlib.Path(str(path) + ".sha256").write_text(
+                  f"{digest}  {path.name}\n", encoding="utf-8"
+              )
           PY
 
-      - name: Upload release artifact
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v7
         with:
           name: lazyverilog-release-${{ inputs.version }}-${{ matrix.platform }}
           path: |
             lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}
             lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
+            lazyverilog-fmt-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}
+            lazyverilog-fmt-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
+            lazyverilog-lint-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}
+            lazyverilog-lint-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
+            lazyverilog-rtltree-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}
+            lazyverilog-rtltree-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}.sha256
 
   publish:
     needs: [build]
@@ -159,6 +174,11 @@ jobs:
           if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z][0-9A-Za-z.-]*)?", version):
               raise SystemExit(f"invalid release version: {version}")
 
+          # lua/vscode auto-download only ever fetches lazyverilog-lsp, so the
+          # version/checksum lock stays scoped to that binary. lazyverilog-fmt,
+          # lazyverilog-lint, and lazyverilog-rtltree are still published as
+          # GitHub Release assets (see the build job and the release files:
+          # list below); they are just not auto-installed by either client.
           platforms = [
               "linux-x64",
               "linux-arm64",
@@ -316,6 +336,9 @@ jobs:
           tag_name: ${{ inputs.version }}
           files: |
             dist-release/lazyverilog-lsp-${{ inputs.version }}-*
+            dist-release/lazyverilog-fmt-${{ inputs.version }}-*
+            dist-release/lazyverilog-lint-${{ inputs.version }}-*
+            dist-release/lazyverilog-rtltree-${{ inputs.version }}-*
             dist-release/lazyverilog-${{ inputs.version }}.vsix
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
