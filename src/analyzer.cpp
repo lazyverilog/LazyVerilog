@@ -226,6 +226,26 @@ static void store_header_texts(const slang::SourceManager& sm, const DocumentSta
     }
 }
 
+/// Source text of the buffer @p uri was loaded into.
+///
+/// SyntaxIndex::build() uses the source text for one thing — finding where a
+/// module instantiation ends — and it splits that text by line.  Handing a
+/// header's build the *including* file's text would resolve those line numbers
+/// against the wrong file, so find the header's own buffer.  getAllBuffers() is
+/// documented as not thread safe; this is safe only because every background
+/// worker owns its SourceManager.
+static std::string_view header_source_text(const slang::SourceManager& sm,
+                                           const std::string& uri) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        if (uri_from_path(full_path) == uri)
+            return sm.getSourceText(buffer);
+    }
+    return {};
+}
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
@@ -234,7 +254,8 @@ make_file_state_with_options(const std::filesystem::path& path,
                              bool retain_text = false,
                              HeaderTextCache* header_texts = nullptr,
                              uint64_t generation = 0,
-                             bool collect_diagnostics = true) {
+                             bool collect_diagnostics = true,
+                             bool restrict_index_to_own_file = false) {
     const auto start = Clock::now();
     const auto norm = normalize_filesystem_path(path);
     const std::string norm_string = norm.string();
@@ -279,7 +300,12 @@ make_file_state_with_options(const std::filesystem::path& path,
         store_header_texts(*state->source_manager, *state, *header_texts, generation,
                            header_cache_excluded);
     if (state->tree) {
-        state->index = SyntaxIndex::build(*state->tree, sm_source, IndexDepth::Declarations);
+        // A restricted build indexes only this file's own declarations and
+        // occurrences; whatever it `include`s becomes one shard per header,
+        // built once per indexing burst by background_index_loop().
+        state->index = SyntaxIndex::build(
+            *state->tree, sm_source, IndexDepth::Declarations,
+            restrict_index_to_own_file ? std::string_view(uri) : std::string_view{});
         state->index.include_dependencies = state->include_dependencies;
     }
     // Formatting a diagnostic renders its message and resolves its line, and the
@@ -3644,14 +3670,21 @@ Analyzer::build_extra_file_snapshot_locked() const {
 std::shared_ptr<const std::vector<ExtraIndexInfo>>
 Analyzer::build_extra_index_snapshot_locked() const {
     auto result = std::make_shared<std::vector<ExtraIndexInfo>>();
-    result->reserve(extra_cache_.size());
-    for (const auto& [key, entry] : extra_cache_) {
+    result->reserve(extra_cache_.size() + background_header_shards_.size());
+    const auto append = [&result](const ExtraFileCacheEntry& entry) {
         result->push_back(ExtraIndexInfo{
             .path = entry.path,
             .uri = entry.uri,
             .index = entry.index,
         });
-    }
+    };
+    for (const auto& [key, entry] : extra_cache_)
+        append(entry);
+    // A file's shard no longer carries what it `include`d, so header shards have
+    // to appear here too or header declarations become invisible to every
+    // feature reading this snapshot.
+    for (const auto& [key, entry] : background_header_shards_)
+        append(entry);
     return result;
 }
 
@@ -4115,6 +4148,12 @@ void Analyzer::schedule_background_reindex_locked() const {
     ++background_generation_;
     background_pending_files_.clear();
     background_pending_set_.clear();
+    // Header shards belong to the generation that built them.  A changed header,
+    // a changed define set and a changed filelist all land here, so dropping
+    // both maps is what guarantees a header is re-indexed rather than served
+    // from the previous configuration.
+    background_header_shards_.clear();
+    background_header_claims_.clear();
     for (const auto& path : extra_files_)
         queue_background_file_locked(path, /*front=*/false);
     start_background_indexer_locked();
@@ -4251,7 +4290,8 @@ void Analyzer::background_index_loop() const {
         auto state = make_file_state_with_options(path_string, defines, include_dirs,
                                                   open_overlays, false,
                                                   &background_header_texts_, generation,
-                                                  /*collect_diagnostics=*/false);
+                                                  /*collect_diagnostics=*/false,
+                                                  /*restrict_index_to_own_file=*/true);
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             --background_index_active_;
@@ -4264,6 +4304,7 @@ void Analyzer::background_index_loop() const {
         // map in the index while all workers and request handlers waited.
         auto committed_index = std::make_shared<SyntaxIndex>(std::move(state->index));
 
+        std::vector<std::string> headers_to_build;
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
@@ -4289,6 +4330,43 @@ void Analyzer::background_index_loop() const {
             };
             invalidate_extra_snapshots_locked();
 
+            // Claim the headers this parse pulled in.  Claiming inside the same
+            // critical section that commits the shard is what keeps two workers
+            // from building the same header concurrently; the build itself
+            // happens below, outside the lock.
+            for (const auto& dependency : state->include_dependencies) {
+                if (background_header_claims_.insert(dependency).second)
+                    headers_to_build.push_back(dependency);
+            }
+
+        }
+
+        // Build the claimed headers from this file's tree, outside map_mutex_
+        // for the same reason the file's own shard is built outside it.  This
+        // worker stays counted as active until they are committed, so the
+        // publish below cannot fire on a project index that is still missing
+        // header shards.
+        std::vector<ExtraFileCacheEntry> header_shards;
+        header_shards.reserve(headers_to_build.size());
+        for (const auto& header_uri : headers_to_build) {
+            auto header_index = std::make_shared<SyntaxIndex>(
+                SyntaxIndex::build(*state->tree, header_source_text(*state->source_manager, header_uri),
+                                   IndexDepth::Declarations, header_uri));
+            header_shards.push_back(ExtraFileCacheEntry{
+                .path = path_from_file_uri(header_uri),
+                .uri = header_uri,
+                .index = std::move(header_index),
+            });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            if (generation == background_generation_ && !header_shards.empty()) {
+                for (auto& shard : header_shards)
+                    background_header_shards_[shard.uri] = std::move(shard);
+                invalidate_extra_snapshots_locked();
+            }
+
             // ProjectIndex is an immutable view derived from per-file shards.
             // Do not publish after every single file while the initial .f cache
             // is warming: that would repeatedly notify downstream features for
@@ -4307,13 +4385,15 @@ void Analyzer::background_index_loop() const {
 
 std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
     auto snapshot = std::make_shared<ProjectIndexSnapshot>();
-    snapshot->shards.reserve(extra_cache_.size());
 
-    for (const auto& [key, entry] : extra_cache_) {
+    // Header shards are published alongside file shards: a file's own shard no
+    // longer carries what it `include`d, so the header's shard is the only place
+    // those declarations live.
+    snapshot->shards.reserve(extra_cache_.size() + background_header_shards_.size());
+    const auto add_shard = [&snapshot](const ExtraFileCacheEntry& entry) {
         if (!entry.index)
-            continue;
+            return;
 
-        const size_t shard_index = snapshot->shards.size();
         snapshot->shards.push_back(ProjectIndexSnapshot::Shard{
             .path = entry.path,
             .uri = entry.uri,
@@ -4329,7 +4409,12 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
                 .module_index = i,
             });
         }
-    }
+    };
+
+    for (const auto& [key, entry] : extra_cache_)
+        add_shard(entry);
+    for (const auto& [key, entry] : background_header_shards_)
+        add_shard(entry);
 
     project_index_snapshot_cache_ = std::move(snapshot);
 
