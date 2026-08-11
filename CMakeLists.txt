@@ -258,6 +258,7 @@ set(LAZYVERILOG_CLI_PROJECT_SOURCES
     src/config.cpp
     src/filelist.cpp
     src/analyzer.cpp
+    src/cpu_budget.cpp
     src/dynamic_file_index.cpp
     src/background_compiler.cpp
     src/syntax_index.cpp
