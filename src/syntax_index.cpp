@@ -965,7 +965,41 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     if (depth == IndexDepth::Full)
         collect_imports(root, index, resolver, sm);
 
-    collect_combined_occurrences(tree, root, index, sm, restrict_to_uri);
+    // The words of the scoped file bound what its occurrence tables can ever be
+    // asked for.  An unrestricted build indexes every buffer the tree covers and
+    // has no such bound, so it keeps the full tables.
+    //
+    // The text is looked up by path rather than taken from @p source so the
+    // filter cannot be wrong about which file it is bounding.  Callers do pass
+    // the scoped file's text today, but @p source is documented only as the
+    // text to resolve instantiation end lines against, and a filter that
+    // silently drops names when that assumption stops holding would degrade
+    // resolution quietly rather than fail.  getAllBuffers() is documented as
+    // not thread safe, which is why this stays behind the restricted-build
+    // check — those run on background workers that each own their
+    // SourceManager, while unrestricted current-file builds may share one.
+    std::unordered_set<std::string_view> mentioned_names;
+    bool bound_by_mentions = false;
+    if (!restrict_to_uri.empty()) {
+        const auto scoped_path = path_from_file_uri(std::string(restrict_to_uri));
+        std::string_view scoped_text;
+        for (const auto buffer : sm.getAllBuffers()) {
+            if (sm.getFullPath(buffer) != scoped_path)
+                continue;
+            scoped_text = sm.getSourceText(buffer);
+            break;
+        }
+        // The filter costs one scan of the scoped file and saves two hash
+        // entries per value it removes, so it pays off only once the value table
+        // is large relative to the file being scanned.  A file that `include`s
+        // little has a small table and would only pay the scan.
+        if (!scoped_text.empty() && index.values.size() > scoped_text.size() / 8) {
+            mentioned_names = collect_mentioned_names(scoped_text, tree);
+            bound_by_mentions = true;
+        }
+    }
+    collect_combined_occurrences(tree, root, index, sm, restrict_to_uri,
+                                 bound_by_mentions ? &mentioned_names : nullptr);
     if (!index.source_files.empty())
         index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
 
