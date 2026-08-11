@@ -247,10 +247,54 @@ add_executable(lazyverilog-fmt tools/fmt_file.cpp src/features/formatter.cpp src
 target_include_directories(lazyverilog-fmt PRIVATE src)
 target_link_libraries(lazyverilog-fmt PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# lazyverilog-lint / lazyverilog-rtltree CLI tools
+# Share the same project-bootstrap sources as the LSP server (minus main.cpp,
+# server.cpp, and LspCpp) so they see the same parse/lint/compile/rtl-tree
+# behavior as `lazyverilog-lsp` for the same lazyverilog.toml.
+# ──────────────────────────────────────────────────────────────────────────────
+set(LAZYVERILOG_CLI_PROJECT_SOURCES
+    tools/cli_project.cpp
+    src/config.cpp
+    src/filelist.cpp
+    src/analyzer.cpp
+    src/dynamic_file_index.cpp
+    src/background_compiler.cpp
+    src/syntax_index.cpp
+    src/syntax_index_shared.cpp
+    src/features/lint.cpp
+)
+
+add_executable(lazyverilog-lint tools/lint_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
+target_include_directories(lazyverilog-lint PRIVATE src tools)
+target_link_libraries(lazyverilog-lint PRIVATE slang::slang tomlplusplus::tomlplusplus)
+
+add_executable(lazyverilog-rtltree tools/rtltree_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
+target_include_directories(lazyverilog-rtltree PRIVATE src tools)
+target_link_libraries(lazyverilog-rtltree PRIVATE slang::slang tomlplusplus::tomlplusplus)
+
 add_executable(lazyverilog-rtl-format-test tests/rtl_format_sweep.cpp)
 add_test(
     NAME formatter-rtl-corpus
     COMMAND lazyverilog-rtl-format-test
             $<TARGET_FILE:lazyverilog-fmt>
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/lazyverilog_formatter_corpus
+)
+
+add_executable(lazyverilog-lint-cli-smoke tests/lint_cli_smoke.cpp)
+target_include_directories(lazyverilog-lint-cli-smoke PRIVATE tests)
+add_test(
+    NAME lint-cli-smoke
+    COMMAND lazyverilog-lint-cli-smoke
+            $<TARGET_FILE:lazyverilog-lint>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(lazyverilog-rtltree-cli-smoke tests/rtltree_cli_smoke.cpp)
+target_include_directories(lazyverilog-rtltree-cli-smoke PRIVATE tests)
+add_test(
+    NAME rtltree-cli-smoke
+    COMMAND lazyverilog-rtltree-cli-smoke
+            $<TARGET_FILE:lazyverilog-rtltree>
+            ${CMAKE_CURRENT_SOURCE_DIR}
 )

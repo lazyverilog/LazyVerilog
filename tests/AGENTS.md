@@ -29,6 +29,9 @@ Unit and integration tests for all lazyverilog LSP features. Uses Catch2 framewo
 | `test_inlay_hints.cpp` | Inlay hints tests |
 | `test_opentitan_benchmark.cpp` | OpenTitan corpus parse/index benchmark (hidden `[.benchmark]` tag) |
 | `rtl_format_sweep.cpp` | Large-scale formatter performance sweep against real RTL |
+| `cli_process.hpp` | Shared cross-platform subprocess helper for CLI smoke tests |
+| `lint_cli_smoke.cpp` | `lazyverilog-lint` binary smoke test (drives the built binary against `demo/`) |
+| `rtltree_cli_smoke.cpp` | `lazyverilog-rtltree` binary smoke test (drives the built binary against `demo/`) |
 | `test.sv` | SystemVerilog fixture used by tests |
 
 ## For AI Agents
