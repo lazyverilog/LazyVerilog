@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <slang/parsing/Token.h>
 #include <slang/syntax/SyntaxNode.h>
@@ -148,6 +149,29 @@ std::string simple_identifier_from_expr(const slang::syntax::PropertyExprSyntax*
 std::vector<std::string> collect_include_dependency_uris(const slang::SourceManager& sm,
                                                          const std::string& owning_uri);
 
+/// Identifier-shaped words a build scoped to a single file could possibly
+/// resolve.
+///
+/// A scoped build records occurrences only for tokens in its own file, and
+/// every lookup it makes keys on the text of such a token.  An `include`d
+/// header contributes its declarations to every file that includes it, so one
+/// widely shared header makes the occurrence lookup tables tens of thousands of
+/// entries, almost none of which any token in the scoped file mentions.  Having
+/// the scoped file's words up front lets those entries be skipped before they
+/// are built.
+///
+/// The result is deliberately a superset.  It is scanned out of raw text, so
+/// keywords and words inside comments and string literals are included too;
+/// that only makes the filter less aggressive, never wrong.  Macro bodies are
+/// added because a macro defined in a header can expand inside the scoped file,
+/// and the tokens it expands to spell names that never appear in that file's
+/// own text.
+///
+/// Returned views borrow from @p source and from @p tree, so the set must not
+/// outlive either.
+std::unordered_set<std::string_view> collect_mentioned_names(
+    std::string_view source, const slang::syntax::SyntaxTree& tree);
+
 /// Combined single-pass replacement for collect_reference_occurrences() and
 /// collect_macro_reference_occurrences().  Performs one SyntaxTree traversal
 /// instead of two by composing the macro-expansion visitToken() and the
@@ -157,7 +181,11 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
 /// @param restrict_to_uri  when non-empty, record only occurrences originating
 ///        in that file, so an `include`d header's occurrences are collected once
 ///        into the header's own shard instead of once per including file.
-void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
-                                  const slang::syntax::SyntaxNode& root, SyntaxIndex& index,
-                                  const slang::SourceManager& sm,
-                                  std::string_view restrict_to_uri = {});
+/// @param mentioned_names  when non-null, the words the scoped file can mention
+///        (see collect_mentioned_names).  Declarations whose name is absent are
+///        left out of the lookup tables, which no in-scope token could have
+///        matched anyway.
+void collect_combined_occurrences(
+    const slang::syntax::SyntaxTree& tree, const slang::syntax::SyntaxNode& root,
+    SyntaxIndex& index, const slang::SourceManager& sm, std::string_view restrict_to_uri = {},
+    const std::unordered_set<std::string_view>* mentioned_names = nullptr);

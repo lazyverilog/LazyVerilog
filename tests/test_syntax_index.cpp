@@ -933,3 +933,115 @@ TEST_CASE("project index: header occurrences are scoped without losing includer 
 
     fs::remove_all(dir);
 }
+
+TEST_CASE("project index: a header-heavy file still resolves every name it can reach",
+          "[index]") {
+    // A file whose declaration table is dominated by `include`d content skips
+    // building lookup entries for names it never mentions.  The names it *can*
+    // reach are wider than the words in its own text, and each way of reaching
+    // one is checked here:
+    //
+    //   * a plain reference to a header declaration;
+    //   * a package member named only inside the body of a header-defined
+    //     macro, reached through the scoped-name handler once the macro
+    //     expands;
+    //   * an escaped identifier, which slang reports with the backslash gone;
+    //   * a package type and enum member reached through a wildcard import,
+    //     in a file that *opens* with the `include -- there the first token of
+    //     the parse tree belongs to the header's buffer, not the file's.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_header_mention_filter";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    // Enough declarations that the mention filter is worth engaging for files
+    // this small; the padding is what a real shared header contributes in bulk.
+    std::string padding;
+    for (int i = 0; i < 60; ++i)
+        padding += "localparam int PAD" + std::to_string(i) + " = " + std::to_string(i) + ";\n";
+
+    write_file(dir / "bigdefs.svh", "logic \\esc.sig ;\n" + padding);
+    write_file(dir / "pkgdefs.svh", "package hdr_pkg;\n"
+                                    "    typedef enum logic [1:0] { HDR_IDLE, HDR_RUN } hdr_state_t;\n"
+                                    "    localparam int SECRET = 7;\n" +
+                                        padding +
+                                        "endpackage\n"
+                                        "`define GET_SECRET hdr_pkg::SECRET\n");
+
+    const auto user_path = dir / "user.sv";
+    const auto scoped_path = dir / "scoped.sv";
+    write_file(user_path, "module user;\n"
+                          "`include \"bigdefs.svh\"\n"
+                          "    logic a, c;\n"
+                          "    always_comb a = PAD7;\n"
+                          "    always_comb c = \\esc.sig ;\n"
+                          "endmodule\n");
+    write_file(scoped_path, "`include \"pkgdefs.svh\"\n"
+                            "module scoped;\n"
+                            "    import hdr_pkg::*;\n"
+                            "    hdr_state_t st;\n"
+                            "    int v;\n"
+                            "    always_comb st = HDR_IDLE;\n"
+                            "    always_comb v = `GET_SECRET;\n"
+                            "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({user_path.string(), scoped_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+
+    // Resolution of a token located in the shard's own file.  An unresolved
+    // token degrades to the "name:" fallback, which is what a wrongly dropped
+    // lookup entry would produce.
+    auto resolved_in = [&](const std::string& uri, std::string_view name) {
+        for (const auto& shard : snapshot->shards) {
+            if (!shard.index || shard.uri != uri)
+                continue;
+            for (const auto& ref : shard.index->references) {
+                if (ref.name == name && shard.index->source_uri(ref.file_id) == uri)
+                    return ref.symbol_debug;
+            }
+        }
+        return std::string{};
+    };
+
+    const auto user_uri = uri_from_path(user_path);
+    const auto scoped_uri = uri_from_path(scoped_path);
+
+    const auto pad = resolved_in(user_uri, "PAD7");
+    CHECK_FALSE(pad.empty());
+    CHECK(pad != "name:PAD7");
+
+    // SECRET is spelled nowhere in scoped.sv -- only inside the body of a macro
+    // defined in the header.  It reaches the package-value table through the
+    // scoped-name handler after `GET_SECRET expands.
+    const auto secret = resolved_in(scoped_uri, "SECRET");
+    CHECK_FALSE(secret.empty());
+    CHECK(secret != "name:SECRET");
+
+    // slang reports \esc.sig as "esc.sig"; scanning user.sv as plain words would
+    // only ever yield "esc" and "sig".
+    const auto escaped = resolved_in(user_uri, "esc.sig");
+    CHECK_FALSE(escaped.empty());
+    CHECK(escaped != "name:esc.sig");
+
+    const auto state_type = resolved_in(scoped_uri, "hdr_state_t");
+    CHECK_FALSE(state_type.empty());
+    CHECK(state_type != "name:hdr_state_t");
+
+    const auto enum_member = resolved_in(scoped_uri, "HDR_IDLE");
+    CHECK_FALSE(enum_member.empty());
+    CHECK(enum_member != "name:HDR_IDLE");
+
+    fs::remove_all(dir);
+}

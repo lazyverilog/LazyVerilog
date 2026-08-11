@@ -124,6 +124,49 @@ SourceFileID SourceFileIdResolver::for_location(SyntaxIndex& index, const slang:
     return file_id;
 }
 
+std::unordered_set<std::string_view> collect_mentioned_names(
+    std::string_view source, const slang::syntax::SyntaxTree& tree) {
+    std::unordered_set<std::string_view> names;
+    // SystemVerilog source averages well under one distinct word per 16 bytes;
+    // sizing here keeps the scan from rehashing on large files.
+    names.reserve(source.size() / 16 + 16);
+
+    auto is_body = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+    for (size_t i = 0; i < source.size();) {
+        // Escaped identifiers (\ up to whitespace) carry names that the plain
+        // scan below would split apart, and slang reports them with the leading
+        // backslash stripped.  Record that stripped spelling.
+        if (source[i] == '\\') {
+            const size_t start = ++i;
+            while (i < source.size() && !std::isspace(static_cast<unsigned char>(source[i])))
+                ++i;
+            if (i > start)
+                names.insert(source.substr(start, i - start));
+            continue;
+        }
+        if (!std::isalpha(static_cast<unsigned char>(source[i])) && source[i] != '_') {
+            ++i;
+            continue;
+        }
+        const size_t start = i;
+        while (i < source.size() && is_body(source[i]))
+            ++i;
+        names.insert(source.substr(start, i - start));
+    }
+
+    for (const auto* def : tree.getDefinedMacros()) {
+        if (!def)
+            continue;
+        for (const auto& token : def->body) {
+            if (token.kind == slang::parsing::TokenKind::Identifier)
+                names.insert(token.valueText());
+        }
+    }
+    return names;
+}
+
 std::string token_value_text(const slang::parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
 }
@@ -477,7 +520,8 @@ void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file
 void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                   const slang::syntax::SyntaxNode& root, SyntaxIndex& index,
                                   const slang::SourceManager& sm,
-                                  std::string_view restrict_to_uri) {
+                                  std::string_view restrict_to_uri,
+                                  const std::unordered_set<std::string_view>* mentioned_names) {
     // === Single shared SourceFileIdResolver ===
     SourceFileIdResolver file_ids;
     if (!restrict_to_uri.empty())
@@ -498,13 +542,29 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_map<std::string, std::string> package_type_ids;
     std::unordered_map<std::string, SourceFileID> declared_subroutines;
 
+    // Every table below is keyed on a name that some token in scope spells, so a
+    // declaration the scoped file never mentions can never be looked up.  Header
+    // declarations dominate that set: dropping them here is what keeps a header
+    // shared by N files from costing N table builds over its whole contents.
+    auto mentioned = [&](const std::string& name) {
+        return !mentioned_names || mentioned_names->contains(name);
+    };
+
     // Sized up front: an `include`d header contributes its declarations to every
     // shard that includes it, so a widely shared header makes these tables tens
     // of thousands of entries and the incremental rehashing shows up in profile.
-    module_values.reserve(index.values.size());
-    module_value_types.reserve(index.values.size());
+    // Under a mention filter no more entries can survive than there are distinct
+    // words in scope, and reserving the unfiltered count would allocate buckets
+    // for the header contents the filter is there to drop.
+    const size_t value_table_hint =
+        mentioned_names ? std::min(index.values.size(), mentioned_names->size())
+                        : index.values.size();
+    module_values.reserve(value_table_hint);
+    module_value_types.reserve(value_table_hint);
     for (const auto& value : index.values) {
         if (value.parent_scope.empty())
+            continue;
+        if (!mentioned(value.name))
             continue;
         if (index.package_names.contains(value.parent_scope)) {
             package_values.insert(value.parent_scope + "\n" + value.name);
