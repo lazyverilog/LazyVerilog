@@ -77,6 +77,26 @@ SourceFileID SourceFileIdResolver::for_token(SyntaxIndex& index, const slang::So
     return for_location(index, sm, token.location());
 }
 
+bool SourceFileIdResolver::accepts(SyntaxIndex& index, const slang::SourceManager& sm,
+                                   const slang::parsing::Token& token) {
+    if (only_uri_.empty())
+        return true;
+    if (!token || !token.location().valid())
+        return false;
+    return accepts(index, sm, token.location());
+}
+
+bool SourceFileIdResolver::accepts(SyntaxIndex& index, const slang::SourceManager& sm,
+                                   slang::SourceLocation location) {
+    if (only_uri_.empty())
+        return true;
+    // Interned lazily rather than in restrict_to_uri() so a build that never
+    // asks does not push the scope URI into an otherwise empty file table.
+    if (only_file_id_ == kInvalidSourceFileID)
+        only_file_id_ = index.intern_source_file(only_uri_);
+    return for_location(index, sm, location) == only_file_id_;
+}
+
 SourceFileID SourceFileIdResolver::for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                                                 slang::SourceLocation location) {
     if (!location.valid())
@@ -456,9 +476,12 @@ void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file
 
 void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                   const slang::syntax::SyntaxNode& root, SyntaxIndex& index,
-                                  const slang::SourceManager& sm) {
+                                  const slang::SourceManager& sm,
+                                  std::string_view restrict_to_uri) {
     // === Single shared SourceFileIdResolver ===
     SourceFileIdResolver file_ids;
+    if (!restrict_to_uri.empty())
+        file_ids.restrict_to_uri(std::string(restrict_to_uri));
 
     // === Lookup tables (from collect_reference_occurrences) ===
     std::unordered_set<std::string> module_values;
@@ -537,6 +560,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     auto add_reference = [&](const slang::parsing::Token& token, std::string canonical_id) {
         if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
             !token.location().valid())
+            return;
+        // Occurrences from an `include`d header belong to that header's shard.
+        if (!file_ids.accepts(index, sm, token))
             return;
         const auto [line, col] = token_pos(sm, token);
         add_reference_entry(index, std::string(token.valueText()),

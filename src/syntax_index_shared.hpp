@@ -66,6 +66,15 @@ SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::Source
 /// to the same file.  The expanded-buffer level absorbs those misses; the raw
 /// buffer level stays in front of it because walking the expansion chain takes
 /// a SourceManager lock.
+///
+/// The resolver also carries the build's *scope*, because deciding which file a
+/// token belongs to and deciding whether this build wants that file are the same
+/// question asked twice.  An include-heavy design otherwise indexes the same
+/// header once per including file: 60 modules sharing two large headers built
+/// the same declarations and the same reference occurrences 60 times, which
+/// measured 7.9 s and 1.8 GB where the unique work is ~2.0 s.  Restricting a
+/// build to one file lets the analyzer index each header once and reference that
+/// shard from every dependent.
 class SourceFileIdResolver {
 public:
     SourceFileID for_token(SyntaxIndex& index, const slang::SourceManager& sm,
@@ -73,9 +82,26 @@ public:
     SourceFileID for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                               slang::SourceLocation location);
 
+    /// Restrict this build to entries originating in @p uri.  An empty URI (the
+    /// default) keeps the historical behaviour of indexing every buffer the
+    /// SyntaxTree covers, which is what live current-file builds want.
+    void restrict_to_uri(std::string uri) { only_uri_ = std::move(uri); }
+
+    /// Whether an entry at @p location belongs to this build's scope.
+    ///
+    /// Comparison is on resolved SourceFileID rather than raw BufferID: slang
+    /// allocates a fresh buffer per macro expansion, so a raw-buffer test would
+    /// reject every macro-expanded token in the very file being indexed.
+    bool accepts(SyntaxIndex& index, const slang::SourceManager& sm,
+                 slang::SourceLocation location);
+    bool accepts(SyntaxIndex& index, const slang::SourceManager& sm,
+                 const slang::parsing::Token& token);
+
 private:
     std::unordered_map<uint32_t, SourceFileID> by_buffer_;
     std::unordered_map<uint32_t, SourceFileID> by_expanded_buffer_;
+    std::string only_uri_;
+    SourceFileID only_file_id_{kInvalidSourceFileID};
 };
 
 /// Safely return a token's user-facing value text, or an empty string for a
@@ -128,6 +154,10 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
 /// reference-resolution visitToken() into a single CombinedVisitor.
 /// The SubroutineDeclarationCollector pre-pass still runs as a separate walk
 /// because its output (declared_subroutines) is consumed by the main visitor.
+/// @param restrict_to_uri  when non-empty, record only occurrences originating
+///        in that file, so an `include`d header's occurrences are collected once
+///        into the header's own shard instead of once per including file.
 void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                   const slang::syntax::SyntaxNode& root, SyntaxIndex& index,
-                                  const slang::SourceManager& sm);
+                                  const slang::SourceManager& sm,
+                                  std::string_view restrict_to_uri = {});

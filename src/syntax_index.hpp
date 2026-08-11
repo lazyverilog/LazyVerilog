@@ -369,8 +369,15 @@ struct SyntaxIndex {
     std::vector<ReferenceEntry> references;
     /// Build index from a parsed SyntaxTree.
     /// @param source  the source text that produced @p tree (used for line-number lookup).
+    /// @param restrict_to_uri  when non-empty, index only entries originating in
+    ///        that file.  The project indexer uses this to give each `include`d
+    ///        header one shard of its own instead of rebuilding the header's
+    ///        declarations and occurrences inside every file that includes it.
+    ///        Empty (the default) indexes every buffer the tree covers, which is
+    ///        what live current-file builds want.
     static SyntaxIndex build(const slang::syntax::SyntaxTree& tree, std::string_view source = {},
-                             IndexDepth depth = IndexDepth::Full);
+                             IndexDepth depth = IndexDepth::Full,
+                             std::string_view restrict_to_uri = {});
 
     /// Merge all collections from @p other into this index.
     /// Used to combine extra-file indexes with the current document's index.
