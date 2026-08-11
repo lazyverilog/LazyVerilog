@@ -265,3 +265,21 @@ add_test(
             $<TARGET_FILE:lazyverilog-fmt>
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/lazyverilog_formatter_corpus
 )
+
+add_executable(lazyverilog-lint-cli-smoke tests/lint_cli_smoke.cpp)
+target_include_directories(lazyverilog-lint-cli-smoke PRIVATE tests)
+add_test(
+    NAME lint-cli-smoke
+    COMMAND lazyverilog-lint-cli-smoke
+            $<TARGET_FILE:lazyverilog-lint>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(lazyverilog-rtltree-cli-smoke tests/rtltree_cli_smoke.cpp)
+target_include_directories(lazyverilog-rtltree-cli-smoke PRIVATE tests)
+add_test(
+    NAME rtltree-cli-smoke
+    COMMAND lazyverilog-rtltree-cli-smoke
+            $<TARGET_FILE:lazyverilog-rtltree>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+)
