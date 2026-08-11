@@ -498,6 +498,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_map<std::string, std::string> package_type_ids;
     std::unordered_map<std::string, SourceFileID> declared_subroutines;
 
+    // Sized up front: an `include`d header contributes its declarations to every
+    // shard that includes it, so a widely shared header makes these tables tens
+    // of thousands of entries and the incremental rehashing shows up in profile.
+    module_values.reserve(index.values.size());
+    module_value_types.reserve(index.values.size());
     for (const auto& value : index.values) {
         if (value.parent_scope.empty())
             continue;
