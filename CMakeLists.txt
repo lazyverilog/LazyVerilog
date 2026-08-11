@@ -254,6 +254,10 @@ add_executable(lazyverilog-lint tools/lint_file.cpp ${LAZYVERILOG_CLI_PROJECT_SO
 target_include_directories(lazyverilog-lint PRIVATE src tools)
 target_link_libraries(lazyverilog-lint PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
+add_executable(lazyverilog-rtltree tools/rtltree_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
+target_include_directories(lazyverilog-rtltree PRIVATE src tools)
+target_link_libraries(lazyverilog-rtltree PRIVATE slang::slang tomlplusplus::tomlplusplus)
+
 add_executable(lazyverilog-rtl-format-test tests/rtl_format_sweep.cpp)
 add_test(
     NAME formatter-rtl-corpus
