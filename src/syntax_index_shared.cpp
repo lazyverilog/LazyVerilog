@@ -692,6 +692,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         if (!def || !def->name || !def->name.location().valid() ||
             !sm.isFileLoc(def->name.location()))
             continue;
+        // A macro defined in an `include`d header is visible in every tree that
+        // includes it; without this it would be recorded once per includer.
+        if (!file_ids.accepts(index, sm, def->name))
+            continue;
         const auto [line, col] = token_pos_line1_col0(sm, def->name);
         add_macro_ref(std::string(def->name.valueText()), file_ids.for_token(index, sm, def->name),
                       line, col);
@@ -1306,6 +1310,27 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
 
         void visitToken(slang::parsing::Token token) {
             if (!token || !token.location().valid())
+                return;
+
+            // Decide scope before doing any per-token work.  add_ref() already
+            // drops out-of-scope tokens, so for an `include`d header -- walked
+            // once per includer -- the valueText() copy, the source-text scan
+            // behind the member-dot probes, and the scope-keyed lookups below
+            // are all computed and thrown away.  The macro arm needs the test
+            // for correctness rather than speed: add_macro() has no scope
+            // filter of its own, so a macro expanded inside a header would
+            // otherwise be recorded once per includer instead of once in the
+            // header's own shard.  The resolver caches per buffer, so this is
+            // one hash lookup per token, and accepts() returns true
+            // immediately for unrestricted builds.
+            //
+            // Hoisting only the token path is safe because visitToken() is
+            // pure: the walk's context (current_module, walked_value_types,
+            // declared_subroutines, visible_type_imports) is maintained by the
+            // handle() overloads, which still run over header nodes.  Pruning
+            // whole header subtrees would drop that context and break
+            // resolution of includer tokens that refer to header declarations.
+            if (!file_ids.accepts(index, sm, token))
                 return;
 
             // Classify buffer on first encounter (saves repeated isMacroLoc calls).
