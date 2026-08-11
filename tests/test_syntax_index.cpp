@@ -805,3 +805,131 @@ TEST_CASE("project index: shared header text is indexed once per including file"
 
     fs::remove_all(dir);
 }
+
+TEST_CASE("project index: header occurrences are scoped without losing includer resolution",
+          "[index]") {
+    // The occurrence walk decides a token's shard before doing any name work,
+    // so a header included by many files is classified once instead of once per
+    // includer.  Three things must survive that early exit:
+    //
+    //   * a macro defined in the header is recorded in the header's shard only;
+    //   * a macro *expanded* in an includer stays with that includer, even
+    //     though the macro body lives in the header;
+    //   * declarations the header contributes still resolve for tokens in the
+    //     includer, because the walk's context is built by the node handlers
+    //     rather than by the token pass that is being skipped.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_header_occurrence_scope";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    const auto header_path = dir / "defs.svh";
+    const auto top_path = dir / "top.sv";
+    const auto other_path = dir / "other.sv";
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    write_file(header_path, "`define HDR_ONE 1\n"
+                            "`define HDR_TWO 2\n"
+                            "localparam int HDR_LP = `HDR_ONE;\n"
+                            "function automatic int hdr_add(input int a);\n"
+                            "    return a + `HDR_TWO;\n"
+                            "endfunction\n");
+    write_file(top_path, "module top;\n"
+                         "`include \"defs.svh\"\n"
+                         "    int r;\n"
+                         "    always_comb r = hdr_add(HDR_LP) + `HDR_ONE;\n"
+                         "endmodule\n");
+    write_file(other_path, "module other;\n"
+                           "`include \"defs.svh\"\n"
+                           "    int q;\n"
+                           "    always_comb q = hdr_add(HDR_LP);\n"
+                           "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({top_path.string(), other_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto header_uri = uri_from_path(header_path);
+    const auto top_uri = uri_from_path(top_path);
+    const auto other_uri = uri_from_path(other_path);
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(snapshot->shards.size() == 3);
+
+    const ProjectIndexSnapshot::Shard* header_shard = nullptr;
+    const ProjectIndexSnapshot::Shard* top_shard = nullptr;
+    const ProjectIndexSnapshot::Shard* other_shard = nullptr;
+    for (const auto& shard : snapshot->shards) {
+        REQUIRE(shard.index);
+        if (shard.uri == header_uri)
+            header_shard = &shard;
+        else if (shard.uri == top_uri)
+            top_shard = &shard;
+        else if (shard.uri == other_uri)
+            other_shard = &shard;
+    }
+    REQUIRE(header_shard);
+    REQUIRE(top_shard);
+    REQUIRE(other_shard);
+
+    // Occurrences physically located in the header, counted per shard.  Anything
+    // other than the header's own shard would be a duplicate copy.
+    auto header_located = [&](const ProjectIndexSnapshot::Shard& shard, std::string_view symbol_debug) {
+        size_t count = 0;
+        for (const auto& ref : shard.index->references) {
+            if (ref.symbol_debug == symbol_debug &&
+                shard.index->source_uri(ref.file_id) == header_uri)
+                ++count;
+        }
+        return count;
+    };
+
+    // `HDR_ONE is defined in the header and expanded once there; both belong to
+    // the header's shard and to no other.
+    CHECK(header_located(*header_shard, "macro::HDR_ONE") >= 2);
+    CHECK(header_located(*top_shard, "macro::HDR_ONE") == 0);
+    CHECK(header_located(*other_shard, "macro::HDR_ONE") == 0);
+    CHECK(header_located(*top_shard, "macro::HDR_TWO") == 0);
+    CHECK(header_located(*other_shard, "macro::HDR_TWO") == 0);
+
+    // The expansion inside top.sv is attributed to top.sv even though the macro
+    // body comes from the header.  Scoping on the expansion site rather than on
+    // the raw buffer is what keeps this correct.
+    auto own_file_macro_uses = [&](const ProjectIndexSnapshot::Shard& shard, std::string_view symbol_debug) {
+        size_t count = 0;
+        for (const auto& ref : shard.index->references) {
+            if (ref.symbol_debug == symbol_debug &&
+                shard.index->source_uri(ref.file_id) == shard.uri)
+                ++count;
+        }
+        return count;
+    };
+    CHECK(own_file_macro_uses(*top_shard, "macro::HDR_ONE") == 1);
+    CHECK(own_file_macro_uses(*other_shard, "macro::HDR_ONE") == 0);
+
+    // Header declarations still resolve for includer tokens: an unresolved token
+    // degrades to the "name:" fallback, so these must not be that.
+    auto resolved_symbol = [&](const ProjectIndexSnapshot::Shard& shard, std::string_view name) {
+        for (const auto& ref : shard.index->references) {
+            if (ref.name == name && shard.index->source_uri(ref.file_id) == shard.uri)
+                return ref.symbol_debug;
+        }
+        return std::string{};
+    };
+    const auto top_lp = resolved_symbol(*top_shard, "HDR_LP");
+    CHECK_FALSE(top_lp.empty());
+    CHECK(top_lp != "name:HDR_LP");
+    const auto top_call = resolved_symbol(*top_shard, "hdr_add");
+    CHECK_FALSE(top_call.empty());
+    CHECK(top_call != "name:hdr_add");
+
+    fs::remove_all(dir);
+}
