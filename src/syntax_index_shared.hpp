@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -98,11 +99,17 @@ public:
     bool accepts(SyntaxIndex& index, const slang::SourceManager& sm,
                  const slang::parsing::Token& token);
 
-    /// Restrict which out-of-scope declarations this build records.  @p names
-    /// must outlive the resolver; passing nullptr (the default) records them
-    /// all.  See collect_mentioned_names().
-    void set_mentioned_names(const std::unordered_set<std::string_view>* names) {
-        mentioned_names_ = names;
+    /// Restrict which out-of-scope declarations this build records.
+    ///
+    /// The set is fetched through @p provider on the first declaration that
+    /// actually comes from another file, because scanning the scoped file costs
+    /// more than it saves for a file that `include`s nothing worth dropping.
+    /// The provider and whatever it returns must outlive the resolver; leaving
+    /// it unset (the default) records every declaration.  See
+    /// collect_mentioned_names().
+    void set_mentions_provider(
+        std::function<const std::unordered_set<std::string_view>*()> provider) {
+        mentions_provider_ = std::move(provider);
     }
 
     /// Whether a declaration of @p name_token belongs in this build's shard.
@@ -121,6 +128,7 @@ private:
     std::unordered_map<uint32_t, SourceFileID> by_expanded_buffer_;
     std::string only_uri_;
     SourceFileID only_file_id_{kInvalidSourceFileID};
+    std::function<const std::unordered_set<std::string_view>*()> mentions_provider_;
     const std::unordered_set<std::string_view>* mentioned_names_{nullptr};
 };
 
