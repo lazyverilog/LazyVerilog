@@ -63,17 +63,6 @@ static std::string make_fn_signature(const FunctionPrototypeSyntax& proto,
     return "```\nfunction " + ret + " " + name + formatted_ports + "\n```";
 }
 
-/// Whether @p member belongs to the file this build is scoped to.
-///
-/// A member reached through `include lives in the header's own shard, so an
-/// unrestricted build (the live current-file path) accepts everything while a
-/// per-file project build skips what the header already owns.
-static bool member_in_build_scope(const MemberSyntax& member, SyntaxIndex& index,
-                                  SourceFileIdResolver& resolver,
-                                  const slang::SourceManager& sm) {
-    return resolver.accepts(index, sm, member.getFirstToken().location());
-}
-
 static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
                                               slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -464,8 +453,6 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     for (const auto* member : module.members) {
         if (!member)
             continue;
-        if (!member_in_build_scope(*member, index, resolver, sm))
-            continue;
         if (const auto* modport = member->as_if<ModportDeclarationSyntax>()) {
             for (const auto* item : modport->items) {
                 if (!item)
@@ -514,8 +501,6 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     for (const auto* member : module.members) {
         if (!member)
-            continue;
-        if (!member_in_build_scope(*member, index, resolver, sm))
             continue;
         if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
             const std::string type_text = render_syntax_node_text(sm, *data->type);
@@ -815,8 +800,6 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
     for (const auto* member : pkg.members) {
         if (!member)
             continue;
-        if (!member_in_build_scope(*member, index, resolver, sm))
-            continue;
         if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             symbols.push_back(token_value_text(td->name));
             // Enum members are exported alongside the typedef that declares
@@ -957,7 +940,7 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
 
     if (const auto* compilation_unit = root.as_if<CompilationUnitSyntax>()) {
         for (const auto* member : compilation_unit->members) {
-            if (member && member_in_build_scope(*member, index, resolver, sm))
+            if (member)
                 process_member(*member, index, resolver, sm, source, depth);
         }
     } else if (const auto* member = root.as_if<MemberSyntax>()) {
@@ -976,8 +959,7 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         // identity.  A direct-root member must use the same dispatch path;
         // otherwise live-open standalone files reached by go-to-definition can
         // be indexed differently from their disk extra-file snapshots.
-        if (member_in_build_scope(*member, index, resolver, sm))
-            process_member(*member, index, resolver, sm, source, depth);
+        process_member(*member, index, resolver, sm, source, depth);
     }
 
     if (depth == IndexDepth::Full)

@@ -1323,14 +1323,19 @@ endmodule
 
     const auto snapshots = analyzer.extra_index_snapshot_ptr();
     REQUIRE(snapshots != nullptr);
-    REQUIRE(snapshots->size() == 1);
-    const auto indexed_add_number = std::find_if(
-        (*snapshots)[0].index_ref().references.begin(), (*snapshots)[0].index_ref().references.end(),
-        [&](const ReferenceEntry& ref) {
-            return ref.name == "add_number" &&
-                   (*snapshots)[0].index_ref().source_uri(ref.file_id) == uri_from_path(header_path);
+    // The including file's shard plus the header's own shard.  Header
+    // occurrences are indexed once, under the header, so look across shards
+    // rather than inside the includer's.
+    REQUIRE(snapshots->size() == 2);
+    const bool indexed_add_number = std::any_of(
+        snapshots->begin(), snapshots->end(), [&](const ExtraIndexInfo& info) {
+            const auto& refs = info.index_ref().references;
+            return std::any_of(refs.begin(), refs.end(), [&](const ReferenceEntry& ref) {
+                return ref.name == "add_number" &&
+                       info.index_ref().source_uri(ref.file_id) == uri_from_path(header_path);
+            });
         });
-    REQUIRE(indexed_add_number != (*snapshots)[0].index_ref().references.end());
+    REQUIRE(indexed_add_number);
 
     const std::string top_uri = uri_from_path(top_path);
     const std::string closed_uri = uri_from_path(closed_path);
@@ -1398,15 +1403,17 @@ endmodule
 
     const auto snapshots = analyzer.extra_index_snapshot_ptr();
     REQUIRE(snapshots != nullptr);
-    REQUIRE(snapshots->size() == 1);
-    const auto indexed_state_t = std::find_if(
-        (*snapshots)[0].index_ref().references.begin(), (*snapshots)[0].index_ref().references.end(),
-        [&](const ReferenceEntry& ref) {
-            return ref.name == "state_t" &&
-                   (*snapshots)[0].index_ref().source_uri(ref.file_id) == header_uri &&
-                   ref.symbol_debug == "typedef::state_t";
+    REQUIRE(snapshots->size() == 2);
+    const bool indexed_state_t = std::any_of(
+        snapshots->begin(), snapshots->end(), [&](const ExtraIndexInfo& info) {
+            const auto& refs = info.index_ref().references;
+            return std::any_of(refs.begin(), refs.end(), [&](const ReferenceEntry& ref) {
+                return ref.name == "state_t" &&
+                       info.index_ref().source_uri(ref.file_id) == header_uri &&
+                       ref.symbol_debug == "typedef::state_t";
+            });
         });
-    REQUIRE(indexed_state_t != (*snapshots)[0].index_ref().references.end());
+    REQUIRE(indexed_state_t);
 
     const auto [line, col] = find_position(header, "} state_t;");
     const auto refs = analyzer.find_references(header_uri, line, col + 2, true);

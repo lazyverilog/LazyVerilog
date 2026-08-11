@@ -497,6 +497,25 @@ class Analyzer {
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;
+
+    /// Shards for `include`d headers, one per header rather than one per
+    /// including file.
+    ///
+    /// A header's declarations and reference occurrences are identical no matter
+    /// which file pulled it in, so rebuilding them inside every dependent is pure
+    /// duplication: 60 modules sharing two large headers measured 7.9 s and
+    /// 1.8 GB where the unique work is ~2.0 s.  The first worker to parse a file
+    /// that includes a header claims it, builds its shard from that file's tree,
+    /// and every later dependent skips the header entirely.
+    ///
+    /// Both maps are guarded by map_mutex_ rather than a lock of their own.  The
+    /// claim has to be taken in the same critical section that commits a shard,
+    /// and HeaderTextCache's rule — never take its mutex under map_mutex_ —
+    /// exists precisely to avoid the nested-lock shape that a second mutex here
+    /// would reintroduce.  Both are cleared when the generation is bumped, so a
+    /// changed header is always re-indexed.
+    mutable std::unordered_map<std::string, ExtraFileCacheEntry> background_header_shards_;
+    mutable std::unordered_set<std::string> background_header_claims_;
     mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 

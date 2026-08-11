@@ -778,9 +778,13 @@ TEST_CASE("project index: shared header text is indexed once per including file"
     const auto header_uri = uri_from_path(header_path);
     auto snapshot = analyzer.project_index_snapshot();
     REQUIRE(snapshot);
-    REQUIRE(snapshot->shards.size() == 2);
+    // Two including files plus one shard for the header itself: the header's
+    // occurrences are indexed once and referenced from both dependents.
+    REQUIRE(snapshot->shards.size() == 3);
     for (const auto& shard : snapshot->shards) {
         REQUIRE(shard.index);
+        if (shard.uri == header_uri)
+            continue;
         CHECK(std::find(shard.index->include_dependencies.begin(),
                         shard.index->include_dependencies.end(),
                         header_uri) != shard.index->include_dependencies.end());
@@ -796,7 +800,7 @@ TEST_CASE("project index: shared header text is indexed once per including file"
 
     auto reparsed = analyzer.project_index_snapshot();
     REQUIRE(reparsed);
-    REQUIRE(reparsed->shards.size() == 2);
+    REQUIRE(reparsed->shards.size() == 3);
     CHECK(shared_width(*reparsed) == "32");
 
     fs::remove_all(dir);
