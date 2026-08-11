@@ -11,6 +11,7 @@ Documentation for the lazyverilog linter. Primary reference for all `lazyverilog
 | File | Description |
 |------|-------------|
 | `options.md` | Complete reference for all linter configuration options with RTL examples |
+| `cli.md` | `lazyverilog-lint` standalone CLI usage and build instructions |
 
 ## For AI Agents
 
