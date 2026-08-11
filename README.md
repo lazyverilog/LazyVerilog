@@ -39,6 +39,8 @@
   ·
   <a href="#-usage">Usage</a>
   ·
+  <a href="#-cli-tools">CLI Tools</a>
+  ·
   <a href="#-configuration">Configuration</a>
   ·
   <a href="#-build">Build</a>
@@ -392,6 +394,73 @@ See the [VS Code installation instructions](#vscode-installation) above for inst
 
 </details>
 
+## 🧰 CLI Tools
+
+LazyVerilog also ships standalone command-line binaries for scripting/CI, alongside the
+`lazyverilog-lsp` editor server. Each reads `lazyverilog.toml` the same way the LSP server does,
+walking up from the target file's directory.
+
+<details>
+<summary><b><code>lazyverilog-fmt</code> — standalone formatter</b></summary>
+
+Formats a single file to stdout, or in-place with `-i`.
+
+```bash
+cmake --build build -j$(nproc) --target lazyverilog-fmt
+./build/lazyverilog-fmt -i rtl/memory_top.sv
+```
+
+| Flag | Description |
+|------|-------------|
+| `-i`, `--in-place` | Write formatted output back to the source file instead of stdout |
+| `--log <log-dir>` | Write internal formatter pass logs to `<log-dir>` for debugging |
+
+Full reference: [`docs/formatter/cli.md`](docs/formatter/cli.md).
+
+</details>
+
+<details>
+<summary><b><code>lazyverilog-lint</code> — standalone linter</b></summary>
+
+Lints one file, or every file in a `-f` filelist, and pretty-prints lint diagnostics and
+compilation diagnostics (`<file>:<line>:<col>: <severity>: <message>`).
+
+```bash
+cmake --build build -j$(nproc) --target lazyverilog-lint
+./build/lazyverilog-lint rtl/memory_top.sv
+./build/lazyverilog-lint -f rtl/vcode.f
+```
+
+| Flag | Description |
+|------|-------------|
+| `-f <filelist>` | Lint every file in a project filelist instead of (or in addition to) `<file>` |
+| `--lint-only` | Print only lint-rule diagnostics; drop parse/semantic diagnostics |
+
+Full reference: [`docs/linter/cli.md`](docs/linter/cli.md).
+
+</details>
+
+<details>
+<summary><b><code>lazyverilog-rtltree</code> — standalone RTL hierarchy viewer</b></summary>
+
+Prints the module instantiation hierarchy rooted at `<file>`'s module as an indented tree —
+forward (children) by default, or `--reverse` (parents).
+
+```bash
+cmake --build build -j$(nproc) --target lazyverilog-rtltree
+./build/lazyverilog-rtltree rtl/memory_top.sv
+./build/lazyverilog-rtltree --reverse rtl/memory.sv
+```
+
+| Flag | Description |
+|------|-------------|
+| `-f <filelist>` | Project filelist for cross-file hierarchy resolution |
+| `--reverse` | Build the reverse hierarchy instead of the forward one |
+
+Full reference: [`docs/rtl-tree/cli.md`](docs/rtl-tree/cli.md).
+
+</details>
+
 ## 🏗️ Build
 
 ### ✅ Requirements
@@ -464,6 +533,7 @@ enable = true
 - [`docs/formatter/macros.md`](docs/formatter/macros.md) — macro formatting policy.
 
 **Linter**
+- [`docs/linter/cli.md`](docs/linter/cli.md) — `lazyverilog-lint` CLI usage and build instructions.
 - [`docs/linter/options.md`](docs/linter/options.md) — linter options with RTL examples.
 
 **Semantic Diagnostics**
@@ -478,6 +548,7 @@ enable = true
 - [`docs/connect.md`](docs/connect.md) — interactively wire output-to-input module instance ports.
 - [`docs/interface.md`](docs/interface.md) — inspect and edit signal interfaces between instances.
 - [`docs/rtl-tree/index.md`](docs/rtl-tree/index.md) — module instantiation hierarchy viewer.
+- [`docs/rtl-tree/cli.md`](docs/rtl-tree/cli.md) — `lazyverilog-rtltree` CLI usage and build instructions.
 
 **For Developers**
 - [`docs/dev/test.md`](docs/dev/test.md) — build, tests, and RTL format sweep.
