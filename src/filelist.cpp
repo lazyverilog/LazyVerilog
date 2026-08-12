@@ -5,6 +5,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -142,9 +143,22 @@ struct VcodeLoader {
     std::unordered_set<std::string> seen_include_dirs;
 };
 
+void warn_missing(const std::filesystem::path& path, const std::filesystem::path& filelist) {
+    std::cerr << "[lazyverilog] warning: " << path.string() << " (referenced in "
+              << filelist.string() << ") not found on disk\n";
+}
+
 void add_file(VcodeLoader& loader, std::string path) {
     if (loader.seen_files.insert(path).second)
         loader.result.files.push_back(std::move(path));
+}
+
+void add_file_checked(VcodeLoader& loader, const std::filesystem::path& path,
+                      const std::filesystem::path& filelist) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec))
+        warn_missing(path, filelist);
+    add_file(loader, path.string());
 }
 
 void add_include_dir(VcodeLoader& loader, std::string dir) {
@@ -161,8 +175,11 @@ void load_vcode_file(const std::filesystem::path& filelist, VcodeLoader& loader)
         return;
 
     std::ifstream input(filelist);
-    if (!input)
+    if (!input) {
+        std::cerr << "[lazyverilog] warning: filelist " << filelist.string()
+                  << " not found or unreadable\n";
         return;
+    }
 
     const auto filelist_dir = filelist.parent_path();
     std::string line;
@@ -253,8 +270,8 @@ void load_vcode_file(const std::filesystem::path& filelist, VcodeLoader& loader)
             // needed by navigation and lint.
             if (token == "-v") {
                 if (i + 1 < tokens.size())
-                    add_file(loader,
-                             resolve_from_filelist_dir(filelist_dir, tokens[++i]).string());
+                    add_file_checked(loader, resolve_from_filelist_dir(filelist_dir, tokens[++i]),
+                                     filelist);
                 continue;
             }
 
@@ -269,7 +286,7 @@ void load_vcode_file(const std::filesystem::path& filelist, VcodeLoader& loader)
             if (token.starts_with("+"))
                 continue;
 
-            add_file(loader, resolve_from_filelist_dir(filelist_dir, token).string());
+            add_file_checked(loader, resolve_from_filelist_dir(filelist_dir, token), filelist);
         }
     }
 }
