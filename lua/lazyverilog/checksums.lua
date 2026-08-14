@@ -16,6 +16,16 @@
 --- built artifacts against this module before uploading them to a release.
 
 return {
+	["v1.3.6"] = {
+		["linux-x64"] = "e0129ad0c52d5f95db40fb9f9d94744487a0b81b0033c7b4f56a280cbfff1652",
+		["linux-arm64"] = "e801e526a7886369f87f05c9a155927652b3693377e89d387bc58a251679d1ea",
+		["linux-x64-static"] = "5b7a25b73ac36eeda0d5e29f2a199eedd0aefe4a3b645407c34ec3eb1f0d35b0",
+		["linux-arm64-static"] = "119c3131741922f4487e8c064dbd3bfe95a79465de805ff5cf50c87c1a9f16d7",
+		["darwin-x64"] = "de4b7a6cbd4899a2aa991c082624527d8663b7359b6fc430a5cb62ec86404994",
+		["darwin-arm64"] = "6ec5122aa2c9b2804ef3f355b277a4f7400598386f3fda8c55cfa7a7b4dba3c6",
+		["windows-x64"] = "69fb2108cf9920a0e679a0dcad856aece870ff55cd193c8b77b6c5571aff161a",
+	},
+
 	["v1.3.5"] = {
 		["linux-x64"] = "110d79700c25aad0c2dd980ca7d60a186af240d61498d3cd17606bdeefe99bfa",
 		["linux-arm64"] = "b683887de8178e3ea95389ba8961d2c535ce9ae62215d63da09950e9cc433dda",
