@@ -35,15 +35,16 @@ int main(int argc, char** argv) {
 
     const fs::path lint_bin = argv[1];
     const fs::path repo_root = argv[2];
-    const fs::path memory_top = repo_root / "demo" / "memory_top.sv";
-    const fs::path vcode = repo_root / "demo" / "vcode.f";
+    const fs::path fixtures = repo_root / "tests" / "fixtures" / "cli_smoke" / "lint";
+    const fs::path top = fixtures / "m_top.sv";
+    const fs::path filelist = fixtures / "lint.f";
 
     if (!fs::exists(lint_bin)) {
         std::cerr << "lint binary does not exist: " << lint_bin << "\n";
         return 2;
     }
-    if (!fs::exists(memory_top) || !fs::exists(vcode)) {
-        std::cerr << "fixtures missing under " << repo_root << "/demo\n";
+    if (!fs::exists(top) || !fs::exists(filelist)) {
+        std::cerr << "fixtures missing under " << fixtures << "\n";
         return 2;
     }
 
@@ -55,18 +56,18 @@ int main(int argc, char** argv) {
 
     // Single-file mode: reports both compilation and lint diagnostics.
     {
-        auto result = run_command(lint_bin, shell_quote(memory_top));
-        expect(result.exit_code == 2, "memory_top.sv has an error-severity diagnostic (exit 2)");
+        auto result = run_command(lint_bin, shell_quote(top));
+        expect(result.exit_code == 2, "m_top.sv has an error-severity diagnostic (exit 2)");
         expect(contains(result.stdout_text, "unknown macro"),
-              "reports the unknown `BB compilation diagnostic");
+              "reports the unknown macro compilation diagnostic");
         expect(contains(result.stdout_text, "[naming]"), "reports a [naming] lint diagnostic");
-        expect(contains(result.stdout_text, "memory_top.sv:"),
+        expect(contains(result.stdout_text, "m_top.sv:"),
               "diagnostic lines are prefixed with the source file path");
     }
 
     // --lint-only: drops compilation diagnostics, keeps lint diagnostics.
     {
-        auto result = run_command(lint_bin, "--lint-only " + shell_quote(memory_top));
+        auto result = run_command(lint_bin, "--lint-only " + shell_quote(top));
         expect(!contains(result.stdout_text, "unknown macro"),
               "--lint-only drops the compilation diagnostic");
         expect(contains(result.stdout_text, "[naming]"),
@@ -75,10 +76,10 @@ int main(int argc, char** argv) {
 
     // -f whole-project mode: lints every file in the filelist, not just one.
     {
-        auto result = run_command(lint_bin, "-f " + shell_quote(vcode));
-        expect(contains(result.stdout_text, "memory_top.sv:"),
-              "-f mode reports diagnostics for memory_top.sv");
-        expect(contains(result.stdout_text, "folding_demo.sv:"),
+        auto result = run_command(lint_bin, "-f " + shell_quote(filelist));
+        expect(contains(result.stdout_text, "m_top.sv:"),
+              "-f mode reports diagnostics for m_top.sv");
+        expect(contains(result.stdout_text, "m_second.sv:"),
               "-f mode reports diagnostics for a second project file");
     }
 
