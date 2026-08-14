@@ -1456,3 +1456,61 @@ endmodule
     CHECK(refs[1].line == 5);
     CHECK(refs[2].line == 6);
 }
+
+TEST_CASE("references: module signal excludes same-named included struct field",
+          "[references]") {
+    const auto dir =
+        std::filesystem::temp_directory_path() / "lazyverilog_refs_include_struct_field_shadow";
+    std::filesystem::create_directories(dir);
+
+    const auto header_path = dir / "params.svh";
+    const auto top_path = dir / "top.sv";
+
+    const std::string header = R"(typedef struct packed {
+    state_t state;
+} a_t;
+
+typedef enum logic [1:0] {
+    IDLE,
+    FETCH
+} state_t;
+)";
+    const std::string top = R"(module top;
+`include "params.svh"
+state_t state;
+endmodule
+)";
+
+    {
+        std::ofstream out(header_path);
+        REQUIRE(out.good());
+        out << header;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({header_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top_uri = uri_from_path(top_path);
+    const std::string header_uri = uri_from_path(header_path);
+    analyzer.open(top_uri, top);
+
+    const auto [line, col] = find_position_after(top, "state", "state_t ");
+    const auto refs = analyzer.find_references(top_uri, line, col, true);
+
+    CHECK(std::none_of(refs.begin(), refs.end(),
+                       [&](const Location& ref) { return ref.uri == header_uri; }));
+    REQUIRE(refs.size() == 1);
+    CHECK(refs[0].uri == top_uri);
+    CHECK(refs[0].line == 2);
+
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(header_path);
+    std::filesystem::remove(dir);
+}
