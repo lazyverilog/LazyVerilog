@@ -42,8 +42,14 @@ static ModuleMap build_module_map(const Analyzer& analyzer) {
 
 static std::unordered_map<std::string, PortEntry> build_port_map(const ModuleEntry& module) {
     std::unordered_map<std::string, PortEntry> ports;
-    for (const auto& port : module.ports)
+    for (const auto& port : module.ports) {
+        // module.ports also holds `#(...)` header parameters (direction
+        // "parameter"/"localparam"); those aren't instance port connections
+        // and must not count toward the port total shown in the hint.
+        if (port.direction == "parameter" || port.direction == "localparam")
+            continue;
         ports[port.name] = port;
+    }
     return ports;
 }
 

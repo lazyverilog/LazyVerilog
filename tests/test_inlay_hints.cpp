@@ -57,6 +57,35 @@ TEST_CASE("inlay hints: instance coverage and direction-only port metadata", "[i
     CHECK(hints[3].label == "↔");
 }
 
+TEST_CASE("inlay hints: header parameters do not count toward the port total", "[inlay]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/inlay_param_top.sv";
+    analyzer.open(uri, R"(module child #(
+    parameter WIDTH = 8
+)(
+    input logic [WIDTH-1:0] a,
+    input logic b,
+    output logic c,
+    inout wire d
+);
+endmodule
+
+module top;
+    child u_child (
+        .a(sig_a),
+        .b(sig_b),
+        .c(sig_c),
+        .d(sig_d)
+    );
+endmodule
+)");
+
+    auto hints = provide_inlay_hints(analyzer, uri, 0, 20);
+
+    REQUIRE(hints.size() == 5);
+    CHECK(hints[0].label == "4/4 ports");
+}
+
 TEST_CASE("inlay hints: unknown port direction is shown as question mark", "[inlay]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/inlay_unknown_top.sv";
