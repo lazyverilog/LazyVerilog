@@ -301,7 +301,7 @@ print_marketplace_publish_instructions() {
     local source_label="$2"
 
     printf '\nVS Code Marketplace manual publish\n'
-    printf '---------------------------------\n'
+    printf '%s\n' '---------------------------------'
     printf 'Publisher: %s\n' "$MARKETPLACE_PUBLISHER"
     printf 'Manage page: %s\n' "$MARKETPLACE_MANAGE_URL"
     printf 'VSIX (%s): %s\n' "$source_label" "$vsix_ref"
