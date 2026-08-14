@@ -35,15 +35,17 @@ int main(int argc, char** argv) {
 
     const fs::path rtltree_bin = argv[1];
     const fs::path repo_root = argv[2];
-    const fs::path memory_top = repo_root / "demo" / "memory_top.sv";
-    const fs::path memory = repo_root / "demo" / "memory.sv";
+    const fs::path fixtures = repo_root / "tests" / "fixtures" / "cli_smoke" / "rtltree";
+    const fs::path top = fixtures / "m_top.sv";
+    const fs::path leaf = fixtures / "m_leaf.sv";
+    const fs::path filelist = fixtures / "rtltree.f";
 
     if (!fs::exists(rtltree_bin)) {
         std::cerr << "rtltree binary does not exist: " << rtltree_bin << "\n";
         return 2;
     }
-    if (!fs::exists(memory_top) || !fs::exists(memory)) {
-        std::cerr << "fixtures missing under " << repo_root << "/demo\n";
+    if (!fs::exists(top) || !fs::exists(leaf) || !fs::exists(filelist)) {
+        std::cerr << "fixtures missing under " << fixtures << "\n";
         return 2;
     }
 
@@ -53,21 +55,22 @@ int main(int argc, char** argv) {
         expect(result.exit_code == 1, "no-args exits 1");
     }
 
-    // Forward hierarchy: memory_top instantiates memory twice.
+    // Forward hierarchy: m_top instantiates m_leaf twice.
     {
-        auto result = run_command(rtltree_bin, shell_quote(memory_top));
+        auto result = run_command(rtltree_bin, "-f " + shell_quote(filelist) + " " + shell_quote(top));
         expect(result.exit_code == 0, "forward hierarchy exits 0");
-        expect(contains(result.stdout_text, "memory_top ["), "root node is memory_top");
-        expect(contains(result.stdout_text, "memory (u_mem2)"), "child instance u_mem2 listed");
-        expect(contains(result.stdout_text, "memory (u_mem3)"), "child instance u_mem3 listed");
+        expect(contains(result.stdout_text, "m_top ["), "root node is m_top");
+        expect(contains(result.stdout_text, "m_leaf (u_leaf_a)"), "child instance u_leaf_a listed");
+        expect(contains(result.stdout_text, "m_leaf (u_leaf_b)"), "child instance u_leaf_b listed");
     }
 
-    // Reverse hierarchy: memory is instantiated by memory_top.
+    // Reverse hierarchy: m_leaf is instantiated by m_top.
     {
-        auto result = run_command(rtltree_bin, "--reverse " + shell_quote(memory));
+        auto result = run_command(
+            rtltree_bin, "-f " + shell_quote(filelist) + " --reverse " + shell_quote(leaf));
         expect(result.exit_code == 0, "reverse hierarchy exits 0");
-        expect(contains(result.stdout_text, "memory ["), "root node is memory");
-        expect(contains(result.stdout_text, "memory_top (u_mem2)"), "reverse parent u_mem2 listed");
+        expect(contains(result.stdout_text, "m_leaf ["), "root node is m_leaf");
+        expect(contains(result.stdout_text, "m_top (u_leaf_a)"), "reverse parent u_leaf_a listed");
     }
 
     if (checks_failed > 0) {
