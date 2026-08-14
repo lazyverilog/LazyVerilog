@@ -1109,6 +1109,22 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             const std::string parent_scope = !current_package.empty() ? current_package : std::string{};
             if (!typedef_name.empty())
                 add_ref(node.name, symbol_canonical("typedef", parent_scope, typedef_name));
+            // Struct/union field declarators are already recorded as
+            // `typedef_field::<scope>::<field>` by the declaration injection
+            // pass.  Without marking them here the generic fallback below would
+            // additionally tag them `module_signal::<enclosing>::<field>` when
+            // the enclosing module happens to declare a same-named signal, so
+            // renaming that signal would also rewrite the struct field.
+            if (const auto* struct_type = node.type->as_if<StructUnionTypeSyntax>()) {
+                for (const auto* member : struct_type->members) {
+                    if (!member)
+                        continue;
+                    for (const auto* decl : member->declarators) {
+                        if (decl)
+                            classified_tokens.insert(token_key(decl->name));
+                    }
+                }
+            }
             visitDefault(node);
         }
 
