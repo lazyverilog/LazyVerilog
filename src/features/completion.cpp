@@ -280,48 +280,89 @@ struct DotCompletionSyntaxContext {
     std::string base_name;
 };
 
+// Offset of `token` in the document the user is editing.
+//
+// A token written inside a macro argument is reported at an expansion
+// location, whose offset belongs to the expansion buffer and has nothing to do
+// with the cursor.  Mapping it back to where it was typed is what lets
+// `` `uvm_info("ID", $sformatf("%0h", item.| ), UVM_MEDIUM) `` be recognized as
+// member access at all.
+static std::optional<size_t> completion_original_offset(const slang::SourceManager& sm,
+                                                        slang::BufferID document_buffer,
+                                                        slang::SourceLocation loc) {
+    if (!loc.valid())
+        return std::nullopt;
+    const auto file_loc = sm.isMacroLoc(loc) ? sm.getFullyOriginalLoc(loc) : loc;
+    if (!file_loc.valid() || file_loc.buffer() != document_buffer)
+        return std::nullopt;
+    return file_loc.offset();
+}
+
+static slang::BufferID completion_document_buffer(const slang::syntax::SyntaxTree& tree) {
+    const auto start = tree.root().sourceRange().start();
+    return start.valid() ? start.buffer() : slang::BufferID{};
+}
+
 static std::optional<DotCompletionSyntaxContext>
 syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t cursor_offset) {
     using namespace slang;
     using namespace slang::syntax;
 
+    const auto& sm = tree.sourceManager();
+    const auto document_buffer = completion_document_buffer(tree);
+
     struct DotVisitor : public SyntaxVisitor<DotVisitor> {
+        const slang::SourceManager& sm;
+        slang::BufferID document_buffer;
         size_t cursor_offset;
         size_t best_start{0};
         size_t best_end{0};
 
-        explicit DotVisitor(size_t cursor_offset) : cursor_offset(cursor_offset) {}
+        DotVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
+                   size_t cursor_offset)
+            : sm(sm), document_buffer(document_buffer), cursor_offset(cursor_offset) {}
 
         void visitToken(slang::parsing::Token token) {
-            if (token && !token.isMissing() && token.kind == parsing::TokenKind::Dot &&
-                token.location().valid()) {
-                const size_t start = token.location().offset();
-                const size_t end = start + token.rawText().size();
+            if (token && !token.isMissing() && token.kind == parsing::TokenKind::Dot) {
+                const auto start = completion_original_offset(sm, document_buffer, token.location());
+                if (!start)
+                    return;
+                const size_t end = *start + token.rawText().size();
                 if (end == cursor_offset && end >= best_end) {
-                    best_start = start;
+                    best_start = *start;
                     best_end = end;
                 }
             }
         }
     };
 
-    DotVisitor dots(cursor_offset);
+    DotVisitor dots(sm, document_buffer, cursor_offset);
     tree.root().visit(dots);
     if (dots.best_end == 0)
         return std::nullopt;
 
     struct NameVisitor : public SyntaxVisitor<NameVisitor> {
+        const slang::SourceManager& sm;
+        slang::BufferID document_buffer;
         size_t dot_start;
         size_t best_end{0};
         std::string result;
 
-        explicit NameVisitor(size_t dot_start) : dot_start(dot_start) {}
+        NameVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
+                    size_t dot_start)
+            : sm(sm), document_buffer(document_buffer), dot_start(dot_start) {}
 
         void consider(const slang::syntax::NameSyntax& node) {
-            const auto range = node.sourceRange();
-            if (!range.start().valid() || !range.end().valid())
+            // Take the end from the last token rather than from the node range:
+            // an expansion range end cannot be mapped back to the document, but
+            // a token start can, and its raw text gives the width.
+            const auto last = node.getLastToken();
+            if (!last)
                 return;
-            const size_t end = range.end().offset();
+            const auto start = completion_original_offset(sm, document_buffer, last.location());
+            if (!start)
+                return;
+            const size_t end = *start + last.rawText().size();
             if (end == dot_start && end >= best_end) {
                 auto base = syntax_scope_base_name(node);
                 if (!base.empty()) {
@@ -347,7 +388,7 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
         }
     };
 
-    NameVisitor names(dots.best_start);
+    NameVisitor names(sm, document_buffer, dots.best_start);
     tree.root().visit(names);
     return DotCompletionSyntaxContext{.dot_offset = dots.best_start, .base_name = names.result};
 }
@@ -1418,6 +1459,31 @@ current_file_package_scope_items_from_ast(const DocumentState& state, std::strin
     } visitor(scope, items, seen);
     state.tree->root().visit(visitor);
     return items;
+}
+
+// Type a typedef declared anywhere in the current file names, or empty.
+//
+// This deliberately looks inside class bodies and through macro expansions:
+// `uvm_object_utils(T)` expands to `typedef uvm_object_registry #(T, "T")
+// type_id;`, and `T::type_id::create(...)` is the most-typed line in a UVM
+// testbench.  Without resolving the typedef, that scope has no members at all.
+static std::string current_file_typedef_target_from_ast(const DocumentState& state,
+                                                        std::string_view name) {
+    if (!state.tree || name.empty())
+        return {};
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        std::string_view name;
+        std::string result;
+        explicit Visitor(std::string_view name) : name(name) {}
+        void handle(const TypedefDeclarationSyntax& node) {
+            if (result.empty() && std::string_view(node.name.valueText()) == name)
+                result = completion_base_type_name(current_ast_decl_text(*node.type));
+            visitDefault(node);
+        }
+    } visitor(name);
+    state.tree->root().visit(visitor);
+    return visitor.result;
 }
 
 static std::vector<lsCompletionItem>
@@ -2820,6 +2886,9 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             add_local_names(*shard.index);
 
     std::vector<lsCompletionItem> all_items;
+    // A second name the shard layer should also be asked about, when the typed
+    // scope only aliases the type that actually owns the members.
+    std::string aliased_scope_name;
 
     switch (ctx.kind) {
     case CompletionContextKind::Identifier:
@@ -2855,6 +2924,15 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     }
     case CompletionContextKind::PackageScope: {
         auto items = current_file_package_scope_items_from_ast(state, ctx.scope_name);
+        if (items.empty()) {
+            // `my_item::type_id::` — the scope is a typedef, so the members
+            // being asked for belong to the type it names.
+            const auto target = current_file_typedef_target_from_ast(state, ctx.scope_name);
+            if (!target.empty() && target != ctx.scope_name) {
+                aliased_scope_name = target;
+                items = current_file_package_scope_items_from_ast(state, target);
+            }
+        }
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
         break;
@@ -2942,10 +3020,12 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         }
 
         std::vector<CompletionContext> shard_contexts{indexed_ctx};
-        if (!inherited_scope.empty()) {
-            CompletionContext base_ctx = indexed_ctx;
-            base_ctx.scope_name = inherited_scope;
-            shard_contexts.push_back(std::move(base_ctx));
+        for (const auto& alias : {inherited_scope, aliased_scope_name}) {
+            if (alias.empty())
+                continue;
+            CompletionContext alias_ctx = indexed_ctx;
+            alias_ctx.scope_name = alias;
+            shard_contexts.push_back(std::move(alias_ctx));
         }
 
         for (const auto& provider : providers_) {

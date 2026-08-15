@@ -1760,3 +1760,28 @@ TEST_CASE("references: an unresolved local name does not match other project fil
     std::filesystem::remove(lib);
     std::filesystem::remove(drv);
 }
+
+TEST_CASE("references: a class field reaches its handle.field uses", "[references][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_member_access.sv";
+    analyzer.open(uri, "class item;\n"
+                       "    int addr;\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    item it;\n"
+                       "    initial begin\n"
+                       "        it.addr = 1;\n"
+                       "        $display(it.addr);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    // On the declaration of `addr`.
+    auto refs = analyzer.find_references(uri, 1, 8, true);
+    CHECK(refs.size() == 3);
+
+    std::vector<int> lines;
+    for (const auto& ref : refs)
+        lines.push_back(ref.line);
+    std::sort(lines.begin(), lines.end());
+    CHECK(lines == std::vector<int>{1, 6, 7});
+}

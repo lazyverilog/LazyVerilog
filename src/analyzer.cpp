@@ -1844,6 +1844,69 @@ static std::optional<std::string> find_class_field_type_in_hierarchy(
     return std::nullopt;
 }
 
+// Declaration of `member_name` written inside `class_name`'s body in this tree.
+//
+// `Class::member` is not only a static method call: it also reaches a nested
+// typedef, which is how the utils macros publish `type_id`.  Those typedefs are
+// produced by macro expansion, so the answer is wherever the token really came
+// from, which is what location_from_token_actual_uri() reports.
+static std::optional<Location> find_class_scoped_declaration_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view class_name,
+    std::string_view member_name) {
+    if (class_name.empty() || member_name.empty())
+        return std::nullopt;
+    using namespace slang::syntax;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view class_name;
+        std::string_view member_name;
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view class_name,
+                std::string_view member_name)
+            : sm(sm), uri(uri), class_name(class_name), member_name(member_name) {}
+
+        void accept(const slang::parsing::Token& token) {
+            if (!result && token && token.valueText() == member_name)
+                result = location_from_token_actual_uri(sm, uri, token);
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                if (const auto* td = item->as_if<TypedefDeclarationSyntax>()) {
+                    accept(td->name);
+                } else if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+                    if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>())
+                        accept(nested->name);
+                    else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+                        for (const auto* decl : data->declarators)
+                            if (decl)
+                                accept(decl->name);
+                    }
+                } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
+                    if (const auto* id =
+                            method->declaration->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                } else if (const auto* proto = item->as_if<ClassMethodPrototypeSyntax>()) {
+                    if (const auto* id = proto->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                }
+            }
+        }
+    } visitor(tree.sourceManager(), uri, class_name, member_name);
+
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
 static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
                               const Location& location) {
     if (!token || !token.location().valid())
@@ -3112,6 +3175,19 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                 return loc;
         }
 
+        // The qualifier may name a class rather than a package: `my_item::type_id`,
+        // `my_class::static_method`.  Resolve inside that class only — this is
+        // still a qualified lookup, so it must not fall back to unrelated
+        // same-named declarations.
+        if (state.tree) {
+            if (auto loc = find_class_scoped_declaration_in_tree(
+                    *state.tree, uri, target.package_qualifier, target.name))
+                return loc;
+        }
+        if (auto loc = find_class_member_in_hierarchy(class_lookup_shards(),
+                                                      target.package_qualifier, target.name))
+            return loc;
+
         // Deliberately no generic fallback.  A qualified name that the package
         // does not export must report "no definition" rather than silently
         // resolving to a same-named local or other-module declaration.
@@ -3642,8 +3718,16 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
-            if (target_info.kind == DefinitionTargetKind::ClassMember &&
-                target_symbol_debug.starts_with("class_method::"))
+            if ((target_info.kind == DefinitionTargetKind::ClassMember &&
+                 target_symbol_debug.starts_with("class_method::")) ||
+                target_symbol_debug.starts_with("class_field::"))
+                // A class field is written both bare inside the class body and
+                // as `handle.field` elsewhere.  Only the first form carries the
+                // scoped `class_field::` identity in a shard: the second is
+                // indexed as an unresolved name, because the shard cannot type
+                // the receiver.  Verifying candidate tokens against the
+                // declaration recovers those uses without widening the
+                // SymbolID match to every same-named symbol in the project.
                 visit_tree(*state->tree, state_uri, resolve_snapshot);
         } else {
             visit_tree(*state->tree, state_uri, resolve_snapshot);
