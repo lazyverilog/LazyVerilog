@@ -1694,3 +1694,69 @@ TEST_CASE("rename: a macro body identifier does not answer for the whole invocat
         return r.line == 4 && r.col == macro_col;
     }));
 }
+
+TEST_CASE("references: a method-local reaches its uses inside macro arguments",
+          "[references][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_method_local_macro.sv";
+    analyzer.open(uri, "`define INFO(A) uvm_report_info(A)\n"
+                       "class item_t;\n"
+                       "    bit [7:0] addr;\n"
+                       "endclass\n"
+                       "class drv;\n"
+                       "    task run();\n"
+                       "        item_t item;\n"
+                       "        get(item);\n"
+                       "        `INFO(item)\n"
+                       "        `INFO(item.addr)\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // A local declared inside a class method has no scope-qualified SymbolID,
+    // so references come from the AST verification path rather than the index.
+    // That path still has to place a macro argument where the user wrote it.
+    const auto refs = analyzer.find_references(uri, 6, 15, true);
+    CHECK(refs.size() == 4);
+    auto has = [&](int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+    CHECK(has(6, 15));  // declaration
+    CHECK(has(7, 12));  // ordinary use
+    CHECK(has(8, 14));  // macro argument
+    CHECK(has(9, 14));  // macro argument, object of a member access
+}
+
+TEST_CASE("references: an unresolved local name does not match other project files",
+          "[references][rename]") {
+    // The open file is listed in the filelist, as any real project file is, so
+    // it also has a closed shard of its own.  That shard knows the local only as
+    // `name:item`, which must not become a bridge to every unrelated `item`.
+    const auto lib = write_temp_sv("lazyverilog_refs_local_lib.sv", "class other;\n"
+                                                                   "    task run();\n"
+                                                                   "        int item;\n"
+                                                                   "        use(item);\n"
+                                                                   "    endtask\n"
+                                                                   "endclass\n");
+    const auto drv = write_temp_sv("lazyverilog_refs_local_drv.sv", "class drv;\n"
+                                                                   "    task run();\n"
+                                                                   "        int item;\n"
+                                                                   "        get(item);\n"
+                                                                   "    endtask\n"
+                                                                   "endclass\n");
+    Analyzer analyzer;
+    analyzer.set_extra_files({lib.string(), drv.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string drv_uri = uri_from_path(drv);
+    std::ifstream in(drv);
+    analyzer.open(drv_uri, std::string(std::istreambuf_iterator<char>(in), {}));
+
+    const auto refs = analyzer.find_references(drv_uri, 2, 12, true);
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == drv_uri);
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(drv);
+}
