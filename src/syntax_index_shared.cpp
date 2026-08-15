@@ -558,8 +558,13 @@ std::string final_name_from_qualified_name(std::string_view qualified_name) {
 std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
-    const auto line = sm.getLineNumber(token.location());
-    const auto col = sm.getColumnNumber(token.location());
+    // A macro argument lives in its own expansion buffer, which has no lines for
+    // getColumnNumber() to walk back through.  Report where the user wrote it.
+    const auto location = sm.isMacroArgLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    const auto line = sm.getLineNumber(location);
+    const auto col = sm.getColumnNumber(location);
     return {line > 0 ? static_cast<int>(line) : 0, col > 0 ? static_cast<int>(col) - 1 : 0};
 }
 
@@ -885,9 +890,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // Extra fields for macro visitor
         decltype(add_macro_ref)& add_macro;
         SourceFileIdResolver& file_ids;
-        // Per-buffer classification: true = macro definition buffer, false = file buffer.
-        // Populated on first token seen from each buffer so isMacroLoc is called only once per buffer.
-        std::unordered_map<uint32_t, bool> buffer_is_macro;
+        // Per-buffer classification, populated on first token seen from each
+        // buffer so the SourceManager is queried only once per buffer.  slang
+        // gives every macro argument its own expansion buffer, distinct from the
+        // one holding the macro body, so the answer really is uniform per buffer.
+        enum class BufferKind : uint8_t { File, MacroBody, MacroArgument };
+        std::unordered_map<uint32_t, BufferKind> buffer_kinds;
         // Deduplication for macro expansion sites. Key = (expansion_buf_id << 32) | expansion_offset.
         // Avoids recording the same macro invocation multiple times when it expands to many tokens.
         std::unordered_set<uint64_t> seen_expansions;
@@ -1479,36 +1487,55 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (!file_ids.accepts(index, sm, token))
                 return;
 
-            // Classify buffer on first encounter (saves repeated isMacroLoc calls).
+            // Classify buffer on first encounter (saves repeated SourceManager
+            // queries, each of which takes a lock).
             const uint32_t buf_id = token.location().buffer().getId();
-            auto [it, inserted] = buffer_is_macro.emplace(buf_id, false);
+            auto [it, inserted] = buffer_kinds.emplace(buf_id, BufferKind::File);
             if (inserted) {
-                it->second = sm.isMacroLoc(token.location());
+                it->second = !sm.isMacroLoc(token.location()) ? BufferKind::File
+                             : sm.isMacroArgLoc(token.location()) ? BufferKind::MacroArgument
+                                                                  : BufferKind::MacroBody;
             }
 
-            if (it->second) {
-                // Macro token — record the macro invocation once per expansion site.
-                const auto range = sm.getExpansionRange(token.location());
+            if (it->second != BufferKind::File) {
+                // Macro token — record the macro invocation once per expansion
+                // site.  Arguments record it too: `define ID(X) X expands to
+                // nothing but its argument, so body tokens cannot be relied on
+                // to be there.
+                auto range = sm.getExpansionRange(token.location());
+                // An argument's expansion range still sits inside a macro
+                // buffer, so keep expanding until the invocation lands in the
+                // file the user wrote.  Stopping early records a nonsense
+                // column and, because the dedup key is the range start, a
+                // second entry for an invocation the body tokens already
+                // recorded correctly.
+                while (range.start().valid() && sm.isMacroLoc(range.start()))
+                    range = sm.getExpansionRange(range.start());
                 if (!range.start().valid())
                     return;
                 const uint64_t key = (static_cast<uint64_t>(range.start().buffer().getId()) << 32) |
                                      static_cast<uint64_t>(range.start().offset());
-                if (!seen_expansions.insert(key).second)
-                    return; // already recorded this expansion site
-                const auto macro_name = sm.getMacroName(token.location());
-                if (macro_name.empty())
+                if (seen_expansions.insert(key).second) {
+                    const auto macro_name = sm.getMacroName(token.location());
+                    if (!macro_name.empty()) {
+                        const int line_num = (int)sm.getLineNumber(range.start());
+                        int col = (int)sm.getColumnNumber(range.start()) - 1;
+                        if (col < 0)
+                            col = 0;
+                        if (auto text = source_text_for_syntax_range(sm, range);
+                            text && text->starts_with('`'))
+                            ++col;
+                        add_macro(std::string(macro_name),
+                                  file_ids.for_location(index, sm, range.start()), line_num, col);
+                    }
+                }
+                // A macro body token is preprocessor output and names nothing at
+                // this position.  An argument is text the user typed at the call
+                // site, so it is an occurrence in its own right and has to go on
+                // to be classified like any other identifier -- otherwise rename
+                // silently skips it and leaves the call broken.
+                if (it->second == BufferKind::MacroBody)
                     return;
-                const int line_num = (int)sm.getLineNumber(range.start());
-                int col = (int)sm.getColumnNumber(range.start()) - 1;
-                if (col < 0)
-                    col = 0;
-                if (auto text = source_text_for_syntax_range(sm, range);
-                    text && text->starts_with('`'))
-                    ++col;
-                add_macro(std::string(macro_name),
-                          file_ids.for_location(index, sm, range.start()),
-                          line_num, col);
-                return;
             }
             // Reference fallback
             if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
