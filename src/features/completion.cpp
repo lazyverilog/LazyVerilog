@@ -836,6 +836,13 @@ static std::string completion_base_type_name(std::string type) {
     const size_t paren = type.find("#(");
     if (paren != std::string::npos)
         type.erase(paren);
+    // A package qualifier has to go before the leading-identifier scan below,
+    // which would otherwise reduce `cfg_pkg::base_cfg` to the package name and
+    // make every class lookup on that type miss.  The scan itself must stay
+    // leading-component so ordinary declarations such as `logic [7:0]` still
+    // reduce to `logic`.
+    if (const size_t scope = type.rfind("::"); scope != std::string::npos)
+        type.erase(0, scope + 2);
     type = trim_completion_copy(std::move(type));
     size_t end = 0;
     while (end < type.size() && is_ident_char(type[end]))
@@ -1513,12 +1520,8 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
                     return;
                 }
                 if (node.extendsClause) {
-                    // completion_base_type_name() stops at the first non-identifier
-                    // character, so a package-qualified base (`extends
-                    // cfg_pkg::base_cfg`) would reduce to the package name.  Drop
-                    // the qualifier and any parameter overrides first.
-                    emit_class(completion_base_type_name(base_class_lookup_name(
-                        current_ast_decl_text(*node.extendsClause->baseName))));
+                    emit_class(completion_base_type_name(
+                        current_ast_decl_text(*node.extendsClause->baseName)));
                 }
                 for (const auto* item : node.items) {
                     if (const auto* prop = item ? item->as_if<ClassPropertyDeclarationSyntax>() : nullptr) {
