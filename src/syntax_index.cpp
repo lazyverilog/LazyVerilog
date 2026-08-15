@@ -713,6 +713,21 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             m.line = ml;
             m.col = mc;
             entry.methods.push_back(std::move(m));
+        } else if (const auto* proto_item = item->as_if<ClassMethodPrototypeSyntax>()) {
+            // `extern virtual function void raise_objection(...);` declares a
+            // member just as much as an inline body does — the body simply
+            // lives further down the file as `class::method`.  Indexing only
+            // inline bodies hides most of a class written in the extern style.
+            const auto& proto = *proto_item->prototype;
+            MethodEntry m;
+            m.name = render_syntax_node_text(sm, *proto.name);
+            m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
+            m.file_id = resolver.for_token(index, sm, proto.keyword);
+            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
+            m.line = ml;
+            m.col = mc;
+            entry.methods.push_back(std::move(m));
         }
     }
 
