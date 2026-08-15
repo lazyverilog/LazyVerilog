@@ -1653,3 +1653,44 @@ TEST_CASE("references: identifiers inside macro arguments are occurrences", "[re
     CHECK(has(id_refs, 1, 8));
     CHECK(has(id_refs, 7, 16));
 }
+
+TEST_CASE("rename: a macro body identifier does not answer for the whole invocation",
+          "[references][rename][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_rename_macro_body.sv";
+    analyzer.open(uri, "`define uvm_info(ID, MSG, VERB) uvm_report_info(ID, MSG, VERB)\n"
+                       "module top;\n"
+                       "    int item;\n"
+                       "    initial begin\n"
+                       "        `uvm_info(\"DRV\", $sformatf(\"%0d\", item), UVM_MEDIUM)\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    const std::string call = "        `uvm_info(\"DRV\", $sformatf(\"%0d\", item), UVM_MEDIUM)";
+
+    // The macro expands to a call to uvm_report_info.  That name is written in
+    // the `define, not here, so it must not be what rename offers at a column
+    // the user typed something else at.
+    const int item_col = (int)call.find("item");
+    auto on_arg = analyzer.identifier_at(uri, 4, item_col);
+    REQUIRE(on_arg.has_value());
+    CHECK(on_arg->name == "item");
+    CHECK(on_arg->line == 4);
+    CHECK(on_arg->col == item_col);
+
+    // The invocation itself still renames as the macro.
+    const int macro_col = (int)call.find("uvm_info");
+    auto on_macro = analyzer.identifier_at(uri, 4, macro_col);
+    REQUIRE(on_macro.has_value());
+    CHECK(on_macro->name == "uvm_info");
+    CHECK(on_macro->line == 4);
+    CHECK(on_macro->col == macro_col);
+
+    const auto macro_refs = analyzer.find_references(uri, 4, macro_col, true);
+    CHECK(macro_refs.size() == 2);
+    CHECK(std::any_of(macro_refs.begin(), macro_refs.end(),
+                      [](const Location& r) { return r.line == 0 && r.col == 8; }));
+    CHECK(std::any_of(macro_refs.begin(), macro_refs.end(), [&](const Location& r) {
+        return r.line == 4 && r.col == macro_col;
+    }));
+}

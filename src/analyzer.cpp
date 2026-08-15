@@ -2856,11 +2856,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
         void visitToken(slang::parsing::Token token) {
             if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
                 return;
+            // A macro body token is preprocessor output with no position of its
+            // own in the file, so the cursor can never really be on it.  Its
+            // visible range is the whole invocation, which would otherwise make
+            // the first identifier the body happens to contain answer for every
+            // column of the call -- naming that instead of what the user wrote.
+            // Arguments are typed at the call site and are hit normally.
+            if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
+                return;
             if (!token_contains_position_in_uri(sm, token, uri, line, col))
                 return;
 
-            const int token_line = to_lsp_line((int)sm.getLineNumber(token.location()));
-            const int token_col = (int)sm.getColumnNumber(token.location()) - 1;
+            const auto start = visible_range_for_token(sm, token).start();
+            const int token_line = to_lsp_line((int)sm.getLineNumber(start));
+            const int token_col = (int)sm.getColumnNumber(start) - 1;
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
@@ -2873,7 +2882,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
     Visitor visitor(state->tree->sourceManager(), uri, line, col);
     state->tree->root().visit(visitor);
-    return visitor.result;
+    if (visitor.result)
+        return visitor.result;
+
+    // A macro invocation leaves no Identifier token at the user's position --
+    // the preprocessor consumed the backtick and the name.  Read the name back
+    // out of the source so `FOO, and a `define of it, stay renameable.
+    if (auto ident = extract_ident_span(state->text, line, col);
+        ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
+                  is_define_identifier(state->text, line, ident->start_col)))
+        return IdentifierAtPosition{.name = ident->text,
+                                    .line = line,
+                                    .col = ident->start_col,
+                                    .end_col = ident->end_col};
+    return std::nullopt;
 }
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
@@ -3130,22 +3152,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // generations in one references response if a didChange / shard publish
     // happened between loops.
     const auto extra_idx = extra_index_snapshot_ptr();
-    if (!target) {
-        // Macro invocations are often represented in slang's parsed tree as
-        // expansion tokens rather than as an ordinary Identifier token at the
-        // user's source location.  `definition_of_state()` already has a raw
-        // source fallback for backtick identifiers; references need the same
-        // seed identifier so "find references" works when the cursor is on
-        // `FOO in source text.
-        if (auto ident = extract_ident_span(state->text, line, col);
-            ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
-                      is_define_identifier(state->text, line, ident->start_col))) {
-            target = IdentifierAtPosition{.name = ident->text,
-                                          .line = line,
-                                          .col = ident->start_col,
-                                          .end_col = ident->end_col};
-        }
-    }
     if (!target)
         return {};
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
