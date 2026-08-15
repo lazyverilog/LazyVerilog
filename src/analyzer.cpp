@@ -1737,6 +1737,52 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
     return std::nullopt;
 }
 
+// One SyntaxIndex shard plus the URI to fall back on when the shard carries no
+// source file of its own.  Class hierarchies routinely span shards — a child in
+// the current file extending a base in a closed project file — so member lookup
+// has to be able to hop between them.
+struct ClassLookupShard {
+    const SyntaxIndex* index;
+    const std::string* uri;
+};
+
+static const ClassEntry* find_class_entry(const SyntaxIndex& index, std::string_view class_name) {
+    auto it = index.class_by_name.find(std::string(class_name));
+    if (it == index.class_by_name.end() || it->second >= index.classes.size())
+        return nullptr;
+    return &index.classes[it->second];
+}
+
+// Resolve `member_name` on `class_name`, then on its `extends` ancestors.
+//
+// SystemVerilog inherits properties and methods, so `child.depth` and a bare
+// `depth` inside a child class body both have to reach `pkt_base::depth`.  Each
+// hop re-searches every shard because the base class is frequently declared in
+// a different file than the child.
+static std::optional<Location> find_class_member_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view member_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        for (const auto& shard : shards) {
+            if (auto loc = find_class_member_definition(*shard.index, *shard.uri, class_name,
+                                                        member_name))
+                return loc;
+        }
+
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (cls && !cls->base_class.empty()) {
+                base = base_class_lookup_name(cls->base_class);
+                break;
+            }
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
 static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
                               const Location& location) {
     if (!token || !token.location().valid())
@@ -2124,6 +2170,9 @@ struct DefinitionTarget {
     std::string package_qualifier;
     std::string scope_module;
     std::string scope_package;
+    // Innermost class body the cursor sits in, empty outside class scope.
+    // Unqualified names there may be inherited members.
+    std::string scope_class;
 };
 
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
@@ -2134,6 +2183,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     DefinitionTarget target;
     std::string current_module;
     std::string current_package;
+    std::string current_class;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
                             int col)
@@ -2181,6 +2231,15 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
         current_module = std::move(previous_module);
         current_package = std::move(previous_package);
+    }
+
+    // Tracked so an unqualified name inside a class body can be resolved
+    // against that class and the classes it extends.
+    void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+        auto previous_class = current_class;
+        current_class = std::string(node.name.valueText());
+        visitDefault(node);
+        current_class = std::move(previous_class);
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
@@ -2380,6 +2439,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
             target.scope_package = current_package;
+            target.scope_class = current_class;
         }
     }
 };
@@ -2927,6 +2987,18 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     const int use_line_one_based = line + 1;
     const auto& current_index = get_structural_index(state);
 
+    // Every shard a class hierarchy could be spread across, current file first.
+    auto class_lookup_shards = [&] {
+        std::vector<ClassLookupShard> shards;
+        shards.reserve(extra_files.size() + 1);
+        shards.push_back(ClassLookupShard{&current_index, &uri});
+        for (const auto& extra : extra_files) {
+            if (!skip_extra(extra))
+                shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+        }
+        return shards;
+    };
+
     if (target.kind == DefinitionTargetKind::PackageMember) {
         if (auto loc =
                 find_package_member(current_index, uri, target.package_qualifier, target.name))
@@ -2971,18 +3043,16 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
             // Search both compact index families so `obj.field` works for
-            // closed-file classes as well as structs/unions.
-            if (auto loc =
-                    find_class_member_definition(current_index, uri, *class_type, target.name))
+            // closed-file classes as well as structs/unions.  Class lookup
+            // walks the `extends` chain; typedef aggregates have no base type.
+            const auto shards = class_lookup_shards();
+            if (auto loc = find_class_member_in_hierarchy(shards, *class_type, target.name))
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
             for (const auto& extra : extra_files) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_class_member_definition(extra.index_ref(), extra.uri, *class_type,
-                                                            target.name))
-                    return loc;
                 if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
                                                              *class_type, target.name))
                     return loc;
@@ -2998,6 +3068,25 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                            target.scope_package, visible_imports,
                                            use_line_one_based))
         return loc;
+
+    // An unqualified name inside a class body that the current file cannot
+    // explain may be an inherited member:
+    //
+    //     class pkt_child extends pkt_base;
+    //         function void bump();
+    //             depth = depth + 1;   // pkt_base::depth, declared elsewhere
+    //
+    // This runs after the current-file walk so method locals and same-file
+    // declarations keep shadowing the base class, and before the project-wide
+    // generic scan so an unrelated same-named symbol cannot win over a real
+    // inherited member.
+    if (!target.scope_class.empty()) {
+        if (auto loc =
+                find_class_member_in_hierarchy(class_lookup_shards(), target.scope_class,
+                                               target.name))
+            return loc;
+    }
+
     for (const auto& extra : extra_files) {
         if (skip_extra(extra))
             continue;

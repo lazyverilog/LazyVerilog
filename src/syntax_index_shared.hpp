@@ -168,6 +168,12 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
 std::string make_subroutine_signature(const slang::syntax::FunctionPrototypeSyntax& proto,
                                       const std::string& name, const slang::SourceManager& sm);
 
+/// Reduce a verbatim `extends` clause to the bare class name used as the
+/// `ClassEntry` key.  The clause is stored as written, so it may carry a
+/// package qualifier and parameter overrides (`extends cfg_pkg::base_cfg #(8)`)
+/// that no index is keyed by.
+std::string base_class_lookup_name(std::string_view base_class);
+
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name);
 bool is_module_value_kind(std::string_view kind);
 std::string canonical_type_name_from_text(std::string_view type);
