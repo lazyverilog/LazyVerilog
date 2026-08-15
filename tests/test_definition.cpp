@@ -770,3 +770,43 @@ TEST_CASE("definition: unresolvable identifier stays fast on a large project",
 
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("definition: imported package subroutine resolves while the package file is open",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_open_pkg.sv",
+                                        "package common_pkg;\n"
+                                        "typedef int my_int_t;\n"
+                                        "\n"
+                                        "function void foo();\n"
+                                        "endfunction\n"
+                                        "endpackage\n");
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_open_pkg_top.sv";
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package buffer being open routes the lookup through the dynamic
+    // open-file shard instead of the disk-backed one; both must report the
+    // declaration position.
+    analyzer.open(pkg_uri, "package common_pkg;\n"
+                           "typedef int my_int_t;\n"
+                           "\n"
+                           "function void foo();\n"
+                           "endfunction\n"
+                           "endpackage\n");
+    analyzer.open(top_uri, "module top;\n"
+                           "import common_pkg::*;\n"
+                           "    initial begin\n"
+                           "        foo();\n"
+                           "    end\n"
+                           "endmodule\n");
+
+    auto loc = analyzer.definition_of(top_uri, 3, 9);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == pkg_uri);
+    CHECK(loc->line == 3);
+    CHECK(loc->col == 14);
+
+    std::filesystem::remove(pkg_path);
+}
