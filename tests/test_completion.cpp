@@ -82,6 +82,12 @@ static void write_text_file(const std::filesystem::path& path, std::string_view 
     REQUIRE(out.good());
 }
 
+static std::filesystem::path write_temp_sv_file(const std::string& name, const std::string& text) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    write_text_file(path, text);
+    return path;
+}
+
 static SyntheticUvmFixture make_synthetic_uvm_fixture(std::string_view name) {
     SyntheticUvmFixture setup;
     setup.root = std::filesystem::temp_directory_path() /
@@ -1683,4 +1689,116 @@ TEST_CASE("completion: FileProvider returns svh from extra files", "[completion]
     CHECK(!has_label(result, "completion_file.sv"));
 
     std::filesystem::remove(header_path);
+}
+
+// ── Member access across the open-buffer / project-shard boundary ─────────────
+
+// One package holding the shapes a UVM-style testbench inherits from: a base
+// class with an extern method, a class used as a handle type, and a base class
+// that owns a handle its subclasses use.
+static const std::string kPackageClassLibraryFixture = R"(package tb_pkg;
+    class base_obj;
+        int base_field;
+        extern virtual function void base_method();
+    endclass
+
+    class phase_obj;
+        extern virtual function void raise_objection();
+        function void inline_method();
+        endfunction
+    endclass
+
+    class driver_base extends base_obj;
+        phase_obj port_handle;
+    endclass
+endpackage
+)";
+
+TEST_CASE("completion: inherited members come from a base class in an imported package",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_lib.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_inherited.sv";
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv extends base_obj;\n"
+                             "    int own_field;\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    my_drv drv;\n"
+                             "    initial drv.own_field = 0;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "drv.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "own_field"));
+    // The base class is declared in the package file, so it is only reachable
+    // through the project shard.
+    CHECK(has_label(result, "base_field"));
+    // ...and it is declared extern, the style UVM uses almost everywhere.
+    CHECK(has_label(result, "base_method"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: a subroutine argument typed by a package class offers its members",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_arg.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_arg.sv";
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv;\n"
+                             "    task run(phase_obj arg_phase);\n"
+                             "        arg_phase.inline_method();\n"
+                             "    endtask\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "arg_phase.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "inline_method"));
+    CHECK(has_label(result, "raise_objection"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: an inherited field resolves its own declared type",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_field.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_inherited_field.sv";
+    // `port_handle` is declared by driver_base, which the current file does not
+    // contain, so its type is only knowable through the project shard.
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv extends driver_base;\n"
+                             "    task run();\n"
+                             "        port_handle.inline_method();\n"
+                             "    endtask\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "port_handle.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "inline_method"));
+    CHECK(has_label(result, "raise_objection"));
+
+    std::filesystem::remove(pkg_path);
 }

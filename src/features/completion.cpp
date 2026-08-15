@@ -1489,9 +1489,65 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 }
             }
         }
+        // `task run_phase(uvm_phase phase);` — the receiver is a subroutine
+        // argument, which is neither a data declaration nor an instance.
+        void handle(const FunctionPortSyntax& node) {
+            if (!result.empty() || !node.dataType || !node.declarator)
+                return;
+            if (before(node.declarator->name) &&
+                node.declarator->name.valueText() == ctx.scope_name)
+                result = completion_base_type_name(current_ast_decl_text(*node.dataType));
+        }
     } visitor(ctx, offset, result);
     state.tree->root().visit(visitor);
     return result.empty() ? ctx.scope_name : result;
+}
+
+// Walk the current file's `extends` chain and return the first base class the
+// file does not declare itself.
+//
+// Member access is layered the same way the index is: the receiver's class can
+// be an open-buffer class while its base lives in a closed project shard.  The
+// AST walk above can only emit members it can see, so the caller needs the name
+// to continue the climb with in the shard layer.
+static std::string current_file_unresolved_base_class(const DocumentState& state,
+                                                      std::string_view class_name) {
+    if (!state.tree || class_name.empty())
+        return {};
+    using namespace slang::syntax;
+
+    struct ClassBaseVisitor : SyntaxVisitor<ClassBaseVisitor> {
+        std::string_view class_name;
+        bool found{false};
+        std::string base;
+        explicit ClassBaseVisitor(std::string_view class_name) : class_name(class_name) {}
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            found = true;
+            if (node.extendsClause)
+                base = completion_base_type_name(
+                    current_ast_decl_text(*node.extendsClause->baseName));
+        }
+    };
+
+    std::string current(class_name);
+    std::unordered_set<std::string> visited;
+    while (visited.insert(current).second) {
+        ClassBaseVisitor visitor(current);
+        state.tree->root().visit(visitor);
+        if (!visitor.found || visitor.base.empty())
+            return {};
+        current = visitor.base;
+
+        ClassBaseVisitor base_visitor(current);
+        state.tree->root().visit(base_visitor);
+        if (!base_visitor.found)
+            return current; // declared elsewhere — the shard layer takes over
+    }
+    return {};
 }
 
 static std::vector<lsCompletionItem>
@@ -1870,6 +1926,27 @@ class IdentifierProvider : public CompletionProvider {
         return items;
     }
 };
+
+// Type of `field_name` as declared on `class_name` or any of its ancestors
+// within one shard.  Used when the receiver itself is an inherited field, e.g.
+// `seq_item_port` declared by `uvm_driver` and used from a subclass.
+static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxIndex& index,
+                                                                std::string class_name,
+                                                                const std::string& field_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        const auto it = index.class_by_name.find(class_name);
+        if (it == index.class_by_name.end() || it->second >= index.classes.size())
+            return std::nullopt;
+        const auto& cls = index.classes[it->second];
+        for (const auto& f : cls.fields) {
+            if (f.name == field_name && !f.type.empty())
+                return f.type;
+        }
+        class_name = base_class_lookup_name(cls.base_class);
+    }
+    return std::nullopt;
+}
 
 // MemberProvider: fields/methods for class, ports for module/interface.
 class MemberProvider : public CompletionProvider {
@@ -2794,6 +2871,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     try {
         CompletionContext indexed_ctx = ctx;
+        std::string inherited_scope;
         if (ctx.kind == CompletionContextKind::MemberAccess && !ctx.scope_name.empty()) {
             // Member access is inherently layered:
             //
@@ -2819,11 +2897,55 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         break;
                 }
             }
+            if (!value_type) {
+                // didChange no longer stores current-file declarations in the
+                // index, so a receiver declared in the buffer being edited is
+                // only visible in its AST.  Without this the shard layer is
+                // asked for members of the *variable* name and answers nothing.
+                const std::string ast_type = current_file_type_of_name_from_ast(state, ctx);
+                if (!ast_type.empty() && ast_type != ctx.scope_name)
+                    value_type = ast_type;
+            }
+            if (!value_type && !ctx.current_scope_name.empty()) {
+                // The receiver can also be a field the enclosing class only
+                // inherits, so its declaration is in whichever shard holds the
+                // base class.
+                const std::string base =
+                    current_file_unresolved_base_class(state, ctx.current_scope_name);
+                if (!base.empty()) {
+                    for (const auto& shard : *opened_shards) {
+                        if (!shard.index)
+                            continue;
+                        value_type =
+                            field_type_in_shard_hierarchy(*shard.index, base, ctx.scope_name);
+                        if (value_type)
+                            break;
+                    }
+                    for (const auto* shard : project_shards) {
+                        if (value_type)
+                            break;
+                        if (shard)
+                            value_type =
+                                field_type_in_shard_hierarchy(*shard, base, ctx.scope_name);
+                    }
+                }
+            }
             if (value_type) {
                 const std::string base = completion_base_type_name(*value_type);
                 if (!base.empty())
                     indexed_ctx.scope_name = base;
             }
+            // The receiver's class may be declared in this buffer while its
+            // base class is not.  The AST pass emitted what it could see; the
+            // shard layer has to be asked for the rest of the chain by name.
+            inherited_scope = current_file_unresolved_base_class(state, indexed_ctx.scope_name);
+        }
+
+        std::vector<CompletionContext> shard_contexts{indexed_ctx};
+        if (!inherited_scope.empty()) {
+            CompletionContext base_ctx = indexed_ctx;
+            base_ctx.scope_name = inherited_scope;
+            shard_contexts.push_back(std::move(base_ctx));
         }
 
         for (const auto& provider : providers_) {
@@ -2833,21 +2955,23 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             all_items.insert(all_items.end(),
                              std::make_move_iterator(items.begin()),
                              std::make_move_iterator(items.end()));
-            for (const auto& shard : *opened_shards) {
-                if (!shard.index)
-                    continue;
-                auto open_items = provider->provide(indexed_ctx, *shard.index, tok);
-                all_items.insert(all_items.end(),
-                                 std::make_move_iterator(open_items.begin()),
-                                 std::make_move_iterator(open_items.end()));
-            }
-            for (const auto* shard : project_shards) {
-                if (!shard)
-                    continue;
-                auto project_items = provider->provide(indexed_ctx, *shard, tok);
-                all_items.insert(all_items.end(),
-                                 std::make_move_iterator(project_items.begin()),
-                                 std::make_move_iterator(project_items.end()));
+            for (const auto& shard_ctx : shard_contexts) {
+                for (const auto& shard : *opened_shards) {
+                    if (!shard.index)
+                        continue;
+                    auto open_items = provider->provide(shard_ctx, *shard.index, tok);
+                    all_items.insert(all_items.end(),
+                                     std::make_move_iterator(open_items.begin()),
+                                     std::make_move_iterator(open_items.end()));
+                }
+                for (const auto* shard : project_shards) {
+                    if (!shard)
+                        continue;
+                    auto project_items = provider->provide(shard_ctx, *shard, tok);
+                    all_items.insert(all_items.end(),
+                                     std::make_move_iterator(project_items.begin()),
+                                     std::make_move_iterator(project_items.end()));
+                }
             }
         }
     } catch (const CompletionCancelled&) {
