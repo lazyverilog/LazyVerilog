@@ -771,6 +771,81 @@ TEST_CASE("definition: unresolvable identifier stays fast on a large project",
     std::filesystem::remove_all(dir);
 }
 
+TEST_CASE("definition: class member access walks the extends chain across files",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto base_path = write_temp_sv("lazyverilog_definition_pkt_base.sv",
+                                         "class pkt_base;\n"
+                                         "    int depth;\n"
+                                         "\n"
+                                         "    function void apply();\n"
+                                         "    endfunction\n"
+                                         "endclass\n");
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_pkt_child.sv";
+    analyzer.set_extra_files({base_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, "class pkt_child extends pkt_base;\n"
+                           "endclass\n"
+                           "\n"
+                           "module top;\n"
+                           "    pkt_child child;\n"
+                           "    initial begin\n"
+                           "        child.depth = 1;\n"
+                           "        child.apply();\n"
+                           "    end\n"
+                           "endmodule\n");
+
+    auto field = analyzer.definition_of(top_uri, 6, 15);
+    REQUIRE(field.has_value());
+    CHECK(field->uri == uri_from_path(base_path));
+    CHECK(field->line == 1);
+    CHECK(field->col == 8);
+
+    auto method = analyzer.definition_of(top_uri, 7, 15);
+    REQUIRE(method.has_value());
+    CHECK(method->uri == uri_from_path(base_path));
+    CHECK(method->line == 3);
+
+    std::filesystem::remove(base_path);
+}
+
+TEST_CASE("definition: unqualified inherited member inside a class body resolves to the base",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto base_path = write_temp_sv("lazyverilog_definition_inherited_base.sv",
+                                         "class pkt_base;\n"
+                                         "    int depth;\n"
+                                         "endclass\n");
+    const std::string child_uri = "file:///tmp/lazyverilog_definition_inherited_child.sv";
+    analyzer.set_extra_files({base_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(child_uri, "class pkt_child extends pkt_base;\n"
+                             "    function void bump();\n"
+                             "        depth = depth + 1;\n"
+                             "    endfunction\n"
+                             "endclass\n");
+
+    auto loc = analyzer.definition_of(child_uri, 2, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(base_path));
+    CHECK(loc->line == 1);
+    CHECK(loc->col == 8);
+
+    // A method local of the same name still shadows the inherited member.
+    analyzer.open(child_uri, "class pkt_child extends pkt_base;\n"
+                             "    function void bump();\n"
+                             "        int depth;\n"
+                             "        depth = 1;\n"
+                             "    endfunction\n"
+                             "endclass\n");
+    auto shadowed = analyzer.definition_of(child_uri, 3, 8);
+    REQUIRE(shadowed.has_value());
+    CHECK(shadowed->uri == child_uri);
+    CHECK(shadowed->line == 2);
+
+    std::filesystem::remove(base_path);
+}
+
 TEST_CASE("definition: imported package subroutine resolves while the package file is open",
           "[definition]") {
     Analyzer analyzer;

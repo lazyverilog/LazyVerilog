@@ -336,6 +336,13 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
     return trim_copy(std::move(text));
 }
 
+std::string base_class_lookup_name(std::string_view base_class) {
+    auto name = base_class.substr(0, base_class.find('#'));
+    if (const auto scope = name.rfind("::"); scope != std::string_view::npos)
+        name = name.substr(scope + 2);
+    return trim_copy(std::string(name));
+}
+
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name) {
     std::string result;
     if (scope.empty()) {
