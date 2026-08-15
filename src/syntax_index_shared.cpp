@@ -12,6 +12,53 @@
 using namespace slang;
 using namespace slang::syntax;
 
+std::string make_subroutine_signature(const FunctionPrototypeSyntax& proto,
+                                      const std::string& name,
+                                      const slang::SourceManager& sm) {
+    const bool is_task =
+        proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword;
+    const std::string ports =
+        proto.portList ? trim_copy(proto.portList->toString()) : "";
+
+    std::string formatted_ports;
+    if (ports.size() >= 2 && ports.front() == '(' && ports.back() == ')') {
+        auto inner = trim_copy(ports.substr(1, ports.size() - 2));
+        if (inner.empty()) {
+            formatted_ports = "()";
+        } else {
+            std::vector<std::string> parts;
+            size_t start = 0;
+            while (start <= inner.size()) {
+                auto comma = inner.find(',', start);
+                if (comma == std::string::npos) {
+                    parts.push_back(trim_copy(inner.substr(start)));
+                    break;
+                }
+                parts.push_back(trim_copy(inner.substr(start, comma - start)));
+                start = comma + 1;
+            }
+            if (parts.size() <= 1) {
+                formatted_ports = "(" + inner + ")";
+            } else {
+                formatted_ports = "(\n";
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    formatted_ports += "    " + parts[i];
+                    if (i + 1 != parts.size())
+                        formatted_ports += ",\n";
+                }
+                formatted_ports += "\n)";
+            }
+        }
+    } else {
+        formatted_ports = ports;
+    }
+
+    if (is_task)
+        return "```\ntask " + name + formatted_ports + "\n```";
+    const std::string ret = render_syntax_node_text(sm, *proto.returnType);
+    return "```\nfunction " + ret + " " + name + formatted_ports + "\n```";
+}
+
 std::string uri_from_file_name(std::string_view file_name) {
     if (file_name.empty())
         return {};

@@ -19,6 +19,7 @@ namespace slang {
 class SourceManager;
 namespace syntax {
 class ExpressionSyntax;
+class FunctionPrototypeSyntax;
 class PropertyExprSyntax;
 class SyntaxTree;
 }
@@ -159,6 +160,13 @@ std::string render_syntax_token_text(const slang::SourceManager& sm,
                                      std::optional<slang::SourceRange>& last_macro_range);
 std::string render_syntax_node_text(const slang::SourceManager& sm,
                                     const slang::syntax::SyntaxNode& node);
+
+/// Render the hover/documentation signature block for a function or task
+/// prototype.  Shared so the closed-file shard and the open-buffer dynamic
+/// index produce byte-identical `ValueEntry::signature` text for the same
+/// declaration.
+std::string make_subroutine_signature(const slang::syntax::FunctionPrototypeSyntax& proto,
+                                      const std::string& name, const slang::SourceManager& sm);
 
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name);
 bool is_module_value_kind(std::string_view kind);

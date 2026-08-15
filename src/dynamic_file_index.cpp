@@ -575,14 +575,29 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                 }
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            const auto name = node_text_raw(sm, *fn->prototype->name);
+            // Mirrors the package branch in syntax_index.cpp.  The entry must
+            // carry the declaration position: without it go-to-definition on an
+            // imported package subroutine lands on line 0 / column 0 whenever
+            // the package file happens to be open in the editor, because the
+            // open buffer is answered from this shard instead of the
+            // disk-backed one.
+            const auto& proto = *fn->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name = id_name ? std::string(id_name->identifier.valueText())
+                                      : node_text_raw(sm, *proto.name);
+            auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
             index.package_value_by_scoped_name.try_emplace(
                 package_scoped_key(module.name, name), index.values.size());
-            index.values.push_back(ValueEntry{.name = name,
-                                              .type = node_text_raw(sm, *fn->prototype->returnType),
-                                              .kind = "function",
-                                              .parent_scope = module.name,
-                                              .file_id = resolver.for_token(index, sm, fn->prototype->keyword)});
+            index.values.push_back(
+                ValueEntry{.name = name,
+                           .type = node_text_raw(sm, *proto.returnType),
+                           .kind = token_value_text(proto.keyword),
+                           .parent_scope = module.name,
+                           .file_id = resolver.for_token(index, sm, name_tok),
+                           .line = nl,
+                           .col = nc,
+                           .signature = make_subroutine_signature(proto, name, sm)});
             index.package_symbols[module.name].push_back(name);
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             process_class(*cls, index, resolver, sm, module.name);
