@@ -1,5 +1,6 @@
 #include "completion.hpp"
 #include "../syntax_index.hpp"
+#include "../syntax_index_shared.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -1511,8 +1512,14 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
                     visitDefault(node);
                     return;
                 }
-                if (node.extendsClause)
-                    emit_class(completion_base_type_name(current_ast_decl_text(*node.extendsClause->baseName)));
+                if (node.extendsClause) {
+                    // completion_base_type_name() stops at the first non-identifier
+                    // character, so a package-qualified base (`extends
+                    // cfg_pkg::base_cfg`) would reduce to the package name.  Drop
+                    // the qualifier and any parameter overrides first.
+                    emit_class(completion_base_type_name(base_class_lookup_name(
+                        current_ast_decl_text(*node.extendsClause->baseName))));
+                }
                 for (const auto* item : node.items) {
                     if (const auto* prop = item ? item->as_if<ClassPropertyDeclarationSyntax>() : nullptr) {
                         if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
@@ -1892,7 +1899,10 @@ class MemberProvider : public CompletionProvider {
                 if (!visited_classes.insert(cls.name).second)
                     return; // cycle or diamond — stop
                 if (!cls.base_class.empty()) {
-                    if (const auto base_it = index.class_by_name.find(cls.base_class);
+                    // The clause is stored verbatim, so `extends pkg::base #(8)`
+                    // has to be reduced to `base` before it can be looked up.
+                    if (const auto base_it =
+                            index.class_by_name.find(base_class_lookup_name(cls.base_class));
                         base_it != index.class_by_name.end())
                         add_class_members(index.classes[base_it->second]);
                 }

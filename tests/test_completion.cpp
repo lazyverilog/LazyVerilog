@@ -1491,6 +1491,33 @@ TEST_CASE("completion: MemberAccess includes inherited class members", "[complet
     CHECK(has_label(result, "child_depth"));
 }
 
+TEST_CASE("completion: MemberAccess inherits through a qualified parameterized base",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_inherited_qualified.sv";
+    // The `extends` clause is indexed verbatim, so a package qualifier and
+    // parameter overrides must not hide the base class members.
+    const std::string text =
+        "package cfg_pkg;\n"
+        "    class base_cfg #(int W = 8);\n"
+        "        int base_depth;\n"
+        "    endclass\n"
+        "endpackage\n"
+        "class child_cfg extends cfg_pkg::base_cfg #(16);\n"
+        "    int child_depth;\n"
+        "endclass\n"
+        "module top;\n"
+        "    child_cfg cfg;\n"
+        "    initial cfg.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 10, 16);
+    CHECK(has_label(result, "base_depth"));
+    CHECK(has_label(result, "child_depth"));
+}
+
 TEST_CASE("completion: MemberAccess includes interface signals and modports", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
