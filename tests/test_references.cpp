@@ -1738,19 +1738,19 @@ TEST_CASE("references: an unresolved local name does not match other project fil
                                                                    "        use(item);\n"
                                                                    "    endtask\n"
                                                                    "endclass\n");
-    const auto drv = write_temp_sv("lazyverilog_refs_local_drv.sv", "class drv;\n"
-                                                                   "    task run();\n"
-                                                                   "        int item;\n"
-                                                                   "        get(item);\n"
-                                                                   "    endtask\n"
-                                                                   "endclass\n");
+    const std::string drv_text = "class drv;\n"
+                                 "    task run();\n"
+                                 "        int item;\n"
+                                 "        get(item);\n"
+                                 "    endtask\n"
+                                 "endclass\n";
+    const auto drv = write_temp_sv("lazyverilog_refs_local_drv.sv", drv_text);
     Analyzer analyzer;
     analyzer.set_extra_files({lib.string(), drv.string()});
     analyzer.wait_for_background_index_idle();
 
     const std::string drv_uri = uri_from_path(drv);
-    std::ifstream in(drv);
-    analyzer.open(drv_uri, std::string(std::istreambuf_iterator<char>(in), {}));
+    analyzer.open(drv_uri, drv_text);
 
     const auto refs = analyzer.find_references(drv_uri, 2, 12, true);
     CHECK(refs.size() == 2);
