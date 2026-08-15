@@ -3155,6 +3155,28 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                                    target_info.module_name, target_info.name)))
                 break;
         }
+    } else if (!target_def && (target_info.kind == DefinitionTargetKind::Generic ||
+                               target_info.kind == DefinitionTargetKind::PackageMember)) {
+        // A name only a closed project file can explain — typically a package
+        // member reached through an import, either bare or `pkg::`-qualified.
+        // definition_of_state() above ran without extra files by design, so it
+        // could not leave the open buffers.  Recover the declaration from the
+        // compact shards rather than walking closed-file ASTs; without this,
+        // references/rename started *from the use site* return nothing at all.
+        const auto visible_imports =
+            state->tree ? get_dynamic_index(*state).imports : std::vector<ImportEntry>{};
+        for (const auto& extra : *extra_idx) {
+            if (target_info.kind == DefinitionTargetKind::PackageMember) {
+                target_def = find_package_member(extra.index_ref(), extra.uri,
+                                                 target_info.package_qualifier, target_info.name);
+            } else {
+                target_def = find_generic_definition_from_index(
+                    extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                    target_info.scope_package, visible_imports, line + 1);
+            }
+            if (target_def)
+                break;
+        }
     }
     if (!target_def)
         return {};
@@ -3314,6 +3336,47 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const SymbolID include_bridge_name_id =
         allow_include_name_bridge ? SymbolID::from_canonical("name:" + target->name) : SymbolID{};
 
+    // Package members are reached from other files by import, and an importing
+    // file cannot attribute the bare name to its owning package on its own:
+    //
+    //   common_pkg.sv   package common_pkg; function void foo(); ...
+    //                     -> package_subroutine::common_pkg::foo
+    //   pkg_use.sv      import common_pkg::*; ... foo();
+    //                     -> name:foo, because this shard never saw the package
+    //
+    // Bridge the two, but only into shards whose own import list makes this
+    // package's members visible, so unrelated same-named symbols elsewhere in
+    // the project cannot be merged into the rename.
+    std::string target_package;
+    {
+        auto owning_package = [&](const SyntaxIndex& index) {
+            for (const auto& [package_name, symbols] : index.package_symbols) {
+                if (std::find(symbols.begin(), symbols.end(), target->name) != symbols.end())
+                    return package_name;
+            }
+            return std::string{};
+        };
+        if (target_def->uri == uri)
+            target_package = owning_package(get_structural_index(*state));
+        if (target_package.empty()) {
+            for (const auto& extra : *extra_idx) {
+                if (extra.uri != target_def->uri)
+                    continue;
+                target_package = owning_package(extra.index_ref());
+                break;
+            }
+        }
+    }
+    const SymbolID import_bridge_name_id =
+        target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
+
+    auto imports_target_package = [&](const std::vector<ImportEntry>& imports) {
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == target_package &&
+                   (import.wildcard || import.symbol_name == target->name);
+        });
+    };
+
     auto index_includes_target_source = [&](const SyntaxIndex& index) {
         // Included-file declarations can be seen under two different syntactic
         // worlds: the standalone header that the user opened, and every parsed
@@ -3330,7 +3393,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                          target_def->uri) != index.include_dependencies.end();
     };
 
-    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref) {
+    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref,
+                                        const std::vector<ImportEntry>& imports) {
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
             return true;
         if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
@@ -3340,6 +3404,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (include_bridge_name_id && ref.symbol_id == include_bridge_name_id &&
             index_includes_target_source(index))
+            return true;
+        if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
+            imports_target_package(imports))
             return true;
         return false;
     };
@@ -3469,8 +3536,12 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // would require closed/project-file ASTs in the resolver.  The
             // SymbolID path avoids that by matching `module:memory` directly.
             const auto open_index = get_structural_index(*state);
+            // The structural index deliberately omits imports; the dynamic
+            // shard is the cached view that carries them.
+            const auto& open_imports =
+                import_bridge_name_id ? get_dynamic_index(*state).imports : open_index.imports;
             for (const auto& ref : open_index.references) {
-                if (reference_matches_target(open_index, ref))
+                if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
             if (target_info.kind == DefinitionTargetKind::ClassMember &&
@@ -3486,7 +3557,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     for (const auto& extra : *extra_idx) {
         if (open_uris.contains(extra.uri))
             continue;
-        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id)
+        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
+            !import_bridge_name_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -3494,7 +3566,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // closer to the v1.0.4 model; explicit references / rename requests pay
         // the linear scan cost over compact ReferenceEntry records instead.
         for (const auto& ref : extra.index_ref().references) {
-            if (reference_matches_target(extra.index_ref(), ref))
+            if (reference_matches_target(extra.index_ref(), ref, extra.index_ref().imports))
                 add_indexed_reference(extra.uri, extra.index_ref(), ref);
         }
     }

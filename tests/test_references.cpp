@@ -47,6 +47,15 @@ static std::pair<int, int> find_position_after(std::string_view text, std::strin
 
 } // namespace
 
+static std::filesystem::path write_temp_sv(const std::string& name, const std::string& text) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    std::ofstream out(path);
+    REQUIRE(out.good());
+    out << text;
+    out.close();
+    return path;
+}
+
 TEST_CASE("references: verifies tokens against the same syntax-tree definition", "[references]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/references_fixture.sv";
@@ -1513,4 +1522,90 @@ endmodule
     std::filesystem::remove(top_path);
     std::filesystem::remove(header_path);
     std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: package members are found in files that import them", "[references]") {
+    const auto pkg = write_temp_sv("lazyverilog_refs_import_pkg.sv",
+                                   "package common_pkg;\n"
+                                   "typedef int my_int_t;\n"
+                                   "typedef enum int { RED, GREEN } color_e;\n"
+                                   "localparam int WIDTH = 8;\n"
+                                   "function void foo();\n"
+                                   "endfunction\n"
+                                   "class my_cls;\n"
+                                   "endclass\n"
+                                   "endpackage\n");
+    const auto use = write_temp_sv("lazyverilog_refs_import_use.sv",
+                                   "module top;\n"
+                                   "import common_pkg::*;\n"
+                                   "    my_int_t x;\n"
+                                   "    color_e c = RED;\n"
+                                   "    logic [WIDTH-1:0] bus;\n"
+                                   "    my_cls handle;\n"
+                                   "    initial begin\n"
+                                   "        foo();\n"
+                                   "    end\n"
+                                   "endmodule\n");
+    const std::string pkg_uri = uri_from_path(pkg);
+    const std::string use_uri = uri_from_path(use);
+    auto read = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+
+    // Every package member kind must reach its use site, whether the importing
+    // file is an open buffer or only a closed project shard.
+    auto uses_in_importer = [&](int line, int col, bool open_importer) {
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(pkg_uri, read(pkg));
+        if (open_importer)
+            analyzer.open(use_uri, read(use));
+        int found = 0;
+        for (const auto& ref : analyzer.find_references(pkg_uri, line, col, true)) {
+            if (ref.uri == use_uri)
+                ++found;
+        }
+        return found;
+    };
+
+    for (bool open_importer : {false, true}) {
+        CHECK(uses_in_importer(1, 12, open_importer) == 1);  // typedef my_int_t
+        CHECK(uses_in_importer(2, 21, open_importer) == 1);  // enum member RED
+        CHECK(uses_in_importer(3, 18, open_importer) == 1);  // localparam WIDTH
+        CHECK(uses_in_importer(4, 14, open_importer) == 1);  // function foo
+        CHECK(uses_in_importer(6, 6, open_importer) == 1);   // class my_cls
+    }
+
+    // Starting from the use site must find the same pair.  The declaration
+    // lives in a closed shard here, so this exercises the index-only recovery.
+    {
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(use_uri, read(use));
+        const auto refs = analyzer.find_references(use_uri, 7, 9, true);
+        CHECK(refs.size() == 2);
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& r) { return r.uri == pkg_uri && r.line == 4; }));
+    }
+
+    // An unrelated file that does not import the package must not be rewritten.
+    {
+        const auto other = write_temp_sv("lazyverilog_refs_import_other.sv", "module other;\n"
+                                                                            "    int foo;\n"
+                                                                            "    initial foo = 1;\n"
+                                                                            "endmodule\n");
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string(), other.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(pkg_uri, read(pkg));
+        for (const auto& ref : analyzer.find_references(pkg_uri, 4, 14, true))
+            CHECK(ref.uri != uri_from_path(other));
+        std::filesystem::remove(other);
+    }
+
+    std::filesystem::remove(pkg);
+    std::filesystem::remove(use);
 }
