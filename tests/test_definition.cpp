@@ -763,8 +763,10 @@ TEST_CASE("definition: unresolvable identifier stays fast on a large project",
     INFO("mean go-to-definition on unresolvable identifier: " << mean_us << " us");
     // Deliberately loose.  A linear scan over 12,000 values measured ~172 us
     // against a ~62 us keyed baseline; this catches that regression without
-    // being a flake generator on a loaded CI machine.
-    CHECK(mean_us < 120.0);
+    // being a flake generator on a loaded CI machine.  x86_64 macOS CI runs
+    // under Rosetta translation on Apple Silicon runners and measured 124.7 us
+    // in steady state, so the margin needs to clear that noise too.
+    CHECK(mean_us < 160.0);
 
     std::filesystem::remove_all(dir);
 }
