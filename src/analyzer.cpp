@@ -2103,6 +2103,14 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
 
 static slang::SourceRange visible_range_for_token(const slang::SourceManager& sm,
                                                   const slang::parsing::Token& token) {
+    // Macro *argument* tokens are text the user typed at the call site, so they
+    // occupy their own original range there.  Only tokens that come from the
+    // macro body have no place of their own in the source and must fall back to
+    // the whole invocation.
+    if (sm.isMacroArgLoc(token.location())) {
+        const auto start = sm.getFullyOriginalLoc(token.location());
+        return slang::SourceRange(start, start + token.rawText().length());
+    }
     if (sm.isMacroLoc(token.location()))
         return sm.getExpansionRange(token.location());
     return token.range();
@@ -2181,6 +2189,11 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     int line;
     int col;
     DefinitionTarget target;
+    // A macro body token whose expansion covers the cursor.  Held aside rather
+    // than accepted outright: the same expansion also covers the arguments the
+    // user typed, and an identifier there is the better answer.  Body tokens are
+    // visited first, so the walk has to continue past them to find out.
+    DefinitionTarget macro_target;
     std::string current_module;
     std::string current_package;
     std::string current_class;
@@ -2409,17 +2422,18 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         if (found() || !token || !token.location().valid())
             return;
 
-        if (sm.isMacroLoc(token.location())) {
-            if (!contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
+        if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location())) {
+            if (macro_target.kind != DefinitionTargetKind::None ||
+                !contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
                                           col))
                 return;
 
             auto macro_name = sm.getMacroName(token.location());
             if (!macro_name.empty()) {
-                target.kind = DefinitionTargetKind::Macro;
-                target.name = std::string(macro_name);
-                target.scope_module = current_module;
-                target.scope_package = current_package;
+                macro_target.kind = DefinitionTargetKind::Macro;
+                macro_target.name = std::string(macro_name);
+                macro_target.scope_module = current_module;
+                macro_target.scope_package = current_package;
             }
             return;
         }
@@ -2448,7 +2462,7 @@ static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tr
                                              const std::string& uri, int line, int col) {
     DefinitionTargetVisitor visitor(tree.sourceManager(), uri, line, col);
     tree.root().visit(visitor);
-    return visitor.target;
+    return visitor.found() ? visitor.target : visitor.macro_target;
 }
 
 static bool index_entry_location_matches(const SyntaxIndex& idx, SourceFileID file_id,
