@@ -885,3 +885,40 @@ TEST_CASE("definition: imported package subroutine resolves while the package fi
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("identifiers inside macro arguments resolve instead of the macro", "[definition][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_macro_arg.sv";
+    analyzer.open(uri, "`define INFO(ID, MSG) $display(ID, MSG)\n"
+                       "class item_t;\n"
+                       "    bit [7:0] addr;\n"
+                       "endclass\n"
+                       "class drv;\n"
+                       "    task run();\n"
+                       "        item_t item;\n"
+                       "        `INFO(\"DRV\", $sformatf(\"a=%0h\", item.addr))\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // Macro arguments are text the user typed at the call site, so a name there
+    // resolves like any other; only the rest of the invocation is the macro.
+    const std::string call = "        `INFO(\"DRV\", $sformatf(\"a=%0h\", item.addr))";
+
+    auto object = analyzer.definition_of(uri, 7, (int)call.find("item.addr"));
+    REQUIRE(object.has_value());
+    CHECK(object->uri == uri);
+    CHECK(object->line == 6);
+    CHECK(object->col == 15);
+
+    auto member = analyzer.definition_of(uri, 7, (int)call.find("item.addr") + 5);
+    REQUIRE(member.has_value());
+    CHECK(member->uri == uri);
+    CHECK(member->line == 2);
+    CHECK(member->col == 14);
+
+    // The macro name itself still goes to the `define.
+    auto macro = analyzer.definition_of(uri, 7, (int)call.find("`INFO") + 1);
+    REQUIRE(macro.has_value());
+    CHECK(macro->line == 0);
+    CHECK(macro->col == 8);
+}
