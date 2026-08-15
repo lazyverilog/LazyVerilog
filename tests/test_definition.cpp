@@ -986,3 +986,65 @@ TEST_CASE("definition: method called through an inherited handle resolves",
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("definition: package parameter resolves through a wildcard import",
+          "[definition][package]") {
+    Analyzer analyzer;
+    // Shaped like UVM's `uvm_object_globals.svh`: a typedef'd parameter type,
+    // a parameter defined in terms of another parameter, and an enum next to
+    // them, all inside a package body pulled in through an include.
+    const auto inc_path = write_temp_sv("lazyverilog_definition_pkg_param_inc.svh",
+                                        "typedef bit [7:0] flag_t;\n"
+                                        "parameter int P_INT = 3;\n"
+                                        "parameter flag_t P_TYPED = 8'h1;\n"
+                                        "parameter flag_t P_DERIVED = P_TYPED;\n"
+                                        "typedef enum int { MODE_ONE = 1 } mode_e;\n");
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_param.sv",
+                                        "package flag_pkg;\n"
+                                        "`include \"lazyverilog_definition_pkg_param_inc.svh\"\n"
+                                        "endpackage\n");
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_param_use.sv";
+    analyzer.open(uri, "import flag_pkg::*;\n"
+                       "module top;\n"
+                       "    int a = P_INT;\n"
+                       "    int b = P_TYPED;\n"
+                       "    int c = P_DERIVED;\n"
+                       "    int d = MODE_ONE;\n"
+                       "endmodule\n");
+
+    auto param_loc = analyzer.definition_of(uri, 2, 13);
+    REQUIRE(param_loc.has_value());
+    CHECK(param_loc->uri == uri_from_path(inc_path));
+    CHECK(param_loc->line == 1);
+
+    // The parameter's type and its initializer must not change the answer, and
+    // the enum member next to them keeps working.
+    CHECK(analyzer.definition_of(uri, 3, 13).has_value());
+    CHECK(analyzer.definition_of(uri, 4, 13).has_value());
+    CHECK(analyzer.definition_of(uri, 5, 13).has_value());
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("definition: macro-generated typedef resolves to its declaration",
+          "[definition][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_macro_typedef.sv";
+    analyzer.open(uri, "`define UTILS(T) typedef registry #(T) type_id;\n"
+                       "class registry #(type T = int);\n"
+                       "endclass\n"
+                       "class my_item;\n"
+                       "    `UTILS(my_item)\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    initial my_item::type_id::create();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 7, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri);
+}

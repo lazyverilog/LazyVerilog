@@ -493,7 +493,12 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
-                if (!resolver.wants_declaration(index, sm, decl->name))
+                // A package builds its body out of `include`d files, and its
+                // members are exported API: whether the package's own root file
+                // happens to mention the name says nothing about who uses it.
+                // Applying the shared-header mentions filter here would drop
+                // most of a library package from the shard.
+                if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
                     continue;
                 if (!type_text)
                     type_text = render_syntax_node_text(sm, *data->type);
@@ -543,7 +548,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
-                    if (!resolver.wants_declaration(index, sm, decl->name))
+                    if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
                         continue;
                     if (!type_text) {
                         type_text = render_syntax_node_text(sm, *param->type);
