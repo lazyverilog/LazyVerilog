@@ -1609,3 +1609,47 @@ TEST_CASE("references: package members are found in files that import them", "[r
     std::filesystem::remove(pkg);
     std::filesystem::remove(use);
 }
+
+TEST_CASE("references: identifiers inside macro arguments are occurrences", "[references][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_macro_arg.sv";
+    analyzer.open(uri, "`define LOG(MSG, LVL) $display(MSG)\n"
+                       "`define ID(X) X\n"
+                       "module top;\n"
+                       "    int item;\n"
+                       "    initial begin\n"
+                       "        `LOG($sformatf(\"%0d\", item), 1)\n"
+                       "        $display(item);\n"
+                       "        item = `ID(item);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto has = [](const std::vector<Location>& refs, int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+
+    // Rename has to rewrite the names the user typed as macro arguments too;
+    // skipping them leaves the call sites referring to a name that is gone.
+    for (auto [line, col] : {std::pair{3, 8}, std::pair{5, 30}}) {
+        const auto refs = analyzer.find_references(uri, line, col, true);
+        CHECK(refs.size() == 5);
+        CHECK(has(refs, 3, 8));   // declaration
+        CHECK(has(refs, 5, 30));  // nested inside `LOG's argument
+        CHECK(has(refs, 6, 17));  // ordinary use
+        CHECK(has(refs, 7, 8));   // ordinary use
+        CHECK(has(refs, 7, 19));  // `ID's argument, the macro's whole expansion
+    }
+
+    // The invocation itself is still a reference to the macro, recorded once at
+    // the name the user wrote rather than at the argument's expansion.
+    const auto log_refs = analyzer.find_references(uri, 5, 10, true);
+    CHECK(log_refs.size() == 2);
+    CHECK(has(log_refs, 0, 8));
+    CHECK(has(log_refs, 5, 9));
+
+    const auto id_refs = analyzer.find_references(uri, 7, 16, true);
+    CHECK(id_refs.size() == 2);
+    CHECK(has(id_refs, 1, 8));
+    CHECK(has(id_refs, 7, 16));
+}
