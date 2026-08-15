@@ -1518,6 +1518,29 @@ TEST_CASE("completion: MemberAccess inherits through a qualified parameterized b
     CHECK(has_label(result, "child_depth"));
 }
 
+TEST_CASE("completion: MemberAccess resolves a package-qualified declared type",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_qualified_decl.sv";
+    // The qualifier sits on the variable declaration rather than on an
+    // `extends` clause, so the receiver's type must survive qualification.
+    const std::string text =
+        "package cfg_pkg;\n"
+        "    class base_cfg #(int W = 8);\n"
+        "        int base_depth;\n"
+        "    endclass\n"
+        "endpackage\n"
+        "module top;\n"
+        "    cfg_pkg::base_cfg #(16) cfg;\n"
+        "    initial cfg.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 7, 16);
+    CHECK(has_label(result, "base_depth"));
+}
+
 TEST_CASE("completion: MemberAccess includes interface signals and modports", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
