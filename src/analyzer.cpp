@@ -1015,8 +1015,15 @@ find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::s
 
 static Location location_from_token(const slang::SourceManager& sm, const std::string& uri,
                                     const slang::parsing::Token& token) {
-    const int line = to_lsp_line((int)sm.getLineNumber(token.location()));
-    const int col = (int)sm.getColumnNumber(token.location()) - 1;
+    // A macro argument is written at the call site, but its own location points
+    // into the expansion buffer, which has no lines for getColumnNumber() to
+    // walk back through -- it answers 0, and the column comes out negative.
+    // Report where the user actually typed it.
+    const auto location = sm.isMacroArgLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    const int line = to_lsp_line((int)sm.getLineNumber(location));
+    const int col = (int)sm.getColumnNumber(location) - 1;
     return Location{uri, line, col, line, col + (int)token.valueText().size()};
 }
 
@@ -3296,22 +3303,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // their compact occurrence shards.  This fixes the "empty references"
         // case for symbols whose only indexed identity is `name:<identifier>`
         // without downgrading precise open-file reference searches.
-        auto current_structural_index = get_structural_index(*state);
-        if (target_def->uri == uri) {
-            if (auto id = symbol_id_for_index_location(current_structural_index, *target_def, true);
-                id && id->starts_with("name:")) {
-                // Do not use unresolved `name:<identifier>` as a bridge from an
-                // open buffer into closed project shards.  The open-buffer AST
-                // path below can verify same-definition references precisely,
-                // but a closed shard cannot distinguish scopes for generic
-                // names such as a module-local function `calc` versus an
-                // unrelated global `calc`.  Owner-qualified SymbolIDs above
-                // still enable scalable cross-file references for modules,
-                // ports, parameters, typedef fields, macros, etc.
-                fallback_symbol_debug.clear();
-            }
-        }
-        if (fallback_symbol_debug.empty()) {
+        // Do not use unresolved `name:<identifier>` as a bridge out of an open
+        // buffer.  The AST path below can verify same-definition references
+        // precisely, but a closed shard cannot distinguish scopes for generic
+        // names such as a method-local `item` versus an unrelated `item` in a
+        // library file.  Only a declaration that lives in a closed file needs
+        // the bridge, because nothing can walk its AST to do better.
+        //
+        // Testing the declaration's own URI rather than the request URI is what
+        // makes the guard hold: an open file is normally listed in the filelist
+        // too, so its own closed shard offers exactly the `name:` ID this is
+        // meant to refuse.  Owner-qualified SymbolIDs above still carry
+        // cross-file references for modules, ports, parameters, typedef fields
+        // and macros.
+        if (!get_state(target_def->uri)) {
             for (const auto& extra : *extra_idx) {
                 if (extra.uri != target_def->uri)
                     continue;
