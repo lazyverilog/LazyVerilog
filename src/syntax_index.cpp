@@ -365,6 +365,35 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                             std::string parent_scope);
 
+// Emit one ImportEntry per imported item of a `import pkg::x;` / `import pkg::*;`
+// declaration.  Called from the member walks that every index depth already
+// performs, so closed project shards carry imports without paying a separate
+// whole-tree traversal for them.
+static void add_package_imports(const PackageImportDeclarationSyntax& node, SyntaxIndex& index,
+                                SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                                std::string_view parent_scope, int scope_end_line) {
+    const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
+    (void)decl_col;
+
+    for (const auto* item : node.items) {
+        if (!item)
+            continue;
+
+        ImportEntry entry;
+        entry.package_name = token_value_text(item->package);
+        if (entry.package_name.empty())
+            continue;
+        entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
+        if (!entry.wildcard)
+            entry.symbol_name = token_value_text(item->item);
+        entry.parent_scope = std::string(parent_scope);
+        entry.file_id = resolver.for_token(index, sm, item->package);
+        entry.start_line = decl_line;
+        entry.end_line = scope_end_line;
+        index.imports.push_back(std::move(entry));
+    }
+}
+
 static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& index,
                            SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                            std::string_view source, IndexDepth depth = IndexDepth::Full) {
@@ -452,10 +481,14 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 package_scoped_key(entry.name, member_name), index.values.size());
     };
 
+    const auto module_end_line = source_range_lines(sm, module.sourceRange()).second;
+
     for (const auto* member : module.members) {
         if (!member)
             continue;
-        if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
+        if (const auto* import_decl = member->as_if<PackageImportDeclarationSyntax>()) {
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+        } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
             std::optional<std::string> type_text;
             for (const auto* decl : data->declarators) {
                 if (!decl)
@@ -813,84 +846,15 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         } else {
             process_module(*mod, index, resolver, sm, source, depth);
         }
+    } else if (const auto* import_decl = member.as_if<PackageImportDeclarationSyntax>()) {
+        // Compilation-unit scope: visible to everything parsed after it, so it
+        // carries no enclosing scope name or end line.
+        add_package_imports(*import_decl, index, resolver, sm, {}, 0);
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
         process_class(*cls, index, resolver, sm);
     } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
         process_typedef(*td, index, resolver, sm);
     }
-}
-
-static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
-                            SourceFileIdResolver& resolver, const slang::SourceManager& sm) {
-    struct ScopeFrame {
-        std::string name;
-        int end_line{0};
-    };
-
-    struct ImportVisitor : public SyntaxVisitor<ImportVisitor> {
-        SyntaxIndex& index;
-        SourceFileIdResolver& resolver;
-        const slang::SourceManager& sm;
-        std::vector<ScopeFrame> scope_stack;
-
-        ImportVisitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
-                      const slang::SourceManager& sm) :
-            index(index), resolver(resolver), sm(sm) {}
-
-        std::string current_scope() const {
-            return scope_stack.empty() ? std::string{} : scope_stack.back().name;
-        }
-
-        int current_end_line() const {
-            return scope_stack.empty() ? 0 : scope_stack.back().end_line;
-        }
-
-        void push_scope(std::string name, slang::SourceRange range) {
-            auto [start, end] = source_range_lines(sm, range);
-            (void)start;
-            scope_stack.push_back(ScopeFrame{.name = std::move(name), .end_line = end});
-        }
-
-        void handle(const ModuleDeclarationSyntax& node) {
-            push_scope(token_value_text(node.header->name), node.sourceRange());
-            visitDefault(node);
-            scope_stack.pop_back();
-        }
-
-        void handle(const ClassDeclarationSyntax& node) {
-            push_scope(token_value_text(node.name), node.sourceRange());
-            visitDefault(node);
-            scope_stack.pop_back();
-        }
-
-        void handle(const PackageImportDeclarationSyntax& node) {
-            const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
-            (void)decl_col;
-
-            for (const auto* item : node.items) {
-                if (!item)
-                    continue;
-
-                ImportEntry entry;
-                entry.package_name = token_value_text(item->package);
-                entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
-                if (!entry.wildcard)
-                    entry.symbol_name = token_value_text(item->item);
-                entry.parent_scope = current_scope();
-                entry.file_id = resolver.for_token(index, sm, item->package);
-                entry.start_line = decl_line;
-                entry.end_line = current_end_line();
-
-                if (!entry.package_name.empty())
-                    index.imports.push_back(std::move(entry));
-            }
-
-            visitDefault(node);
-        }
-    };
-
-    ImportVisitor visitor(index, resolver, sm);
-    root.visit(visitor);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -966,9 +930,6 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         // be indexed differently from their disk extra-file snapshots.
         process_member(*member, index, resolver, sm, source, depth);
     }
-
-    if (depth == IndexDepth::Full)
-        collect_imports(root, index, resolver, sm);
 
     // Only filter the tables when collection already found something foreign to
     // drop.  If it did not, every value in the index is this file's own and

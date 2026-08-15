@@ -605,6 +605,16 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
         } else if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             process_typedef(*td, index, resolver, sm, module.name);
             index.package_symbols[module.name].push_back(token_value_text(td->name));
+            // Enum members are package members in their own right, and
+            // syntax_index.cpp lists them here too.  Without them an open
+            // package buffer cannot report that it owns `RED`.
+            if (const auto* enum_type = td->type->as_if<EnumTypeSyntax>()) {
+                for (const auto* enum_member : enum_type->members) {
+                    if (enum_member)
+                        index.package_symbols[module.name].push_back(
+                            token_value_text(enum_member->name));
+                }
+            }
         }
     }
 
