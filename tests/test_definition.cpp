@@ -922,3 +922,67 @@ TEST_CASE("identifiers inside macro arguments resolve instead of the macro", "[d
     CHECK(macro->line == 0);
     CHECK(macro->col == 8);
 }
+
+// ── Member access whose receiver type lives in another file ──────────────────
+
+static const std::string kPackageClassDefinitionFixture = R"(package tb_pkg;
+    class phase_obj;
+        extern virtual function void raise_objection();
+    endclass
+
+    class driver_base;
+        phase_obj port_handle;
+    endclass
+endpackage
+)";
+
+TEST_CASE("definition: method called through a package-class argument resolves",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_class_arg.sv",
+                                        kPackageClassDefinitionFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_arg.sv";
+    analyzer.open(uri, "import tb_pkg::*;\n"
+                       "class my_drv;\n"
+                       "    task run(phase_obj arg_phase);\n"
+                       "        arg_phase.raise_objection();\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // Line 3, on `raise_objection`.
+    auto loc = analyzer.definition_of(uri, 3, 20);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: method called through an inherited handle resolves",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_class_field.sv",
+                                        kPackageClassDefinitionFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_field.sv";
+    // `port_handle` is declared by driver_base in the package file, so both the
+    // receiver's type and the method live outside the open buffer.
+    analyzer.open(uri, "import tb_pkg::*;\n"
+                       "class my_drv extends driver_base;\n"
+                       "    task run();\n"
+                       "        port_handle.raise_objection();\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    auto loc = analyzer.definition_of(uri, 3, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}

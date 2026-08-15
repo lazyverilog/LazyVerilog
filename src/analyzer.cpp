@@ -1586,6 +1586,32 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
             current_module = previous_module;
         }
 
+        // A class body is a declaration scope too, so `p.foo()` inside a method
+        // has to find `p` among the class properties and method locals.
+        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+            const auto previous_module = current_module;
+            current_module = std::string(node.name.valueText());
+            scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+            current_module = previous_module;
+        }
+
+        // `task run_phase(uvm_phase phase);` — the receiver is an argument.
+        void handle(const slang::syntax::FunctionPortSyntax& node) {
+            if (current_module != module_name || !node.dataType || !node.declarator)
+                return;
+            if (node.declarator->name.valueText() != object_name)
+                return;
+            const auto decl_uri = uri_from_source_location(sm, node.declarator->name.location());
+            if (!decl_uri.empty() && decl_uri != uri)
+                return;
+            const auto type_name =
+                canonical_type_name_from_text(render_syntax_node_text(sm, *node.dataType));
+            if (!type_name.empty())
+                result = type_name;
+        }
+
         void handle(const slang::syntax::BlockStatementSyntax& node) {
             scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
             visitDefault(node);
@@ -1784,6 +1810,34 @@ static std::optional<Location> find_class_member_in_hierarchy(
                 base = base_class_lookup_name(cls->base_class);
                 break;
             }
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
+// Declared type of `field_name` on `class_name` or any ancestor, searched
+// across shards.  The receiver of a member access is often itself an inherited
+// field, e.g. `seq_item_port` declared by `uvm_driver` and used from a subclass.
+static std::optional<std::string> find_class_field_type_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view field_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (!cls)
+                continue;
+            for (const auto& field : cls->fields) {
+                if (field.name != field_name || field.type.empty())
+                    continue;
+                const auto type = canonical_type_name_from_text(field.type);
+                if (!type.empty())
+                    return type;
+            }
+            if (base.empty() && !cls->base_class.empty())
+                base = base_class_lookup_name(cls->base_class);
         }
         class_name = std::move(base);
     }
@@ -2454,6 +2508,10 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.object_name = object_name;
                 target.scope_module = current_module;
                 target.scope_package = current_package;
+                // The receiver of `obj.member` inside a class body is looked up
+                // in that class, so the enclosing class has to travel with the
+                // target just as it does for unqualified names.
+                target.scope_class = current_class;
                 return;
             }
             target.kind = DefinitionTargetKind::Generic;
@@ -3082,6 +3140,21 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (!class_type) {
             class_type = class_type_for_object_reference_in_tree(
                 *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
+        }
+        // Inside a class body the enclosing scope is the class, not a module,
+        // and the receiver may be a property, a method local, an argument, or a
+        // field the class only inherits.
+        if (!class_type && !target.scope_class.empty()) {
+            class_type = class_type_for_object_reference(current_index, target.scope_class,
+                                                         target.object_name, use_line_one_based);
+            if (!class_type) {
+                class_type = class_type_for_object_reference_in_tree(
+                    *state.tree, uri, target.scope_class, target.object_name, use_line_one_based);
+            }
+            if (!class_type) {
+                class_type = find_class_field_type_in_hierarchy(
+                    class_lookup_shards(), target.scope_class, target.object_name);
+            }
         }
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
