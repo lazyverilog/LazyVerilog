@@ -47,6 +47,15 @@ static std::pair<int, int> find_position_after(std::string_view text, std::strin
 
 } // namespace
 
+static std::filesystem::path write_temp_sv(const std::string& name, const std::string& text) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    std::ofstream out(path);
+    REQUIRE(out.good());
+    out << text;
+    out.close();
+    return path;
+}
+
 TEST_CASE("references: verifies tokens against the same syntax-tree definition", "[references]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/references_fixture.sv";
@@ -1121,6 +1130,185 @@ endmodule
     std::filesystem::remove(dir);
 }
 
+TEST_CASE("references: package class field declaration matches closed member access",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     "lazyverilog_refs_package_class_field";
+    std::filesystem::create_directories(dir);
+
+    const auto pkg_path = dir / "pkt_pkg.sv";
+    const auto top_path = dir / "memory_top.sv";
+
+    const std::string pkg = R"(package pkt_pkg;
+    class Packet;
+        int data;
+        task req_data();
+        endtask
+    endclass
+endpackage
+)";
+    const std::string top = R"(module memory_top;
+    import pkt_pkg::*;
+    always_comb begin
+        Packet p;
+        p.data = 1;
+        p.req_data();
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << pkg;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), top_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    const std::string top_uri = uri_from_path(top_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "data");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == pkg_uri && ref.line == 2 && ref.col == 12;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 4 && ref.col == 10;
+    }));
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: method-local stays scoped when its own file is indexed",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_method_local";
+    std::filesystem::create_directories(dir);
+
+    const auto drv_path = dir / "drv.sv";
+    const auto lib_path = dir / "lib.sv";
+
+    const std::string drv = R"(class my_driver;
+    task run_phase();
+        int item;
+        item = 1;
+    endtask
+endclass
+)";
+    const std::string lib = R"(module lib;
+    initial begin
+        int item;
+        item = 2;
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(drv_path);
+        REQUIRE(out.good());
+        out << drv;
+    }
+    {
+        std::ofstream out(lib_path);
+        REQUIRE(out.good());
+        out << lib;
+    }
+
+    Analyzer analyzer;
+    // The open file is in the filelist too, so it has a closed shard of its own
+    // that offers a weak `name:item` identity for this method-local.
+    analyzer.set_extra_files({drv_path.string(), lib_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string drv_uri = uri_from_path(drv_path);
+    analyzer.open(drv_uri, drv);
+
+    const auto [line, col] = find_position(drv, "item;");
+    const auto refs = analyzer.find_references(drv_uri, line, col, true);
+
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == drv_uri);
+
+    std::filesystem::remove(drv_path);
+    std::filesystem::remove(lib_path);
+    std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: package class method declaration matches closed member call",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     "lazyverilog_refs_package_class_method";
+    std::filesystem::create_directories(dir);
+
+    const auto pkg_path = dir / "pkt_pkg.sv";
+    const auto top_path = dir / "memory_top.sv";
+
+    const std::string pkg = R"(package pkt_pkg;
+    class Packet;
+        int data;
+        task req_data();
+        endtask
+    endclass
+endpackage
+)";
+    const std::string top = R"(module memory_top;
+    import pkt_pkg::*;
+    always_comb begin
+        Packet p;
+        p.data = 1;
+        p.req_data();
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << pkg;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), top_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    const std::string top_uri = uri_from_path(top_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "req_data");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == pkg_uri && ref.line == 3;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 5 && ref.col == 10;
+    }));
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: included header declarations bridge unresolved includer names",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() /
@@ -1513,4 +1701,329 @@ endmodule
     std::filesystem::remove(top_path);
     std::filesystem::remove(header_path);
     std::filesystem::remove(dir);
+}
+
+TEST_CASE("references: package members are found in files that import them", "[references]") {
+    const auto pkg = write_temp_sv("lazyverilog_refs_import_pkg.sv",
+                                   "package common_pkg;\n"
+                                   "typedef int my_int_t;\n"
+                                   "typedef enum int { RED, GREEN } color_e;\n"
+                                   "localparam int WIDTH = 8;\n"
+                                   "function void foo();\n"
+                                   "endfunction\n"
+                                   "class my_cls;\n"
+                                   "endclass\n"
+                                   "endpackage\n");
+    const auto use = write_temp_sv("lazyverilog_refs_import_use.sv",
+                                   "module top;\n"
+                                   "import common_pkg::*;\n"
+                                   "    my_int_t x;\n"
+                                   "    color_e c = RED;\n"
+                                   "    logic [WIDTH-1:0] bus;\n"
+                                   "    my_cls handle;\n"
+                                   "    initial begin\n"
+                                   "        foo();\n"
+                                   "    end\n"
+                                   "endmodule\n");
+    const std::string pkg_uri = uri_from_path(pkg);
+    const std::string use_uri = uri_from_path(use);
+    auto read = [](const std::filesystem::path& path) {
+        std::ifstream in(path);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+
+    // Every package member kind must reach its use site, whether the importing
+    // file is an open buffer or only a closed project shard.
+    auto uses_in_importer = [&](int line, int col, bool open_importer) {
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(pkg_uri, read(pkg));
+        if (open_importer)
+            analyzer.open(use_uri, read(use));
+        int found = 0;
+        for (const auto& ref : analyzer.find_references(pkg_uri, line, col, true)) {
+            if (ref.uri == use_uri)
+                ++found;
+        }
+        return found;
+    };
+
+    for (bool open_importer : {false, true}) {
+        CHECK(uses_in_importer(1, 12, open_importer) == 1);  // typedef my_int_t
+        CHECK(uses_in_importer(2, 21, open_importer) == 1);  // enum member RED
+        CHECK(uses_in_importer(3, 18, open_importer) == 1);  // localparam WIDTH
+        CHECK(uses_in_importer(4, 14, open_importer) == 1);  // function foo
+        CHECK(uses_in_importer(6, 6, open_importer) == 1);   // class my_cls
+    }
+
+    // Starting from the use site must find the same pair.  The declaration
+    // lives in a closed shard here, so this exercises the index-only recovery.
+    {
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(use_uri, read(use));
+        const auto refs = analyzer.find_references(use_uri, 7, 9, true);
+        CHECK(refs.size() == 2);
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& r) { return r.uri == pkg_uri && r.line == 4; }));
+    }
+
+    // An unrelated file that does not import the package must not be rewritten.
+    {
+        const auto other = write_temp_sv("lazyverilog_refs_import_other.sv", "module other;\n"
+                                                                            "    int foo;\n"
+                                                                            "    initial foo = 1;\n"
+                                                                            "endmodule\n");
+        Analyzer analyzer;
+        analyzer.set_extra_files({pkg.string(), use.string(), other.string()});
+        analyzer.wait_for_background_index_idle();
+        analyzer.open(pkg_uri, read(pkg));
+        for (const auto& ref : analyzer.find_references(pkg_uri, 4, 14, true))
+            CHECK(ref.uri != uri_from_path(other));
+        std::filesystem::remove(other);
+    }
+
+    std::filesystem::remove(pkg);
+    std::filesystem::remove(use);
+}
+
+TEST_CASE("references: identifiers inside macro arguments are occurrences", "[references][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_macro_arg.sv";
+    analyzer.open(uri, "`define LOG(MSG, LVL) $display(MSG)\n"
+                       "`define ID(X) X\n"
+                       "module top;\n"
+                       "    int item;\n"
+                       "    initial begin\n"
+                       "        `LOG($sformatf(\"%0d\", item), 1)\n"
+                       "        $display(item);\n"
+                       "        item = `ID(item);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto has = [](const std::vector<Location>& refs, int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+
+    // Rename has to rewrite the names the user typed as macro arguments too;
+    // skipping them leaves the call sites referring to a name that is gone.
+    for (auto [line, col] : {std::pair{3, 8}, std::pair{5, 30}}) {
+        const auto refs = analyzer.find_references(uri, line, col, true);
+        CHECK(refs.size() == 5);
+        CHECK(has(refs, 3, 8));   // declaration
+        CHECK(has(refs, 5, 30));  // nested inside `LOG's argument
+        CHECK(has(refs, 6, 17));  // ordinary use
+        CHECK(has(refs, 7, 8));   // ordinary use
+        CHECK(has(refs, 7, 19));  // `ID's argument, the macro's whole expansion
+    }
+
+    // The invocation itself is still a reference to the macro, recorded once at
+    // the name the user wrote rather than at the argument's expansion.
+    const auto log_refs = analyzer.find_references(uri, 5, 10, true);
+    CHECK(log_refs.size() == 2);
+    CHECK(has(log_refs, 0, 8));
+    CHECK(has(log_refs, 5, 9));
+
+    const auto id_refs = analyzer.find_references(uri, 7, 16, true);
+    CHECK(id_refs.size() == 2);
+    CHECK(has(id_refs, 1, 8));
+    CHECK(has(id_refs, 7, 16));
+}
+
+TEST_CASE("rename: a macro body identifier does not answer for the whole invocation",
+          "[references][rename][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_rename_macro_body.sv";
+    analyzer.open(uri, "`define uvm_info(ID, MSG, VERB) uvm_report_info(ID, MSG, VERB)\n"
+                       "module top;\n"
+                       "    int item;\n"
+                       "    initial begin\n"
+                       "        `uvm_info(\"DRV\", $sformatf(\"%0d\", item), UVM_MEDIUM)\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    const std::string call = "        `uvm_info(\"DRV\", $sformatf(\"%0d\", item), UVM_MEDIUM)";
+
+    // The macro expands to a call to uvm_report_info.  That name is written in
+    // the `define, not here, so it must not be what rename offers at a column
+    // the user typed something else at.
+    const int item_col = (int)call.find("item");
+    auto on_arg = analyzer.identifier_at(uri, 4, item_col);
+    REQUIRE(on_arg.has_value());
+    CHECK(on_arg->name == "item");
+    CHECK(on_arg->line == 4);
+    CHECK(on_arg->col == item_col);
+
+    // The invocation itself still renames as the macro.
+    const int macro_col = (int)call.find("uvm_info");
+    auto on_macro = analyzer.identifier_at(uri, 4, macro_col);
+    REQUIRE(on_macro.has_value());
+    CHECK(on_macro->name == "uvm_info");
+    CHECK(on_macro->line == 4);
+    CHECK(on_macro->col == macro_col);
+
+    const auto macro_refs = analyzer.find_references(uri, 4, macro_col, true);
+    CHECK(macro_refs.size() == 2);
+    CHECK(std::any_of(macro_refs.begin(), macro_refs.end(),
+                      [](const Location& r) { return r.line == 0 && r.col == 8; }));
+    CHECK(std::any_of(macro_refs.begin(), macro_refs.end(), [&](const Location& r) {
+        return r.line == 4 && r.col == macro_col;
+    }));
+}
+
+TEST_CASE("references: a method-local reaches its uses inside macro arguments",
+          "[references][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_method_local_macro.sv";
+    analyzer.open(uri, "`define INFO(A) uvm_report_info(A)\n"
+                       "class item_t;\n"
+                       "    bit [7:0] addr;\n"
+                       "endclass\n"
+                       "class drv;\n"
+                       "    task run();\n"
+                       "        item_t item;\n"
+                       "        get(item);\n"
+                       "        `INFO(item)\n"
+                       "        `INFO(item.addr)\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // A local declared inside a class method has no scope-qualified SymbolID,
+    // so references come from the AST verification path rather than the index.
+    // That path still has to place a macro argument where the user wrote it.
+    const auto refs = analyzer.find_references(uri, 6, 15, true);
+    CHECK(refs.size() == 4);
+    auto has = [&](int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+    CHECK(has(6, 15));  // declaration
+    CHECK(has(7, 12));  // ordinary use
+    CHECK(has(8, 14));  // macro argument
+    CHECK(has(9, 14));  // macro argument, object of a member access
+}
+
+TEST_CASE("references: an unresolved local name does not match other project files",
+          "[references][rename]") {
+    // The open file is listed in the filelist, as any real project file is, so
+    // it also has a closed shard of its own.  That shard knows the local only as
+    // `name:item`, which must not become a bridge to every unrelated `item`.
+    const auto lib = write_temp_sv("lazyverilog_refs_local_lib.sv", "class other;\n"
+                                                                   "    task run();\n"
+                                                                   "        int item;\n"
+                                                                   "        use(item);\n"
+                                                                   "    endtask\n"
+                                                                   "endclass\n");
+    const std::string drv_text = "class drv;\n"
+                                 "    task run();\n"
+                                 "        int item;\n"
+                                 "        get(item);\n"
+                                 "    endtask\n"
+                                 "endclass\n";
+    const auto drv = write_temp_sv("lazyverilog_refs_local_drv.sv", drv_text);
+    Analyzer analyzer;
+    analyzer.set_extra_files({lib.string(), drv.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string drv_uri = uri_from_path(drv);
+    analyzer.open(drv_uri, drv_text);
+
+    const auto refs = analyzer.find_references(drv_uri, 2, 12, true);
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == drv_uri);
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(drv);
+}
+
+TEST_CASE("references: a class field reaches its handle.field uses", "[references][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_member_access.sv";
+    analyzer.open(uri, "class item;\n"
+                       "    int addr;\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    item it;\n"
+                       "    initial begin\n"
+                       "        it.addr = 1;\n"
+                       "        $display(it.addr);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    // On the declaration of `addr`.
+    auto refs = analyzer.find_references(uri, 1, 8, true);
+    CHECK(refs.size() == 3);
+
+    std::vector<int> lines;
+    for (const auto& ref : refs)
+        lines.push_back(ref.line);
+    std::sort(lines.begin(), lines.end());
+    CHECK(lines == std::vector<int>{1, 6, 7});
+}
+
+TEST_CASE("references: an open file reachable through a symlinked path is not "
+          "double-counted against its own closed shard",
+          "[references]") {
+    // A client can open a document through a symlinked directory while the
+    // project filelist reaches the identical on-disk file through its
+    // canonical path.  find_references()'s "skip the open file's own closed
+    // shard" guard used to compare those two URI spellings as raw strings, so
+    // it failed to recognize them as the same file and walked the shard
+    // anyway -- doubling every result under a second, differently-spelled URI.
+    namespace fs = std::filesystem;
+    const auto real_dir = fs::temp_directory_path() / "lazyverilog_refs_symlink_real";
+    const auto link_dir = fs::temp_directory_path() / "lazyverilog_refs_symlink_link";
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
+    fs::create_directories(real_dir);
+    std::error_code ec;
+    fs::create_directory_symlink(real_dir, link_dir, ec);
+    if (ec) {
+        SUCCEED("symlinks unavailable on this platform");
+        return;
+    }
+
+    const auto real_path = real_dir / "item.sv";
+    {
+        std::ofstream out(real_path);
+        REQUIRE(out.good());
+        out << "class item;\n"
+               "    int addr;\n"
+               "endclass\n"
+               "module top;\n"
+               "    item it;\n"
+               "    initial begin\n"
+               "        it.addr = 1;\n"
+               "        $display(it.addr);\n"
+               "    end\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({real_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // Open through the uncanonicalized (symlinked) spelling on purpose --
+    // uri_from_path() would canonicalize it away and hide the mismatch.
+    const std::string uri = "file://" + (link_dir / "item.sv").string();
+    analyzer.open(uri, "class item;\n"
+                       "    int addr;\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    item it;\n"
+                       "    initial begin\n"
+                       "        it.addr = 1;\n"
+                       "        $display(it.addr);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto refs = analyzer.find_references(uri, 1, 8, true);
+    CHECK(refs.size() == 3);
+
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
 }

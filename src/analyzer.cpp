@@ -1015,15 +1015,32 @@ find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::s
 
 static Location location_from_token(const slang::SourceManager& sm, const std::string& uri,
                                     const slang::parsing::Token& token) {
-    const int line = to_lsp_line((int)sm.getLineNumber(token.location()));
-    const int col = (int)sm.getColumnNumber(token.location()) - 1;
+    // A macro argument -- or a literal written inside the macro body itself,
+    // e.g. `type_id` in `uvm_object_utils_begin` -- has its own location point
+    // into the expansion buffer, which has no lines for getColumnNumber() to
+    // walk back through -- it answers 0, and the column comes out negative.
+    // Report where the user actually typed it.
+    const auto location = sm.isMacroLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    const int line = to_lsp_line((int)sm.getLineNumber(location));
+    const int col = (int)sm.getColumnNumber(location) - 1;
     return Location{uri, line, col, line, col + (int)token.valueText().size()};
 }
 
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
                                                const std::string& fallback_uri,
                                                const slang::parsing::Token& token) {
-    auto loc = location_from_token(sm, location_to_uri(sm, token.location(), fallback_uri), token);
+    // The URI must come from the same resolved location that
+    // location_from_token() uses for line/col below -- deriving it from the
+    // raw (unresolved) token location instead mixes getFullyExpandedLoc()'s
+    // buffer with getFullyOriginalLoc()'s line/col, which point at different
+    // files for a token written inside a macro body (e.g. `type_id` in
+    // `uvm_object_utils_begin`).
+    const auto location = sm.isMacroLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    auto loc = location_from_token(sm, location_to_uri(sm, location, fallback_uri), token);
     return loc;
 }
 
@@ -1579,6 +1596,32 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
             current_module = previous_module;
         }
 
+        // A class body is a declaration scope too, so `p.foo()` inside a method
+        // has to find `p` among the class properties and method locals.
+        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+            const auto previous_module = current_module;
+            current_module = std::string(node.name.valueText());
+            scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+            current_module = previous_module;
+        }
+
+        // `task run_phase(uvm_phase phase);` — the receiver is an argument.
+        void handle(const slang::syntax::FunctionPortSyntax& node) {
+            if (current_module != module_name || !node.dataType || !node.declarator)
+                return;
+            if (node.declarator->name.valueText() != object_name)
+                return;
+            const auto decl_uri = uri_from_source_location(sm, node.declarator->name.location());
+            if (!decl_uri.empty() && decl_uri != uri)
+                return;
+            const auto type_name =
+                canonical_type_name_from_text(render_syntax_node_text(sm, *node.dataType));
+            if (!type_name.empty())
+                result = type_name;
+        }
+
         void handle(const slang::syntax::BlockStatementSyntax& node) {
             scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
             visitDefault(node);
@@ -1733,8 +1776,156 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
                             method.col + (int)method.name.size()};
         }
+
+        // A class-scoped typedef (`my_item::type_id`) is a member too, but it
+        // lives in the typedef table rather than on the ClassEntry.
+        for (const auto& td : index.typedefs) {
+            if (td.name != member_name || td.line <= 0 || td.parent_scope != cls.name)
+                continue;
+            const std::string actual_uri = index.source_uri(td.file_id);
+            const int line = to_lsp_line(td.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
+                            td.col + (int)td.name.size()};
+        }
     }
     return std::nullopt;
+}
+
+// One SyntaxIndex shard plus the URI to fall back on when the shard carries no
+// source file of its own.  Class hierarchies routinely span shards — a child in
+// the current file extending a base in a closed project file — so member lookup
+// has to be able to hop between them.
+struct ClassLookupShard {
+    const SyntaxIndex* index;
+    const std::string* uri;
+};
+
+static const ClassEntry* find_class_entry(const SyntaxIndex& index, std::string_view class_name) {
+    auto it = index.class_by_name.find(std::string(class_name));
+    if (it == index.class_by_name.end() || it->second >= index.classes.size())
+        return nullptr;
+    return &index.classes[it->second];
+}
+
+// Resolve `member_name` on `class_name`, then on its `extends` ancestors.
+//
+// SystemVerilog inherits properties and methods, so `child.depth` and a bare
+// `depth` inside a child class body both have to reach `pkt_base::depth`.  Each
+// hop re-searches every shard because the base class is frequently declared in
+// a different file than the child.
+static std::optional<Location> find_class_member_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view member_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        for (const auto& shard : shards) {
+            if (auto loc = find_class_member_definition(*shard.index, *shard.uri, class_name,
+                                                        member_name))
+                return loc;
+        }
+
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (cls && !cls->base_class.empty()) {
+                base = base_class_lookup_name(cls->base_class);
+                break;
+            }
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
+// Declared type of `field_name` on `class_name` or any ancestor, searched
+// across shards.  The receiver of a member access is often itself an inherited
+// field, e.g. `seq_item_port` declared by `uvm_driver` and used from a subclass.
+static std::optional<std::string> find_class_field_type_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view field_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (!cls)
+                continue;
+            for (const auto& field : cls->fields) {
+                if (field.name != field_name || field.type.empty())
+                    continue;
+                const auto type = canonical_type_name_from_text(field.type);
+                if (!type.empty())
+                    return type;
+            }
+            if (base.empty() && !cls->base_class.empty())
+                base = base_class_lookup_name(cls->base_class);
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
+// Declaration of `member_name` written inside `class_name`'s body in this tree.
+//
+// `Class::member` is not only a static method call: it also reaches a nested
+// typedef, which is how the utils macros publish `type_id`.  Those typedefs are
+// produced by macro expansion, so the answer is wherever the token really came
+// from, which is what location_from_token_actual_uri() reports.
+static std::optional<Location> find_class_scoped_declaration_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view class_name,
+    std::string_view member_name) {
+    if (class_name.empty() || member_name.empty())
+        return std::nullopt;
+    using namespace slang::syntax;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view class_name;
+        std::string_view member_name;
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view class_name,
+                std::string_view member_name)
+            : sm(sm), uri(uri), class_name(class_name), member_name(member_name) {}
+
+        void accept(const slang::parsing::Token& token) {
+            if (!result && token && token.valueText() == member_name)
+                result = location_from_token_actual_uri(sm, uri, token);
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                if (const auto* td = item->as_if<TypedefDeclarationSyntax>()) {
+                    accept(td->name);
+                } else if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+                    if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>())
+                        accept(nested->name);
+                    else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+                        for (const auto* decl : data->declarators)
+                            if (decl)
+                                accept(decl->name);
+                    }
+                } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
+                    if (const auto* id =
+                            method->declaration->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                } else if (const auto* proto = item->as_if<ClassMethodPrototypeSyntax>()) {
+                    if (const auto* id = proto->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                }
+            }
+        }
+    } visitor(tree.sourceManager(), uri, class_name, member_name);
+
+    tree.root().visit(visitor);
+    return visitor.result;
 }
 
 static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
@@ -2057,6 +2248,14 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
 
 static slang::SourceRange visible_range_for_token(const slang::SourceManager& sm,
                                                   const slang::parsing::Token& token) {
+    // Macro *argument* tokens are text the user typed at the call site, so they
+    // occupy their own original range there.  Only tokens that come from the
+    // macro body have no place of their own in the source and must fall back to
+    // the whole invocation.
+    if (sm.isMacroArgLoc(token.location())) {
+        const auto start = sm.getFullyOriginalLoc(token.location());
+        return slang::SourceRange(start, start + token.rawText().length());
+    }
     if (sm.isMacroLoc(token.location()))
         return sm.getExpansionRange(token.location());
     return token.range();
@@ -2124,6 +2323,9 @@ struct DefinitionTarget {
     std::string package_qualifier;
     std::string scope_module;
     std::string scope_package;
+    // Innermost class body the cursor sits in, empty outside class scope.
+    // Unqualified names there may be inherited members.
+    std::string scope_class;
 };
 
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
@@ -2132,8 +2334,14 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     int line;
     int col;
     DefinitionTarget target;
+    // A macro body token whose expansion covers the cursor.  Held aside rather
+    // than accepted outright: the same expansion also covers the arguments the
+    // user typed, and an identifier there is the better answer.  Body tokens are
+    // visited first, so the walk has to continue past them to find out.
+    DefinitionTarget macro_target;
     std::string current_module;
     std::string current_package;
+    std::string current_class;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
                             int col)
@@ -2181,6 +2389,15 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
         current_module = std::move(previous_module);
         current_package = std::move(previous_package);
+    }
+
+    // Tracked so an unqualified name inside a class body can be resolved
+    // against that class and the classes it extends.
+    void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+        auto previous_class = current_class;
+        current_class = std::string(node.name.valueText());
+        visitDefault(node);
+        current_class = std::move(previous_class);
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
@@ -2290,13 +2507,23 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
 
-        const auto* left = node.left->as_if<slang::syntax::IdentifierNameSyntax>();
+        // The qualifier is usually a bare IdentifierNameSyntax (`pkg::name`), but
+        // a parameterized class qualifier (`uvm_config_db #(T)::get`) parses as
+        // ClassNameSyntax instead — same identifier, plus a parameter list this
+        // lookup doesn't need. Accept either so a parameterized-class static
+        // method call isn't left to fall through to an unscoped bare lookup.
         const auto* right = node.right->as_if<slang::syntax::IdentifierNameSyntax>();
-        if (left && right &&
+        slang::parsing::Token left_identifier;
+        if (const auto* left_id = node.left->as_if<slang::syntax::IdentifierNameSyntax>())
+            left_identifier = left_id->identifier;
+        else if (const auto* left_class = node.left->as_if<slang::syntax::ClassNameSyntax>())
+            left_identifier = left_class->identifier;
+
+        if (left_identifier && right &&
             token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(right->identifier.valueText());
-            target.package_qualifier = std::string(left->identifier.valueText());
+            target.package_qualifier = std::string(left_identifier.valueText());
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
@@ -2350,17 +2577,18 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         if (found() || !token || !token.location().valid())
             return;
 
-        if (sm.isMacroLoc(token.location())) {
-            if (!contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
+        if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location())) {
+            if (macro_target.kind != DefinitionTargetKind::None ||
+                !contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
                                           col))
                 return;
 
             auto macro_name = sm.getMacroName(token.location());
             if (!macro_name.empty()) {
-                target.kind = DefinitionTargetKind::Macro;
-                target.name = std::string(macro_name);
-                target.scope_module = current_module;
-                target.scope_package = current_package;
+                macro_target.kind = DefinitionTargetKind::Macro;
+                macro_target.name = std::string(macro_name);
+                macro_target.scope_module = current_module;
+                macro_target.scope_package = current_package;
             }
             return;
         }
@@ -2374,12 +2602,17 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.object_name = object_name;
                 target.scope_module = current_module;
                 target.scope_package = current_package;
+                // The receiver of `obj.member` inside a class body is looked up
+                // in that class, so the enclosing class has to travel with the
+                // target just as it does for unqualified names.
+                target.scope_class = current_class;
                 return;
             }
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
             target.scope_package = current_package;
+            target.scope_class = current_class;
         }
     }
 };
@@ -2388,7 +2621,7 @@ static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tr
                                              const std::string& uri, int line, int col) {
     DefinitionTargetVisitor visitor(tree.sourceManager(), uri, line, col);
     tree.root().visit(visitor);
-    return visitor.target;
+    return visitor.found() ? visitor.target : visitor.macro_target;
 }
 
 static bool index_entry_location_matches(const SyntaxIndex& idx, SourceFileID file_id,
@@ -2782,11 +3015,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
         void visitToken(slang::parsing::Token token) {
             if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
                 return;
+            // A macro body token is preprocessor output with no position of its
+            // own in the file, so the cursor can never really be on it.  Its
+            // visible range is the whole invocation, which would otherwise make
+            // the first identifier the body happens to contain answer for every
+            // column of the call -- naming that instead of what the user wrote.
+            // Arguments are typed at the call site and are hit normally.
+            if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
+                return;
             if (!token_contains_position_in_uri(sm, token, uri, line, col))
                 return;
 
-            const int token_line = to_lsp_line((int)sm.getLineNumber(token.location()));
-            const int token_col = (int)sm.getColumnNumber(token.location()) - 1;
+            const auto start = visible_range_for_token(sm, token).start();
+            const int token_line = to_lsp_line((int)sm.getLineNumber(start));
+            const int token_col = (int)sm.getColumnNumber(start) - 1;
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
@@ -2799,7 +3041,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
     Visitor visitor(state->tree->sourceManager(), uri, line, col);
     state->tree->root().visit(visitor);
-    return visitor.result;
+    if (visitor.result)
+        return visitor.result;
+
+    // A macro invocation leaves no Identifier token at the user's position --
+    // the preprocessor consumed the backtick and the name.  Read the name back
+    // out of the source so `FOO, and a `define of it, stay renameable.
+    if (auto ident = extract_ident_span(state->text, line, col);
+        ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
+                  is_define_identifier(state->text, line, ident->start_col)))
+        return IdentifierAtPosition{.name = ident->text,
+                                    .line = line,
+                                    .col = ident->start_col,
+                                    .end_col = ident->end_col};
+    return std::nullopt;
 }
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
@@ -2927,6 +3182,18 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     const int use_line_one_based = line + 1;
     const auto& current_index = get_structural_index(state);
 
+    // Every shard a class hierarchy could be spread across, current file first.
+    auto class_lookup_shards = [&] {
+        std::vector<ClassLookupShard> shards;
+        shards.reserve(extra_files.size() + 1);
+        shards.push_back(ClassLookupShard{&current_index, &uri});
+        for (const auto& extra : extra_files) {
+            if (!skip_extra(extra))
+                shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+        }
+        return shards;
+    };
+
     if (target.kind == DefinitionTargetKind::PackageMember) {
         if (auto loc =
                 find_package_member(current_index, uri, target.package_qualifier, target.name))
@@ -2938,6 +3205,19 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                 target.package_qualifier, target.name))
                 return loc;
         }
+
+        // The qualifier may name a class rather than a package: `my_item::type_id`,
+        // `my_class::static_method`.  Resolve inside that class only — this is
+        // still a qualified lookup, so it must not fall back to unrelated
+        // same-named declarations.
+        if (state.tree) {
+            if (auto loc = find_class_scoped_declaration_in_tree(
+                    *state.tree, uri, target.package_qualifier, target.name))
+                return loc;
+        }
+        if (auto loc = find_class_member_in_hierarchy(class_lookup_shards(),
+                                                      target.package_qualifier, target.name))
+            return loc;
 
         // Deliberately no generic fallback.  A qualified name that the package
         // does not export must report "no definition" rather than silently
@@ -2968,21 +3248,34 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             class_type = class_type_for_object_reference_in_tree(
                 *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
         }
+        // Inside a class body the enclosing scope is the class, not a module,
+        // and the receiver may be a property, a method local, an argument, or a
+        // field the class only inherits.
+        if (!class_type && !target.scope_class.empty()) {
+            class_type = class_type_for_object_reference(current_index, target.scope_class,
+                                                         target.object_name, use_line_one_based);
+            if (!class_type) {
+                class_type = class_type_for_object_reference_in_tree(
+                    *state.tree, uri, target.scope_class, target.object_name, use_line_one_based);
+            }
+            if (!class_type) {
+                class_type = find_class_field_type_in_hierarchy(
+                    class_lookup_shards(), target.scope_class, target.object_name);
+            }
+        }
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
             // Search both compact index families so `obj.field` works for
-            // closed-file classes as well as structs/unions.
-            if (auto loc =
-                    find_class_member_definition(current_index, uri, *class_type, target.name))
+            // closed-file classes as well as structs/unions.  Class lookup
+            // walks the `extends` chain; typedef aggregates have no base type.
+            const auto shards = class_lookup_shards();
+            if (auto loc = find_class_member_in_hierarchy(shards, *class_type, target.name))
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
             for (const auto& extra : extra_files) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_class_member_definition(extra.index_ref(), extra.uri, *class_type,
-                                                            target.name))
-                    return loc;
                 if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
                                                              *class_type, target.name))
                     return loc;
@@ -2998,6 +3291,25 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                            target.scope_package, visible_imports,
                                            use_line_one_based))
         return loc;
+
+    // An unqualified name inside a class body that the current file cannot
+    // explain may be an inherited member:
+    //
+    //     class pkt_child extends pkt_base;
+    //         function void bump();
+    //             depth = depth + 1;   // pkt_base::depth, declared elsewhere
+    //
+    // This runs after the current-file walk so method locals and same-file
+    // declarations keep shadowing the base class, and before the project-wide
+    // generic scan so an unrelated same-named symbol cannot win over a real
+    // inherited member.
+    if (!target.scope_class.empty()) {
+        if (auto loc =
+                find_class_member_in_hierarchy(class_lookup_shards(), target.scope_class,
+                                               target.name))
+            return loc;
+    }
+
     for (const auto& extra : extra_files) {
         if (skip_extra(extra))
             continue;
@@ -3027,22 +3339,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // generations in one references response if a didChange / shard publish
     // happened between loops.
     const auto extra_idx = extra_index_snapshot_ptr();
-    if (!target) {
-        // Macro invocations are often represented in slang's parsed tree as
-        // expansion tokens rather than as an ordinary Identifier token at the
-        // user's source location.  `definition_of_state()` already has a raw
-        // source fallback for backtick identifiers; references need the same
-        // seed identifier so "find references" works when the cursor is on
-        // `FOO in source text.
-        if (auto ident = extract_ident_span(state->text, line, col);
-            ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
-                      is_define_identifier(state->text, line, ident->start_col))) {
-            target = IdentifierAtPosition{.name = ident->text,
-                                          .line = line,
-                                          .col = ident->start_col,
-                                          .end_col = ident->end_col};
-        }
-    }
     if (!target)
         return {};
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
@@ -3064,6 +3360,28 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         for (const auto& extra : *extra_idx) {
             if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
                                                    target_info.module_name, target_info.name)))
+                break;
+        }
+    } else if (!target_def && (target_info.kind == DefinitionTargetKind::Generic ||
+                               target_info.kind == DefinitionTargetKind::PackageMember)) {
+        // A name only a closed project file can explain — typically a package
+        // member reached through an import, either bare or `pkg::`-qualified.
+        // definition_of_state() above ran without extra files by design, so it
+        // could not leave the open buffers.  Recover the declaration from the
+        // compact shards rather than walking closed-file ASTs; without this,
+        // references/rename started *from the use site* return nothing at all.
+        const auto visible_imports =
+            state->tree ? get_dynamic_index(*state).imports : std::vector<ImportEntry>{};
+        for (const auto& extra : *extra_idx) {
+            if (target_info.kind == DefinitionTargetKind::PackageMember) {
+                target_def = find_package_member(extra.index_ref(), extra.uri,
+                                                 target_info.package_qualifier, target_info.name);
+            } else {
+                target_def = find_generic_definition_from_index(
+                    extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                    target_info.scope_package, visible_imports, line + 1);
+            }
+            if (target_def)
                 break;
         }
     }
@@ -3165,22 +3483,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // their compact occurrence shards.  This fixes the "empty references"
         // case for symbols whose only indexed identity is `name:<identifier>`
         // without downgrading precise open-file reference searches.
-        auto current_structural_index = get_structural_index(*state);
-        if (target_def->uri == uri) {
-            if (auto id = symbol_id_for_index_location(current_structural_index, *target_def, true);
-                id && id->starts_with("name:")) {
-                // Do not use unresolved `name:<identifier>` as a bridge from an
-                // open buffer into closed project shards.  The open-buffer AST
-                // path below can verify same-definition references precisely,
-                // but a closed shard cannot distinguish scopes for generic
-                // names such as a module-local function `calc` versus an
-                // unrelated global `calc`.  Owner-qualified SymbolIDs above
-                // still enable scalable cross-file references for modules,
-                // ports, parameters, typedef fields, macros, etc.
-                fallback_symbol_debug.clear();
-            }
-        }
-        if (fallback_symbol_debug.empty()) {
+        // Do not use unresolved `name:<identifier>` as a bridge out of an open
+        // buffer.  The AST path below can verify same-definition references
+        // precisely, but a closed shard cannot distinguish scopes for generic
+        // names such as a method-local `item` versus an unrelated `item` in a
+        // library file.  Only a declaration that lives in a closed file needs
+        // the bridge, because nothing can walk its AST to do better.
+        //
+        // Testing the declaration's own URI rather than the request URI is what
+        // makes the guard hold: an open file is normally listed in the filelist
+        // too, so its own closed shard offers exactly the `name:` ID this is
+        // meant to refuse.  Owner-qualified SymbolIDs above still carry
+        // cross-file references for modules, ports, parameters, typedef fields
+        // and macros.
+        if (!get_state(target_def->uri)) {
             for (const auto& extra : *extra_idx) {
                 if (extra.uri != target_def->uri)
                     continue;
@@ -3225,6 +3541,91 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const SymbolID include_bridge_name_id =
         allow_include_name_bridge ? SymbolID::from_canonical("name:" + target->name) : SymbolID{};
 
+    // Package members are reached from other files by import, and an importing
+    // file cannot attribute the bare name to its owning package on its own:
+    //
+    //   common_pkg.sv   package common_pkg; function void foo(); ...
+    //                     -> package_subroutine::common_pkg::foo
+    //   pkg_use.sv      import common_pkg::*; ... foo();
+    //                     -> name:foo, because this shard never saw the package
+    //
+    // Bridge the two, but only into shards whose own import list makes this
+    // package's members visible, so unrelated same-named symbols elsewhere in
+    // the project cannot be merged into the rename.
+    std::string target_package;
+    {
+        auto owning_package = [&](const SyntaxIndex& index) {
+            for (const auto& [package_name, symbols] : index.package_symbols) {
+                if (std::find(symbols.begin(), symbols.end(), target->name) != symbols.end())
+                    return package_name;
+            }
+            return std::string{};
+        };
+        if (target_def->uri == uri)
+            target_package = owning_package(get_structural_index(*state));
+        if (target_package.empty()) {
+            for (const auto& extra : *extra_idx) {
+                if (extra.uri != target_def->uri)
+                    continue;
+                target_package = owning_package(extra.index_ref());
+                break;
+            }
+        }
+    }
+    const SymbolID import_bridge_name_id =
+        target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
+
+    // `handle.member` in another file is recorded under the receiver's bare
+    // type name and a kind-neutral `class_member::` prefix, because that shard
+    // never parsed the class body: it knows neither the owning package nor
+    // whether the member is a field or a method.  Treat that spelling as the
+    // same symbol.  When the class is package-scoped the alias is admitted only
+    // inside shards importing that package, so a same-named member on an
+    // unrelated class stays out of the result.
+    SymbolID class_member_alias_id;
+    std::string class_member_package;
+    std::string class_member_class;
+    for (const auto prefix : {std::string_view("class_field::"),
+                              std::string_view("class_method::")}) {
+        if (!target_symbol_debug.starts_with(prefix))
+            continue;
+        const std::string_view rest = std::string_view(target_symbol_debug).substr(prefix.size());
+        const auto member_sep = rest.rfind("::");
+        if (member_sep == std::string_view::npos)
+            break;
+        const auto owner = rest.substr(0, member_sep);
+        const auto member = rest.substr(member_sep + 2);
+        const auto scope_sep = owner.rfind("::");
+        if (scope_sep == std::string_view::npos) {
+            class_member_class = std::string(owner);
+        } else {
+            class_member_package = std::string(owner.substr(0, scope_sep));
+            class_member_class = std::string(owner.substr(scope_sep + 2));
+        }
+        if (!class_member_class.empty())
+            class_member_alias_id = SymbolID::from_canonical(
+                "class_member::" + class_member_class + "::" + std::string(member));
+        break;
+    }
+
+    auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports) {
+        // A class outside any package is reached by bare name, so there is no
+        // import to require.
+        if (class_member_package.empty())
+            return true;
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == class_member_package &&
+                   (import.wildcard || import.symbol_name == class_member_class);
+        });
+    };
+
+    auto imports_target_package = [&](const std::vector<ImportEntry>& imports) {
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == target_package &&
+                   (import.wildcard || import.symbol_name == target->name);
+        });
+    };
+
     auto index_includes_target_source = [&](const SyntaxIndex& index) {
         // Included-file declarations can be seen under two different syntactic
         // worlds: the standalone header that the user opened, and every parsed
@@ -3241,7 +3642,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                          target_def->uri) != index.include_dependencies.end();
     };
 
-    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref) {
+    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref,
+                                        const std::vector<ImportEntry>& imports) {
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
             return true;
         if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
@@ -3251,6 +3653,12 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (include_bridge_name_id && ref.symbol_id == include_bridge_name_id &&
             index_includes_target_source(index))
+            return true;
+        if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
+            imports_target_package(imports))
+            return true;
+        if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
+            admits_class_member_alias(imports))
             return true;
         return false;
     };
@@ -3320,7 +3728,13 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     std::unordered_set<std::string> open_uris;
     for (const auto& [state_uri, state] : open_states) {
         open_state_by_uri[state_uri] = state;
-        open_uris.insert(state_uri);
+        // Compare against extra.uri's canonical spelling below, not the raw
+        // client URI: a client can open a file through a symlinked path while
+        // the filelist indexer reaches the same file through its canonical
+        // path (uri_from_path() resolves symlinks via weakly_canonical()).  A
+        // raw string mismatch here would fail to skip the file's own closed
+        // shard, double-counting every reference in it.
+        open_uris.insert(state ? uri_from_path(state->normalized_path) : state_uri);
     }
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
@@ -3380,12 +3794,24 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // would require closed/project-file ASTs in the resolver.  The
             // SymbolID path avoids that by matching `module:memory` directly.
             const auto open_index = get_structural_index(*state);
+            // The structural index deliberately omits imports; the dynamic
+            // shard is the cached view that carries them.
+            const auto& open_imports =
+                import_bridge_name_id ? get_dynamic_index(*state).imports : open_index.imports;
             for (const auto& ref : open_index.references) {
-                if (reference_matches_target(open_index, ref))
+                if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
-            if (target_info.kind == DefinitionTargetKind::ClassMember &&
-                target_symbol_debug.starts_with("class_method::"))
+            if ((target_info.kind == DefinitionTargetKind::ClassMember &&
+                 target_symbol_debug.starts_with("class_method::")) ||
+                target_symbol_debug.starts_with("class_field::"))
+                // A class field is written both bare inside the class body and
+                // as `handle.field` elsewhere.  Only the first form carries the
+                // scoped `class_field::` identity in a shard: the second is
+                // indexed as an unresolved name, because the shard cannot type
+                // the receiver.  Verifying candidate tokens against the
+                // declaration recovers those uses without widening the
+                // SymbolID match to every same-named symbol in the project.
                 visit_tree(*state->tree, state_uri, resolve_snapshot);
         } else {
             visit_tree(*state->tree, state_uri, resolve_snapshot);
@@ -3397,7 +3823,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     for (const auto& extra : *extra_idx) {
         if (open_uris.contains(extra.uri))
             continue;
-        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id)
+        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
+            !import_bridge_name_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -3405,7 +3832,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // closer to the v1.0.4 model; explicit references / rename requests pay
         // the linear scan cost over compact ReferenceEntry records instead.
         for (const auto& ref : extra.index_ref().references) {
-            if (reference_matches_target(extra.index_ref(), ref))
+            if (reference_matches_target(extra.index_ref(), ref, extra.index_ref().imports))
                 add_indexed_reference(extra.uri, extra.index_ref(), ref);
         }
     }

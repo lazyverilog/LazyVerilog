@@ -10,3 +10,7 @@
 ./uvm-core/src/uvm_pkg.sv
 ./uvm_completion_demo.sv
 ./uvm_autocomplete_test.sv
+./pkt_base.sv
+./pkt_child.sv
+./common_pkg.sv
+./pkg_use.sv

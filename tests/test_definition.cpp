@@ -770,3 +770,424 @@ TEST_CASE("definition: unresolvable identifier stays fast on a large project",
 
     std::filesystem::remove_all(dir);
 }
+
+TEST_CASE("definition: class member access walks the extends chain across files",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto base_path = write_temp_sv("lazyverilog_definition_pkt_base.sv",
+                                         "class pkt_base;\n"
+                                         "    int depth;\n"
+                                         "\n"
+                                         "    function void apply();\n"
+                                         "    endfunction\n"
+                                         "endclass\n");
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_pkt_child.sv";
+    analyzer.set_extra_files({base_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, "class pkt_child extends pkt_base;\n"
+                           "endclass\n"
+                           "\n"
+                           "module top;\n"
+                           "    pkt_child child;\n"
+                           "    initial begin\n"
+                           "        child.depth = 1;\n"
+                           "        child.apply();\n"
+                           "    end\n"
+                           "endmodule\n");
+
+    auto field = analyzer.definition_of(top_uri, 6, 15);
+    REQUIRE(field.has_value());
+    CHECK(field->uri == uri_from_path(base_path));
+    CHECK(field->line == 1);
+    CHECK(field->col == 8);
+
+    auto method = analyzer.definition_of(top_uri, 7, 15);
+    REQUIRE(method.has_value());
+    CHECK(method->uri == uri_from_path(base_path));
+    CHECK(method->line == 3);
+
+    std::filesystem::remove(base_path);
+}
+
+TEST_CASE("definition: unqualified inherited member inside a class body resolves to the base",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto base_path = write_temp_sv("lazyverilog_definition_inherited_base.sv",
+                                         "class pkt_base;\n"
+                                         "    int depth;\n"
+                                         "endclass\n");
+    const std::string child_uri = "file:///tmp/lazyverilog_definition_inherited_child.sv";
+    analyzer.set_extra_files({base_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(child_uri, "class pkt_child extends pkt_base;\n"
+                             "    function void bump();\n"
+                             "        depth = depth + 1;\n"
+                             "    endfunction\n"
+                             "endclass\n");
+
+    auto loc = analyzer.definition_of(child_uri, 2, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(base_path));
+    CHECK(loc->line == 1);
+    CHECK(loc->col == 8);
+
+    // A method local of the same name still shadows the inherited member.
+    analyzer.open(child_uri, "class pkt_child extends pkt_base;\n"
+                             "    function void bump();\n"
+                             "        int depth;\n"
+                             "        depth = 1;\n"
+                             "    endfunction\n"
+                             "endclass\n");
+    auto shadowed = analyzer.definition_of(child_uri, 3, 8);
+    REQUIRE(shadowed.has_value());
+    CHECK(shadowed->uri == child_uri);
+    CHECK(shadowed->line == 2);
+
+    std::filesystem::remove(base_path);
+}
+
+TEST_CASE("definition: imported package subroutine resolves while the package file is open",
+          "[definition]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_open_pkg.sv",
+                                        "package common_pkg;\n"
+                                        "typedef int my_int_t;\n"
+                                        "\n"
+                                        "function void foo();\n"
+                                        "endfunction\n"
+                                        "endpackage\n");
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_open_pkg_top.sv";
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package buffer being open routes the lookup through the dynamic
+    // open-file shard instead of the disk-backed one; both must report the
+    // declaration position.
+    analyzer.open(pkg_uri, "package common_pkg;\n"
+                           "typedef int my_int_t;\n"
+                           "\n"
+                           "function void foo();\n"
+                           "endfunction\n"
+                           "endpackage\n");
+    analyzer.open(top_uri, "module top;\n"
+                           "import common_pkg::*;\n"
+                           "    initial begin\n"
+                           "        foo();\n"
+                           "    end\n"
+                           "endmodule\n");
+
+    auto loc = analyzer.definition_of(top_uri, 3, 9);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == pkg_uri);
+    CHECK(loc->line == 3);
+    CHECK(loc->col == 14);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("identifiers inside macro arguments resolve instead of the macro", "[definition][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_macro_arg.sv";
+    analyzer.open(uri, "`define INFO(ID, MSG) $display(ID, MSG)\n"
+                       "class item_t;\n"
+                       "    bit [7:0] addr;\n"
+                       "endclass\n"
+                       "class drv;\n"
+                       "    task run();\n"
+                       "        item_t item;\n"
+                       "        `INFO(\"DRV\", $sformatf(\"a=%0h\", item.addr))\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // Macro arguments are text the user typed at the call site, so a name there
+    // resolves like any other; only the rest of the invocation is the macro.
+    const std::string call = "        `INFO(\"DRV\", $sformatf(\"a=%0h\", item.addr))";
+
+    auto object = analyzer.definition_of(uri, 7, (int)call.find("item.addr"));
+    REQUIRE(object.has_value());
+    CHECK(object->uri == uri);
+    CHECK(object->line == 6);
+    CHECK(object->col == 15);
+
+    auto member = analyzer.definition_of(uri, 7, (int)call.find("item.addr") + 5);
+    REQUIRE(member.has_value());
+    CHECK(member->uri == uri);
+    CHECK(member->line == 2);
+    CHECK(member->col == 14);
+
+    // The macro name itself still goes to the `define.
+    auto macro = analyzer.definition_of(uri, 7, (int)call.find("`INFO") + 1);
+    REQUIRE(macro.has_value());
+    CHECK(macro->line == 0);
+    CHECK(macro->col == 8);
+}
+
+// ── Member access whose receiver type lives in another file ──────────────────
+
+static const std::string kPackageClassDefinitionFixture = R"(package tb_pkg;
+    class phase_obj;
+        extern virtual function void raise_objection();
+    endclass
+
+    class driver_base;
+        phase_obj port_handle;
+    endclass
+endpackage
+)";
+
+TEST_CASE("definition: method called through a package-class argument resolves",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_class_arg.sv",
+                                        kPackageClassDefinitionFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_arg.sv";
+    analyzer.open(uri, "import tb_pkg::*;\n"
+                       "class my_drv;\n"
+                       "    task run(phase_obj arg_phase);\n"
+                       "        arg_phase.raise_objection();\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    // Line 3, on `raise_objection`.
+    auto loc = analyzer.definition_of(uri, 3, 20);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: method called through an inherited handle resolves",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_class_field.sv",
+                                        kPackageClassDefinitionFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_field.sv";
+    // `port_handle` is declared by driver_base in the package file, so both the
+    // receiver's type and the method live outside the open buffer.
+    analyzer.open(uri, "import tb_pkg::*;\n"
+                       "class my_drv extends driver_base;\n"
+                       "    task run();\n"
+                       "        port_handle.raise_objection();\n"
+                       "    endtask\n"
+                       "endclass\n");
+
+    auto loc = analyzer.definition_of(uri, 3, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: package parameter resolves through a wildcard import",
+          "[definition][package]") {
+    Analyzer analyzer;
+    // Shaped like UVM's `uvm_object_globals.svh`: a typedef'd parameter type,
+    // a parameter defined in terms of another parameter, and an enum next to
+    // them, all inside a package body pulled in through an include.
+    const auto inc_path = write_temp_sv("lazyverilog_definition_pkg_param_inc.svh",
+                                        "typedef bit [7:0] flag_t;\n"
+                                        "parameter int P_INT = 3;\n"
+                                        "parameter flag_t P_TYPED = 8'h1;\n"
+                                        "parameter flag_t P_DERIVED = P_TYPED;\n"
+                                        "typedef enum int { MODE_ONE = 1 } mode_e;\n");
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_pkg_param.sv",
+                                        "package flag_pkg;\n"
+                                        "`include \"lazyverilog_definition_pkg_param_inc.svh\"\n"
+                                        "endpackage\n");
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_pkg_param_use.sv";
+    analyzer.open(uri, "import flag_pkg::*;\n"
+                       "module top;\n"
+                       "    int a = P_INT;\n"
+                       "    int b = P_TYPED;\n"
+                       "    int c = P_DERIVED;\n"
+                       "    int d = MODE_ONE;\n"
+                       "endmodule\n");
+
+    auto param_loc = analyzer.definition_of(uri, 2, 13);
+    REQUIRE(param_loc.has_value());
+    CHECK(param_loc->uri == uri_from_path(inc_path));
+    CHECK(param_loc->line == 1);
+
+    // The parameter's type and its initializer must not change the answer, and
+    // the enum member next to them keeps working.
+    CHECK(analyzer.definition_of(uri, 3, 13).has_value());
+    CHECK(analyzer.definition_of(uri, 4, 13).has_value());
+    CHECK(analyzer.definition_of(uri, 5, 13).has_value());
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("definition: macro-generated typedef resolves to its declaration",
+          "[definition][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_definition_macro_typedef.sv";
+    analyzer.open(uri, "`define UTILS(T) typedef registry #(T) type_id;\n"
+                       "class registry #(type T = int);\n"
+                       "endclass\n"
+                       "class my_item;\n"
+                       "    `UTILS(my_item)\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    initial my_item::type_id::create();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 7, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri);
+    // `type_id` here is a literal in the macro *body*, not a substituted
+    // argument -- must not be confused with the isMacroArgLoc-only case.
+    CHECK(loc->line == 0);
+    CHECK(loc->col == 39);
+}
+
+TEST_CASE("definition: class-scoped typedef resolves from a closed package file",
+          "[definition]") {
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_closed_type_id.sv",
+                                        "package type_pkg;\n"
+                                        "    class registry #(type T = int);\n"
+                                        "        static function T create();\n"
+                                        "        endfunction\n"
+                                        "    endclass\n"
+                                        "    class my_item;\n"
+                                        "        typedef registry #(my_item) type_id;\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package file stays closed, so the class body is reachable only
+    // through its SyntaxIndex shard.
+    const std::string uri = "file:///tmp/lazyverilog_definition_closed_type_id_use.sv";
+    analyzer.open(uri, "import type_pkg::*;\n"
+                       "module top;\n"
+                       "    initial my_item::type_id::create();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 2, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 6);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: static method called directly on a parameterized closed-file "
+          "class resolves without a type_id hop",
+          "[definition]") {
+    // `ClassName #(params)::method()` parses its qualifier as ClassNameSyntax,
+    // not the plain IdentifierNameSyntax a `pkg::name`/`my_item::type_id`
+    // qualifier parses as.  The scoped-name handler only recognized the latter,
+    // so a parameterized qualifier fell through to an unscoped bare-name
+    // lookup that had no way to find a member scoped to a different class --
+    // e.g. `uvm_config_db #(int)::get(...)`.
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_param_class_static.sv",
+                                        "package registry_pkg;\n"
+                                        "    class registry #(type T = int);\n"
+                                        "        static function T get();\n"
+                                        "        endfunction\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_param_class_static_use.sv";
+    analyzer.open(uri, "import registry_pkg::*;\n"
+                       "module top;\n"
+                       "    initial registry #(int)::get();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 2, 30);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: field on a receiver with a parameterized declared type",
+          "[definition]") {
+    // `Container #(byte)` used to resolve the receiver's class name to `byte`
+    // (the trailing parameter) instead of `Container`, since the type-name
+    // heuristic grabbed the last identifier-like run in the type text.
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_param_field.sv",
+                                        "package pkg;\n"
+                                        "    class Container #(type REQ = int, RSP = REQ);\n"
+                                        "        int seq_item_export;\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_param_field_use.sv";
+    analyzer.open(uri, "import pkg::*;\n"
+                       "module top;\n"
+                       "    Container #(byte) sequencer;\n"
+                       "    initial sequencer.seq_item_export = 1;\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 3, 24);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("definition: class method declared entirely inside a macro body resolves "
+          "from a closed package file",
+          "[definition][macro]") {
+    // Mirrors UVM's `UVM_SEQ_ITEM_PULL_IMP, which expands to a whole
+    // `task get_next_item(...); ... endtask` member -- the method name is a
+    // macro-body literal, not a substituted argument.  Closed-file indexing
+    // used to compute the entry's location from the raw (unresolved)
+    // macro-expansion buffer location, which has no real line numbers, so the
+    // entry landed at line 0 and find_class_member_definition's `line <= 0`
+    // guard silently dropped it.
+    const std::string macro_line =
+        "    `define GEN_ITEM_METHOD(IMP) task get_next_item(); IMP.get_next_item(); "
+        "endtask\n";
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_macro_method.sv",
+                                        "package pkg;\n" + macro_line +
+                                        "    class base;\n"
+                                        "        `GEN_ITEM_METHOD(imp)\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string use_line = "    initial b.get_next_item();\n";
+    const std::string uri = "file:///tmp/lazyverilog_definition_macro_method_use.sv";
+    analyzer.open(uri, "import pkg::*;\n"
+                       "module top;\n"
+                       "    base b;\n" +
+                           use_line + "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 3, (int)use_line.find("get_next_item"));
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 1);
+    CHECK(loc->col == (int)macro_line.find("get_next_item"));
+
+    std::filesystem::remove(pkg_path);
+}

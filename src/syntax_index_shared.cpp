@@ -12,6 +12,53 @@
 using namespace slang;
 using namespace slang::syntax;
 
+std::string make_subroutine_signature(const FunctionPrototypeSyntax& proto,
+                                      const std::string& name,
+                                      const slang::SourceManager& sm) {
+    const bool is_task =
+        proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword;
+    const std::string ports =
+        proto.portList ? trim_copy(proto.portList->toString()) : "";
+
+    std::string formatted_ports;
+    if (ports.size() >= 2 && ports.front() == '(' && ports.back() == ')') {
+        auto inner = trim_copy(ports.substr(1, ports.size() - 2));
+        if (inner.empty()) {
+            formatted_ports = "()";
+        } else {
+            std::vector<std::string> parts;
+            size_t start = 0;
+            while (start <= inner.size()) {
+                auto comma = inner.find(',', start);
+                if (comma == std::string::npos) {
+                    parts.push_back(trim_copy(inner.substr(start)));
+                    break;
+                }
+                parts.push_back(trim_copy(inner.substr(start, comma - start)));
+                start = comma + 1;
+            }
+            if (parts.size() <= 1) {
+                formatted_ports = "(" + inner + ")";
+            } else {
+                formatted_ports = "(\n";
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    formatted_ports += "    " + parts[i];
+                    if (i + 1 != parts.size())
+                        formatted_ports += ",\n";
+                }
+                formatted_ports += "\n)";
+            }
+        }
+    } else {
+        formatted_ports = ports;
+    }
+
+    if (is_task)
+        return "```\ntask " + name + formatted_ports + "\n```";
+    const std::string ret = render_syntax_node_text(sm, *proto.returnType);
+    return "```\nfunction " + ret + " " + name + formatted_ports + "\n```";
+}
+
 std::string uri_from_file_name(std::string_view file_name) {
     if (file_name.empty())
         return {};
@@ -182,13 +229,28 @@ std::string token_value_text(const slang::parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
 }
 
+slang::SourceLocation token_true_origin_location(const slang::SourceManager& sm,
+                                                 const slang::parsing::Token& token) {
+    if (!token || !token.location().valid())
+        return {};
+    return sm.isMacroLoc(token.location()) ? sm.getFullyOriginalLoc(token.location())
+                                           : token.location();
+}
+
 std::pair<int, int> token_pos_line1_col0(const slang::SourceManager& sm,
                                          const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
 
-    const auto line = sm.getLineNumber(token.location());
-    const auto col = sm.getColumnNumber(token.location());
+    // A token written as a literal inside a macro body (e.g. the method name
+    // in a UVM-style `` `define FOO(...) task get_next_item(); ... endtask ``)
+    // has its own location point into the expansion buffer, which has no
+    // lines to walk -- getLineNumber() answers 0.  Report where it was
+    // actually written instead, matching location_from_token()'s live-AST
+    // handling of the same case.
+    const auto location = token_true_origin_location(sm, token);
+    const auto line = sm.getLineNumber(location);
+    const auto col = sm.getColumnNumber(location);
     return {line > 0 ? static_cast<int>(line) : 0,
             col > 0 ? static_cast<int>(col) - 1 : 0};
 }
@@ -289,6 +351,13 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
     return trim_copy(std::move(text));
 }
 
+std::string base_class_lookup_name(std::string_view base_class) {
+    auto name = base_class.substr(0, base_class.find('#'));
+    if (const auto scope = name.rfind("::"); scope != std::string_view::npos)
+        name = name.substr(scope + 2);
+    return trim_copy(std::string(name));
+}
+
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name) {
     std::string result;
     if (scope.empty()) {
@@ -341,6 +410,13 @@ std::string canonical_type_name_from_text(std::string_view type) {
     //   logic [7:0] not_a_struct;
     //
     // Built-in scalar types will simply fail to match any typedef field map.
+    //
+    // A parameter list, e.g. `Container #(byte, byte)`, must not shift the
+    // trailing-run scan onto the last parameter -- the class name is what
+    // precedes `#(`, not what happens to sit at the end of the text.
+    if (const auto hash = type.find('#'); hash != std::string_view::npos)
+        type = type.substr(0, hash);
+
     size_t end = type.size();
     while (end > 0 && !syntax_fragment_edge_is_wordlike(type[end - 1]))
         --end;
@@ -504,8 +580,13 @@ std::string final_name_from_qualified_name(std::string_view qualified_name) {
 std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
-    const auto line = sm.getLineNumber(token.location());
-    const auto col = sm.getColumnNumber(token.location());
+    // A macro argument lives in its own expansion buffer, which has no lines for
+    // getColumnNumber() to walk back through.  Report where the user wrote it.
+    const auto location = sm.isMacroArgLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    const auto line = sm.getLineNumber(location);
+    const auto col = sm.getColumnNumber(location);
     return {line > 0 ? static_cast<int>(line) : 0, col > 0 ? static_cast<int>(col) - 1 : 0};
 }
 
@@ -543,6 +624,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_map<std::string, std::string> module_value_types;
     std::unordered_set<std::string> package_values;
     std::unordered_set<std::string> class_fields;
+    std::unordered_map<std::string, std::string> unique_class_scopes;
+    std::unordered_set<std::string> ambiguous_class_names;
     std::unordered_set<std::string> typedef_fields;
     std::unordered_map<std::string, std::string> unique_typedef_scopes;
     std::unordered_set<std::string> ambiguous_typedef_names;
@@ -598,6 +681,15 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                    !unique_type_ids.try_emplace(cls.name, class_id).second) {
             unique_type_ids.erase(cls.name);
             ambiguous_type_names.insert(cls.name);
+        }
+        // A member access spells the receiver's declared type bare (`Packet p;`),
+        // but class_fields is keyed by the scoped name a declaration carries
+        // (`pkt_pkg::Packet`).  Keep the bare→scoped mapping so `p.data` can be
+        // matched to the same SymbolID the declaration emits.
+        if (!ambiguous_class_names.contains(cls.name) &&
+            !unique_class_scopes.try_emplace(cls.name, class_scope).second) {
+            unique_class_scopes.erase(cls.name);
+            ambiguous_class_names.insert(cls.name);
         }
         for (const auto& field : cls.fields)
             class_fields.insert(class_scope + "\n" + field.name);
@@ -797,6 +889,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         std::unordered_map<std::string, std::string> walked_value_types;
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
+        const std::unordered_map<std::string, std::string>& unique_class_scopes;
         const std::unordered_set<std::string>& typedef_fields;
         const std::unordered_map<std::string, std::string>& unique_typedef_scopes;
         const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
@@ -831,9 +924,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // Extra fields for macro visitor
         decltype(add_macro_ref)& add_macro;
         SourceFileIdResolver& file_ids;
-        // Per-buffer classification: true = macro definition buffer, false = file buffer.
-        // Populated on first token seen from each buffer so isMacroLoc is called only once per buffer.
-        std::unordered_map<uint32_t, bool> buffer_is_macro;
+        // Per-buffer classification, populated on first token seen from each
+        // buffer so the SourceManager is queried only once per buffer.  slang
+        // gives every macro argument its own expansion buffer, distinct from the
+        // one holding the macro body, so the answer really is uniform per buffer.
+        enum class BufferKind : uint8_t { File, MacroBody, MacroArgument };
+        std::unordered_map<uint32_t, BufferKind> buffer_kinds;
         // Deduplication for macro expansion sites. Key = (expansion_buf_id << 32) | expansion_offset.
         // Avoids recording the same macro invocation multiple times when it expands to many tokens.
         std::unordered_set<uint64_t> seen_expansions;
@@ -853,6 +949,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         const std::unordered_map<std::string, std::string>& module_value_types,
                         const std::unordered_set<std::string>& package_values,
                         const std::unordered_set<std::string>& class_fields,
+                        const std::unordered_map<std::string, std::string>& unique_class_scopes,
                         const std::unordered_set<std::string>& typedef_fields,
                         const std::unordered_map<std::string, std::string>& unique_typedef_scopes,
                         const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
@@ -865,7 +962,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         SourceFileIdResolver& file_ids)
             : index(index), sm(sm), add_ref(add_reference), module_values(module_values),
               module_value_types(module_value_types), package_values(package_values),
-              class_fields(class_fields), typedef_fields(typedef_fields),
+              class_fields(class_fields), unique_class_scopes(unique_class_scopes),
+              typedef_fields(typedef_fields),
               unique_typedef_scopes(unique_typedef_scopes),
               unique_enum_member_ids(unique_enum_member_ids), unique_type_ids(unique_type_ids),
               package_type_ids(package_type_ids), declared_subroutines(declared_subroutines),
@@ -1278,6 +1376,30 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::nullopt;
         }
 
+        // Scope under which `field_name` is declared on the class named
+        // `object_type`, or nullopt when that class declares no such field.
+        // The receiver type is spelled bare at the use site, so a
+        // package-scoped class has to be mapped back to its scoped name first.
+        std::optional<std::string> class_field_scope(std::string_view object_type,
+                                                     std::string_view field_name) {
+            if (object_type.empty() || field_name.empty())
+                return std::nullopt;
+            scope_key = object_type;
+            scope_key += '\n';
+            scope_key.append(field_name);
+            if (class_fields.contains(scope_key))
+                return std::string(object_type);
+            const auto it = unique_class_scopes.find(std::string(object_type));
+            if (it == unique_class_scopes.end() || it->second == object_type)
+                return std::nullopt;
+            scope_key = it->second;
+            scope_key += '\n';
+            scope_key.append(field_name);
+            if (class_fields.contains(scope_key))
+                return it->second;
+            return std::nullopt;
+        }
+
         void handle(const MemberAccessExpressionSyntax& node) {
             const std::string field_name(node.name.valueText());
             const std::string object_name = simple_identifier_from_expr(node.left);
@@ -1322,6 +1444,33 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             visitDefault(node);
         }
 
+        // `obj.member` whose receiver type is known here, but whose declaring
+        // class lives in a file this shard never parsed.  Record it under the
+        // bare type name instead of letting it decay to `name:<member>`, which
+        // is too broad to ever be matched back to one class.  find_references()
+        // re-scopes this to the declaring package before accepting it.
+        //
+        // The kind stays deliberately neutral: without the class body this
+        // shard cannot tell a field from a method, and claiming either one
+        // would make the occurrence unmatchable for the other.
+        bool try_add_foreign_member_reference(const slang::parsing::Token& token,
+                                              std::string_view member_name,
+                                              std::string_view object_name,
+                                              const std::optional<std::string>& object_type) {
+            if (member_name.empty() || object_name.empty() || !object_type ||
+                object_type->empty())
+                return false;
+            // A type this shard does know was already given its precise
+            // SymbolID by one of the attempts above; re-recording it here
+            // would attach a second, weaker identity to the same token.
+            if (unique_class_scopes.contains(*object_type) ||
+                unique_typedef_scopes.contains(*object_type))
+                return false;
+            add_ref(token,
+                    symbol_canonical("class_member", *object_type, std::string(member_name)));
+            return true;
+        }
+
         std::string object_before_member_dot(const slang::parsing::Token& token) const {
             if (!token || !token.location().valid())
                 return {};
@@ -1345,7 +1494,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         bool try_add_class_method_reference(const slang::parsing::Token& token,
-                                            std::string_view method_name) {
+                                            std::string_view method_name,
+                                            std::string_view object_name,
+                                            const std::optional<std::string>& object_type) {
             // Some call forms are not represented as MemberAccessExpressionSyntax
             // by slang's parsed syntax tree, so classify simple object-method
             // tokens from the token fallback as well.  This mirrors the typedef
@@ -1353,13 +1504,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             //
             //     Packet p;
             //     p.req_data();  // class_method::Packet::req_data
-            if (method_name.empty())
-                return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
-                return false;
-            auto object_type = current_module_object_type(object_name);
-            if (!object_type)
+            if (method_name.empty() || object_name.empty() || !object_type)
                 return false;
             const auto method_key =
                 subroutine_scope_key(SubroutineOwnerKind::Class, *object_type, method_name);
@@ -1370,13 +1515,27 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return true;
         }
 
-        bool try_add_typedef_field_reference(const slang::parsing::Token& token,
-                                             std::string_view field_name) {
-            // Check the cheap module-context guard before the expensive source-text scan.
-            if (current_module.empty() || field_name.empty() || module_value_types.empty())
+        bool try_add_class_field_reference(const slang::parsing::Token& token,
+                                           std::string_view field_name,
+                                           std::string_view object_name,
+                                           const std::optional<std::string>& object_type) {
+            // `p.data` is the same declaration as the bare `data` written
+            // inside the class body.  Without this the occurrence decays to
+            // `name:<field>` and rename skips every use outside that class.
+            if (field_name.empty() || object_name.empty() || !object_type)
                 return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
+            auto scope = class_field_scope(*object_type, field_name);
+            if (!scope)
+                return false;
+            add_ref(token, symbol_canonical("class_field", *scope, std::string(field_name)));
+            return true;
+        }
+
+        bool try_add_typedef_field_reference(const slang::parsing::Token& token,
+                                             std::string_view field_name,
+                                             std::string_view object_name) {
+            if (current_module.empty() || field_name.empty() || object_name.empty() ||
+                module_value_types.empty())
                 return false;
             scope_key = current_module;
             scope_key += '\n';
@@ -1425,36 +1584,55 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (!file_ids.accepts(index, sm, token))
                 return;
 
-            // Classify buffer on first encounter (saves repeated isMacroLoc calls).
+            // Classify buffer on first encounter (saves repeated SourceManager
+            // queries, each of which takes a lock).
             const uint32_t buf_id = token.location().buffer().getId();
-            auto [it, inserted] = buffer_is_macro.emplace(buf_id, false);
+            auto [it, inserted] = buffer_kinds.emplace(buf_id, BufferKind::File);
             if (inserted) {
-                it->second = sm.isMacroLoc(token.location());
+                it->second = !sm.isMacroLoc(token.location()) ? BufferKind::File
+                             : sm.isMacroArgLoc(token.location()) ? BufferKind::MacroArgument
+                                                                  : BufferKind::MacroBody;
             }
 
-            if (it->second) {
-                // Macro token — record the macro invocation once per expansion site.
-                const auto range = sm.getExpansionRange(token.location());
+            if (it->second != BufferKind::File) {
+                // Macro token — record the macro invocation once per expansion
+                // site.  Arguments record it too: `define ID(X) X expands to
+                // nothing but its argument, so body tokens cannot be relied on
+                // to be there.
+                auto range = sm.getExpansionRange(token.location());
+                // An argument's expansion range still sits inside a macro
+                // buffer, so keep expanding until the invocation lands in the
+                // file the user wrote.  Stopping early records a nonsense
+                // column and, because the dedup key is the range start, a
+                // second entry for an invocation the body tokens already
+                // recorded correctly.
+                while (range.start().valid() && sm.isMacroLoc(range.start()))
+                    range = sm.getExpansionRange(range.start());
                 if (!range.start().valid())
                     return;
                 const uint64_t key = (static_cast<uint64_t>(range.start().buffer().getId()) << 32) |
                                      static_cast<uint64_t>(range.start().offset());
-                if (!seen_expansions.insert(key).second)
-                    return; // already recorded this expansion site
-                const auto macro_name = sm.getMacroName(token.location());
-                if (macro_name.empty())
+                if (seen_expansions.insert(key).second) {
+                    const auto macro_name = sm.getMacroName(token.location());
+                    if (!macro_name.empty()) {
+                        const int line_num = (int)sm.getLineNumber(range.start());
+                        int col = (int)sm.getColumnNumber(range.start()) - 1;
+                        if (col < 0)
+                            col = 0;
+                        if (auto text = source_text_for_syntax_range(sm, range);
+                            text && text->starts_with('`'))
+                            ++col;
+                        add_macro(std::string(macro_name),
+                                  file_ids.for_location(index, sm, range.start()), line_num, col);
+                    }
+                }
+                // A macro body token is preprocessor output and names nothing at
+                // this position.  An argument is text the user typed at the call
+                // site, so it is an occurrence in its own right and has to go on
+                // to be classified like any other identifier -- otherwise rename
+                // silently skips it and leaves the call broken.
+                if (it->second == BufferKind::MacroBody)
                     return;
-                const int line_num = (int)sm.getLineNumber(range.start());
-                int col = (int)sm.getColumnNumber(range.start()) - 1;
-                if (col < 0)
-                    col = 0;
-                if (auto text = source_text_for_syntax_range(sm, range);
-                    text && text->starts_with('`'))
-                    ++col;
-                add_macro(std::string(macro_name),
-                          file_ids.for_location(index, sm, range.start()),
-                          line_num, col);
-                return;
             }
             // Reference fallback
             if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
@@ -1465,10 +1643,25 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return;
             if (classified_tokens.contains(token_key(token)))
                 return;
-            if (try_add_class_method_reference(token, name))
-                return;
-            if (try_add_typedef_field_reference(token, name))
-                return;
+            // The four member-access fallbacks below all key off the same
+            // "what's the identifier before the preceding dot, and what type
+            // is it" facts.  Compute those once instead of having each
+            // fallback redo its own source-text scan and hashmap lookups --
+            // on a macro/UVM-heavy file with dense member-access chains
+            // (`cfg.something`, `env.agt.drv`, ...) that quadruples work that
+            // scales with member-access density for no behavioral benefit.
+            const auto object_name = object_before_member_dot(token);
+            if (!object_name.empty()) {
+                const auto object_type = current_module_object_type(object_name);
+                if (try_add_class_method_reference(token, name, object_name, object_type))
+                    return;
+                if (try_add_class_field_reference(token, name, object_name, object_type))
+                    return;
+                if (try_add_typedef_field_reference(token, name, object_name))
+                    return;
+                if (try_add_foreign_member_reference(token, name, object_name, object_type))
+                    return;
+            }
             if (!current_class.empty()) {
                 scope_key = current_class;
                 scope_key += '\n';
@@ -1521,7 +1714,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     };
 
     CombinedVisitor visitor(index, sm, add_reference, module_values, module_value_types,
-                            package_values, class_fields, typedef_fields, unique_typedef_scopes,
+                            package_values, class_fields, unique_class_scopes, typedef_fields,
+                            unique_typedef_scopes,
                             unique_enum_member_ids, unique_type_ids, package_type_ids,
                             declared_subroutines, module_owner_kind,
                             resolve_subroutine_owner_from_qualified_name,

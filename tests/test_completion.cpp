@@ -82,6 +82,12 @@ static void write_text_file(const std::filesystem::path& path, std::string_view 
     REQUIRE(out.good());
 }
 
+static std::filesystem::path write_temp_sv_file(const std::string& name, const std::string& text) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    write_text_file(path, text);
+    return path;
+}
+
 static SyntheticUvmFixture make_synthetic_uvm_fixture(std::string_view name) {
     SyntheticUvmFixture setup;
     setup.root = std::filesystem::temp_directory_path() /
@@ -1491,6 +1497,56 @@ TEST_CASE("completion: MemberAccess includes inherited class members", "[complet
     CHECK(has_label(result, "child_depth"));
 }
 
+TEST_CASE("completion: MemberAccess inherits through a qualified parameterized base",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_inherited_qualified.sv";
+    // The `extends` clause is indexed verbatim, so a package qualifier and
+    // parameter overrides must not hide the base class members.
+    const std::string text =
+        "package cfg_pkg;\n"
+        "    class base_cfg #(int W = 8);\n"
+        "        int base_depth;\n"
+        "    endclass\n"
+        "endpackage\n"
+        "class child_cfg extends cfg_pkg::base_cfg #(16);\n"
+        "    int child_depth;\n"
+        "endclass\n"
+        "module top;\n"
+        "    child_cfg cfg;\n"
+        "    initial cfg.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 10, 16);
+    CHECK(has_label(result, "base_depth"));
+    CHECK(has_label(result, "child_depth"));
+}
+
+TEST_CASE("completion: MemberAccess resolves a package-qualified declared type",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_qualified_decl.sv";
+    // The qualifier sits on the variable declaration rather than on an
+    // `extends` clause, so the receiver's type must survive qualification.
+    const std::string text =
+        "package cfg_pkg;\n"
+        "    class base_cfg #(int W = 8);\n"
+        "        int base_depth;\n"
+        "    endclass\n"
+        "endpackage\n"
+        "module top;\n"
+        "    cfg_pkg::base_cfg #(16) cfg;\n"
+        "    initial cfg.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 7, 16);
+    CHECK(has_label(result, "base_depth"));
+}
+
 TEST_CASE("completion: MemberAccess includes interface signals and modports", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
@@ -1511,6 +1567,36 @@ TEST_CASE("completion: MemberAccess includes interface signals and modports", "[
     CHECK(has_label(result, "valid"));
     CHECK(has_label(result, "ready"));
     CHECK(has_label(result, "master"));
+}
+
+TEST_CASE("completion: MemberAccess resolves a virtual-interface class field",
+          "[completion]") {
+    // A `virtual` interface handle field's DataTypeSyntax text includes the
+    // `virtual` keyword ahead of the interface name (`virtual bus_if`), and
+    // the field itself is filed under ClassEntry.fields rather than
+    // index.values.  Both had to be handled for member access on the field
+    // from within one of the class's own methods to resolve at all -- the
+    // same shape as a UVM component reading a virtual interface out of
+    // uvm_config_db and then accessing it from a later method.
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_virtual_iface_field.sv";
+    const std::string text =
+        "interface bus_if;\n"
+        "    logic valid;\n"
+        "    logic ready;\n"
+        "endinterface\n"
+        "class driver;\n"
+        "    virtual bus_if vif;\n"
+        "    function void run();\n"
+        "        vif.\n"
+        "    endfunction\n"
+        "endclass\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 7, 12);
+    CHECK(has_label(result, "valid"));
+    CHECK(has_label(result, "ready"));
 }
 
 TEST_CASE("completion: EventControl suggests local signals", "[completion]") {
@@ -1633,4 +1719,252 @@ TEST_CASE("completion: FileProvider returns svh from extra files", "[completion]
     CHECK(!has_label(result, "completion_file.sv"));
 
     std::filesystem::remove(header_path);
+}
+
+// ── Member access across the open-buffer / project-shard boundary ─────────────
+
+// One package holding the shapes a UVM-style testbench inherits from: a base
+// class with an extern method, a class used as a handle type, and a base class
+// that owns a handle its subclasses use.
+static const std::string kPackageClassLibraryFixture = R"(package tb_pkg;
+    class base_obj;
+        int base_field;
+        extern virtual function void base_method();
+    endclass
+
+    class phase_obj;
+        extern virtual function void raise_objection();
+        function void inline_method();
+        endfunction
+    endclass
+
+    class driver_base extends base_obj;
+        phase_obj port_handle;
+    endclass
+endpackage
+)";
+
+TEST_CASE("completion: inherited members come from a base class in an imported package",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_lib.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_inherited.sv";
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv extends base_obj;\n"
+                             "    int own_field;\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    my_drv drv;\n"
+                             "    initial drv.own_field = 0;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "drv.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "own_field"));
+    // The base class is declared in the package file, so it is only reachable
+    // through the project shard.
+    CHECK(has_label(result, "base_field"));
+    // ...and it is declared extern, the style UVM uses almost everywhere.
+    CHECK(has_label(result, "base_method"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: a subroutine argument typed by a package class offers its members",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_arg.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_arg.sv";
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv;\n"
+                             "    task run(phase_obj arg_phase);\n"
+                             "        arg_phase.inline_method();\n"
+                             "    endtask\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "arg_phase.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "inline_method"));
+    CHECK(has_label(result, "raise_objection"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: an inherited field resolves its own declared type",
+          "[completion][class]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto pkg_path =
+        write_temp_sv_file("lazyverilog_completion_pkg_class_field.sv", kPackageClassLibraryFixture);
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_pkg_inherited_field.sv";
+    // `port_handle` is declared by driver_base, which the current file does not
+    // contain, so its type is only knowable through the project shard.
+    const std::string text = "import tb_pkg::*;\n"
+                             "class my_drv extends driver_base;\n"
+                             "    task run();\n"
+                             "        port_handle.inline_method();\n"
+                             "    endtask\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "port_handle.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "inline_method"));
+    CHECK(has_label(result, "raise_objection"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: member access inside a macro argument keeps its context",
+          "[completion][macro]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const std::string uri = "file:///tmp/completion_macro_arg_member.sv";
+    const std::string text = "`define LOG(MSG) $display(MSG)\n"
+                             "class item;\n"
+                             "    int addr;\n"
+                             "    int data;\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    item it;\n"
+                             "    initial `LOG($sformatf(\"%0d\", it.addr));\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "it.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "addr"));
+    CHECK(has_label(result, "data"));
+    // A macro argument must not degrade into the generic identifier list.
+    CHECK_FALSE(has_label(result, "top"));
+}
+
+TEST_CASE("completion: a macro-generated typedef works as a scope", "[completion][macro]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const std::string uri = "file:///tmp/completion_macro_typedef_scope.sv";
+    // The shape `uvm_object_utils` expands to: a typedef, generated by a macro,
+    // naming a parameterized class whose static members are what users call.
+    const std::string text = "`define UTILS(T) typedef registry #(T) type_id;\n"
+                             "class registry #(type T = int);\n"
+                             "    static function T create();\n"
+                             "    endfunction\n"
+                             "    static function void set_override();\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "class my_item;\n"
+                             "    `UTILS(my_item)\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    initial my_item::type_id::create();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "my_item::type_id::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "create"));
+    CHECK(has_label(result, "set_override"));
+}
+
+TEST_CASE("completion: a class-scoped typedef in a closed file works as a scope",
+          "[completion]") {
+    const auto pkg_path = write_temp_sv_file("lazyverilog_completion_closed_type_id.sv",
+                                             "package type_pkg;\n"
+                                             "    class registry #(type T = int);\n"
+                                             "        static function T create();\n"
+                                             "        endfunction\n"
+                                             "        static function void set_override();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class my_item;\n"
+                                             "        typedef registry #(my_item) type_id;\n"
+                                             "    endclass\n"
+                                             "endpackage\n");
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package file stays closed, so both the typedef and the class it names
+    // are reachable only through SyntaxIndex shards.
+    const std::string uri = "file:///tmp/completion_closed_type_id_use.sv";
+    const std::string text = "import type_pkg::*;\n"
+                             "module top;\n"
+                             "    initial my_item::type_id::create();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "my_item::type_id::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "create"));
+    CHECK(has_label(result, "set_override"));
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("completion: a class-scoped typedef resolves under its own qualifier",
+          "[completion]") {
+    // Every class declares a typedef named `type_id`; only the qualifier says
+    // which one `type_id::` means.
+    const auto pkg_path = write_temp_sv_file("lazyverilog_completion_type_id_qualifier.sv",
+                                             "package type_pkg;\n"
+                                             "    class reg_a #(type T = int);\n"
+                                             "        static function void from_a();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class reg_b #(type T = int);\n"
+                                             "        static function void from_b();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class item_a;\n"
+                                             "        typedef reg_a #(item_a) type_id;\n"
+                                             "    endclass\n"
+                                             "    class item_b;\n"
+                                             "        typedef reg_b #(item_b) type_id;\n"
+                                             "    endclass\n"
+                                             "endpackage\n");
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_type_id_qualifier_use.sv";
+    const std::string text = "import type_pkg::*;\n"
+                             "module top;\n"
+                             "    initial item_b::type_id::from_b();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "item_b::type_id::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "from_b"));
+    CHECK_FALSE(has_label(result, "from_a"));
+
+    std::filesystem::remove(pkg_path);
 }
