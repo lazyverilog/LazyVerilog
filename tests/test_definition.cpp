@@ -1085,3 +1085,34 @@ TEST_CASE("definition: class-scoped typedef resolves from a closed package file"
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("definition: field on a receiver with a parameterized declared type",
+          "[definition]") {
+    // `Container #(byte)` used to resolve the receiver's class name to `byte`
+    // (the trailing parameter) instead of `Container`, since the type-name
+    // heuristic grabbed the last identifier-like run in the type text.
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_param_field.sv",
+                                        "package pkg;\n"
+                                        "    class Container #(type REQ = int, RSP = REQ);\n"
+                                        "        int seq_item_export;\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_param_field_use.sv";
+    analyzer.open(uri, "import pkg::*;\n"
+                       "module top;\n"
+                       "    Container #(byte) sequencer;\n"
+                       "    initial sequencer.seq_item_export = 1;\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 3, 24);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}

@@ -395,6 +395,13 @@ std::string canonical_type_name_from_text(std::string_view type) {
     //   logic [7:0] not_a_struct;
     //
     // Built-in scalar types will simply fail to match any typedef field map.
+    //
+    // A parameter list, e.g. `Container #(byte, byte)`, must not shift the
+    // trailing-run scan onto the last parameter -- the class name is what
+    // precedes `#(`, not what happens to sit at the end of the text.
+    if (const auto hash = type.find('#'); hash != std::string_view::npos)
+        type = type.substr(0, hash);
+
     size_t end = type.size();
     while (end > 0 && !syntax_fragment_edge_is_wordlike(type[end - 1]))
         --end;
