@@ -58,6 +58,7 @@
 #include "features/rename.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
+#include "features/document_symbols.hpp"
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
@@ -755,6 +756,8 @@ void LazyVerilogServer::register_handlers() {
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.workspaceSymbolProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
+            caps.documentSymbolProvider =
+                std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
 
             // Completion triggers are intentionally conservative.
             //
@@ -1299,6 +1302,18 @@ void LazyVerilogServer::register_handlers() {
             rsp.result = provide_workspace_symbols(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] workspaceSymbol error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/documentSymbol ───────────────────────────────────────────
+    ep.registerHandler([&](const td_symbol::request& req) {
+        td_symbol::response rsp;
+        rsp.id = req.id;
+        try {
+            rsp.result = provide_document_symbols(analyzer_, req.params);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] documentSymbol error: " << e.what() << "\n";
         }
         return rsp;
     });
