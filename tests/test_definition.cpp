@@ -1047,6 +1047,10 @@ TEST_CASE("definition: macro-generated typedef resolves to its declaration",
     auto loc = analyzer.definition_of(uri, 7, 22);
     REQUIRE(loc.has_value());
     CHECK(loc->uri == uri);
+    // `type_id` here is a literal in the macro *body*, not a substituted
+    // argument -- must not be confused with the isMacroArgLoc-only case.
+    CHECK(loc->line == 0);
+    CHECK(loc->col == 39);
 }
 
 TEST_CASE("definition: class-scoped typedef resolves from a closed package file",
