@@ -1454,14 +1454,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // shard cannot tell a field from a method, and claiming either one
         // would make the occurrence unmatchable for the other.
         bool try_add_foreign_member_reference(const slang::parsing::Token& token,
-                                              std::string_view member_name) {
-            if (member_name.empty())
-                return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
-                return false;
-            auto object_type = current_module_object_type(object_name);
-            if (!object_type || object_type->empty())
+                                              std::string_view member_name,
+                                              std::string_view object_name,
+                                              const std::optional<std::string>& object_type) {
+            if (member_name.empty() || object_name.empty() || !object_type ||
+                object_type->empty())
                 return false;
             // A type this shard does know was already given its precise
             // SymbolID by one of the attempts above; re-recording it here
@@ -1497,7 +1494,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         bool try_add_class_method_reference(const slang::parsing::Token& token,
-                                            std::string_view method_name) {
+                                            std::string_view method_name,
+                                            std::string_view object_name,
+                                            const std::optional<std::string>& object_type) {
             // Some call forms are not represented as MemberAccessExpressionSyntax
             // by slang's parsed syntax tree, so classify simple object-method
             // tokens from the token fallback as well.  This mirrors the typedef
@@ -1505,13 +1504,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             //
             //     Packet p;
             //     p.req_data();  // class_method::Packet::req_data
-            if (method_name.empty())
-                return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
-                return false;
-            auto object_type = current_module_object_type(object_name);
-            if (!object_type)
+            if (method_name.empty() || object_name.empty() || !object_type)
                 return false;
             const auto method_key =
                 subroutine_scope_key(SubroutineOwnerKind::Class, *object_type, method_name);
@@ -1523,17 +1516,13 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         bool try_add_class_field_reference(const slang::parsing::Token& token,
-                                           std::string_view field_name) {
+                                           std::string_view field_name,
+                                           std::string_view object_name,
+                                           const std::optional<std::string>& object_type) {
             // `p.data` is the same declaration as the bare `data` written
             // inside the class body.  Without this the occurrence decays to
             // `name:<field>` and rename skips every use outside that class.
-            if (field_name.empty())
-                return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
-                return false;
-            auto object_type = current_module_object_type(object_name);
-            if (!object_type)
+            if (field_name.empty() || object_name.empty() || !object_type)
                 return false;
             auto scope = class_field_scope(*object_type, field_name);
             if (!scope)
@@ -1543,12 +1532,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         bool try_add_typedef_field_reference(const slang::parsing::Token& token,
-                                             std::string_view field_name) {
-            // Check the cheap module-context guard before the expensive source-text scan.
-            if (current_module.empty() || field_name.empty() || module_value_types.empty())
-                return false;
-            const auto object_name = object_before_member_dot(token);
-            if (object_name.empty())
+                                             std::string_view field_name,
+                                             std::string_view object_name) {
+            if (current_module.empty() || field_name.empty() || object_name.empty() ||
+                module_value_types.empty())
                 return false;
             scope_key = current_module;
             scope_key += '\n';
@@ -1656,14 +1643,25 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return;
             if (classified_tokens.contains(token_key(token)))
                 return;
-            if (try_add_class_method_reference(token, name))
-                return;
-            if (try_add_class_field_reference(token, name))
-                return;
-            if (try_add_typedef_field_reference(token, name))
-                return;
-            if (try_add_foreign_member_reference(token, name))
-                return;
+            // The four member-access fallbacks below all key off the same
+            // "what's the identifier before the preceding dot, and what type
+            // is it" facts.  Compute those once instead of having each
+            // fallback redo its own source-text scan and hashmap lookups --
+            // on a macro/UVM-heavy file with dense member-access chains
+            // (`cfg.something`, `env.agt.drv`, ...) that quadruples work that
+            // scales with member-access density for no behavioral benefit.
+            const auto object_name = object_before_member_dot(token);
+            if (!object_name.empty()) {
+                const auto object_type = current_module_object_type(object_name);
+                if (try_add_class_method_reference(token, name, object_name, object_type))
+                    return;
+                if (try_add_class_field_reference(token, name, object_name, object_type))
+                    return;
+                if (try_add_typedef_field_reference(token, name, object_name))
+                    return;
+                if (try_add_foreign_member_reference(token, name, object_name, object_type))
+                    return;
+            }
             if (!current_class.empty()) {
                 scope_key = current_class;
                 scope_key += '\n';
