@@ -896,6 +896,28 @@ static std::optional<std::string> type_of_value(const SyntaxIndex& index,
         if (!fallback_value) fallback_value = v.type;
     }
     if (fallback_value) return fallback_value;
+
+    // A field declared on the enclosing class (or one of its base classes)
+    // isn't in index.values -- process_class() files it under
+    // ClassEntry.fields instead. Walk the inheritance chain so a field used
+    // from an inherited method (a common UVM pattern, e.g. `vif` accessed
+    // from a subclass's build_phase) resolves too.
+    if (!scope.empty()) {
+        std::unordered_set<std::string> visited_classes;
+        std::string cls_name = scope;
+        while (!cls_name.empty() && visited_classes.insert(cls_name).second) {
+            const auto it = index.class_by_name.find(cls_name);
+            if (it == index.class_by_name.end())
+                break;
+            const auto& cls = index.classes[it->second];
+            for (const auto& f : cls.fields) {
+                if (f.name == name && !f.type.empty())
+                    return f.type;
+            }
+            cls_name = base_class_lookup_name(cls.base_class);
+        }
+    }
+
     std::optional<std::string> fallback_inst;
     for (const auto& inst : index.instances) {
         if (inst.instance_name != name) continue;
@@ -920,6 +942,18 @@ static std::string completion_base_type_name(std::string type) {
     if (const size_t scope = type.rfind("::"); scope != std::string::npos)
         type.erase(0, scope + 2);
     type = trim_completion_copy(std::move(type));
+    // A virtual interface handle's DataTypeSyntax node text includes the
+    // `virtual` (and optional `interface`) keyword ahead of the interface
+    // name, e.g. `virtual lv_full_if` or `virtual interface lv_full_if`.
+    // Strip those keywords so the identifier scan below lands on the actual
+    // interface name instead of returning "virtual" as the type.
+    for (const std::string_view kw : {"virtual", "interface"}) {
+        if (type.size() > kw.size() && type.compare(0, kw.size(), kw) == 0 &&
+            std::isspace(static_cast<unsigned char>(type[kw.size()]))) {
+            type.erase(0, kw.size());
+            type = trim_completion_copy(std::move(type));
+        }
+    }
     size_t end = 0;
     while (end < type.size() && is_ident_char(type[end]))
         ++end;

@@ -1569,6 +1569,36 @@ TEST_CASE("completion: MemberAccess includes interface signals and modports", "[
     CHECK(has_label(result, "master"));
 }
 
+TEST_CASE("completion: MemberAccess resolves a virtual-interface class field",
+          "[completion]") {
+    // A `virtual` interface handle field's DataTypeSyntax text includes the
+    // `virtual` keyword ahead of the interface name (`virtual bus_if`), and
+    // the field itself is filed under ClassEntry.fields rather than
+    // index.values.  Both had to be handled for member access on the field
+    // from within one of the class's own methods to resolve at all -- the
+    // same shape as a UVM component reading a virtual interface out of
+    // uvm_config_db and then accessing it from a later method.
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_virtual_iface_field.sv";
+    const std::string text =
+        "interface bus_if;\n"
+        "    logic valid;\n"
+        "    logic ready;\n"
+        "endinterface\n"
+        "class driver;\n"
+        "    virtual bus_if vif;\n"
+        "    function void run();\n"
+        "        vif.\n"
+        "    endfunction\n"
+        "endclass\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 7, 12);
+    CHECK(has_label(result, "valid"));
+    CHECK(has_label(result, "ready"));
+}
+
 TEST_CASE("completion: EventControl suggests local signals", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
