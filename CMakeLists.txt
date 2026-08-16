@@ -131,6 +131,7 @@ set(LAZYVERILOG_SOURCES
     src/features/signature_help.cpp
     src/features/inlay_hints.cpp
     src/features/workspace_symbols.cpp
+    src/features/document_symbols.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoinst.cpp
@@ -179,6 +180,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_lsp_features.cpp
     tests/test_completion.cpp
     tests/test_folding_ranges.cpp
+    tests/test_document_symbols.cpp
     tests/test_opentitan_benchmark.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
     src/features/completion.cpp
@@ -204,6 +206,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/hover.cpp
     src/features/signature_help.cpp
     src/features/workspace_symbols.cpp
+    src/features/document_symbols.cpp
     src/features/folding_range.cpp
 )
 
