@@ -693,7 +693,12 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
-            if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+            // `typedef registry #(T) type_id;` inside a class body is a member
+            // of that class, reached as `my_item::type_id`.  Indexing only the
+            // data declarators hides every such type from closed-file lookup.
+            if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
+                process_typedef(*nested, index, resolver, sm, entry.name);
+            } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const std::string type_text = render_syntax_node_text(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)
@@ -790,7 +795,10 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         entry.resolved = render_syntax_node_text(sm, *td.type);
     }
 
-    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+    // Any owner, not just a package: a class-scoped `type_id` is spelled once
+    // per class, so keying only by bare name would let the first one seen win
+    // and drop every other class's copy at merge time.
+    if (!entry.parent_scope.empty())
         index.package_type_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -1078,10 +1086,11 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
         classes.push_back(std::move(copy));
     }
 
-    // typedefs — same scoped-key rule as classes above.
+    // typedefs — scoped by any owner, not just a package, so that the
+    // same-named typedef each class declares survives instead of the first one
+    // seen claiming the bare name for the whole project.
     for (const auto& t : other.typedefs) {
-        const bool scoped =
-            !t.parent_scope.empty() && other.package_names.count(t.parent_scope) > 0;
+        const bool scoped = !t.parent_scope.empty();
         const auto scoped_key = scoped ? package_scoped_key(t.parent_scope, t.name) : std::string{};
         const bool scoped_is_new = scoped && !package_type_by_scoped_name.count(scoped_key);
         if (typedef_by_name.count(t.name) && !scoped_is_new)

@@ -1766,6 +1766,17 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
                             method.col + (int)method.name.size()};
         }
+
+        // A class-scoped typedef (`my_item::type_id`) is a member too, but it
+        // lives in the typedef table rather than on the ClassEntry.
+        for (const auto& td : index.typedefs) {
+            if (td.name != member_name || td.line <= 0 || td.parent_scope != cls.name)
+                continue;
+            const std::string actual_uri = index.source_uri(td.file_id);
+            const int line = to_lsp_line(td.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
+                            td.col + (int)td.name.size()};
+        }
     }
     return std::nullopt;
 }

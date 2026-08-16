@@ -1048,3 +1048,36 @@ TEST_CASE("definition: macro-generated typedef resolves to its declaration",
     REQUIRE(loc.has_value());
     CHECK(loc->uri == uri);
 }
+
+TEST_CASE("definition: class-scoped typedef resolves from a closed package file",
+          "[definition]") {
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_closed_type_id.sv",
+                                        "package type_pkg;\n"
+                                        "    class registry #(type T = int);\n"
+                                        "        static function T create();\n"
+                                        "        endfunction\n"
+                                        "    endclass\n"
+                                        "    class my_item;\n"
+                                        "        typedef registry #(my_item) type_id;\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package file stays closed, so the class body is reachable only
+    // through its SyntaxIndex shard.
+    const std::string uri = "file:///tmp/lazyverilog_definition_closed_type_id_use.sv";
+    analyzer.open(uri, "import type_pkg::*;\n"
+                       "module top;\n"
+                       "    initial my_item::type_id::create();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 2, 22);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 6);
+
+    std::filesystem::remove(pkg_path);
+}

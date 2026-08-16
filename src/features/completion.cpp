@@ -2014,6 +2014,17 @@ static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxInde
     return std::nullopt;
 }
 
+// Type that the typedef `name` aliases, read from one shard.  A class-scoped
+// typedef such as `my_item::type_id` lives in a file the editor may never open,
+// so the current-file AST pass cannot see it and only the shard knows what it
+// names.
+static std::string typedef_target_in_shard(const SyntaxIndex& index, const std::string& name) {
+    const auto it = index.typedef_by_name.find(name);
+    if (it == index.typedef_by_name.end() || it->second >= index.typedefs.size())
+        return {};
+    return completion_base_type_name(index.typedefs[it->second].resolved);
+}
+
 // MemberProvider: fields/methods for class, ports for module/interface.
 class MemberProvider : public CompletionProvider {
   public:
@@ -2932,6 +2943,26 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                 aliased_scope_name = target;
                 items = current_file_package_scope_items_from_ast(state, target);
             }
+        }
+        if (aliased_scope_name.empty()) {
+            // The typedef itself may be declared in a file that is never
+            // opened, leaving the shard as the only place that knows the type
+            // it names.
+            for (const auto& shard : *opened_shards) {
+                if (!shard.index)
+                    continue;
+                aliased_scope_name = typedef_target_in_shard(*shard.index, ctx.scope_name);
+                if (!aliased_scope_name.empty())
+                    break;
+            }
+            for (const auto* shard : project_shards) {
+                if (!aliased_scope_name.empty())
+                    break;
+                if (shard)
+                    aliased_scope_name = typedef_target_in_shard(*shard, ctx.scope_name);
+            }
+            if (aliased_scope_name == ctx.scope_name)
+                aliased_scope_name.clear();
         }
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));

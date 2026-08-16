@@ -1857,3 +1857,41 @@ TEST_CASE("completion: a macro-generated typedef works as a scope", "[completion
     CHECK(has_label(result, "create"));
     CHECK(has_label(result, "set_override"));
 }
+
+TEST_CASE("completion: a class-scoped typedef in a closed file works as a scope",
+          "[completion]") {
+    const auto pkg_path = write_temp_sv_file("lazyverilog_completion_closed_type_id.sv",
+                                             "package type_pkg;\n"
+                                             "    class registry #(type T = int);\n"
+                                             "        static function T create();\n"
+                                             "        endfunction\n"
+                                             "        static function void set_override();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class my_item;\n"
+                                             "        typedef registry #(my_item) type_id;\n"
+                                             "    endclass\n"
+                                             "endpackage\n");
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The package file stays closed, so both the typedef and the class it names
+    // are reachable only through SyntaxIndex shards.
+    const std::string uri = "file:///tmp/completion_closed_type_id_use.sv";
+    const std::string text = "import type_pkg::*;\n"
+                             "module top;\n"
+                             "    initial my_item::type_id::create();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "my_item::type_id::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "create"));
+    CHECK(has_label(result, "set_override"));
+
+    std::filesystem::remove(pkg_path);
+}
