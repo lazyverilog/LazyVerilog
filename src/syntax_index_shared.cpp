@@ -229,13 +229,28 @@ std::string token_value_text(const slang::parsing::Token& token) {
     return token ? std::string(token.valueText()) : std::string{};
 }
 
+slang::SourceLocation token_true_origin_location(const slang::SourceManager& sm,
+                                                 const slang::parsing::Token& token) {
+    if (!token || !token.location().valid())
+        return {};
+    return sm.isMacroLoc(token.location()) ? sm.getFullyOriginalLoc(token.location())
+                                           : token.location();
+}
+
 std::pair<int, int> token_pos_line1_col0(const slang::SourceManager& sm,
                                          const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
 
-    const auto line = sm.getLineNumber(token.location());
-    const auto col = sm.getColumnNumber(token.location());
+    // A token written as a literal inside a macro body (e.g. the method name
+    // in a UVM-style `` `define FOO(...) task get_next_item(); ... endtask ``)
+    // has its own location point into the expansion buffer, which has no
+    // lines to walk -- getLineNumber() answers 0.  Report where it was
+    // actually written instead, matching location_from_token()'s live-AST
+    // handling of the same case.
+    const auto location = token_true_origin_location(sm, token);
+    const auto line = sm.getLineNumber(location);
+    const auto col = sm.getColumnNumber(location);
     return {line > 0 ? static_cast<int>(line) : 0,
             col > 0 ? static_cast<int>(col) - 1 : 0};
 }

@@ -140,6 +140,14 @@ std::string token_value_text(const slang::parsing::Token& token);
 
 bool syntax_fragment_edge_is_wordlike(char c);
 
+/// Return where @p token was actually written, redirecting a macro-body
+/// literal (e.g. the method name in a UVM-style `` `define FOO(...) task
+/// get_next_item(...); ... endtask ``) to its true origin instead of the
+/// macro-expansion buffer, which has no real line/column to report.  A plain
+/// token, or a substituted macro argument, is returned unchanged.
+slang::SourceLocation token_true_origin_location(const slang::SourceManager& sm,
+                                                 const slang::parsing::Token& token);
+
 /// Return a token position using slang's 1-based line numbers and LSP-style
 /// 0-based columns.  This is the historical coordinate shape stored in
 /// SyntaxIndex entries: callers convert the line to LSP coordinates at the

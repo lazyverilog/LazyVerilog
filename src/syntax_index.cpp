@@ -714,12 +714,29 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             }
         } else if (const auto* meth = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *meth->declaration->prototype;
+            // A macro can generate a whole method (e.g. UVM's
+            // `UVM_SEQ_ITEM_PULL_IMP, which expands to `task get_next_item(...)`).
+            // render_syntax_node_text() deliberately renders such a name as its
+            // macro-invocation spelling (e.g. `` `FOO(bar)``) rather than the
+            // expanded identifier, which is right for hover/type text but wrong
+            // for a member's lookup key.  Use the resolved identifier text --
+            // and its own token, not the keyword's -- whenever the name is a
+            // simple identifier, matching the FunctionDeclarationSyntax handling
+            // above.
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
             MethodEntry m;
-            m.name = render_syntax_node_text(sm, *proto.name);
+            m.name = id_name ? std::string(id_name->identifier.valueText())
+                             : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
-            m.file_id = resolver.for_token(index, sm, proto.keyword);
-            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
+            // file_id must name the same file the line/col below resolve
+            // into, or a method whose whole declaration is a macro-body
+            // literal ends up attributed to the invocation file while its
+            // line/col point into the macro's own definition file.
+            m.file_id =
+                resolver.for_location(index, sm, token_true_origin_location(sm, name_tok));
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             m.line = ml;
             m.col = mc;
             entry.methods.push_back(std::move(m));
@@ -729,12 +746,16 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // lives further down the file as `class::method`.  Indexing only
             // inline bodies hides most of a class written in the extern style.
             const auto& proto = *proto_item->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
             MethodEntry m;
-            m.name = render_syntax_node_text(sm, *proto.name);
+            m.name = id_name ? std::string(id_name->identifier.valueText())
+                             : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
-            m.file_id = resolver.for_token(index, sm, proto.keyword);
-            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
+            m.file_id =
+                resolver.for_location(index, sm, token_true_origin_location(sm, name_tok));
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             m.line = ml;
             m.col = mc;
             entry.methods.push_back(std::move(m));
