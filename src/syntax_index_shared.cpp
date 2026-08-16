@@ -602,6 +602,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_map<std::string, std::string> module_value_types;
     std::unordered_set<std::string> package_values;
     std::unordered_set<std::string> class_fields;
+    std::unordered_map<std::string, std::string> unique_class_scopes;
+    std::unordered_set<std::string> ambiguous_class_names;
     std::unordered_set<std::string> typedef_fields;
     std::unordered_map<std::string, std::string> unique_typedef_scopes;
     std::unordered_set<std::string> ambiguous_typedef_names;
@@ -657,6 +659,15 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                    !unique_type_ids.try_emplace(cls.name, class_id).second) {
             unique_type_ids.erase(cls.name);
             ambiguous_type_names.insert(cls.name);
+        }
+        // A member access spells the receiver's declared type bare (`Packet p;`),
+        // but class_fields is keyed by the scoped name a declaration carries
+        // (`pkt_pkg::Packet`).  Keep the bare→scoped mapping so `p.data` can be
+        // matched to the same SymbolID the declaration emits.
+        if (!ambiguous_class_names.contains(cls.name) &&
+            !unique_class_scopes.try_emplace(cls.name, class_scope).second) {
+            unique_class_scopes.erase(cls.name);
+            ambiguous_class_names.insert(cls.name);
         }
         for (const auto& field : cls.fields)
             class_fields.insert(class_scope + "\n" + field.name);
@@ -856,6 +867,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         std::unordered_map<std::string, std::string> walked_value_types;
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
+        const std::unordered_map<std::string, std::string>& unique_class_scopes;
         const std::unordered_set<std::string>& typedef_fields;
         const std::unordered_map<std::string, std::string>& unique_typedef_scopes;
         const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
@@ -915,6 +927,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         const std::unordered_map<std::string, std::string>& module_value_types,
                         const std::unordered_set<std::string>& package_values,
                         const std::unordered_set<std::string>& class_fields,
+                        const std::unordered_map<std::string, std::string>& unique_class_scopes,
                         const std::unordered_set<std::string>& typedef_fields,
                         const std::unordered_map<std::string, std::string>& unique_typedef_scopes,
                         const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
@@ -927,7 +940,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         SourceFileIdResolver& file_ids)
             : index(index), sm(sm), add_ref(add_reference), module_values(module_values),
               module_value_types(module_value_types), package_values(package_values),
-              class_fields(class_fields), typedef_fields(typedef_fields),
+              class_fields(class_fields), unique_class_scopes(unique_class_scopes),
+              typedef_fields(typedef_fields),
               unique_typedef_scopes(unique_typedef_scopes),
               unique_enum_member_ids(unique_enum_member_ids), unique_type_ids(unique_type_ids),
               package_type_ids(package_type_ids), declared_subroutines(declared_subroutines),
@@ -1340,6 +1354,30 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::nullopt;
         }
 
+        // Scope under which `field_name` is declared on the class named
+        // `object_type`, or nullopt when that class declares no such field.
+        // The receiver type is spelled bare at the use site, so a
+        // package-scoped class has to be mapped back to its scoped name first.
+        std::optional<std::string> class_field_scope(std::string_view object_type,
+                                                     std::string_view field_name) {
+            if (object_type.empty() || field_name.empty())
+                return std::nullopt;
+            scope_key = object_type;
+            scope_key += '\n';
+            scope_key.append(field_name);
+            if (class_fields.contains(scope_key))
+                return std::string(object_type);
+            const auto it = unique_class_scopes.find(std::string(object_type));
+            if (it == unique_class_scopes.end() || it->second == object_type)
+                return std::nullopt;
+            scope_key = it->second;
+            scope_key += '\n';
+            scope_key.append(field_name);
+            if (class_fields.contains(scope_key))
+                return it->second;
+            return std::nullopt;
+        }
+
         void handle(const MemberAccessExpressionSyntax& node) {
             const std::string field_name(node.name.valueText());
             const std::string object_name = simple_identifier_from_expr(node.left);
@@ -1382,6 +1420,32 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 }
             }
             visitDefault(node);
+        }
+
+        // `obj.member` whose receiver type is known here, but whose declaring
+        // class lives in a file this shard never parsed.  Record it under the
+        // bare type name instead of letting it decay to `name:<member>`, which
+        // is too broad to ever be matched back to one class.  find_references()
+        // re-scopes this to the declaring package before accepting it.
+        bool try_add_foreign_member_reference(const slang::parsing::Token& token,
+                                              std::string_view member_name) {
+            if (member_name.empty())
+                return false;
+            const auto object_name = object_before_member_dot(token);
+            if (object_name.empty())
+                return false;
+            auto object_type = current_module_object_type(object_name);
+            if (!object_type || object_type->empty())
+                return false;
+            // A type this shard does know was already given its precise
+            // SymbolID by one of the attempts above; re-recording it here
+            // would attach a second, weaker identity to the same token.
+            if (unique_class_scopes.contains(*object_type) ||
+                unique_typedef_scopes.contains(*object_type))
+                return false;
+            add_ref(token,
+                    symbol_canonical("class_field", *object_type, std::string(member_name)));
+            return true;
         }
 
         std::string object_before_member_dot(const slang::parsing::Token& token) const {
@@ -1429,6 +1493,26 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return false;
             add_ref(token, subroutine_symbol_id(SubroutineOwnerKind::Class, *object_type,
                                                 std::string(method_name)));
+            return true;
+        }
+
+        bool try_add_class_field_reference(const slang::parsing::Token& token,
+                                           std::string_view field_name) {
+            // `p.data` is the same declaration as the bare `data` written
+            // inside the class body.  Without this the occurrence decays to
+            // `name:<field>` and rename skips every use outside that class.
+            if (field_name.empty())
+                return false;
+            const auto object_name = object_before_member_dot(token);
+            if (object_name.empty())
+                return false;
+            auto object_type = current_module_object_type(object_name);
+            if (!object_type)
+                return false;
+            auto scope = class_field_scope(*object_type, field_name);
+            if (!scope)
+                return false;
+            add_ref(token, symbol_canonical("class_field", *scope, std::string(field_name)));
             return true;
         }
 
@@ -1548,7 +1632,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 return;
             if (try_add_class_method_reference(token, name))
                 return;
+            if (try_add_class_field_reference(token, name))
+                return;
             if (try_add_typedef_field_reference(token, name))
+                return;
+            if (try_add_foreign_member_reference(token, name))
                 return;
             if (!current_class.empty()) {
                 scope_key = current_class;
@@ -1602,7 +1690,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     };
 
     CombinedVisitor visitor(index, sm, add_reference, module_values, module_value_types,
-                            package_values, class_fields, typedef_fields, unique_typedef_scopes,
+                            package_values, class_fields, unique_class_scopes, typedef_fields,
+                            unique_typedef_scopes,
                             unique_enum_member_ids, unique_type_ids, package_type_ids,
                             declared_subroutines, module_owner_kind,
                             resolve_subroutine_owner_from_qualified_name,

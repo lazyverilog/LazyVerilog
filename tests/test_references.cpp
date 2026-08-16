@@ -1130,6 +1130,68 @@ endmodule
     std::filesystem::remove(dir);
 }
 
+TEST_CASE("references: package class field declaration matches closed member access",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     "lazyverilog_refs_package_class_field";
+    std::filesystem::create_directories(dir);
+
+    const auto pkg_path = dir / "pkt_pkg.sv";
+    const auto top_path = dir / "memory_top.sv";
+
+    const std::string pkg = R"(package pkt_pkg;
+    class Packet;
+        int data;
+        task req_data();
+        endtask
+    endclass
+endpackage
+)";
+    const std::string top = R"(module memory_top;
+    import pkt_pkg::*;
+    always_comb begin
+        Packet p;
+        p.data = 1;
+        p.req_data();
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << pkg;
+    }
+    {
+        std::ofstream out(top_path);
+        REQUIRE(out.good());
+        out << top;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), top_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    const std::string top_uri = uri_from_path(top_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "data");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    REQUIRE(refs.size() == 2);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == pkg_uri && ref.line == 2 && ref.col == 12;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == top_uri && ref.line == 4 && ref.col == 10;
+    }));
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(top_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: included header declarations bridge unresolved includer names",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() /

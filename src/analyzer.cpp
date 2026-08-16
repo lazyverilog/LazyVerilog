@@ -3544,6 +3544,44 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const SymbolID import_bridge_name_id =
         target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
 
+    // `handle.field` in another file is recorded under the receiver's bare type
+    // name, because that shard never parsed the class body and so cannot know
+    // the package the class belongs to.  Treat the bare spelling as the same
+    // symbol, but only inside shards importing the declaring package, so a
+    // same-named field on an unrelated class stays out of the result.
+    SymbolID class_field_alias_id;
+    std::string class_field_package;
+    std::string class_field_class;
+    {
+        constexpr std::string_view kClassFieldPrefix = "class_field::";
+        if (target_symbol_debug.starts_with(kClassFieldPrefix)) {
+            const std::string_view rest =
+                std::string_view(target_symbol_debug).substr(kClassFieldPrefix.size());
+            const auto field_sep = rest.rfind("::");
+            if (field_sep != std::string_view::npos) {
+                const auto owner = rest.substr(0, field_sep);
+                const auto field = rest.substr(field_sep + 2);
+                // No package qualifier means the use site already spells the
+                // owner exactly as the declaration does.
+                if (const auto scope_sep = owner.rfind("::");
+                    scope_sep != std::string_view::npos) {
+                    class_field_package = std::string(owner.substr(0, scope_sep));
+                    class_field_class = std::string(owner.substr(scope_sep + 2));
+                    class_field_alias_id = SymbolID::from_canonical(
+                        std::string(kClassFieldPrefix) + class_field_class + "::" +
+                        std::string(field));
+                }
+            }
+        }
+    }
+
+    auto imports_class_field_package = [&](const std::vector<ImportEntry>& imports) {
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == class_field_package &&
+                   (import.wildcard || import.symbol_name == class_field_class);
+        });
+    };
+
     auto imports_target_package = [&](const std::vector<ImportEntry>& imports) {
         return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
             return import.package_name == target_package &&
@@ -3581,6 +3619,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
             imports_target_package(imports))
+            return true;
+        if (class_field_alias_id && ref.symbol_id == class_field_alias_id &&
+            imports_class_field_package(imports))
             return true;
         return false;
     };
