@@ -1427,6 +1427,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // bare type name instead of letting it decay to `name:<member>`, which
         // is too broad to ever be matched back to one class.  find_references()
         // re-scopes this to the declaring package before accepting it.
+        //
+        // The kind stays deliberately neutral: without the class body this
+        // shard cannot tell a field from a method, and claiming either one
+        // would make the occurrence unmatchable for the other.
         bool try_add_foreign_member_reference(const slang::parsing::Token& token,
                                               std::string_view member_name) {
             if (member_name.empty())
@@ -1444,7 +1448,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 unique_typedef_scopes.contains(*object_type))
                 return false;
             add_ref(token,
-                    symbol_canonical("class_field", *object_type, std::string(member_name)));
+                    symbol_canonical("class_member", *object_type, std::string(member_name)));
             return true;
         }
 
