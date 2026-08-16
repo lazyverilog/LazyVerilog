@@ -1086,6 +1086,41 @@ TEST_CASE("definition: class-scoped typedef resolves from a closed package file"
     std::filesystem::remove(pkg_path);
 }
 
+TEST_CASE("definition: static method called directly on a parameterized closed-file "
+          "class resolves without a type_id hop",
+          "[definition]") {
+    // `ClassName #(params)::method()` parses its qualifier as ClassNameSyntax,
+    // not the plain IdentifierNameSyntax a `pkg::name`/`my_item::type_id`
+    // qualifier parses as.  The scoped-name handler only recognized the latter,
+    // so a parameterized qualifier fell through to an unscoped bare-name
+    // lookup that had no way to find a member scoped to a different class --
+    // e.g. `uvm_config_db #(int)::get(...)`.
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_param_class_static.sv",
+                                        "package registry_pkg;\n"
+                                        "    class registry #(type T = int);\n"
+                                        "        static function T get();\n"
+                                        "        endfunction\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_definition_param_class_static_use.sv";
+    analyzer.open(uri, "import registry_pkg::*;\n"
+                       "module top;\n"
+                       "    initial registry #(int)::get();\n"
+                       "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 2, 30);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 2);
+
+    std::filesystem::remove(pkg_path);
+}
+
 TEST_CASE("definition: field on a receiver with a parameterized declared type",
           "[definition]") {
     // `Container #(byte)` used to resolve the receiver's class name to `byte`

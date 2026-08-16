@@ -2507,13 +2507,23 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
 
-        const auto* left = node.left->as_if<slang::syntax::IdentifierNameSyntax>();
+        // The qualifier is usually a bare IdentifierNameSyntax (`pkg::name`), but
+        // a parameterized class qualifier (`uvm_config_db #(T)::get`) parses as
+        // ClassNameSyntax instead — same identifier, plus a parameter list this
+        // lookup doesn't need. Accept either so a parameterized-class static
+        // method call isn't left to fall through to an unscoped bare lookup.
         const auto* right = node.right->as_if<slang::syntax::IdentifierNameSyntax>();
-        if (left && right &&
+        slang::parsing::Token left_identifier;
+        if (const auto* left_id = node.left->as_if<slang::syntax::IdentifierNameSyntax>())
+            left_identifier = left_id->identifier;
+        else if (const auto* left_class = node.left->as_if<slang::syntax::ClassNameSyntax>())
+            left_identifier = left_class->identifier;
+
+        if (left_identifier && right &&
             token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(right->identifier.valueText());
-            target.package_qualifier = std::string(left->identifier.valueText());
+            target.package_qualifier = std::string(left_identifier.valueText());
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
