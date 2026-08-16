@@ -1192,6 +1192,61 @@ endmodule
     std::filesystem::remove(dir);
 }
 
+TEST_CASE("references: method-local stays scoped when its own file is indexed",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_method_local";
+    std::filesystem::create_directories(dir);
+
+    const auto drv_path = dir / "drv.sv";
+    const auto lib_path = dir / "lib.sv";
+
+    const std::string drv = R"(class my_driver;
+    task run_phase();
+        int item;
+        item = 1;
+    endtask
+endclass
+)";
+    const std::string lib = R"(module lib;
+    initial begin
+        int item;
+        item = 2;
+    end
+endmodule
+)";
+
+    {
+        std::ofstream out(drv_path);
+        REQUIRE(out.good());
+        out << drv;
+    }
+    {
+        std::ofstream out(lib_path);
+        REQUIRE(out.good());
+        out << lib;
+    }
+
+    Analyzer analyzer;
+    // The open file is in the filelist too, so it has a closed shard of its own
+    // that offers a weak `name:item` identity for this method-local.
+    analyzer.set_extra_files({drv_path.string(), lib_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string drv_uri = uri_from_path(drv_path);
+    analyzer.open(drv_uri, drv);
+
+    const auto [line, col] = find_position(drv, "item;");
+    const auto refs = analyzer.find_references(drv_uri, line, col, true);
+
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri == drv_uri);
+
+    std::filesystem::remove(drv_path);
+    std::filesystem::remove(lib_path);
+    std::filesystem::remove(dir);
+}
+
 TEST_CASE("references: package class method declaration matches closed member call",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() /
