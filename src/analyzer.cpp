@@ -1015,11 +1015,12 @@ find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::s
 
 static Location location_from_token(const slang::SourceManager& sm, const std::string& uri,
                                     const slang::parsing::Token& token) {
-    // A macro argument is written at the call site, but its own location points
+    // A macro argument -- or a literal written inside the macro body itself,
+    // e.g. `type_id` in `uvm_object_utils_begin` -- has its own location point
     // into the expansion buffer, which has no lines for getColumnNumber() to
     // walk back through -- it answers 0, and the column comes out negative.
     // Report where the user actually typed it.
-    const auto location = sm.isMacroArgLoc(token.location())
+    const auto location = sm.isMacroLoc(token.location())
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
     const int line = to_lsp_line((int)sm.getLineNumber(location));
@@ -1030,7 +1031,16 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
                                                const std::string& fallback_uri,
                                                const slang::parsing::Token& token) {
-    auto loc = location_from_token(sm, location_to_uri(sm, token.location(), fallback_uri), token);
+    // The URI must come from the same resolved location that
+    // location_from_token() uses for line/col below -- deriving it from the
+    // raw (unresolved) token location instead mixes getFullyExpandedLoc()'s
+    // buffer with getFullyOriginalLoc()'s line/col, which point at different
+    // files for a token written inside a macro body (e.g. `type_id` in
+    // `uvm_object_utils_begin`).
+    const auto location = sm.isMacroLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    auto loc = location_from_token(sm, location_to_uri(sm, location, fallback_uri), token);
     return loc;
 }
 
