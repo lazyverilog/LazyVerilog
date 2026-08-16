@@ -1964,3 +1964,66 @@ TEST_CASE("references: a class field reaches its handle.field uses", "[reference
     std::sort(lines.begin(), lines.end());
     CHECK(lines == std::vector<int>{1, 6, 7});
 }
+
+TEST_CASE("references: an open file reachable through a symlinked path is not "
+          "double-counted against its own closed shard",
+          "[references]") {
+    // A client can open a document through a symlinked directory while the
+    // project filelist reaches the identical on-disk file through its
+    // canonical path.  find_references()'s "skip the open file's own closed
+    // shard" guard used to compare those two URI spellings as raw strings, so
+    // it failed to recognize them as the same file and walked the shard
+    // anyway -- doubling every result under a second, differently-spelled URI.
+    namespace fs = std::filesystem;
+    const auto real_dir = fs::temp_directory_path() / "lazyverilog_refs_symlink_real";
+    const auto link_dir = fs::temp_directory_path() / "lazyverilog_refs_symlink_link";
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
+    fs::create_directories(real_dir);
+    std::error_code ec;
+    fs::create_directory_symlink(real_dir, link_dir, ec);
+    if (ec) {
+        SUCCEED("symlinks unavailable on this platform");
+        return;
+    }
+
+    const auto real_path = real_dir / "item.sv";
+    {
+        std::ofstream out(real_path);
+        REQUIRE(out.good());
+        out << "class item;\n"
+               "    int addr;\n"
+               "endclass\n"
+               "module top;\n"
+               "    item it;\n"
+               "    initial begin\n"
+               "        it.addr = 1;\n"
+               "        $display(it.addr);\n"
+               "    end\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({real_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // Open through the uncanonicalized (symlinked) spelling on purpose --
+    // uri_from_path() would canonicalize it away and hide the mismatch.
+    const std::string uri = "file://" + (link_dir / "item.sv").string();
+    analyzer.open(uri, "class item;\n"
+                       "    int addr;\n"
+                       "endclass\n"
+                       "module top;\n"
+                       "    item it;\n"
+                       "    initial begin\n"
+                       "        it.addr = 1;\n"
+                       "        $display(it.addr);\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto refs = analyzer.find_references(uri, 1, 8, true);
+    CHECK(refs.size() == 3);
+
+    fs::remove(link_dir);
+    fs::remove_all(real_dir);
+}
