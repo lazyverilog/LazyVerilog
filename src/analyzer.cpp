@@ -3728,7 +3728,13 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     std::unordered_set<std::string> open_uris;
     for (const auto& [state_uri, state] : open_states) {
         open_state_by_uri[state_uri] = state;
-        open_uris.insert(state_uri);
+        // Compare against extra.uri's canonical spelling below, not the raw
+        // client URI: a client can open a file through a symlinked path while
+        // the filelist indexer reaches the same file through its canonical
+        // path (uri_from_path() resolves symlinks via weakly_canonical()).  A
+        // raw string mismatch here would fail to skip the file's own closed
+        // shard, double-counting every reference in it.
+        open_uris.insert(state ? uri_from_path(state->normalized_path) : state_uri);
     }
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
