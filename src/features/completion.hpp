@@ -36,6 +36,10 @@ struct CompletionContext {
     CompletionContextKind kind{CompletionContextKind::Unknown};
     std::string prefix;     // text already typed (for prefix/fuzzy matching)
     std::string scope_name; // LHS of . or :: (MemberAccess / PackageScope)
+    // Segment left of scope_name in a `a::b::` chain, empty when there is none.
+    // `my_item::type_id::` yields scope_name "type_id", scope_qualifier
+    // "my_item" — and only the qualifier says which class's `type_id` is meant.
+    std::string scope_qualifier;
     std::string current_scope_name; // best-effort enclosing module/interface/package
     std::string expected_type; // best-effort RHS expected type, e.g. enum typedef on assignment
     KeywordContextKind keyword_context{KeywordContextKind::General};

@@ -275,6 +275,41 @@ static std::optional<std::string> text_scope_base_before_double_colon(const std:
     return text.substr(scan, ident_end - scan);
 }
 
+// Segment left of the scope base: `my_item` in `my_item::type_id::|`.
+//
+// The base alone is ambiguous whenever a name is declared once per class, which
+// is exactly the shape `type_id` has.  Read textually for the same reason the
+// base fallback above does: `::` is the user's explicit request for scope
+// completion, so this guesses no context from ordinary typing.
+static std::string text_scope_qualifier_before_double_colon(const std::string& text, size_t pos) {
+    if (pos < 2 || text[pos - 1] != ':' || text[pos - 2] != ':')
+        return {};
+
+    size_t scan = pos - 2;
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+    const size_t base_end = scan;
+    while (scan > 0 && is_ident_char(text[scan - 1]))
+        --scan;
+    if (scan == base_end)
+        return {};
+
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+    if (scan < 2 || text[scan - 1] != ':' || text[scan - 2] != ':')
+        return {};
+    scan -= 2;
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+
+    const size_t qualifier_end = scan;
+    while (scan > 0 && is_ident_char(text[scan - 1]))
+        --scan;
+    if (scan == qualifier_end)
+        return {};
+    return text.substr(scan, qualifier_end - scan);
+}
+
 struct DotCompletionSyntaxContext {
     size_t dot_offset{0};
     std::string base_name;
@@ -2025,6 +2060,19 @@ static std::string typedef_target_in_shard(const SyntaxIndex& index, const std::
     return completion_base_type_name(index.typedefs[it->second].resolved);
 }
 
+// Same, but for `owner::name`.  `typedef_by_name` holds one entry per bare
+// name, so a typedef every class declares — `type_id` above all — resolves
+// there to whichever class happened to be indexed first.  The owner-scoped
+// table is the only one that can tell them apart.
+static std::string scoped_typedef_target_in_shard(const SyntaxIndex& index,
+                                                  const std::string& owner,
+                                                  const std::string& name) {
+    const auto it = index.package_type_by_scoped_name.find(package_scoped_key(owner, name));
+    if (it == index.package_type_by_scoped_name.end() || it->second >= index.typedefs.size())
+        return {};
+    return completion_base_type_name(index.typedefs[it->second].resolved);
+}
+
 // MemberProvider: fields/methods for class, ports for module/interface.
 class MemberProvider : public CompletionProvider {
   public:
@@ -2715,12 +2763,14 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
             ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
         if (!ctx.scope_name.empty()) {
             ctx.kind = CompletionContextKind::PackageScope;
+            ctx.scope_qualifier = text_scope_qualifier_before_double_colon(text, pos);
             return ctx;
         }
     } else {
         ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
         if (!ctx.scope_name.empty()) {
             ctx.kind = CompletionContextKind::PackageScope;
+            ctx.scope_qualifier = text_scope_qualifier_before_double_colon(text, pos);
             return ctx;
         }
     }
@@ -2947,20 +2997,35 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         if (aliased_scope_name.empty()) {
             // The typedef itself may be declared in a file that is never
             // opened, leaving the shard as the only place that knows the type
-            // it names.
-            for (const auto& shard : *opened_shards) {
-                if (!shard.index)
-                    continue;
-                aliased_scope_name = typedef_target_in_shard(*shard.index, ctx.scope_name);
-                if (!aliased_scope_name.empty())
-                    break;
-            }
-            for (const auto* shard : project_shards) {
-                if (!aliased_scope_name.empty())
-                    break;
-                if (shard)
-                    aliased_scope_name = typedef_target_in_shard(*shard, ctx.scope_name);
-            }
+            // it names.  Try the qualifier-scoped table across every shard
+            // first; the bare-name table cannot distinguish two classes that
+            // declare the same typedef name, so it is only a last resort.
+            auto scan_shards = [&](auto&& lookup) {
+                for (const auto& shard : *opened_shards) {
+                    if (!shard.index)
+                        continue;
+                    aliased_scope_name = lookup(*shard.index);
+                    if (!aliased_scope_name.empty())
+                        return;
+                }
+                for (const auto* shard : project_shards) {
+                    if (!shard)
+                        continue;
+                    aliased_scope_name = lookup(*shard);
+                    if (!aliased_scope_name.empty())
+                        return;
+                }
+            };
+
+            if (!ctx.scope_qualifier.empty())
+                scan_shards([&](const SyntaxIndex& index) {
+                    return scoped_typedef_target_in_shard(index, ctx.scope_qualifier,
+                                                          ctx.scope_name);
+                });
+            if (aliased_scope_name.empty())
+                scan_shards([&](const SyntaxIndex& index) {
+                    return typedef_target_in_shard(index, ctx.scope_name);
+                });
             if (aliased_scope_name == ctx.scope_name)
                 aliased_scope_name.clear();
         }
