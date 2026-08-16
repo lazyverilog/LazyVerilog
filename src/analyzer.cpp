@@ -3555,41 +3555,47 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const SymbolID import_bridge_name_id =
         target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
 
-    // `handle.field` in another file is recorded under the receiver's bare type
-    // name, because that shard never parsed the class body and so cannot know
-    // the package the class belongs to.  Treat the bare spelling as the same
-    // symbol, but only inside shards importing the declaring package, so a
-    // same-named field on an unrelated class stays out of the result.
-    SymbolID class_field_alias_id;
-    std::string class_field_package;
-    std::string class_field_class;
-    {
-        constexpr std::string_view kClassFieldPrefix = "class_field::";
-        if (target_symbol_debug.starts_with(kClassFieldPrefix)) {
-            const std::string_view rest =
-                std::string_view(target_symbol_debug).substr(kClassFieldPrefix.size());
-            const auto field_sep = rest.rfind("::");
-            if (field_sep != std::string_view::npos) {
-                const auto owner = rest.substr(0, field_sep);
-                const auto field = rest.substr(field_sep + 2);
-                // No package qualifier means the use site already spells the
-                // owner exactly as the declaration does.
-                if (const auto scope_sep = owner.rfind("::");
-                    scope_sep != std::string_view::npos) {
-                    class_field_package = std::string(owner.substr(0, scope_sep));
-                    class_field_class = std::string(owner.substr(scope_sep + 2));
-                    class_field_alias_id = SymbolID::from_canonical(
-                        std::string(kClassFieldPrefix) + class_field_class + "::" +
-                        std::string(field));
-                }
-            }
+    // `handle.member` in another file is recorded under the receiver's bare
+    // type name and a kind-neutral `class_member::` prefix, because that shard
+    // never parsed the class body: it knows neither the owning package nor
+    // whether the member is a field or a method.  Treat that spelling as the
+    // same symbol.  When the class is package-scoped the alias is admitted only
+    // inside shards importing that package, so a same-named member on an
+    // unrelated class stays out of the result.
+    SymbolID class_member_alias_id;
+    std::string class_member_package;
+    std::string class_member_class;
+    for (const auto prefix : {std::string_view("class_field::"),
+                              std::string_view("class_method::")}) {
+        if (!target_symbol_debug.starts_with(prefix))
+            continue;
+        const std::string_view rest = std::string_view(target_symbol_debug).substr(prefix.size());
+        const auto member_sep = rest.rfind("::");
+        if (member_sep == std::string_view::npos)
+            break;
+        const auto owner = rest.substr(0, member_sep);
+        const auto member = rest.substr(member_sep + 2);
+        const auto scope_sep = owner.rfind("::");
+        if (scope_sep == std::string_view::npos) {
+            class_member_class = std::string(owner);
+        } else {
+            class_member_package = std::string(owner.substr(0, scope_sep));
+            class_member_class = std::string(owner.substr(scope_sep + 2));
         }
+        if (!class_member_class.empty())
+            class_member_alias_id = SymbolID::from_canonical(
+                "class_member::" + class_member_class + "::" + std::string(member));
+        break;
     }
 
-    auto imports_class_field_package = [&](const std::vector<ImportEntry>& imports) {
+    auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports) {
+        // A class outside any package is reached by bare name, so there is no
+        // import to require.
+        if (class_member_package.empty())
+            return true;
         return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
-            return import.package_name == class_field_package &&
-                   (import.wildcard || import.symbol_name == class_field_class);
+            return import.package_name == class_member_package &&
+                   (import.wildcard || import.symbol_name == class_member_class);
         });
     };
 
@@ -3631,8 +3637,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
             imports_target_package(imports))
             return true;
-        if (class_field_alias_id && ref.symbol_id == class_field_alias_id &&
-            imports_class_field_package(imports))
+        if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
+            admits_class_member_alias(imports))
             return true;
         return false;
     };
