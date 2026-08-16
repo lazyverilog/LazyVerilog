@@ -1895,3 +1895,46 @@ TEST_CASE("completion: a class-scoped typedef in a closed file works as a scope"
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("completion: a class-scoped typedef resolves under its own qualifier",
+          "[completion]") {
+    // Every class declares a typedef named `type_id`; only the qualifier says
+    // which one `type_id::` means.
+    const auto pkg_path = write_temp_sv_file("lazyverilog_completion_type_id_qualifier.sv",
+                                             "package type_pkg;\n"
+                                             "    class reg_a #(type T = int);\n"
+                                             "        static function void from_a();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class reg_b #(type T = int);\n"
+                                             "        static function void from_b();\n"
+                                             "        endfunction\n"
+                                             "    endclass\n"
+                                             "    class item_a;\n"
+                                             "        typedef reg_a #(item_a) type_id;\n"
+                                             "    endclass\n"
+                                             "    class item_b;\n"
+                                             "        typedef reg_b #(item_b) type_id;\n"
+                                             "    endclass\n"
+                                             "endpackage\n");
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_type_id_qualifier_use.sv";
+    const std::string text = "import type_pkg::*;\n"
+                             "module top;\n"
+                             "    initial item_b::type_id::from_b();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "item_b::type_id::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "from_b"));
+    CHECK_FALSE(has_label(result, "from_a"));
+
+    std::filesystem::remove(pkg_path);
+}
