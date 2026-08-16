@@ -1116,3 +1116,43 @@ TEST_CASE("definition: field on a receiver with a parameterized declared type",
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("definition: class method declared entirely inside a macro body resolves "
+          "from a closed package file",
+          "[definition][macro]") {
+    // Mirrors UVM's `UVM_SEQ_ITEM_PULL_IMP, which expands to a whole
+    // `task get_next_item(...); ... endtask` member -- the method name is a
+    // macro-body literal, not a substituted argument.  Closed-file indexing
+    // used to compute the entry's location from the raw (unresolved)
+    // macro-expansion buffer location, which has no real line numbers, so the
+    // entry landed at line 0 and find_class_member_definition's `line <= 0`
+    // guard silently dropped it.
+    const std::string macro_line =
+        "    `define GEN_ITEM_METHOD(IMP) task get_next_item(); IMP.get_next_item(); "
+        "endtask\n";
+    const auto pkg_path = write_temp_sv("lazyverilog_definition_macro_method.sv",
+                                        "package pkg;\n" + macro_line +
+                                        "    class base;\n"
+                                        "        `GEN_ITEM_METHOD(imp)\n"
+                                        "    endclass\n"
+                                        "endpackage\n");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string use_line = "    initial b.get_next_item();\n";
+    const std::string uri = "file:///tmp/lazyverilog_definition_macro_method_use.sv";
+    analyzer.open(uri, "import pkg::*;\n"
+                       "module top;\n"
+                       "    base b;\n" +
+                           use_line + "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 3, (int)use_line.find("get_next_item"));
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(pkg_path));
+    CHECK(loc->line == 1);
+    CHECK(loc->col == (int)macro_line.find("get_next_item"));
+
+    std::filesystem::remove(pkg_path);
+}
