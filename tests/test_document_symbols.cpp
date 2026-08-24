@@ -1,7 +1,10 @@
 #include "analyzer.hpp"
 #include "features/document_symbols.hpp"
+#include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 static lsDocumentSymbolParams make_params(const std::string& uri) {
     lsDocumentSymbolParams p;
@@ -150,4 +153,67 @@ TEST_CASE("documentSymbol: a module instance appears as a child of its parent mo
     const auto* inst = find_child(children, "u_sub");
     REQUIRE(inst != nullptr);
     CHECK(inst->kind == lsSymbolKind::Object);
+}
+
+static std::filesystem::path write_temp_sv(const std::string& name, const std::string& text) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    std::ofstream out(path);
+    REQUIRE(out.good());
+    out << text;
+    out.close();
+    return path;
+}
+
+static void collect_lines(const std::vector<lsDocumentSymbol>& symbols, std::vector<int>& lines) {
+    for (const auto& s : symbols) {
+        lines.push_back(s.range.start.line);
+        lines.push_back(s.range.end.line);
+        if (s.children)
+            collect_lines(*s.children, lines);
+    }
+}
+
+TEST_CASE("documentSymbol: every reported range lies inside the requested document",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    // lsDocumentSymbol carries no URI, so every range it reports is read
+    // against the requested document.  A symbol declared in an `include`d
+    // header therefore must not be reported here under the header's own line
+    // numbers: those land past the end of the file the client asked about.
+    // The padding puts the header's class well beyond this file's length.
+    std::string header;
+    for (int i = 0; i < 40; ++i)
+        header += "// padding\n";
+    header += "class header_cls;\n"
+              "    int header_field;\n"
+              "endclass\n";
+    write_temp_sv("docsym_foreign_header.svh", header);
+    const std::string top_text = "`include \"docsym_foreign_header.svh\"\n"
+                                 "class local_cls;\n"
+                                 "    int local_field;\n"
+                                 "    function void own_fn();\n"
+                                 "    endfunction\n"
+                                 "endclass\n";
+    const auto top_path = write_temp_sv("docsym_foreign_top.sv", top_text);
+    const std::string top_uri = uri_from_path(top_path);
+    analyzer.open(top_uri, top_text);
+
+    auto result = provide_document_symbols(analyzer, make_params(top_uri));
+
+    const int line_count = 6; // lines in docsym_foreign_top.sv
+    std::vector<int> lines;
+    collect_lines(result, lines);
+    REQUIRE(!lines.empty());
+    for (int line : lines)
+        CHECK(line < line_count);
+
+    // The class declared here survives, along with its hand-written members.
+    const auto* local = find_child(result, "local_cls");
+    REQUIRE(local != nullptr);
+    const auto members = children_of(*local);
+    CHECK(find_child(members, "local_field") != nullptr);
+    CHECK(find_child(members, "own_fn") != nullptr);
+
+    // The header's own class belongs to the header's document, not this one.
+    CHECK(find_child(result, "header_cls") == nullptr);
 }
