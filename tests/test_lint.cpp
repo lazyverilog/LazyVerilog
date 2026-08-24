@@ -216,3 +216,56 @@ TEST_CASE("lint: included files are skipped", "[lint]") {
 
     std::filesystem::remove(include_path);
 }
+
+TEST_CASE("lint: a macro body is not linted at the invocation line", "[lint][macro]") {
+    // Code written inside a macro body belongs to whoever wrote the macro.
+    // Reporting it against the line that *invokes* the macro shows the user a
+    // warning about source they do not own and cannot edit -- on a UVM file
+    // every `uvm_*_utils line otherwise contributes several of these.
+    LintConfig cfg;
+    cfg.statement.explicit_begin = true;
+
+    auto diags = lint_text("`define BARE_IF(C) if (C) $display(\"x\");\n"
+                           "module top;\n"
+                           "  initial begin\n"
+                           "    `BARE_IF(1)\n"
+                           "    if (1) $display(\"z\");\n"
+                           "  end\n"
+                           "endmodule\n",
+                           cfg);
+
+    // The user-written `if` on line 5 is still reported ...
+    REQUIRE(has_message_containing(diags, "if statement body should use begin/end"));
+    // ... and it is the only one: the macro body's `if` is not.
+    const auto count = std::count_if(diags.begin(), diags.end(), [](const auto& d) {
+        return d.message.find("if statement body should use begin/end") != std::string::npos;
+    });
+    CHECK(count == 1);
+    for (const auto& d : diags) {
+        if (d.message.find("if statement body should use begin/end") != std::string::npos)
+            CHECK(d.line == 4); // 0-based: line 5, the hand-written if
+    }
+}
+
+TEST_CASE("lint: a macro argument is still linted, at the call site", "[lint][macro]") {
+    // The other half of the rule.  A macro *argument* is text the user typed at
+    // the invocation, so it stays lintable -- and must be reported where they
+    // typed it, not at a position inside the expansion buffer.  Without this a
+    // fix that simply drops every macro-expanded token would also pass the
+    // suppression test above.
+    LintConfig cfg;
+    cfg.naming.enable = true;
+    cfg.naming.signal_pattern = "^s_.*$";
+
+    auto diags = lint_text("`define DECL_WIRE(N) logic N;\n"
+                           "module top;\n"
+                           "  `DECL_WIRE(bad_name)\n"
+                           "endmodule\n",
+                           cfg);
+
+    REQUIRE(has_message_containing(diags, "bad_name"));
+    for (const auto& d : diags) {
+        if (d.message.find("bad_name") != std::string::npos)
+            CHECK(d.line == 2); // 0-based: line 3, where the user typed it
+    }
+}
