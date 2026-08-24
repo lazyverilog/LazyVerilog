@@ -1,4 +1,5 @@
 #include "completion.hpp"
+#include "../dynamic_file_index.hpp"
 #include "../syntax_index.hpp"
 #include "../syntax_index_shared.hpp"
 #include <algorithm>
@@ -2971,7 +2972,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     const int line = params.position.line;
     const int col  = params.position.character;
-    SyntaxIndex current_index;
+    SyntaxIndex context_index;
 
     CompletionContext ctx;
     try {
@@ -2981,13 +2982,25 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         // include, or explicit scope context.  Do not touch the .f project
         // cache until after we know this request actually needs project-wide
         // symbols.
-        ctx = detect_context(state, line, col, current_index);
+        //
+        // The index stays empty here on purpose.  Detection scans whatever it is
+        // given, and handing it the current file's full dynamic index measured
+        // ~18ms -> ~37ms per member-access completion on a UVM buffer for no
+        // change in results; the AST-based detection below already answers the
+        // questions detection actually asks.
+        ctx = detect_context(state, line, col, context_index);
     } catch (...) {
         ctx.kind = CompletionContextKind::Identifier;
     }
-    for (const auto& mac : current_index.macros)
+    // Imports and macros do come from the current file's cached dynamic index:
+    // they gate which package members are offered, and reading them costs one
+    // vector copy rather than a scan.  They describe the current file only --
+    // an import written in another buffer must not make its package visible
+    // here -- while the values they gate come from the other buffers' shards.
+    const SyntaxIndex& current_file_index = get_dynamic_index(state);
+    for (const auto& mac : current_file_index.macros)
         ctx.visible_macros.insert(mac.name);
-    ctx.visible_imports = current_index.imports;
+    ctx.visible_imports = current_file_index.imports;
 
     if (ctx.kind == CompletionContextKind::IncludeFile) {
         for (const auto& p : analyzer.extra_files()) {
@@ -3009,7 +3022,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     // current file index.  This avoids rebuilding a full "all open files except
     // current" SyntaxIndex on every edit-driven cache miss while still reusing
     // each immutable DocumentState's cached dynamic SyntaxIndex.
-    SyntaxIndex completion_index = std::move(current_index);
+    // Deliberately empty: the current file contributes through the AST paths
+    // below, not through a provider index.  Copying the cached dynamic index
+    // here would add a full per-keystroke index copy for items that are already
+    // being emitted from the live AST.
+    SyntaxIndex completion_index;
     auto opened_shards = analyzer.opened_file_index_shards(params.textDocument.uri.raw_uri_);
     // The snapshot owns the only guaranteed reference to these shards: a
     // concurrent didOpen/didChange replaces the per-file shard in the analyzer
