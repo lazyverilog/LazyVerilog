@@ -292,6 +292,10 @@ void process_generate_instances(const MemberSyntax& member, SyntaxIndex& index,
     }
 }
 
+void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
+                     SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                     std::string parent_scope);
+
 void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                    SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                    std::string parent_scope = {}) {
@@ -309,7 +313,13 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
-            if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+            // `typedef registry #(T) type_id;` in a class body is a member of
+            // that class, reached as `my_item::type_id`.  The shard builder
+            // indexes these; the open-buffer index has to as well, or the same
+            // file offers different members depending on whether it is open.
+            if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
+                process_typedef(*nested, index, resolver, sm, entry.name);
+            } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const auto type = node_text_raw(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)

@@ -2074,3 +2074,38 @@ TEST_CASE("completion: a class-scoped typedef resolves under its own qualifier",
 
     std::filesystem::remove(pkg_path);
 }
+
+TEST_CASE("completion: class scope offers typedefs declared in the class body",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const auto header = write_temp_sv_file("completion_class_typedef_macros.svh",
+                                           "`define CT_UTILS(T) \\\n"
+                                           "    typedef registry_of #(T) type_id; \\\n"
+                                           "    static function type_id get_type(); \\\n"
+                                           "    endfunction\n");
+    analyzer.set_include_dirs({std::filesystem::temp_directory_path().string()});
+
+    // `type_id` is declared by a macro body, the way UVM's factory macros do
+    // it, and is reached as `owner::type_id` just like the static method beside
+    // it.
+    const std::string uri =
+        uri_from_path(std::filesystem::temp_directory_path() / "completion_class_typedef.sv");
+    const std::string text = "`include \"completion_class_typedef_macros.svh\"\n"
+                             "class item_c;\n"
+                             "    int payload;\n"
+                             "    `CT_UTILS(item_c)\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    initial handle = item_c::\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto result = complete_at(engine, analyzer, uri, 6,
+                              (int)std::string("    initial handle = item_c::").size());
+    CHECK(has_label(result, "get_type"));
+    const auto* type_id = find_item(result, "type_id");
+    REQUIRE(type_id != nullptr);
+
+    std::filesystem::remove(header);
+}
