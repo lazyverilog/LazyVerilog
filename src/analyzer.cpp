@@ -1993,9 +1993,18 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 }
             }
 
+            // ModuleDeclarationSyntax also covers interface, package, and
+            // program declarations; reporting all of them as "module" mislabels
+            // every interface in a testbench.
+            const char* declaration_kind =
+                node.kind == slang::syntax::SyntaxKind::InterfaceDeclaration ? "interface"
+                : node.kind == slang::syntax::SyntaxKind::PackageDeclaration ? "package"
+                : node.kind == slang::syntax::SyntaxKind::ProgramDeclaration ? "program"
+                                                                             : "module";
+
             result = SymbolInfo{.name = name,
-                                .kind = "module",
-                                .detail = "module",
+                                .kind = declaration_kind,
+                                .detail = declaration_kind,
                                 .doc = std::move(doc),
                                 .line = definition.line,
                                 .col = definition.col};
@@ -3044,6 +3053,19 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
                 return info;
             break;
+        }
+
+        // A project file's shard also indexes everything it `include`s, and the
+        // included header is usually not itself a filelist entry -- UVM lists
+        // uvm_pkg.sv, which includes every uvm_*.svh.  Matching shards by URI
+        // alone therefore finds nothing for such declarations and hover degrades
+        // to a bare name.  Fall back to scanning the shards; the entries carry
+        // their own file_id, so the location match stays exact.
+        for (const auto& extra : *extra_files) {
+            if (extra.uri == definition->uri)
+                continue; // already tried above
+            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
+                return info;
         }
         return SymbolInfo{
             .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};

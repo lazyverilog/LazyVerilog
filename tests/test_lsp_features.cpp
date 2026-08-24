@@ -1305,3 +1305,69 @@ endmodule
 
     std::filesystem::remove(path);
 }
+
+TEST_CASE("hover: an interface is not reported as a module", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_hover_iface_kind.sv";
+    const std::string text = "interface bus_if;\n"
+                             "    logic valid;\n"
+                             "endinterface\n"
+                             "module top;\n"
+                             "    bus_if the_bus();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(0, (int)std::string("interface bu").size());
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& value = hover->contents.second->value;
+    CHECK(value.find("*interface*") != std::string::npos);
+    CHECK(value.find("*module*") == std::string::npos);
+}
+
+TEST_CASE("hover: resolves a declaration reached through a project file's include",
+          "[hover]") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto header = dir / "lazyverilog_hover_shard_inc.svh";
+    {
+        std::ofstream out(header);
+        out << "class lib_base_c;\n"
+               "endclass\n";
+    }
+    // Only the package is a filelist entry; the class lives in a header it
+    // includes, which is how UVM ships (uvm_pkg.sv includes every uvm_*.svh).
+    const auto pkg = dir / "lazyverilog_hover_shard_pkg.sv";
+    {
+        std::ofstream out(pkg);
+        out << "package lib_pkg;\n"
+               "`include \"lazyverilog_hover_shard_inc.svh\"\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({pkg.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "lazyverilog_hover_shard_user.sv");
+    const std::string text = "class user_c extends lib_base_c;\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(0, (int)std::string("class user_c extends lib_ba").size());
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    // Without shard-wide lookup this degrades to the bare "symbol" kind.
+    CHECK(hover->contents.second->value.find("*class*") != std::string::npos);
+
+    std::filesystem::remove(header);
+    std::filesystem::remove(pkg);
+}
