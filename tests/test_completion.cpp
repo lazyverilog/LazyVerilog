@@ -1451,6 +1451,59 @@ TEST_CASE("completion: MemberAccess resolves class variable type", "[completion]
     CHECK(has_label(result, "apply"));
 }
 
+// `this` and `super` are the two receivers that are not variables to look up:
+// their type is fixed by the enclosing class.  Every UVM phase method opens
+// with `super.build_phase(phase);`, so these are among the most frequently
+// typed member-access positions in a testbench.
+static const std::string kThisSuperText =
+    "class base_c;\n"
+    "    int base_field;\n"
+    "    function void base_only();\n"
+    "    endfunction\n"
+    "endclass\n"
+    "class derived_c extends base_c;\n"
+    "    int derived_field;\n"
+    "    function void run();\n"
+    "        super.\n"
+    "    endfunction\n"
+    "endclass\n";
+
+TEST_CASE("completion: super. returns the base class members, not the derived ones",
+          "[completion][handle]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_super_handle.sv";
+    analyzer.open(uri, kThisSuperText);
+
+    auto [line, col] = pos_after(kThisSuperText, "        super.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "base_field"));
+    CHECK(has_label(result, "base_only"));
+    // The whole reason to write `super.` is to reach past the current class,
+    // so a member only the derived class declares must not be offered.
+    CHECK_FALSE(has_label(result, "derived_field"));
+}
+
+TEST_CASE("completion: this. returns the enclosing class members including inherited",
+          "[completion][handle]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_this_handle.sv";
+    std::string text = kThisSuperText;
+    const auto at = text.find("        super.");
+    REQUIRE(at != std::string::npos);
+    text.replace(at, std::string("        super.").size(), "        this.");
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "        this.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "derived_field"));
+    CHECK(has_label(result, "run"));
+    CHECK(has_label(result, "base_field"));
+}
+
 TEST_CASE("completion: MemberAccess resolves typedef struct variable type", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;

@@ -41,6 +41,12 @@ struct CompletionContext {
     // "my_item" — and only the qualifier says which class's `type_id` is meant.
     std::string scope_qualifier;
     std::string current_scope_name; // best-effort enclosing module/interface/package
+    // Type of the member-access receiver when the receiver is an implicit
+    // handle -- `this` (the enclosing class) or `super` (its base) -- rather
+    // than a named value.  There is no declaration to look up in that case, so
+    // this is filled in during context detection and short-circuits the
+    // variable-to-type resolution.  Empty for an ordinary `handle.` receiver.
+    std::string receiver_type;
     std::string expected_type; // best-effort RHS expected type, e.g. enum typedef on assignment
     KeywordContextKind keyword_context{KeywordContextKind::General};
     int line{0};            // 0-based cursor line
