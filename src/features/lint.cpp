@@ -49,6 +49,24 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
     return d;
 }
 
+/// Record a lint finding unless it describes code the user did not write.
+///
+/// A token from a macro *body* has no position of its own, so it is reported
+/// against the line that invoked the macro.  That line is not something the
+/// reader can act on -- the construct lives in whoever wrote the macro, often a
+/// vendor header -- and on a UVM file every `uvm_*_utils invocation otherwise
+/// contributes several such warnings, burying the user's real findings.
+///
+/// A macro *argument* is text typed at the call site, so it stays lintable.
+/// This is the same isMacroLoc / isMacroArgLoc split the indexer uses to decide
+/// where a declaration versus a reference belongs.
+static void push_diag(std::vector<ParseDiagInfo>& diags, SourceManager& sm, SourceLocation loc,
+                      int sev, std::string msg) {
+    if (loc.valid() && sm.isMacroLoc(loc) && !sm.isMacroArgLoc(loc))
+        return;
+    diags.emplace_back(make_diag(sm, loc, sev, std::move(msg)));
+}
+
 static std::vector<ParseDiagInfo> lint_trailing_whitespace(const std::string& text) {
     std::vector<ParseDiagInfo> diags;
     size_t line_start = 0;
@@ -300,8 +318,8 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                   const std::string& pat, const char* cat) {
         if (!re || name.empty()) return;
         if (!std::regex_match(name, *re))
-            diags.push_back(make_diag(sm, loc, naming_sev(),
-                std::string("[naming] ") + cat + " '" + name + "' does not match pattern '" + pat + "'"));
+            push_diag(diags, sm, loc, naming_sev(),
+                std::string("[naming] ") + cat + " '" + name + "' does not match pattern '" + pat + "'");
     }
 
     void chk_port(const std::string& name, SourceLocation loc, PortDir dir) {
@@ -320,8 +338,8 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 if (node.items[i]->as_if<DefaultCaseItemSyntax>())
                     has_default = true;
             if (!has_default)
-                diags.push_back(make_diag(sm, node.caseKeyword.location(), 2,
-                    "[statement] case statement missing default item"));
+                push_diag(diags, sm, node.caseKeyword.location(), 2,
+                    "[statement] case statement missing default item");
         }
         visitDefault(node);
     }
@@ -336,15 +354,15 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             if (cfg.function.functions_automatic) {
                 bool is_auto = has_life && proto.lifetime.rawText() == "automatic";
                 if (!is_auto)
-                    diags.push_back(make_diag(sm, proto.keyword.location(), 2,
-                        "[function] function declaration should use 'automatic' lifetime"));
+                    push_diag(diags, sm, proto.keyword.location(), 2,
+                        "[function] function declaration should use 'automatic' lifetime");
             } else if (cfg.function.explicit_function_lifetime && !has_life) {
-                diags.push_back(make_diag(sm, proto.keyword.location(), 2,
-                    "[function] function declaration missing explicit lifetime (automatic/static)"));
+                push_diag(diags, sm, proto.keyword.location(), 2,
+                    "[function] function declaration missing explicit lifetime (automatic/static)");
             }
         } else if (cfg.function.explicit_task_lifetime && !has_life) {
-            diags.push_back(make_diag(sm, proto.keyword.location(), 2,
-                "[function] task declaration missing explicit lifetime (automatic/static)"));
+            push_diag(diags, sm, proto.keyword.location(), 2,
+                "[function] task declaration missing explicit lifetime (automatic/static)");
         }
         visitDefault(node);
     }
@@ -366,14 +384,14 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                                                                                       : 2)
                                               : 2;
             if (style == "named" && has_positional)
-                diags.push_back(make_diag(sm, node.left->getFirstToken().location(), fn_sev,
-                    "[function] call uses positional arguments; named arguments required"));
+                push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    "[function] call uses positional arguments; named arguments required");
             else if (style == "positional" && has_named)
-                diags.push_back(make_diag(sm, node.left->getFirstToken().location(), fn_sev,
-                    "[function] call uses named arguments; positional arguments required"));
+                push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    "[function] call uses named arguments; positional arguments required");
             else if (style == "both" && has_positional && has_named)
-                diags.push_back(make_diag(sm, node.left->getFirstToken().location(), fn_sev,
-                    "[function] call mixes positional and named arguments"));
+                push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    "[function] call mixes positional and named arguments");
         }
         visitDefault(node);
     }
@@ -417,16 +435,16 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     continue;
                 std::string port = std::string(named->name.valueText());
                 if (!seen.insert(port).second)
-                    diags.push_back(make_diag(sm, named->name.location(), module_sev(),
-                        "[module] duplicate autoinst connection for port '" + port + "'"));
+                    push_diag(diags, sm, named->name.location(), module_sev(),
+                        "[module] duplicate autoinst connection for port '" + port + "'");
                 else if (!has_port(port))
-                    diags.push_back(make_diag(sm, named->name.location(), module_sev(),
-                        "[module] stale autoinst connection for unknown port '" + port + "'"));
+                    push_diag(diags, sm, named->name.location(), module_sev(),
+                        "[module] stale autoinst connection for unknown port '" + port + "'");
             }
             for_each_port([&](const std::string& port_name) {
                 if (!seen.count(port_name) && inst->decl)
-                    diags.push_back(make_diag(sm, inst->decl->name.location(), module_sev(),
-                        "[module] autoinst connection missing port '" + port_name + "'"));
+                    push_diag(diags, sm, inst->decl->name.location(), module_sev(),
+                        "[module] autoinst connection missing port '" + port_name + "'");
             });
         }
     }
@@ -448,14 +466,14 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     }
                 }
                 if (style == "named" && has_positional)
-                    diags.push_back(make_diag(sm, node.type.location(), module_sev(),
-                        "[module] instance uses positional port connections; named connections required"));
+                    push_diag(diags, sm, node.type.location(), module_sev(),
+                        "[module] instance uses positional port connections; named connections required");
                 else if (style == "positional" && has_named)
-                    diags.push_back(make_diag(sm, node.type.location(), module_sev(),
-                        "[module] instance uses named port connections; positional connections required"));
+                    push_diag(diags, sm, node.type.location(), module_sev(),
+                        "[module] instance uses named port connections; positional connections required");
                 else if (style == "both" && has_positional && has_named)
-                    diags.push_back(make_diag(sm, node.type.location(), module_sev(),
-                        "[module] instance mixes positional and named port connections"));
+                    push_diag(diags, sm, node.type.location(), module_sev(),
+                        "[module] instance mixes positional and named port connections");
             }
         }
         if (cfg.instance.stale_instance_diagnostic) {
@@ -495,14 +513,14 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         if (node.kind == SyntaxKind::ModuleDeclaration) {
             ++module_count_;
             if (cfg.module.one_module_per_file && module_count_ > 1)
-                diags.push_back(make_diag(sm, node.header->name.location(), module_sev(),
-                    "[module] more than one module declared in this file"));
+                push_diag(diags, sm, node.header->name.location(), module_sev(),
+                    "[module] more than one module declared in this file");
             if (cfg.naming.enable) {
                 chk_name(name, node.header->name.location(), module_re_,
                          cfg.naming.module_pattern, "module");
                 if (cfg.naming.check_module_filename && !file_stem_.empty() && name != file_stem_)
-                    diags.push_back(make_diag(sm, node.header->name.location(), naming_sev(),
-                        "[naming] module '" + name + "' does not match filename '" + file_stem_ + "'"));
+                    push_diag(diags, sm, node.header->name.location(), naming_sev(),
+                        "[naming] module '" + name + "' does not match filename '" + file_stem_ + "'");
             }
         } else if (node.kind == SyntaxKind::InterfaceDeclaration) {
             if (cfg.naming.enable)
@@ -511,8 +529,8 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         } else if (node.kind == SyntaxKind::PackageDeclaration) {
             if (cfg.naming.enable && cfg.naming.check_package_filename && !file_stem_.empty() &&
                 name != file_stem_)
-                diags.push_back(make_diag(sm, node.header->name.location(), naming_sev(),
-                    "[naming] package '" + name + "' does not match filename '" + file_stem_ + "'"));
+                push_diag(diags, sm, node.header->name.location(), naming_sev(),
+                    "[naming] package '" + name + "' does not match filename '" + file_stem_ + "'");
         }
         visitDefault(node);
     }
@@ -601,12 +619,12 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     // ── latch_inference_detection + register naming (always_ff) ──────────────
     void handle(const ProceduralBlockSyntax& node) {
         if (cfg.statement.no_raw_always && node.kind == SyntaxKind::AlwaysBlock)
-            diags.push_back(make_diag(sm, node.keyword.location(), statement_sev(),
-                "[statement] raw always block should use always_comb, always_ff, or always_latch"));
+            push_diag(diags, sm, node.keyword.location(), statement_sev(),
+                "[statement] raw always block should use always_comb, always_ff, or always_latch");
         if (cfg.statement.latch_inference_detection && node.kind == SyntaxKind::AlwaysCombBlock) {
             if (has_latch_risk(*node.statement))
-                diags.push_back(make_diag(sm, node.keyword.location(), 2,
-                    "[statement] always_comb block may infer a latch (incomplete if)"));
+                push_diag(diags, sm, node.keyword.location(), 2,
+                    "[statement] always_comb block may infer a latch (incomplete if)");
         }
         bool was_ff = in_always_ff_;
         bool was_comb = in_always_comb_;
@@ -623,11 +641,11 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const BinaryExpressionSyntax& node) {
         if (cfg.statement.blocking_nonblocking_assignments) {
             if (in_always_ff_ && is_blocking_assignment(node.kind))
-                diags.push_back(make_diag(sm, node.getFirstToken().location(), statement_sev(),
-                    "[statement] always_ff should use nonblocking assignments"));
+                push_diag(diags, sm, node.getFirstToken().location(), statement_sev(),
+                    "[statement] always_ff should use nonblocking assignments");
             else if (in_always_comb_ && node.kind == SyntaxKind::NonblockingAssignmentExpression)
-                diags.push_back(make_diag(sm, node.getFirstToken().location(), statement_sev(),
-                    "[statement] always_comb should use blocking assignments"));
+                push_diag(diags, sm, node.getFirstToken().location(), statement_sev(),
+                    "[statement] always_comb should use blocking assignments");
         }
         if (in_always_ff_ && cfg.naming.enable && register_re_ &&
             node.kind == SyntaxKind::NonblockingAssignmentExpression) {
@@ -644,48 +662,48 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const ConditionalStatementSyntax& node) {
         if (cfg.statement.explicit_begin) {
             if (!is_block_statement(node.statement))
-                diags.push_back(make_diag(sm, node.ifKeyword.location(), statement_sev(),
-                    "[statement] if statement body should use begin/end"));
+                push_diag(diags, sm, node.ifKeyword.location(), statement_sev(),
+                    "[statement] if statement body should use begin/end");
             if (node.elseClause && !node.elseClause->clause->as_if<ConditionalStatementSyntax>() &&
                 !is_block_statement(node.elseClause->clause))
-                diags.push_back(make_diag(sm, node.elseClause->elseKeyword.location(), statement_sev(),
-                    "[statement] else statement body should use begin/end"));
+                push_diag(diags, sm, node.elseClause->elseKeyword.location(), statement_sev(),
+                    "[statement] else statement body should use begin/end");
         }
         visitDefault(node);
     }
 
     void handle(const LoopStatementSyntax& node) {
         if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
-            diags.push_back(make_diag(sm, node.repeatOrWhile.location(), statement_sev(),
-                "[statement] loop body should use begin/end"));
+            push_diag(diags, sm, node.repeatOrWhile.location(), statement_sev(),
+                "[statement] loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForLoopStatementSyntax& node) {
         if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
-            diags.push_back(make_diag(sm, node.forKeyword.location(), statement_sev(),
-                "[statement] for loop body should use begin/end"));
+            push_diag(diags, sm, node.forKeyword.location(), statement_sev(),
+                "[statement] for loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForeachLoopStatementSyntax& node) {
         if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
-            diags.push_back(make_diag(sm, node.keyword.location(), statement_sev(),
-                "[statement] foreach loop body should use begin/end"));
+            push_diag(diags, sm, node.keyword.location(), statement_sev(),
+                "[statement] foreach loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForeverStatementSyntax& node) {
         if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
-            diags.push_back(make_diag(sm, node.foreverKeyword.location(), statement_sev(),
-                "[statement] forever body should use begin/end"));
+            push_diag(diags, sm, node.foreverKeyword.location(), statement_sev(),
+                "[statement] forever body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const DoWhileStatementSyntax& node) {
         if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
-            diags.push_back(make_diag(sm, node.doKeyword.location(), statement_sev(),
-                "[statement] do body should use begin/end"));
+            push_diag(diags, sm, node.doKeyword.location(), statement_sev(),
+                "[statement] do body should use begin/end");
         visitDefault(node);
     }
 };
