@@ -354,6 +354,55 @@ endmodule
     std::filesystem::remove(path);
 }
 
+TEST_CASE("signature help: an ambiguous constructor name yields no signature", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_sig_new.sv";
+    // Two classes, two `new`s.  Which one `handle = new(` means depends on the
+    // declared type of `handle`, so answering with either would be a guess.
+    const std::string text = "class alpha_c;\n"
+                             "    function new(string alpha_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "class beta_c;\n"
+                             "    function new(string beta_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    beta_c handle;\n"
+                             "    initial handle = new(\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(10, (int)std::string("    initial handle = new(").size());
+
+    CHECK_FALSE(provide_signature_help(analyzer, params).has_value());
+}
+
+TEST_CASE("signature help: an unambiguous constructor still resolves", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_sig_new_single.sv";
+    const std::string text = "class only_c;\n"
+                             "    function new(string only_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    only_c handle;\n"
+                             "    initial handle = new(\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(6, (int)std::string("    initial handle = new(").size());
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(!help->signatures.empty());
+    CHECK(help->signatures[0].label.find("only_arg") != std::string::npos);
+}
+
 TEST_CASE("hover: a macro-declared member resolves to the named owner class", "[hover]") {
     const auto header = std::filesystem::temp_directory_path() / "lazyverilog_hover_utils.svh";
     {
