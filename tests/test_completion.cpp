@@ -1157,6 +1157,59 @@ TEST_CASE("completion: identifier completion requires package import", "[complet
     CHECK(has_label(wildcard_import, "H_IDLE"));
 }
 
+TEST_CASE("completion: an imported package in another open buffer is offered",
+          "[completion][imports]") {
+    // The import gate in value_visible_in_context() reads ctx.visible_imports.
+    // Those come from the current file, and the values being filtered come from
+    // the *other open buffer's* shard -- generic identifier completion is
+    // deliberately current-file-plus-open-buffers, so a package that is merely
+    // on the .f list stays out either way (see the extra-files test below).
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const std::string pkg_uri = "file:///tmp/completion_open_pkg.sv";
+    analyzer.open(pkg_uri,
+                  "package pkg_open_buffer;\n"
+                  "    parameter int OPEN_PARAM = 3;\n"
+                  "endpackage\n");
+
+    const std::string uri = "file:///tmp/completion_open_pkg_user.sv";
+    analyzer.open(uri,
+                  "import pkg_open_buffer::*;\n"
+                  "module top_open_pkg;\n"
+                  "    \n"
+                  "endmodule\n");
+
+    auto result = complete_at(engine, analyzer, uri, 2, 4);
+
+    CHECK(has_label(result, "OPEN_PARAM"));
+}
+
+TEST_CASE("completion: an un-imported package in another open buffer stays hidden",
+          "[completion][imports]") {
+    // The other half: the gate must still filter.  Without an import statement
+    // the same open-buffer package must not reach identifier completion, or the
+    // fix above would just be "show everything from every open buffer".
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const std::string pkg_uri = "file:///tmp/completion_open_pkg_noimp.sv";
+    analyzer.open(pkg_uri,
+                  "package pkg_open_noimport;\n"
+                  "    parameter int UNIMPORTED_PARAM = 3;\n"
+                  "endpackage\n");
+
+    const std::string uri = "file:///tmp/completion_open_pkg_noimp_user.sv";
+    analyzer.open(uri,
+                  "module top_open_pkg_noimport;\n"
+                  "    \n"
+                  "endmodule\n");
+
+    auto result = complete_at(engine, analyzer, uri, 1, 4);
+
+    CHECK_FALSE(has_label(result, "UNIMPORTED_PARAM"));
+}
+
 TEST_CASE("completion: imports from extra files do not leak into current file", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;
