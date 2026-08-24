@@ -313,6 +313,11 @@ static std::string text_scope_qualifier_before_double_colon(const std::string& t
 struct DotCompletionSyntaxContext {
     size_t dot_offset{0};
     std::string base_name;
+    // Set when the receiver is an implicit handle rather than a named value,
+    // i.e. SyntaxKind::ThisHandle or SyntaxKind::SuperHandle.  Those carry no
+    // identifier to look up -- their type comes from the enclosing class -- so
+    // base_name stays empty and the caller resolves the type directly.
+    slang::syntax::SyntaxKind base_handle{slang::syntax::SyntaxKind::Unknown};
 };
 
 // Offset of `token` in the document the user is editing.
@@ -382,6 +387,7 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
         size_t dot_start;
         size_t best_end{0};
         std::string result;
+        SyntaxKind handle_kind{SyntaxKind::Unknown};
 
         NameVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
                     size_t dot_start)
@@ -421,11 +427,34 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
             consider(node);
             visitDefault(node);
         }
+
+        // `this` and `super` parse as KeywordNameSyntax, so they reach the
+        // visitor as names but have no identifier for syntax_scope_base_name()
+        // to return.  Record which handle it is instead; the type comes from
+        // the enclosing class, not from a declaration lookup.
+        void handle(const KeywordNameSyntax& node) {
+            if (node.kind != SyntaxKind::ThisHandle && node.kind != SyntaxKind::SuperHandle) {
+                visitDefault(node);
+                return;
+            }
+            const auto start = completion_original_offset(sm, document_buffer, node.keyword.location());
+            if (start) {
+                const size_t end = *start + node.keyword.rawText().size();
+                if (end == dot_start && end >= best_end) {
+                    best_end = end;
+                    result.clear();
+                    handle_kind = node.kind;
+                }
+            }
+            visitDefault(node);
+        }
     };
 
     NameVisitor names(sm, document_buffer, dots.best_start);
     tree.root().visit(names);
-    return DotCompletionSyntaxContext{.dot_offset = dots.best_start, .base_name = names.result};
+    return DotCompletionSyntaxContext{.dot_offset = dots.best_start,
+                                      .base_name = names.result,
+                                      .base_handle = names.handle_kind};
 }
 
 static size_t token_start_offset(const slang::parsing::Token& token) {
@@ -1638,6 +1667,45 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
     return result.empty() ? ctx.scope_name : result;
 }
 
+struct CurrentFileClassBase {
+    bool declared_here{false}; // the class itself is declared in this file
+    std::string base;          // its extends clause, empty when it has none
+};
+
+/// What this file's AST says about @p class_name and its immediate base.
+///
+/// Both facts are reported because callers need to tell "this file does not
+/// declare the class" apart from "it declares it with no base"; collapsing them
+/// into one empty string loses the distinction that decides whether the shard
+/// layer should take over.
+static CurrentFileClassBase current_file_class_base(const DocumentState& state,
+                                                    std::string_view class_name) {
+    CurrentFileClassBase info;
+    if (!state.tree || class_name.empty())
+        return info;
+    using namespace slang::syntax;
+
+    struct ClassBaseVisitor : SyntaxVisitor<ClassBaseVisitor> {
+        std::string_view class_name;
+        CurrentFileClassBase& info;
+        ClassBaseVisitor(std::string_view class_name, CurrentFileClassBase& info)
+            : class_name(class_name), info(info) {}
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            info.declared_here = true;
+            if (node.extendsClause)
+                info.base = completion_base_type_name(
+                    current_ast_decl_text(*node.extendsClause->baseName));
+        }
+    } visitor(class_name, info);
+
+    state.tree->root().visit(visitor);
+    return info;
+}
+
 // Walk the current file's `extends` chain and return the first base class the
 // file does not declare itself.
 //
@@ -1645,41 +1713,24 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
 // be an open-buffer class while its base lives in a closed project shard.  The
 // AST walk above can only emit members it can see, so the caller needs the name
 // to continue the climb with in the shard layer.
+//
+// Note this deliberately answers only for bases the shard layer must resolve.
+// A `super.` receiver wants the immediate base whether or not this file
+// declares it, and so calls current_file_class_base() directly.
 static std::string current_file_unresolved_base_class(const DocumentState& state,
                                                       std::string_view class_name) {
     if (!state.tree || class_name.empty())
         return {};
-    using namespace slang::syntax;
-
-    struct ClassBaseVisitor : SyntaxVisitor<ClassBaseVisitor> {
-        std::string_view class_name;
-        bool found{false};
-        std::string base;
-        explicit ClassBaseVisitor(std::string_view class_name) : class_name(class_name) {}
-        void handle(const ClassDeclarationSyntax& node) {
-            if (std::string_view(node.name.valueText()) != class_name) {
-                visitDefault(node);
-                return;
-            }
-            found = true;
-            if (node.extendsClause)
-                base = completion_base_type_name(
-                    current_ast_decl_text(*node.extendsClause->baseName));
-        }
-    };
 
     std::string current(class_name);
     std::unordered_set<std::string> visited;
     while (visited.insert(current).second) {
-        ClassBaseVisitor visitor(current);
-        state.tree->root().visit(visitor);
-        if (!visitor.found || visitor.base.empty())
+        const auto info = current_file_class_base(state, current);
+        if (!info.declared_here || info.base.empty())
             return {};
-        current = visitor.base;
+        current = info.base;
 
-        ClassBaseVisitor base_visitor(current);
-        state.tree->root().visit(base_visitor);
-        if (!base_visitor.found)
+        if (!current_file_class_base(state, current).declared_here)
             return current; // declared elsewhere — the shard layer takes over
     }
     return {};
@@ -2748,6 +2799,23 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
                 return ctx;
             }
 
+            // this.prefix / super.prefix → MemberAccess on a type we already
+            // know.  `this` is the enclosing class; `super` is deliberately its
+            // base, so that a member the current class overrides still resolves
+            // to the base declaration the user asked for by writing `super`.
+            if (dot_ctx->base_handle == slang::syntax::SyntaxKind::ThisHandle ||
+                dot_ctx->base_handle == slang::syntax::SyntaxKind::SuperHandle) {
+                std::string type = ctx.current_scope_name;
+                if (dot_ctx->base_handle == slang::syntax::SyntaxKind::SuperHandle && !type.empty())
+                    type = current_file_class_base(state, type).base;
+                if (!type.empty()) {
+                    ctx.kind = CompletionContextKind::MemberAccess;
+                    ctx.scope_name = type;
+                    ctx.receiver_type = std::move(type);
+                    return ctx;
+                }
+            }
+
             // bare '.' (no preceding identifier) → NamedPort or Parameter.
             // This is recovered from slang hierarchy-instantiation nodes and
             // named connection/parameter nodes, not from a backward source
@@ -3093,8 +3161,15 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // ask each shard for members of that type.  This keeps the
             // no-flat-merge rule without losing the common
             // "variable_of_other_file_class." completion case.
-            std::optional<std::string> value_type =
-                type_of_value(completion_index, ctx.current_scope_name, ctx.scope_name);
+            // A `this` / `super` receiver already carries its type: there is no
+            // variable of that name to look up, and asking for one would search
+            // for a declaration named after the class itself.
+            std::optional<std::string> value_type;
+            if (!ctx.receiver_type.empty())
+                value_type = ctx.receiver_type;
+            else
+                value_type = type_of_value(completion_index, ctx.current_scope_name,
+                                           ctx.scope_name);
             if (!value_type) {
                 for (const auto& shard : *opened_shards) {
                     if (!shard.index)
