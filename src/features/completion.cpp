@@ -1546,13 +1546,28 @@ current_file_package_scope_items_from_ast(const DocumentState& state, std::strin
             if (std::string_view(node.name.valueText()) != scope)
                 return;
             for (const auto* item : node.items) {
-                const auto* method = item ? item->as_if<ClassMethodDeclarationSyntax>() : nullptr;
-                if (!method)
+                if (!item)
                     continue;
-                push_unique_item(items, seen, completion_ast_text(*method->declaration->prototype->name),
-                                 method->declaration->kind == SyntaxKind::TaskDeclaration
-                                     ? lsCompletionItemKind::Method
-                                     : lsCompletionItemKind::Function);
+                if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
+                    push_unique_item(
+                        items, seen, completion_ast_text(*method->declaration->prototype->name),
+                        method->declaration->kind == SyntaxKind::TaskDeclaration
+                            ? lsCompletionItemKind::Method
+                            : lsCompletionItemKind::Function);
+                    continue;
+                }
+                // A typedef in a class body is reached through `::` just like a
+                // static method.  `uvm_object_utils(T)` declares `type_id` this
+                // way, and `T::type_id::create(...)` is the most-typed line in
+                // a UVM testbench, so omitting nested types hides it.
+                const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>();
+                const auto* td = prop ? prop->declaration->as_if<TypedefDeclarationSyntax>()
+                                      : item->as_if<TypedefDeclarationSyntax>();
+                if (td)
+                    push_unique_item(items, seen, std::string(td->name.valueText()),
+                                     td->type->kind == SyntaxKind::EnumType
+                                         ? lsCompletionItemKind::Enum
+                                         : lsCompletionItemKind::TypeParameter);
             }
         }
     } visitor(scope, items, seen);
@@ -2503,6 +2518,19 @@ class PackageScopeProvider : public CompletionProvider {
                 auto item = make_item(field.name, lsCompletionItemKind::Field);
                 if (!field.type.empty())
                     item.detail = optional<std::string>(field.type);
+                items.push_back(std::move(item));
+            }
+            // A typedef declared in a class body is reached through `::` just
+            // like a static method.  UVM's factory macros make `type_id` the
+            // most-typed member of the lot, so omitting nested types drops it
+            // from every registered class.
+            for (const auto& td : index.typedefs) {
+                if (td.parent_scope != cls.name)
+                    continue;
+                auto item = make_item(td.name, td.is_enum ? lsCompletionItemKind::Enum
+                                                          : lsCompletionItemKind::TypeParameter);
+                if (!td.resolved.empty())
+                    item.detail = optional<std::string>(td.resolved);
                 items.push_back(std::move(item));
             }
         }
