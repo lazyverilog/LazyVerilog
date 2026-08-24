@@ -354,6 +354,47 @@ endmodule
     std::filesystem::remove(path);
 }
 
+TEST_CASE("hover: a macro-declared member resolves to the named owner class", "[hover]") {
+    const auto header = std::filesystem::temp_directory_path() / "lazyverilog_hover_utils.svh";
+    {
+        std::ofstream out(header);
+        out << "`define HOVER_UTILS(T) \\\n"
+               "    typedef registry_of #(T) type_id;\n";
+    }
+
+    // Both classes get a `type_id` from the same macro body, so both
+    // declarations report that one location.  Only the qualifier says which
+    // class the cursor meant.
+    Analyzer analyzer;
+    const std::string uri =
+        uri_from_path(std::filesystem::temp_directory_path() / "lazyverilog_hover_utils_user.sv");
+    const std::string text = "`include \"lazyverilog_hover_utils.svh\"\n"
+                             "class alpha_c;\n"
+                             "    `HOVER_UTILS(alpha_c)\n"
+                             "endclass\n"
+                             "class beta_c;\n"
+                             "    `HOVER_UTILS(beta_c)\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    initial handle = beta_c::type_id;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    const auto col = std::string("    initial handle = beta_c::type_id;").find("type_id");
+    params.position = lsPosition(8, (int)col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& value = hover->contents.second->value;
+    CHECK(value.find("beta_c") != std::string::npos);
+    CHECK(value.find("alpha_c") == std::string::npos);
+
+    std::filesystem::remove(header);
+}
+
 TEST_CASE("hover: resolves instance module names through extra files", "[hover]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_child.sv";
     {

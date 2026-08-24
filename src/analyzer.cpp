@@ -1950,18 +1950,22 @@ static std::string name_text(const slang::syntax::NameSyntax& name) {
 static std::optional<SymbolInfo>
 symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::string& uri,
                             const std::string& name, const Location& definition,
-                            const SyntaxIndex* prebuilt_index = nullptr) {
+                            const SyntaxIndex* prebuilt_index = nullptr,
+                            const std::string& owner = {}) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
         const std::string& name;
         const Location& definition;
         const SyntaxIndex& index;
+        // Class named to the left of `::`, empty when the cursor was unqualified.
+        const std::string& owner;
+        std::vector<std::string> enclosing_class;
         std::optional<SymbolInfo> result;
 
         Visitor(const slang::SourceManager& sm, const std::string& uri, const std::string& name,
-                const Location& definition, const SyntaxIndex& index)
-            : sm(sm), uri(uri), name(name), definition(definition), index(index) {}
+                const Location& definition, const SyntaxIndex& index, const std::string& owner)
+            : sm(sm), uri(uri), name(name), definition(definition), index(index), owner(owner) {}
 
         void set_from_token(const slang::parsing::Token& token, std::string kind,
                             std::string detail) {
@@ -2000,7 +2004,9 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::ClassDeclarationSyntax& node) {
             if (result || node.name.valueText() != name ||
                 !token_at_location(sm, node.name, definition)) {
+                enclosing_class.emplace_back(node.name.valueText());
                 visitDefault(node);
+                enclosing_class.pop_back();
                 return;
             }
 
@@ -2229,7 +2235,13 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
-            set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
+            // A macro that declares a member expands once per class, and every
+            // expansion reports the macro body's own location -- UVM's factory
+            // macros give each registered class its own `type_id` this way.
+            // Location alone therefore cannot tell them apart, so when the
+            // cursor named an owner, only that owner's copy may answer.
+            if (owner.empty() || (!enclosing_class.empty() && enclosing_class.back() == owner))
+                set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
             if (!result)
                 visitDefault(node);
         }
@@ -2241,7 +2253,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
     // removing: a point query should not silently index the whole current file.
     SyntaxIndex empty_index;
     const auto& index = prebuilt_index ? *prebuilt_index : empty_index;
-    Visitor visitor(tree.sourceManager(), uri, name, definition, index);
+    Visitor visitor(tree.sourceManager(), uri, name, definition, index, owner);
     tree.root().visit(visitor);
     return visitor.result;
 }
@@ -2731,10 +2743,25 @@ static SymbolInfo symbol_info_for_typedef_entry(const TypedefEntry& td, const st
 static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                                                         const DefinitionTarget& target,
                                                         const Location& definition) {
-    // First try an exact definition-location lookup.  This is the most robust
-    // path for closed project files because the clicked token may be classified
-    // only as a generic identifier, while `definition_of_state()` has already
-    // resolved the exact declaration in a SyntaxIndex shard.
+    // A member spelled once per owner cannot be identified by location alone
+    // when every owner's copy expands from the same macro body: UVM's factory
+    // macros give each registered class its own `type_id`, and all of them
+    // report the macro's own line.  The location scan below would hand back
+    // whichever class was indexed first.  When the cursor named the owner
+    // (`lv_full_item::type_id`), resolve under that owner instead.
+    if (!target.package_qualifier.empty() && !target.name.empty()) {
+        const auto key = package_scoped_key(target.package_qualifier, target.name);
+        if (auto it = idx.package_type_by_scoped_name.find(key);
+            it != idx.package_type_by_scoped_name.end() && it->second < idx.typedefs.size()) {
+            const auto& td = idx.typedefs[it->second];
+            return symbol_info_for_typedef_entry(td, td.name, definition);
+        }
+    }
+
+    // Otherwise try an exact definition-location lookup.  This is the most
+    // robust path for closed project files because the clicked token may be
+    // classified only as a generic identifier, while `definition_of_state()`
+    // has already resolved the exact declaration in a SyntaxIndex shard.
     for (const auto& module : idx.modules) {
         if (index_entry_location_matches(idx, module.file_id, module.line, module.col, definition))
             return SymbolInfo{.name = module.name,
@@ -2997,7 +3024,8 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // first; token_at_location() matches exact URI/line/column, so this does
         // not steal metadata for definitions that only exist in a different
         // shard.
-        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition, nullptr,
+                                                    target.package_qualifier))
             return info;
 
         if (definition->uri != uri) {
