@@ -1063,3 +1063,93 @@ TEST_CASE("project index: a header-heavy file still resolves every name it can r
 
     fs::remove_all(dir);
 }
+
+TEST_CASE("syntax_index: a macro-declared class member resolves to the macro's own file",
+          "[index]") {
+    // A macro body can declare a whole member (UVM does this pervasively, e.g.
+    // `UVM_SEQ_ITEM_PULL_IMP -> task get_next_item(...)).  Such a member's
+    // position is reported at the macro's own definition site, so its file_id
+    // must name that file too -- pairing an invocation-site file with a
+    // definition-site line/col yields a location that exists in neither.
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "lazyverilog_macro_decl_attribution";
+    fs::create_directories(root);
+    {
+        std::ofstream header(root / "decl_macros.svh");
+        header << "`define DECL_FIELD int magic_field;\n";
+    }
+    {
+        std::ofstream source(root / "macro_decl_top.sv");
+        source << "`include \"decl_macros.svh\"\n"
+                  "class my_cls;\n"
+                  "  `DECL_FIELD\n"
+                  "  int normal_field;\n"
+                  "endclass\n";
+    }
+
+    slang::SourceManager sm;
+    sm.addUserDirectories(std::string_view(root.string()));
+    auto tree = slang::syntax::SyntaxTree::fromFile((root / "macro_decl_top.sv").string(), sm);
+    REQUIRE(tree);
+
+    auto idx = SyntaxIndex::build(**tree);
+    REQUIRE(idx.classes.size() == 1);
+
+    auto field_named = [&](std::string_view name) -> const FieldEntry* {
+        for (const auto& field : idx.classes[0].fields)
+            if (field.name == name)
+                return &field;
+        return nullptr;
+    };
+
+    const auto* normal = field_named("normal_field");
+    REQUIRE(normal != nullptr);
+    CHECK(idx.source_uri(normal->file_id).ends_with("macro_decl_top.sv"));
+    CHECK(normal->line == 4);
+
+    // The macro-declared field is written at decl_macros.svh:1, not in the
+    // file that invokes the macro.
+    const auto* magic = field_named("magic_field");
+    REQUIRE(magic != nullptr);
+    CHECK(magic->line == 1);
+    CHECK(idx.source_uri(magic->file_id).ends_with("decl_macros.svh"));
+}
+
+TEST_CASE("syntax_index: a type spelled as an object-like macro resolves to the aliased name",
+          "[index]") {
+    // The shard stores rendered type text, which preserves a macro's invocation
+    // spelling.  That is right for dimensions -- Connect / Interface synthesize
+    // source from port text -- but a base type name spelled `ITEM_T matches no
+    // class in any lookup table, so member resolution on such a field dies at
+    // the shard boundary while the live-AST path resolves it fine.
+    const std::string source = "`define ITEM_T my_item\n"
+                               "`define WIDTH 8\n"
+                               "class my_item;\n"
+                               "  int data_field;\n"
+                               "endclass\n"
+                               "class holder;\n"
+                               "  `ITEM_T aliased;\n"
+                               "  my_item plain;\n"
+                               "  logic [`WIDTH-1:0] bus;\n"
+                               "endclass\n";
+    auto tree = slang::syntax::SyntaxTree::fromText(source);
+    REQUIRE(tree != nullptr);
+    auto idx = SyntaxIndex::build(*tree, source);
+
+    auto holder = std::find_if(idx.classes.begin(), idx.classes.end(),
+                               [](const ClassEntry& c) { return c.name == "holder"; });
+    REQUIRE(holder != idx.classes.end());
+
+    auto type_of = [&](std::string_view name) {
+        for (const auto& field : holder->fields)
+            if (field.name == name)
+                return field.type;
+        return std::string("<missing>");
+    };
+
+    CHECK(type_of("aliased") == "my_item");
+    CHECK(type_of("plain") == "my_item");
+    // A macro standing for a dimension keeps the user's spelling: there is no
+    // base type name to resolve, and port/signal text is used to generate code.
+    CHECK(type_of("bus").find("`WIDTH") != std::string::npos);
+}

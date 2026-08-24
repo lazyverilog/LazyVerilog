@@ -43,7 +43,7 @@ static MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolv
                                           const DefineDirectiveSyntax& def) {
     MacroEntry mac;
     mac.name = std::string(def.name.valueText());
-    mac.file_id = resolver.for_token(index, sm, def.name);
+    mac.file_id = resolver.for_declaration_token(index, sm, def.name);
     if (def.formalArguments) {
         mac.is_function_like = true;
         for (const auto* arg : def.formalArguments->args) {
@@ -158,7 +158,7 @@ static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
     auto [line, col] = token_pos_line1_col0(sm, name);
     ports.push_back(PortEntry{
         .name = token_value_text(name),
-        .file_id = resolver.for_token(index, sm, name),
+        .file_id = resolver.for_declaration_token(index, sm, name),
         .direction = std::move(direction),
         .type = std::move(type),
         .decl_type = std::move(decl_type),
@@ -303,7 +303,7 @@ struct InstanceScan {
             entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = token_value_text(instance->decl->name);
-                entry.file_id = resolver->for_token(*index, *sm, instance->decl->name);
+                entry.file_id = resolver->for_declaration_token(*index, *sm, instance->decl->name);
                 entry.line = token_pos_line1_col0(*sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -327,7 +327,7 @@ struct InstanceScan {
                 entry.connections.push_back(NamedPortConn{
                     .port_name = token_value_text(named->name),
                     .signal_name = simple_identifier_from_expr(named->expr),
-                    .file_id = resolver->for_token(*index, *sm, named->name),
+                    .file_id = resolver->for_declaration_token(*index, *sm, named->name),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,
@@ -387,7 +387,7 @@ static void add_package_imports(const PackageImportDeclarationSyntax& node, Synt
         if (!entry.wildcard)
             entry.symbol_name = token_value_text(item->item);
         entry.parent_scope = std::string(parent_scope);
-        entry.file_id = resolver.for_token(index, sm, item->package);
+        entry.file_id = resolver.for_declaration_token(index, sm, item->package);
         entry.start_line = decl_line;
         entry.end_line = scope_end_line;
         index.imports.push_back(std::move(entry));
@@ -399,7 +399,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                            std::string_view source, IndexDepth depth = IndexDepth::Full) {
     ModuleEntry entry;
     entry.name = token_value_text(module.header->name);
-    entry.file_id = resolver.for_token(index, sm, module.header->name);
+    entry.file_id = resolver.for_declaration_token(index, sm, module.header->name);
     auto [line, col] = token_pos_line1_col0(sm, module.header->name);
     entry.line = line;
     entry.col = col;
@@ -442,7 +442,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 auto [ml, mc] = token_pos_line1_col0(sm, item->name);
                 entry.modports.push_back(ModportEntry{
                     .name = token_value_text(item->name),
-                    .file_id = resolver.for_token(index, sm, item->name),
+                    .file_id = resolver.for_declaration_token(index, sm, item->name),
                     .line = ml,
                     .col = mc,
                 });
@@ -509,7 +509,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, *type_text, *decl),
                     .kind = "variable",
                     .parent_scope = entry.name,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .line = vl,
                     .col = vc,
                 });
@@ -527,7 +527,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 .type = render_syntax_node_text(sm, *proto.returnType),
                 .kind = std::string(proto.keyword.valueText()),
                 .parent_scope = entry.name,
-                .file_id = resolver.for_token(index, sm, name_tok),
+                .file_id = resolver.for_declaration_token(index, sm, name_tok),
                 .line = nl,
                 .col = nc,
                 .signature = make_subroutine_signature(proto, fn_name, sm),
@@ -564,7 +564,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                         .default_value = decl->initializer
                                              ? render_syntax_node_text(sm, *decl->initializer->expr)
                                              : std::string{},
-                        .file_id = resolver.for_token(index, sm, decl->name),
+                        .file_id = resolver.for_declaration_token(index, sm, decl->name),
                         .line = vl,
                         .col = vc,
                     });
@@ -625,7 +625,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -652,7 +652,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -680,7 +680,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                            std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = token_value_text(cls.name);
-    entry.file_id = resolver.for_token(index, sm, cls.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos_line1_col0(sm, cls.name);
     entry.line = line;
@@ -707,7 +707,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     entry.fields.push_back(
                         FieldEntry{.name = token_value_text(decl->name),
                                    .type = type_text,
-                                   .file_id = resolver.for_token(index, sm, decl->name),
+                                   .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                    .line = fl,
                                    .col = fc});
                 }
@@ -730,12 +730,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
-            // file_id must name the same file the line/col below resolve
-            // into, or a method whose whole declaration is a macro-body
-            // literal ends up attributed to the invocation file while its
-            // line/col point into the macro's own definition file.
-            m.file_id =
-                resolver.for_location(index, sm, token_true_origin_location(sm, name_tok));
+            m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             m.line = ml;
             m.col = mc;
@@ -753,8 +748,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
-            m.file_id =
-                resolver.for_location(index, sm, token_true_origin_location(sm, name_tok));
+            m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             m.line = ml;
             m.col = mc;
@@ -775,7 +769,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = resolver.for_token(index, sm, td.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, td.name);
     auto [td_line, td_col] = token_pos_line1_col0(sm, td.name);
     entry.line = td_line;
     entry.col = td_col;
@@ -787,7 +781,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 auto [em_line, em_col] = token_pos_line1_col0(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = token_value_text(member->name),
-                    .file_id = resolver.for_token(index, sm, member->name),
+                    .file_id = resolver.for_declaration_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -806,7 +800,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 entry.fields.push_back(FieldEntry{
                     .name = token_value_text(decl->name),
                     .type = with_declarator_dimensions(sm, type_text, *decl),
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .line = fl,
                     .col = fc,
                 });
@@ -1008,6 +1002,49 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
                 continue;
 
             index.macros.push_back(std::move(mac));
+        }
+    }
+
+    // A type written as a bare object-like macro (`` `define ITEM_T my_item ``)
+    // renders as its invocation spelling, and no class/typedef table can be
+    // keyed on `` `ITEM_T ``.  The live-AST path already reports the expanded
+    // name, so resolving the alias here is what keeps the shard and the AST
+    // representations of one file agreeing.
+    //
+    // Only a single-identifier body is substituted.  A macro standing for a
+    // dimension (`` [`WIDTH-1:0] ``) or a whole declaration has no base type
+    // name to resolve, and PortEntry text is deliberately left alone because
+    // Connect / Interface synthesize source from it and must keep the user's
+    // spelling.
+    std::unordered_map<std::string, std::string> macro_type_aliases;
+    for (const auto* def : tree.getDefinedMacros()) {
+        if (!def || def->formalArguments || !def->name || def->body.size() != 1)
+            continue;
+        const auto& body = def->body[0];
+        if (body.kind != slang::parsing::TokenKind::Identifier)
+            continue;
+        macro_type_aliases.emplace(std::string(def->name.valueText()),
+                                   std::string(body.valueText()));
+    }
+    if (!macro_type_aliases.empty()) {
+        auto resolve_macro_type = [&](std::string& type) {
+            if (type.size() < 2 || type.front() != '`')
+                return;
+            const auto alias = macro_type_aliases.find(type.substr(1));
+            if (alias != macro_type_aliases.end())
+                type = alias->second;
+        };
+        for (auto& value : index.values)
+            resolve_macro_type(value.type);
+        for (auto& cls : index.classes) {
+            resolve_macro_type(cls.base_class);
+            for (auto& field : cls.fields)
+                resolve_macro_type(field.type);
+        }
+        for (auto& td : index.typedefs) {
+            resolve_macro_type(td.resolved);
+            for (auto& field : td.fields)
+                resolve_macro_type(field.type);
         }
     }
 

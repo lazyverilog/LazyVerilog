@@ -80,8 +80,14 @@ SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::Source
 /// shard from every dependent.
 class SourceFileIdResolver {
 public:
+    /// File of a reference occurrence: the call site, matching token_pos().
     SourceFileID for_token(SyntaxIndex& index, const slang::SourceManager& sm,
                            const slang::parsing::Token& token);
+    /// File of a declaration's name token: its true origin, matching
+    /// token_pos_line1_col0().  A member declared inside a macro body belongs
+    /// to the file that defined the macro, not the one that invoked it.
+    SourceFileID for_declaration_token(SyntaxIndex& index, const slang::SourceManager& sm,
+                                       const slang::parsing::Token& token);
     SourceFileID for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                               slang::SourceLocation location);
 
