@@ -32,6 +32,20 @@ struct SubroutineInfo {
     std::vector<ParamInfo> args;
 };
 
+static bool same_signature(const SubroutineInfo& lhs, const SubroutineInfo& rhs) {
+    if (lhs.kind != rhs.kind || lhs.return_type != rhs.return_type ||
+        lhs.args.size() != rhs.args.size())
+        return false;
+    for (size_t i = 0; i < lhs.args.size(); ++i) {
+        const auto& a = lhs.args[i];
+        const auto& b = rhs.args[i];
+        if (a.name != b.name || a.direction != b.direction || a.type != b.type ||
+            a.default_value != b.default_value)
+            return false;
+    }
+    return true;
+}
+
 static std::string trim(std::string text) {
     auto first =
         std::find_if_not(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); });
@@ -130,13 +144,19 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
     struct Visitor : public SyntaxVisitor<Visitor> {
         const std::string& name;
         std::optional<SubroutineInfo> result;
+        // Every class declares its own `new`, so a bare-name match would answer
+        // a constructor call with whichever class happens to come first in the
+        // file.  Which one a call means depends on the type being constructed,
+        // which this text-driven provider cannot resolve.  Candidates that all
+        // render the same signature are still safe to show -- UVM's factory
+        // macros give every class an identical `create`, for instance -- so
+        // only genuinely differing candidates make the name ambiguous.
+        bool ambiguous{false};
 
         explicit Visitor(const std::string& name) : name(name) {}
 
         void handle(const FunctionDeclarationSyntax& node) {
-            if (result)
-                return;
-            if (name_text(*node.prototype->name) != name)
+            if (ambiguous || name_text(*node.prototype->name) != name)
                 return;
 
             SubroutineInfo info;
@@ -159,6 +179,12 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
                     if (!param.name.empty())
                         info.args.push_back(std::move(param));
                 }
+            }
+
+            if (result && !same_signature(*result, info)) {
+                ambiguous = true;
+                result.reset();
+                return;
             }
             result = std::move(info);
         }
