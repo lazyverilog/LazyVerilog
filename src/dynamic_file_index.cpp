@@ -96,7 +96,7 @@ ValueEntry* add_value(SyntaxIndex& index, SourceFileIdResolver& resolver,
                                       .type = std::move(type),
                                       .kind = std::move(kind),
                                       .parent_scope = std::move(parent_scope),
-                                      .file_id = resolver.for_token(index, sm, name),
+                                      .file_id = resolver.for_declaration_token(index, sm, name),
                                       .line = line,
                                       .col = col});
     return &index.values.back();
@@ -111,7 +111,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, SourceFileIdResolver& res
         return;
     auto [line, col] = token_pos_line1_col0(sm, name);
     module.ports.push_back(PortEntry{.name = token_value_text(name),
-                                     .file_id = resolver.for_token(index, sm, name),
+                                     .file_id = resolver.for_declaration_token(index, sm, name),
                                      .direction = direction,
                                      .type = type,
                                      .decl_type = decl_type.empty() ? type : std::move(decl_type),
@@ -128,7 +128,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, SourceFileIdResolver& res
                                       .default_value = is_parameter
                                                            ? module.ports.back().default_value
                                                            : std::string{},
-                                      .file_id = resolver.for_token(index, sm, name),
+                                      .file_id = resolver.for_declaration_token(index, sm, name),
                                       .line = line,
                                       .col = col});
 }
@@ -203,7 +203,7 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
         entry.parent_module = parent_module;
         if (inst->decl) {
             entry.instance_name = token_value_text(inst->decl->name);
-            entry.file_id = resolver.for_token(index, sm, inst->decl->name);
+            entry.file_id = resolver.for_declaration_token(index, sm, inst->decl->name);
             entry.line = token_pos_line1_col0(sm, inst->decl->name).first;
         }
         entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -221,7 +221,7 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
                 entry.connections.push_back(NamedPortConn{.port_name = token_value_text(named->name),
                                                           .signal_name =
                                                               simple_identifier_from_expr(named->expr),
-                                                          .file_id = resolver.for_token(index, sm, named->name),
+                                                          .file_id = resolver.for_declaration_token(index, sm, named->name),
                                                           .line = line,
                                                           .col = col,
                                                           .hint_col = paren_line == line
@@ -297,7 +297,7 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                    std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = token_value_text(cls.name);
-    entry.file_id = resolver.for_token(index, sm, cls.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos_line1_col0(sm, cls.name);
     entry.line = line;
@@ -317,19 +317,27 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     auto [fl, fc] = token_pos_line1_col0(sm, decl->name);
                     entry.fields.push_back(FieldEntry{.name = token_value_text(decl->name),
                                                       .type = with_dims(sm, type, *decl),
-                                                      .file_id = resolver.for_token(index, sm, decl->name),
+                                                      .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                       .line = fl,
                                                       .col = fc});
                 }
             }
         } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *method->declaration->prototype;
-            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
-            entry.methods.push_back(MethodEntry{.name = node_text_raw(sm, *proto.name),
+            // Match the shard builder: a method whose declaration is a macro-body
+            // literal has to be keyed by its resolved identifier and located from
+            // that identifier's own token, or the open-buffer index disagrees with
+            // the shard index for the same file.
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
+            entry.methods.push_back(MethodEntry{.name = id_name
+                                                    ? std::string(id_name->identifier.valueText())
+                                                    : node_text_raw(sm, *proto.name),
                                                 .return_type = node_text_raw(sm, *proto.returnType),
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
-                                                .file_id = resolver.for_token(index, sm, proto.keyword),
+                                                .file_id = resolver.for_declaration_token(index, sm, name_tok),
                                                 .line = ml,
                                                 .col = mc});
         }
@@ -347,7 +355,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = resolver.for_token(index, sm, td.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, td.name);
     auto [line, col] = token_pos_line1_col0(sm, td.name);
     entry.line = line;
     entry.col = col;
@@ -358,7 +366,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                 auto [em_line, em_col] = token_pos_line1_col0(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = token_value_text(member->name),
-                    .file_id = resolver.for_token(index, sm, member->name),
+                    .file_id = resolver.for_declaration_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -376,7 +384,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                 auto [fl, fc] = token_pos_line1_col0(sm, decl->name);
                 entry.fields.push_back(FieldEntry{.name = token_value_text(decl->name),
                                                   .type = with_dims(sm, type, *decl),
-                                                  .file_id = resolver.for_token(index, sm, decl->name),
+                                                  .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                   .line = fl,
                                                   .col = fc});
             }
@@ -397,7 +405,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                     std::string_view source) {
     ModuleEntry module;
     module.name = token_value_text(node.header->name);
-    module.file_id = resolver.for_token(index, sm, node.header->name);
+    module.file_id = resolver.for_declaration_token(index, sm, node.header->name);
     auto [line, col] = token_pos_line1_col0(sm, node.header->name);
     module.line = line;
     module.col = col;
@@ -513,7 +521,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                     continue;
                 auto [ml, mc] = token_pos_line1_col0(sm, item->name);
                 module.modports.push_back(ModportEntry{.name = token_value_text(item->name),
-                                                       .file_id = resolver.for_token(index, sm, item->name),
+                                                       .file_id = resolver.for_declaration_token(index, sm, item->name),
                                                        .line = ml,
                                                        .col = mc});
             }
@@ -530,7 +538,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                      SourceFileIdResolver& resolver, const slang::SourceManager& sm) {
     ModuleEntry module;
     module.name = token_value_text(pkg.header->name);
-    module.file_id = resolver.for_token(index, sm, pkg.header->name);
+    module.file_id = resolver.for_declaration_token(index, sm, pkg.header->name);
     auto [line, col] = token_pos_line1_col0(sm, pkg.header->name);
     module.line = line;
     module.col = col;
@@ -568,7 +576,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                                                           decl->initializer
                                                               ? node_text_raw(sm, *decl->initializer->expr)
                                                               : std::string{},
-                                                      .file_id = resolver.for_token(index, sm, decl->name),
+                                                      .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                       .line = pl,
                                                       .col = pc});
                     index.package_symbols[module.name].push_back(token_value_text(decl->name));
@@ -594,7 +602,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                            .type = node_text_raw(sm, *proto.returnType),
                            .kind = token_value_text(proto.keyword),
                            .parent_scope = module.name,
-                           .file_id = resolver.for_token(index, sm, name_tok),
+                           .file_id = resolver.for_declaration_token(index, sm, name_tok),
                            .line = nl,
                            .col = nc,
                            .signature = make_subroutine_signature(proto, name, sm)});
@@ -641,7 +649,7 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
                 entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
                 if (!entry.wildcard)
                     entry.symbol_name = token_value_text(item->item);
-                entry.file_id = resolver.for_token(index, sm, item->package);
+                entry.file_id = resolver.for_declaration_token(index, sm, item->package);
                 entry.start_line = line;
                 index.imports.push_back(std::move(entry));
             }
@@ -660,7 +668,7 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
         auto [line, _] = token_pos_line1_col0(sm, def->name);
         MacroEntry mac;
         mac.name = token_value_text(def->name);
-        mac.file_id = resolver.for_token(index, sm, def->name);
+        mac.file_id = resolver.for_declaration_token(index, sm, def->name);
         mac.line = line;
         if (def->formalArguments) {
             mac.is_function_like = true;

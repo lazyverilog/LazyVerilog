@@ -124,6 +124,28 @@ SourceFileID SourceFileIdResolver::for_token(SyntaxIndex& index, const slang::So
     return for_location(index, sm, token.location());
 }
 
+SourceFileID SourceFileIdResolver::for_declaration_token(SyntaxIndex& index,
+                                                         const slang::SourceManager& sm,
+                                                         const slang::parsing::Token& token) {
+    if (!token || !token.location().valid())
+        return kInvalidSourceFileID;
+    // A stored file_id is only meaningful next to the line/col stored with it,
+    // so the two must share an origin policy:
+    //
+    //   declarations  token_pos_line1_col0() -> isMacroLoc     -> true origin
+    //   references    token_pos()            -> isMacroArgLoc  -> call site
+    //
+    // A declaration written as a literal inside a macro body therefore belongs
+    // to the file that *defined* the macro, matching where its line/col point.
+    // Pairing an invocation-site file with a definition-site line/col names a
+    // position that exists in neither file.  Use for_token() for reference
+    // occurrences, which stay attributed to the call site.
+    //
+    // Shard scoping is unaffected either way: accepts() classifies raw token
+    // locations through for_location() and never consults a stored file_id.
+    return for_location(index, sm, token_true_origin_location(sm, token));
+}
+
 bool SourceFileIdResolver::accepts(SyntaxIndex& index, const slang::SourceManager& sm,
                                    const slang::parsing::Token& token) {
     if (only_uri_.empty())
