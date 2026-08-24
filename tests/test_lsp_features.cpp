@@ -1371,3 +1371,47 @@ TEST_CASE("hover: resolves a declaration reached through a project file's includ
     std::filesystem::remove(header);
     std::filesystem::remove(pkg);
 }
+
+TEST_CASE("code action: RTL generators are not offered inside a class body", "[codeAction]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_class_scope.sv";
+    const std::string text = "class driver_c;\n"
+                             "    int depth;\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    logic clk;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto titles_at = [&](int line) {
+        lsCodeActionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.range.start = lsPosition(line, 0);
+        params.range.end = lsPosition(line, 0);
+        std::vector<std::string> titles;
+        for (const auto& a : provide_code_actions(analyzer, config, params))
+            titles.push_back(a.title);
+        return titles;
+    };
+
+    auto has = [](const std::vector<std::string>& titles, const std::string& needle) {
+        return std::any_of(titles.begin(), titles.end(), [&](const std::string& t) {
+            return t.find(needle) != std::string::npos;
+        });
+    };
+
+    // Line 1 is inside the class body: none of these are legal class items.
+    const auto in_class = titles_at(1);
+    CHECK_FALSE(has(in_class, "AutoWire"));
+    CHECK_FALSE(has(in_class, "AutoFF All"));
+    CHECK_FALSE(has(in_class, "always_ff"));
+    CHECK_FALSE(has(in_class, "always_comb"));
+
+    // Line 4 is module scope, where they belong.
+    const auto in_module = titles_at(4);
+    CHECK(has(in_module, "AutoWire"));
+    CHECK(has(in_module, "AutoFF All"));
+    CHECK(has(in_module, "always_ff"));
+    CHECK(has(in_module, "always_comb"));
+}

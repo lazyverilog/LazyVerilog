@@ -118,6 +118,31 @@ struct QuickFixLocator : public SyntaxVisitor<QuickFixLocator> {
     }
 };
 
+// True when `line` falls inside a class body.  The RTL generators below emit
+// net declarations and always_ff/always_comb blocks, none of which are legal
+// class items, so offering them there is pure noise.  Interfaces and programs
+// do accept those constructs and are deliberately not excluded.
+static bool line_inside_class_body(const SyntaxTree& tree, int line) {
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        const SourceManager& sm;
+        int line;
+        bool found{false};
+
+        Visitor(const SourceManager& sm, int line) : sm(sm), line(line) {}
+
+        void handle(const ClassDeclarationSyntax& node) {
+            auto first = node.getFirstToken();
+            auto last = node.getLastToken();
+            if (first && last && first.location().valid() && last.location().valid() &&
+                token_line(sm, first) <= line && line <= token_line(sm, last))
+                found = true;
+            visitDefault(node);
+        }
+    } visitor(tree.sourceManager(), line);
+    tree.root().visit(visitor);
+    return visitor.found;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Config& config,
@@ -142,6 +167,10 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
         opened_shards = analyzer.opened_file_index_shards(uri);
         project_index = analyzer.project_index_snapshot();
     }
+
+    // The generators below produce module-level RTL, which a class body cannot
+    // hold.  Offering them inside a class is noise on every UVM file.
+    const bool in_class_body = state->tree && line_inside_class_body(*state->tree, line);
 
     // ── 1. AutoInst ──────────────────────────────────────────────────────────
     try {
@@ -250,7 +279,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
 
     // ── 5. AutoWire ──────────────────────────────────────────────────────────
     try {
-        if (state->tree) {
+        if (state->tree && !in_class_body) {
             CodeAction action;
             action.title = "AutoWire: declare missing signals";
             action.kind = optional<std::string>(std::string("refactor.rewrite"));
@@ -270,17 +299,19 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
 
     // ── 6. AutoFF All ────────────────────────────────────────────────────────
     try {
-        CodeAction action;
-        action.title = "AutoFF All: insert all FF assignments";
-        action.kind = optional<std::string>(std::string("refactor.rewrite"));
-        lsCommandWithAny cmd;
-        cmd.title = "AutoFF All";
-        cmd.command = "lazyverilog.autoffAllPreview";
-        lsp::Any uri_arg;
-        uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
-        cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
-        action.command = optional<lsCommandWithAny>(cmd);
-        actions.push_back(std::move(action));
+        if (!in_class_body) {
+            CodeAction action;
+            action.title = "AutoFF All: insert all FF assignments";
+            action.kind = optional<std::string>(std::string("refactor.rewrite"));
+            lsCommandWithAny cmd;
+            cmd.title = "AutoFF All";
+            cmd.command = "lazyverilog.autoffAllPreview";
+            lsp::Any uri_arg;
+            uri_arg.SetJsonString("\"" + uri + "\"", lsp::Any::kUnKnown);
+            cmd.arguments = optional<std::vector<lsp::Any>>({uri_arg});
+            action.command = optional<lsCommandWithAny>(cmd);
+            actions.push_back(std::move(action));
+        }
     } catch (...) {
     }
 
@@ -384,7 +415,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     }
 
     // ── 8. Template snippets ─────────────────────────────────────────────────
-    {
+    if (!in_class_body) {
         CodeAction ff_snippet;
         ff_snippet.title = "Insert always_ff block";
         ff_snippet.kind = optional<std::string>(std::string("refactor.rewrite"));
@@ -397,7 +428,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
         ff_snippet.edit = optional<lsWorkspaceEdit>(ff_we);
         actions.push_back(std::move(ff_snippet));
     }
-    {
+    if (!in_class_body) {
         CodeAction comb_snippet;
         comb_snippet.title = "Insert always_comb block";
         comb_snippet.kind = optional<std::string>(std::string("refactor.rewrite"));
