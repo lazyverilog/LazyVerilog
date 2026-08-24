@@ -3813,8 +3813,11 @@ public:
             // pass through this spacing pass.
             if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
                 spaces = opts_.function_declaration.space_before_paren ? 1 : 0;
-            // Function/task call spacing
-            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage)))
+            // Function/task call spacing.  `new` lexes as its own keyword rather
+            // than an identifier, but `new(...)` is a constructor call and must
+            // follow the same option -- otherwise every class constructor
+            // renders as `new (name)`.
+            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword)))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::InstancePorts &&
                 opts_.instance.align)
