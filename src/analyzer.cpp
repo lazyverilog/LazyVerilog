@@ -2349,11 +2349,39 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
     bool found() const { return target.kind != DefinitionTargetKind::None; }
 
+    /// Whether @p token may claim the cursor as a definite target.
+    ///
+    /// visitToken() already defers macro-body tokens: their expansion range is
+    /// the whole invocation, which also covers the arguments the user typed, so
+    /// an identifier written in those arguments is the better answer and the
+    /// walk has to continue past the body token to find it.  The typed node
+    /// handlers need the same rule.  Without it the type name in a macro body
+    /// such as `` `define COPY(ARG) function void f(peer_t rhs); ARG = rhs.ARG;
+    /// endfunction `` claims a cursor sitting on `cfg` in `` `COPY(cfg) `` and
+    /// resolves to peer_t instead of the user's own declaration.
+    bool token_claims_cursor(const slang::parsing::Token& token) const {
+        if (!token_contains_position_in_uri(sm, token, uri, line, col))
+            return false;
+        return !(sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()));
+    }
+
     std::string object_before_member_dot(const slang::parsing::Token& token) const {
         if (!token || !token.location().valid())
             return {};
-        const auto source = sm.getSourceText(token.location().buffer());
-        size_t i = token.location().offset();
+        // Ask the question of the text the user actually typed.  A macro
+        // argument is expanded into the macro's body, so scanning backwards from
+        // the expansion buffer sees whatever the body put in front of it: in
+        // `` `define COPY(ARG) ARG = rhs.ARG; ``, the second ARG is preceded by
+        // "rhs." there, and `` `COPY(cfg) `` would be read as `rhs.cfg` even
+        // though the user wrote a bare `cfg`.  At the call site the same token is
+        // preceded by "(", so no member access is inferred.
+        auto loc = token.location();
+        if (sm.isMacroArgLoc(loc))
+            loc = sm.getFullyOriginalLoc(loc);
+        if (!loc.valid())
+            return {};
+        const auto source = sm.getSourceText(loc.buffer());
+        size_t i = loc.offset();
         if (i > source.size())
             return {};
         while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
@@ -2372,7 +2400,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.header->name, uri, line, col)) {
+        if (token_claims_cursor(node.header->name)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(node.header->name.valueText());
             target.scope_module = current_module;
@@ -2401,7 +2429,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.type, uri, line, col)) {
+        if (token_claims_cursor(node.type)) {
             target.kind = DefinitionTargetKind::Instance;
             target.name = std::string(node.type.valueText());
             target.module_name = target.name;
@@ -2418,7 +2446,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                               : nullptr;
                 if (!named)
                     continue;
-                if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+                if (token_claims_cursor(named->name)) {
                     target.kind = DefinitionTargetKind::NamedParameter;
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
@@ -2433,7 +2461,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             if (!instance)
                 continue;
             if (instance->decl &&
-                token_contains_position_in_uri(sm, instance->decl->name, uri, line, col)) {
+                token_claims_cursor(instance->decl->name)) {
                 target.kind = DefinitionTargetKind::Instance;
                 target.name = std::string(instance->decl->name.valueText());
                 target.module_name = module_name;
@@ -2446,7 +2474,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 if (!connection)
                     continue;
                 const auto* named = connection->as_if<slang::syntax::NamedPortConnectionSyntax>();
-                if (named && token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+                if (named && token_claims_cursor(named->name)) {
                     target.kind = DefinitionTargetKind::NamedPort;
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
@@ -2473,7 +2501,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             const auto* named = argument->as_if<slang::syntax::NamedArgumentSyntax>();
             if (!named)
                 continue;
-            if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+            if (token_claims_cursor(named->name)) {
                 target.kind = DefinitionTargetKind::NamedArgument;
                 target.name = std::string(named->name.valueText());
                 target.subroutine_name = subroutine_name;
@@ -2520,7 +2548,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             left_identifier = left_class->identifier;
 
         if (left_identifier && right &&
-            token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
+            token_claims_cursor(right->identifier)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(right->identifier.valueText());
             target.package_qualifier = std::string(left_identifier.valueText());
@@ -2537,7 +2565,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     // where a package-qualified name would otherwise resolve to a local
     // declaration of the same name.
     void handle(const slang::syntax::PackageImportItemSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.item, uri, line, col)) {
+        if (token_claims_cursor(node.item)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(node.item.valueText());
             target.package_qualifier = std::string(node.package.valueText());
@@ -2549,7 +2577,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.name, uri, line, col)) {
+        if (token_claims_cursor(node.name)) {
             target.kind = DefinitionTargetKind::ClassMember;
             target.name = std::string(node.name.valueText());
             target.object_name = simple_identifier_from_expr(node.left);
@@ -2563,7 +2591,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     void handle(const slang::syntax::NamedTypeSyntax& node) {
         const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>();
         if (identifier &&
-            token_contains_position_in_uri(sm, identifier->identifier, uri, line, col)) {
+            token_claims_cursor(identifier->identifier)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(identifier->identifier.valueText());
             target.scope_module = current_module;

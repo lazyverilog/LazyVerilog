@@ -923,6 +923,35 @@ TEST_CASE("identifiers inside macro arguments resolve instead of the macro", "[d
     CHECK(macro->col == 8);
 }
 
+TEST_CASE("definition: a macro argument expanded into several contexts resolves to its "
+          "own declaration",
+          "[definition][macro]") {
+    // `uvm_field_object(cfg, ...) expands ARG into many positions, including as
+    // the suffix of a member access (`uvm_copy_object(ARG, local_rhs__.ARG,...)).
+    // Every one of those expanded tokens maps back to the same original range,
+    // so all of them "contain" the cursor and the resolver must pick the one
+    // used in its own right rather than whichever it happens to reach first.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_macro_arg_multi.sv";
+    analyzer.open(uri, "`define COPY_FIELD(ARG) \\\n"
+                       "    function void do_copy(peer_t rhs); \\\n"
+                       "        ARG = rhs.ARG; \\\n"
+                       "    endfunction\n"
+                       "class peer_t;\n"
+                       "    int unrelated_field;\n"
+                       "endclass\n"
+                       "class holder;\n"
+                       "    int cfg;\n"
+                       "    `COPY_FIELD(cfg)\n"
+                       "endclass\n");
+
+    const std::string call = "    `COPY_FIELD(cfg)";
+    auto arg = analyzer.definition_of(uri, 9, (int)call.find("(cfg") + 1);
+    REQUIRE(arg.has_value());
+    CHECK(arg->uri == uri);
+    CHECK(arg->line == 8); // holder's own `int cfg;`, not peer_t's
+}
+
 // ── Member access whose receiver type lives in another file ──────────────────
 
 static const std::string kPackageClassDefinitionFixture = R"(package tb_pkg;
