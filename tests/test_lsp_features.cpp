@@ -815,6 +815,42 @@ endclass
     std::filesystem::remove(path);
 }
 
+TEST_CASE("workspace symbols: a declaration reachable from several indexes is reported once",
+          "[workspace]") {
+    const auto lib = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_lib.svh";
+    {
+        std::ofstream out(lib);
+        out << "class shared_cls;\nendclass\n";
+    }
+
+    // Both open buffers include the same header, and the header is a project
+    // file too.  Every one of those indexes carries shared_cls, but they all
+    // describe the same declaration at the same place.
+    Analyzer analyzer;
+    analyzer.set_extra_files({lib.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string include_line = "`include \"lazyverilog_wssym_dedup_lib.svh\"\n";
+    const auto first = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_a.sv";
+    const auto second = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_b.sv";
+    for (const auto& p : {first, second}) {
+        std::ofstream out(p);
+        out << include_line << "module " << p.stem().string() << ";\nendmodule\n";
+    }
+    analyzer.open(uri_from_path(first), include_line + "module lazyverilog_wssym_dedup_a;\nendmodule\n");
+    analyzer.open(uri_from_path(second), include_line + "module lazyverilog_wssym_dedup_b;\nendmodule\n");
+
+    WorkspaceSymbolParams params;
+    params.query = "shared_cls";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    CHECK(symbols.size() == 1);
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(first);
+    std::filesystem::remove(second);
+}
+
 TEST_CASE("autofunc: preserves positional call arguments", "[autofunc]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/autofunc_positional.sv";
