@@ -139,6 +139,7 @@ TEST_CASE("lint: stale autoinst ignores parameter-only module entries", "[lint]"
 
 TEST_CASE("lint: statement rules emit diagnostics", "[lint]") {
     LintConfig cfg;
+    cfg.statement.enable = true;
     cfg.statement.no_raw_always = true;
     cfg.statement.blocking_nonblocking_assignments = true;
     cfg.statement.explicit_begin = true;
@@ -223,6 +224,7 @@ TEST_CASE("lint: a macro body is not linted at the invocation line", "[lint][mac
     // warning about source they do not own and cannot edit -- on a UVM file
     // every `uvm_*_utils line otherwise contributes several of these.
     LintConfig cfg;
+    cfg.statement.enable = true;
     cfg.statement.explicit_begin = true;
 
     auto diags = lint_text("`define BARE_IF(C) if (C) $display(\"x\");\n"
@@ -366,4 +368,70 @@ TEST_CASE("lint: the task lifetime message is tagged [task], not [function]",
         if (d.message.find("task declaration missing explicit lifetime") != std::string::npos)
             CHECK(d.message.rfind("[task] ", 0) == 0);
     }
+}
+
+// ── [lint.statement] section gating and severity ─────────────────────────────
+//
+// Same contract as [lint.function] above: the sub-flags select which rules run,
+// `enable` turns the whole section off, and `severity` decides how every one of
+// its diagnostics is reported.  `case_missing_default` and
+// `latch_inference_detection` read neither, so they fired with enable=false and
+// always reported at "warning".
+
+static const char* kStatementSource =
+    "module top;\n"
+    "  logic a, b, c, d;\n"
+    "  always @(*) begin\n"
+    "    case (a)\n"
+    "      1'b0: b = 1'b0;\n"
+    "    endcase\n"
+    "  end\n"
+    "  always_comb begin\n"
+    "    if (a) c = 1'b1;\n"
+    "  end\n"
+    "  always_ff @(posedge a) if (b) d <= 1'b1;\n"
+    "endmodule\n";
+
+static LintConfig statement_config(bool enable, const std::string& severity) {
+    LintConfig cfg;
+    cfg.statement.enable = enable;
+    cfg.statement.severity = severity;
+    cfg.statement.case_missing_default = true;
+    cfg.statement.latch_inference_detection = true;
+    cfg.statement.explicit_begin = true;
+    cfg.statement.no_raw_always = true;
+    cfg.statement.blocking_nonblocking_assignments = true;
+    return cfg;
+}
+
+TEST_CASE("lint: [lint.statement] enable=false disables every statement rule",
+          "[lint][statement]") {
+    auto diags = lint_text(kStatementSource, statement_config(false, "warning"));
+
+    CHECK_FALSE(has_message_containing(diags, "[statement]"));
+}
+
+TEST_CASE("lint: [lint.statement] severity applies to every statement rule",
+          "[lint][statement]") {
+    auto diags = lint_text(kStatementSource, statement_config(true, "hint"));
+
+    int statement_diags = 0;
+    for (const auto& d : diags) {
+        if (d.message.find("[statement]") != std::string::npos) {
+            ++statement_diags;
+            CHECK(d.severity == 3);
+        }
+    }
+    // case_missing_default, latch_inference_detection, no_raw_always, and
+    // explicit_begin all have something to say about the fixture.
+    CHECK(statement_diags >= 4);
+}
+
+TEST_CASE("lint: [lint.statement] rules still fire with enable=true", "[lint][statement]") {
+    auto diags = lint_text(kStatementSource, statement_config(true, "warning"));
+
+    CHECK(has_message_containing(diags, "case statement missing default item"));
+    CHECK(has_message_containing(diags, "may infer a latch"));
+    CHECK(has_message_containing(diags, "raw always block"));
+    CHECK(has_message_containing(diags, "should use begin/end"));
 }
