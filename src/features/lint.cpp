@@ -314,6 +314,12 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     int statement_sev() const { return severity_from(cfg.statement.severity); }
     int function_sev() const { return severity_from(cfg.function.severity); }
 
+    // The statement rules are spread over eight visitor handlers, several of
+    // which also do unrelated work (always_ff tracking, register naming), so the
+    // section switch cannot be a single early return the way it is for
+    // functions.  Gate each rule instead.
+    bool statement_rules_on() const { return cfg.statement.enable; }
+
     void chk_name(const std::string& name, SourceLocation loc,
                   const CachedRegex& re,
                   const std::string& pat, const char* cat) {
@@ -333,13 +339,14 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     // ── case_missing_default ──────────────────────────────────────────────
     void handle(const CaseStatementSyntax& node) {
-        if (cfg.statement.case_missing_default && !node.uniqueOrPriority.valid()) {
+        if (statement_rules_on() && cfg.statement.case_missing_default &&
+            !node.uniqueOrPriority.valid()) {
             bool has_default = false;
             for (uint32_t i = 0; i < node.items.size() && !has_default; ++i)
                 if (node.items[i]->as_if<DefaultCaseItemSyntax>())
                     has_default = true;
             if (!has_default)
-                push_diag(diags, sm, node.caseKeyword.location(), 2,
+                push_diag(diags, sm, node.caseKeyword.location(), statement_sev(),
                     "[statement] case statement missing default item");
         }
         visitDefault(node);
@@ -621,12 +628,14 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     // ── latch_inference_detection + register naming (always_ff) ──────────────
     void handle(const ProceduralBlockSyntax& node) {
-        if (cfg.statement.no_raw_always && node.kind == SyntaxKind::AlwaysBlock)
+        if (statement_rules_on() && cfg.statement.no_raw_always &&
+            node.kind == SyntaxKind::AlwaysBlock)
             push_diag(diags, sm, node.keyword.location(), statement_sev(),
                 "[statement] raw always block should use always_comb, always_ff, or always_latch");
-        if (cfg.statement.latch_inference_detection && node.kind == SyntaxKind::AlwaysCombBlock) {
+        if (statement_rules_on() && cfg.statement.latch_inference_detection &&
+            node.kind == SyntaxKind::AlwaysCombBlock) {
             if (has_latch_risk(*node.statement))
-                push_diag(diags, sm, node.keyword.location(), 2,
+                push_diag(diags, sm, node.keyword.location(), statement_sev(),
                     "[statement] always_comb block may infer a latch (incomplete if)");
         }
         bool was_ff = in_always_ff_;
@@ -642,7 +651,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     // ── naming: register names (nonblocking assignment LHS in always_ff) ─────
     void handle(const BinaryExpressionSyntax& node) {
-        if (cfg.statement.blocking_nonblocking_assignments) {
+        if (statement_rules_on() && cfg.statement.blocking_nonblocking_assignments) {
             if (in_always_ff_ && is_blocking_assignment(node.kind))
                 push_diag(diags, sm, node.getFirstToken().location(), statement_sev(),
                     "[statement] always_ff should use nonblocking assignments");
@@ -663,7 +672,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     }
 
     void handle(const ConditionalStatementSyntax& node) {
-        if (cfg.statement.explicit_begin) {
+        if (statement_rules_on() && cfg.statement.explicit_begin) {
             if (!is_block_statement(node.statement))
                 push_diag(diags, sm, node.ifKeyword.location(), statement_sev(),
                     "[statement] if statement body should use begin/end");
@@ -676,35 +685,35 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     }
 
     void handle(const LoopStatementSyntax& node) {
-        if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
+        if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.repeatOrWhile.location(), statement_sev(),
                 "[statement] loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForLoopStatementSyntax& node) {
-        if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
+        if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.forKeyword.location(), statement_sev(),
                 "[statement] for loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForeachLoopStatementSyntax& node) {
-        if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
+        if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.keyword.location(), statement_sev(),
                 "[statement] foreach loop body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const ForeverStatementSyntax& node) {
-        if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
+        if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.foreverKeyword.location(), statement_sev(),
                 "[statement] forever body should use begin/end");
         visitDefault(node);
     }
 
     void handle(const DoWhileStatementSyntax& node) {
-        if (cfg.statement.explicit_begin && !is_block_statement(node.statement))
+        if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.doKeyword.location(), statement_sev(),
                 "[statement] do body should use begin/end");
         visitDefault(node);
