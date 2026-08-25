@@ -1958,6 +1958,31 @@ static std::optional<Location> find_class_member_in_hierarchy(
     return std::nullopt;
 }
 
+// Whether `derived` reaches `base` through its `extends` chain.
+//
+// Each hop re-searches every shard for the same reason the member lookup above
+// does: a base class is usually declared in a different file than the class
+// that extends it.
+static bool class_derives_from(std::span<const ClassLookupShard> shards, std::string derived,
+                               std::string_view base) {
+    std::unordered_set<std::string> visited;
+    while (!derived.empty() && visited.insert(derived).second) {
+        if (derived == base)
+            return true;
+
+        std::string next;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, derived);
+            if (cls && !cls->base_class.empty()) {
+                next = base_class_lookup_name(cls->base_class);
+                break;
+            }
+        }
+        derived = std::move(next);
+    }
+    return false;
+}
+
 // Declared type of `field_name` on `class_name` or any ancestor, searched
 // across shards.  The receiver of a member access is often itself an inherited
 // field, e.g. `seq_item_port` declared by `uvm_driver` and used from a subclass.
@@ -3831,6 +3856,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     SymbolID class_member_alias_id;
     std::string class_member_package;
     std::string class_member_class;
+    std::string class_member_name;
     for (const auto prefix : {std::string_view("class_field::"),
                               std::string_view("class_method::")}) {
         if (!target_symbol_debug.starts_with(prefix))
@@ -3848,11 +3874,49 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             class_member_package = std::string(owner.substr(0, scope_sep));
             class_member_class = std::string(owner.substr(scope_sep + 2));
         }
+        class_member_name = std::string(member);
         if (!class_member_class.empty())
             class_member_alias_id = SymbolID::from_canonical(
-                "class_member::" + class_member_class + "::" + std::string(member));
+                "class_member::" + class_member_class + "::" + class_member_name);
         break;
     }
+
+    // An unqualified inherited member — `depth` inside a class that extends the
+    // one declaring it — is recorded by the deriving file's shard as
+    // `class_member::<that class>::depth`, because that shard never parsed the
+    // base class and cannot name the owner.  Complete the hop here: accept such
+    // an occurrence only when its class really derives from the class the
+    // clicked declaration belongs to, so an unrelated class with a same-named
+    // member stays out of references and rename.
+    std::vector<ClassLookupShard> hierarchy_shards;
+    std::unordered_map<std::string, bool> derives_cache;
+    const auto* current_structural_for_hierarchy =
+        class_member_class.empty() ? nullptr : &get_structural_index(*state);
+    if (current_structural_for_hierarchy) {
+        hierarchy_shards.reserve(extra_idx->size() + 1);
+        hierarchy_shards.push_back(ClassLookupShard{current_structural_for_hierarchy, &uri});
+        for (const auto& extra : *extra_idx)
+            hierarchy_shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+    }
+
+    auto is_inherited_member_occurrence = [&](const ReferenceEntry& ref) {
+        static constexpr std::string_view kPrefix = "class_member::";
+        if (class_member_class.empty() || !ref.symbol_debug.starts_with(kPrefix))
+            return false;
+        const std::string_view rest = std::string_view(ref.symbol_debug).substr(kPrefix.size());
+        const auto member_sep = rest.rfind("::");
+        if (member_sep == std::string_view::npos)
+            return false;
+        if (rest.substr(member_sep + 2) != class_member_name)
+            return false;
+        std::string derived(rest.substr(0, member_sep));
+        if (derived == class_member_class)
+            return false; // already covered by class_member_alias_id
+        auto [it, inserted] = derives_cache.try_emplace(derived, false);
+        if (inserted)
+            it->second = class_derives_from(hierarchy_shards, derived, class_member_class);
+        return it->second;
+    };
 
     auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports) {
         // A class outside any package is reached by bare name, so there is no
@@ -3905,6 +3969,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
             admits_class_member_alias(imports))
+            return true;
+        if (is_inherited_member_occurrence(ref) && admits_class_member_alias(imports))
             return true;
         return false;
     };
