@@ -3,6 +3,9 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 static const std::string kUri = "file:///test.sv";
 static const std::string kSrc1 = "module foo; endmodule\n";
@@ -67,4 +70,50 @@ TEST_CASE("doc sync: concurrent reads are safe", "[sync]") {
 
     CHECK(errors == 0);
     CHECK(a.get_state(kUri) != nullptr);
+}
+
+// The parse worker holds a filelist file's live project shard back until the
+// parse queue has been idle for a moment, so a burst of keystrokes rebuilds it
+// once instead of once per character.  Held back is not dropped: this pins that
+// the shard does arrive once the typing stops.
+TEST_CASE("doc sync: a deferred live shard still reaches the project index", "[sync]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-deferred-shard";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "blk.sv";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "module blk;\nendmodule\n";
+    }
+    const auto uri = "file://" + path.string();
+
+    Analyzer a;
+    a.set_project_config({}, {dir.string()}, {path.string()});
+    a.wait_for_background_index_idle();
+
+    a.enqueue_parse(uri, "module blk_renamed;\nendmodule\n");
+
+    auto shard_has_module = [&](const std::string& name) {
+        auto snapshot = a.extra_index_snapshot_ptr();
+        for (const auto& entry : *snapshot) {
+            if (entry.uri != uri)
+                continue;
+            for (const auto& module : entry.index_ref().modules) {
+                if (module.name == name)
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    // Generous: the deferral is time-based, and a loaded CI runner may need
+    // several rounds before the worker sees an idle queue.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && !shard_has_module("blk_renamed"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    CHECK(shard_has_module("blk_renamed"));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

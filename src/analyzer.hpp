@@ -117,6 +117,92 @@ private:
     }
 };
 
+/// Text of headers an *open buffer* `include`s, kept across keystrokes.
+///
+/// didChange builds a fresh SourceManager per document snapshot, so without this
+/// every keystroke re-opens and re-reads every header the buffer includes.  A
+/// design where each module includes one multi-megabyte shared header pays that
+/// read on every character typed, and on a networked filesystem the read, not
+/// the parse, is what the user feels.
+///
+/// HeaderTextCache cannot serve this: it is scoped to one background indexing
+/// burst and dropped when the queue drains, which is what keeps its contents
+/// from going stale.  An edit-path cache has to survive far longer than that, so
+/// it instead validates every entry against the file's size and modification
+/// time before handing text out.  That is one stat per included header per
+/// keystroke — orders of magnitude cheaper than the read it replaces, and it
+/// leaves external edits as visible as they are without any cache.
+struct OpenParseHeaderCache {
+    /// Same budget as HeaderTextCache, for the same reason: a design whose
+    /// headers exceed it keeps the ones seen first and the win is partial.
+    static constexpr size_t kMaxBytes = 32u << 20;
+
+    struct Entry {
+        std::shared_ptr<const std::string> text;
+        std::uintmax_t size{0};
+        std::filesystem::file_time_type write_time{};
+    };
+
+    /// Text for @p path if the file on disk still matches what was cached.
+    ///
+    /// Returns null when the entry is absent or the stat says the file moved on,
+    /// dropping the stale entry so the caller's parse re-reads it.
+    std::shared_ptr<const std::string> get_if_current(const std::string& path) {
+        std::error_code ec;
+        std::filesystem::directory_entry entry(path, ec);
+        if (ec)
+            return nullptr;
+        const auto size = entry.file_size(ec);
+        if (ec)
+            return nullptr;
+        const auto write_time = entry.last_write_time(ec);
+        if (ec)
+            return nullptr;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        if (it == texts.end())
+            return nullptr;
+        if (it->second.size != size || it->second.write_time != write_time) {
+            bytes -= it->second.text->size();
+            texts.erase(it);
+            return nullptr;
+        }
+        return it->second.text;
+    }
+
+    void store(const std::string& path, std::string_view text) {
+        std::error_code ec;
+        std::filesystem::directory_entry entry(path, ec);
+        if (ec)
+            return;
+        const auto size = entry.file_size(ec);
+        if (ec)
+            return;
+        const auto write_time = entry.last_write_time(ec);
+        if (ec)
+            return;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (texts.contains(path))
+            return;
+        if (bytes + text.size() > kMaxBytes)
+            return;
+        bytes += text.size();
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), size, write_time});
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        texts.clear();
+        bytes = 0;
+    }
+
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, Entry> texts;
+    size_t bytes{0};
+};
+
 struct SymbolInfo {
     std::string name;
     std::string kind; // module, port, signal, instance, etc.
@@ -497,6 +583,9 @@ class Analyzer {
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;
+    // Also guarded by its own mutex, and for the same reason: make_state()
+    // parses outside map_mutex_.
+    mutable OpenParseHeaderCache open_parse_header_texts_;
 
     /// Shards for `include`d headers, one per header rather than one per
     /// including file.
