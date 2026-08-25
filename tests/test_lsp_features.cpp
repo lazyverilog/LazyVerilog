@@ -1415,3 +1415,54 @@ TEST_CASE("code action: RTL generators are not offered inside a class body", "[c
     CHECK(has(in_module, "always_ff"));
     CHECK(has(in_module, "always_comb"));
 }
+
+TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
+    // UVM's `uvm_component_utils(T) reaches the typedef through a second macro:
+    //
+    //   `define m_uvm_component_registry_internal(T,S) \
+    //      typedef uvm_component_registry #(T,`"S`") type_id;
+    //
+    // Tokens produced inside that nested expansion share one expansion range
+    // that has no readable source text, so the "render a macro invocation once"
+    // rule used to drop all but the first of them and hover reported the
+    // truncated `uvm_component_registry lv_full_driver,`.
+    Analyzer analyzer;
+    const std::string uri = "file:///nested_macro_typedef.sv";
+    const std::string text = R"(`define mk_internal(T,S) \
+  typedef registry #(T,`"S`") type_id; \
+  static function type_id get_type(); \
+    return type_id::get(); \
+  endfunction
+`define mk(T) `mk_internal(T,T)
+class c;
+  `mk(c)
+  function void f();
+    c::type_id::create("x");
+  endfunction
+endclass
+)";
+    analyzer.open(uri, text);
+
+    const auto offset = text.find("type_id::create");
+    REQUIRE(offset != std::string::npos);
+    int line = 0;
+    int col = 0;
+    for (size_t i = 0; i < offset; ++i) {
+        if (text[i] == '\n') {
+            ++line;
+            col = 0;
+        } else {
+            ++col;
+        }
+    }
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**type_id** — *typedef*\n\n---\n\n```\nregistry#(c, \"c\")\n```");
+}
