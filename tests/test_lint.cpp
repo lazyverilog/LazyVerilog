@@ -269,3 +269,101 @@ TEST_CASE("lint: a macro argument is still linted, at the call site", "[lint][ma
             CHECK(d.line == 2); // 0-based: line 3, where the user typed it
     }
 }
+
+// ── [lint.function] section gating and severity ──────────────────────────────
+//
+// The lifetime rules used to read neither `[lint.function].enable` nor
+// `[lint.function].severity`: they fired whenever their own sub-flag was set
+// and always reported at "warning".  These tests pin both to the same contract
+// the naming/module/statement sections already follow.
+
+static const char* kLifetimeSource =
+    "class c;\n"
+    "  function void f();\n"
+    "  endfunction\n"
+    "  task t();\n"
+    "  endtask\n"
+    "endclass\n";
+
+TEST_CASE("lint: [lint.function] enable=false disables the lifetime rules", "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = false;
+    cfg.function.explicit_function_lifetime = true;
+    cfg.function.explicit_task_lifetime = true;
+
+    auto diags = lint_text(kLifetimeSource, cfg);
+
+    CHECK_FALSE(has_message_containing(diags, "missing explicit lifetime"));
+}
+
+TEST_CASE("lint: [lint.function] enable=false disables functions_automatic", "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = false;
+    cfg.function.functions_automatic = true;
+
+    auto diags = lint_text(kLifetimeSource, cfg);
+
+    CHECK_FALSE(has_message_containing(diags, "should use 'automatic' lifetime"));
+}
+
+TEST_CASE("lint: [lint.function] enable=false disables function_call_style", "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = false;
+    cfg.function.function_call_style = "named";
+
+    auto diags = lint_text("module top;\n"
+                           "  initial f(1);\n"
+                           "endmodule\n",
+                           cfg);
+
+    CHECK_FALSE(has_message_containing(diags, "named arguments required"));
+}
+
+TEST_CASE("lint: [lint.function] severity applies to the lifetime rules", "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = true;
+    cfg.function.severity = "hint";
+    cfg.function.explicit_function_lifetime = true;
+    cfg.function.explicit_task_lifetime = true;
+
+    auto diags = lint_text(kLifetimeSource, cfg);
+
+    int lifetime_diags = 0;
+    for (const auto& d : diags) {
+        if (d.message.find("missing explicit lifetime") != std::string::npos) {
+            ++lifetime_diags;
+            CHECK(d.severity == 3);
+        }
+    }
+    CHECK(lifetime_diags == 2);
+}
+
+TEST_CASE("lint: [lint.function] severity applies to functions_automatic", "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = true;
+    cfg.function.severity = "error";
+    cfg.function.functions_automatic = true;
+
+    auto diags = lint_text(kLifetimeSource, cfg);
+
+    REQUIRE(has_message_containing(diags, "should use 'automatic' lifetime"));
+    for (const auto& d : diags) {
+        if (d.message.find("should use 'automatic' lifetime") != std::string::npos)
+            CHECK(d.severity == 1);
+    }
+}
+
+TEST_CASE("lint: the task lifetime message is tagged [task], not [function]",
+          "[lint][function]") {
+    LintConfig cfg;
+    cfg.function.enable = true;
+    cfg.function.explicit_task_lifetime = true;
+
+    auto diags = lint_text(kLifetimeSource, cfg);
+
+    REQUIRE(has_message_containing(diags, "task declaration missing explicit lifetime"));
+    for (const auto& d : diags) {
+        if (d.message.find("task declaration missing explicit lifetime") != std::string::npos)
+            CHECK(d.message.rfind("[task] ", 0) == 0);
+    }
+}
