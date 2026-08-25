@@ -169,6 +169,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
     tests/test_syntax_index.cpp
+    tests/test_shared_header_scaling.cpp
     tests/test_formatter.cpp
     tests/test_lint.cpp
     tests/test_autoff.cpp
