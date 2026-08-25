@@ -294,7 +294,7 @@ void process_generate_instances(const MemberSyntax& member, SyntaxIndex& index,
 
 void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                      SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                     std::string parent_scope);
+                     std::string parent_scope, bool scoped_lookup = false);
 
 void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                    SourceFileIdResolver& resolver, const slang::SourceManager& sm,
@@ -318,7 +318,8 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // indexes these; the open-buffer index has to as well, or the same
             // file offers different members depending on whether it is open.
             if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
-                process_typedef(*nested, index, resolver, sm, entry.name);
+                process_typedef(*nested, index, resolver, sm, entry.name,
+                                /*scoped_lookup=*/true);
             } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const auto type = node_text_raw(sm, *data->type);
                 for (const auto* decl : data->declarators) {
@@ -361,7 +362,7 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                      SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                     std::string parent_scope = {}) {
+                     std::string parent_scope = {}, bool scoped_lookup) {
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
@@ -403,7 +404,13 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         entry.resolved = node_text_raw(sm, *td.type);
     }
 
-    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+    // Any `::`-addressable owner, matching the closed-file shard: a class-scoped
+    // `type_id` is spelled once per class, so the bare-name table answers with
+    // whichever class was seen first.  Module scope is excluded on purpose --
+    // nothing can name `mod::t`.  `scoped_lookup` covers class members, whose
+    // ClassEntry is not registered until its body has been walked.
+    if (!entry.parent_scope.empty() &&
+        (scoped_lookup || index.package_names.count(entry.parent_scope)))
         index.package_type_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());

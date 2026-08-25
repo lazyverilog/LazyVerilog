@@ -17,6 +17,11 @@ struct CallContext {
     std::string name;
     std::variant<int, std::string> active{0};
     bool is_module_param{false};
+    // Offset of the callee name in the prefix, and whether a `::` qualifier
+    // precedes it.  A qualified callee names one specific subroutine, so it must
+    // not be matched by bare name against the whole file.
+    size_t name_offset{0};
+    bool is_scoped{false};
 };
 
 struct ParamInfo {
@@ -126,10 +131,16 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
                 auto name = ident_before(before, end);
                 if (name.empty())
                     return std::nullopt;
+                size_t name_end = end;
+                while (name_end > 0 && std::isspace((unsigned char)before[name_end - 1]))
+                    --name_end;
+                const size_t name_start = name_end - name.size();
+                const bool scoped =
+                    name_start >= 2 && before.compare(name_start - 2, 2, "::") == 0;
                 return CallContext{name,
                                    named_port ? std::variant<int, std::string>(*named_port)
                                               : std::variant<int, std::string>(active),
-                                   module_param};
+                                   module_param, name_start, scoped};
             }
             --depth;
         } else if (c == ',' && depth == 0 && !named_port) {
@@ -137,6 +148,31 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
         }
     }
     return std::nullopt;
+}
+
+static SubroutineInfo subroutine_info_from_declaration(const FunctionDeclarationSyntax& node) {
+    SubroutineInfo info;
+    info.kind = node.kind == SyntaxKind::TaskDeclaration ? "task" : "function";
+    if (info.kind == "function")
+        info.return_type = trim(node.prototype->returnType->toString());
+
+    if (node.prototype->portList) {
+        for (const auto* port_base : node.prototype->portList->ports) {
+            const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
+            if (!port || !port->declarator)
+                continue;
+            ParamInfo param;
+            param.name = token_text(port->declarator->name);
+            param.direction = token_text(port->direction);
+            if (port->dataType)
+                param.type = trim(port->dataType->toString());
+            if (port->declarator->initializer)
+                param.default_value = trim(port->declarator->initializer->expr->toString());
+            if (!param.name.empty())
+                info.args.push_back(std::move(param));
+        }
+    }
+    return info;
 }
 
 static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree,
@@ -159,27 +195,7 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
             if (ambiguous || name_text(*node.prototype->name) != name)
                 return;
 
-            SubroutineInfo info;
-            info.kind = node.kind == SyntaxKind::TaskDeclaration ? "task" : "function";
-            if (info.kind == "function")
-                info.return_type = trim(node.prototype->returnType->toString());
-
-            if (node.prototype->portList) {
-                for (const auto* port_base : node.prototype->portList->ports) {
-                    const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
-                    if (!port || !port->declarator)
-                        continue;
-                    ParamInfo param;
-                    param.name = token_text(port->declarator->name);
-                    param.direction = token_text(port->direction);
-                    if (port->dataType)
-                        param.type = trim(port->dataType->toString());
-                    if (port->declarator->initializer)
-                        param.default_value = trim(port->declarator->initializer->expr->toString());
-                    if (!param.name.empty())
-                        info.args.push_back(std::move(param));
-                }
-            }
+            SubroutineInfo info = subroutine_info_from_declaration(node);
 
             if (result && !same_signature(*result, info)) {
                 ambiguous = true;
@@ -191,6 +207,40 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
     };
 
     Visitor visitor(name);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+/// The subroutine declared at @p line / @p col (both 0-based), if any.
+///
+/// Used for `::`-qualified callees, where the name alone is ambiguous but
+/// go-to-definition already knows which declaration the call means.
+static std::optional<SubroutineInfo> subroutine_at_declaration(const SyntaxTree& tree, int line,
+                                                                int col) {
+    struct Visitor : public SyntaxVisitor<Visitor> {
+        const SourceManager& sm;
+        int line;
+        int col;
+        std::optional<SubroutineInfo> result;
+
+        Visitor(const SourceManager& sm, int line, int col) : sm(sm), line(line), col(col) {}
+
+        void handle(const FunctionDeclarationSyntax& node) {
+            if (result)
+                return;
+            const auto token = node.prototype->name->getFirstToken();
+            if (!token)
+                return;
+            const auto loc = token.location();
+            if (!loc.valid())
+                return;
+            if ((int)sm.getLineNumber(loc) - 1 != line || (int)sm.getColumnNumber(loc) - 1 != col)
+                return;
+            result = subroutine_info_from_declaration(node);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), line, col);
     tree.root().visit(visitor);
     return visitor.result;
 }
@@ -368,7 +418,26 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
             labels, active);
     }
 
-    auto subroutine = subroutine_from_tree(*state->tree, ctx->name);
+    std::optional<SubroutineInfo> subroutine;
+    if (ctx->is_scoped) {
+        // `my_item::type_id::create(...)` names one declaration, and the class
+        // the call is written on usually has a same-named method of its own --
+        // UVM's factory macros give every class a `create`.  Ask go-to-definition
+        // which one is meant instead of matching the bare name.  A declaration
+        // outside this document has no parameter list to show, so returning
+        // nothing there is the honest answer.
+        if (auto def = analyzer.definition_of(params.textDocument.uri.raw_uri_,
+                                              params.position.line,
+                                              (int)(ctx->name_offset - line_start))) {
+            if (def->uri == params.textDocument.uri.raw_uri_)
+                subroutine = subroutine_at_declaration(*state->tree, def->line, def->col);
+        }
+        if (!subroutine)
+            return std::nullopt;
+    } else {
+        subroutine = subroutine_from_tree(*state->tree, ctx->name);
+    }
+
     if (!subroutine) {
         auto params_info = find_module_params(analyzer, *state->tree, ctx->name);
         if (!params_info)
