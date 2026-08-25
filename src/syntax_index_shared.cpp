@@ -342,10 +342,19 @@ std::string render_syntax_token_text(const slang::SourceManager& sm,
         // spelling, not repeated preprocessor expansion tokens.
         if (last_macro_range && same_source_range(*last_macro_range, expansion_range))
             return {};
-        last_macro_range = expansion_range;
 
-        if (auto text = source_text_for_syntax_range(sm, expansion_range))
+        // Collapsing a repeated range is only correct once that range has
+        // actually contributed its invocation text.  A nested macro expands into
+        // a macro buffer whose range has no readable source text, and there the
+        // tokens fall through to their raw text below -- so every one of them
+        // must still be rendered.  Suppressing them regardless is what turned
+        // UVM's `typedef uvm_component_registry #(T,`"S`") type_id` into the
+        // truncated `uvm_component_registry lv_full_driver,`.
+        if (auto text = source_text_for_syntax_range(sm, expansion_range)) {
+            last_macro_range = expansion_range;
             return *text;
+        }
+        last_macro_range.reset();
     } else {
         last_macro_range.reset();
     }
