@@ -941,6 +941,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // identifier in a class body can only be an inherited member if it is
         // not one of these.
         std::unordered_set<std::string> subroutine_locals;
+        bool in_subroutine_{false};
 
         struct TypeImport {
             std::string package_name;
@@ -982,22 +983,18 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                    static_cast<uint64_t>(token.location().offset());
         }
 
-        // Every name declared anywhere under @p node, so a subroutine body can be
-        // told apart from the members it inherits.  Nested subroutines are not a
-        // concern: SystemVerilog does not have them.
-        static void collect_local_declarator_names(const slang::syntax::SyntaxNode& node,
-                                                    std::unordered_set<std::string>& out) {
-            struct Collector : public slang::syntax::SyntaxVisitor<Collector> {
-                std::unordered_set<std::string>& out;
-                explicit Collector(std::unordered_set<std::string>& out) : out(out) {}
-                void handle(const DeclaratorSyntax& decl) {
-                    if (decl.name)
-                        out.insert(std::string(decl.name.valueText()));
-                    visitDefault(decl);
-                }
-            };
-            Collector collector(out);
-            node.visit(collector);
+        // Names declared in the subroutine currently being walked, collected as
+        // the walk reaches them rather than by a separate pre-pass.
+        //
+        // SystemVerilog requires a subroutine's variables to be declared before
+        // they are used, so by the time a use is visited its declarator already
+        // is in the set.  A pre-pass would traverse every subroutine body twice
+        // for the same answer.  Ports are covered too: the prototype is part of
+        // the same node and is visited ahead of the body.
+        void handle(const DeclaratorSyntax& node) {
+            if (in_subroutine_ && node.name)
+                subroutine_locals.insert(std::string(node.name.valueText()));
+            visitDefault(node);
         }
 
         CombinedVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
@@ -1174,16 +1171,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             }
 
             auto previous_locals = std::move(subroutine_locals);
+            const bool previously_in_subroutine = in_subroutine_;
             subroutine_locals.clear();
-            if (node.prototype && node.prototype->portList) {
-                for (const auto* port_base : node.prototype->portList->ports) {
-                    const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
-                    if (port && port->declarator)
-                        subroutine_locals.insert(std::string(port->declarator->name.valueText()));
-                }
-            }
-            collect_local_declarator_names(node, subroutine_locals);
+            in_subroutine_ = true;
             visitDefault(node);
+            in_subroutine_ = previously_in_subroutine;
             subroutine_locals = std::move(previous_locals);
         }
 
