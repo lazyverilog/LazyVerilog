@@ -1,4 +1,5 @@
 {
+  "enableAllProjectMcpServers": true,
   "hooks": {
     "SessionStart": [
       {
