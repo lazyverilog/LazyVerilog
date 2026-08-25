@@ -867,6 +867,47 @@ endmodule
     CHECK(*help->activeParameter == 1);
 }
 
+TEST_CASE("signature help: a ::-qualified callee is not matched by bare name",
+          "[signature][scoped]") {
+    // `thing::type_id::create(...)` names `registry_base::create`.  Matching the
+    // bare name instead answered with `thing::create`, which is exactly the
+    // collision UVM's factory macros create: the class the call is written on
+    // always has its own `create`.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/signature_scoped_fixture.sv";
+    analyzer.open(uri, R"(
+class registry_base;
+    static function registry_base create(string name, int parent);
+        return null;
+    endfunction
+endclass
+
+class thing;
+    typedef registry_base type_id;
+
+    static function thing create(string name = "");
+        return null;
+    endfunction
+endclass
+
+module top;
+    initial thing::type_id::create("x", );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(16, 40);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label ==
+          "function registry_base create(string name, int parent)");
+    REQUIRE(help->activeParameter.has_value());
+    CHECK(*help->activeParameter == 1);
+}
+
 TEST_CASE("workspace symbols: indexes top-level symbols from extra files", "[workspace]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_workspace_symbols.sv";
     {
