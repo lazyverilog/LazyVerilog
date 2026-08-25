@@ -51,6 +51,17 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
   `--cpus 0`, user CPU, and maxRSS.  A change can leave desktop wall time flat while
   adding user CPU, which is exactly what hurts a node that granted one core.
 - Worker count comes from the CPU slice (`src/cpu_budget.cpp`), capped at 8.
+- Compare two commits by building `index-bench` in a worktree and pointing
+  `--binary` at it.  Use the **same `CMAKE_BUILD_TYPE` on both sides** —
+  `Release` vs `RelWithDebInfo` swamps the effect being measured.
+- A shared header re-parsed once per includer is correct and expected.  An
+  *index* pass that also walks the whole header is not: it multiplies the
+  largest file in the project by the number of includers.  Watch `maxRSS` —
+  a per-file map keyed on header content shows up there first.
+- Guarded in CI by `./build/lazyverilog-tests "[scaling]"`
+  (`tests/test_shared_header_scaling.cpp`).  Write scaling guards as a **ratio
+  against a structurally identical input, minimum of N runs**, never an absolute
+  millisecond budget — that is what survives a shared CI runner.
 - Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
 
 ### Releasing a New Version
