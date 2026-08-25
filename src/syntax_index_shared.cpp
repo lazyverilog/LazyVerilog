@@ -933,6 +933,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         SubroutineOwnerKind current_module_kind{SubroutineOwnerKind::Module};
         std::string current_package;
         std::string current_class;
+        // Same class, spelled the way a member-access alias spells it: bare, no
+        // package prefix.  See the `class_member::` alias in visitToken().
+        std::string current_class_bare;
+        bool current_class_has_base{false};
+        // Names declared inside the subroutine currently being walked.  A bare
+        // identifier in a class body can only be an inherited member if it is
+        // not one of these.
+        std::unordered_set<std::string> subroutine_locals;
 
         struct TypeImport {
             std::string package_name;
@@ -972,6 +980,24 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         static uint64_t token_key(const slang::parsing::Token& token) {
             return (static_cast<uint64_t>(token.location().buffer().getId()) << 32) |
                    static_cast<uint64_t>(token.location().offset());
+        }
+
+        // Every name declared anywhere under @p node, so a subroutine body can be
+        // told apart from the members it inherits.  Nested subroutines are not a
+        // concern: SystemVerilog does not have them.
+        static void collect_local_declarator_names(const slang::syntax::SyntaxNode& node,
+                                                    std::unordered_set<std::string>& out) {
+            struct Collector : public slang::syntax::SyntaxVisitor<Collector> {
+                std::unordered_set<std::string>& out;
+                explicit Collector(std::unordered_set<std::string>& out) : out(out) {}
+                void handle(const DeclaratorSyntax& decl) {
+                    if (decl.name)
+                        out.insert(std::string(decl.name.valueText()));
+                    visitDefault(decl);
+                }
+            };
+            Collector collector(out);
+            node.visit(collector);
         }
 
         CombinedVisitor(SyntaxIndex& index, const slang::SourceManager& sm,
@@ -1044,14 +1070,44 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (!class_name.empty())
                 add_ref(node.name, symbol_canonical("class", parent_scope, class_name));
 
+            // An `extends` clause names a class, and that is knowable from syntax
+            // alone -- this shard need not have parsed the base class's file.
+            // Emit the same `class::` identity the base's declaration carries, so
+            // renaming a class also rewrites `extends` in the files that derive
+            // from it instead of silently leaving them pointing at a name that no
+            // longer exists.
+            //
+            // This is added alongside, not instead of, whatever identity the
+            // generic token fallback assigns the same token: an unqualified base
+            // may be a package class reached by a wildcard import, and that path
+            // is bridged through the `name:` occurrence.
+            if (node.extendsClause && node.extendsClause->baseName) {
+                if (const auto base_token = last_identifier_token(*node.extendsClause->baseName)) {
+                    const auto rendered = render_syntax_node_text(sm, *node.extendsClause->baseName);
+                    const auto qualified = rendered.substr(0, rendered.find('#'));
+                    const auto base_name = base_class_lookup_name(qualified);
+                    std::string base_scope;
+                    if (const auto sep = qualified.rfind("::"); sep != std::string::npos)
+                        base_scope = trim_copy(qualified.substr(0, sep));
+                    if (!base_name.empty())
+                        add_ref(base_token, symbol_canonical("class", base_scope, base_name));
+                }
+            }
+
             auto previous_class = current_class;
+            const auto previous_class_bare = current_class_bare;
+            const bool previous_has_base = current_class_has_base;
             const auto import_stack_size = visible_type_imports.size();
             if (!current_class.empty())
                 current_class += "::" + class_name;
             else
                 current_class = parent_scope.empty() ? class_name : parent_scope + "::" + class_name;
+            current_class_bare = class_name;
+            current_class_has_base = node.extendsClause != nullptr;
             visitDefault(node);
             current_class = std::move(previous_class);
+            current_class_bare = previous_class_bare;
+            current_class_has_base = previous_has_base;
             visible_type_imports.resize(import_stack_size);
         }
 
@@ -1116,7 +1172,19 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     add_ref(name_token, subroutine_symbol_id(owner_kind, owner_name, name));
                 }
             }
+
+            auto previous_locals = std::move(subroutine_locals);
+            subroutine_locals.clear();
+            if (node.prototype && node.prototype->portList) {
+                for (const auto* port_base : node.prototype->portList->ports) {
+                    const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
+                    if (port && port->declarator)
+                        subroutine_locals.insert(std::string(port->declarator->name.valueText()));
+                }
+            }
+            collect_local_declarator_names(node, subroutine_locals);
             visitDefault(node);
+            subroutine_locals = std::move(previous_locals);
         }
 
         void add_subroutine_invocation_ref(const slang::parsing::Token& name_token,
@@ -1738,6 +1806,25 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 add_ref(token, enum_it->second);
                 return;
             }
+            // Nothing this shard knows explains the name, and it sits in a class
+            // body that extends something.  The base class is normally declared
+            // in a different file, so this shard cannot say which ancestor owns
+            // the name -- but it can say which class the use is written in, and
+            // find_references() completes the hop by checking that class really
+            // derives from the one that declares the member.  Without this,
+            // renaming a base-class field silently skips every derived class.
+            //
+            // Emitted alongside the `name:` occurrence below so the include and
+            // import bridges keep working on the same token.
+            //
+            // Only for an *unqualified* name.  `receiver.member` names a member
+            // of the receiver's class, not of the class the line is written in,
+            // so aliasing it here would attribute it to the wrong owner; the
+            // member-access fallbacks above already own that shape.
+            if (current_class_has_base && !current_class_bare.empty() && object_name.empty() &&
+                !subroutine_locals.contains(name))
+                add_ref(token, symbol_canonical("class_member", current_class_bare, name));
+
             scope_key = "name:";
             scope_key += name;
             add_ref(token, scope_key);

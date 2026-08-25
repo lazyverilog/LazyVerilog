@@ -1192,6 +1192,145 @@ endmodule
     std::filesystem::remove(dir);
 }
 
+namespace {
+
+// pkt_base.sv / pkt_child.sv from demo/, the smallest two-file inheritance
+// fixture: `pkt_child extends pkt_base` and reaches `depth` without qualifying
+// it.  Both files are project files; neither is open unless a test opens it.
+struct InheritanceFixture {
+    std::filesystem::path dir;
+    std::filesystem::path base_path;
+    std::filesystem::path child_path;
+    std::string base_text;
+    std::string child_text;
+};
+
+static InheritanceFixture make_inheritance_fixture(const std::string& name) {
+    InheritanceFixture fx;
+    fx.dir = std::filesystem::temp_directory_path() / name;
+    std::filesystem::create_directories(fx.dir);
+    fx.base_path = fx.dir / "pkt_base.sv";
+    fx.child_path = fx.dir / "pkt_child.sv";
+
+    fx.base_text = R"(class pkt_base;
+    int depth;
+
+    function void apply();
+    endfunction
+endclass
+)";
+    fx.child_text = R"(class pkt_child extends pkt_base;
+    function void bump();
+        depth = depth + 1;
+        apply();
+    endfunction
+endclass
+)";
+
+    {
+        std::ofstream out(fx.base_path);
+        REQUIRE(out.good());
+        out << fx.base_text;
+    }
+    {
+        std::ofstream out(fx.child_path);
+        REQUIRE(out.good());
+        out << fx.child_text;
+    }
+    return fx;
+}
+
+static void remove_inheritance_fixture(const InheritanceFixture& fx) {
+    std::filesystem::remove(fx.base_path);
+    std::filesystem::remove(fx.child_path);
+    std::filesystem::remove(fx.dir);
+}
+
+} // namespace
+
+TEST_CASE("references: base class declaration finds an extends clause in another file",
+          "[references][inheritance]") {
+    // `rename` is built on this list, so a miss here silently leaves
+    // `class pkt_child extends pkt_base;` pointing at a name that no longer
+    // exists.
+    const auto fx = make_inheritance_fixture("lazyverilog_refs_extends_clause");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({fx.base_path.string(), fx.child_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string base_uri = uri_from_path(fx.base_path);
+    const std::string child_uri = uri_from_path(fx.child_path);
+    analyzer.open(base_uri, fx.base_text);
+
+    const auto [line, col] = find_position(fx.base_text, "pkt_base");
+    const auto refs = analyzer.find_references(base_uri, line, col, true);
+
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == base_uri && ref.line == 0;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == child_uri && ref.line == 0 &&
+               ref.col == (int)fx.child_text.find("pkt_base");
+    }));
+
+    remove_inheritance_fixture(fx);
+}
+
+TEST_CASE("references: base class field declaration finds inherited uses in another file",
+          "[references][inheritance]") {
+    // `depth` inside pkt_child is an unqualified inherited field access, which
+    // go-to-definition already walks the `extends` chain for.  References has to
+    // agree, or rename drops every derived-class use.
+    const auto fx = make_inheritance_fixture("lazyverilog_refs_inherited_field");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({fx.base_path.string(), fx.child_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string base_uri = uri_from_path(fx.base_path);
+    const std::string child_uri = uri_from_path(fx.child_path);
+    analyzer.open(base_uri, fx.base_text);
+
+    const auto [line, col] = find_position(fx.base_text, "depth");
+    const auto refs = analyzer.find_references(base_uri, line, col, true);
+
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == base_uri && ref.line == 1;
+    }));
+    const auto child_uses = std::count_if(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == child_uri && ref.line == 2;
+    });
+    CHECK(child_uses == 2); // `depth = depth + 1;`
+
+    remove_inheritance_fixture(fx);
+}
+
+TEST_CASE("references: base class method declaration finds inherited calls in another file",
+          "[references][inheritance]") {
+    const auto fx = make_inheritance_fixture("lazyverilog_refs_inherited_method");
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({fx.base_path.string(), fx.child_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string base_uri = uri_from_path(fx.base_path);
+    const std::string child_uri = uri_from_path(fx.child_path);
+    analyzer.open(base_uri, fx.base_text);
+
+    const auto [line, col] = find_position(fx.base_text, "apply");
+    const auto refs = analyzer.find_references(base_uri, line, col, true);
+
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == base_uri && ref.line == 3;
+    }));
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == child_uri && ref.line == 3;
+    }));
+
+    remove_inheritance_fixture(fx);
+}
+
 TEST_CASE("references: method-local stays scoped when its own file is indexed",
           "[references]") {
     const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_method_local";
