@@ -39,6 +39,12 @@ constexpr size_t kMaxRtlTreeDepth = 256;
 
 constexpr unsigned kMaxBackgroundIndexThreads = 8;
 
+// How long the parse queue must stay empty before the parse worker rebuilds the
+// live project shard of a buffer it has just reparsed.  Short enough that a user
+// who stops typing sees project-wide features catch up immediately, long enough
+// that it never runs twice inside one burst of keystrokes.
+constexpr auto kLiveShardIdleDelay = std::chrono::milliseconds(150);
+
 // Milder than the background compiler's default of 10.  Project index warmup
 // gates when cross-file features start answering, so it should yield to
 // interactive work without being starved outright.
@@ -204,6 +210,45 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
     }
 }
 
+/// Seed the headers the previous parse of this same buffer `include`d.
+///
+/// The candidate list is that parse's dependency set rather than everything the
+/// cache holds: assignText() copies, so offering every open buffer's headers to
+/// every keystroke would trade one read for several copies.  A header that has
+/// changed on disk since it was cached is dropped by get_if_current() and simply
+/// read again.
+static void preload_open_parse_headers(slang::SourceManager& sm, OpenParseHeaderCache& cache,
+                                       const std::vector<std::string>& previous_dependencies,
+                                       const std::unordered_set<std::string_view>& excluded) {
+    for (const auto& dependency_uri : previous_dependencies) {
+        const auto path = normalize_filesystem_path(path_from_file_uri(dependency_uri)).string();
+        if (path.empty() || excluded.contains(path))
+            continue;
+        if (auto text = cache.get_if_current(path))
+            sm.assignText(std::string_view(path), std::string_view(*text));
+    }
+}
+
+/// Record the headers an open buffer's parse pulled in, so the next keystroke
+/// can seed them instead of reading them again.
+static void store_open_parse_headers(const slang::SourceManager& sm, const DocumentState& state,
+                                     OpenParseHeaderCache& cache,
+                                     const std::unordered_set<std::string_view>& excluded) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        const auto path_string = full_path.string();
+        if (excluded.contains(path_string))
+            continue;
+        // Same reasoning as store_header_texts(): the dependency set is what
+        // separates genuine `include targets from seeded buffers and overlays.
+        if (!state.include_dependency_set.contains(uri_from_path(full_path)))
+            continue;
+        cache.store(path_string, sm.getSourceText(buffer));
+    }
+}
+
 /// Record the headers this parse pulled in, so sibling files in the same burst
 /// can be seeded from memory instead of re-reading them.
 static void store_header_texts(const slang::SourceManager& sm, const DocumentState& state,
@@ -352,11 +397,17 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
+    std::vector<std::string> previous_dependencies;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         defines = defines_;
         include_dirs = include_dirs_;
+        // What this buffer included last time is the candidate set for header
+        // seeding below.  On didOpen there is no previous snapshot, so the first
+        // parse reads from disk and every keystroke after it does not.
+        if (const auto it = docs_.find(uri); it != docs_.end() && it->second)
+            previous_dependencies = it->second->include_dependencies;
         open_overlays.reserve(docs_.size());
         for (const auto& [open_uri, open_state] : docs_) {
             if (!open_state || open_uri == uri)
@@ -373,6 +424,10 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
 
     auto sm = make_lsp_source_manager();
     add_include_dirs(*sm, include_dirs);
+    const auto header_cache_excluded =
+        header_cache_excluded_paths(open_overlays, normalized_current_path);
+    preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
+                               header_cache_excluded);
     preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
@@ -388,6 +443,8 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
     state->include_dependency_set.insert(state->include_dependencies.begin(),
                                          state->include_dependencies.end());
+    store_open_parse_headers(*state->source_manager, *state, open_parse_header_texts_,
+                             header_cache_excluded);
     // clangd-style current-file layer:
     //
     // Do not materialize any current-file SyntaxIndex on didOpen/didChange.
@@ -499,6 +556,16 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text
 
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
+        // This placeholder replaces the parsed snapshot before the worker has
+        // produced a new one, so carry its `include list forward.  What a file
+        // included one keystroke ago is the best available answer until the
+        // reparse lands, and leaving it empty would tell make_state() that this
+        // buffer includes nothing — which is exactly when its headers should be
+        // seeded from cache instead of read again.
+        if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
+            state->include_dependencies = it->second->include_dependencies;
+            state->include_dependency_set = it->second->include_dependency_set;
+        }
         docs_[uri] = std::move(state);
         latest_version_[uri] = version;
         semantic_diagnostics_.erase(uri);
@@ -520,18 +587,46 @@ void Analyzer::set_parse_complete_callback(
 }
 
 void Analyzer::parse_worker_loop() {
+    // Live shards whose owning buffer has been reparsed but whose rebuild is
+    // waiting for the typing to stop.  See the deferral note below.
+    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> deferred_shards;
+
     while (true) {
         ParseJob job;
+        bool have_job = false;
         {
             std::unique_lock<std::mutex> lock(parse_mutex_);
-            parse_cv_.wait(lock, [&] {
-                return parse_stop_.load() || !parse_pending_.empty();
-            });
+            if (deferred_shards.empty()) {
+                parse_cv_.wait(lock, [&] {
+                    return parse_stop_.load() || !parse_pending_.empty();
+                });
+            } else {
+                parse_cv_.wait_for(lock, kLiveShardIdleDelay, [&] {
+                    return parse_stop_.load() || !parse_pending_.empty();
+                });
+            }
             if (parse_stop_.load())
                 break;
-            auto it = parse_pending_.begin();
-            job = std::move(it->second);
-            parse_pending_.erase(it);
+            if (!parse_pending_.empty()) {
+                auto it = parse_pending_.begin();
+                job = std::move(it->second);
+                parse_pending_.erase(it);
+                have_job = true;
+            }
+        }
+
+        if (!have_job) {
+            // The queue stayed empty for kLiveShardIdleDelay, so the user has
+            // stopped typing and the deferred shards are worth building.
+            for (auto& [shard_uri, shard_state] : deferred_shards) {
+                auto index = get_dynamic_index(*shard_state);
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (const auto it = docs_.find(shard_uri);
+                    it != docs_.end() && it->second == shard_state)
+                    update_extra_cache_for_live_state_locked(shard_state, std::move(index));
+            }
+            deferred_shards.clear();
+            continue;
         }
 
         auto state = make_state(job.uri, job.text); // outside all locks
@@ -584,12 +679,19 @@ void Analyzer::parse_worker_loop() {
         }
 
         if (committed) {
-            if (listed_extra) {
-                auto index = get_dynamic_index(*state);
-                std::lock_guard<std::mutex> lock(map_mutex_);
-                if (const auto it = docs_.find(job.uri); it != docs_.end() && it->second == state)
-                    update_extra_cache_for_live_state_locked(state, std::move(index));
-            }
+            // Defer the shard rebuild until the typing stops.
+            //
+            // Only project-wide features read this shard, so it is allowed to
+            // trail the buffer by a moment.  Building it walks everything the
+            // file `include`s, which with one large shared header is the most
+            // expensive thing on the edit path — and every keystroke throws the
+            // previous result away.  Holding it until the parse queue has been
+            // empty for kLiveShardIdleDelay makes a burst cost one rebuild
+            // instead of one per character.  The cost of that is a shard which
+            // trails the buffer by up to one delay after the last keystroke;
+            // nothing that answers for the current file reads it.
+            if (listed_extra)
+                deferred_shards[job.uri] = state;
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
         }
@@ -4651,6 +4753,10 @@ void Analyzer::schedule_background_reindex_locked() const {
     // committing each shard, so a slow parse can never overwrite newer project
     // state.
     ++background_generation_;
+    // Include directories may have moved, so a path the previous parse resolved
+    // an `include to is no longer evidence of what the same directive resolves
+    // to now.  Size and mtime cannot catch that; only dropping the cache can.
+    open_parse_header_texts_.clear();
     background_pending_files_.clear();
     background_pending_set_.clear();
     // Header shards belong to the generation that built them.  A changed header,
