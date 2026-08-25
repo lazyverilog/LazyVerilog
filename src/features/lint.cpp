@@ -312,6 +312,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     int module_sev() const { return severity_from(cfg.module.severity); }
     int instance_sev() const { return severity_from(cfg.instance.severity); }
     int statement_sev() const { return severity_from(cfg.statement.severity); }
+    int function_sev() const { return severity_from(cfg.function.severity); }
 
     void chk_name(const std::string& name, SourceLocation loc,
                   const CachedRegex& re,
@@ -346,6 +347,11 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     // ── functions_automatic / explicit_function_lifetime / explicit_task_lifetime
     void handle(const FunctionDeclarationSyntax& node) {
+        if (!cfg.function.enable) {
+            visitDefault(node);
+            return;
+        }
+
         bool is_task   = (node.kind == SyntaxKind::TaskDeclaration);
         auto& proto    = *node.prototype;
         bool  has_life = proto.lifetime.valid() && !proto.lifetime.rawText().empty();
@@ -354,15 +360,15 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             if (cfg.function.functions_automatic) {
                 bool is_auto = has_life && proto.lifetime.rawText() == "automatic";
                 if (!is_auto)
-                    push_diag(diags, sm, proto.keyword.location(), 2,
+                    push_diag(diags, sm, proto.keyword.location(), function_sev(),
                         "[function] function declaration should use 'automatic' lifetime");
             } else if (cfg.function.explicit_function_lifetime && !has_life) {
-                push_diag(diags, sm, proto.keyword.location(), 2,
+                push_diag(diags, sm, proto.keyword.location(), function_sev(),
                     "[function] function declaration missing explicit lifetime (automatic/static)");
             }
         } else if (cfg.function.explicit_task_lifetime && !has_life) {
-            push_diag(diags, sm, proto.keyword.location(), 2,
-                "[function] task declaration missing explicit lifetime (automatic/static)");
+            push_diag(diags, sm, proto.keyword.location(), function_sev(),
+                "[task] task declaration missing explicit lifetime (automatic/static)");
         }
         visitDefault(node);
     }
@@ -370,7 +376,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     // ── function_call_style: "named" | "positional" | "both" ─────────────────
     void handle(const InvocationExpressionSyntax& node) {
         const auto& style = cfg.function.function_call_style;
-        if (!style.empty() && node.arguments) {
+        if (cfg.function.enable && !style.empty() && node.arguments) {
             bool has_positional = false, has_named = false;
             for (auto* arg : node.arguments->parameters) {
                 if (!arg) continue;
@@ -379,10 +385,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 else if (arg->as_if<NamedArgumentSyntax>())
                     has_named = true;
             }
-            auto fn_sev = cfg.function.enable ? (cfg.function.severity == "error"   ? 1
-                                                 : cfg.function.severity == "hint"   ? 3
-                                                                                      : 2)
-                                              : 2;
+            auto fn_sev = function_sev();
             if (style == "named" && has_positional)
                 push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
                     "[function] call uses positional arguments; named arguments required");
