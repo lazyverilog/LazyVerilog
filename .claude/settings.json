@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake -B build)",
+      "Bash(cmake --build build:*)",
+      "Bash(ctest --test-dir build:*)",
+      "Bash(./build/lazyverilog-tests:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git submodule status:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)"
+    ]
+  }
+}
