@@ -363,7 +363,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                            std::string parent_scope);
+                            std::string parent_scope, bool scoped_lookup);
 
 // Emit one ImportEntry per imported item of a `import pkg::x;` / `import pkg::*;`
 // declaration.  Called from the member walks that every index depth already
@@ -582,7 +582,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // `obj.field` can resolve through find_typedef_field_definition().
             // The generic AST definition visitor intentionally skips aggregate
             // field declarators; member access is the correct path for fields.
-            process_typedef(*td, index, resolver, sm, entry.name);
+            process_typedef(*td, index, resolver, sm, entry.name, in_package);
         }
     }
 
@@ -697,7 +697,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // of that class, reached as `my_item::type_id`.  Indexing only the
             // data declarators hides every such type from closed-file lookup.
             if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
-                process_typedef(*nested, index, resolver, sm, entry.name);
+                process_typedef(*nested, index, resolver, sm, entry.name, /*scoped_lookup=*/true);
             } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const std::string type_text = render_syntax_node_text(sm, *data->type);
                 for (const auto* decl : data->declarators) {
@@ -765,7 +765,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                              SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                             std::string parent_scope = {}) {
+                             std::string parent_scope = {}, bool scoped_lookup = false) {
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
@@ -810,10 +810,13 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         entry.resolved = render_syntax_node_text(sm, *td.type);
     }
 
-    // Any owner, not just a package: a class-scoped `type_id` is spelled once
-    // per class, so keying only by bare name would let the first one seen win
-    // and drop every other class's copy at merge time.
-    if (!entry.parent_scope.empty())
+    // Any `::`-addressable owner, not just a package: a class-scoped `type_id`
+    // is spelled once per class, so keying only by bare name would let the
+    // first one seen win and drop every other class's copy at merge time.  A
+    // module scope is deliberately excluded — nothing can name `mod::t`, so the
+    // entry would never be looked up, and a shared header of N typedefs
+    // included by M modules would add N*M unreachable keys to the project.
+    if (scoped_lookup && !entry.parent_scope.empty())
         index.package_type_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -1016,23 +1019,52 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     // name to resolve, and PortEntry text is deliberately left alone because
     // Connect / Interface synthesize source from it and must keep the user's
     // spelling.
-    std::unordered_map<std::string, std::string> macro_type_aliases;
-    for (const auto* def : tree.getDefinedMacros()) {
-        if (!def || def->formalArguments || !def->name || def->body.size() != 1)
-            continue;
-        const auto& body = def->body[0];
-        if (body.kind != slang::parsing::TokenKind::Identifier)
-            continue;
-        macro_type_aliases.emplace(std::string(def->name.valueText()),
-                                   std::string(body.valueText()));
+    //
+    // Which macro spellings this build could substitute is decided from the
+    // entries it just produced, before any `define is looked at.  Walking the
+    // macro table unconditionally is what a shared header makes expensive:
+    // one header defining N macros and included by M files builds the same
+    // N-entry string map M times, and almost every file wants none of it.
+    std::unordered_set<std::string_view> macro_typed_names;
+    auto note_macro_type = [&](const std::string& type) {
+        if (type.size() >= 2 && type.front() == '`')
+            macro_typed_names.insert(std::string_view(type).substr(1));
+    };
+    for (const auto& value : index.values)
+        note_macro_type(value.type);
+    for (const auto& cls : index.classes) {
+        note_macro_type(cls.base_class);
+        for (const auto& field : cls.fields)
+            note_macro_type(field.type);
     }
-    if (!macro_type_aliases.empty()) {
+    for (const auto& td : index.typedefs) {
+        note_macro_type(td.resolved);
+        for (const auto& field : td.fields)
+            note_macro_type(field.type);
+    }
+
+    if (!macro_typed_names.empty()) {
+        // Token text outlives this function, so the table borrows rather than
+        // copying.  macro_typed_names borrows from the entries rewritten below
+        // and is not read again once rewriting starts.
+        std::unordered_map<std::string_view, std::string_view> macro_type_aliases;
+        for (const auto* def : tree.getDefinedMacros()) {
+            if (!def || def->formalArguments || !def->name || def->body.size() != 1)
+                continue;
+            const auto& body = def->body[0];
+            if (body.kind != slang::parsing::TokenKind::Identifier)
+                continue;
+            const auto name = def->name.valueText();
+            if (!macro_typed_names.contains(name))
+                continue;
+            macro_type_aliases.emplace(name, body.valueText());
+        }
         auto resolve_macro_type = [&](std::string& type) {
             if (type.size() < 2 || type.front() != '`')
                 return;
-            const auto alias = macro_type_aliases.find(type.substr(1));
+            const auto alias = macro_type_aliases.find(std::string_view(type).substr(1));
             if (alias != macro_type_aliases.end())
-                type = alias->second;
+                type.assign(alias->second);
         };
         for (auto& value : index.values)
             resolve_macro_type(value.type);
@@ -1144,11 +1176,16 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
         classes.push_back(std::move(copy));
     }
 
-    // typedefs — scoped by any owner, not just a package, so that the
-    // same-named typedef each class declares survives instead of the first one
-    // seen claiming the bare name for the whole project.
+    // typedefs — scoped by any `::`-addressable owner, not just a package, so
+    // that the same-named typedef each class declares survives instead of the
+    // first one seen claiming the bare name for the whole project.  A
+    // module-scoped typedef stays unscoped: it matches what build() records,
+    // and scoping it would append one copy per shard that saw the header
+    // declaring it.
     for (const auto& t : other.typedefs) {
-        const bool scoped = !t.parent_scope.empty();
+        const bool scoped = !t.parent_scope.empty() &&
+                            (other.package_names.count(t.parent_scope) > 0 ||
+                             other.class_by_name.count(t.parent_scope) > 0);
         const auto scoped_key = scoped ? package_scoped_key(t.parent_scope, t.name) : std::string{};
         const bool scoped_is_new = scoped && !package_type_by_scoped_name.count(scoped_key);
         if (typedef_by_name.count(t.name) && !scoped_is_new)
