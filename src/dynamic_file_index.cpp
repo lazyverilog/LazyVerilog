@@ -476,11 +476,20 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                              with_dims(sm, port_signal_decl_type(sm, *port_decl->header), *decl));
             }
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const auto type = node_text_raw(sm, *data->type);
+            // Rendered on the first declarator actually kept: a shared header's
+            // declarations would otherwise pay type rendering once per including
+            // file only to be dropped.  Mirrors the same branch in
+            // syntax_index.cpp so an open buffer and its closed shard agree.
+            std::optional<std::string> type;
             for (const auto* decl : data->declarators) {
-                if (decl)
-                    add_value(index, resolver, sm, decl->name, with_dims(sm, type, *decl), "variable",
-                              module.name);
+                if (!decl)
+                    continue;
+                if (!resolver.wants_declaration(index, sm, decl->name))
+                    continue;
+                if (!type)
+                    type = node_text_raw(sm, *data->type);
+                add_value(index, resolver, sm, decl->name, with_dims(sm, *type, *decl), "variable",
+                          module.name);
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             if (auto* value = add_value(index, resolver, sm, fn->prototype->keyword,
@@ -492,12 +501,18 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             // `#(...)` parameters handled above.  Mirrors the same branch in
             // syntax_index.cpp so open buffers and closed shards agree.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                const auto type = node_text_raw(sm, *param->type);
-                const auto kind = token_value_text(param->keyword);
+                std::optional<std::string> type;
+                std::string kind;
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
-                    if (auto* value = add_value(index, resolver, sm, decl->name, type, kind, module.name))
+                    if (!resolver.wants_declaration(index, sm, decl->name))
+                        continue;
+                    if (!type) {
+                        type = node_text_raw(sm, *param->type);
+                        kind = token_value_text(param->keyword);
+                    }
+                    if (auto* value = add_value(index, resolver, sm, decl->name, *type, kind, module.name))
                         value->default_value =
                             decl->initializer ? node_text_raw(sm, *decl->initializer->expr)
                                               : std::string{};
@@ -693,9 +708,15 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
 
 
 
-} // namespace
-
-SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
+/// Walk the live AST into a shard.
+///
+/// @p restrict_to_uri empty keeps every buffer the tree covers, which is what a
+/// whole-file structural view wants.  Non-empty scopes the build to one file the
+/// way SyntaxIndex::build() does for background shards: declarations from an
+/// `include`d header survive only when this file mentions their name, and
+/// occurrence tables cover this file alone.  The header's own shard is what
+/// records the rest, once for the whole project instead of once per includer.
+SyntaxIndex build_structural_index(const DocumentState& state, std::string_view restrict_to_uri) {
     SyntaxIndex index;
     if (!state.tree)
         return index;
@@ -703,6 +724,25 @@ SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
     const auto& root = state.tree->root();
     const auto& sm = state.tree->sourceManager();
     SourceFileIdResolver resolver;
+
+    // Built on the first declaration that actually comes from another file:
+    // scanning the buffer costs more than it saves for a file that `include`s
+    // nothing.  The views point into state.text and into macro body tokens, both
+    // of which outlive this function.
+    std::unordered_set<std::string_view> mentioned_names;
+    bool mentions_ready = false;
+    auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {
+        if (!mentions_ready) {
+            mentioned_names = collect_mentioned_names(state.text, *state.tree);
+            mentions_ready = true;
+        }
+        return &mentioned_names;
+    };
+    if (!restrict_to_uri.empty()) {
+        resolver.restrict_to_uri(std::string(restrict_to_uri));
+        resolver.set_mentions_provider(ensure_mentions);
+    }
+
     auto process_member = [&](const MemberSyntax& member) {
         if (const auto* mod = member.as_if<ModuleDeclarationSyntax>()) {
             if (member.kind == SyntaxKind::InterfaceDeclaration) {
@@ -728,9 +768,16 @@ SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
         process_member(*member);
     }
 
-    collect_combined_occurrences(*state.tree, root, index, sm);
+    collect_combined_occurrences(*state.tree, root, index, sm, restrict_to_uri,
+                                 mentions_ready ? &mentioned_names : nullptr);
     index.include_dependencies = collect_include_dependency_uris(sm, state.uri);
     return index;
+}
+
+} // namespace
+
+SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
+    return build_structural_index(state, {});
 }
 
 const SyntaxIndex& get_structural_index(const DocumentState& state) {
@@ -741,16 +788,29 @@ const SyntaxIndex& get_structural_index(const DocumentState& state) {
 }
 
 SyntaxIndex build_dynamic_file_index(const DocumentState& state) {
-    SyntaxIndex index = get_structural_index(state);
+    // Scoped to this file, matching the disk-backed shard the background indexer
+    // builds for the same path (Analyzer::make_file_state_with_options passes
+    // restrict_index_to_own_file).  Without that, opening a file swapped its lean
+    // shard for one carrying every declaration and every identifier occurrence of
+    // whatever it `include`s — a header shared by N files costing N copies of
+    // itself, rebuilt from scratch on each edit.
+    //
+    // This is deliberately not the structural cache: that one is the unrestricted
+    // whole-file view AutoWire, Connect, RTL-tree and documentSymbol ask for, and
+    // it stays unrestricted.
+    SyntaxIndex index = build_structural_index(state, state.uri);
     if (!state.tree)
         return index;
 
     SourceFileIdResolver resolver;
 
     collect_imports(state.tree->root(), index, resolver, state.tree->sourceManager());
+    // Macros stay unscoped on purpose.  Header shards are built at Declarations
+    // depth, which skips macros entirely, so this shard is the only place a
+    // header's `define reaches macro completion from.
     collect_macros(*state.tree, index, resolver);
-    // The structural cache already contains macro reference occurrences for
-    // the open file.  `collect_macros()` above only adds completion metadata
+    // The structural walk above already recorded macro reference occurrences for
+    // the open file.  `collect_macros()` only adds completion metadata
     // (MacroEntry), so do not add references a second time here.
     return index;
 }
