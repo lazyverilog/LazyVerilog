@@ -38,12 +38,13 @@ int main(int argc, char** argv) {
     const fs::path fixtures = repo_root / "tests" / "fixtures" / "cli_smoke" / "lint";
     const fs::path top = fixtures / "m_top.sv";
     const fs::path filelist = fixtures / "lint.f";
+    const fs::path semantic_error = fixtures / "m_semantic_error.sv";
 
     if (!fs::exists(lint_bin)) {
         std::cerr << "lint binary does not exist: " << lint_bin << "\n";
         return 2;
     }
-    if (!fs::exists(top) || !fs::exists(filelist)) {
+    if (!fs::exists(top) || !fs::exists(filelist) || !fs::exists(semantic_error)) {
         std::cerr << "fixtures missing under " << fixtures << "\n";
         return 2;
     }
@@ -72,6 +73,36 @@ int main(int argc, char** argv) {
               "--lint-only drops the compilation diagnostic");
         expect(contains(result.stdout_text, "[naming]"),
               "--lint-only keeps the lint diagnostic");
+    }
+
+    // --compile-only: drops lint diagnostics, keeps compilation diagnostics.
+    {
+        auto result = run_command(lint_bin, "--compile-only " + shell_quote(top));
+        expect(contains(result.stdout_text, "unknown macro"),
+              "--compile-only keeps the compilation diagnostic");
+        expect(!contains(result.stdout_text, "[naming]"),
+              "--compile-only drops the lint diagnostic");
+    }
+
+    // Single-file mode: reports a real semantic (not just parse) diagnostic
+    // for the target file, regardless of the [compilation] background_compilation
+    // toml setting — regression coverage for a bug where Analyzer::open()'s
+    // synchronous CLI path never registered a tracked version, so
+    // Analyzer::semantic_diagnostics() unconditionally treated the file as
+    // stale and dropped every semantic diagnostic for it.
+    {
+        auto result = run_command(lint_bin, shell_quote(semantic_error));
+        expect(result.exit_code == 2, "semantic error has an error-severity diagnostic (exit 2)");
+        expect(contains(result.stdout_text, "redefinition"),
+              "reports the semantic redefinition diagnostic");
+    }
+
+    // --version: prints a version and exits 0.
+    {
+        auto result = run_command(lint_bin, "--version");
+        expect(result.exit_code == 0, "--version exits 0");
+        expect(contains(result.stdout_text, "lazyverilog-lint"),
+              "--version reports the binary name");
     }
 
     // -f whole-project mode: lints every file in the filelist, not just one.

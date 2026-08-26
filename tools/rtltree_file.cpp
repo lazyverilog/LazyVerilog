@@ -48,6 +48,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-h" || arg == "--help") {
             print_usage();
             return 0;
+        } else if (arg == "--version") {
+            std::cout << "lazyverilog-rtltree " << LAZYVERILOG_VERSION << "\n";
+            return 0;
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage();

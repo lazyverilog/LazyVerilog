@@ -110,6 +110,22 @@ string(REPLACE
 file(WRITE "${_caps_h}" "${_caps_content}")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Version string for --version, from the nearest git tag
+# ──────────────────────────────────────────────────────────────────────────────
+execute_process(
+    COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE LAZYVERILOG_GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _git_describe_result
+    ERROR_QUIET
+)
+if(NOT _git_describe_result EQUAL 0 OR LAZYVERILOG_GIT_VERSION STREQUAL "")
+    set(LAZYVERILOG_GIT_VERSION "unknown")
+endif()
+add_compile_definitions(LAZYVERILOG_VERSION="${LAZYVERILOG_GIT_VERSION}")
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main LSP server binary
 # ──────────────────────────────────────────────────────────────────────────────
 set(LAZYVERILOG_SOURCES

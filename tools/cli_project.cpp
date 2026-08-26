@@ -32,9 +32,6 @@ void index_cli_project(Analyzer& analyzer, const CliProject& project) {
 }
 
 void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project) {
-    if (!project.config.compilation.background_compilation)
-        return;
-
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
