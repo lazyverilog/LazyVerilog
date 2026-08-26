@@ -1742,6 +1742,149 @@ TEST_CASE("completion: NewExpression suggests classes", "[completion]") {
     CHECK(has_label(result, "pkt_cfg"));
 }
 
+// A base class almost never lives in the file that extends it — a child in the
+// live buffer extending a base in a closed filelist file is the ordinary shape
+// of UVM and of any layered testbench.  Generic identifier completion
+// deliberately stays local (see "avoids extra-file modules" below), so
+// `extends` has to be its own context that consults the project index, the way
+// `new` and `pkg::` already do.
+TEST_CASE("completion: extends offers a base class from a closed project file", "[completion]") {
+    const auto base_path =
+        std::filesystem::temp_directory_path() / "completion_extends_base.sv";
+    {
+        std::ofstream out(base_path);
+        REQUIRE(out.good());
+        out << "class lib_base_cfg;\n    int depth;\nendclass\n";
+    }
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({base_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_extends_child.sv";
+    const std::string text = "class child_cfg extends lib_base_cfg\nendclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "extends lib_base_cfg");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "lib_base_cfg"));
+
+    std::filesystem::remove(base_path);
+}
+
+TEST_CASE("completion: extends still offers a base class from the same file", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_extends_local.sv";
+    const std::string text =
+        "class local_base;\n"
+        "    int depth;\n"
+        "endclass\n"
+        "class local_child extends local_base\n"
+        "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "extends local_base");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "local_base"));
+}
+
+// Only a class name is legal after `extends`, so the modules and keywords that
+// generic identifier completion offers would be pure noise here.
+TEST_CASE("completion: extends offers neither modules nor keywords", "[completion]") {
+    const auto extra_path =
+        std::filesystem::temp_directory_path() / "completion_extends_module.sv";
+    {
+        std::ofstream out(extra_path);
+        REQUIRE(out.good());
+        out << "module m_extends_adder(input logic i_a);\nendmodule\n"
+               "class ext_only_cfg;\nendclass\n";
+    }
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({extra_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_extends_noise.sv";
+    const std::string text = "class noise_child extends \nendclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "extends ");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "ext_only_cfg"));
+    CHECK_FALSE(has_label(result, "m_extends_adder"));
+    CHECK_FALSE(has_label(result, "always_comb"));
+    CHECK_FALSE(has_label(result, "endclass"));
+}
+
+TEST_CASE("completion: implements offers an interface class from a closed project file",
+          "[completion]") {
+    const auto proto_path =
+        std::filesystem::temp_directory_path() / "completion_implements_proto.sv";
+    {
+        std::ofstream out(proto_path);
+        REQUIRE(out.good());
+        out << "interface class lib_proto_if;\n"
+               "    pure virtual function void run();\n"
+               "endclass\n";
+    }
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({proto_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_implements_child.sv";
+    const std::string text = "class impl_cfg implements lib_proto_if\nendclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "implements lib_proto_if");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "lib_proto_if"));
+
+    std::filesystem::remove(proto_path);
+}
+
+// A qualified base is a more precise question than "some class somewhere", and
+// PackageScope already answers it.  Pin that `extends` detection does not steal
+// the qualified spelling away from it.
+TEST_CASE("completion: a qualified extends base still resolves through package scope",
+          "[completion]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "completion_extends_pkg.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package base_cfg_pkg;\n"
+               "  class pkg_base_cfg;\n"
+               "    int depth;\n"
+               "  endclass\n"
+               "endpackage\n";
+    }
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/completion_extends_qualified.sv";
+    const std::string text = "class qual_child extends base_cfg_pkg::\nendclass\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "extends base_cfg_pkg::");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "pkg_base_cfg"));
+
+    std::filesystem::remove(pkg_path);
+}
+
 TEST_CASE("completion: snippet items included in identifier context", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;

@@ -20,6 +20,7 @@ enum class CompletionContextKind {
     Macro,        // `
     IncludeFile,  // `include "
     NewExpression, // after new
+    BaseClass,    // after extends / implements
     EventControl, // inside @( ... )
     Unknown,      // fallback — treated as Identifier
 };
