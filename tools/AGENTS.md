@@ -16,6 +16,7 @@ Developer utilities for benchmarking and debugging the lazyverilog server. Not p
 | `startup_bench.py` | Wraps `index-bench` with repeats, CPU-slice restriction, RSS/CPU accounting (`tools/startup_bench.py [project] [--cpus 0] [--trace] [--json]`) |
 | `run_parse_bench_opentitan.sh` | Runs formatter performance sweep against OpenTitan RTL corpus |
 | `diff_once_twice` | Idempotency checker — formats a `.sv` file once and twice, then diffs pass-by-pass logs to find the first non-idempotent pass |
+| `clk_file.cpp` | `lazyverilog-clk` — per-port clock domains for one instance (`lazyverilog-clk -f <filelist> <instance>`); see `docs/clock-domain/cli.md` |
 
 ## For AI Agents
 
@@ -30,5 +31,12 @@ Developer utilities for benchmarking and debugging the lazyverilog server. Not p
   `--cpus` to reproduce batch-scheduled or containerised nodes.  See `docs/dev/startup-perf.md`.
 - Per-file tracing is only reliable single-threaded (`--cpus 0`); pool workers share an
   unsynchronized `cerr`, so parallel runs splice trace lines.
+- `lazyverilog-clk` is the one tool that elaborates **without**
+  `CompilationFlags::LintMode`.  Lint mode makes every module its own top, which flattens
+  the hierarchy that hierarchical instance paths depend on.  The cost is that an
+  incomplete filelist fails loudly here instead of being papered over.
+- Its trace logic lives in `src/features/clock_domain.cpp` and is unit-tested separately
+  from the CLI: `./build/lazyverilog-tests "[clkdomain]"` for clock extraction,
+  `ctest --test-dir build -R clk-cli-smoke` for the end-to-end table.
 
 <!-- MANUAL: -->

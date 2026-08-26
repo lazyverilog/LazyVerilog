@@ -10,6 +10,8 @@ implementation of LazyVerilog.
 - [Connect](connect.md): interactive instance-to-instance wiring.
 - [Interface](interface.md): two-instance and single-instance interface views.
 - [Disconnect](disconnect.md): clearing Interface connections.
+- [Clock domain CLI](clock-domain/cli.md): `lazyverilog-clk`, per-port capture
+  and drive clocks for one instance.
 - `format-options.md`: formatter-related `lazyverilog.toml` options, including
   declaration alignment, spacing controls, instance formatting, and
   function/task-call formatting.

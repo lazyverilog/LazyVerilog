@@ -1,7 +1,7 @@
 #include "background_compiler.hpp"
+#include "compilation_builder.hpp"
 #include "cpu_budget.hpp"
 #include "syntax_index_shared.hpp"
-#include "string_utils.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -10,11 +10,7 @@
 #include <iostream>
 #include <slang/ast/Compilation.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
-#include <slang/parsing/Preprocessor.h>
-#include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
-#include <slang/util/Bag.h>
-#include <unordered_set>
 
 namespace {
 
@@ -295,74 +291,18 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     result.generation = generation;
     result.open_uris = std::move(snapshot.open_uris);
 
-    auto source_manager = make_lsp_source_manager();
-    for (const auto& dir : snapshot.include_dirs) {
-        if (!dir.empty())
-            (void)source_manager->addUserDirectories(dir);
-    }
-
-    slang::parsing::PreprocessorOptions preprocessor_options;
-    preprocessor_options.predefines = snapshot.defines;
-
     slang::ast::CompilationOptions compilation_options;
     compilation_options.flags |= slang::ast::CompilationFlags::LintMode;
 
-    slang::Bag bag;
-    bag.set(preprocessor_options);
-    bag.set(compilation_options);
-
-    slang::ast::Compilation compilation(bag);
-    std::string first_uri;
-    std::unordered_set<std::string> assigned_paths;
-    size_t scanned_buffer_count = 0;
-
-    auto add_new_assigned_paths = [&] {
-        const auto buffers = source_manager->getAllBuffers();
-        // SourceManager buffer IDs are append-only for this compilation.  Do
-        // not clear and rebuild the whole set after each syntax tree: on large
-        // filelists that turns a simple duplicate check into O(n²) allocator
-        // churn.  Scan only buffers that appeared since the previous tree.
-        for (size_t i = scanned_buffer_count; i < buffers.size(); ++i) {
-            auto buffer = buffers[i];
-            const auto& path = source_manager->getFullPath(buffer);
-            if (!path.empty())
-                assigned_paths.insert(normalize_filesystem_path(path).string());
-        }
-        scanned_buffer_count = buffers.size();
-    };
-
-    for (const auto& file : snapshot.files) {
-        const auto normalized_path = normalize_filesystem_path(file.path).string();
-        if (assigned_paths.contains(normalized_path))
-            continue;
-
-        std::string text = file.text ? *file.text : read_file_text_or_empty(file.path);
-        if (text.empty() && !file.text)
-            continue;
-
-        if (first_uri.empty())
-            first_uri = file.uri;
-
-        try {
-            auto tree = slang::syntax::SyntaxTree::fromText(std::string_view(text), *source_manager,
-                                                            std::string_view(file.uri),
-                                                            std::string_view(file.path), bag);
-            compilation.addSyntaxTree(std::move(tree));
-            add_new_assigned_paths();
-        } catch (const std::exception& e) {
-            const bool log_timing = log_timing_.load(std::memory_order_relaxed);
-            if (log_timing) {
-                std::cerr << "[lazyverilog] semantic compile skipped " << file.path << ": "
-                          << e.what() << "\n";
-            }
-            add_new_assigned_paths();
-        }
-    }
+    auto built = build_compilation(snapshot, compilation_options,
+                                   log_timing_.load(std::memory_order_relaxed));
+    auto& source_manager = built.source_manager;
+    const std::string& first_uri = built.first_uri;
 
     if (!first_uri.empty()) {
         slang::DiagnosticEngine engine(*source_manager);
         try {
-            for (const auto& diagnostic : compilation.getSemanticDiagnostics()) {
+            for (const auto& diagnostic : built.compilation->getSemanticDiagnostics()) {
                 std::string uri;
                 auto info = convert_diagnostic(*source_manager, engine, diagnostic, first_uri, uri);
                 result.diagnostics_by_uri[uri].push_back(std::move(info));

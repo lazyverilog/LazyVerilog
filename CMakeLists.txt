@@ -137,6 +137,7 @@ set(LAZYVERILOG_SOURCES
     src/analyzer.cpp
     src/dynamic_file_index.cpp
     src/background_compiler.cpp
+    src/compilation_builder.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/features/hover.cpp
@@ -201,7 +202,9 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_folding_ranges.cpp
     tests/test_document_symbols.cpp
     tests/test_opentitan_benchmark.cpp
+    tests/test_clock_domain.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
+    src/features/clock_domain.cpp
     src/features/completion.cpp
     src/features/code_action.cpp
     src/features/autoinst.cpp
@@ -283,6 +286,7 @@ set(LAZYVERILOG_CLI_PROJECT_SOURCES
     src/cpu_budget.cpp
     src/dynamic_file_index.cpp
     src/background_compiler.cpp
+    src/compilation_builder.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/features/lint.cpp
@@ -295,6 +299,13 @@ target_link_libraries(lazyverilog-lint PRIVATE slang::slang tomlplusplus::tomlpl
 add_executable(lazyverilog-rtltree tools/rtltree_file.cpp ${LAZYVERILOG_CLI_PROJECT_SOURCES})
 target_include_directories(lazyverilog-rtltree PRIVATE src tools)
 target_link_libraries(lazyverilog-rtltree PRIVATE slang::slang tomlplusplus::tomlplusplus)
+
+add_executable(lazyverilog-clk
+    tools/clk_file.cpp
+    src/features/clock_domain.cpp
+    ${LAZYVERILOG_CLI_PROJECT_SOURCES})
+target_include_directories(lazyverilog-clk PRIVATE src tools)
+target_link_libraries(lazyverilog-clk PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
 add_executable(lazyverilog-rtl-format-test tests/rtl_format_sweep.cpp)
 add_test(
@@ -319,5 +330,14 @@ add_test(
     NAME rtltree-cli-smoke
     COMMAND lazyverilog-rtltree-cli-smoke
             $<TARGET_FILE:lazyverilog-rtltree>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(lazyverilog-clk-cli-smoke tests/clk_cli_smoke.cpp)
+target_include_directories(lazyverilog-clk-cli-smoke PRIVATE tests)
+add_test(
+    NAME clk-cli-smoke
+    COMMAND lazyverilog-clk-cli-smoke
+            $<TARGET_FILE:lazyverilog-clk>
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
