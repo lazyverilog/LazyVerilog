@@ -4656,10 +4656,13 @@ std::vector<ParseDiagInfo> Analyzer::semantic_diagnostics(const std::string& uri
     const auto it = semantic_diagnostics_.find(uri);
     if (it == semantic_diagnostics_.end())
         return {};
+    // Mirror set_semantic_diagnostics(): only open buffers are version-tracked.
+    // Closed/filelist-only files (and files opened via the synchronous CLI
+    // Analyzer::open() path, which does not register a version) have no
+    // latest_version_ entry — publish their diagnostics unconditionally rather
+    // than treating "untracked" the same as "stale".
     const auto cur_it = latest_version_.find(uri);
-    if (cur_it == latest_version_.end())
-        return {};
-    if (it->second.version != cur_it->second)
+    if (cur_it != latest_version_.end() && it->second.version != cur_it->second)
         return {};  // stale cache entry — don't publish
     return it->second.diags;
 }
