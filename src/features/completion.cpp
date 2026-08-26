@@ -1600,8 +1600,10 @@ static std::string current_file_typedef_target_from_ast(const DocumentState& sta
     return visitor.result;
 }
 
+/// Every class this buffer declares, for the contexts that admit only a class
+/// name: `new` and an `extends`/`implements` base.
 static std::vector<lsCompletionItem>
-current_file_new_expression_items_from_ast(const DocumentState& state) {
+current_file_class_name_items_from_ast(const DocumentState& state) {
     std::vector<lsCompletionItem> items;
     if (!state.tree)
         return items;
@@ -2597,6 +2599,33 @@ class NewExpressionProvider : public CompletionProvider {
     }
 };
 
+// BaseClassProvider: class names for an `extends`/`implements` clause.
+//
+// Unlike NewExpressionProvider this emits the bare name: the text being
+// completed is a type reference, not a constructor call, so a `::new()`
+// snippet would be wrong here.
+class BaseClassProvider : public CompletionProvider {
+  public:
+    bool accepts(const CompletionContext& ctx) const override {
+        return ctx.kind == CompletionContextKind::BaseClass;
+    }
+
+    std::vector<lsCompletionItem> provide(const CompletionContext& /*ctx*/,
+                                           const SyntaxIndex& index,
+                                           const CancellationToken& tok) const override {
+        std::vector<lsCompletionItem> items;
+        for (const auto& c : index.classes) {
+            if (tok.cancelled) throw CompletionCancelled{};
+            auto item = make_item(c.name, lsCompletionItemKind::Class);
+            item.detail = optional<std::string>(c.parent_scope.empty()
+                                                    ? std::string("class")
+                                                    : "class in " + c.parent_scope);
+            items.push_back(std::move(item));
+        }
+        return items;
+    }
+};
+
 class EventControlProvider : public CompletionProvider {
   public:
     bool accepts(const CompletionContext& ctx) const override {
@@ -2752,6 +2781,7 @@ CompletionEngine::CompletionEngine() {
     providers_.push_back(std::make_unique<MacroProvider>());
     providers_.push_back(std::make_unique<FileProvider>());
     providers_.push_back(std::make_unique<NewExpressionProvider>());
+    providers_.push_back(std::make_unique<BaseClassProvider>());
     providers_.push_back(std::make_unique<EventControlProvider>());
     providers_.push_back(std::make_unique<IdentifierProvider>());
     providers_.push_back(std::make_unique<SnippetProvider>());
@@ -2779,6 +2809,14 @@ static bool completion_context_needs_project_index(CompletionContextKind kind) {
         // Class construction is an explicit class-oriented context.  Project
         // classes are useful here, but this context is much less frequent than
         // generic identifier completion.
+        return true;
+    case CompletionContextKind::BaseClass:
+        // `extends`/`implements` names a class, and a base class living in a
+        // different file is the normal case, not the exception: a child in a
+        // live buffer extending a base in a closed project file is exactly the
+        // shape UVM and any layered testbench has.  Like NewExpression this is
+        // an explicit, rare, class-only position, so consulting the project
+        // index here does not put a project-wide scan on ordinary typing.
         return true;
     case CompletionContextKind::Identifier:
     case CompletionContextKind::Macro:
@@ -2925,13 +2963,24 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
         return ctx;
     }
 
-    // --- class construction after "new " ---------------------------------
+    // --- keywords that admit only a class name ----------------------------
+    //
+    //   new |                    -> construction
+    //   extends | / implements | -> base class
+    //
+    // A qualified base (`extends pkg::base_`) has already been classified as
+    // PackageScope above, which is the more precise answer, so only the
+    // unqualified spelling reaches here.
     {
         size_t tmp = pos;
         backward_skip_ws(text, tmp);
         const std::string kw = backward_read_word(text, tmp);
         if (kw == "new") {
             ctx.kind = CompletionContextKind::NewExpression;
+            return ctx;
+        }
+        if (kw == "extends" || kw == "implements") {
+            ctx.kind = CompletionContextKind::BaseClass;
             return ctx;
         }
     }
@@ -3180,8 +3229,9 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                          std::make_move_iterator(items.end()));
         break;
     }
-    case CompletionContextKind::NewExpression: {
-        auto items = current_file_new_expression_items_from_ast(state);
+    case CompletionContextKind::NewExpression:
+    case CompletionContextKind::BaseClass: {
+        auto items = current_file_class_name_items_from_ast(state);
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
         break;
@@ -3312,7 +3362,10 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     if (all_items.empty() && ctx.kind != CompletionContextKind::MemberAccess &&
         ctx.kind != CompletionContextKind::PackageScope &&
         ctx.kind != CompletionContextKind::NamedPort &&
-        ctx.kind != CompletionContextKind::Parameter) {
+        ctx.kind != CompletionContextKind::Parameter &&
+        // Only a class name is legal after `extends`/`implements`; offering the
+        // keyword list when the project has no matching class would be noise.
+        ctx.kind != CompletionContextKind::BaseClass) {
         KeywordProvider fallback;
         CancellationToken dummy;
         all_items = fallback.provide(ctx, completion_index, dummy);
