@@ -238,7 +238,13 @@ static void store_open_parse_headers(const slang::SourceManager& sm, const Docum
         const auto& full_path = sm.getFullPath(buffer);
         if (full_path.empty())
             continue;
-        const auto path_string = full_path.string();
+        // Normalize before using this as a cache key: preload_open_parse_headers()
+        // looks entries up by normalize_filesystem_path(path_from_file_uri(...)),
+        // and slang's own resolved path does not go through that normalization.
+        // On a filesystem where the project path crosses a symlink or a short
+        // (8.3) name the two spellings differ, so storing under the raw path
+        // left get_if_current() unable to ever find what was just stored.
+        const auto path_string = normalize_filesystem_path(full_path).string();
         if (excluded.contains(path_string))
             continue;
         // Same reasoning as store_header_texts(): the dependency set is what
@@ -433,8 +439,17 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     ppo.predefines = defines;
     slang::Bag bag;
     bag.set(ppo);
+    // Pass the normalized path, not the raw one path_from_file_uri() produced:
+    // this SourceManager has disableProximatePaths set, so it resolves a
+    // relative `include against this path verbatim, with no canonicalization
+    // of its own.  If this were the raw path, an include's resolved full path
+    // would carry whatever symlink or short (8.3) name the client's spelling
+    // had, which does not match the normalized path preload/store_open_parse_headers()
+    // key their cache with — a permanent cache miss on any filesystem where
+    // that spelling differs (macOS /tmp, Windows short names).
     auto tree = slang::syntax::SyntaxTree::fromText(
-        std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
+        std::string_view(text), *sm, std::string_view(uri), std::string_view(normalized_current_path),
+        bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalized_current_path;
     cache_document_end_position(*state);

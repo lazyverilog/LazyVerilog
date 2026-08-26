@@ -462,6 +462,14 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
     std::unordered_set<std::string> seen;
     std::vector<std::string> result;
 
+    // Every buffer path below is compared through uri_from_path(), which always
+    // resolves symlinks and short (8.3) names.  owning_uri is whatever spelling
+    // the client sent, so comparing it as-is fails on any filesystem where that
+    // spelling differs from the resolved one (macOS's /tmp -> /private/tmp,
+    // Windows short names) — the search below would never find its own root
+    // buffer and silently report this file has no dependencies at all.
+    const std::string normalized_owning_uri = uri_from_path(path_from_file_uri(owning_uri));
+
     // Find the owning file's BufferID so we can distinguish its real `include
     // children from open-buffer overlays that were pre-loaded into the same
     // SourceManager.  Overlays are injected via assignText() with no
@@ -470,7 +478,7 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
     slang::BufferID owning_buffer;
     for (auto buffer : sm.getAllBuffers()) {
         const auto& full_path = sm.getFullPath(buffer);
-        if (!full_path.empty() && uri_from_path(full_path) == owning_uri) {
+        if (!full_path.empty() && uri_from_path(full_path) == normalized_owning_uri) {
             owning_buffer = buffer;
             break;
         }
@@ -501,7 +509,7 @@ std::vector<std::string> collect_include_dependency_uris(const slang::SourceMana
         if (full_path.empty())
             continue;
         const auto uri = uri_from_path(full_path);
-        if (uri == owning_uri)
+        if (uri == normalized_owning_uri)
             continue;
         if (seen.insert(uri).second)
             result.push_back(uri);
