@@ -30,6 +30,13 @@ class SharedHeaderProject {
         dir_ = std::filesystem::temp_directory_path() / "lazyverilog-open-shard-scope";
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
+        // Resolve once, up front: the analyzer identifies a shard by its
+        // normalized (symlink-resolved) URI, so a temp directory that is
+        // itself reached through a symlink (macOS's /tmp -> /private/tmp) or a
+        // short name (Windows) would give module_uri() a spelling the
+        // background-compiled shard never uses, and shard_value_names()'s
+        // plain string match would never see it.
+        dir_ = std::filesystem::canonical(dir_);
 
         std::string header = "localparam int SHARED_USED = 1;\n"
                              "`define DECLARE_TAG logic tag_q\n";
