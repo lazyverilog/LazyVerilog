@@ -15,7 +15,8 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only] [<file>]\n";
+    std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] "
+                  "[--version] [<file>]\n";
 }
 
 std::string_view severity_text(int severity) {
@@ -50,6 +51,7 @@ int main(int argc, char* argv[]) {
     std::string filelist_arg;
     std::string file_arg;
     bool lint_only = false;
+    bool compile_only = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -61,6 +63,11 @@ int main(int argc, char* argv[]) {
             filelist_arg = argv[++i];
         } else if (arg == "--lint-only") {
             lint_only = true;
+        } else if (arg == "--compile-only") {
+            compile_only = true;
+        } else if (arg == "--version") {
+            std::cout << "lazyverilog-lint " << LAZYVERILOG_VERSION << "\n";
+            return 0;
         } else if (arg == "-h" || arg == "--help") {
             print_usage();
             return 0;
@@ -105,10 +112,11 @@ int main(int argc, char* argv[]) {
     }
 
     analyzer.wait_for_background_index_idle();
-    run_synchronous_semantic_compile(analyzer, project);
+    if (!lint_only)
+        run_synchronous_semantic_compile(analyzer, project);
 
     std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-    if (project.config.lint.instance.stale_instance_diagnostic)
+    if (!compile_only && project.config.lint.instance.stale_instance_diagnostic)
         project_lint_index = analyzer.project_index_snapshot();
 
     std::vector<std::shared_ptr<const DocumentState>> states;
@@ -125,10 +133,11 @@ int main(int argc, char* argv[]) {
             continue;
         if (!lint_only) {
             collect(flat, state->uri, state->parse_diagnostics);
-            if (project.config.compilation.background_compilation)
-                collect(flat, state->uri, analyzer.semantic_diagnostics(state->uri));
+            collect(flat, state->uri, analyzer.semantic_diagnostics(state->uri));
         }
-        collect(flat, state->uri, run_lint(*state, project.config.lint, project_lint_index.get()));
+        if (!compile_only)
+            collect(flat, state->uri,
+                    run_lint(*state, project.config.lint, project_lint_index.get()));
     }
 
     std::sort(flat.begin(), flat.end(), [](const FlatDiag& a, const FlatDiag& b) {

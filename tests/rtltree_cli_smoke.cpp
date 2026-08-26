@@ -73,6 +73,14 @@ int main(int argc, char** argv) {
         expect(contains(result.stdout_text, "m_top (u_leaf_a)"), "reverse parent u_leaf_a listed");
     }
 
+    // --version: prints a version and exits 0.
+    {
+        auto result = run_command(rtltree_bin, "--version");
+        expect(result.exit_code == 0, "--version exits 0");
+        expect(contains(result.stdout_text, "lazyverilog-rtltree"),
+              "--version reports the binary name");
+    }
+
     if (checks_failed > 0) {
         std::cerr << checks_failed << "/" << checks_run << " checks failed\n";
         return 1;
