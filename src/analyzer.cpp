@@ -1413,10 +1413,45 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         return false;
     }
 
+    // Lexical declaration scopes (begin/end blocks, loop headers) that enclose
+    // the declarations being visited.  A pair of zero lines means "no lexical
+    // restriction" — used for scopes that live in another file, where the
+    // cursor's line number is not comparable.
+    std::vector<std::pair<int, int>> scope_stack;
+
+    void push_scope(slang::SourceRange range) {
+        if (!range.start().valid() || !range.end().valid() ||
+            uri_from_source_location(sm, range.start()) != uri) {
+            scope_stack.emplace_back(0, 0);
+            return;
+        }
+        scope_stack.emplace_back((int)sm.getLineNumber(range.start()),
+                                 (int)sm.getLineNumber(range.end()));
+    }
+
+    // A declaration inside a block or loop header is only visible to uses
+    // lexically inside that same block:
+    //
+    //     for (int i = 0; i < 10; i++) begin ... end
+    //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
+    //                                               ^ the second `i`, not the first
+    bool cursor_in_innermost_scope() const {
+        if (scope_stack.empty())
+            return true;
+        const auto [start_line, end_line] = scope_stack.back();
+        if (start_line > 0 && use_line_one_based < start_line)
+            return false;
+        if (end_line > 0 && use_line_one_based > end_line)
+            return false;
+        return true;
+    }
+
     void maybe_set(slang::parsing::Token token, bool scope_sensitive = true) {
         if (!token || token.valueText() != name)
             return;
         if (!package_member_visible(current_package, token.valueText()))
+            return;
+        if (scope_sensitive && !cursor_in_innermost_scope())
             return;
 
         auto loc = location_from_token_actual_uri(sm, uri, token);
@@ -1516,6 +1551,24 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
         maybe_set(node.name);
         visitDefault(node);
+    }
+
+    void handle(const slang::syntax::BlockStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    void handle(const slang::syntax::ForLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    void handle(const slang::syntax::ForeachLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
     }
 };
 
