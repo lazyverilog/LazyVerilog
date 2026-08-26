@@ -47,3 +47,18 @@ cmake -B "$REPO_DIR/build" -DCMAKE_BUILD_TYPE=Release -S "$REPO_DIR"
 cmake --build "$REPO_DIR/build" -j"$(nproc)" --target lazyverilog-lsp
 
 echo "[session-start] done: $REPO_DIR/build/lazyverilog-lsp"
+
+# nvim-mcp gives Claude an MCP server that can drive a running Neovim
+# instance (buffers, diagnostics, RPC) instead of only shelling out to nvim
+# headlessly. The server is registered project-wide via .mcp.json (trusted
+# automatically by .claude/settings.json's enableAllProjectMcpServers), but
+# the `nvim-mcp` binary itself isn't part of the repo, so each fresh
+# container needs it built.
+if command -v nvim-mcp >/dev/null 2>&1; then
+  echo "[session-start] nvim-mcp already installed: $(command -v nvim-mcp)"
+elif command -v cargo >/dev/null 2>&1; then
+  echo "[session-start] installing nvim-mcp (cargo install nvim-mcp)"
+  cargo install nvim-mcp
+else
+  echo "[session-start] WARNING: cargo not found, skipping nvim-mcp install" >&2
+fi
