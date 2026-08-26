@@ -9,6 +9,7 @@
 // with the disk shard, a header declaration the file actually uses survives,
 // and one it never names does not.
 #include "analyzer.hpp"
+#include "string_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -60,7 +61,12 @@ class SharedHeaderProject {
     SharedHeaderProject& operator=(const SharedHeaderProject&) = delete;
 
     std::filesystem::path module_path() const { return dir_ / "blk.sv"; }
-    std::string module_uri() const { return "file://" + module_path().string(); }
+    // Must match the production file:// spelling exactly: on Windows a plain
+    // "file://" + path.string() keeps backslashes and skips the extra slash a
+    // drive letter needs, so it would never equal the closed-file shard's
+    // uri_from_path()-derived key and shard_value_names() would look up
+    // nothing at all.
+    std::string module_uri() const { return uri_from_path(module_path()); }
     std::string module_text() const {
         std::ifstream in(module_path(), std::ios::binary);
         return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
