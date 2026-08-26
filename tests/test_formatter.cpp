@@ -4601,3 +4601,25 @@ TEST_CASE("formatter: array subscript with identifier index aligned with group",
     CHECK(format_source(src, opts) == expected);
     CHECK(format_source(expected, opts) == expected);
 }
+
+TEST_CASE("formatter: index bracket inside a for body keeps no space before the bracket",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    CHECK(format_source("module m;\n"
+                        "always_comb begin\n"
+                        "    for (int i = 0; i < 10; i++) begin\n"
+                        "        o_data[i] = 1;\n"
+                        "    end\n"
+                        "end\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "always_comb begin\n"
+                                 "    for (int i = 0; i < 10; i++) begin\n"
+                                 "        o_data[i] = 1;\n"
+                                 "    end\n"
+                                 "end\n"
+                                 "endmodule\n");
+}

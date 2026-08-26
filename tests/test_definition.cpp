@@ -1293,3 +1293,55 @@ TEST_CASE("hover: T::type_id::create describes the alias target's method",
     CHECK(info->doc.find("function registry_base create") != std::string::npos);
     CHECK(info->doc.find("int parent") != std::string::npos);
 }
+
+TEST_CASE("definition: loop variable resolves to its own for-loop declaration",
+          "[definition][scope]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_for_loop_scope.sv";
+    analyzer.open(uri,
+                  "module m;\n"
+                  "always_comb begin\n"
+                  "    for (int i = 0; i < 10; i++) begin\n"
+                  "        o_data[i] = 1;\n"
+                  "    end\n"
+                  "\n"
+                  "    for (int i = 0; i < 10; i++) begin\n"
+                  "        address[i] = 1;\n"
+                  "    end\n"
+                  "end\n"
+                  "endmodule\n");
+
+    auto first = analyzer.definition_of(uri, 3, 15);
+    REQUIRE(first.has_value());
+    CHECK(first->line == 2);
+    CHECK(first->col == 13);
+
+    auto second = analyzer.definition_of(uri, 7, 16);
+    REQUIRE(second.has_value());
+    CHECK(second->line == 6);
+    CHECK(second->col == 13);
+}
+
+TEST_CASE("definition: block-local declaration does not shadow a later sibling block",
+          "[definition][scope]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_block_scope.sv";
+    analyzer.open(uri,
+                  "module m;\n"
+                  "always_comb begin\n"
+                  "    begin\n"
+                  "        int tmp;\n"
+                  "        tmp = 1;\n"
+                  "    end\n"
+                  "    begin\n"
+                  "        int tmp;\n"
+                  "        tmp = 2;\n"
+                  "    end\n"
+                  "end\n"
+                  "endmodule\n");
+
+    auto loc = analyzer.definition_of(uri, 8, 8);
+    REQUIRE(loc.has_value());
+    CHECK(loc->line == 7);
+}
+
