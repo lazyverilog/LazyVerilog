@@ -942,3 +942,190 @@ modules each including two of M headers, one `+incdir+`.  Any generator of that
 shape reproduces the header-bytes term.  The property that matters is many
 distinct headers with low per-header fan-in, which is what separates hdr100 and
 hdr200 from `shared2`.
+
+# Round 6 plan: a file's header shards cost one whole-tree walk each
+
+Not a regression — the cost has been there since header shards were introduced.
+It is invisible on every corpus rounds 1–5 used, and it dominates any project
+that carries UVM.  Found while looking for the next startup win; measured on
+this branch, and reproduced identically on `feat/uvm-support`, so it is not
+specific to either.
+
+## Symptom
+
+A one-entry filelist containing only `demo/uvm-core/src/uvm_pkg.sv`:
+
+| | |
+|---|---|
+| index time | **15.2 s** |
+| user / sys | 15.03 s / 0.42 s |
+| maxRSS | 441 MB |
+| shards | 166 |
+
+`LAZYVERILOG_TRACE_PERF=1` attributes only ~190 ms of that to
+`make_file_state_with_options` — the parse and the file's own shard.  The rest
+is untraced.
+
+A 20-file UVM testbench (each file `` `include "uvm_macros.svh" `` and
+`import uvm_pkg::*`, plus `uvm_pkg.sv` on the filelist) costs **13.3 s** with
+user ≈ wall: one worker sits on `uvm_pkg.sv` for the whole startup while the
+other cores idle.
+
+## Cause
+
+`background_index_loop()` builds one shard per `` `include ``d header, and each
+one re-walks the *entire includer tree* (`src/analyzer.cpp:4351`):
+
+```cpp
+for (const auto& header_uri : headers_to_build) {
+    auto header_index = std::make_shared<SyntaxIndex>(
+        SyntaxIndex::build(*state->tree, header_source_text(...),
+                           IndexDepth::Declarations, header_uri));
+    ...
+}
+```
+
+`restrict_to_uri` decides which entries are *kept*, not how much tree is
+*visited*.  The filter is five gate points — `accepts()` at
+`src/syntax_index_shared.cpp:641,773,1425` and `wants_declaration()` at
+`src/syntax_index.cpp:510,560` — and everything else in `build()` runs in full
+regardless.  So a file that includes N headers is walked N+1 times.
+
+Cost is therefore **O(tree_size × include_count)** for a single file.
+`uvm_pkg.sv` has 165 include dependencies, so its AST is walked 166 times.
+
+### Confirmed on both axes
+
+Synthetic corpus: one package that `` `include ``s M one-line headers and
+declares C classes.  Header bytes are negligible, so only the *count* varies:
+
+| headers | classes | index time |
+|---|---|---|
+| 10 | 3000 | 281 ms |
+| 100 | 3000 | **2349 ms** |
+| 100 | 500 | 332 ms |
+| 100 | 6000 | **5230 ms** |
+
+10× the headers on an unchanged body: 8.4×.  12× the body at an unchanged
+header count: 15.8×.  The cost is the product, which is the signature of a
+per-header whole-tree walk.
+
+### Why rounds 1–5 missed it
+
+Every corpus used so far has low include *fan-out per file*: `hpc60` is one
+header per file, `hdr100`/`hdr200` are two per file, OpenTitan averages under
+one resolved include per file with no `+incdir+` configured.  Rounds 4–5
+studied header **fan-in** (one header included by many files) and fixed it
+properly.  Fan-out — one file including many headers — was never on the bench.
+`uvm_pkg.sv` at 165 is the shape that exposes it, and it is the single most
+common file in the SystemVerilog verification world.
+
+This is the rule `CLAUDE.md` already states, in the transposed direction: an
+index pass that walks the whole tree per header multiplies the largest file in
+the project by that file's include count.
+
+## The prize (measured, not predicted)
+
+A probe that parses `uvm_pkg.sv` once and then times the two strategies over
+the same tree:
+
+```
+parse:            309 ms
+own restricted:   120 ms   (deps=165)
+one unrestricted: 254 ms   (covers all 163 files)
+header loop x165: 13782 ms
+```
+
+- current index work: 120 + 13782 = **13902 ms**
+- one walk covering the same 163 files: **254 ms**
+
+**55× on the index phase**, ~25× end-to-end for this file once the 309 ms parse
+is counted.
+
+## Fix: scope the walk to a set, then partition
+
+One walk that collects every in-scope file's entries, split afterwards into
+per-file shards.  Two small pieces:
+
+**1. `SourceFileIdResolver` takes a scope set instead of one URI.**
+`only_file_id_` becomes a set of `SourceFileID`, and `accepts()` becomes a
+membership test instead of an equality test.  Three call sites, all mechanical.
+`wants_declaration()` keeps the mentions filter for the *owner* file only —
+headers keep everything they declare, which is the existing rule.
+
+**2. Partition the resulting index by `file_id`.**  Every source-backed entry
+already stores one (`src/syntax_index.hpp:302`), so this is a pure data
+transform over finished tables — no walk changes.  Each shard gets its entries,
+a remapped `source_files` table, and its own `include_dependencies`.
+`SyntaxIndex::merge()` already remaps `SourceFileID`s, so the remap machinery
+exists and is tested.
+
+The indexer flow becomes: parse → read include dependencies off the tree →
+claim unbuilt headers under `map_mutex_` (unchanged) → **one** walk scoped to
+{own file} ∪ {claimed headers} → partition → commit.  Claiming still happens
+before the walk, so headers another worker already owns are never collected,
+and the walk stays cheaper than the unrestricted probe above.
+
+`make_file_state_with_options()` keeps its current single-shard behaviour for
+open buffers; only the background indexer asks for the multi-shard form.
+
+### Why this preserves output
+
+- A header shard built by the current code keeps every declaration in that
+  header, because `scoped_text` is empty for it and the mentions filter never
+  engages.  Partitioning by `file_id` gives exactly the same set.
+- The owner's shard keeps its own entries plus foreign declarations whose names
+  it mentions.  That subset is still decided by `wants_declaration()`, on the
+  same tokens, during the same walk.
+- Shard *count* is the cheapest correctness canary and `startup_bench.py`
+  already warns on it; it must stay identical on every corpus.
+
+### Risks
+
+- **Transient memory.** One scoped walk holds every in-scope file's entries at
+  once, where the loop held one file's at a time and released it.  The probe's
+  unrestricted build covers 163 files; measure `maxRSS` before and after, since
+  a memory-capped node is exactly the environment round 4 was written for.
+- **Owner-vs-header ambiguity for macro-expanded declarations.** `for_token()`
+  and `for_declaration_token()` deliberately disagree about which file a
+  macro-expanded token belongs to.  Partitioning must use the same resolver the
+  gate points use, or a `` `uvm_component_utils `` member could land in the
+  wrong shard.  This is the one place the change can be subtly wrong, and UVM
+  is built entirely out of such macros — cover it with a test that indexes a
+  class whose members come from a macro defined in another header.
+
+## After this lands
+
+Both remaining open items get their teeth back, because neither can matter
+while one file costs 14 s:
+
+- **Longest-first scheduling** (plan step 5, still open).  The UVM testbench
+  above is one enormous file plus 20 small ones; FIFO strands it.  Once
+  `uvm_pkg.sv` drops to ~0.6 s the queue is worth ordering.
+- **Persistent on-disk shard cache** (improvement 2, still open).  UVM never
+  changes between sessions and is the largest thing a verification project
+  indexes, so it is the ideal cache hit.
+
+## Reproduce
+
+```bash
+cmake --build build --target index-bench -j$(nproc)
+
+mkdir -p /tmp/uvm1 && cd /tmp/uvm1
+printf '[design]\nvcode = "lazyverilog.f"\ndefine = []\n\n[compilation]\nbackground_compilation = false\n' > lazyverilog.toml
+UVM=<repo>/demo/uvm-core/src
+printf "+incdir+$UVM\n$UVM/uvm_pkg.sv\n" > lazyverilog.f
+<repo>/tools/startup_bench.py /tmp/uvm1 -r 3
+LAZYVERILOG_TRACE_PERF=1 <repo>/build/index-bench /tmp/uvm1 1
+```
+
+The header-count and body-size tables come from a generated corpus: one package
+including M one-line headers and declaring C classes, one `+incdir+`.  Any
+generator of that shape reproduces the product term.
+
+The probe is ~40 lines against `SyntaxIndex::build`: parse the file once, then
+time (a) one restricted build on the file's own URI, (b) one unrestricted
+build, and (c) a loop of one restricted build per entry of
+`include_dependencies`.  Build it as a temporary `add_executable` alongside
+`parse-bench` so it picks up the same flags; comparing (b) against (c) is the
+whole argument.
