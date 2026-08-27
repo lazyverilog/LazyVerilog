@@ -867,6 +867,142 @@ endmodule
     CHECK(*help->activeParameter == 1);
 }
 
+// A call to a function imported from a package is normally a call into another
+// file, and that file is usually closed.  Hover and go-to-definition already
+// resolve these; signature help used to search only the current document's AST
+// and returned nothing, so the popup was empty for exactly the calls a
+// testbench makes most.
+TEST_CASE("signature help: a function declared in a closed project file resolves",
+          "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_closed_pkg.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_closed_pkg;\n"
+               "  function automatic int add3(int a, int b, int c);\n"
+               "    return a + b + c;\n"
+               "  endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_closed_use.sv";
+    analyzer.open(uri, R"(
+module top;
+    import sig_closed_pkg::*;
+    int r;
+    initial r = add3(1, , 3);
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(4, 24); // between the first and second commas
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int add3(int a, int b, int c)");
+    REQUIRE(help->signatures[0].parameters.size() == 3);
+    CHECK(help->signatures[0].parameters[0].label == "int a");
+    CHECK(help->signatures[0].parameters[2].label == "int c");
+    REQUIRE(help->activeParameter.has_value());
+    CHECK(*help->activeParameter == 1);
+
+    std::filesystem::remove(pkg_path);
+}
+
+// The shard stores one rendered string per subroutine, so directions and packed
+// dimensions have to survive being parsed back out of it.
+TEST_CASE("signature help: a closed-file task keeps directions and packed dimensions",
+          "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_closed_task.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_task_pkg;\n"
+               "  task automatic do_xfer(input bit [7:0] addr, output bit ok);\n"
+               "    ok = 1'b1;\n"
+               "  endtask\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_closed_task_use.sv";
+    analyzer.open(uri, R"(
+module top;
+    import sig_task_pkg::*;
+    bit good;
+    initial do_xfer(8'h10, );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(4, 27);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "task do_xfer(input bit [7:0] addr, output bit ok)");
+    REQUIRE(help->signatures[0].parameters.size() == 2);
+    CHECK(help->signatures[0].parameters[0].label == "input bit [7:0] addr");
+    CHECK(help->signatures[0].parameters[1].label == "output bit ok");
+
+    std::filesystem::remove(pkg_path);
+}
+
+// The current document keeps priority: a local declaration is what the call
+// means, even when a closed file declares the same name.
+TEST_CASE("signature help: a same-file declaration wins over a closed-file one", "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_shadowed.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_shadow_pkg;\n"
+               "  function automatic int shared_fn(int from_package);\n"
+               "    return from_package;\n"
+               "  endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_shadowed_use.sv";
+    analyzer.open(uri, R"(
+function int shared_fn(int from_current_file);
+    return from_current_file;
+endfunction
+
+module top;
+    int r;
+    initial r = shared_fn( );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(7, 26);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int shared_fn(int from_current_file)");
+
+    std::filesystem::remove(pkg_path);
+}
+
 TEST_CASE("signature help: a ::-qualified callee is not matched by bare name",
           "[signature][scoped]") {
     // `thing::type_id::create(...)` names `registry_base::create`.  Matching the
