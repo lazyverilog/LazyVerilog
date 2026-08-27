@@ -111,6 +111,13 @@ ctest --test-dir build                          # test gate — must pass first
   file AST.  Prefer caching such AST-derived indexes per immutable
   `DocumentState` snapshot when they are reused across requests; invalidate by
   replacing the `DocumentState` on `didChange`.
+- An `include`d header's declarations live in **the header's own shard**, not in
+  its includers'.  Once a header parses standalone, the background indexer serves
+  the rest of the burst only its preprocessor directives, so a closed includer's
+  shard generally does not carry them; an open buffer's does, and so do the few
+  files that were already parsing when the projection was installed.  Resolve
+  header symbols through the header's shard, never by assuming either.  See
+  `docs/dev/indexing.md` ("Shared `include`d headers") and `PERF.md` round 6.
 - Do not move expensive whole-project merges or closed-file AST walks onto hot
   request paths.  Background indexing should publish reusable index snapshots,
   and request handlers should consume those snapshots without reparsing or

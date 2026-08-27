@@ -297,6 +297,118 @@ static std::string_view header_source_text(const slang::SourceManager& sm,
     return {};
 }
 
+/// The key store_header_texts() files @p uri's text under.
+///
+/// Taken from the SourceManager rather than derived from the URI so it is the
+/// same spelling store_header_texts() used; slang's resolved path does not go
+/// through normalize_filesystem_path(), and a key that differs by a symlink or a
+/// short name would replace nothing.
+static std::string header_cache_key(const slang::SourceManager& sm, const std::string& uri) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (!full_path.empty() && uri_from_path(full_path) == uri)
+            return full_path.string();
+    }
+    return {};
+}
+
+/// Whether @p line's first thing that is neither whitespace nor a comment is a
+/// backtick, updating @p in_block_comment for the line that follows.
+///
+/// The comment state has to be carried whether or not the answer is already
+/// known, or a dropped line that opens a block comment would leave a later
+/// `define inside it looking like a directive.
+static bool line_starts_directive(std::string_view line, bool& in_block_comment) {
+    bool starts = false;
+    bool decided = false;
+    for (size_t i = 0; i < line.size();) {
+        if (in_block_comment) {
+            if (line.compare(i, 2, "*/") == 0) {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        if (line.compare(i, 2, "//") == 0)
+            break;
+        if (line.compare(i, 2, "/*") == 0) {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if (line[i] == '"') {
+            // Skipped rather than scanned: a backtick or a /* inside a string
+            // literal is neither a directive nor a comment.
+            ++i;
+            while (i < line.size() && line[i] != '"') {
+                if (line[i] == '\\' && i + 1 < line.size())
+                    ++i;
+                ++i;
+            }
+            ++i;
+            decided = true;
+            continue;
+        }
+        if (!decided && std::isspace(static_cast<unsigned char>(line[i])) == 0) {
+            starts = line[i] == '`';
+            decided = true;
+        }
+        ++i;
+    }
+    return starts;
+}
+
+/// @p text with everything but its preprocessor directives blanked out.
+///
+/// What an includer needs from a header is what the preprocessor does with it.
+/// A `define is genuinely per-includer — its body means whatever it expands to
+/// where it is used — so every file has to see it again.  A declaration is not:
+/// since shard scoping the header's own shard is where its declarations live and
+/// what every other file resolves against, so re-reading the header's bulk once
+/// per includer buys nothing and costs O(files x header), which on an HPC design
+/// is the largest file in the project multiplied by its includer count.
+///
+/// Dropped lines become empty rather than disappearing, so every directive keeps
+/// the line number it is written on: a macro expansion carries the location of
+/// its definition, and anything that resolves one back to the header would
+/// otherwise report the wrong line.
+///
+/// A directive inside a block comment stays dropped even though the preprocessor
+/// would ignore it either way — keeping the line without its opening /* would
+/// leave a stray */ in text that gets `include`d.
+static std::string header_directives_only(std::string_view text) {
+    std::string projected;
+    projected.reserve(text.size() / 8 + 64);
+
+    bool in_block_comment = false;
+    bool continuing = false;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line_end = eol == std::string_view::npos ? text.size() : eol;
+        const auto line = text.substr(pos, line_end - pos);
+
+        const bool opened_in_comment = in_block_comment;
+        const bool directive = line_starts_directive(line, in_block_comment);
+        const bool keep = continuing || (!opened_in_comment && directive);
+        if (keep)
+            projected.append(line);
+
+        auto body = line;
+        while (!body.empty() && (body.back() == '\r' || body.back() == '\n'))
+            body.remove_suffix(1);
+        continuing = keep && !body.empty() && body.back() == '\\';
+
+        if (eol == std::string_view::npos)
+            break;
+        projected.push_back('\n');
+        pos = eol + 1;
+    }
+    return projected;
+}
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
@@ -332,9 +444,15 @@ make_file_state_with_options(const std::filesystem::path& path,
     // fromFile already loaded source into SourceManager; read text from there
     // instead of opening the file a second time.  On NFS this avoids an extra
     // open + stat + read per indexed file.
+    // The buffer the tree was parsed from, not the one its root node starts in:
+    // a file whose first line is an `include has its first token in the header,
+    // so the root-node spelling hands back the *header's* text as if it were
+    // this file's.  See SyntaxIndex::build(), which scopes on the same identity.
     std::string_view sm_source;
-    if (const auto& t = *tree_or_error; t)
-        sm_source = sm->getSourceText(t->root().sourceRange().start().buffer());
+    if (const auto& t = *tree_or_error; t) {
+        if (const auto own_buffers = t->getSourceBufferIds(); !own_buffers.empty())
+            sm_source = sm->getSourceText(own_buffers.front());
+    }
 
     auto state = std::make_shared<DocumentState>(uri, retain_text ? std::string(sm_source)
                                                                   : std::string{},
@@ -4394,16 +4512,45 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     }
 
     for (const auto& path : changed_paths) {
-        if (path.empty() || !extra_file_set_.contains(path) || !seen_changed_paths.insert(path).second)
+        if (path.empty() || !seen_changed_paths.insert(path).second)
             continue;
 
-        // Queue only the explicitly reported file.  This is the important HPC
-        // property: a rename/workspace-edit notification does not trigger a
-        // whole-design rescan and does not perform metadata checks for every
-        // filelist entry.  The background worker will parse disk contents for a
-        // closed file, or use the live DocumentState if the file is open.
-        queue_background_file_locked(path, /*front=*/true);
-        queued_changed_file = true;
+        if (extra_file_set_.contains(path)) {
+            // Queue only the explicitly reported file.  This is the important HPC
+            // property: a rename/workspace-edit notification does not trigger a
+            // whole-design rescan and does not perform metadata checks for every
+            // filelist entry.  The background worker will parse disk contents for a
+            // closed file, or use the live DocumentState if the file is open.
+            queue_background_file_locked(path, /*front=*/true);
+            queued_changed_file = true;
+            continue;
+        }
+
+        // A shared header is usually not a filelist entry, so the branch above
+        // never queues it.  Its declarations reach the project index only
+        // through the shard background_index_loop() builds for it, and that
+        // shard is claimed once per generation: without dropping the claim the
+        // header keeps serving whatever it contained when the claim was taken,
+        // for the rest of the session.
+        const auto header_uri = uri_from_path(path);
+        const bool was_indexed_header = background_header_claims_.erase(header_uri) > 0;
+        background_header_shards_.erase(header_uri);
+        if (!was_indexed_header)
+            continue;
+        invalidate_extra_snapshots_locked();
+
+        // Nothing queues a header directly.  Re-queue the files that `include`
+        // it instead; the first one to commit re-claims the header and rebuilds
+        // its shard from that file's fresh tree.
+        for (const auto& [entry_uri, entry] : extra_cache_) {
+            if (!entry.index)
+                continue;
+            const auto& deps = entry.index->include_dependencies;
+            if (std::find(deps.begin(), deps.end(), header_uri) == deps.end())
+                continue;
+            queue_background_file_locked(entry.path, /*front=*/true);
+            queued_changed_file = true;
+        }
     }
 
     if (!queued_changed_file && !removed_deleted_file)
@@ -5155,17 +5302,57 @@ void Analyzer::background_index_loop() const {
 
         }
 
-        // Build the claimed headers from this file's tree, outside map_mutex_
-        // for the same reason the file's own shard is built outside it.  This
-        // worker stays counted as active until they are committed, so the
-        // publish below cannot fire on a project index that is still missing
-        // header shards.
+        // Build the claimed headers outside map_mutex_ for the same reason the
+        // file's own shard is built outside it.  This worker stays counted as
+        // active until they are committed, so the publish below cannot fire on a
+        // project index that is still missing header shards.
         std::vector<ExtraFileCacheEntry> header_shards;
         header_shards.reserve(headers_to_build.size());
         for (const auto& header_uri : headers_to_build) {
-            auto header_index = std::make_shared<SyntaxIndex>(
-                SyntaxIndex::build(*state->tree, header_source_text(*state->source_manager, header_uri),
-                                   IndexDepth::Declarations, header_uri));
+            // Parse the header on its own.  Deriving its shard from an includer's
+            // tree cannot express "the header's declarations": the restriction
+            // meant to do that does not filter, because
+            // SourceFileIdResolver::wants_declaration() keeps every declaration
+            // when no mentions provider is set.  What landed under the header's
+            // URI was therefore a copy of whichever includer claimed it first —
+            // its modules and ports, scoped to its module, and none of the
+            // header's own declarations when the `include sits at file scope.
+            std::shared_ptr<SyntaxIndex> header_index;
+            auto header_state = make_file_state_with_options(
+                path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
+                /*retain_text=*/false, &background_header_texts_, generation,
+                /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true);
+            const bool stands_alone =
+                header_state && header_state->tree &&
+                std::none_of(header_state->parse_diagnostics.begin(),
+                             header_state->parse_diagnostics.end(),
+                             [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+            if (stands_alone) {
+                header_index = std::make_shared<SyntaxIndex>(std::move(header_state->index));
+
+                // Its declarations are now recorded, so the rest of the burst
+                // only needs its directives.  Serving the projection through the
+                // same cache the full text came from is what makes the saving
+                // reach the files still queued: at most one file per worker can
+                // already be reading the header when this runs, and every file
+                // after them is seeded from here.  A header open in the editor
+                // was never stored, so it is never projected.
+                if (const auto key = header_cache_key(*state->source_manager, header_uri);
+                    !key.empty()) {
+                    background_header_texts_.project(
+                        generation, key,
+                        header_directives_only(
+                            header_source_text(*state->source_manager, header_uri)));
+                }
+            } else {
+                // A header that is a textual fragment — a port list, a module
+                // opened in one file and closed in another — has no tree of its
+                // own to index.  PERF.md documents this shape; keep deriving
+                // those from the includer that pulled them in.
+                header_index = std::make_shared<SyntaxIndex>(SyntaxIndex::build(
+                    *state->tree, header_source_text(*state->source_manager, header_uri),
+                    IndexDepth::Declarations, header_uri));
+            }
             header_shards.push_back(ExtraFileCacheEntry{
                 .path = path_from_file_uri(header_uri),
                 .uri = header_uri,

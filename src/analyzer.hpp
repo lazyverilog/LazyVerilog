@@ -75,6 +75,26 @@ struct HeaderTextCache {
         texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
     }
 
+    /// Replace what this burst serves for @p path with @p text.
+    ///
+    /// Used to hand the remaining files a header's directives without its
+    /// declarations, once the header's own shard has recorded them; see
+    /// header_directives_only() for why that is equivalent for an includer.
+    /// Only an entry this burst already holds is replaced: an absent one means
+    /// store() judged the header not worth caching, and inserting it here would
+    /// enter it with a hit count no popularity rule can ever admit.
+    void project(uint64_t gen, const std::string& path, std::string text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (gen != generation)
+            return;
+        const auto it = texts.find(path);
+        if (it == texts.end())
+            return;
+        bytes -= it->second.text->size();
+        bytes += text.size();
+        it->second.text = std::make_shared<const std::string>(std::move(text));
+    }
+
     /// Headers worth seeding into the next parse, as shared pointers so seeding
     /// does not hold the lock while slang copies text into a SourceManager.
     ///
