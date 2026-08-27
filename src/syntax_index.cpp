@@ -900,6 +900,43 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         process_class(*cls, index, resolver, sm);
     } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
         process_typedef(*td, index, resolver, sm);
+    } else if (const auto* ps = member.as_if<ParameterDeclarationStatementSyntax>()) {
+        // Compilation-unit scope: `localparam int WIDTH = 8;` written outside
+        // any module or package.  A central params.svh is usually nothing but
+        // these, and without this branch none of it reached the project index —
+        // the file being edited still resolved such a name through its own AST,
+        // where the header's text is spliced in, so only closed files went
+        // without.  Carries no parent_scope, which is what makes it visible to
+        // every file that includes the header rather than to one module.
+        const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>();
+        if (!param)
+            return;
+        // Rendered on the first declarator actually kept, for the same reason
+        // the module-scope path defers it: a shared header's parameter bulk
+        // would otherwise pay type and initializer rendering per including file.
+        std::optional<std::string> type_text;
+        std::string kind;
+        for (const auto* decl : param->declarators) {
+            if (!decl || !resolver.wants_declaration(index, sm, decl->name))
+                continue;
+            if (!type_text) {
+                type_text = render_syntax_node_text(sm, *param->type);
+                kind = token_value_text(param->keyword);
+            }
+            auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+            index.values.push_back(ValueEntry{
+                .name = token_value_text(decl->name),
+                .type = *type_text,
+                .kind = kind,
+                .parent_scope = {},
+                .default_value = decl->initializer
+                                     ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                     : std::string{},
+                .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                .line = vl,
+                .col = vc,
+            });
+        }
     }
 }
 
@@ -936,11 +973,19 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         // tree.  A header shard is built from an *includer's* tree and handed
         // the header's text instead, and it must keep every declaration it
         // finds, because it is the shard everyone else resolves against.
-        // Comparing against the buffer the tree root starts in tells the two
+        // Comparing against the buffer the tree was parsed from tells the two
         // apart in O(1), without normalizing any path.
-        const auto root_text = sm.getSourceText(root.sourceRange().start().buffer());
-        if (!source.empty() && root_text.data() == source.data() &&
-            root_text.size() == source.size())
+        //
+        // Not the buffer the *root node* starts in: a file whose first line is
+        // an `include has its first token in the header, so that test said "not
+        // my text" for the file's own build and left the mentions filter off.
+        // Every declaration in a shared header then landed in every includer's
+        // shard — 60 modules x 7501 parameters on tests/rtl/hpc60.
+        const auto own_buffers = tree.getSourceBufferIds();
+        const auto own_text =
+            own_buffers.empty() ? std::string_view{} : sm.getSourceText(own_buffers.front());
+        if (!source.empty() && own_text.data() == source.data() &&
+            own_text.size() == source.size())
             scoped_text = source;
     }
     auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {

@@ -61,6 +61,9 @@ class SharedHeaderProject {
     SharedHeaderProject& operator=(const SharedHeaderProject&) = delete;
 
     std::filesystem::path module_path() const { return dir_ / "blk.sv"; }
+    std::filesystem::path header_path() const { return dir_ / "defs.svh"; }
+    std::string header_uri() const { return uri_from_path(header_path()); }
+    void rewrite_header(const std::string& text) { write(header_path(), text); }
     // Must match the production file:// spelling exactly: on Windows a plain
     // "file://" + path.string() keeps backslashes and skips the extra slash a
     // drive letter needs, so it would never equal the closed-file shard's
@@ -130,6 +133,26 @@ TEST_CASE("open shard: header declarations the file uses survive scoping", "[ind
     // — this is the case that would silently break AutoWire on a codebase whose
     // signals come from header macros.
     CHECK(names.contains("tag_q"));
+}
+
+TEST_CASE("header shard: a header edited on disk is re-indexed", "[index][scaling]") {
+    SharedHeaderProject project;
+    Analyzer analyzer;
+    analyzer.set_project_config({}, {project.dir().string()}, {project.module_path().string()});
+    analyzer.wait_for_background_index_idle();
+
+    // The header is not a filelist entry — it reaches the project index only as
+    // the header shard the indexer builds for whatever `include`s it.
+    REQUIRE(shard_value_names(analyzer, project.header_uri()).contains("SHARED_USED"));
+
+    project.rewrite_header("localparam int SHARED_USED = 1;\n"
+                           "localparam int SHARED_ADDED = 2;\n");
+
+    // The event the server forwards from workspace/didChangeWatchedFiles.
+    analyzer.refresh_changed_extra_files({project.header_uri()});
+    analyzer.wait_for_background_index_idle();
+
+    CHECK(shard_value_names(analyzer, project.header_uri()).contains("SHARED_ADDED"));
 }
 
 TEST_CASE("open shard: header declarations the file never names are dropped", "[index][scaling]") {

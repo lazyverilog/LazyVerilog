@@ -78,6 +78,44 @@ can safely finish against the old snapshot while new requests see a fresh cache.
 Do not retain full ASTs for closed project files to get similar behavior; closed
 files should continue to participate through compact `SyntaxIndex` shards only.
 
+## Shared `include`d headers
+
+A header is not a filelist entry, so it has no shard of its own until something
+`include`s it.  The background indexer gives it one: the first worker whose file
+pulls the header in claims it and builds its shard.  That shard is built from a
+parse of the header **on its own**, not from the includer's tree — a restricted
+build of an includer keeps every declaration it finds, so deriving the header's
+shard from one produced a copy of that includer under the header's URI.
+
+A header that cannot stand alone — a port list, a module opened in one file and
+closed in another — has no tree of its own to index, and only for those is the
+shard still derived from the includer that pulled them in.  The parse itself is
+the test: a tree, and no error-severity parse diagnostic.
+
+**The header's shard is where its declarations live.**  Once it stands alone, the
+rest of the indexing burst is served a projection of the header holding only its
+preprocessor directives, with every other line blanked out (line numbers are
+preserved, so a macro still reports the line it is defined on).  Directives are
+the part that is genuinely per-includer — what a `` `define `` means depends on
+where it expands — while declarations do not vary by includer at all, and
+re-reading them once per file costs `O(files x header)`.
+
+Two consequences worth knowing before writing a feature:
+
+- An includer's shard no longer carries the header declarations it mentions.
+  Resolve those through the header's own shard in the published snapshot.
+- The saving is bounded, not total: the projection can only be installed after
+  some file has proved the header stands alone, so the files already parsing at
+  that moment still read it whole.  The header's bulk is therefore read at most
+  once per background worker — one read on a single-core slice — instead of once
+  per includer.  Those few includers keep their mentioned header declarations,
+  which is a duplicate of what the header shard holds, not a different answer.
+
+The open-buffer path is deliberately not projected.  An edit needs the current
+file's own AST to be exact, including whatever its headers splice into it, and
+that path has its own cache (`OpenParseHeaderCache`) validated by stat rather
+than scoped to an indexing burst.
+
 ## Published project index snapshot
 
 The published project index is shard-based.  A `ProjectIndexSnapshot` contains
