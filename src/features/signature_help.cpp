@@ -319,6 +319,196 @@ static std::optional<std::vector<ParamInfo>> find_module_params(const Analyzer& 
     return std::nullopt;
 }
 
+// ── Subroutines declared outside the current document ────────────────────────
+//
+// A call to a function in an imported package is the ordinary case, and the
+// declaring file is usually closed.  Closed project files deliberately keep no
+// AST (see the index architecture rules), so the shard's pre-rendered
+// `signature` is the only description of that declaration available here.
+// Recover the structured parameter list from it rather than re-parsing the file.
+
+/// Split on commas that sit outside any bracket group, so a parameterized type
+/// such as `my_cls#(1,2) handle` stays one argument.
+static std::vector<std::string> split_top_level_commas(std::string_view text) {
+    std::vector<std::string> parts;
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '(' || c == '[' || c == '{')
+            ++depth;
+        else if (c == ')' || c == ']' || c == '}')
+            --depth;
+        else if (c == ',' && depth == 0) {
+            parts.push_back(std::string(text.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    parts.push_back(std::string(text.substr(start)));
+    return parts;
+}
+
+static std::string trim_ws(std::string_view text) {
+    size_t b = 0, e = text.size();
+    while (b < e && std::isspace((unsigned char)text[b]))
+        ++b;
+    while (e > b && std::isspace((unsigned char)text[e - 1]))
+        --e;
+    return std::string(text.substr(b, e - b));
+}
+
+/// `input bit [7:0] addr = 8'h0` -> direction/type/name/default.
+///
+/// The declared name is the last identifier before any unpacked dimensions, so
+/// the split is done from the right; everything left of it is the direction and
+/// type exactly as the source spelled them.
+static ParamInfo parse_arg_text(const std::string& raw) {
+    ParamInfo info;
+    std::string text = trim_ws(raw);
+
+    // Default value first: everything after a top-level '='.
+    int depth = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '(' || c == '[' || c == '{')
+            ++depth;
+        else if (c == ')' || c == ']' || c == '}')
+            --depth;
+        else if (c == '=' && depth == 0) {
+            info.default_value = trim_ws(std::string_view(text).substr(i + 1));
+            text = trim_ws(std::string_view(text).substr(0, i));
+            break;
+        }
+    }
+
+    // Trailing unpacked dimensions belong to the type, not the name.
+    std::string trailing_dims;
+    while (!text.empty() && text.back() == ']') {
+        const size_t open = text.rfind('[');
+        if (open == std::string::npos)
+            break;
+        trailing_dims = text.substr(open) + trailing_dims;
+        text = trim_ws(std::string_view(text).substr(0, open));
+    }
+
+    size_t end = text.size();
+    while (end > 0 && is_ident_char(text[end - 1]))
+        --end;
+    info.name = text.substr(end);
+    std::string lead = trim_ws(std::string_view(text).substr(0, end));
+
+    static const char* kDirections[] = {"input", "output", "inout", "ref", nullptr};
+    for (int i = 0; kDirections[i]; ++i) {
+        const std::string dir = kDirections[i];
+        if (lead.rfind(dir, 0) == 0 &&
+            (lead.size() == dir.size() || std::isspace((unsigned char)lead[dir.size()]))) {
+            info.direction = dir;
+            lead = trim_ws(std::string_view(lead).substr(dir.size()));
+            break;
+        }
+    }
+    info.type = lead + trailing_dims;
+    return info;
+}
+
+/// Rebuild a SubroutineInfo from the shard's rendered signature, which
+/// make_subroutine_signature() produced as
+/// "```\n[function <ret>|task] <name>(<ports>)\n```".
+static std::optional<SubroutineInfo> subroutine_from_index_signature(const std::string& signature,
+                                                                      const std::string& name) {
+    std::string body = signature;
+    const std::string fence = "```";
+    if (body.rfind(fence, 0) == 0)
+        body = body.substr(fence.size());
+    if (body.size() >= fence.size() && body.compare(body.size() - fence.size(), fence.size(),
+                                                    fence) == 0)
+        body = body.substr(0, body.size() - fence.size());
+    // The port list is rendered one argument per line for readability; commas
+    // still separate them, so newlines can collapse to spaces.
+    std::replace(body.begin(), body.end(), '\n', ' ');
+    body = trim_ws(body);
+
+    const size_t open = body.find('(');
+    std::string header = trim_ws(open == std::string::npos ? body : body.substr(0, open));
+    std::string ports;
+    if (open != std::string::npos) {
+        const size_t close = body.rfind(')');
+        if (close == std::string::npos || close < open)
+            return std::nullopt;
+        ports = trim_ws(body.substr(open + 1, close - open - 1));
+    }
+
+    SubroutineInfo info;
+    if (header.rfind("function", 0) == 0)
+        info.kind = "function";
+    else if (header.rfind("task", 0) == 0)
+        info.kind = "task";
+    else
+        return std::nullopt;
+
+    // Strip the keyword and the trailing declared name; what remains is the
+    // return type ("" for a task).
+    header = trim_ws(std::string_view(header).substr(info.kind.size()));
+    if (header.size() >= name.size() &&
+        header.compare(header.size() - name.size(), name.size(), name) == 0)
+        header = trim_ws(std::string_view(header).substr(0, header.size() - name.size()));
+    info.return_type = header;
+
+    if (!ports.empty()) {
+        for (const auto& part : split_top_level_commas(ports)) {
+            const std::string trimmed = trim_ws(part);
+            if (!trimmed.empty())
+                info.args.push_back(parse_arg_text(trimmed));
+        }
+    }
+    return info;
+}
+
+/// The one subroutine named @p name across a shard, or nothing when the shard
+/// holds several that would render differently.  Same discipline as the
+/// current-file visitor: an ambiguous name is not worth a guess.
+static void collect_subroutine_from_shard(const SyntaxIndex& index, const std::string& name,
+                                          std::optional<SubroutineInfo>& result,
+                                          bool& ambiguous) {
+    for (const auto& value : index.values) {
+        if (ambiguous)
+            return;
+        if (value.name != name || value.signature.empty())
+            continue;
+        if (value.kind != "function" && value.kind != "task")
+            continue;
+        auto parsed = subroutine_from_index_signature(value.signature, name);
+        if (!parsed)
+            continue;
+        if (!result)
+            result = std::move(parsed);
+        else if (!same_signature(*result, *parsed))
+            ambiguous = true;
+    }
+}
+
+static std::optional<SubroutineInfo> find_subroutine_outside_document(const Analyzer& analyzer,
+                                                                      const std::string& uri,
+                                                                      const std::string& name) {
+    std::optional<SubroutineInfo> result;
+    bool ambiguous = false;
+    if (auto opened = analyzer.opened_file_index_shards(uri)) {
+        for (const auto& shard : *opened) {
+            if (shard.index)
+                collect_subroutine_from_shard(*shard.index, name, result, ambiguous);
+        }
+    }
+    if (auto project = analyzer.project_index_snapshot()) {
+        for (const auto& shard : project->shards) {
+            if (shard.index)
+                collect_subroutine_from_shard(*shard.index, name, result, ambiguous);
+        }
+    }
+    if (ambiguous)
+        return std::nullopt;
+    return result;
+}
+
 static std::string format_arg(const ParamInfo& param) {
     std::vector<std::string> parts;
     if (!param.direction.empty())
@@ -436,6 +626,13 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
             return std::nullopt;
     } else {
         subroutine = subroutine_from_tree(*state->tree, ctx->name);
+        // A call to a function imported from a package is normally a call into
+        // another file, so the current document's AST is only the first place
+        // to look.  Hover and go-to-definition already resolve these; signature
+        // help asking the same shards keeps the three consistent.
+        if (!subroutine)
+            subroutine = find_subroutine_outside_document(
+                analyzer, params.textDocument.uri.raw_uri_, ctx->name);
     }
 
     if (!subroutine) {
