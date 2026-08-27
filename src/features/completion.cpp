@@ -1671,6 +1671,29 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 }
             }
         }
+        // ANSI module port, e.g. `input uart_reg_pkg::uart_reg2hw_t reg2hw`.
+        // Without this, a receiver that is one of the current module's own
+        // ports resolves to nothing here, and the caller falls back to a
+        // same-name lookup across every other file's index instead.
+        void handle(const ImplicitAnsiPortSyntax& node) {
+            if (!result.empty() || !node.header || !node.declarator)
+                return;
+            if (before(node.declarator->name) &&
+                node.declarator->name.valueText() == ctx.scope_name)
+                result = completion_base_type_name(current_ast_port_type(*node.header));
+        }
+        // Non-ANSI port declaration, e.g. `input uart_reg_pkg::uart_reg2hw_t reg2hw;`
+        // inside the module body (paired with a bare name in the port list).
+        void handle(const PortDeclarationSyntax& node) {
+            if (!result.empty() || !node.header)
+                return;
+            for (const auto* decl : node.declarators) {
+                if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
+                    result = completion_base_type_name(current_ast_port_type(*node.header));
+                    return;
+                }
+            }
+        }
         // `task run_phase(uvm_phase phase);` — the receiver is a subroutine
         // argument, which is neither a data declaration nor an instance.
         void handle(const FunctionPortSyntax& node) {
@@ -3260,9 +3283,21 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // variable of that name to look up, and asking for one would search
             // for a declaration named after the class itself.
             std::optional<std::string> value_type;
-            if (!ctx.receiver_type.empty())
+            if (!ctx.receiver_type.empty()) {
                 value_type = ctx.receiver_type;
-            else
+            } else {
+                // didChange no longer stores current-file declarations in the
+                // index, so a receiver declared in the buffer being edited is
+                // only visible in its AST — check that first.  Asking the
+                // merged index before the AST let its unscoped fallback match
+                // a same-named symbol declared in an unrelated file (e.g. two
+                // modules that both happen to have a port named `reg2hw`) win
+                // over the receiver's real type in this file.
+                const std::string ast_type = current_file_type_of_name_from_ast(state, ctx);
+                if (!ast_type.empty() && ast_type != ctx.scope_name)
+                    value_type = ast_type;
+            }
+            if (!value_type)
                 value_type = type_of_value(completion_index, ctx.current_scope_name,
                                            ctx.scope_name);
             if (!value_type) {
@@ -3274,15 +3309,6 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     if (value_type)
                         break;
                 }
-            }
-            if (!value_type) {
-                // didChange no longer stores current-file declarations in the
-                // index, so a receiver declared in the buffer being edited is
-                // only visible in its AST.  Without this the shard layer is
-                // asked for members of the *variable* name and answers nothing.
-                const std::string ast_type = current_file_type_of_name_from_ast(state, ctx);
-                if (!ast_type.empty() && ast_type != ctx.scope_name)
-                    value_type = ast_type;
             }
             if (!value_type && !ctx.current_scope_name.empty()) {
                 // The receiver can also be a field the enclosing class only
