@@ -4,6 +4,8 @@
 #include "features/lint.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
+#include <chrono>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 
@@ -434,4 +436,123 @@ TEST_CASE("lint: [lint.statement] rules still fire with enable=true", "[lint][st
     CHECK(has_message_containing(diags, "may infer a latch"));
     CHECK(has_message_containing(diags, "raw always block"));
     CHECK(has_message_containing(diags, "should use begin/end"));
+}
+
+// A header shared by every file in a design is the largest thing lint sees, and
+// lint has nothing to say about it: run_lint_impl() drops every diagnostic whose
+// URI is not the document's own.  Dropping them at the end still pays for the
+// regex match, the URI derivation and the line/column resolution on each one, so
+// a 30k-line params.svh taxed every keystroke in every module that includes it.
+//
+// Guarded the way docs/dev/startup-perf.md prescribes: a ratio against a
+// structurally identical input rather than a millisecond budget, reporting the
+// fastest of several runs, so a loaded CI runner cannot fail it.  Both halves
+// use the same module text and differ only in how many declarations the header
+// they include contributes.  Parsing happens outside the timed region, so this
+// measures lint and nothing else.
+namespace {
+
+constexpr int kHeaderScalingDecls = 4000;
+constexpr int kHeaderScalingRuns = 7;
+
+std::string scaling_header(int count) {
+    std::string text;
+    for (int i = 0; i < count; ++i)
+        text += "localparam int HDR_" + std::to_string(i) + " = " + std::to_string(i) + ";\n";
+    return text;
+}
+
+LintConfig header_scaling_config() {
+    LintConfig cfg;
+    // Rules that fire per declaration: without them the header costs the walk
+    // only and the ratio would not show the work being removed.
+    cfg.naming.enable = true;
+    cfg.naming.parameter_pattern = "^W_.*$";
+    cfg.naming.localparam_pattern = "^LP_.*$";
+    cfg.naming.signal_pattern = "^s_.*$";
+    return cfg;
+}
+
+struct HeaderScalingResult {
+    double best_ms{};
+    size_t diag_count{};
+};
+
+/// Fastest run_lint() over a module preceded by kHeaderScalingDecls
+/// declarations.  Those declarations sit in an `include`d header when
+/// @p in_header, and in the file itself otherwise.  Everything else -- the
+/// declaration text, their count, the module, the config, the machine -- is
+/// identical between the two, so the difference is only where they live.
+HeaderScalingResult lint_ms(bool in_header) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     (std::string("lazyverilog-lint-header-scaling-") +
+                      (in_header ? "included" : "own"));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const std::string decls = scaling_header(kHeaderScalingDecls);
+    std::string module_text;
+    if (in_header) {
+        std::ofstream out(dir / "defs.svh", std::ios::binary);
+        out << decls;
+        module_text = "`include \"defs.svh\"\n";
+    } else {
+        module_text = decls;
+    }
+    module_text += "module blk (input logic clk_i);\n"
+                   "    logic data_q;\n"
+                   "    always_ff @(posedge clk_i) data_q <= 1'b1;\n"
+                   "endmodule\n";
+    const auto module_path = dir / "blk.sv";
+    {
+        std::ofstream out(module_path, std::ios::binary);
+        out << module_text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_config({}, {dir.string()}, {});
+    const auto uri = uri_from_path(module_path);
+    analyzer.open(uri, module_text);
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    // The header half really is expanding a second file; otherwise both halves
+    // would be the same input and the comparison would prove nothing.
+    REQUIRE(state->include_dependencies.size() == (in_header ? 1u : 0u));
+
+    const auto cfg = header_scaling_config();
+    HeaderScalingResult result;
+    result.best_ms = std::numeric_limits<double>::max();
+    for (int run = 0; run < kHeaderScalingRuns; ++run) {
+        const auto start = std::chrono::steady_clock::now();
+        auto diags = run_lint(*state, cfg);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        result.diag_count = diags.size();
+        result.best_ms =
+            std::min(result.best_ms, std::chrono::duration<double, std::milli>(elapsed).count());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    return result;
+}
+
+} // namespace
+
+TEST_CASE("lint: an included declaration costs far less than an owned one", "[lint][scaling]") {
+    const auto own = lint_ms(/*in_header=*/false);
+    const auto included = lint_ms(/*in_header=*/true);
+
+    // Same declarations either way, and lint reports none of them when they are
+    // included -- run_lint_impl() drops every diagnostic that is not the
+    // document's own.  This is the behaviour the timing check protects.
+    CHECK(included.diag_count < own.diag_count);
+
+    INFO("lint ms for " << kHeaderScalingDecls << " decls: own = " << own.best_ms
+                        << ", included = " << included.best_ms);
+    // Both halves walk the same number of top-level members, so this cannot
+    // reach zero -- what it pins is that an included declaration is never
+    // analyzed.  Before the subtree skip the two were within noise of each
+    // other; a 4x gap cannot be reached by analyzing included text.
+    CHECK(included.best_ms < own.best_ms / 4.0);
 }
