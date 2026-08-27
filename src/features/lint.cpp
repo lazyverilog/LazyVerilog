@@ -9,6 +9,7 @@
 #include <slang/text/SourceManager.h>
 #include <slang/parsing/TokenKind.h>
 #include <algorithm>
+#include <span>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -288,11 +289,53 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     CachedRegex parameter_re_;
     CachedRegex localparam_re_;
 
+    /// The buffers the tree was parsed from -- the document's own text, never
+    /// what it `include`s.  See skip_subtree().
+    std::span<const slang::BufferID> own_buffers_;
+
+    /// True when @p node is entirely `include`d text.
+    ///
+    /// run_lint_impl() drops every diagnostic whose URI is not the document's
+    /// own, so nothing under such a node can survive.  Deciding that here
+    /// instead of at the end is what keeps a params.svh shared by a whole design
+    /// off the edit path: otherwise each keystroke pays the regex match, the URI
+    /// derivation and the line/column resolution for every declaration in it.
+    ///
+    /// Both ends must agree before the subtree is skipped.  The compilation
+    /// unit of a file whose first line is an `include starts in the header and
+    /// ends in the file, and pruning that would discard the whole document.
+    ///
+    /// Macro locations are deliberately not pruned: push_diag() already applies
+    /// the isMacroLoc / isMacroArgLoc rule, and text typed as a macro *argument*
+    /// belongs to the call site even when the macro comes from a header.
+    bool skip_subtree(const SyntaxNode& node) const {
+        const auto range = node.sourceRange();
+        const auto start = range.start();
+        const auto end = range.end();
+        if (!start.valid() || !end.valid() || start.buffer() != end.buffer())
+            return false;
+        if (sm.isMacroLoc(start))
+            return false;
+        return std::find(own_buffers_.begin(), own_buffers_.end(), start.buffer()) ==
+               own_buffers_.end();
+    }
+
+    /// Shadows SyntaxVisitor::visit so the check runs at every level: the base
+    /// visitDefault() dispatches children through `child->visit(DERIVED)`, which
+    /// resolves here.
+    template<typename T>
+    void visit(const T& node) {
+        if (skip_subtree(node))
+            return;
+        SyntaxVisitor<LintVisitor>::visit(node);
+    }
+
     LintVisitor(const LintConfig& c, const CurrentModulePortMap& current,
                 const SyntaxIndex* project, const ProjectIndexSnapshot* snapshot,
-                SourceManager& s, std::string file_stem)
+                SourceManager& s, std::string file_stem,
+                std::span<const slang::BufferID> own_buffers)
         : cfg(c), current_modules(current), project_index(project), project_snapshot(snapshot), sm(s),
-          file_stem_(std::move(file_stem)) {
+          file_stem_(std::move(file_stem)), own_buffers_(own_buffers) {
         if (cfg.naming.enable) {
             module_re_      = compile_re(cfg.naming.module_pattern);
             input_port_re_  = compile_re(cfg.naming.input_port_pattern);
@@ -768,7 +811,8 @@ static std::vector<ParseDiagInfo> run_lint_impl(const DocumentState& state, cons
         state.tree->root().visit(collector);
         current_modules = std::move(collector.modules);
     }
-    LintVisitor v(config, current_modules, project_index, project_snapshot, sm, file_stem_from_uri(state.uri));
+    LintVisitor v(config, current_modules, project_index, project_snapshot, sm,
+                  file_stem_from_uri(state.uri), state.tree->getSourceBufferIds());
     state.tree->root().visit(v);
     v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {
         return !diag.uri.empty() && diag.uri != state.uri;
