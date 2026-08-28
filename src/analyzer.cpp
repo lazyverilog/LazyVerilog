@@ -46,6 +46,16 @@ constexpr unsigned kMaxBackgroundIndexThreads = 8;
 // that it never runs twice inside one burst of keystrokes.
 constexpr auto kLiveShardIdleDelay = std::chrono::milliseconds(150);
 
+// Smallest header an open buffer's parse is willing to see as directives alone.
+//
+// The projection trades exactness of the buffer's own tree -- the header's
+// declarations stop appearing in it, and features answer for them from the
+// header's shard instead -- for not re-parsing the header on every keystroke.
+// That trade is only worth making where the bulk is actually felt: a header this
+// size costs milliseconds per character typed, while a small one costs
+// microseconds and is worth keeping exact.
+constexpr size_t kDirectivesOnlySeedBytes = 64u << 10;
+
 // Milder than the background compiler's default of 10.  Project index warmup
 // gates when cross-file features start answering, so it should yield to
 // interactive work without being starved outright.
@@ -232,6 +242,8 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
     }
 }
 
+static std::string header_directives_only(std::string_view text);
+
 /// Seed the headers the previous parse of this same buffer `include`d.
 ///
 /// The candidate list is that parse's dependency set rather than everything the
@@ -239,15 +251,26 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 /// every keystroke would trade one read for several copies.  A header that
 /// changed on disk was already dropped by the watcher path
 /// (refresh_changed_extra_files), so nothing here needs to check the filesystem.
+///
+/// A header big enough for its bulk to be felt per keystroke is seeded as its
+/// directives alone, provided its own shard was built from a parse of it on its
+/// own.  See kDirectivesOnlySeedBytes for why size gates this.
 static void preload_open_parse_headers(slang::SourceManager& sm, OpenParseHeaderCache& cache,
                                        const std::vector<std::string>& previous_dependencies,
-                                       const std::unordered_set<std::string_view>& excluded) {
+                                       const std::unordered_set<std::string_view>& excluded,
+                                       const std::unordered_set<std::string>& standalone_uris) {
     for (const auto& dependency_uri : previous_dependencies) {
         const auto path = normalize_filesystem_path(path_from_file_uri(dependency_uri)).string();
         if (path.empty() || excluded.contains(path))
             continue;
-        if (auto text = cache.get(path))
-            sm.assignText(std::string_view(path), std::string_view(*text));
+        auto text = cache.get(path);
+        if (!text)
+            continue;
+        if (text->size() >= kDirectivesOnlySeedBytes && standalone_uris.contains(dependency_uri)) {
+            if (auto directives = cache.get_directives(path, header_directives_only))
+                text = std::move(directives);
+        }
+        sm.assignText(std::string_view(path), std::string_view(*text));
     }
 }
 
@@ -431,6 +454,22 @@ static std::string header_directives_only(std::string_view text) {
     return projected;
 }
 
+struct BuiltHeaderShard {
+    std::string uri;
+    std::shared_ptr<const SyntaxIndex> index;
+    /// Built from a parse of the header by itself, so the shard is the
+    /// authoritative record of its declarations — the condition for serving an
+    /// includer its directives alone.  See standalone_header_uris_.
+    bool stands_alone{false};
+};
+
+static std::vector<BuiltHeaderShard>
+build_header_shards(const std::vector<std::string>& headers_to_build, const DocumentState& includer,
+                    const std::vector<std::string>& defines,
+                    const std::vector<std::filesystem::path>& include_dirs,
+                    const std::vector<OpenTextOverlay>& open_overlays,
+                    HeaderTextCache& header_texts, uint64_t generation);
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
@@ -508,6 +547,75 @@ make_file_state_with_options(const std::filesystem::path& path,
     return state;
 }
 
+/// Build one shard per claimed header, using @p includer as the parse that
+/// pulled them in.  Runs outside map_mutex_: it parses.
+///
+/// The caller's claim is what keeps two workers off the same header.  @p includer
+/// may be an open buffer's snapshot — its text is unsaved, but a header's own
+/// shard is built from the header, so an open includer can claim just as well as
+/// a closed one.
+static std::vector<BuiltHeaderShard>
+build_header_shards(const std::vector<std::string>& headers_to_build, const DocumentState& includer,
+                    const std::vector<std::string>& defines,
+                    const std::vector<std::filesystem::path>& include_dirs,
+                    const std::vector<OpenTextOverlay>& open_overlays,
+                    HeaderTextCache& header_texts, uint64_t generation) {
+    std::vector<BuiltHeaderShard> built;
+    built.reserve(headers_to_build.size());
+    for (const auto& header_uri : headers_to_build) {
+        // Parse the header on its own.  Deriving its shard from an includer's
+        // tree cannot express "the header's declarations": the restriction
+        // meant to do that does not filter, because
+        // SourceFileIdResolver::wants_declaration() keeps every declaration
+        // when no mentions provider is set.  What landed under the header's
+        // URI was therefore a copy of whichever includer claimed it first —
+        // its modules and ports, scoped to its module, and none of the
+        // header's own declarations when the `include sits at file scope.
+        std::shared_ptr<SyntaxIndex> header_index;
+        auto header_state = make_file_state_with_options(
+            path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
+            /*retain_text=*/false, &header_texts, generation,
+            /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true);
+        const bool stands_alone =
+            header_state && header_state->tree &&
+            std::none_of(header_state->parse_diagnostics.begin(),
+                         header_state->parse_diagnostics.end(),
+                         [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+        if (stands_alone) {
+            header_index = std::make_shared<SyntaxIndex>(std::move(header_state->index));
+
+            // Its declarations are now recorded, so the rest of the burst
+            // only needs its directives.  Serving the projection through the
+            // same cache the full text came from is what makes the saving
+            // reach the files still queued: at most one file per worker can
+            // already be reading the header when this runs, and every file
+            // after them is seeded from here.  A header open in the editor
+            // was never stored, so it is never projected.
+            if (const auto key = header_cache_key(*includer.source_manager, header_uri);
+                !key.empty()) {
+                header_texts.project(
+                    generation, key,
+                    header_directives_only(header_source_text(*includer.source_manager,
+                                                              header_uri)));
+            }
+        } else {
+            // A header that is a textual fragment — a port list, a module
+            // opened in one file and closed in another — has no tree of its
+            // own to index.  PERF.md documents this shape; keep deriving
+            // those from the includer that pulled them in.
+            header_index = std::make_shared<SyntaxIndex>(SyntaxIndex::build(
+                *includer.tree, header_source_text(*includer.source_manager, header_uri),
+                IndexDepth::Declarations, header_uri));
+        }
+        built.push_back(BuiltHeaderShard{
+            .uri = header_uri,
+            .index = std::move(header_index),
+            .stands_alone = stands_alone,
+        });
+    }
+    return built;
+}
+
 Analyzer::~Analyzer() {
     if (parse_worker_.joinable()) {
         {
@@ -544,6 +652,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::vector<std::filesystem::path> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
     std::vector<std::string> previous_dependencies;
+    std::unordered_set<std::string> standalone_headers;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
@@ -554,6 +663,12 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         // parse reads from disk and every keystroke after it does not.
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second)
             previous_dependencies = it->second->include_dependencies;
+        // Only the ones this buffer includes: the set is project-wide, and
+        // copying all of it per keystroke would grow with the design.
+        for (const auto& dependency_uri : previous_dependencies) {
+            if (standalone_header_uris_.contains(dependency_uri))
+                standalone_headers.insert(dependency_uri);
+        }
         open_overlays.reserve(docs_.size());
         for (const auto& [open_uri, open_state] : docs_) {
             if (!open_state || open_uri == uri)
@@ -572,7 +687,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     const auto header_cache_excluded =
         header_cache_excluded_paths(open_overlays, normalized_current_path);
     preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
-                               header_cache_excluded);
+                               header_cache_excluded, standalone_headers);
     preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
@@ -4548,6 +4663,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         const auto header_uri = uri_from_path(path);
         const bool was_indexed_header = background_header_claims_.erase(header_uri) > 0;
         background_header_shards_.erase(header_uri);
+        standalone_header_uris_.erase(header_uri);
         if (!was_indexed_header)
             continue;
         invalidate_extra_snapshots_locked();
@@ -4603,8 +4719,14 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
 std::shared_ptr<const std::vector<ExtraFileInfo>>
 Analyzer::build_extra_file_snapshot_locked() const {
     auto result = std::make_shared<std::vector<ExtraFileInfo>>();
-    result->reserve(extra_cache_.size());
-    for (const auto& [key, entry] : extra_cache_) {
+    result->reserve(extra_cache_.size() + background_header_shards_.size());
+    // Header shards belong here for the same reason they belong in the index
+    // snapshot: a file's shard no longer carries what it `include`d, and an open
+    // buffer past kDirectivesOnlySeedBytes does not carry it either.  Without
+    // this, definition and every other feature reading this snapshot could only
+    // find a header's declarations through some includer that happened to be
+    // parsed before the projection was installed.
+    const auto append = [&](const ExtraFileCacheEntry& entry) {
         // Closed project files intentionally have no DocumentState here.  They
         // are represented only by the compact SyntaxIndex shard.  If the file
         // is open, attach the live state so AST-only features can inspect
@@ -4622,7 +4744,7 @@ Analyzer::build_extra_file_snapshot_locked() const {
                 .state = it->second,
                 .index = entry.index,
             });
-            continue;
+            return;
         }
         result->push_back(ExtraFileInfo{
             .path = entry.path,
@@ -4630,6 +4752,14 @@ Analyzer::build_extra_file_snapshot_locked() const {
             .state = nullptr,
             .index = entry.index,
         });
+    };
+    for (const auto& [key, entry] : extra_cache_)
+        append(entry);
+    for (const auto& [key, entry] : background_header_shards_) {
+        // A header that is also a filelist entry is already above; appending it
+        // twice would give every by-name lookup two candidates for one file.
+        if (!extra_cache_.contains(key))
+            append(entry);
     }
     return result;
 }
@@ -5102,6 +5232,7 @@ bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {
     // than serve the shard claimed under the previous text.  The old shard stays
     // in place until the new one commits, so the project index never has a gap.
     background_header_claims_.erase(uri);
+    standalone_header_uris_.erase(uri);
     for (const auto& [extra_uri, entry] : extra_cache_) {
         // Test the shard's dependency list in place.  Offering a
         // `std::vector<std::string>{}` fallback made the conditional expression
@@ -5177,6 +5308,7 @@ void Analyzer::schedule_background_reindex_locked() const {
     // from the previous configuration.
     background_header_shards_.clear();
     background_header_claims_.clear();
+    standalone_header_uris_.clear();
     for (const auto& path : extra_files_)
         queue_background_file_locked(path, /*front=*/false);
     start_background_indexer_locked();
@@ -5289,24 +5421,61 @@ void Analyzer::background_index_loop() const {
             // DocumentState if the user has not edited it meanwhile.
             auto reparsed_live_doc = make_state(uri, live_doc->text);
             auto live_index = get_dynamic_index(*reparsed_live_doc);
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            if (generation == background_generation_) {
-                if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second == live_doc) {
-                    docs_[uri] = reparsed_live_doc;
-                    invalidate_extra_snapshots_locked();
-                    if (extra_file_set_.contains(path_string)) {
-                        extra_cache_[uri] = ExtraFileCacheEntry{
-                            .path = path_string,
-                            .uri = uri,
-                            .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
-                        };
+            std::vector<std::string> headers_to_build;
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (generation == background_generation_) {
+                    if (const auto doc = docs_.find(uri);
+                        doc != docs_.end() && doc->second == live_doc) {
+                        docs_[uri] = reparsed_live_doc;
                         invalidate_extra_snapshots_locked();
-                        schedule_background_project_publish_locked();
+                        if (extra_file_set_.contains(path_string)) {
+                            extra_cache_[uri] = ExtraFileCacheEntry{
+                                .path = path_string,
+                                .uri = uri,
+                                .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
+                            };
+                            invalidate_extra_snapshots_locked();
+                            schedule_background_project_publish_locked();
+                        }
+                    }
+
+                    // Claim this buffer's headers too.  What makes an open buffer
+                    // different is its unsaved text, and a header's shard is built
+                    // from the header itself, so nothing about it is unsaved.
+                    // Skipping the claim here left a header that only an open
+                    // buffer includes without a shard of its own, which is both a
+                    // gap in the project index and the one case the edit path
+                    // cannot serve as directives alone.
+                    for (const auto& dependency : reparsed_live_doc->include_dependencies) {
+                        if (background_header_claims_.insert(dependency).second)
+                            headers_to_build.push_back(dependency);
                     }
                 }
             }
-            --background_index_active_;
-            background_cv_.notify_all();
+
+            auto built_headers = build_header_shards(headers_to_build, *reparsed_live_doc, defines,
+                                                     include_dirs, open_overlays,
+                                                     background_header_texts_, generation);
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (generation == background_generation_ && !built_headers.empty()) {
+                    for (auto& header : built_headers) {
+                        if (header.stands_alone)
+                            standalone_header_uris_.insert(header.uri);
+                        background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                            .path = path_from_file_uri(header.uri),
+                            .uri = header.uri,
+                            .index = std::move(header.index),
+                        };
+                    }
+                    invalidate_extra_snapshots_locked();
+                }
+                --background_index_active_;
+                if (background_pending_files_.empty() && background_index_active_ == 0)
+                    schedule_background_project_publish_locked();
+                background_cv_.notify_all();
+            }
             continue;
         }
 
@@ -5340,93 +5509,55 @@ void Analyzer::background_index_loop() const {
             // flight, the live buffer is newer and must win. The didOpen /
             // didChange path builds and commits that live shard outside this
             // mutex, so do not build it here while holding map_mutex_.
-            if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
-                --background_index_active_;
-                background_cv_.notify_all();
-                continue;
+            const bool opened_mid_parse = [&] {
+                const auto doc = docs_.find(uri);
+                return doc != docs_.end() && doc->second;
+            }();
+            if (!opened_mid_parse) {
+                extra_cache_[uri] = ExtraFileCacheEntry{
+                    .path = path_string,
+                    .uri = uri,
+                    .index = std::move(committed_index),
+                };
+                invalidate_extra_snapshots_locked();
             }
-
-            extra_cache_[uri] = ExtraFileCacheEntry{
-                .path = path_string,
-                .uri = uri,
-                .index = std::move(committed_index),
-            };
-            invalidate_extra_snapshots_locked();
 
             // Claim the headers this parse pulled in.  Claiming inside the same
             // critical section that commits the shard is what keeps two workers
             // from building the same header concurrently; the build itself
             // happens below, outside the lock.
+            //
+            // Claimed even when the buffer opened mid-parse and this file's own
+            // shard is discarded: a header's shard is built from the header, so
+            // whose text pulled it in does not matter.  Dropping the claim there
+            // left a header nothing else includes without a shard at all, since
+            // nothing re-queues a file that is now open.
             for (const auto& dependency : state->include_dependencies) {
                 if (background_header_claims_.insert(dependency).second)
                     headers_to_build.push_back(dependency);
             }
-
         }
 
         // Build the claimed headers outside map_mutex_ for the same reason the
         // file's own shard is built outside it.  This worker stays counted as
         // active until they are committed, so the publish below cannot fire on a
         // project index that is still missing header shards.
-        std::vector<ExtraFileCacheEntry> header_shards;
-        header_shards.reserve(headers_to_build.size());
-        for (const auto& header_uri : headers_to_build) {
-            // Parse the header on its own.  Deriving its shard from an includer's
-            // tree cannot express "the header's declarations": the restriction
-            // meant to do that does not filter, because
-            // SourceFileIdResolver::wants_declaration() keeps every declaration
-            // when no mentions provider is set.  What landed under the header's
-            // URI was therefore a copy of whichever includer claimed it first —
-            // its modules and ports, scoped to its module, and none of the
-            // header's own declarations when the `include sits at file scope.
-            std::shared_ptr<SyntaxIndex> header_index;
-            auto header_state = make_file_state_with_options(
-                path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
-                /*retain_text=*/false, &background_header_texts_, generation,
-                /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true);
-            const bool stands_alone =
-                header_state && header_state->tree &&
-                std::none_of(header_state->parse_diagnostics.begin(),
-                             header_state->parse_diagnostics.end(),
-                             [](const ParseDiagInfo& diag) { return diag.severity == 1; });
-            if (stands_alone) {
-                header_index = std::make_shared<SyntaxIndex>(std::move(header_state->index));
-
-                // Its declarations are now recorded, so the rest of the burst
-                // only needs its directives.  Serving the projection through the
-                // same cache the full text came from is what makes the saving
-                // reach the files still queued: at most one file per worker can
-                // already be reading the header when this runs, and every file
-                // after them is seeded from here.  A header open in the editor
-                // was never stored, so it is never projected.
-                if (const auto key = header_cache_key(*state->source_manager, header_uri);
-                    !key.empty()) {
-                    background_header_texts_.project(
-                        generation, key,
-                        header_directives_only(
-                            header_source_text(*state->source_manager, header_uri)));
-                }
-            } else {
-                // A header that is a textual fragment — a port list, a module
-                // opened in one file and closed in another — has no tree of its
-                // own to index.  PERF.md documents this shape; keep deriving
-                // those from the includer that pulled them in.
-                header_index = std::make_shared<SyntaxIndex>(SyntaxIndex::build(
-                    *state->tree, header_source_text(*state->source_manager, header_uri),
-                    IndexDepth::Declarations, header_uri));
-            }
-            header_shards.push_back(ExtraFileCacheEntry{
-                .path = path_from_file_uri(header_uri),
-                .uri = header_uri,
-                .index = std::move(header_index),
-            });
-        }
+        auto built_headers = build_header_shards(headers_to_build, *state, defines, include_dirs,
+                                                 open_overlays, background_header_texts_,
+                                                 generation);
 
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            if (generation == background_generation_ && !header_shards.empty()) {
-                for (auto& shard : header_shards)
-                    background_header_shards_[shard.uri] = std::move(shard);
+            if (generation == background_generation_ && !built_headers.empty()) {
+                for (auto& header : built_headers) {
+                    if (header.stands_alone)
+                        standalone_header_uris_.insert(header.uri);
+                    background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                        .path = path_from_file_uri(header.uri),
+                        .uri = header.uri,
+                        .index = std::move(header.index),
+                    };
+                }
                 invalidate_extra_snapshots_locked();
             }
 
