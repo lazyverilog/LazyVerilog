@@ -1073,7 +1073,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string text = state ? state->text : "";
                 for (const auto& chg : note.params.contentChanges)
                     text = apply_incremental_change(std::move(text), chg);
-                analyzer_.enqueue_parse(uri, text);
+                analyzer_.enqueue_parse(uri, std::move(text));
             }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChange error: " << e.what() << "\n";

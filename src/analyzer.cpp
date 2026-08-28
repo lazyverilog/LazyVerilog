@@ -678,11 +678,11 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 
 }
 
-uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text) {
+uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
     uint64_t version = ++version_counter_;
 
     std::string path = path_from_file_uri(uri);
-    auto state = std::make_shared<DocumentState>(uri, text, nullptr);
+    auto state = std::make_shared<DocumentState>(uri, std::move(text), nullptr);
     state->normalized_path = normalize_filesystem_path(path).string();
     cache_document_end_position(*state);
     state->doc_version = version;
@@ -699,14 +699,14 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text
             state->include_dependencies = it->second->include_dependencies;
             state->include_dependency_set = it->second->include_dependency_set;
         }
-        docs_[uri] = std::move(state);
+        docs_[uri] = state;
         latest_version_[uri] = version;
         semantic_diagnostics_.erase(uri);
         invalidate_extra_snapshots_locked();
     }
     {
         std::lock_guard<std::mutex> lock(parse_mutex_);
-        parse_pending_[uri] = ParseJob{uri, text, version};
+        parse_pending_[uri] = ParseJob{uri, std::move(state), version};
         if (!parse_worker_.joinable())
             parse_worker_ = std::thread([this] { parse_worker_loop(); });
     }
@@ -762,7 +762,7 @@ void Analyzer::parse_worker_loop() {
             continue;
         }
 
-        auto state = make_state(job.uri, job.text); // outside all locks
+        auto state = make_state(job.uri, job.pending->text); // outside all locks
         state->doc_version = job.version;
 
         bool committed = false;
