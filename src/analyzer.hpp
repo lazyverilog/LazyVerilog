@@ -137,6 +137,24 @@ private:
     }
 };
 
+/// File extensions the server asks the client to watch for on-disk changes.
+///
+/// Single source of truth: server.cpp turns these into the
+/// workspace/didChangeWatchedFiles glob registration, and OpenParseHeaderCache
+/// refuses to cache anything outside the list, because outside it nothing would
+/// ever tell the cache its text went stale.
+inline constexpr std::string_view kWatchedSourceExtensions[] = {
+    ".sv", ".v", ".svh", ".vh", ".f", ".vf", ".svi",
+};
+
+inline bool is_watched_source_path(std::string_view path) {
+    for (const auto ext : kWatchedSourceExtensions) {
+        if (path.size() > ext.size() && path.ends_with(ext))
+            return true;
+    }
+    return false;
+}
+
 /// Text of headers an *open buffer* `include`s, kept across keystrokes.
 ///
 /// didChange builds a fresh SourceManager per document snapshot, so without this
@@ -147,84 +165,53 @@ private:
 ///
 /// HeaderTextCache cannot serve this: it is scoped to one background indexing
 /// burst and dropped when the queue drains, which is what keeps its contents
-/// from going stale.  An edit-path cache has to survive far longer than that, so
-/// it instead validates every entry against the file's size and modification
-/// time before handing text out.  That is a couple of metadata calls per cached
-/// header per keystroke — orders of magnitude cheaper than the read it
-/// replaces, and it leaves external edits as visible as they are without any
-/// cache.  Both entry points below are written to make no filesystem call at
-/// all in the cases where the answer is already known.
+/// from going stale.  An edit-path cache has to survive far longer than that.
+///
+/// Staleness is handled by invalidation, not by re-checking the file: the cache
+/// makes **no filesystem call at all**, and entries live until someone reports
+/// the file changed.  That is the same event-driven rule the project shards
+/// already follow (see Analyzer::refresh_changed_extra_files) — the client's
+/// OS-level watcher says which files moved, so the server never polls.  A size
+/// and mtime check would be two metadata calls per included header per
+/// keystroke, which on a shared/HPC filesystem is two network round trips for a
+/// question the watcher already answers for free.
+///
+/// The consequence is worth stating plainly: if the client does not deliver
+/// workspace/didChangeWatchedFiles, an externally edited header stays cached
+/// until the project configuration changes or the server restarts.  Both
+/// shipped clients (lua/, vscode/) register the watcher, and only the
+/// extensions in kWatchedSourceExtensions are cached, so a path nothing watches
+/// is simply re-read every keystroke as it was before this cache existed.
 struct OpenParseHeaderCache {
     /// Same budget as HeaderTextCache, for the same reason: a design whose
     /// headers exceed it keeps the ones seen first and the win is partial.
     static constexpr size_t kMaxBytes = 32u << 20;
 
-    struct Entry {
-        std::shared_ptr<const std::string> text;
-        std::uintmax_t size{0};
-        std::filesystem::file_time_type write_time{};
-    };
-
-    /// Text for @p path if the file on disk still matches what was cached.
-    ///
-    /// Returns null when the entry is absent or the stat says the file moved on,
-    /// dropping the stale entry so the caller's parse re-reads it.  The map is
-    /// consulted before the filesystem: a header nothing has cached yet has no
-    /// answer a stat could change.
-    std::shared_ptr<const std::string> get_if_current(const std::string& path) {
-        std::shared_ptr<const std::string> cached;
-        std::uintmax_t cached_size = 0;
-        std::filesystem::file_time_type cached_write_time{};
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            const auto it = texts.find(path);
-            if (it == texts.end())
-                return nullptr;
-            cached = it->second.text;
-            cached_size = it->second.size;
-            cached_write_time = it->second.write_time;
-        }
-
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type write_time{};
-        if (!stat_file(path, size, write_time))
-            return nullptr;
-        if (size == cached_size && write_time == cached_write_time)
-            return cached;
-
+    /// Cached text for @p path, or null if nothing is cached for it.
+    std::shared_ptr<const std::string> get(const std::string& path) const {
         std::lock_guard<std::mutex> lock(mutex);
-        // Only drop what this call validated.  Another thread may have replaced
-        // the entry while the stat was in flight, and erasing that one would
-        // throw away text nobody has shown to be stale.
-        if (const auto it = texts.find(path); it != texts.end() && it->second.text == cached) {
-            bytes -= it->second.text->size();
-            texts.erase(it);
-        }
-        return nullptr;
+        const auto it = texts.find(path);
+        return it == texts.end() ? nullptr : it->second;
     }
 
     void store(const std::string& path, std::string_view text) {
-        // Decide whether there is anything to store before touching the
-        // filesystem.  store() runs for every header of every open-buffer
-        // parse, and from the second keystroke on the entry is already present,
-        // so statting first made the common case pay a full round trip per
-        // header to discover it had nothing to do.
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (texts.contains(path) || bytes + text.size() > kMaxBytes)
-                return;
-        }
-
-        std::uintmax_t size = 0;
-        std::filesystem::file_time_type write_time{};
-        if (!stat_file(path, size, write_time))
+        if (!is_watched_source_path(path))
             return;
-
         std::lock_guard<std::mutex> lock(mutex);
         if (texts.contains(path) || bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
-        texts.emplace(path, Entry{std::make_shared<const std::string>(text), size, write_time});
+        texts.emplace(path, std::make_shared<const std::string>(text));
+    }
+
+    /// Drop @p path so the next parse reads it from disk again.
+    void invalidate(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        if (it == texts.end())
+            return;
+        bytes -= it->second->size();
+        texts.erase(it);
     }
 
     void clear() {
@@ -234,26 +221,8 @@ struct OpenParseHeaderCache {
     }
 
     mutable std::mutex mutex;
-    std::unordered_map<std::string, Entry> texts;
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> texts;
     size_t bytes{0};
-
-private:
-    /// Size and modification time of @p path; false if either cannot be read.
-    ///
-    /// Deliberately not std::filesystem::directory_entry: constructing one
-    /// stats the path, and its file_size()/last_write_time() each stat it
-    /// again, so validating a single header cost three metadata calls.  Asking
-    /// for the two facts directly costs two, which on a networked filesystem is
-    /// one fewer round trip per included header per keystroke.
-    static bool stat_file(const std::string& path, std::uintmax_t& size,
-                          std::filesystem::file_time_type& write_time) {
-        std::error_code ec;
-        size = std::filesystem::file_size(path, ec);
-        if (ec)
-            return false;
-        write_time = std::filesystem::last_write_time(path, ec);
-        return !ec;
-    }
 };
 
 struct SymbolInfo {

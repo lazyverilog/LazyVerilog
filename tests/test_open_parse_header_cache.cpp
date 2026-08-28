@@ -3,10 +3,11 @@
 // shared header on a networked filesystem that read, not the parse, is what the
 // user feels while typing.
 //
-// OpenParseHeaderCache holds that text across keystrokes and validates it by
-// size and modification time.  These tests pin both halves of the deal: the read
-// is genuinely skipped when the file has not moved, and a header edited on disk
-// is still picked up.
+// OpenParseHeaderCache holds that text across keystrokes and never revalidates
+// it against the filesystem; the client's OS watcher reports changed files and
+// the server drops those entries.  These tests pin both halves of the deal: the
+// read is genuinely skipped while nothing reports a change, and a reported
+// change is picked up.
 #include "analyzer.hpp"
 #include "dynamic_file_index.hpp"
 
@@ -48,6 +49,7 @@ class HeaderProject {
     std::filesystem::path header_path() const { return dir_ / "marker.svh"; }
     std::filesystem::path module_path() const { return dir_ / "blk.sv"; }
     std::string module_uri() const { return "file://" + module_path().string(); }
+    std::string header_uri() const { return "file://" + header_path().string(); }
 
     /// Two spellings so a reparse is a real content change, not a no-op.
     static std::string module_text(const std::string& port = "clk_i") {
@@ -82,31 +84,47 @@ TEST_CASE("open header cache: a keystroke does not re-read an unchanged header",
     analyzer.open(project.module_uri(), HeaderProject::module_text());
     REQUIRE(has_value_named(analyzer, project.module_uri(), "CACHED_MARK"));
 
-    // Rewrite the header in place and put its modification time back.  Byte
-    // count and mtime both match what was cached, so a server that reuses the
-    // cached text cannot see this edit — which is precisely the read it skipped.
-    const auto stamp = std::filesystem::last_write_time(project.header_path());
+    // Rewrite the header on disk and say nothing.  Size and mtime both move, so
+    // this is exactly the edit a revalidating cache would notice; the point of
+    // the change is that the keystroke path asks the filesystem nothing at all.
     project.write_header("FRESHX_MARK");
-    std::filesystem::last_write_time(project.header_path(), stamp);
+    std::filesystem::last_write_time(project.header_path(),
+                                     std::filesystem::last_write_time(project.header_path()) +
+                                         std::chrono::seconds(2));
 
     analyzer.change(project.module_uri(), HeaderProject::module_text("clk"));
     CHECK(has_value_named(analyzer, project.module_uri(), "CACHED_MARK"));
     CHECK_FALSE(has_value_named(analyzer, project.module_uri(), "FRESHX_MARK"));
 }
 
-TEST_CASE("open header cache: a header edited on disk is still picked up", "[sync]") {
+TEST_CASE("open header cache: a watcher-reported header change is picked up", "[sync]") {
     HeaderProject project("refresh");
     Analyzer analyzer;
     analyzer.open(project.module_uri(), HeaderProject::module_text());
     REQUIRE(has_value_named(analyzer, project.module_uri(), "CACHED_MARK"));
 
     project.write_header("FRESHX_MARK");
-    // Advance the stamp explicitly: a coarse filesystem clock can report the
-    // same mtime for two writes in the same test, which would make this pass or
-    // fail for reasons that have nothing to do with the cache.
-    std::filesystem::last_write_time(project.header_path(),
-                                     std::filesystem::last_write_time(project.header_path()) +
-                                         std::chrono::seconds(2));
+    // What workspace/didChangeWatchedFiles delivers.  This, not a stat, is what
+    // makes the next parse read the header again.
+    analyzer.refresh_changed_extra_files({project.header_uri()});
+
+    analyzer.change(project.module_uri(), HeaderProject::module_text("clk"));
+    CHECK(has_value_named(analyzer, project.module_uri(), "FRESHX_MARK"));
+    CHECK_FALSE(has_value_named(analyzer, project.module_uri(), "CACHED_MARK"));
+}
+
+TEST_CASE("open header cache: closing a header drops its pre-session text", "[sync]") {
+    HeaderProject project("close");
+    Analyzer analyzer;
+    analyzer.open(project.module_uri(), HeaderProject::module_text());
+    REQUIRE(has_value_named(analyzer, project.module_uri(), "CACHED_MARK"));
+
+    // Edit the header through a buffer and close it.  An open buffer is excluded
+    // from the cache, so nothing invalidated the disk text cached before the
+    // buffer existed; close() has to drop it or the includer keeps seeing it.
+    analyzer.open(project.header_uri(), "localparam int FRESHX_MARK = 1;\n");
+    project.write_header("FRESHX_MARK");
+    analyzer.close(project.header_uri());
 
     analyzer.change(project.module_uri(), HeaderProject::module_text("clk"));
     CHECK(has_value_named(analyzer, project.module_uri(), "FRESHX_MARK"));

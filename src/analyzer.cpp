@@ -214,9 +214,9 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 ///
 /// The candidate list is that parse's dependency set rather than everything the
 /// cache holds: assignText() copies, so offering every open buffer's headers to
-/// every keystroke would trade one read for several copies.  A header that has
-/// changed on disk since it was cached is dropped by get_if_current() and simply
-/// read again.
+/// every keystroke would trade one read for several copies.  A header that
+/// changed on disk was already dropped by the watcher path
+/// (refresh_changed_extra_files), so nothing here needs to check the filesystem.
 static void preload_open_parse_headers(slang::SourceManager& sm, OpenParseHeaderCache& cache,
                                        const std::vector<std::string>& previous_dependencies,
                                        const std::unordered_set<std::string_view>& excluded) {
@@ -224,7 +224,7 @@ static void preload_open_parse_headers(slang::SourceManager& sm, OpenParseHeader
         const auto path = normalize_filesystem_path(path_from_file_uri(dependency_uri)).string();
         if (path.empty() || excluded.contains(path))
             continue;
-        if (auto text = cache.get_if_current(path))
+        if (auto text = cache.get(path))
             sm.assignText(std::string_view(path), std::string_view(*text));
     }
 }
@@ -243,7 +243,7 @@ static void store_open_parse_headers(const slang::SourceManager& sm, const Docum
         // and slang's own resolved path does not go through that normalization.
         // On a filesystem where the project path crosses a symlink or a short
         // (8.3) name the two spellings differ, so storing under the raw path
-        // left get_if_current() unable to ever find what was just stored.
+        // left get() unable to ever find what was just stored.
         const auto path_string = normalize_filesystem_path(full_path).string();
         if (excluded.contains(path_string))
             continue;
@@ -832,6 +832,11 @@ void Analyzer::parse_worker_loop() {
 }
 
 void Analyzer::close(const std::string& uri) {
+    // A file open as a buffer is excluded from the open-parse header cache, so
+    // whatever was cached for it predates the editing session.  Closing it makes
+    // it cache-eligible again; drop the pre-session text rather than serve it.
+    open_parse_header_texts_.invalidate(
+        normalize_filesystem_path(path_from_file_uri(uri)).string());
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_.erase(uri);
@@ -4496,6 +4501,15 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     changed_paths.reserve(changed_uris.size());
     for (const auto& uri : changed_uris)
         changed_paths.push_back(normalized_project_path(uri));
+
+    // Open-buffer header text is kept across keystrokes with no revalidation, so
+    // this notification is the only thing that can make it stale.  Drop it before
+    // taking map_mutex_: OpenParseHeaderCache has its own mutex and the same rule
+    // as HeaderTextCache — never take it under map_mutex_.
+    for (const auto& path : deleted_paths)
+        open_parse_header_texts_.invalidate(path);
+    for (const auto& path : changed_paths)
+        open_parse_header_texts_.invalidate(path);
 
     std::lock_guard<std::mutex> lock(map_mutex_);
 
