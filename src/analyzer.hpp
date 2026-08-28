@@ -149,9 +149,11 @@ private:
 /// burst and dropped when the queue drains, which is what keeps its contents
 /// from going stale.  An edit-path cache has to survive far longer than that, so
 /// it instead validates every entry against the file's size and modification
-/// time before handing text out.  That is one stat per included header per
-/// keystroke — orders of magnitude cheaper than the read it replaces, and it
-/// leaves external edits as visible as they are without any cache.
+/// time before handing text out.  That is a couple of metadata calls per cached
+/// header per keystroke — orders of magnitude cheaper than the read it
+/// replaces, and it leaves external edits as visible as they are without any
+/// cache.  Both entry points below are written to make no filesystem call at
+/// all in the cases where the answer is already known.
 struct OpenParseHeaderCache {
     /// Same budget as HeaderTextCache, for the same reason: a design whose
     /// headers exceed it keeps the ones seen first and the win is partial.
@@ -166,47 +168,60 @@ struct OpenParseHeaderCache {
     /// Text for @p path if the file on disk still matches what was cached.
     ///
     /// Returns null when the entry is absent or the stat says the file moved on,
-    /// dropping the stale entry so the caller's parse re-reads it.
+    /// dropping the stale entry so the caller's parse re-reads it.  The map is
+    /// consulted before the filesystem: a header nothing has cached yet has no
+    /// answer a stat could change.
     std::shared_ptr<const std::string> get_if_current(const std::string& path) {
-        std::error_code ec;
-        std::filesystem::directory_entry entry(path, ec);
-        if (ec)
+        std::shared_ptr<const std::string> cached;
+        std::uintmax_t cached_size = 0;
+        std::filesystem::file_time_type cached_write_time{};
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto it = texts.find(path);
+            if (it == texts.end())
+                return nullptr;
+            cached = it->second.text;
+            cached_size = it->second.size;
+            cached_write_time = it->second.write_time;
+        }
+
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type write_time{};
+        if (!stat_file(path, size, write_time))
             return nullptr;
-        const auto size = entry.file_size(ec);
-        if (ec)
-            return nullptr;
-        const auto write_time = entry.last_write_time(ec);
-        if (ec)
-            return nullptr;
+        if (size == cached_size && write_time == cached_write_time)
+            return cached;
 
         std::lock_guard<std::mutex> lock(mutex);
-        const auto it = texts.find(path);
-        if (it == texts.end())
-            return nullptr;
-        if (it->second.size != size || it->second.write_time != write_time) {
+        // Only drop what this call validated.  Another thread may have replaced
+        // the entry while the stat was in flight, and erasing that one would
+        // throw away text nobody has shown to be stale.
+        if (const auto it = texts.find(path); it != texts.end() && it->second.text == cached) {
             bytes -= it->second.text->size();
             texts.erase(it);
-            return nullptr;
         }
-        return it->second.text;
+        return nullptr;
     }
 
     void store(const std::string& path, std::string_view text) {
-        std::error_code ec;
-        std::filesystem::directory_entry entry(path, ec);
-        if (ec)
-            return;
-        const auto size = entry.file_size(ec);
-        if (ec)
-            return;
-        const auto write_time = entry.last_write_time(ec);
-        if (ec)
+        // Decide whether there is anything to store before touching the
+        // filesystem.  store() runs for every header of every open-buffer
+        // parse, and from the second keystroke on the entry is already present,
+        // so statting first made the common case pay a full round trip per
+        // header to discover it had nothing to do.
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (texts.contains(path) || bytes + text.size() > kMaxBytes)
+                return;
+        }
+
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type write_time{};
+        if (!stat_file(path, size, write_time))
             return;
 
         std::lock_guard<std::mutex> lock(mutex);
-        if (texts.contains(path))
-            return;
-        if (bytes + text.size() > kMaxBytes)
+        if (texts.contains(path) || bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
         texts.emplace(path, Entry{std::make_shared<const std::string>(text), size, write_time});
@@ -221,6 +236,24 @@ struct OpenParseHeaderCache {
     mutable std::mutex mutex;
     std::unordered_map<std::string, Entry> texts;
     size_t bytes{0};
+
+private:
+    /// Size and modification time of @p path; false if either cannot be read.
+    ///
+    /// Deliberately not std::filesystem::directory_entry: constructing one
+    /// stats the path, and its file_size()/last_write_time() each stat it
+    /// again, so validating a single header cost three metadata calls.  Asking
+    /// for the two facts directly costs two, which on a networked filesystem is
+    /// one fewer round trip per included header per keystroke.
+    static bool stat_file(const std::string& path, std::uintmax_t& size,
+                          std::filesystem::file_time_type& write_time) {
+        std::error_code ec;
+        size = std::filesystem::file_size(path, ec);
+        if (ec)
+            return false;
+        write_time = std::filesystem::last_write_time(path, ec);
+        return !ec;
+    }
 };
 
 struct SymbolInfo {
@@ -331,7 +364,10 @@ class Analyzer {
     /// Replaces update_text() + change().  Immediately stores null-tree state
     /// with current text, assigns a monotonically increasing version, enqueues
     /// async parse.  Returns assigned version.
-    uint64_t enqueue_parse(const std::string& uri, const std::string& text);
+    /// Takes @p text by value: didChange builds the new buffer text itself and
+    /// has no further use for it, so the caller can move it in and the snapshot
+    /// installed here is the only copy the edit path makes.
+    uint64_t enqueue_parse(const std::string& uri, std::string text);
 
     /// Server registers this once.  Called on worker thread after a parse commits.
     void set_parse_complete_callback(
@@ -637,8 +673,12 @@ class Analyzer {
     // Async parse worker state.
     struct ParseJob {
         std::string uri;
-        std::string text;
-        uint64_t version;
+        // The placeholder snapshot enqueue_parse() installed, not a second copy
+        // of its text.  The worker parses pending->text, and docs_ holds the
+        // same snapshot until the reparse lands, so the buffer exists once
+        // instead of once per queue it passes through.
+        std::shared_ptr<const DocumentState> pending;
+        uint64_t version{0};
     };
 
     std::function<void(const std::string&)> parse_complete_cb_;
