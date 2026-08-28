@@ -136,6 +136,20 @@ The trade is that between an edit and a save, a closed includer's shard reflects
 the saved header.  That is consistent with the rest of the model — a closed
 file's own text is read from disk too.
 
+## Include directories are resolved once, not per parse
+
+A `SourceManager` is built per parse, and `addUserDirectories()` globs each
+configured directory and then canonicalizes every match — a stat per path
+component, per directory, on every keystroke and once per project file.  With a
+few hundred `+incdir+` entries that dominated the edit path, and on a shared
+filesystem each of those stats is a round trip.
+
+The glob now runs once, where the config is set, and the result is handed to
+slang as `PreprocessorOptions::additionalIncludePaths`.  Search order is
+unchanged: slang tries the including file's own directory first, then these.
+A directory added after the config was loaded is picked up on the next config
+reload, the same event that already re-parses the project.
+
 The open-buffer path is deliberately not projected.  An edit needs the current
 file's own AST to be exact, including whatever its headers splice into it, and
 that path has its own cache (`OpenParseHeaderCache`), which outlives an indexing

@@ -19,6 +19,7 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
+#include <slang/text/Glob.h>
 #include <slang/text/SourceManager.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,16 +91,37 @@ static void cache_document_end_position(DocumentState& state) {
     state.end_character = saturating_lsp_int(col);
 }
 
-static void add_include_dirs(slang::SourceManager& sm, const std::vector<std::string>& dirs) {
+/// Resolve configured include-directory patterns to existing directories, once.
+///
+/// The parse path used to hand these to SourceManager::addUserDirectories(),
+/// which globs the pattern and then runs weakly_canonical() over every match —
+/// a stat per path component, per directory.  A SourceManager is built per
+/// parse, so that ran again on every keystroke and once per project file during
+/// indexing: with a few hundred include directories it dominated the edit path,
+/// and on a shared/network filesystem each of those stats is a round trip.
+///
+/// Resolving here and passing the result as
+/// PreprocessorOptions::additionalIncludePaths keeps the same search order —
+/// slang tries the including file's own directory first, then these — with no
+/// filesystem work left on the edit path.
+static std::vector<std::filesystem::path>
+resolve_include_dirs(const std::vector<std::string>& dirs) {
+    std::vector<std::filesystem::path> resolved;
+    resolved.reserve(dirs.size());
     for (const auto& dir : dirs) {
         if (dir.empty())
             continue;
-        // SourceManager reports an error only for exact non-existent directory
-        // patterns.  Completion should remain best-effort when the user has a
-        // stale config path, so we ignore the return code here and let missing
-        // include diagnostics surface from slang in the normal parse path.
-        (void)sm.addUserDirectories(dir);
+        slang::SmallVector<std::filesystem::path> matches;
+        std::error_code ec;
+        // The same glob slang applied, so wildcard include paths keep working.
+        // A pattern matching nothing is dropped and the error ignored, as
+        // before: completion stays best-effort when the user has a stale config
+        // path, and missing include diagnostics still surface from the parse.
+        slang::svGlob({}, dir, slang::GlobMode::Directories, matches,
+                      /*expandEnvVars=*/false, ec);
+        resolved.insert(resolved.end(), matches.begin(), matches.end());
     }
+    return resolved;
 }
 
 static void collect_parse_diagnostics(DocumentState& state, const std::string& fallback_uri) {
@@ -412,7 +434,7 @@ static std::string header_directives_only(std::string_view text) {
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
-                             const std::vector<std::string>& include_dirs,
+                             const std::vector<std::filesystem::path>& include_dirs,
                              const std::vector<OpenTextOverlay>& open_overlays = {},
                              bool retain_text = false,
                              HeaderTextCache* header_texts = nullptr,
@@ -425,7 +447,6 @@ make_file_state_with_options(const std::filesystem::path& path,
     const std::string uri = uri_from_path(norm);
 
     auto sm = make_lsp_source_manager();
-    add_include_dirs(*sm, include_dirs);
     std::unordered_set<std::string_view> header_cache_excluded;
     if (header_texts) {
         header_cache_excluded = header_cache_excluded_paths(open_overlays, norm_string);
@@ -434,6 +455,7 @@ make_file_state_with_options(const std::filesystem::path& path,
     preload_open_text_overlays(*sm, open_overlays, norm_string);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
+    ppo.additionalIncludePaths = include_dirs;
     slang::Bag bag;
     bag.set(ppo);
 
@@ -519,14 +541,14 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // errors when the same file is re-parsed on didChange, and prevents the
     // static singleton from accumulating stale buffers across edits.
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
     std::vector<std::string> previous_dependencies;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         defines = defines_;
-        include_dirs = include_dirs_;
+        include_dirs = include_dir_paths_;
         // What this buffer included last time is the candidate set for header
         // seeding below.  On didOpen there is no previous snapshot, so the first
         // parse reads from disk and every keystroke after it does not.
@@ -547,7 +569,6 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     }
 
     auto sm = make_lsp_source_manager();
-    add_include_dirs(*sm, include_dirs);
     const auto header_cache_excluded =
         header_cache_excluded_paths(open_overlays, normalized_current_path);
     preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
@@ -555,6 +576,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
+    ppo.additionalIncludePaths = std::move(include_dirs);
     slang::Bag bag;
     bag.set(ppo);
     // Pass the normalized path, not the raw one path_from_file_uri() produced:
@@ -840,14 +862,14 @@ std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_
 
     std::vector<std::string> paths;
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> live_by_path;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         paths = extra_files_;
         defines = defines_;
-        include_dirs = include_dirs_;
+        include_dirs = include_dir_paths_;
 
         open_overlays.reserve(docs_.size());
         live_by_path.reserve(docs_.size());
@@ -4376,8 +4398,11 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     for (const auto& dir : include_dirs)
         normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
 
+    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
     include_dirs_ = std::move(normalized_include_dirs);
+    include_dir_paths_ = std::move(resolved_include_dirs);
 
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
@@ -4428,6 +4453,8 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     for (const auto& path : extra_files)
         normalized_extra_files.push_back(normalize_filesystem_path(path).string());
 
+    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     // Apply every parse-affecting project input under one lock.  A config reload
@@ -4437,6 +4464,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // can still burn CPU / shared-filesystem bandwidth while they parse.
     defines_ = defines;
     include_dirs_ = std::move(normalized_include_dirs);
+    include_dir_paths_ = std::move(resolved_include_dirs);
 
     filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_extra_files);
@@ -5169,7 +5197,7 @@ void Analyzer::background_index_loop() const {
     // include_dirs_ bumps the background generation before any later work can
     // be queued, so a matching generation means the copy is still current.
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     uint64_t config_generation = std::numeric_limits<uint64_t>::max();
 
     while (!background_stop_.load()) {
@@ -5227,7 +5255,7 @@ void Analyzer::background_index_loop() const {
             generation = background_generation_;
             if (config_generation != generation) {
                 defines = defines_;
-                include_dirs = include_dirs_;
+                include_dirs = include_dir_paths_;
                 config_generation = generation;
             }
             open_overlays.reserve(docs_.size());
