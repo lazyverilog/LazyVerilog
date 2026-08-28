@@ -14,6 +14,7 @@
 // its bulk not to matter is left exactly as it was.
 #include "analyzer.hpp"
 #include "dynamic_file_index.hpp"
+#include "string_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -44,6 +45,12 @@ class ProjectedHeaderProject {
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_ / "inc");
         std::filesystem::create_directories(dir_ / "rtl");
+        // Resolve once, up front: the analyzer identifies a file by its
+        // normalized (symlink-resolved) URI, so a temp directory reached through
+        // a symlink (macOS's /var -> /private/var) would hand set_extra_files()
+        // and set_include_dirs() a spelling the shards never use, and the
+        // header's shard would answer under a URI these tests never name.
+        dir_ = std::filesystem::canonical(dir_);
 
         std::string header = shape_ == Shape::StandsAlone
                                  ? "package hdr_pkg;\n    localparam int BIG_MARK = 7;\n"
@@ -96,8 +103,11 @@ class ProjectedHeaderProject {
 
     std::filesystem::path header_path() const { return dir_ / "inc" / "marker.svh"; }
     std::filesystem::path opened_path() const { return dir_ / "rtl" / "opened.sv"; }
-    std::string opened_uri() const { return "file://" + opened_path().string(); }
-    std::string header_uri() const { return "file://" + header_path().string(); }
+    // Must match the production file:// spelling exactly: on Windows a plain
+    // "file://" + path.string() keeps backslashes and skips the extra slash a
+    // drive letter needs, so it would name a file the analyzer never keys on.
+    std::string opened_uri() const { return uri_from_path(opened_path()); }
+    std::string header_uri() const { return uri_from_path(header_path()); }
 
     /// Two spellings, so a change() is a real edit rather than a no-op.  The
     /// reference to BIG_MARK is on line 2 of the stand-alone shape.
