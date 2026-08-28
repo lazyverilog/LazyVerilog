@@ -729,6 +729,52 @@ TEST_CASE("header text cache: only widely shared headers are offered for seeding
     CHECK(candidates.front().first == "/proj/common.svh");
 }
 
+TEST_CASE("project index: a header is found through a configured include directory", "[index]") {
+    // The configured include directories are resolved once and handed to slang
+    // as additional include paths rather than rebuilt per SourceManager.  A
+    // header that lives outside the including file's own directory can only be
+    // resolved through them, so this is what proves they still reach the parse.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_incdir_resolution";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "include");
+    fs::create_directories(dir / "rtl");
+
+    const auto header_path = dir / "include" / "widths.svh";
+    const auto source_path = dir / "rtl" / "user.sv";
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    write_file(header_path, "package widths_pkg;\n    localparam int BUS_W = 24;\nendpackage\n");
+    write_file(source_path, "`include \"widths.svh\"\n"
+                            "module user;\n    logic [widths_pkg::BUS_W-1:0] d;\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({(dir / "include").string()});
+    analyzer.set_extra_files({source_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    bool found = false;
+    for (const auto& shard : snapshot->shards) {
+        if (!shard.index)
+            continue;
+        for (const auto& value : shard.index->values) {
+            if (value.name == "BUS_W" && value.default_value == "24")
+                found = true;
+        }
+    }
+    CHECK(found);
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("project index: shared header text is indexed once per including file", "[index]") {
     // Background indexing seeds already-known header text into each file's
     // SourceManager so a shared header is not re-read once per including file.

@@ -573,6 +573,10 @@ class Analyzer {
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
     std::vector<std::string> defines_;
     std::vector<std::string> include_dirs_;
+    // include_dirs_ globbed to the directories that exist, once, when the
+    // config is set.  Parses hand this to slang as additional include paths
+    // instead of rebuilding it per SourceManager; see resolve_include_dirs().
+    std::vector<std::filesystem::path> include_dir_paths_;
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
