@@ -2,9 +2,11 @@
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <thread>
 #include <catch2/catch_test_macros.hpp>
 #include <slang/syntax/SyntaxTree.h>
 
@@ -802,6 +804,75 @@ TEST_CASE("project index: shared header text is indexed once per including file"
     REQUIRE(reparsed);
     REQUIRE(reparsed->shards.size() == 3);
     CHECK(shared_width(*reparsed) == "32");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("project index: typing in a header reaches the index without reparsing every includer",
+          "[index]") {
+    // The editor path is enqueue_parse, and its fanout to the files that
+    // `include the buffer is deferred until the typing stops and then reparses
+    // one closed includer rather than all of them.  What has to survive both is
+    // that the project index answers from the unsaved text; the rest of the
+    // closed includers refresh when the file is saved and the watcher reports
+    // it.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_header_edit_fanout";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    const auto header_path = dir / "shared.svh";
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+    auto shared_width = [](const ProjectIndexSnapshot& snapshot) -> std::string {
+        for (const auto& shard : snapshot.shards) {
+            if (!shard.index)
+                continue;
+            for (const auto& value : shard.index->values) {
+                if (value.name == "SHARED_W" && value.default_value == "32")
+                    return value.default_value;
+            }
+        }
+        return {};
+    };
+
+    write_file(header_path, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    std::vector<std::string> includers;
+    for (int i = 0; i < 4; ++i) {
+        const auto path = dir / ("blk" + std::to_string(i) + ".sv");
+        write_file(path, "`include \"shared.svh\"\nmodule blk" + std::to_string(i) +
+                             ";\n    logic [shared_pkg::SHARED_W-1:0] a;\nendmodule\n");
+        includers.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files(includers);
+    analyzer.wait_for_background_index_idle();
+
+    const auto header_uri = uri_from_path(header_path);
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(shared_width(*snapshot).empty());
+
+    analyzer.open(header_uri, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    analyzer.enqueue_parse(header_uri,
+                           "package shared_pkg;\n    localparam int SHARED_W = 32;\nendpackage\n");
+
+    // The fanout waits for the parse queue to go idle, so poll rather than
+    // asserting on one timing.
+    std::string width;
+    for (int attempt = 0; attempt < 100 && width != "32"; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        analyzer.wait_for_background_index_idle();
+        if (auto reparsed = analyzer.project_index_snapshot())
+            width = shared_width(*reparsed);
+    }
+    CHECK(width == "32");
 
     fs::remove_all(dir);
 }
