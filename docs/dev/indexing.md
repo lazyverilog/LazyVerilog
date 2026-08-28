@@ -150,12 +150,53 @@ unchanged: slang tries the including file's own directory first, then these.
 A directory added after the config was loaded is picked up on the next config
 reload, the same event that already re-parses the project.
 
-The open-buffer path is deliberately not projected.  An edit needs the current
-file's own AST to be exact, including whatever its headers splice into it, and
-that path has its own cache (`OpenParseHeaderCache`), which outlives an indexing
-burst instead of being scoped to one.
+## Editing a file that includes a large header
 
-That cache never touches the filesystem.  It follows the same event-driven rule
+The open-buffer path has its own header cache (`OpenParseHeaderCache`), which
+outlives an indexing burst instead of being scoped to one.  Caching the text is
+not enough on its own: the text was never the expensive part.  A 214-line module
+including a 14 005-line header measured **38.7 ms per keystroke** on one core
+against 0.4 ms for the same module without the include, and `fromText()` was
+29 ms of a 29 ms `make_state()` — pure lex, preprocess and parse of the header,
+re-done for every character typed.
+
+So the edit path projects too, under two conditions:
+
+- **The header is past `kDirectivesOnlySeedBytes` (64 KB).**  Below that the
+  exact tree is worth more than the microseconds; the threshold is what keeps
+  this change confined to the shape that actually hurts.
+- **Its own shard was built from a parse of it on its own**
+  (`standalone_header_uris_`).  That is what makes the header's declarations
+  recoverable from somewhere else.
+
+Measured on the same case: 38.7 ms → 2.1 ms per keystroke.
+
+An open buffer's includes are claimed too.  The indexer skips an open buffer's
+*own* shard because its text is unsaved, but a header's shard is built from the
+header, so nothing about it is unsaved.  Two paths had to learn this: the live
+branch of `background_index_loop()`, and the closed branch when the buffer opened
+while the disk parse was in flight — that one discarded the whole parse, claim
+included, and nothing re-queues a file that is now open.  A header only the open
+buffer includes therefore earns a shard as well: 38.7 ms → 5.7 ms there, the
+difference being that this file's own shard is the discarded one.
+
+Header shards are in **both** snapshots.  `build_extra_file_snapshot_locked()`
+listed only `extra_cache_`, so `definition_of` and everything else reading that
+snapshot could find a header's declarations only through an includer parsed
+before the projection was installed — a copy that is not guaranteed to exist.
+
+Two consequences, both pinned by `tests/test_open_header_projection.cpp`:
+
+- The buffer's own tree stops carrying that header's declarations, so features
+  answer for them from the header's shard, exactly as they already do for a
+  closed file.  Its macros still expand — directives are what the projection
+  keeps.
+- Semantic diagnostics are unaffected.  `BackgroundCompiler` builds its own
+  `SourceManager` and its own trees from the filelist and open-buffer text
+  (`background_compiler.cpp`); it never reads `DocumentState::tree`, so it still
+  sees every header in full.
+
+`OpenParseHeaderCache` never touches the filesystem.  It follows the same event-driven rule
 as the project shards: entries live until `refresh_changed_extra_files()` — fed
 by `workspace/didChangeWatchedFiles` — reports the file changed, or until
 `Analyzer::close()` drops a header that was open as a buffer, or until a config

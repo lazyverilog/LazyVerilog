@@ -187,11 +187,49 @@ struct OpenParseHeaderCache {
     /// headers exceed it keeps the ones seen first and the win is partial.
     static constexpr size_t kMaxBytes = 32u << 20;
 
+    struct Entry {
+        std::shared_ptr<const std::string> text;
+        /// text with everything but its preprocessor directives blanked out,
+        /// built on first use.  Not counted against the byte budget: it is a
+        /// fraction of the text it is derived from, and it only exists for
+        /// headers already admitted.
+        std::shared_ptr<const std::string> directives;
+    };
+
     /// Cached text for @p path, or null if nothing is cached for it.
     std::shared_ptr<const std::string> get(const std::string& path) const {
         std::lock_guard<std::mutex> lock(mutex);
         const auto it = texts.find(path);
-        return it == texts.end() ? nullptr : it->second;
+        return it == texts.end() ? nullptr : it->second.text;
+    }
+
+    /// Cached text for @p path with only its preprocessor directives left.
+    ///
+    /// @p project is header_directives_only(), passed in rather than called
+    /// directly so the projection rules stay in the .cpp with the parse path
+    /// that needs them.  It runs outside the mutex: it is a scan of the whole
+    /// header, and this mutex is on the edit path of every open buffer.
+    std::shared_ptr<const std::string>
+    get_directives(const std::string& path,
+                   const std::function<std::string(std::string_view)>& project) {
+        std::shared_ptr<const std::string> text;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto it = texts.find(path);
+            if (it == texts.end())
+                return nullptr;
+            if (it->second.directives)
+                return it->second.directives;
+            text = it->second.text;
+        }
+        auto projected = std::make_shared<const std::string>(project(*text));
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        if (it == texts.end() || it->second.text != text)
+            return projected; // invalidated while projecting; use it, cache nothing
+        if (!it->second.directives)
+            it->second.directives = std::move(projected);
+        return it->second.directives;
     }
 
     void store(const std::string& path, std::string_view text) {
@@ -201,7 +239,7 @@ struct OpenParseHeaderCache {
         if (texts.contains(path) || bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
-        texts.emplace(path, std::make_shared<const std::string>(text));
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), nullptr});
     }
 
     /// Drop @p path so the next parse reads it from disk again.
@@ -210,7 +248,7 @@ struct OpenParseHeaderCache {
         const auto it = texts.find(path);
         if (it == texts.end())
             return;
-        bytes -= it->second->size();
+        bytes -= it->second.text->size();
         texts.erase(it);
     }
 
@@ -221,7 +259,7 @@ struct OpenParseHeaderCache {
     }
 
     mutable std::mutex mutex;
-    std::unordered_map<std::string, std::shared_ptr<const std::string>> texts;
+    std::unordered_map<std::string, Entry> texts;
     size_t bytes{0};
 };
 
@@ -638,6 +676,12 @@ class Analyzer {
     /// changed header is always re-indexed.
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> background_header_shards_;
     mutable std::unordered_set<std::string> background_header_claims_;
+    /// Headers whose shard was built from a parse of the header on its own, so
+    /// that shard is the authoritative record of their declarations.  Only those
+    /// are safe to hand an open buffer as directives alone; see
+    /// header_directives_only() and preload_open_parse_headers().  Cleared with
+    /// the two maps above, so a re-indexed header re-earns its place.
+    mutable std::unordered_set<std::string> standalone_header_uris_;
     mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 
