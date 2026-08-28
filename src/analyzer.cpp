@@ -625,42 +625,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
 
-        auto depends_on_changed_uri = [&](const DocumentState& doc) {
-            return doc.include_dependency_set.contains(uri);
-        };
-        auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
-            return std::find(deps.begin(), deps.end(), uri) != deps.end();
-        };
-
-        bool queued_dependent = false;
-        for (const auto& [other_uri, other_state] : docs_) {
-            if (other_uri == uri || !other_state ||
-                !depends_on_changed_uri(*other_state))
-                continue;
-
-            const std::string& other_path = other_state->normalized_path;
-            // Indirect include fanout belongs on the background path.  A common
-            // header can be included by many open files; reparsing all of them
-            // synchronously on each keystroke would violate the current-file
-            // AST / background-project-index split and can lag badly on shared
-            // HPC filesystems.  The worker reparses live open buffers from
-            // their in-memory text and open include overlays.
-            queue_background_file_locked(other_path, /*front=*/true);
-            queued_dependent = true;
-        }
-
-        for (const auto& [extra_uri, entry] : extra_cache_) {
-            // Test the shard's dependency list in place.  Offering a
-            // `std::vector<std::string>{}` fallback made the conditional
-            // expression a prvalue, so every shard's list was deep-copied on
-            // every edit, under map_mutex_.
-            if (docs_.contains(extra_uri) || !entry.index ||
-                !index_depends_on_changed_uri(entry.index->include_dependencies))
-                continue;
-            queue_background_file_locked(entry.path, /*front=*/true);
-            queued_dependent = true;
-        }
-        if (queued_dependent) {
+        if (queue_include_dependents_locked(uri)) {
             ++background_generation_;
             start_background_indexer_locked();
             background_cv_.notify_all();
@@ -723,13 +688,16 @@ void Analyzer::parse_worker_loop() {
     // Live shards whose owning buffer has been reparsed but whose rebuild is
     // waiting for the typing to stop.  See the deferral note below.
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> deferred_shards;
+    // Reparsed buffers whose includers still have to be told, waiting for the
+    // same moment.  See the fanout note below.
+    std::unordered_set<std::string> deferred_dependents;
 
     while (true) {
         ParseJob job;
         bool have_job = false;
         {
             std::unique_lock<std::mutex> lock(parse_mutex_);
-            if (deferred_shards.empty()) {
+            if (deferred_shards.empty() && deferred_dependents.empty()) {
                 parse_cv_.wait(lock, [&] {
                     return parse_stop_.load() || !parse_pending_.empty();
                 });
@@ -759,6 +727,39 @@ void Analyzer::parse_worker_loop() {
                     update_extra_cache_for_live_state_locked(shard_state, std::move(index));
             }
             deferred_shards.clear();
+
+            // Tell the includers, once per burst.
+            //
+            // Editing a header included by hundreds of files used to queue all
+            // of them on every keystroke, and each fanout bumped the background
+            // generation.  That generation is what scopes HeaderTextCache and
+            // the directives-only projection built from it, so every character
+            // typed threw both away and made the resulting storm re-read and
+            // re-preprocess the whole header once per includer — the
+            // O(files x header) blowup the projection exists to prevent, paid
+            // per keystroke and on the same CPU the buffer's own parse needs.
+            //
+            // The scan is not cheap either: it walks every project shard's
+            // dependency list under map_mutex_, which every request handler
+            // also needs.
+            //
+            // Deferring costs the includers a staleness window of one idle
+            // delay after the last keystroke, the same trade already accepted
+            // for the live shard above.
+            if (!deferred_dependents.empty()) {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                bool queued = false;
+                for (const auto& dependent_uri : deferred_dependents) {
+                    if (queue_include_dependents_locked(dependent_uri))
+                        queued = true;
+                }
+                if (queued) {
+                    ++background_generation_;
+                    start_background_indexer_locked();
+                    background_cv_.notify_all();
+                }
+                deferred_dependents.clear();
+            }
             continue;
         }
 
@@ -774,37 +775,6 @@ void Analyzer::parse_worker_loop() {
                 docs_[job.uri] = state;
                 invalidate_extra_snapshots_locked();
                 listed_extra = extra_file_set_.contains(state->normalized_path);
-
-                // Replicate dependent-reparse logic from change()
-                auto depends_on_changed_uri = [&](const DocumentState& doc) {
-                    return doc.include_dependency_set.contains(job.uri);
-                };
-                auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
-                    return std::find(deps.begin(), deps.end(), job.uri) != deps.end();
-                };
-
-                bool queued_dependent = false;
-                for (const auto& [other_uri, other_state] : docs_) {
-                    if (other_uri == job.uri || !other_state ||
-                        !depends_on_changed_uri(*other_state))
-                        continue;
-                    queue_background_file_locked(other_state->normalized_path, /*front=*/true);
-                    queued_dependent = true;
-                }
-                for (const auto& [extra_uri, entry] : extra_cache_) {
-                    // See change(): the vector fallback in the conditional
-                    // expression deep-copied every shard's dependency list.
-                    if (docs_.contains(extra_uri) || !entry.index ||
-                        !index_depends_on_changed_uri(entry.index->include_dependencies))
-                        continue;
-                    queue_background_file_locked(entry.path, /*front=*/true);
-                    queued_dependent = true;
-                }
-                if (queued_dependent) {
-                    ++background_generation_;
-                    start_background_indexer_locked();
-                    background_cv_.notify_all();
-                }
 
                 committed = true;
             }
@@ -825,6 +795,7 @@ void Analyzer::parse_worker_loop() {
             // nothing that answers for the current file reads it.
             if (listed_extra)
                 deferred_shards[job.uri] = state;
+            deferred_dependents.insert(job.uri);
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
         }
@@ -5069,6 +5040,55 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
 
     std::unordered_set<std::string> seen;
     return build(target->name, 0, seen);
+}
+
+bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {
+    bool queued = false;
+    for (const auto& [other_uri, other_state] : docs_) {
+        if (other_uri == uri || !other_state ||
+            !other_state->include_dependency_set.contains(uri))
+            continue;
+        // Indirect include fanout belongs on the background path.  A common
+        // header can be included by many open files; reparsing all of them
+        // synchronously would violate the current-file AST / background-project-
+        // index split and can lag badly on shared HPC filesystems.  The worker
+        // reparses live open buffers from their in-memory text and open include
+        // overlays.
+        queue_background_file_locked(other_state->normalized_path, /*front=*/true);
+        queued = true;
+    }
+    // Closed project files get one requeue between them, not one each.
+    //
+    // A header's declarations live in the header's own shard, and that shard is
+    // rebuilt by whichever file claims the header — so a single includer is
+    // enough to refresh what the project index answers about this header, from
+    // the unsaved buffer via the open overlays.  Reparsing all of them instead
+    // costs one parse per includer, hundreds for a common header, on every
+    // typing burst; and saving asks for that same full fanout again through
+    // refresh_changed_extra_files(), against the text that actually reached
+    // disk.  A closed file's own shard is index-authoritative from disk anyway,
+    // so what it loses here is a copy of header declarations the header's shard
+    // already holds.
+    //
+    // Dropping the claim is what makes the requeue rebuild the header rather
+    // than serve the shard claimed under the previous text.  The old shard stays
+    // in place until the new one commits, so the project index never has a gap.
+    background_header_claims_.erase(uri);
+    for (const auto& [extra_uri, entry] : extra_cache_) {
+        // Test the shard's dependency list in place.  Offering a
+        // `std::vector<std::string>{}` fallback made the conditional expression
+        // a prvalue, so every shard's list was deep-copied on every edit, under
+        // map_mutex_.
+        if (docs_.contains(extra_uri) || !entry.index)
+            continue;
+        const auto& deps = entry.index->include_dependencies;
+        if (std::find(deps.begin(), deps.end(), uri) == deps.end())
+            continue;
+        queue_background_file_locked(entry.path, /*front=*/true);
+        queued = true;
+        break;
+    }
+    return queued;
 }
 
 void Analyzer::queue_background_file_locked(std::string path, bool front) const {

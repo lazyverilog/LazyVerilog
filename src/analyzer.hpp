@@ -545,6 +545,10 @@ class Analyzer {
     /// Append @p path to the background queue unless it is already waiting.
     /// @p front puts it ahead of the cold-start filelist backlog, which is what
     /// edit-driven refreshes want.
+    /// Queue every open buffer and project shard that `include`s @p uri for a
+    /// background reparse.  Returns whether anything was queued; the caller
+    /// bumps the generation and wakes the pool.
+    bool queue_include_dependents_locked(const std::string& uri) const;
     void queue_background_file_locked(std::string path, bool front) const;
     void start_background_indexer_locked() const;
     void schedule_background_reindex_locked() const;

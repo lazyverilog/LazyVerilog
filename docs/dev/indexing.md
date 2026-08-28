@@ -111,6 +111,31 @@ Two consequences worth knowing before writing a feature:
   per includer.  Those few includers keep their mentioned header declarations,
   which is a duplicate of what the header shard holds, not a different answer.
 
+## Editing a header: what an unsaved keystroke refreshes
+
+Typing in a header used to queue every file that `include`s it, on every
+keystroke, and bump the background generation each time.  That generation is
+what scopes `HeaderTextCache` and the directives-only projection built from it,
+so each character threw both away and made the resulting storm re-read and
+re-preprocess the whole header once per includer.  On a one-core slice that
+storm runs on the same CPU the buffer's own parse needs.
+
+Two rules replace it:
+
+- **The fanout waits for the typing to stop.**  `parse_worker_loop()` holds the
+  reparsed URIs and fans out once the parse queue has been idle for
+  `kLiveShardIdleDelay`, the same deferral the live shard rebuild already used.
+- **Unsaved edits reach open buffers; disk changes reach the project.**  Every
+  *open* buffer that includes the header is requeued, because it is on screen.
+  Closed project files get one requeue between them, enough to re-claim the
+  header, and are otherwise left to the save path: the watcher reports the saved
+  file and `refresh_changed_extra_files()` re-queues every includer against the
+  text that actually reached disk.
+
+The trade is that between an edit and a save, a closed includer's shard reflects
+the saved header.  That is consistent with the rest of the model — a closed
+file's own text is read from disk too.
+
 The open-buffer path is deliberately not projected.  An edit needs the current
 file's own AST to be exact, including whatever its headers splice into it, and
 that path has its own cache (`OpenParseHeaderCache`), which outlives an indexing
