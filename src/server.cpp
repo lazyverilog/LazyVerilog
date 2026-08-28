@@ -895,10 +895,11 @@ void LazyVerilogServer::register_handlers() {
             RegistrationWithOptions reg;
             reg.id = "lazyverilog-file-watcher";
             reg.method = "workspace/didChangeWatchedFiles";
-            reg.registerOptions.watchers = {
-                {"**/*.sv"}, {"**/*.v"},  {"**/*.svh"}, {"**/*.vh"},
-                {"**/*.f"},  {"**/*.vf"}, {"**/*.svi"},
-            };
+            // Built from the same list OpenParseHeaderCache caches by: an
+            // extension the client is not asked to watch is one nothing would
+            // ever report a change for.
+            for (const auto ext : kWatchedSourceExtensions)
+                reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
             req.params.registrations = {std::move(reg)};
             (void)impl_->remote_endpoint.send(req);
         } catch (const std::exception& e) {

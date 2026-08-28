@@ -113,8 +113,21 @@ Two consequences worth knowing before writing a feature:
 
 The open-buffer path is deliberately not projected.  An edit needs the current
 file's own AST to be exact, including whatever its headers splice into it, and
-that path has its own cache (`OpenParseHeaderCache`) validated by stat rather
-than scoped to an indexing burst.
+that path has its own cache (`OpenParseHeaderCache`), which outlives an indexing
+burst instead of being scoped to one.
+
+That cache never touches the filesystem.  It follows the same event-driven rule
+as the project shards: entries live until `refresh_changed_extra_files()` — fed
+by `workspace/didChangeWatchedFiles` — reports the file changed, or until
+`Analyzer::close()` drops a header that was open as a buffer, or until a config
+reload clears everything.  Nothing stats, nothing polls, so an included header
+costs zero metadata calls per keystroke.
+
+The trade is explicit: a client that does not deliver watched-file events keeps
+serving cached header text until the project configuration changes or the server
+restarts.  Only extensions in `kWatchedSourceExtensions` are cached — that array
+is also what builds the watcher glob registration in `server.cpp`, so a path the
+client is not asked to watch is one the cache refuses to hold.
 
 ## Published project index snapshot
 
