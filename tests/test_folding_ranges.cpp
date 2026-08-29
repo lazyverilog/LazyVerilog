@@ -1094,6 +1094,14 @@ endmodule
     // folding from the instance line should hide the #(...) parameter override
     // block and the (...) port connection block together.
     CHECK(has_fold_kind(folds, 1, 8, "instance"));
+
+    // No shorter fold may start on the instance line.  Vim's line-based fold
+    // model marks one fold start per line, so a "#(...)" region ending on the
+    // ") u_mem (" line would be the fold za/zc reach first and the instance
+    // would never collapse as a whole.
+    CHECK_FALSE(std::any_of(folds.begin(), folds.end(), [](const FoldingRange& r) {
+        return r.startLine == 1 && r.endLine < 8;
+    }));
 }
 
 TEST_CASE("foldingRange: AST folds from included files are not emitted for current document",
