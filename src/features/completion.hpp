@@ -41,6 +41,10 @@ struct CompletionContext {
     // `my_item::type_id::` yields scope_name "type_id", scope_qualifier
     // "my_item" — and only the qualifier says which class's `type_id` is meant.
     std::string scope_qualifier;
+    // Field hops between scope_name and the cursor in a `a.b.c.` member access,
+    // empty for `a.`.  scope_name names a declaration; each hop is a field of
+    // the type resolved so far, so they resolve through different lookups.
+    std::vector<std::string> member_chain;
     std::string current_scope_name; // best-effort enclosing module/interface/package
     // Type of the member-access receiver when the receiver is an implicit
     // handle -- `this` (the enclosing class) or `super` (its base) -- rather
