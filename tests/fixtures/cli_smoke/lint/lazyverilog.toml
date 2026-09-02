@@ -1,0 +1,12 @@
+# Stops `find_config_root`'s upward walk here, so the lint CLI smoke test never
+# inherits the repository's own lazyverilog.toml and its demo/ filelist.  The
+# naming rule below is what m_top.sv's `address` input is expected to trip.
+
+[lint]
+enable = true
+
+[lint.naming]
+enable = true
+severity = "hint"
+input_port_pattern = "^i_.*$"
+output_port_pattern = "^o_.*$"
