@@ -58,6 +58,7 @@
 #include "features/rename.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
+#include "features/document_symbols.hpp"
 #include "syntax_index.hpp"
 #include <slang/syntax/SyntaxTree.h>
 
@@ -755,6 +756,8 @@ void LazyVerilogServer::register_handlers() {
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.workspaceSymbolProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
+            caps.documentSymbolProvider =
+                std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
 
             // Completion triggers are intentionally conservative.
             //
@@ -892,10 +895,11 @@ void LazyVerilogServer::register_handlers() {
             RegistrationWithOptions reg;
             reg.id = "lazyverilog-file-watcher";
             reg.method = "workspace/didChangeWatchedFiles";
-            reg.registerOptions.watchers = {
-                {"**/*.sv"}, {"**/*.v"},  {"**/*.svh"}, {"**/*.vh"},
-                {"**/*.f"},  {"**/*.vf"}, {"**/*.svi"},
-            };
+            // Built from the same list OpenParseHeaderCache caches by: an
+            // extension the client is not asked to watch is one nothing would
+            // ever report a change for.
+            for (const auto ext : kWatchedSourceExtensions)
+                reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
             req.params.registrations = {std::move(reg)};
             (void)impl_->remote_endpoint.send(req);
         } catch (const std::exception& e) {
@@ -1070,7 +1074,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string text = state ? state->text : "";
                 for (const auto& chg : note.params.contentChanges)
                     text = apply_incremental_change(std::move(text), chg);
-                analyzer_.enqueue_parse(uri, text);
+                analyzer_.enqueue_parse(uri, std::move(text));
             }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChange error: " << e.what() << "\n";
@@ -1299,6 +1303,18 @@ void LazyVerilogServer::register_handlers() {
             rsp.result = provide_workspace_symbols(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] workspaceSymbol error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/documentSymbol ───────────────────────────────────────────
+    ep.registerHandler([&](const td_symbol::request& req) {
+        td_symbol::response rsp;
+        rsp.id = req.id;
+        try {
+            rsp.result = provide_document_symbols(analyzer_, req.params);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] documentSymbol error: " << e.what() << "\n";
         }
         return rsp;
     });

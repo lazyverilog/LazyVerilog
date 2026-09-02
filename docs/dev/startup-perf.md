@@ -54,6 +54,58 @@ granted the process one core.
   the includer's macro state.  Indexing it once standalone is therefore not
   correct.  See `PERF.md`.
 
+- **A shared header must cost O(header) per file, never O(header) *extra* per file.**
+  Re-parsing it once per includer is the price of correctness (previous bullet).
+  Any *index* pass that also walks the whole header — the macro table, a
+  per-declaration map key — is multiplied by the number of includers on the
+  largest file in the project.  Two such passes regressed this way and are now
+  pinned by tests; see below.
+
+## Regression tests
+
+Wall-clock benchmarks need a baseline to compare against and a quiet machine, so
+they cannot gate a pull request.  These do, and run in CI as part of `ctest`:
+
+```bash
+./build/lazyverilog-tests "[scaling]"        # tests/test_shared_header_scaling.cpp
+```
+
+- *a module-scoped typedef adds no scoped-lookup key* — structural, deterministic.
+- *a macro-spelled type still resolves to its alias* — the behaviour the lazy
+  alias table must keep.
+- *index build cost is flat in unreferenced macro count* — a timing check written
+  as a **ratio between two headers that differ only in the shape of their macro
+  bodies**: same byte count, same macro count, same declarations, so parsing and
+  every other pass cancel.  It reports the fastest of 11 `SyntaxIndex::build()`
+  runs per side, because the cost being measured is a raised floor and runner
+  noise only ever adds time.  Threshold is 2x; the healthy ratio is ~1.0 and the
+  regression it was written for measured ~2.9.
+
+Write new scaling guards the same way — a ratio against a structurally identical
+input, minimum of N runs — rather than an absolute millisecond budget, which is
+what makes them safe on a shared CI runner.
+
+## Reproducing a shared-header project
+
+`tests/rtl/hpc60` is the checked-in corpus for this shape (60 modules, one large
+header).  For a variant — the header inside the module body, thousands of
+`` `define ``s, a typedef-dominated header — generate one into a scratch
+directory with a `lazyverilog.toml` pointing at its `.f` file and run
+`startup_bench.py` against it, comparing two builds of `index-bench`:
+
+```bash
+git worktree add --detach /tmp/base <known-good-commit>
+cmake -S /tmp/base -B /tmp/base/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build /tmp/base/build --target index-bench -j$(nproc)
+
+tools/startup_bench.py <corpus> -r 3 --cpus 0 --binary /tmp/base/build/index-bench --label base
+tools/startup_bench.py <corpus> -r 3 --cpus 0 --label head
+```
+
+Use the same `CMAKE_BUILD_TYPE` on both sides — `Release` and `RelWithDebInfo`
+differ enough to swamp the effect being measured — and read `maxRSS` alongside
+the times: a per-file map that grows with header size shows up in memory first.
+
 ## Related
 
 - `PERF.md` — measured optimization rounds and their evidence.

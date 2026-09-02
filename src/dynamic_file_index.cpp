@@ -96,7 +96,7 @@ ValueEntry* add_value(SyntaxIndex& index, SourceFileIdResolver& resolver,
                                       .type = std::move(type),
                                       .kind = std::move(kind),
                                       .parent_scope = std::move(parent_scope),
-                                      .file_id = resolver.for_token(index, sm, name),
+                                      .file_id = resolver.for_declaration_token(index, sm, name),
                                       .line = line,
                                       .col = col});
     return &index.values.back();
@@ -111,7 +111,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, SourceFileIdResolver& res
         return;
     auto [line, col] = token_pos_line1_col0(sm, name);
     module.ports.push_back(PortEntry{.name = token_value_text(name),
-                                     .file_id = resolver.for_token(index, sm, name),
+                                     .file_id = resolver.for_declaration_token(index, sm, name),
                                      .direction = direction,
                                      .type = type,
                                      .decl_type = decl_type.empty() ? type : std::move(decl_type),
@@ -128,7 +128,7 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, SourceFileIdResolver& res
                                       .default_value = is_parameter
                                                            ? module.ports.back().default_value
                                                            : std::string{},
-                                      .file_id = resolver.for_token(index, sm, name),
+                                      .file_id = resolver.for_declaration_token(index, sm, name),
                                       .line = line,
                                       .col = col});
 }
@@ -203,7 +203,7 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
         entry.parent_module = parent_module;
         if (inst->decl) {
             entry.instance_name = token_value_text(inst->decl->name);
-            entry.file_id = resolver.for_token(index, sm, inst->decl->name);
+            entry.file_id = resolver.for_declaration_token(index, sm, inst->decl->name);
             entry.line = token_pos_line1_col0(sm, inst->decl->name).first;
         }
         entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -221,7 +221,7 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
                 entry.connections.push_back(NamedPortConn{.port_name = token_value_text(named->name),
                                                           .signal_name =
                                                               simple_identifier_from_expr(named->expr),
-                                                          .file_id = resolver.for_token(index, sm, named->name),
+                                                          .file_id = resolver.for_declaration_token(index, sm, named->name),
                                                           .line = line,
                                                           .col = col,
                                                           .hint_col = paren_line == line
@@ -292,12 +292,16 @@ void process_generate_instances(const MemberSyntax& member, SyntaxIndex& index,
     }
 }
 
+void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
+                     SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                     std::string parent_scope, bool scoped_lookup = false);
+
 void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                    SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                    std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = token_value_text(cls.name);
-    entry.file_id = resolver.for_token(index, sm, cls.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos_line1_col0(sm, cls.name);
     entry.line = line;
@@ -309,7 +313,14 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
-            if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+            // `typedef registry #(T) type_id;` in a class body is a member of
+            // that class, reached as `my_item::type_id`.  The shard builder
+            // indexes these; the open-buffer index has to as well, or the same
+            // file offers different members depending on whether it is open.
+            if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
+                process_typedef(*nested, index, resolver, sm, entry.name,
+                                /*scoped_lookup=*/true);
+            } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const auto type = node_text_raw(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)
@@ -317,19 +328,27 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     auto [fl, fc] = token_pos_line1_col0(sm, decl->name);
                     entry.fields.push_back(FieldEntry{.name = token_value_text(decl->name),
                                                       .type = with_dims(sm, type, *decl),
-                                                      .file_id = resolver.for_token(index, sm, decl->name),
+                                                      .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                       .line = fl,
                                                       .col = fc});
                 }
             }
         } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *method->declaration->prototype;
-            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
-            entry.methods.push_back(MethodEntry{.name = node_text_raw(sm, *proto.name),
+            // Match the shard builder: a method whose declaration is a macro-body
+            // literal has to be keyed by its resolved identifier and located from
+            // that identifier's own token, or the open-buffer index disagrees with
+            // the shard index for the same file.
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
+            entry.methods.push_back(MethodEntry{.name = id_name
+                                                    ? std::string(id_name->identifier.valueText())
+                                                    : node_text_raw(sm, *proto.name),
                                                 .return_type = node_text_raw(sm, *proto.returnType),
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
-                                                .file_id = resolver.for_token(index, sm, proto.keyword),
+                                                .file_id = resolver.for_declaration_token(index, sm, name_tok),
                                                 .line = ml,
                                                 .col = mc});
         }
@@ -343,11 +362,11 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                      SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                     std::string parent_scope = {}) {
+                     std::string parent_scope = {}, bool scoped_lookup) {
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = resolver.for_token(index, sm, td.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, td.name);
     auto [line, col] = token_pos_line1_col0(sm, td.name);
     entry.line = line;
     entry.col = col;
@@ -358,7 +377,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                 auto [em_line, em_col] = token_pos_line1_col0(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = token_value_text(member->name),
-                    .file_id = resolver.for_token(index, sm, member->name),
+                    .file_id = resolver.for_declaration_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -376,7 +395,7 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                 auto [fl, fc] = token_pos_line1_col0(sm, decl->name);
                 entry.fields.push_back(FieldEntry{.name = token_value_text(decl->name),
                                                   .type = with_dims(sm, type, *decl),
-                                                  .file_id = resolver.for_token(index, sm, decl->name),
+                                                  .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                   .line = fl,
                                                   .col = fc});
             }
@@ -385,7 +404,13 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         entry.resolved = node_text_raw(sm, *td.type);
     }
 
-    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+    // Any `::`-addressable owner, matching the closed-file shard: a class-scoped
+    // `type_id` is spelled once per class, so the bare-name table answers with
+    // whichever class was seen first.  Module scope is excluded on purpose --
+    // nothing can name `mod::t`.  `scoped_lookup` covers class members, whose
+    // ClassEntry is not registered until its body has been walked.
+    if (!entry.parent_scope.empty() &&
+        (scoped_lookup || index.package_names.count(entry.parent_scope)))
         index.package_type_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -397,7 +422,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                     std::string_view source) {
     ModuleEntry module;
     module.name = token_value_text(node.header->name);
-    module.file_id = resolver.for_token(index, sm, node.header->name);
+    module.file_id = resolver.for_declaration_token(index, sm, node.header->name);
     auto [line, col] = token_pos_line1_col0(sm, node.header->name);
     module.line = line;
     module.col = col;
@@ -458,11 +483,20 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                              with_dims(sm, port_signal_decl_type(sm, *port_decl->header), *decl));
             }
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
-            const auto type = node_text_raw(sm, *data->type);
+            // Rendered on the first declarator actually kept: a shared header's
+            // declarations would otherwise pay type rendering once per including
+            // file only to be dropped.  Mirrors the same branch in
+            // syntax_index.cpp so an open buffer and its closed shard agree.
+            std::optional<std::string> type;
             for (const auto* decl : data->declarators) {
-                if (decl)
-                    add_value(index, resolver, sm, decl->name, with_dims(sm, type, *decl), "variable",
-                              module.name);
+                if (!decl)
+                    continue;
+                if (!resolver.wants_declaration(index, sm, decl->name))
+                    continue;
+                if (!type)
+                    type = node_text_raw(sm, *data->type);
+                add_value(index, resolver, sm, decl->name, with_dims(sm, *type, *decl), "variable",
+                          module.name);
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             if (auto* value = add_value(index, resolver, sm, fn->prototype->keyword,
@@ -474,12 +508,18 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             // `#(...)` parameters handled above.  Mirrors the same branch in
             // syntax_index.cpp so open buffers and closed shards agree.
             if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
-                const auto type = node_text_raw(sm, *param->type);
-                const auto kind = token_value_text(param->keyword);
+                std::optional<std::string> type;
+                std::string kind;
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
-                    if (auto* value = add_value(index, resolver, sm, decl->name, type, kind, module.name))
+                    if (!resolver.wants_declaration(index, sm, decl->name))
+                        continue;
+                    if (!type) {
+                        type = node_text_raw(sm, *param->type);
+                        kind = token_value_text(param->keyword);
+                    }
+                    if (auto* value = add_value(index, resolver, sm, decl->name, *type, kind, module.name))
                         value->default_value =
                             decl->initializer ? node_text_raw(sm, *decl->initializer->expr)
                                               : std::string{};
@@ -513,7 +553,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                     continue;
                 auto [ml, mc] = token_pos_line1_col0(sm, item->name);
                 module.modports.push_back(ModportEntry{.name = token_value_text(item->name),
-                                                       .file_id = resolver.for_token(index, sm, item->name),
+                                                       .file_id = resolver.for_declaration_token(index, sm, item->name),
                                                        .line = ml,
                                                        .col = mc});
             }
@@ -530,7 +570,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                      SourceFileIdResolver& resolver, const slang::SourceManager& sm) {
     ModuleEntry module;
     module.name = token_value_text(pkg.header->name);
-    module.file_id = resolver.for_token(index, sm, pkg.header->name);
+    module.file_id = resolver.for_declaration_token(index, sm, pkg.header->name);
     auto [line, col] = token_pos_line1_col0(sm, pkg.header->name);
     module.line = line;
     module.col = col;
@@ -568,21 +608,36 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                                                           decl->initializer
                                                               ? node_text_raw(sm, *decl->initializer->expr)
                                                               : std::string{},
-                                                      .file_id = resolver.for_token(index, sm, decl->name),
+                                                      .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                                       .line = pl,
                                                       .col = pc});
                     index.package_symbols[module.name].push_back(token_value_text(decl->name));
                 }
             }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            const auto name = node_text_raw(sm, *fn->prototype->name);
+            // Mirrors the package branch in syntax_index.cpp.  The entry must
+            // carry the declaration position: without it go-to-definition on an
+            // imported package subroutine lands on line 0 / column 0 whenever
+            // the package file happens to be open in the editor, because the
+            // open buffer is answered from this shard instead of the
+            // disk-backed one.
+            const auto& proto = *fn->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name = id_name ? std::string(id_name->identifier.valueText())
+                                      : node_text_raw(sm, *proto.name);
+            auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
             index.package_value_by_scoped_name.try_emplace(
                 package_scoped_key(module.name, name), index.values.size());
-            index.values.push_back(ValueEntry{.name = name,
-                                              .type = node_text_raw(sm, *fn->prototype->returnType),
-                                              .kind = "function",
-                                              .parent_scope = module.name,
-                                              .file_id = resolver.for_token(index, sm, fn->prototype->keyword)});
+            index.values.push_back(
+                ValueEntry{.name = name,
+                           .type = node_text_raw(sm, *proto.returnType),
+                           .kind = token_value_text(proto.keyword),
+                           .parent_scope = module.name,
+                           .file_id = resolver.for_declaration_token(index, sm, name_tok),
+                           .line = nl,
+                           .col = nc,
+                           .signature = make_subroutine_signature(proto, name, sm)});
             index.package_symbols[module.name].push_back(name);
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             process_class(*cls, index, resolver, sm, module.name);
@@ -590,6 +645,16 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
         } else if (const auto* td = member->as_if<TypedefDeclarationSyntax>()) {
             process_typedef(*td, index, resolver, sm, module.name);
             index.package_symbols[module.name].push_back(token_value_text(td->name));
+            // Enum members are package members in their own right, and
+            // syntax_index.cpp lists them here too.  Without them an open
+            // package buffer cannot report that it owns `RED`.
+            if (const auto* enum_type = td->type->as_if<EnumTypeSyntax>()) {
+                for (const auto* enum_member : enum_type->members) {
+                    if (enum_member)
+                        index.package_symbols[module.name].push_back(
+                            token_value_text(enum_member->name));
+                }
+            }
         }
     }
 
@@ -616,7 +681,7 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
                 entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
                 if (!entry.wildcard)
                     entry.symbol_name = token_value_text(item->item);
-                entry.file_id = resolver.for_token(index, sm, item->package);
+                entry.file_id = resolver.for_declaration_token(index, sm, item->package);
                 entry.start_line = line;
                 index.imports.push_back(std::move(entry));
             }
@@ -635,7 +700,7 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
         auto [line, _] = token_pos_line1_col0(sm, def->name);
         MacroEntry mac;
         mac.name = token_value_text(def->name);
-        mac.file_id = resolver.for_token(index, sm, def->name);
+        mac.file_id = resolver.for_declaration_token(index, sm, def->name);
         mac.line = line;
         if (def->formalArguments) {
             mac.is_function_like = true;
@@ -650,9 +715,15 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
 
 
 
-} // namespace
-
-SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
+/// Walk the live AST into a shard.
+///
+/// @p restrict_to_uri empty keeps every buffer the tree covers, which is what a
+/// whole-file structural view wants.  Non-empty scopes the build to one file the
+/// way SyntaxIndex::build() does for background shards: declarations from an
+/// `include`d header survive only when this file mentions their name, and
+/// occurrence tables cover this file alone.  The header's own shard is what
+/// records the rest, once for the whole project instead of once per includer.
+SyntaxIndex build_structural_index(const DocumentState& state, std::string_view restrict_to_uri) {
     SyntaxIndex index;
     if (!state.tree)
         return index;
@@ -660,6 +731,25 @@ SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
     const auto& root = state.tree->root();
     const auto& sm = state.tree->sourceManager();
     SourceFileIdResolver resolver;
+
+    // Built on the first declaration that actually comes from another file:
+    // scanning the buffer costs more than it saves for a file that `include`s
+    // nothing.  The views point into state.text and into macro body tokens, both
+    // of which outlive this function.
+    std::unordered_set<std::string_view> mentioned_names;
+    bool mentions_ready = false;
+    auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {
+        if (!mentions_ready) {
+            mentioned_names = collect_mentioned_names(state.text, *state.tree);
+            mentions_ready = true;
+        }
+        return &mentioned_names;
+    };
+    if (!restrict_to_uri.empty()) {
+        resolver.restrict_to_uri(std::string(restrict_to_uri));
+        resolver.set_mentions_provider(ensure_mentions);
+    }
+
     auto process_member = [&](const MemberSyntax& member) {
         if (const auto* mod = member.as_if<ModuleDeclarationSyntax>()) {
             if (member.kind == SyntaxKind::InterfaceDeclaration) {
@@ -685,9 +775,16 @@ SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
         process_member(*member);
     }
 
-    collect_combined_occurrences(*state.tree, root, index, sm);
+    collect_combined_occurrences(*state.tree, root, index, sm, restrict_to_uri,
+                                 mentions_ready ? &mentioned_names : nullptr);
     index.include_dependencies = collect_include_dependency_uris(sm, state.uri);
     return index;
+}
+
+} // namespace
+
+SyntaxIndex build_current_ast_structural_index(const DocumentState& state) {
+    return build_structural_index(state, {});
 }
 
 const SyntaxIndex& get_structural_index(const DocumentState& state) {
@@ -698,16 +795,29 @@ const SyntaxIndex& get_structural_index(const DocumentState& state) {
 }
 
 SyntaxIndex build_dynamic_file_index(const DocumentState& state) {
-    SyntaxIndex index = get_structural_index(state);
+    // Scoped to this file, matching the disk-backed shard the background indexer
+    // builds for the same path (Analyzer::make_file_state_with_options passes
+    // restrict_index_to_own_file).  Without that, opening a file swapped its lean
+    // shard for one carrying every declaration and every identifier occurrence of
+    // whatever it `include`s — a header shared by N files costing N copies of
+    // itself, rebuilt from scratch on each edit.
+    //
+    // This is deliberately not the structural cache: that one is the unrestricted
+    // whole-file view AutoWire, Connect, RTL-tree and documentSymbol ask for, and
+    // it stays unrestricted.
+    SyntaxIndex index = build_structural_index(state, state.uri);
     if (!state.tree)
         return index;
 
     SourceFileIdResolver resolver;
 
     collect_imports(state.tree->root(), index, resolver, state.tree->sourceManager());
+    // Macros stay unscoped on purpose.  Header shards are built at Declarations
+    // depth, which skips macros entirely, so this shard is the only place a
+    // header's `define reaches macro completion from.
     collect_macros(*state.tree, index, resolver);
-    // The structural cache already contains macro reference occurrences for
-    // the open file.  `collect_macros()` above only adds completion metadata
+    // The structural walk above already recorded macro reference occurrences for
+    // the open file.  `collect_macros()` only adds completion metadata
     // (MacroEntry), so do not add references a second time here.
     return index;
 }

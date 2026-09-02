@@ -75,6 +75,26 @@ struct HeaderTextCache {
         texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
     }
 
+    /// Replace what this burst serves for @p path with @p text.
+    ///
+    /// Used to hand the remaining files a header's directives without its
+    /// declarations, once the header's own shard has recorded them; see
+    /// header_directives_only() for why that is equivalent for an includer.
+    /// Only an entry this burst already holds is replaced: an absent one means
+    /// store() judged the header not worth caching, and inserting it here would
+    /// enter it with a hit count no popularity rule can ever admit.
+    void project(uint64_t gen, const std::string& path, std::string text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (gen != generation)
+            return;
+        const auto it = texts.find(path);
+        if (it == texts.end())
+            return;
+        bytes -= it->second.text->size();
+        bytes += text.size();
+        it->second.text = std::make_shared<const std::string>(std::move(text));
+    }
+
     /// Headers worth seeding into the next parse, as shared pointers so seeding
     /// does not hold the lock while slang copies text into a SourceManager.
     ///
@@ -115,6 +135,132 @@ private:
         parses = 0;
         generation = gen;
     }
+};
+
+/// File extensions the server asks the client to watch for on-disk changes.
+///
+/// Single source of truth: server.cpp turns these into the
+/// workspace/didChangeWatchedFiles glob registration, and OpenParseHeaderCache
+/// refuses to cache anything outside the list, because outside it nothing would
+/// ever tell the cache its text went stale.
+inline constexpr std::string_view kWatchedSourceExtensions[] = {
+    ".sv", ".v", ".svh", ".vh", ".f", ".vf", ".svi",
+};
+
+inline bool is_watched_source_path(std::string_view path) {
+    for (const auto ext : kWatchedSourceExtensions) {
+        if (path.size() > ext.size() && path.ends_with(ext))
+            return true;
+    }
+    return false;
+}
+
+/// Text of headers an *open buffer* `include`s, kept across keystrokes.
+///
+/// didChange builds a fresh SourceManager per document snapshot, so without this
+/// every keystroke re-opens and re-reads every header the buffer includes.  A
+/// design where each module includes one multi-megabyte shared header pays that
+/// read on every character typed, and on a networked filesystem the read, not
+/// the parse, is what the user feels.
+///
+/// HeaderTextCache cannot serve this: it is scoped to one background indexing
+/// burst and dropped when the queue drains, which is what keeps its contents
+/// from going stale.  An edit-path cache has to survive far longer than that.
+///
+/// Staleness is handled by invalidation, not by re-checking the file: the cache
+/// makes **no filesystem call at all**, and entries live until someone reports
+/// the file changed.  That is the same event-driven rule the project shards
+/// already follow (see Analyzer::refresh_changed_extra_files) — the client's
+/// OS-level watcher says which files moved, so the server never polls.  A size
+/// and mtime check would be two metadata calls per included header per
+/// keystroke, which on a shared/HPC filesystem is two network round trips for a
+/// question the watcher already answers for free.
+///
+/// The consequence is worth stating plainly: if the client does not deliver
+/// workspace/didChangeWatchedFiles, an externally edited header stays cached
+/// until the project configuration changes or the server restarts.  Both
+/// shipped clients (lua/, vscode/) register the watcher, and only the
+/// extensions in kWatchedSourceExtensions are cached, so a path nothing watches
+/// is simply re-read every keystroke as it was before this cache existed.
+struct OpenParseHeaderCache {
+    /// Same budget as HeaderTextCache, for the same reason: a design whose
+    /// headers exceed it keeps the ones seen first and the win is partial.
+    static constexpr size_t kMaxBytes = 32u << 20;
+
+    struct Entry {
+        std::shared_ptr<const std::string> text;
+        /// text with everything but its preprocessor directives blanked out,
+        /// built on first use.  Not counted against the byte budget: it is a
+        /// fraction of the text it is derived from, and it only exists for
+        /// headers already admitted.
+        std::shared_ptr<const std::string> directives;
+    };
+
+    /// Cached text for @p path, or null if nothing is cached for it.
+    std::shared_ptr<const std::string> get(const std::string& path) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        return it == texts.end() ? nullptr : it->second.text;
+    }
+
+    /// Cached text for @p path with only its preprocessor directives left.
+    ///
+    /// @p project is header_directives_only(), passed in rather than called
+    /// directly so the projection rules stay in the .cpp with the parse path
+    /// that needs them.  It runs outside the mutex: it is a scan of the whole
+    /// header, and this mutex is on the edit path of every open buffer.
+    std::shared_ptr<const std::string>
+    get_directives(const std::string& path,
+                   const std::function<std::string(std::string_view)>& project) {
+        std::shared_ptr<const std::string> text;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const auto it = texts.find(path);
+            if (it == texts.end())
+                return nullptr;
+            if (it->second.directives)
+                return it->second.directives;
+            text = it->second.text;
+        }
+        auto projected = std::make_shared<const std::string>(project(*text));
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        if (it == texts.end() || it->second.text != text)
+            return projected; // invalidated while projecting; use it, cache nothing
+        if (!it->second.directives)
+            it->second.directives = std::move(projected);
+        return it->second.directives;
+    }
+
+    void store(const std::string& path, std::string_view text) {
+        if (!is_watched_source_path(path))
+            return;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (texts.contains(path) || bytes + text.size() > kMaxBytes)
+            return;
+        bytes += text.size();
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), nullptr});
+    }
+
+    /// Drop @p path so the next parse reads it from disk again.
+    void invalidate(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = texts.find(path);
+        if (it == texts.end())
+            return;
+        bytes -= it->second.text->size();
+        texts.erase(it);
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        texts.clear();
+        bytes = 0;
+    }
+
+    mutable std::mutex mutex;
+    std::unordered_map<std::string, Entry> texts;
+    size_t bytes{0};
 };
 
 struct SymbolInfo {
@@ -225,7 +371,10 @@ class Analyzer {
     /// Replaces update_text() + change().  Immediately stores null-tree state
     /// with current text, assigns a monotonically increasing version, enqueues
     /// async parse.  Returns assigned version.
-    uint64_t enqueue_parse(const std::string& uri, const std::string& text);
+    /// Takes @p text by value: didChange builds the new buffer text itself and
+    /// has no further use for it, so the caller can move it in and the snapshot
+    /// installed here is the only copy the edit path makes.
+    uint64_t enqueue_parse(const std::string& uri, std::string text);
 
     /// Server registers this once.  Called on worker thread after a parse commits.
     void set_parse_complete_callback(
@@ -434,6 +583,10 @@ class Analyzer {
     /// Append @p path to the background queue unless it is already waiting.
     /// @p front puts it ahead of the cold-start filelist backlog, which is what
     /// edit-driven refreshes want.
+    /// Queue every open buffer and project shard that `include`s @p uri for a
+    /// background reparse.  Returns whether anything was queued; the caller
+    /// bumps the generation and wakes the pool.
+    bool queue_include_dependents_locked(const std::string& uri) const;
     void queue_background_file_locked(std::string path, bool front) const;
     void start_background_indexer_locked() const;
     void schedule_background_reindex_locked() const;
@@ -458,6 +611,10 @@ class Analyzer {
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
     std::vector<std::string> defines_;
     std::vector<std::string> include_dirs_;
+    // include_dirs_ globbed to the directories that exist, once, when the
+    // config is set.  Parses hand this to slang as additional include paths
+    // instead of rebuilding it per SourceManager; see resolve_include_dirs().
+    std::vector<std::filesystem::path> include_dir_paths_;
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
@@ -497,6 +654,9 @@ class Analyzer {
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;
+    // Also guarded by its own mutex, and for the same reason: make_state()
+    // parses outside map_mutex_.
+    mutable OpenParseHeaderCache open_parse_header_texts_;
 
     /// Shards for `include`d headers, one per header rather than one per
     /// including file.
@@ -516,6 +676,12 @@ class Analyzer {
     /// changed header is always re-indexed.
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> background_header_shards_;
     mutable std::unordered_set<std::string> background_header_claims_;
+    /// Headers whose shard was built from a parse of the header on its own, so
+    /// that shard is the authoritative record of their declarations.  Only those
+    /// are safe to hand an open buffer as directives alone; see
+    /// header_directives_only() and preload_open_parse_headers().  Cleared with
+    /// the two maps above, so a re-indexed header re-earns its place.
+    mutable std::unordered_set<std::string> standalone_header_uris_;
     mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 
@@ -528,8 +694,12 @@ class Analyzer {
     // Async parse worker state.
     struct ParseJob {
         std::string uri;
-        std::string text;
-        uint64_t version;
+        // The placeholder snapshot enqueue_parse() installed, not a second copy
+        // of its text.  The worker parses pending->text, and docs_ holds the
+        // same snapshot until the reparse lands, so the buffer exists once
+        // instead of once per queue it passes through.
+        std::shared_ptr<const DocumentState> pending;
+        uint64_t version{0};
     };
 
     std::function<void(const std::string&)> parse_complete_cb_;

@@ -19,6 +19,7 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
+#include <slang/text/Glob.h>
 #include <slang/text/SourceManager.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,6 +39,22 @@ using Clock = std::chrono::steady_clock;
 constexpr size_t kMaxRtlTreeDepth = 256;
 
 constexpr unsigned kMaxBackgroundIndexThreads = 8;
+
+// How long the parse queue must stay empty before the parse worker rebuilds the
+// live project shard of a buffer it has just reparsed.  Short enough that a user
+// who stops typing sees project-wide features catch up immediately, long enough
+// that it never runs twice inside one burst of keystrokes.
+constexpr auto kLiveShardIdleDelay = std::chrono::milliseconds(150);
+
+// Smallest header an open buffer's parse is willing to see as directives alone.
+//
+// The projection trades exactness of the buffer's own tree -- the header's
+// declarations stop appearing in it, and features answer for them from the
+// header's shard instead -- for not re-parsing the header on every keystroke.
+// That trade is only worth making where the bulk is actually felt: a header this
+// size costs milliseconds per character typed, while a small one costs
+// microseconds and is worth keeping exact.
+constexpr size_t kDirectivesOnlySeedBytes = 64u << 10;
 
 // Milder than the background compiler's default of 10.  Project index warmup
 // gates when cross-file features start answering, so it should yield to
@@ -84,16 +101,37 @@ static void cache_document_end_position(DocumentState& state) {
     state.end_character = saturating_lsp_int(col);
 }
 
-static void add_include_dirs(slang::SourceManager& sm, const std::vector<std::string>& dirs) {
+/// Resolve configured include-directory patterns to existing directories, once.
+///
+/// The parse path used to hand these to SourceManager::addUserDirectories(),
+/// which globs the pattern and then runs weakly_canonical() over every match —
+/// a stat per path component, per directory.  A SourceManager is built per
+/// parse, so that ran again on every keystroke and once per project file during
+/// indexing: with a few hundred include directories it dominated the edit path,
+/// and on a shared/network filesystem each of those stats is a round trip.
+///
+/// Resolving here and passing the result as
+/// PreprocessorOptions::additionalIncludePaths keeps the same search order —
+/// slang tries the including file's own directory first, then these — with no
+/// filesystem work left on the edit path.
+static std::vector<std::filesystem::path>
+resolve_include_dirs(const std::vector<std::string>& dirs) {
+    std::vector<std::filesystem::path> resolved;
+    resolved.reserve(dirs.size());
     for (const auto& dir : dirs) {
         if (dir.empty())
             continue;
-        // SourceManager reports an error only for exact non-existent directory
-        // patterns.  Completion should remain best-effort when the user has a
-        // stale config path, so we ignore the return code here and let missing
-        // include diagnostics surface from slang in the normal parse path.
-        (void)sm.addUserDirectories(dir);
+        slang::SmallVector<std::filesystem::path> matches;
+        std::error_code ec;
+        // The same glob slang applied, so wildcard include paths keep working.
+        // A pattern matching nothing is dropped and the error ignored, as
+        // before: completion stays best-effort when the user has a stale config
+        // path, and missing include diagnostics still surface from the parse.
+        slang::svGlob({}, dir, slang::GlobMode::Directories, matches,
+                      /*expandEnvVars=*/false, ec);
+        resolved.insert(resolved.end(), matches.begin(), matches.end());
     }
+    return resolved;
 }
 
 static void collect_parse_diagnostics(DocumentState& state, const std::string& fallback_uri) {
@@ -204,6 +242,64 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
     }
 }
 
+static std::string header_directives_only(std::string_view text);
+
+/// Seed the headers the previous parse of this same buffer `include`d.
+///
+/// The candidate list is that parse's dependency set rather than everything the
+/// cache holds: assignText() copies, so offering every open buffer's headers to
+/// every keystroke would trade one read for several copies.  A header that
+/// changed on disk was already dropped by the watcher path
+/// (refresh_changed_extra_files), so nothing here needs to check the filesystem.
+///
+/// A header big enough for its bulk to be felt per keystroke is seeded as its
+/// directives alone, provided its own shard was built from a parse of it on its
+/// own.  See kDirectivesOnlySeedBytes for why size gates this.
+static void preload_open_parse_headers(slang::SourceManager& sm, OpenParseHeaderCache& cache,
+                                       const std::vector<std::string>& previous_dependencies,
+                                       const std::unordered_set<std::string_view>& excluded,
+                                       const std::unordered_set<std::string>& standalone_uris) {
+    for (const auto& dependency_uri : previous_dependencies) {
+        const auto path = normalize_filesystem_path(path_from_file_uri(dependency_uri)).string();
+        if (path.empty() || excluded.contains(path))
+            continue;
+        auto text = cache.get(path);
+        if (!text)
+            continue;
+        if (text->size() >= kDirectivesOnlySeedBytes && standalone_uris.contains(dependency_uri)) {
+            if (auto directives = cache.get_directives(path, header_directives_only))
+                text = std::move(directives);
+        }
+        sm.assignText(std::string_view(path), std::string_view(*text));
+    }
+}
+
+/// Record the headers an open buffer's parse pulled in, so the next keystroke
+/// can seed them instead of reading them again.
+static void store_open_parse_headers(const slang::SourceManager& sm, const DocumentState& state,
+                                     OpenParseHeaderCache& cache,
+                                     const std::unordered_set<std::string_view>& excluded) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        // Normalize before using this as a cache key: preload_open_parse_headers()
+        // looks entries up by normalize_filesystem_path(path_from_file_uri(...)),
+        // and slang's own resolved path does not go through that normalization.
+        // On a filesystem where the project path crosses a symlink or a short
+        // (8.3) name the two spellings differ, so storing under the raw path
+        // left get() unable to ever find what was just stored.
+        const auto path_string = normalize_filesystem_path(full_path).string();
+        if (excluded.contains(path_string))
+            continue;
+        // Same reasoning as store_header_texts(): the dependency set is what
+        // separates genuine `include targets from seeded buffers and overlays.
+        if (!state.include_dependency_set.contains(uri_from_path(full_path)))
+            continue;
+        cache.store(path_string, sm.getSourceText(buffer));
+    }
+}
+
 /// Record the headers this parse pulled in, so sibling files in the same burst
 /// can be seeded from memory instead of re-reading them.
 static void store_header_texts(const slang::SourceManager& sm, const DocumentState& state,
@@ -246,10 +342,138 @@ static std::string_view header_source_text(const slang::SourceManager& sm,
     return {};
 }
 
+/// The key store_header_texts() files @p uri's text under.
+///
+/// Taken from the SourceManager rather than derived from the URI so it is the
+/// same spelling store_header_texts() used; slang's resolved path does not go
+/// through normalize_filesystem_path(), and a key that differs by a symlink or a
+/// short name would replace nothing.
+static std::string header_cache_key(const slang::SourceManager& sm, const std::string& uri) {
+    for (const auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (!full_path.empty() && uri_from_path(full_path) == uri)
+            return full_path.string();
+    }
+    return {};
+}
+
+/// Whether @p line's first thing that is neither whitespace nor a comment is a
+/// backtick, updating @p in_block_comment for the line that follows.
+///
+/// The comment state has to be carried whether or not the answer is already
+/// known, or a dropped line that opens a block comment would leave a later
+/// `define inside it looking like a directive.
+static bool line_starts_directive(std::string_view line, bool& in_block_comment) {
+    bool starts = false;
+    bool decided = false;
+    for (size_t i = 0; i < line.size();) {
+        if (in_block_comment) {
+            if (line.compare(i, 2, "*/") == 0) {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                ++i;
+            }
+            continue;
+        }
+        if (line.compare(i, 2, "//") == 0)
+            break;
+        if (line.compare(i, 2, "/*") == 0) {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if (line[i] == '"') {
+            // Skipped rather than scanned: a backtick or a /* inside a string
+            // literal is neither a directive nor a comment.
+            ++i;
+            while (i < line.size() && line[i] != '"') {
+                if (line[i] == '\\' && i + 1 < line.size())
+                    ++i;
+                ++i;
+            }
+            ++i;
+            decided = true;
+            continue;
+        }
+        if (!decided && std::isspace(static_cast<unsigned char>(line[i])) == 0) {
+            starts = line[i] == '`';
+            decided = true;
+        }
+        ++i;
+    }
+    return starts;
+}
+
+/// @p text with everything but its preprocessor directives blanked out.
+///
+/// What an includer needs from a header is what the preprocessor does with it.
+/// A `define is genuinely per-includer — its body means whatever it expands to
+/// where it is used — so every file has to see it again.  A declaration is not:
+/// since shard scoping the header's own shard is where its declarations live and
+/// what every other file resolves against, so re-reading the header's bulk once
+/// per includer buys nothing and costs O(files x header), which on an HPC design
+/// is the largest file in the project multiplied by its includer count.
+///
+/// Dropped lines become empty rather than disappearing, so every directive keeps
+/// the line number it is written on: a macro expansion carries the location of
+/// its definition, and anything that resolves one back to the header would
+/// otherwise report the wrong line.
+///
+/// A directive inside a block comment stays dropped even though the preprocessor
+/// would ignore it either way — keeping the line without its opening /* would
+/// leave a stray */ in text that gets `include`d.
+static std::string header_directives_only(std::string_view text) {
+    std::string projected;
+    projected.reserve(text.size() / 8 + 64);
+
+    bool in_block_comment = false;
+    bool continuing = false;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line_end = eol == std::string_view::npos ? text.size() : eol;
+        const auto line = text.substr(pos, line_end - pos);
+
+        const bool opened_in_comment = in_block_comment;
+        const bool directive = line_starts_directive(line, in_block_comment);
+        const bool keep = continuing || (!opened_in_comment && directive);
+        if (keep)
+            projected.append(line);
+
+        auto body = line;
+        while (!body.empty() && (body.back() == '\r' || body.back() == '\n'))
+            body.remove_suffix(1);
+        continuing = keep && !body.empty() && body.back() == '\\';
+
+        if (eol == std::string_view::npos)
+            break;
+        projected.push_back('\n');
+        pos = eol + 1;
+    }
+    return projected;
+}
+
+struct BuiltHeaderShard {
+    std::string uri;
+    std::shared_ptr<const SyntaxIndex> index;
+    /// Built from a parse of the header by itself, so the shard is the
+    /// authoritative record of its declarations — the condition for serving an
+    /// includer its directives alone.  See standalone_header_uris_.
+    bool stands_alone{false};
+};
+
+static std::vector<BuiltHeaderShard>
+build_header_shards(const std::vector<std::string>& headers_to_build, const DocumentState& includer,
+                    const std::vector<std::string>& defines,
+                    const std::vector<std::filesystem::path>& include_dirs,
+                    const std::vector<OpenTextOverlay>& open_overlays,
+                    HeaderTextCache& header_texts, uint64_t generation);
+
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
                              const std::vector<std::string>& defines,
-                             const std::vector<std::string>& include_dirs,
+                             const std::vector<std::filesystem::path>& include_dirs,
                              const std::vector<OpenTextOverlay>& open_overlays = {},
                              bool retain_text = false,
                              HeaderTextCache* header_texts = nullptr,
@@ -262,7 +486,6 @@ make_file_state_with_options(const std::filesystem::path& path,
     const std::string uri = uri_from_path(norm);
 
     auto sm = make_lsp_source_manager();
-    add_include_dirs(*sm, include_dirs);
     std::unordered_set<std::string_view> header_cache_excluded;
     if (header_texts) {
         header_cache_excluded = header_cache_excluded_paths(open_overlays, norm_string);
@@ -271,6 +494,7 @@ make_file_state_with_options(const std::filesystem::path& path,
     preload_open_text_overlays(*sm, open_overlays, norm_string);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
+    ppo.additionalIncludePaths = include_dirs;
     slang::Bag bag;
     bag.set(ppo);
 
@@ -281,9 +505,15 @@ make_file_state_with_options(const std::filesystem::path& path,
     // fromFile already loaded source into SourceManager; read text from there
     // instead of opening the file a second time.  On NFS this avoids an extra
     // open + stat + read per indexed file.
+    // The buffer the tree was parsed from, not the one its root node starts in:
+    // a file whose first line is an `include has its first token in the header,
+    // so the root-node spelling hands back the *header's* text as if it were
+    // this file's.  See SyntaxIndex::build(), which scopes on the same identity.
     std::string_view sm_source;
-    if (const auto& t = *tree_or_error; t)
-        sm_source = sm->getSourceText(t->root().sourceRange().start().buffer());
+    if (const auto& t = *tree_or_error; t) {
+        if (const auto own_buffers = t->getSourceBufferIds(); !own_buffers.empty())
+            sm_source = sm->getSourceText(own_buffers.front());
+    }
 
     auto state = std::make_shared<DocumentState>(uri, retain_text ? std::string(sm_source)
                                                                   : std::string{},
@@ -315,6 +545,75 @@ make_file_state_with_options(const std::filesystem::path& path,
         collect_parse_diagnostics(*state, uri);
     log_perf("make_file_state_with_options " + uri, start);
     return state;
+}
+
+/// Build one shard per claimed header, using @p includer as the parse that
+/// pulled them in.  Runs outside map_mutex_: it parses.
+///
+/// The caller's claim is what keeps two workers off the same header.  @p includer
+/// may be an open buffer's snapshot — its text is unsaved, but a header's own
+/// shard is built from the header, so an open includer can claim just as well as
+/// a closed one.
+static std::vector<BuiltHeaderShard>
+build_header_shards(const std::vector<std::string>& headers_to_build, const DocumentState& includer,
+                    const std::vector<std::string>& defines,
+                    const std::vector<std::filesystem::path>& include_dirs,
+                    const std::vector<OpenTextOverlay>& open_overlays,
+                    HeaderTextCache& header_texts, uint64_t generation) {
+    std::vector<BuiltHeaderShard> built;
+    built.reserve(headers_to_build.size());
+    for (const auto& header_uri : headers_to_build) {
+        // Parse the header on its own.  Deriving its shard from an includer's
+        // tree cannot express "the header's declarations": the restriction
+        // meant to do that does not filter, because
+        // SourceFileIdResolver::wants_declaration() keeps every declaration
+        // when no mentions provider is set.  What landed under the header's
+        // URI was therefore a copy of whichever includer claimed it first —
+        // its modules and ports, scoped to its module, and none of the
+        // header's own declarations when the `include sits at file scope.
+        std::shared_ptr<SyntaxIndex> header_index;
+        auto header_state = make_file_state_with_options(
+            path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
+            /*retain_text=*/false, &header_texts, generation,
+            /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true);
+        const bool stands_alone =
+            header_state && header_state->tree &&
+            std::none_of(header_state->parse_diagnostics.begin(),
+                         header_state->parse_diagnostics.end(),
+                         [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+        if (stands_alone) {
+            header_index = std::make_shared<SyntaxIndex>(std::move(header_state->index));
+
+            // Its declarations are now recorded, so the rest of the burst
+            // only needs its directives.  Serving the projection through the
+            // same cache the full text came from is what makes the saving
+            // reach the files still queued: at most one file per worker can
+            // already be reading the header when this runs, and every file
+            // after them is seeded from here.  A header open in the editor
+            // was never stored, so it is never projected.
+            if (const auto key = header_cache_key(*includer.source_manager, header_uri);
+                !key.empty()) {
+                header_texts.project(
+                    generation, key,
+                    header_directives_only(header_source_text(*includer.source_manager,
+                                                              header_uri)));
+            }
+        } else {
+            // A header that is a textual fragment — a port list, a module
+            // opened in one file and closed in another — has no tree of its
+            // own to index.  PERF.md documents this shape; keep deriving
+            // those from the includer that pulled them in.
+            header_index = std::make_shared<SyntaxIndex>(SyntaxIndex::build(
+                *includer.tree, header_source_text(*includer.source_manager, header_uri),
+                IndexDepth::Declarations, header_uri));
+        }
+        built.push_back(BuiltHeaderShard{
+            .uri = header_uri,
+            .index = std::move(header_index),
+            .stands_alone = stands_alone,
+        });
+    }
+    return built;
 }
 
 Analyzer::~Analyzer() {
@@ -350,13 +649,26 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // errors when the same file is re-parsed on didChange, and prevents the
     // static singleton from accumulating stale buffers across edits.
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
+    std::vector<std::string> previous_dependencies;
+    std::unordered_set<std::string> standalone_headers;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         defines = defines_;
-        include_dirs = include_dirs_;
+        include_dirs = include_dir_paths_;
+        // What this buffer included last time is the candidate set for header
+        // seeding below.  On didOpen there is no previous snapshot, so the first
+        // parse reads from disk and every keystroke after it does not.
+        if (const auto it = docs_.find(uri); it != docs_.end() && it->second)
+            previous_dependencies = it->second->include_dependencies;
+        // Only the ones this buffer includes: the set is project-wide, and
+        // copying all of it per keystroke would grow with the design.
+        for (const auto& dependency_uri : previous_dependencies) {
+            if (standalone_header_uris_.contains(dependency_uri))
+                standalone_headers.insert(dependency_uri);
+        }
         open_overlays.reserve(docs_.size());
         for (const auto& [open_uri, open_state] : docs_) {
             if (!open_state || open_uri == uri)
@@ -372,14 +684,27 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     }
 
     auto sm = make_lsp_source_manager();
-    add_include_dirs(*sm, include_dirs);
+    const auto header_cache_excluded =
+        header_cache_excluded_paths(open_overlays, normalized_current_path);
+    preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
+                               header_cache_excluded, standalone_headers);
     preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
+    ppo.additionalIncludePaths = std::move(include_dirs);
     slang::Bag bag;
     bag.set(ppo);
+    // Pass the normalized path, not the raw one path_from_file_uri() produced:
+    // this SourceManager has disableProximatePaths set, so it resolves a
+    // relative `include against this path verbatim, with no canonicalization
+    // of its own.  If this were the raw path, an include's resolved full path
+    // would carry whatever symlink or short (8.3) name the client's spelling
+    // had, which does not match the normalized path preload/store_open_parse_headers()
+    // key their cache with — a permanent cache miss on any filesystem where
+    // that spelling differs (macOS /tmp, Windows short names).
     auto tree = slang::syntax::SyntaxTree::fromText(
-        std::string_view(text), *sm, std::string_view(uri), std::string_view(path), bag);
+        std::string_view(text), *sm, std::string_view(uri), std::string_view(normalized_current_path),
+        bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalized_current_path;
     cache_document_end_position(*state);
@@ -388,6 +713,8 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     state->include_dependencies = collect_include_dependency_uris(*state->source_manager, uri);
     state->include_dependency_set.insert(state->include_dependencies.begin(),
                                          state->include_dependencies.end());
+    store_open_parse_headers(*state->source_manager, *state, open_parse_header_texts_,
+                             header_cache_excluded);
     // clangd-style current-file layer:
     //
     // Do not materialize any current-file SyntaxIndex on didOpen/didChange.
@@ -435,42 +762,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
 
-        auto depends_on_changed_uri = [&](const DocumentState& doc) {
-            return doc.include_dependency_set.contains(uri);
-        };
-        auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
-            return std::find(deps.begin(), deps.end(), uri) != deps.end();
-        };
-
-        bool queued_dependent = false;
-        for (const auto& [other_uri, other_state] : docs_) {
-            if (other_uri == uri || !other_state ||
-                !depends_on_changed_uri(*other_state))
-                continue;
-
-            const std::string& other_path = other_state->normalized_path;
-            // Indirect include fanout belongs on the background path.  A common
-            // header can be included by many open files; reparsing all of them
-            // synchronously on each keystroke would violate the current-file
-            // AST / background-project-index split and can lag badly on shared
-            // HPC filesystems.  The worker reparses live open buffers from
-            // their in-memory text and open include overlays.
-            queue_background_file_locked(other_path, /*front=*/true);
-            queued_dependent = true;
-        }
-
-        for (const auto& [extra_uri, entry] : extra_cache_) {
-            // Test the shard's dependency list in place.  Offering a
-            // `std::vector<std::string>{}` fallback made the conditional
-            // expression a prvalue, so every shard's list was deep-copied on
-            // every edit, under map_mutex_.
-            if (docs_.contains(extra_uri) || !entry.index ||
-                !index_depends_on_changed_uri(entry.index->include_dependencies))
-                continue;
-            queue_background_file_locked(entry.path, /*front=*/true);
-            queued_dependent = true;
-        }
-        if (queued_dependent) {
+        if (queue_include_dependents_locked(uri)) {
             ++background_generation_;
             start_background_indexer_locked();
             background_cv_.notify_all();
@@ -488,25 +780,35 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 
 }
 
-uint64_t Analyzer::enqueue_parse(const std::string& uri, const std::string& text) {
+uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
     uint64_t version = ++version_counter_;
 
     std::string path = path_from_file_uri(uri);
-    auto state = std::make_shared<DocumentState>(uri, text, nullptr);
+    auto state = std::make_shared<DocumentState>(uri, std::move(text), nullptr);
     state->normalized_path = normalize_filesystem_path(path).string();
     cache_document_end_position(*state);
     state->doc_version = version;
 
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        docs_[uri] = std::move(state);
+        // This placeholder replaces the parsed snapshot before the worker has
+        // produced a new one, so carry its `include list forward.  What a file
+        // included one keystroke ago is the best available answer until the
+        // reparse lands, and leaving it empty would tell make_state() that this
+        // buffer includes nothing — which is exactly when its headers should be
+        // seeded from cache instead of read again.
+        if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
+            state->include_dependencies = it->second->include_dependencies;
+            state->include_dependency_set = it->second->include_dependency_set;
+        }
+        docs_[uri] = state;
         latest_version_[uri] = version;
         semantic_diagnostics_.erase(uri);
         invalidate_extra_snapshots_locked();
     }
     {
         std::lock_guard<std::mutex> lock(parse_mutex_);
-        parse_pending_[uri] = ParseJob{uri, text, version};
+        parse_pending_[uri] = ParseJob{uri, std::move(state), version};
         if (!parse_worker_.joinable())
             parse_worker_ = std::thread([this] { parse_worker_loop(); });
     }
@@ -520,21 +822,85 @@ void Analyzer::set_parse_complete_callback(
 }
 
 void Analyzer::parse_worker_loop() {
+    // Live shards whose owning buffer has been reparsed but whose rebuild is
+    // waiting for the typing to stop.  See the deferral note below.
+    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> deferred_shards;
+    // Reparsed buffers whose includers still have to be told, waiting for the
+    // same moment.  See the fanout note below.
+    std::unordered_set<std::string> deferred_dependents;
+
     while (true) {
         ParseJob job;
+        bool have_job = false;
         {
             std::unique_lock<std::mutex> lock(parse_mutex_);
-            parse_cv_.wait(lock, [&] {
-                return parse_stop_.load() || !parse_pending_.empty();
-            });
+            if (deferred_shards.empty() && deferred_dependents.empty()) {
+                parse_cv_.wait(lock, [&] {
+                    return parse_stop_.load() || !parse_pending_.empty();
+                });
+            } else {
+                parse_cv_.wait_for(lock, kLiveShardIdleDelay, [&] {
+                    return parse_stop_.load() || !parse_pending_.empty();
+                });
+            }
             if (parse_stop_.load())
                 break;
-            auto it = parse_pending_.begin();
-            job = std::move(it->second);
-            parse_pending_.erase(it);
+            if (!parse_pending_.empty()) {
+                auto it = parse_pending_.begin();
+                job = std::move(it->second);
+                parse_pending_.erase(it);
+                have_job = true;
+            }
         }
 
-        auto state = make_state(job.uri, job.text); // outside all locks
+        if (!have_job) {
+            // The queue stayed empty for kLiveShardIdleDelay, so the user has
+            // stopped typing and the deferred shards are worth building.
+            for (auto& [shard_uri, shard_state] : deferred_shards) {
+                auto index = get_dynamic_index(*shard_state);
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (const auto it = docs_.find(shard_uri);
+                    it != docs_.end() && it->second == shard_state)
+                    update_extra_cache_for_live_state_locked(shard_state, std::move(index));
+            }
+            deferred_shards.clear();
+
+            // Tell the includers, once per burst.
+            //
+            // Editing a header included by hundreds of files used to queue all
+            // of them on every keystroke, and each fanout bumped the background
+            // generation.  That generation is what scopes HeaderTextCache and
+            // the directives-only projection built from it, so every character
+            // typed threw both away and made the resulting storm re-read and
+            // re-preprocess the whole header once per includer — the
+            // O(files x header) blowup the projection exists to prevent, paid
+            // per keystroke and on the same CPU the buffer's own parse needs.
+            //
+            // The scan is not cheap either: it walks every project shard's
+            // dependency list under map_mutex_, which every request handler
+            // also needs.
+            //
+            // Deferring costs the includers a staleness window of one idle
+            // delay after the last keystroke, the same trade already accepted
+            // for the live shard above.
+            if (!deferred_dependents.empty()) {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                bool queued = false;
+                for (const auto& dependent_uri : deferred_dependents) {
+                    if (queue_include_dependents_locked(dependent_uri))
+                        queued = true;
+                }
+                if (queued) {
+                    ++background_generation_;
+                    start_background_indexer_locked();
+                    background_cv_.notify_all();
+                }
+                deferred_dependents.clear();
+            }
+            continue;
+        }
+
+        auto state = make_state(job.uri, job.pending->text); // outside all locks
         state->doc_version = job.version;
 
         bool committed = false;
@@ -547,49 +913,26 @@ void Analyzer::parse_worker_loop() {
                 invalidate_extra_snapshots_locked();
                 listed_extra = extra_file_set_.contains(state->normalized_path);
 
-                // Replicate dependent-reparse logic from change()
-                auto depends_on_changed_uri = [&](const DocumentState& doc) {
-                    return doc.include_dependency_set.contains(job.uri);
-                };
-                auto index_depends_on_changed_uri = [&](const std::vector<std::string>& deps) {
-                    return std::find(deps.begin(), deps.end(), job.uri) != deps.end();
-                };
-
-                bool queued_dependent = false;
-                for (const auto& [other_uri, other_state] : docs_) {
-                    if (other_uri == job.uri || !other_state ||
-                        !depends_on_changed_uri(*other_state))
-                        continue;
-                    queue_background_file_locked(other_state->normalized_path, /*front=*/true);
-                    queued_dependent = true;
-                }
-                for (const auto& [extra_uri, entry] : extra_cache_) {
-                    // See change(): the vector fallback in the conditional
-                    // expression deep-copied every shard's dependency list.
-                    if (docs_.contains(extra_uri) || !entry.index ||
-                        !index_depends_on_changed_uri(entry.index->include_dependencies))
-                        continue;
-                    queue_background_file_locked(entry.path, /*front=*/true);
-                    queued_dependent = true;
-                }
-                if (queued_dependent) {
-                    ++background_generation_;
-                    start_background_indexer_locked();
-                    background_cv_.notify_all();
-                }
-
                 committed = true;
             }
             // else: stale, discard
         }
 
         if (committed) {
-            if (listed_extra) {
-                auto index = get_dynamic_index(*state);
-                std::lock_guard<std::mutex> lock(map_mutex_);
-                if (const auto it = docs_.find(job.uri); it != docs_.end() && it->second == state)
-                    update_extra_cache_for_live_state_locked(state, std::move(index));
-            }
+            // Defer the shard rebuild until the typing stops.
+            //
+            // Only project-wide features read this shard, so it is allowed to
+            // trail the buffer by a moment.  Building it walks everything the
+            // file `include`s, which with one large shared header is the most
+            // expensive thing on the edit path — and every keystroke throws the
+            // previous result away.  Holding it until the parse queue has been
+            // empty for kLiveShardIdleDelay makes a burst cost one rebuild
+            // instead of one per character.  The cost of that is a shard which
+            // trails the buffer by up to one delay after the last keystroke;
+            // nothing that answers for the current file reads it.
+            if (listed_extra)
+                deferred_shards[job.uri] = state;
+            deferred_dependents.insert(job.uri);
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
         }
@@ -597,6 +940,11 @@ void Analyzer::parse_worker_loop() {
 }
 
 void Analyzer::close(const std::string& uri) {
+    // A file open as a buffer is excluded from the open-parse header cache, so
+    // whatever was cached for it predates the editing session.  Closing it makes
+    // it cache-eligible again; drop the pre-session text rather than serve it.
+    open_parse_header_texts_.invalidate(
+        normalize_filesystem_path(path_from_file_uri(uri)).string());
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_.erase(uri);
@@ -629,14 +977,14 @@ std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_
 
     std::vector<std::string> paths;
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     std::vector<OpenTextOverlay> open_overlays;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> live_by_path;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         paths = extra_files_;
         defines = defines_;
-        include_dirs = include_dirs_;
+        include_dirs = include_dir_paths_;
 
         open_overlays.reserve(docs_.size());
         live_by_path.reserve(docs_.size());
@@ -835,6 +1183,25 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
                     port->col + (int)port->name.size()};
 }
 
+// Class name that `owner::alias` names, for a `typedef` declared inside a class.
+//
+// Keyed by owner rather than by bare alias name: `typedef_by_name` holds one
+// entry per name, and in a UVM project every class declares its own `type_id`,
+// so a bare lookup answers with whichever class was indexed first.
+static std::optional<std::string> scoped_typedef_base_type(const SyntaxIndex& index,
+                                                           const std::string& owner,
+                                                           const std::string& alias) {
+    if (owner.empty() || alias.empty())
+        return std::nullopt;
+    const auto it = index.package_type_by_scoped_name.find(package_scoped_key(owner, alias));
+    if (it == index.package_type_by_scoped_name.end() || it->second >= index.typedefs.size())
+        return std::nullopt;
+    auto name = canonical_type_name_from_text(index.typedefs[it->second].resolved);
+    if (name.empty())
+        return std::nullopt;
+    return name;
+}
+
 // Resolve `package_name::member` through the package-scoped lookup maps.
 //
 // Three O(1) map probes, no linear scan: this runs on the request path for every
@@ -1015,15 +1382,32 @@ find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::s
 
 static Location location_from_token(const slang::SourceManager& sm, const std::string& uri,
                                     const slang::parsing::Token& token) {
-    const int line = to_lsp_line((int)sm.getLineNumber(token.location()));
-    const int col = (int)sm.getColumnNumber(token.location()) - 1;
+    // A macro argument -- or a literal written inside the macro body itself,
+    // e.g. `type_id` in `uvm_object_utils_begin` -- has its own location point
+    // into the expansion buffer, which has no lines for getColumnNumber() to
+    // walk back through -- it answers 0, and the column comes out negative.
+    // Report where the user actually typed it.
+    const auto location = sm.isMacroLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    const int line = to_lsp_line((int)sm.getLineNumber(location));
+    const int col = (int)sm.getColumnNumber(location) - 1;
     return Location{uri, line, col, line, col + (int)token.valueText().size()};
 }
 
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
                                                const std::string& fallback_uri,
                                                const slang::parsing::Token& token) {
-    auto loc = location_from_token(sm, location_to_uri(sm, token.location(), fallback_uri), token);
+    // The URI must come from the same resolved location that
+    // location_from_token() uses for line/col below -- deriving it from the
+    // raw (unresolved) token location instead mixes getFullyExpandedLoc()'s
+    // buffer with getFullyOriginalLoc()'s line/col, which point at different
+    // files for a token written inside a macro body (e.g. `type_id` in
+    // `uvm_object_utils_begin`).
+    const auto location = sm.isMacroLoc(token.location())
+                              ? sm.getFullyOriginalLoc(token.location())
+                              : token.location();
+    auto loc = location_from_token(sm, location_to_uri(sm, location, fallback_uri), token);
     return loc;
 }
 
@@ -1260,10 +1644,45 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         return false;
     }
 
+    // Lexical declaration scopes (begin/end blocks, loop headers) that enclose
+    // the declarations being visited.  A pair of zero lines means "no lexical
+    // restriction" — used for scopes that live in another file, where the
+    // cursor's line number is not comparable.
+    std::vector<std::pair<int, int>> scope_stack;
+
+    void push_scope(slang::SourceRange range) {
+        if (!range.start().valid() || !range.end().valid() ||
+            uri_from_source_location(sm, range.start()) != uri) {
+            scope_stack.emplace_back(0, 0);
+            return;
+        }
+        scope_stack.emplace_back((int)sm.getLineNumber(range.start()),
+                                 (int)sm.getLineNumber(range.end()));
+    }
+
+    // A declaration inside a block or loop header is only visible to uses
+    // lexically inside that same block:
+    //
+    //     for (int i = 0; i < 10; i++) begin ... end
+    //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
+    //                                               ^ the second `i`, not the first
+    bool cursor_in_innermost_scope() const {
+        if (scope_stack.empty())
+            return true;
+        const auto [start_line, end_line] = scope_stack.back();
+        if (start_line > 0 && use_line_one_based < start_line)
+            return false;
+        if (end_line > 0 && use_line_one_based > end_line)
+            return false;
+        return true;
+    }
+
     void maybe_set(slang::parsing::Token token, bool scope_sensitive = true) {
         if (!token || token.valueText() != name)
             return;
         if (!package_member_visible(current_package, token.valueText()))
+            return;
+        if (scope_sensitive && !cursor_in_innermost_scope())
             return;
 
         auto loc = location_from_token_actual_uri(sm, uri, token);
@@ -1363,6 +1782,24 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
         maybe_set(node.name);
         visitDefault(node);
+    }
+
+    void handle(const slang::syntax::BlockStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    void handle(const slang::syntax::ForLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    void handle(const slang::syntax::ForeachLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
     }
 };
 
@@ -1579,6 +2016,32 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
             current_module = previous_module;
         }
 
+        // A class body is a declaration scope too, so `p.foo()` inside a method
+        // has to find `p` among the class properties and method locals.
+        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+            const auto previous_module = current_module;
+            current_module = std::string(node.name.valueText());
+            scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+            current_module = previous_module;
+        }
+
+        // `task run_phase(uvm_phase phase);` — the receiver is an argument.
+        void handle(const slang::syntax::FunctionPortSyntax& node) {
+            if (current_module != module_name || !node.dataType || !node.declarator)
+                return;
+            if (node.declarator->name.valueText() != object_name)
+                return;
+            const auto decl_uri = uri_from_source_location(sm, node.declarator->name.location());
+            if (!decl_uri.empty() && decl_uri != uri)
+                return;
+            const auto type_name =
+                canonical_type_name_from_text(render_syntax_node_text(sm, *node.dataType));
+            if (!type_name.empty())
+                result = type_name;
+        }
+
         void handle(const slang::syntax::BlockStatementSyntax& node) {
             scope_stack.push_back(source_range_lines_one_based(sm, node.sourceRange()));
             visitDefault(node);
@@ -1733,8 +2196,181 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
                             method.col + (int)method.name.size()};
         }
+
+        // A class-scoped typedef (`my_item::type_id`) is a member too, but it
+        // lives in the typedef table rather than on the ClassEntry.
+        for (const auto& td : index.typedefs) {
+            if (td.name != member_name || td.line <= 0 || td.parent_scope != cls.name)
+                continue;
+            const std::string actual_uri = index.source_uri(td.file_id);
+            const int line = to_lsp_line(td.line);
+            return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
+                            td.col + (int)td.name.size()};
+        }
     }
     return std::nullopt;
+}
+
+// One SyntaxIndex shard plus the URI to fall back on when the shard carries no
+// source file of its own.  Class hierarchies routinely span shards — a child in
+// the current file extending a base in a closed project file — so member lookup
+// has to be able to hop between them.
+struct ClassLookupShard {
+    const SyntaxIndex* index;
+    const std::string* uri;
+};
+
+static const ClassEntry* find_class_entry(const SyntaxIndex& index, std::string_view class_name) {
+    auto it = index.class_by_name.find(std::string(class_name));
+    if (it == index.class_by_name.end() || it->second >= index.classes.size())
+        return nullptr;
+    return &index.classes[it->second];
+}
+
+// Resolve `member_name` on `class_name`, then on its `extends` ancestors.
+//
+// SystemVerilog inherits properties and methods, so `child.depth` and a bare
+// `depth` inside a child class body both have to reach `pkt_base::depth`.  Each
+// hop re-searches every shard because the base class is frequently declared in
+// a different file than the child.
+static std::optional<Location> find_class_member_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view member_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        for (const auto& shard : shards) {
+            if (auto loc = find_class_member_definition(*shard.index, *shard.uri, class_name,
+                                                        member_name))
+                return loc;
+        }
+
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (cls && !cls->base_class.empty()) {
+                base = base_class_lookup_name(cls->base_class);
+                break;
+            }
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
+// Whether `derived` reaches `base` through its `extends` chain.
+//
+// Each hop re-searches every shard for the same reason the member lookup above
+// does: a base class is usually declared in a different file than the class
+// that extends it.
+static bool class_derives_from(std::span<const ClassLookupShard> shards, std::string derived,
+                               std::string_view base) {
+    std::unordered_set<std::string> visited;
+    while (!derived.empty() && visited.insert(derived).second) {
+        if (derived == base)
+            return true;
+
+        std::string next;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, derived);
+            if (cls && !cls->base_class.empty()) {
+                next = base_class_lookup_name(cls->base_class);
+                break;
+            }
+        }
+        derived = std::move(next);
+    }
+    return false;
+}
+
+// Declared type of `field_name` on `class_name` or any ancestor, searched
+// across shards.  The receiver of a member access is often itself an inherited
+// field, e.g. `seq_item_port` declared by `uvm_driver` and used from a subclass.
+static std::optional<std::string> find_class_field_type_in_hierarchy(
+    std::span<const ClassLookupShard> shards, std::string class_name,
+    std::string_view field_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        std::string base;
+        for (const auto& shard : shards) {
+            const auto* cls = find_class_entry(*shard.index, class_name);
+            if (!cls)
+                continue;
+            for (const auto& field : cls->fields) {
+                if (field.name != field_name || field.type.empty())
+                    continue;
+                const auto type = canonical_type_name_from_text(field.type);
+                if (!type.empty())
+                    return type;
+            }
+            if (base.empty() && !cls->base_class.empty())
+                base = base_class_lookup_name(cls->base_class);
+        }
+        class_name = std::move(base);
+    }
+    return std::nullopt;
+}
+
+// Declaration of `member_name` written inside `class_name`'s body in this tree.
+//
+// `Class::member` is not only a static method call: it also reaches a nested
+// typedef, which is how the utils macros publish `type_id`.  Those typedefs are
+// produced by macro expansion, so the answer is wherever the token really came
+// from, which is what location_from_token_actual_uri() reports.
+static std::optional<Location> find_class_scoped_declaration_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view class_name,
+    std::string_view member_name) {
+    if (class_name.empty() || member_name.empty())
+        return std::nullopt;
+    using namespace slang::syntax;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view class_name;
+        std::string_view member_name;
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view class_name,
+                std::string_view member_name)
+            : sm(sm), uri(uri), class_name(class_name), member_name(member_name) {}
+
+        void accept(const slang::parsing::Token& token) {
+            if (!result && token && token.valueText() == member_name)
+                result = location_from_token_actual_uri(sm, uri, token);
+        }
+
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                if (const auto* td = item->as_if<TypedefDeclarationSyntax>()) {
+                    accept(td->name);
+                } else if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+                    if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>())
+                        accept(nested->name);
+                    else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+                        for (const auto* decl : data->declarators)
+                            if (decl)
+                                accept(decl->name);
+                    }
+                } else if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
+                    if (const auto* id =
+                            method->declaration->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                } else if (const auto* proto = item->as_if<ClassMethodPrototypeSyntax>()) {
+                    if (const auto* id = proto->prototype->name->as_if<IdentifierNameSyntax>())
+                        accept(id->identifier);
+                }
+            }
+        }
+    } visitor(tree.sourceManager(), uri, class_name, member_name);
+
+    tree.root().visit(visitor);
+    return visitor.result;
 }
 
 static bool token_at_location(const slang::SourceManager& sm, const slang::parsing::Token& token,
@@ -1759,18 +2395,22 @@ static std::string name_text(const slang::syntax::NameSyntax& name) {
 static std::optional<SymbolInfo>
 symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::string& uri,
                             const std::string& name, const Location& definition,
-                            const SyntaxIndex* prebuilt_index = nullptr) {
+                            const SyntaxIndex* prebuilt_index = nullptr,
+                            const std::string& owner = {}) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
         const std::string& name;
         const Location& definition;
         const SyntaxIndex& index;
+        // Class named to the left of `::`, empty when the cursor was unqualified.
+        const std::string& owner;
+        std::vector<std::string> enclosing_class;
         std::optional<SymbolInfo> result;
 
         Visitor(const slang::SourceManager& sm, const std::string& uri, const std::string& name,
-                const Location& definition, const SyntaxIndex& index)
-            : sm(sm), uri(uri), name(name), definition(definition), index(index) {}
+                const Location& definition, const SyntaxIndex& index, const std::string& owner)
+            : sm(sm), uri(uri), name(name), definition(definition), index(index), owner(owner) {}
 
         void set_from_token(const slang::parsing::Token& token, std::string kind,
                             std::string detail) {
@@ -1798,9 +2438,18 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 }
             }
 
+            // ModuleDeclarationSyntax also covers interface, package, and
+            // program declarations; reporting all of them as "module" mislabels
+            // every interface in a testbench.
+            const char* declaration_kind =
+                node.kind == slang::syntax::SyntaxKind::InterfaceDeclaration ? "interface"
+                : node.kind == slang::syntax::SyntaxKind::PackageDeclaration ? "package"
+                : node.kind == slang::syntax::SyntaxKind::ProgramDeclaration ? "program"
+                                                                             : "module";
+
             result = SymbolInfo{.name = name,
-                                .kind = "module",
-                                .detail = "module",
+                                .kind = declaration_kind,
+                                .detail = declaration_kind,
                                 .doc = std::move(doc),
                                 .line = definition.line,
                                 .col = definition.col};
@@ -1809,7 +2458,9 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::ClassDeclarationSyntax& node) {
             if (result || node.name.valueText() != name ||
                 !token_at_location(sm, node.name, definition)) {
+                enclosing_class.emplace_back(node.name.valueText());
                 visitDefault(node);
+                enclosing_class.pop_back();
                 return;
             }
 
@@ -2038,7 +2689,13 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
-            set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
+            // A macro that declares a member expands once per class, and every
+            // expansion reports the macro body's own location -- UVM's factory
+            // macros give each registered class its own `type_id` this way.
+            // Location alone therefore cannot tell them apart, so when the
+            // cursor named an owner, only that owner's copy may answer.
+            if (owner.empty() || (!enclosing_class.empty() && enclosing_class.back() == owner))
+                set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
             if (!result)
                 visitDefault(node);
         }
@@ -2050,13 +2707,21 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
     // removing: a point query should not silently index the whole current file.
     SyntaxIndex empty_index;
     const auto& index = prebuilt_index ? *prebuilt_index : empty_index;
-    Visitor visitor(tree.sourceManager(), uri, name, definition, index);
+    Visitor visitor(tree.sourceManager(), uri, name, definition, index, owner);
     tree.root().visit(visitor);
     return visitor.result;
 }
 
 static slang::SourceRange visible_range_for_token(const slang::SourceManager& sm,
                                                   const slang::parsing::Token& token) {
+    // Macro *argument* tokens are text the user typed at the call site, so they
+    // occupy their own original range there.  Only tokens that come from the
+    // macro body have no place of their own in the source and must fall back to
+    // the whole invocation.
+    if (sm.isMacroArgLoc(token.location())) {
+        const auto start = sm.getFullyOriginalLoc(token.location());
+        return slang::SourceRange(start, start + token.rawText().length());
+    }
     if (sm.isMacroLoc(token.location()))
         return sm.getExpansionRange(token.location());
     return token.range();
@@ -2122,8 +2787,16 @@ struct DefinitionTarget {
     // has the syntax tree, so it cannot know whether this really names a
     // package; definition_of_state() decides that against the index.
     std::string package_qualifier;
+    // Owner of `package_qualifier` when the qualifier is itself scoped, as in
+    // `my_item::type_id::create`: "my_item" here, "type_id" above.  A type alias
+    // is only identifiable together with the class that declares it -- in a UVM
+    // project every class declares its own `type_id`.
+    std::string qualifier_scope;
     std::string scope_module;
     std::string scope_package;
+    // Innermost class body the cursor sits in, empty outside class scope.
+    // Unqualified names there may be inherited members.
+    std::string scope_class;
 };
 
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
@@ -2132,8 +2805,14 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     int line;
     int col;
     DefinitionTarget target;
+    // A macro body token whose expansion covers the cursor.  Held aside rather
+    // than accepted outright: the same expansion also covers the arguments the
+    // user typed, and an identifier there is the better answer.  Body tokens are
+    // visited first, so the walk has to continue past them to find out.
+    DefinitionTarget macro_target;
     std::string current_module;
     std::string current_package;
+    std::string current_class;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
                             int col)
@@ -2141,11 +2820,39 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
     bool found() const { return target.kind != DefinitionTargetKind::None; }
 
+    /// Whether @p token may claim the cursor as a definite target.
+    ///
+    /// visitToken() already defers macro-body tokens: their expansion range is
+    /// the whole invocation, which also covers the arguments the user typed, so
+    /// an identifier written in those arguments is the better answer and the
+    /// walk has to continue past the body token to find it.  The typed node
+    /// handlers need the same rule.  Without it the type name in a macro body
+    /// such as `` `define COPY(ARG) function void f(peer_t rhs); ARG = rhs.ARG;
+    /// endfunction `` claims a cursor sitting on `cfg` in `` `COPY(cfg) `` and
+    /// resolves to peer_t instead of the user's own declaration.
+    bool token_claims_cursor(const slang::parsing::Token& token) const {
+        if (!token_contains_position_in_uri(sm, token, uri, line, col))
+            return false;
+        return !(sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()));
+    }
+
     std::string object_before_member_dot(const slang::parsing::Token& token) const {
         if (!token || !token.location().valid())
             return {};
-        const auto source = sm.getSourceText(token.location().buffer());
-        size_t i = token.location().offset();
+        // Ask the question of the text the user actually typed.  A macro
+        // argument is expanded into the macro's body, so scanning backwards from
+        // the expansion buffer sees whatever the body put in front of it: in
+        // `` `define COPY(ARG) ARG = rhs.ARG; ``, the second ARG is preceded by
+        // "rhs." there, and `` `COPY(cfg) `` would be read as `rhs.cfg` even
+        // though the user wrote a bare `cfg`.  At the call site the same token is
+        // preceded by "(", so no member access is inferred.
+        auto loc = token.location();
+        if (sm.isMacroArgLoc(loc))
+            loc = sm.getFullyOriginalLoc(loc);
+        if (!loc.valid())
+            return {};
+        const auto source = sm.getSourceText(loc.buffer());
+        size_t i = loc.offset();
         if (i > source.size())
             return {};
         while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
@@ -2164,7 +2871,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.header->name, uri, line, col)) {
+        if (token_claims_cursor(node.header->name)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(node.header->name.valueText());
             target.scope_module = current_module;
@@ -2183,8 +2890,17 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         current_package = std::move(previous_package);
     }
 
+    // Tracked so an unqualified name inside a class body can be resolved
+    // against that class and the classes it extends.
+    void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+        auto previous_class = current_class;
+        current_class = std::string(node.name.valueText());
+        visitDefault(node);
+        current_class = std::move(previous_class);
+    }
+
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.type, uri, line, col)) {
+        if (token_claims_cursor(node.type)) {
             target.kind = DefinitionTargetKind::Instance;
             target.name = std::string(node.type.valueText());
             target.module_name = target.name;
@@ -2201,7 +2917,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                               : nullptr;
                 if (!named)
                     continue;
-                if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+                if (token_claims_cursor(named->name)) {
                     target.kind = DefinitionTargetKind::NamedParameter;
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
@@ -2216,7 +2932,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             if (!instance)
                 continue;
             if (instance->decl &&
-                token_contains_position_in_uri(sm, instance->decl->name, uri, line, col)) {
+                token_claims_cursor(instance->decl->name)) {
                 target.kind = DefinitionTargetKind::Instance;
                 target.name = std::string(instance->decl->name.valueText());
                 target.module_name = module_name;
@@ -2229,7 +2945,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 if (!connection)
                     continue;
                 const auto* named = connection->as_if<slang::syntax::NamedPortConnectionSyntax>();
-                if (named && token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+                if (named && token_claims_cursor(named->name)) {
                     target.kind = DefinitionTargetKind::NamedPort;
                     target.name = std::string(named->name.valueText());
                     target.module_name = module_name;
@@ -2256,7 +2972,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             const auto* named = argument->as_if<slang::syntax::NamedArgumentSyntax>();
             if (!named)
                 continue;
-            if (token_contains_position_in_uri(sm, named->name, uri, line, col)) {
+            if (token_claims_cursor(named->name)) {
                 target.kind = DefinitionTargetKind::NamedArgument;
                 target.name = std::string(named->name.valueText());
                 target.subroutine_name = subroutine_name;
@@ -2290,13 +3006,47 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
 
-        const auto* left = node.left->as_if<slang::syntax::IdentifierNameSyntax>();
+        // The qualifier is usually a bare IdentifierNameSyntax (`pkg::name`), but
+        // a parameterized class qualifier (`uvm_config_db #(T)::get`) parses as
+        // ClassNameSyntax instead — same identifier, plus a parameter list this
+        // lookup doesn't need. Accept either so a parameterized-class static
+        // method call isn't left to fall through to an unscoped bare lookup.
         const auto* right = node.right->as_if<slang::syntax::IdentifierNameSyntax>();
-        if (left && right &&
-            token_contains_position_in_uri(sm, right->identifier, uri, line, col)) {
+        slang::parsing::Token left_identifier;
+        std::string left_owner;
+        if (const auto* left_id = node.left->as_if<slang::syntax::IdentifierNameSyntax>())
+            left_identifier = left_id->identifier;
+        else if (const auto* left_class = node.left->as_if<slang::syntax::ClassNameSyntax>())
+            left_identifier = left_class->identifier;
+        else if (const auto* left_scoped = node.left->as_if<slang::syntax::ScopedNameSyntax>()) {
+            // Two hops: `my_item::type_id::create`.  The qualifier that matters
+            // for `create` is `type_id`, but that alias is only identifiable
+            // together with the class that declares it, so carry `my_item` too.
+            //
+            // Without this the whole expression fell through to the unqualified
+            // walk, which resolves `create` against the enclosing class -- and in
+            // UVM that class always has one, generated by the same factory macro
+            // that declares `type_id`.
+            if (left_scoped->separator.kind == slang::parsing::TokenKind::DoubleColon &&
+                left_scoped->left && left_scoped->right) {
+                if (const auto* alias =
+                        left_scoped->right->as_if<slang::syntax::IdentifierNameSyntax>())
+                    left_identifier = alias->identifier;
+                if (const auto* owner =
+                        left_scoped->left->as_if<slang::syntax::IdentifierNameSyntax>())
+                    left_owner = std::string(owner->identifier.valueText());
+                else if (const auto* owner_class =
+                             left_scoped->left->as_if<slang::syntax::ClassNameSyntax>())
+                    left_owner = std::string(owner_class->identifier.valueText());
+            }
+        }
+
+        if (left_identifier && right &&
+            token_claims_cursor(right->identifier)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(right->identifier.valueText());
-            target.package_qualifier = std::string(left->identifier.valueText());
+            target.package_qualifier = std::string(left_identifier.valueText());
+            target.qualifier_scope = std::move(left_owner);
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
@@ -2310,7 +3060,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     // where a package-qualified name would otherwise resolve to a local
     // declaration of the same name.
     void handle(const slang::syntax::PackageImportItemSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.item, uri, line, col)) {
+        if (token_claims_cursor(node.item)) {
             target.kind = DefinitionTargetKind::PackageMember;
             target.name = std::string(node.item.valueText());
             target.package_qualifier = std::string(node.package.valueText());
@@ -2322,7 +3072,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
-        if (token_contains_position_in_uri(sm, node.name, uri, line, col)) {
+        if (token_claims_cursor(node.name)) {
             target.kind = DefinitionTargetKind::ClassMember;
             target.name = std::string(node.name.valueText());
             target.object_name = simple_identifier_from_expr(node.left);
@@ -2336,7 +3086,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     void handle(const slang::syntax::NamedTypeSyntax& node) {
         const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>();
         if (identifier &&
-            token_contains_position_in_uri(sm, identifier->identifier, uri, line, col)) {
+            token_claims_cursor(identifier->identifier)) {
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(identifier->identifier.valueText());
             target.scope_module = current_module;
@@ -2350,17 +3100,18 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         if (found() || !token || !token.location().valid())
             return;
 
-        if (sm.isMacroLoc(token.location())) {
-            if (!contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
+        if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location())) {
+            if (macro_target.kind != DefinitionTargetKind::None ||
+                !contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
                                           col))
                 return;
 
             auto macro_name = sm.getMacroName(token.location());
             if (!macro_name.empty()) {
-                target.kind = DefinitionTargetKind::Macro;
-                target.name = std::string(macro_name);
-                target.scope_module = current_module;
-                target.scope_package = current_package;
+                macro_target.kind = DefinitionTargetKind::Macro;
+                macro_target.name = std::string(macro_name);
+                macro_target.scope_module = current_module;
+                macro_target.scope_package = current_package;
             }
             return;
         }
@@ -2374,12 +3125,17 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.object_name = object_name;
                 target.scope_module = current_module;
                 target.scope_package = current_package;
+                // The receiver of `obj.member` inside a class body is looked up
+                // in that class, so the enclosing class has to travel with the
+                // target just as it does for unqualified names.
+                target.scope_class = current_class;
                 return;
             }
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
             target.scope_package = current_package;
+            target.scope_class = current_class;
         }
     }
 };
@@ -2388,7 +3144,7 @@ static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tr
                                              const std::string& uri, int line, int col) {
     DefinitionTargetVisitor visitor(tree.sourceManager(), uri, line, col);
     tree.root().visit(visitor);
-    return visitor.target;
+    return visitor.found() ? visitor.target : visitor.macro_target;
 }
 
 static bool index_entry_location_matches(const SyntaxIndex& idx, SourceFileID file_id,
@@ -2470,10 +3226,25 @@ static SymbolInfo symbol_info_for_typedef_entry(const TypedefEntry& td, const st
 static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                                                         const DefinitionTarget& target,
                                                         const Location& definition) {
-    // First try an exact definition-location lookup.  This is the most robust
-    // path for closed project files because the clicked token may be classified
-    // only as a generic identifier, while `definition_of_state()` has already
-    // resolved the exact declaration in a SyntaxIndex shard.
+    // A member spelled once per owner cannot be identified by location alone
+    // when every owner's copy expands from the same macro body: UVM's factory
+    // macros give each registered class its own `type_id`, and all of them
+    // report the macro's own line.  The location scan below would hand back
+    // whichever class was indexed first.  When the cursor named the owner
+    // (`lv_full_item::type_id`), resolve under that owner instead.
+    if (!target.package_qualifier.empty() && !target.name.empty()) {
+        const auto key = package_scoped_key(target.package_qualifier, target.name);
+        if (auto it = idx.package_type_by_scoped_name.find(key);
+            it != idx.package_type_by_scoped_name.end() && it->second < idx.typedefs.size()) {
+            const auto& td = idx.typedefs[it->second];
+            return symbol_info_for_typedef_entry(td, td.name, definition);
+        }
+    }
+
+    // Otherwise try an exact definition-location lookup.  This is the most
+    // robust path for closed project files because the clicked token may be
+    // classified only as a generic identifier, while `definition_of_state()`
+    // has already resolved the exact declaration in a SyntaxIndex shard.
     for (const auto& module : idx.modules) {
         if (index_entry_location_matches(idx, module.file_id, module.line, module.col, definition))
             return SymbolInfo{.name = module.name,
@@ -2736,7 +3507,8 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // first; token_at_location() matches exact URI/line/column, so this does
         // not steal metadata for definitions that only exist in a different
         // shard.
-        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition))
+        if (auto info = symbol_info_from_definition(*state->tree, uri, name, *definition, nullptr,
+                                                    target.package_qualifier))
             return info;
 
         if (definition->uri != uri) {
@@ -2755,6 +3527,19 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
                 return info;
             break;
+        }
+
+        // A project file's shard also indexes everything it `include`s, and the
+        // included header is usually not itself a filelist entry -- UVM lists
+        // uvm_pkg.sv, which includes every uvm_*.svh.  Matching shards by URI
+        // alone therefore finds nothing for such declarations and hover degrades
+        // to a bare name.  Fall back to scanning the shards; the entries carry
+        // their own file_id, so the location match stays exact.
+        for (const auto& extra : *extra_files) {
+            if (extra.uri == definition->uri)
+                continue; // already tried above
+            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
+                return info;
         }
         return SymbolInfo{
             .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};
@@ -2782,11 +3567,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
         void visitToken(slang::parsing::Token token) {
             if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
                 return;
+            // A macro body token is preprocessor output with no position of its
+            // own in the file, so the cursor can never really be on it.  Its
+            // visible range is the whole invocation, which would otherwise make
+            // the first identifier the body happens to contain answer for every
+            // column of the call -- naming that instead of what the user wrote.
+            // Arguments are typed at the call site and are hit normally.
+            if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
+                return;
             if (!token_contains_position_in_uri(sm, token, uri, line, col))
                 return;
 
-            const int token_line = to_lsp_line((int)sm.getLineNumber(token.location()));
-            const int token_col = (int)sm.getColumnNumber(token.location()) - 1;
+            const auto start = visible_range_for_token(sm, token).start();
+            const int token_line = to_lsp_line((int)sm.getLineNumber(start));
+            const int token_col = (int)sm.getColumnNumber(start) - 1;
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
@@ -2799,7 +3593,20 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
     Visitor visitor(state->tree->sourceManager(), uri, line, col);
     state->tree->root().visit(visitor);
-    return visitor.result;
+    if (visitor.result)
+        return visitor.result;
+
+    // A macro invocation leaves no Identifier token at the user's position --
+    // the preprocessor consumed the backtick and the name.  Read the name back
+    // out of the source so `FOO, and a `define of it, stay renameable.
+    if (auto ident = extract_ident_span(state->text, line, col);
+        ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
+                  is_define_identifier(state->text, line, ident->start_col)))
+        return IdentifierAtPosition{.name = ident->text,
+                                    .line = line,
+                                    .col = ident->start_col,
+                                    .end_col = ident->end_col};
+    return std::nullopt;
 }
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
@@ -2927,17 +3734,60 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     const int use_line_one_based = line + 1;
     const auto& current_index = get_structural_index(state);
 
+    // Every shard a class hierarchy could be spread across, current file first.
+    auto class_lookup_shards = [&] {
+        std::vector<ClassLookupShard> shards;
+        shards.reserve(extra_files.size() + 1);
+        shards.push_back(ClassLookupShard{&current_index, &uri});
+        for (const auto& extra : extra_files) {
+            if (!skip_extra(extra))
+                shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+        }
+        return shards;
+    };
+
     if (target.kind == DefinitionTargetKind::PackageMember) {
-        if (auto loc =
-                find_package_member(current_index, uri, target.package_qualifier, target.name))
+        // `my_item::type_id::create` — the qualifier is a type alias, so the
+        // member lives in the type it names, not under the alias.  Substitute
+        // before any lookup below; nothing is keyed by the alias name.
+        std::string qualifier = target.package_qualifier;
+        if (!target.qualifier_scope.empty()) {
+            auto aliased =
+                scoped_typedef_base_type(current_index, target.qualifier_scope, qualifier);
+            for (const auto& extra : extra_files) {
+                if (aliased)
+                    break;
+                if (skip_extra(extra))
+                    continue;
+                aliased =
+                    scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope, qualifier);
+            }
+            if (aliased)
+                qualifier = *aliased;
+        }
+
+        if (auto loc = find_package_member(current_index, uri, qualifier, target.name))
             return loc;
         for (const auto& extra : extra_files) {
             if (skip_extra(extra))
                 continue;
-            if (auto loc = find_package_member(extra.index_ref(), extra.uri,
-                                                target.package_qualifier, target.name))
+            if (auto loc = find_package_member(extra.index_ref(), extra.uri, qualifier,
+                                                target.name))
                 return loc;
         }
+
+        // The qualifier may name a class rather than a package: `my_item::type_id`,
+        // `my_class::static_method`.  Resolve inside that class only — this is
+        // still a qualified lookup, so it must not fall back to unrelated
+        // same-named declarations.
+        if (state.tree) {
+            if (auto loc =
+                    find_class_scoped_declaration_in_tree(*state.tree, uri, qualifier, target.name))
+                return loc;
+        }
+        if (auto loc = find_class_member_in_hierarchy(class_lookup_shards(), qualifier,
+                                                      target.name))
+            return loc;
 
         // Deliberately no generic fallback.  A qualified name that the package
         // does not export must report "no definition" rather than silently
@@ -2968,21 +3818,34 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             class_type = class_type_for_object_reference_in_tree(
                 *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
         }
+        // Inside a class body the enclosing scope is the class, not a module,
+        // and the receiver may be a property, a method local, an argument, or a
+        // field the class only inherits.
+        if (!class_type && !target.scope_class.empty()) {
+            class_type = class_type_for_object_reference(current_index, target.scope_class,
+                                                         target.object_name, use_line_one_based);
+            if (!class_type) {
+                class_type = class_type_for_object_reference_in_tree(
+                    *state.tree, uri, target.scope_class, target.object_name, use_line_one_based);
+            }
+            if (!class_type) {
+                class_type = find_class_field_type_in_hierarchy(
+                    class_lookup_shards(), target.scope_class, target.object_name);
+            }
+        }
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
             // Search both compact index families so `obj.field` works for
-            // closed-file classes as well as structs/unions.
-            if (auto loc =
-                    find_class_member_definition(current_index, uri, *class_type, target.name))
+            // closed-file classes as well as structs/unions.  Class lookup
+            // walks the `extends` chain; typedef aggregates have no base type.
+            const auto shards = class_lookup_shards();
+            if (auto loc = find_class_member_in_hierarchy(shards, *class_type, target.name))
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
             for (const auto& extra : extra_files) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_class_member_definition(extra.index_ref(), extra.uri, *class_type,
-                                                            target.name))
-                    return loc;
                 if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
                                                              *class_type, target.name))
                     return loc;
@@ -2998,6 +3861,25 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                            target.scope_package, visible_imports,
                                            use_line_one_based))
         return loc;
+
+    // An unqualified name inside a class body that the current file cannot
+    // explain may be an inherited member:
+    //
+    //     class pkt_child extends pkt_base;
+    //         function void bump();
+    //             depth = depth + 1;   // pkt_base::depth, declared elsewhere
+    //
+    // This runs after the current-file walk so method locals and same-file
+    // declarations keep shadowing the base class, and before the project-wide
+    // generic scan so an unrelated same-named symbol cannot win over a real
+    // inherited member.
+    if (!target.scope_class.empty()) {
+        if (auto loc =
+                find_class_member_in_hierarchy(class_lookup_shards(), target.scope_class,
+                                               target.name))
+            return loc;
+    }
+
     for (const auto& extra : extra_files) {
         if (skip_extra(extra))
             continue;
@@ -3027,22 +3909,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // generations in one references response if a didChange / shard publish
     // happened between loops.
     const auto extra_idx = extra_index_snapshot_ptr();
-    if (!target) {
-        // Macro invocations are often represented in slang's parsed tree as
-        // expansion tokens rather than as an ordinary Identifier token at the
-        // user's source location.  `definition_of_state()` already has a raw
-        // source fallback for backtick identifiers; references need the same
-        // seed identifier so "find references" works when the cursor is on
-        // `FOO in source text.
-        if (auto ident = extract_ident_span(state->text, line, col);
-            ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
-                      is_define_identifier(state->text, line, ident->start_col))) {
-            target = IdentifierAtPosition{.name = ident->text,
-                                          .line = line,
-                                          .col = ident->start_col,
-                                          .end_col = ident->end_col};
-        }
-    }
     if (!target)
         return {};
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
@@ -3064,6 +3930,28 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         for (const auto& extra : *extra_idx) {
             if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
                                                    target_info.module_name, target_info.name)))
+                break;
+        }
+    } else if (!target_def && (target_info.kind == DefinitionTargetKind::Generic ||
+                               target_info.kind == DefinitionTargetKind::PackageMember)) {
+        // A name only a closed project file can explain — typically a package
+        // member reached through an import, either bare or `pkg::`-qualified.
+        // definition_of_state() above ran without extra files by design, so it
+        // could not leave the open buffers.  Recover the declaration from the
+        // compact shards rather than walking closed-file ASTs; without this,
+        // references/rename started *from the use site* return nothing at all.
+        const auto visible_imports =
+            state->tree ? get_dynamic_index(*state).imports : std::vector<ImportEntry>{};
+        for (const auto& extra : *extra_idx) {
+            if (target_info.kind == DefinitionTargetKind::PackageMember) {
+                target_def = find_package_member(extra.index_ref(), extra.uri,
+                                                 target_info.package_qualifier, target_info.name);
+            } else {
+                target_def = find_generic_definition_from_index(
+                    extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                    target_info.scope_package, visible_imports, line + 1);
+            }
+            if (target_def)
                 break;
         }
     }
@@ -3165,22 +4053,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // their compact occurrence shards.  This fixes the "empty references"
         // case for symbols whose only indexed identity is `name:<identifier>`
         // without downgrading precise open-file reference searches.
-        auto current_structural_index = get_structural_index(*state);
-        if (target_def->uri == uri) {
-            if (auto id = symbol_id_for_index_location(current_structural_index, *target_def, true);
-                id && id->starts_with("name:")) {
-                // Do not use unresolved `name:<identifier>` as a bridge from an
-                // open buffer into closed project shards.  The open-buffer AST
-                // path below can verify same-definition references precisely,
-                // but a closed shard cannot distinguish scopes for generic
-                // names such as a module-local function `calc` versus an
-                // unrelated global `calc`.  Owner-qualified SymbolIDs above
-                // still enable scalable cross-file references for modules,
-                // ports, parameters, typedef fields, macros, etc.
-                fallback_symbol_debug.clear();
-            }
-        }
-        if (fallback_symbol_debug.empty()) {
+        // Do not use unresolved `name:<identifier>` as a bridge out of an open
+        // buffer.  The AST path below can verify same-definition references
+        // precisely, but a closed shard cannot distinguish scopes for generic
+        // names such as a method-local `item` versus an unrelated `item` in a
+        // library file.  Only a declaration that lives in a closed file needs
+        // the bridge, because nothing can walk its AST to do better.
+        //
+        // Testing the declaration's own URI rather than the request URI is what
+        // makes the guard hold: an open file is normally listed in the filelist
+        // too, so its own closed shard offers exactly the `name:` ID this is
+        // meant to refuse.  Owner-qualified SymbolIDs above still carry
+        // cross-file references for modules, ports, parameters, typedef fields
+        // and macros.
+        if (!get_state(target_def->uri)) {
             for (const auto& extra : *extra_idx) {
                 if (extra.uri != target_def->uri)
                     continue;
@@ -3225,6 +4111,130 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const SymbolID include_bridge_name_id =
         allow_include_name_bridge ? SymbolID::from_canonical("name:" + target->name) : SymbolID{};
 
+    // Package members are reached from other files by import, and an importing
+    // file cannot attribute the bare name to its owning package on its own:
+    //
+    //   common_pkg.sv   package common_pkg; function void foo(); ...
+    //                     -> package_subroutine::common_pkg::foo
+    //   pkg_use.sv      import common_pkg::*; ... foo();
+    //                     -> name:foo, because this shard never saw the package
+    //
+    // Bridge the two, but only into shards whose own import list makes this
+    // package's members visible, so unrelated same-named symbols elsewhere in
+    // the project cannot be merged into the rename.
+    std::string target_package;
+    {
+        auto owning_package = [&](const SyntaxIndex& index) {
+            for (const auto& [package_name, symbols] : index.package_symbols) {
+                if (std::find(symbols.begin(), symbols.end(), target->name) != symbols.end())
+                    return package_name;
+            }
+            return std::string{};
+        };
+        if (target_def->uri == uri)
+            target_package = owning_package(get_structural_index(*state));
+        if (target_package.empty()) {
+            for (const auto& extra : *extra_idx) {
+                if (extra.uri != target_def->uri)
+                    continue;
+                target_package = owning_package(extra.index_ref());
+                break;
+            }
+        }
+    }
+    const SymbolID import_bridge_name_id =
+        target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
+
+    // `handle.member` in another file is recorded under the receiver's bare
+    // type name and a kind-neutral `class_member::` prefix, because that shard
+    // never parsed the class body: it knows neither the owning package nor
+    // whether the member is a field or a method.  Treat that spelling as the
+    // same symbol.  When the class is package-scoped the alias is admitted only
+    // inside shards importing that package, so a same-named member on an
+    // unrelated class stays out of the result.
+    SymbolID class_member_alias_id;
+    std::string class_member_package;
+    std::string class_member_class;
+    std::string class_member_name;
+    for (const auto prefix : {std::string_view("class_field::"),
+                              std::string_view("class_method::")}) {
+        if (!target_symbol_debug.starts_with(prefix))
+            continue;
+        const std::string_view rest = std::string_view(target_symbol_debug).substr(prefix.size());
+        const auto member_sep = rest.rfind("::");
+        if (member_sep == std::string_view::npos)
+            break;
+        const auto owner = rest.substr(0, member_sep);
+        const auto member = rest.substr(member_sep + 2);
+        const auto scope_sep = owner.rfind("::");
+        if (scope_sep == std::string_view::npos) {
+            class_member_class = std::string(owner);
+        } else {
+            class_member_package = std::string(owner.substr(0, scope_sep));
+            class_member_class = std::string(owner.substr(scope_sep + 2));
+        }
+        class_member_name = std::string(member);
+        if (!class_member_class.empty())
+            class_member_alias_id = SymbolID::from_canonical(
+                "class_member::" + class_member_class + "::" + class_member_name);
+        break;
+    }
+
+    // An unqualified inherited member — `depth` inside a class that extends the
+    // one declaring it — is recorded by the deriving file's shard as
+    // `class_member::<that class>::depth`, because that shard never parsed the
+    // base class and cannot name the owner.  Complete the hop here: accept such
+    // an occurrence only when its class really derives from the class the
+    // clicked declaration belongs to, so an unrelated class with a same-named
+    // member stays out of references and rename.
+    std::vector<ClassLookupShard> hierarchy_shards;
+    std::unordered_map<std::string, bool> derives_cache;
+    const auto* current_structural_for_hierarchy =
+        class_member_class.empty() ? nullptr : &get_structural_index(*state);
+    if (current_structural_for_hierarchy) {
+        hierarchy_shards.reserve(extra_idx->size() + 1);
+        hierarchy_shards.push_back(ClassLookupShard{current_structural_for_hierarchy, &uri});
+        for (const auto& extra : *extra_idx)
+            hierarchy_shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+    }
+
+    auto is_inherited_member_occurrence = [&](const ReferenceEntry& ref) {
+        static constexpr std::string_view kPrefix = "class_member::";
+        if (class_member_class.empty() || !ref.symbol_debug.starts_with(kPrefix))
+            return false;
+        const std::string_view rest = std::string_view(ref.symbol_debug).substr(kPrefix.size());
+        const auto member_sep = rest.rfind("::");
+        if (member_sep == std::string_view::npos)
+            return false;
+        if (rest.substr(member_sep + 2) != class_member_name)
+            return false;
+        std::string derived(rest.substr(0, member_sep));
+        if (derived == class_member_class)
+            return false; // already covered by class_member_alias_id
+        auto [it, inserted] = derives_cache.try_emplace(derived, false);
+        if (inserted)
+            it->second = class_derives_from(hierarchy_shards, derived, class_member_class);
+        return it->second;
+    };
+
+    auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports) {
+        // A class outside any package is reached by bare name, so there is no
+        // import to require.
+        if (class_member_package.empty())
+            return true;
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == class_member_package &&
+                   (import.wildcard || import.symbol_name == class_member_class);
+        });
+    };
+
+    auto imports_target_package = [&](const std::vector<ImportEntry>& imports) {
+        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+            return import.package_name == target_package &&
+                   (import.wildcard || import.symbol_name == target->name);
+        });
+    };
+
     auto index_includes_target_source = [&](const SyntaxIndex& index) {
         // Included-file declarations can be seen under two different syntactic
         // worlds: the standalone header that the user opened, and every parsed
@@ -3241,7 +4251,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                          target_def->uri) != index.include_dependencies.end();
     };
 
-    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref) {
+    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref,
+                                        const std::vector<ImportEntry>& imports) {
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
             return true;
         if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
@@ -3251,6 +4262,14 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (include_bridge_name_id && ref.symbol_id == include_bridge_name_id &&
             index_includes_target_source(index))
+            return true;
+        if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
+            imports_target_package(imports))
+            return true;
+        if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
+            admits_class_member_alias(imports))
+            return true;
+        if (is_inherited_member_occurrence(ref) && admits_class_member_alias(imports))
             return true;
         return false;
     };
@@ -3320,7 +4339,13 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     std::unordered_set<std::string> open_uris;
     for (const auto& [state_uri, state] : open_states) {
         open_state_by_uri[state_uri] = state;
-        open_uris.insert(state_uri);
+        // Compare against extra.uri's canonical spelling below, not the raw
+        // client URI: a client can open a file through a symlinked path while
+        // the filelist indexer reaches the same file through its canonical
+        // path (uri_from_path() resolves symlinks via weakly_canonical()).  A
+        // raw string mismatch here would fail to skip the file's own closed
+        // shard, double-counting every reference in it.
+        open_uris.insert(state ? uri_from_path(state->normalized_path) : state_uri);
     }
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
@@ -3380,12 +4405,24 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // would require closed/project-file ASTs in the resolver.  The
             // SymbolID path avoids that by matching `module:memory` directly.
             const auto open_index = get_structural_index(*state);
+            // The structural index deliberately omits imports; the dynamic
+            // shard is the cached view that carries them.
+            const auto& open_imports =
+                import_bridge_name_id ? get_dynamic_index(*state).imports : open_index.imports;
             for (const auto& ref : open_index.references) {
-                if (reference_matches_target(open_index, ref))
+                if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
-            if (target_info.kind == DefinitionTargetKind::ClassMember &&
-                target_symbol_debug.starts_with("class_method::"))
+            if ((target_info.kind == DefinitionTargetKind::ClassMember &&
+                 target_symbol_debug.starts_with("class_method::")) ||
+                target_symbol_debug.starts_with("class_field::"))
+                // A class field is written both bare inside the class body and
+                // as `handle.field` elsewhere.  Only the first form carries the
+                // scoped `class_field::` identity in a shard: the second is
+                // indexed as an unresolved name, because the shard cannot type
+                // the receiver.  Verifying candidate tokens against the
+                // declaration recovers those uses without widening the
+                // SymbolID match to every same-named symbol in the project.
                 visit_tree(*state->tree, state_uri, resolve_snapshot);
         } else {
             visit_tree(*state->tree, state_uri, resolve_snapshot);
@@ -3397,7 +4434,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     for (const auto& extra : *extra_idx) {
         if (open_uris.contains(extra.uri))
             continue;
-        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id)
+        if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
+            !import_bridge_name_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -3405,7 +4443,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // closer to the v1.0.4 model; explicit references / rename requests pay
         // the linear scan cost over compact ReferenceEntry records instead.
         for (const auto& ref : extra.index_ref().references) {
-            if (reference_matches_target(extra.index_ref(), ref))
+            if (reference_matches_target(extra.index_ref(), ref, extra.index_ref().imports))
                 add_indexed_reference(extra.uri, extra.index_ref(), ref);
         }
     }
@@ -3475,8 +4513,11 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     for (const auto& dir : include_dirs)
         normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
 
+    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
     include_dirs_ = std::move(normalized_include_dirs);
+    include_dir_paths_ = std::move(resolved_include_dirs);
 
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
@@ -3527,6 +4568,8 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     for (const auto& path : extra_files)
         normalized_extra_files.push_back(normalize_filesystem_path(path).string());
 
+    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     // Apply every parse-affecting project input under one lock.  A config reload
@@ -3536,6 +4579,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // can still burn CPU / shared-filesystem bandwidth while they parse.
     defines_ = defines;
     include_dirs_ = std::move(normalized_include_dirs);
+    include_dir_paths_ = std::move(resolved_include_dirs);
 
     filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_extra_files);
@@ -3572,6 +4616,15 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     for (const auto& uri : changed_uris)
         changed_paths.push_back(normalized_project_path(uri));
 
+    // Open-buffer header text is kept across keystrokes with no revalidation, so
+    // this notification is the only thing that can make it stale.  Drop it before
+    // taking map_mutex_: OpenParseHeaderCache has its own mutex and the same rule
+    // as HeaderTextCache — never take it under map_mutex_.
+    for (const auto& path : deleted_paths)
+        open_parse_header_texts_.invalidate(path);
+    for (const auto& path : changed_paths)
+        open_parse_header_texts_.invalidate(path);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     bool queued_changed_file = false;
@@ -3587,16 +4640,46 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     }
 
     for (const auto& path : changed_paths) {
-        if (path.empty() || !extra_file_set_.contains(path) || !seen_changed_paths.insert(path).second)
+        if (path.empty() || !seen_changed_paths.insert(path).second)
             continue;
 
-        // Queue only the explicitly reported file.  This is the important HPC
-        // property: a rename/workspace-edit notification does not trigger a
-        // whole-design rescan and does not perform metadata checks for every
-        // filelist entry.  The background worker will parse disk contents for a
-        // closed file, or use the live DocumentState if the file is open.
-        queue_background_file_locked(path, /*front=*/true);
-        queued_changed_file = true;
+        if (extra_file_set_.contains(path)) {
+            // Queue only the explicitly reported file.  This is the important HPC
+            // property: a rename/workspace-edit notification does not trigger a
+            // whole-design rescan and does not perform metadata checks for every
+            // filelist entry.  The background worker will parse disk contents for a
+            // closed file, or use the live DocumentState if the file is open.
+            queue_background_file_locked(path, /*front=*/true);
+            queued_changed_file = true;
+            continue;
+        }
+
+        // A shared header is usually not a filelist entry, so the branch above
+        // never queues it.  Its declarations reach the project index only
+        // through the shard background_index_loop() builds for it, and that
+        // shard is claimed once per generation: without dropping the claim the
+        // header keeps serving whatever it contained when the claim was taken,
+        // for the rest of the session.
+        const auto header_uri = uri_from_path(path);
+        const bool was_indexed_header = background_header_claims_.erase(header_uri) > 0;
+        background_header_shards_.erase(header_uri);
+        standalone_header_uris_.erase(header_uri);
+        if (!was_indexed_header)
+            continue;
+        invalidate_extra_snapshots_locked();
+
+        // Nothing queues a header directly.  Re-queue the files that `include`
+        // it instead; the first one to commit re-claims the header and rebuilds
+        // its shard from that file's fresh tree.
+        for (const auto& [entry_uri, entry] : extra_cache_) {
+            if (!entry.index)
+                continue;
+            const auto& deps = entry.index->include_dependencies;
+            if (std::find(deps.begin(), deps.end(), header_uri) == deps.end())
+                continue;
+            queue_background_file_locked(entry.path, /*front=*/true);
+            queued_changed_file = true;
+        }
     }
 
     if (!queued_changed_file && !removed_deleted_file)
@@ -3636,8 +4719,14 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
 std::shared_ptr<const std::vector<ExtraFileInfo>>
 Analyzer::build_extra_file_snapshot_locked() const {
     auto result = std::make_shared<std::vector<ExtraFileInfo>>();
-    result->reserve(extra_cache_.size());
-    for (const auto& [key, entry] : extra_cache_) {
+    result->reserve(extra_cache_.size() + background_header_shards_.size());
+    // Header shards belong here for the same reason they belong in the index
+    // snapshot: a file's shard no longer carries what it `include`d, and an open
+    // buffer past kDirectivesOnlySeedBytes does not carry it either.  Without
+    // this, definition and every other feature reading this snapshot could only
+    // find a header's declarations through some includer that happened to be
+    // parsed before the projection was installed.
+    const auto append = [&](const ExtraFileCacheEntry& entry) {
         // Closed project files intentionally have no DocumentState here.  They
         // are represented only by the compact SyntaxIndex shard.  If the file
         // is open, attach the live state so AST-only features can inspect
@@ -3655,7 +4744,7 @@ Analyzer::build_extra_file_snapshot_locked() const {
                 .state = it->second,
                 .index = entry.index,
             });
-            continue;
+            return;
         }
         result->push_back(ExtraFileInfo{
             .path = entry.path,
@@ -3663,6 +4752,14 @@ Analyzer::build_extra_file_snapshot_locked() const {
             .state = nullptr,
             .index = entry.index,
         });
+    };
+    for (const auto& [key, entry] : extra_cache_)
+        append(entry);
+    for (const auto& [key, entry] : background_header_shards_) {
+        // A header that is also a filelist entry is already above; appending it
+        // twice would give every by-name lookup two candidates for one file.
+        if (!extra_cache_.contains(key))
+            append(entry);
     }
     return result;
 }
@@ -3849,10 +4946,13 @@ std::vector<ParseDiagInfo> Analyzer::semantic_diagnostics(const std::string& uri
     const auto it = semantic_diagnostics_.find(uri);
     if (it == semantic_diagnostics_.end())
         return {};
+    // Mirror set_semantic_diagnostics(): only open buffers are version-tracked.
+    // Closed/filelist-only files (and files opened via the synchronous CLI
+    // Analyzer::open() path, which does not register a version) have no
+    // latest_version_ entry — publish their diagnostics unconditionally rather
+    // than treating "untracked" the same as "stale".
     const auto cur_it = latest_version_.find(uri);
-    if (cur_it == latest_version_.end())
-        return {};
-    if (it->second.version != cur_it->second)
+    if (cur_it != latest_version_.end() && it->second.version != cur_it->second)
         return {};  // stale cache entry — don't publish
     return it->second.diags;
 }
@@ -4100,6 +5200,56 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
     return build(target->name, 0, seen);
 }
 
+bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {
+    bool queued = false;
+    for (const auto& [other_uri, other_state] : docs_) {
+        if (other_uri == uri || !other_state ||
+            !other_state->include_dependency_set.contains(uri))
+            continue;
+        // Indirect include fanout belongs on the background path.  A common
+        // header can be included by many open files; reparsing all of them
+        // synchronously would violate the current-file AST / background-project-
+        // index split and can lag badly on shared HPC filesystems.  The worker
+        // reparses live open buffers from their in-memory text and open include
+        // overlays.
+        queue_background_file_locked(other_state->normalized_path, /*front=*/true);
+        queued = true;
+    }
+    // Closed project files get one requeue between them, not one each.
+    //
+    // A header's declarations live in the header's own shard, and that shard is
+    // rebuilt by whichever file claims the header — so a single includer is
+    // enough to refresh what the project index answers about this header, from
+    // the unsaved buffer via the open overlays.  Reparsing all of them instead
+    // costs one parse per includer, hundreds for a common header, on every
+    // typing burst; and saving asks for that same full fanout again through
+    // refresh_changed_extra_files(), against the text that actually reached
+    // disk.  A closed file's own shard is index-authoritative from disk anyway,
+    // so what it loses here is a copy of header declarations the header's shard
+    // already holds.
+    //
+    // Dropping the claim is what makes the requeue rebuild the header rather
+    // than serve the shard claimed under the previous text.  The old shard stays
+    // in place until the new one commits, so the project index never has a gap.
+    background_header_claims_.erase(uri);
+    standalone_header_uris_.erase(uri);
+    for (const auto& [extra_uri, entry] : extra_cache_) {
+        // Test the shard's dependency list in place.  Offering a
+        // `std::vector<std::string>{}` fallback made the conditional expression
+        // a prvalue, so every shard's list was deep-copied on every edit, under
+        // map_mutex_.
+        if (docs_.contains(extra_uri) || !entry.index)
+            continue;
+        const auto& deps = entry.index->include_dependencies;
+        if (std::find(deps.begin(), deps.end(), uri) == deps.end())
+            continue;
+        queue_background_file_locked(entry.path, /*front=*/true);
+        queued = true;
+        break;
+    }
+    return queued;
+}
+
 void Analyzer::queue_background_file_locked(std::string path, bool front) const {
     if (!background_pending_set_.insert(path).second)
         return;
@@ -4146,6 +5296,10 @@ void Analyzer::schedule_background_reindex_locked() const {
     // committing each shard, so a slow parse can never overwrite newer project
     // state.
     ++background_generation_;
+    // Include directories may have moved, so a path the previous parse resolved
+    // an `include to is no longer evidence of what the same directive resolves
+    // to now.  Size and mtime cannot catch that; only dropping the cache can.
+    open_parse_header_texts_.clear();
     background_pending_files_.clear();
     background_pending_set_.clear();
     // Header shards belong to the generation that built them.  A changed header,
@@ -4154,6 +5308,7 @@ void Analyzer::schedule_background_reindex_locked() const {
     // from the previous configuration.
     background_header_shards_.clear();
     background_header_claims_.clear();
+    standalone_header_uris_.clear();
     for (const auto& path : extra_files_)
         queue_background_file_locked(path, /*front=*/false);
     start_background_indexer_locked();
@@ -4174,7 +5329,7 @@ void Analyzer::background_index_loop() const {
     // include_dirs_ bumps the background generation before any later work can
     // be queued, so a matching generation means the copy is still current.
     std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+    std::vector<std::filesystem::path> include_dirs;
     uint64_t config_generation = std::numeric_limits<uint64_t>::max();
 
     while (!background_stop_.load()) {
@@ -4232,7 +5387,7 @@ void Analyzer::background_index_loop() const {
             generation = background_generation_;
             if (config_generation != generation) {
                 defines = defines_;
-                include_dirs = include_dirs_;
+                include_dirs = include_dir_paths_;
                 config_generation = generation;
             }
             open_overlays.reserve(docs_.size());
@@ -4266,24 +5421,61 @@ void Analyzer::background_index_loop() const {
             // DocumentState if the user has not edited it meanwhile.
             auto reparsed_live_doc = make_state(uri, live_doc->text);
             auto live_index = get_dynamic_index(*reparsed_live_doc);
-            std::lock_guard<std::mutex> lock(map_mutex_);
-            if (generation == background_generation_) {
-                if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second == live_doc) {
-                    docs_[uri] = reparsed_live_doc;
-                    invalidate_extra_snapshots_locked();
-                    if (extra_file_set_.contains(path_string)) {
-                        extra_cache_[uri] = ExtraFileCacheEntry{
-                            .path = path_string,
-                            .uri = uri,
-                            .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
-                        };
+            std::vector<std::string> headers_to_build;
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (generation == background_generation_) {
+                    if (const auto doc = docs_.find(uri);
+                        doc != docs_.end() && doc->second == live_doc) {
+                        docs_[uri] = reparsed_live_doc;
                         invalidate_extra_snapshots_locked();
-                        schedule_background_project_publish_locked();
+                        if (extra_file_set_.contains(path_string)) {
+                            extra_cache_[uri] = ExtraFileCacheEntry{
+                                .path = path_string,
+                                .uri = uri,
+                                .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
+                            };
+                            invalidate_extra_snapshots_locked();
+                            schedule_background_project_publish_locked();
+                        }
+                    }
+
+                    // Claim this buffer's headers too.  What makes an open buffer
+                    // different is its unsaved text, and a header's shard is built
+                    // from the header itself, so nothing about it is unsaved.
+                    // Skipping the claim here left a header that only an open
+                    // buffer includes without a shard of its own, which is both a
+                    // gap in the project index and the one case the edit path
+                    // cannot serve as directives alone.
+                    for (const auto& dependency : reparsed_live_doc->include_dependencies) {
+                        if (background_header_claims_.insert(dependency).second)
+                            headers_to_build.push_back(dependency);
                     }
                 }
             }
-            --background_index_active_;
-            background_cv_.notify_all();
+
+            auto built_headers = build_header_shards(headers_to_build, *reparsed_live_doc, defines,
+                                                     include_dirs, open_overlays,
+                                                     background_header_texts_, generation);
+            {
+                std::lock_guard<std::mutex> lock(map_mutex_);
+                if (generation == background_generation_ && !built_headers.empty()) {
+                    for (auto& header : built_headers) {
+                        if (header.stands_alone)
+                            standalone_header_uris_.insert(header.uri);
+                        background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                            .path = path_from_file_uri(header.uri),
+                            .uri = header.uri,
+                            .index = std::move(header.index),
+                        };
+                    }
+                    invalidate_extra_snapshots_locked();
+                }
+                --background_index_active_;
+                if (background_pending_files_.empty() && background_index_active_ == 0)
+                    schedule_background_project_publish_locked();
+                background_cv_.notify_all();
+            }
             continue;
         }
 
@@ -4317,53 +5509,55 @@ void Analyzer::background_index_loop() const {
             // flight, the live buffer is newer and must win. The didOpen /
             // didChange path builds and commits that live shard outside this
             // mutex, so do not build it here while holding map_mutex_.
-            if (const auto doc = docs_.find(uri); doc != docs_.end() && doc->second) {
-                --background_index_active_;
-                background_cv_.notify_all();
-                continue;
+            const bool opened_mid_parse = [&] {
+                const auto doc = docs_.find(uri);
+                return doc != docs_.end() && doc->second;
+            }();
+            if (!opened_mid_parse) {
+                extra_cache_[uri] = ExtraFileCacheEntry{
+                    .path = path_string,
+                    .uri = uri,
+                    .index = std::move(committed_index),
+                };
+                invalidate_extra_snapshots_locked();
             }
-
-            extra_cache_[uri] = ExtraFileCacheEntry{
-                .path = path_string,
-                .uri = uri,
-                .index = std::move(committed_index),
-            };
-            invalidate_extra_snapshots_locked();
 
             // Claim the headers this parse pulled in.  Claiming inside the same
             // critical section that commits the shard is what keeps two workers
             // from building the same header concurrently; the build itself
             // happens below, outside the lock.
+            //
+            // Claimed even when the buffer opened mid-parse and this file's own
+            // shard is discarded: a header's shard is built from the header, so
+            // whose text pulled it in does not matter.  Dropping the claim there
+            // left a header nothing else includes without a shard at all, since
+            // nothing re-queues a file that is now open.
             for (const auto& dependency : state->include_dependencies) {
                 if (background_header_claims_.insert(dependency).second)
                     headers_to_build.push_back(dependency);
             }
-
         }
 
-        // Build the claimed headers from this file's tree, outside map_mutex_
-        // for the same reason the file's own shard is built outside it.  This
-        // worker stays counted as active until they are committed, so the
-        // publish below cannot fire on a project index that is still missing
-        // header shards.
-        std::vector<ExtraFileCacheEntry> header_shards;
-        header_shards.reserve(headers_to_build.size());
-        for (const auto& header_uri : headers_to_build) {
-            auto header_index = std::make_shared<SyntaxIndex>(
-                SyntaxIndex::build(*state->tree, header_source_text(*state->source_manager, header_uri),
-                                   IndexDepth::Declarations, header_uri));
-            header_shards.push_back(ExtraFileCacheEntry{
-                .path = path_from_file_uri(header_uri),
-                .uri = header_uri,
-                .index = std::move(header_index),
-            });
-        }
+        // Build the claimed headers outside map_mutex_ for the same reason the
+        // file's own shard is built outside it.  This worker stays counted as
+        // active until they are committed, so the publish below cannot fire on a
+        // project index that is still missing header shards.
+        auto built_headers = build_header_shards(headers_to_build, *state, defines, include_dirs,
+                                                 open_overlays, background_header_texts_,
+                                                 generation);
 
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            if (generation == background_generation_ && !header_shards.empty()) {
-                for (auto& shard : header_shards)
-                    background_header_shards_[shard.uri] = std::move(shard);
+            if (generation == background_generation_ && !built_headers.empty()) {
+                for (auto& header : built_headers) {
+                    if (header.stands_alone)
+                        standalone_header_uris_.insert(header.uri);
+                    background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                        .path = path_from_file_uri(header.uri),
+                        .uri = header.uri,
+                        .index = std::move(header.index),
+                    };
+                }
                 invalidate_extra_snapshots_locked();
             }
 

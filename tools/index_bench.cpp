@@ -15,6 +15,12 @@
 #include <string>
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--version") {
+            std::cout << "index-bench " << LAZYVERILOG_VERSION << "\n";
+            return 0;
+        }
+    }
     if (argc < 2) {
         std::cerr << "usage: index-bench <project-root> [repeat]\n";
         return 2;

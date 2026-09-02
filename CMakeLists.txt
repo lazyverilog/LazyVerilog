@@ -110,6 +110,22 @@ string(REPLACE
 file(WRITE "${_caps_h}" "${_caps_content}")
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Version string for --version, from the nearest git tag
+# ──────────────────────────────────────────────────────────────────────────────
+execute_process(
+    COMMAND git describe --tags --always --dirty
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE LAZYVERILOG_GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _git_describe_result
+    ERROR_QUIET
+)
+if(NOT _git_describe_result EQUAL 0 OR LAZYVERILOG_GIT_VERSION STREQUAL "")
+    set(LAZYVERILOG_GIT_VERSION "unknown")
+endif()
+add_compile_definitions(LAZYVERILOG_VERSION="${LAZYVERILOG_GIT_VERSION}")
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main LSP server binary
 # ──────────────────────────────────────────────────────────────────────────────
 set(LAZYVERILOG_SOURCES
@@ -131,6 +147,7 @@ set(LAZYVERILOG_SOURCES
     src/features/signature_help.cpp
     src/features/inlay_hints.cpp
     src/features/workspace_symbols.cpp
+    src/features/document_symbols.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoinst.cpp
@@ -167,7 +184,11 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_path_uri.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
+    tests/test_open_parse_header_cache.cpp
+    tests/test_open_header_projection.cpp
+    tests/test_open_shard_scope.cpp
     tests/test_syntax_index.cpp
+    tests/test_shared_header_scaling.cpp
     tests/test_formatter.cpp
     tests/test_lint.cpp
     tests/test_autoff.cpp
@@ -179,6 +200,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_lsp_features.cpp
     tests/test_completion.cpp
     tests/test_folding_ranges.cpp
+    tests/test_document_symbols.cpp
     tests/test_opentitan_benchmark.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
     src/features/completion.cpp
@@ -204,6 +226,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/hover.cpp
     src/features/signature_help.cpp
     src/features/workspace_symbols.cpp
+    src/features/document_symbols.cpp
     src/features/folding_range.cpp
 )
 

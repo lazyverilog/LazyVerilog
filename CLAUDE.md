@@ -51,6 +51,17 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
   `--cpus 0`, user CPU, and maxRSS.  A change can leave desktop wall time flat while
   adding user CPU, which is exactly what hurts a node that granted one core.
 - Worker count comes from the CPU slice (`src/cpu_budget.cpp`), capped at 8.
+- Compare two commits by building `index-bench` in a worktree and pointing
+  `--binary` at it.  Use the **same `CMAKE_BUILD_TYPE` on both sides** —
+  `Release` vs `RelWithDebInfo` swamps the effect being measured.
+- A shared header re-parsed once per includer is correct and expected.  An
+  *index* pass that also walks the whole header is not: it multiplies the
+  largest file in the project by the number of includers.  Watch `maxRSS` —
+  a per-file map keyed on header content shows up there first.
+- Guarded in CI by `./build/lazyverilog-tests "[scaling]"`
+  (`tests/test_shared_header_scaling.cpp`).  Write scaling guards as a **ratio
+  against a structurally identical input, minimum of N runs**, never an absolute
+  millisecond budget — that is what survives a shared CI runner.
 - Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
 
 ### Releasing a New Version
@@ -100,6 +111,13 @@ ctest --test-dir build                          # test gate — must pass first
   file AST.  Prefer caching such AST-derived indexes per immutable
   `DocumentState` snapshot when they are reused across requests; invalidate by
   replacing the `DocumentState` on `didChange`.
+- An `include`d header's declarations live in **the header's own shard**, not in
+  its includers'.  Once a header parses standalone, the background indexer serves
+  the rest of the burst only its preprocessor directives, so a closed includer's
+  shard generally does not carry them; an open buffer's does, and so do the few
+  files that were already parsing when the projection was installed.  Resolve
+  header symbols through the header's shard, never by assuming either.  See
+  `docs/dev/indexing.md` ("Shared `include`d headers") and `PERF.md` round 6.
 - Do not move expensive whole-project merges or closed-file AST walks onto hot
   request paths.  Background indexing should publish reusable index snapshots,
   and request handlers should consume those snapshots without reparsing or

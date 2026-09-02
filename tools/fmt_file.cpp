@@ -21,6 +21,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "-i" || arg == "--in-place") {
             in_place = true;
         }
+        else if (arg == "--version") {
+            std::cout << "lazyverilog-fmt " << LAZYVERILOG_VERSION << "\n";
+            return 0;
+        }
         else
             path = argv[i];
     }

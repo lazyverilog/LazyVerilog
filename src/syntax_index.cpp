@@ -16,53 +16,6 @@
 using namespace slang;
 using namespace slang::syntax;
 
-static std::string make_fn_signature(const FunctionPrototypeSyntax& proto,
-                                     const std::string& name,
-                                     const slang::SourceManager& sm) {
-    const bool is_task =
-        proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword;
-    const std::string ports =
-        proto.portList ? trim_copy(proto.portList->toString()) : "";
-
-    std::string formatted_ports;
-    if (ports.size() >= 2 && ports.front() == '(' && ports.back() == ')') {
-        auto inner = trim_copy(ports.substr(1, ports.size() - 2));
-        if (inner.empty()) {
-            formatted_ports = "()";
-        } else {
-            std::vector<std::string> parts;
-            size_t start = 0;
-            while (start <= inner.size()) {
-                auto comma = inner.find(',', start);
-                if (comma == std::string::npos) {
-                    parts.push_back(trim_copy(inner.substr(start)));
-                    break;
-                }
-                parts.push_back(trim_copy(inner.substr(start, comma - start)));
-                start = comma + 1;
-            }
-            if (parts.size() <= 1) {
-                formatted_ports = "(" + inner + ")";
-            } else {
-                formatted_ports = "(\n";
-                for (size_t i = 0; i < parts.size(); ++i) {
-                    formatted_ports += "    " + parts[i];
-                    if (i + 1 != parts.size())
-                        formatted_ports += ",\n";
-                }
-                formatted_ports += "\n)";
-            }
-        }
-    } else {
-        formatted_ports = ports;
-    }
-
-    if (is_task)
-        return "```\ntask " + name + formatted_ports + "\n```";
-    const std::string ret = render_syntax_node_text(sm, *proto.returnType);
-    return "```\nfunction " + ret + " " + name + formatted_ports + "\n```";
-}
-
 static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
                                               slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -90,7 +43,7 @@ static MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolv
                                           const DefineDirectiveSyntax& def) {
     MacroEntry mac;
     mac.name = std::string(def.name.valueText());
-    mac.file_id = resolver.for_token(index, sm, def.name);
+    mac.file_id = resolver.for_declaration_token(index, sm, def.name);
     if (def.formalArguments) {
         mac.is_function_like = true;
         for (const auto* arg : def.formalArguments->args) {
@@ -205,7 +158,7 @@ static void add_port(std::vector<PortEntry>& ports, SyntaxIndex& index,
     auto [line, col] = token_pos_line1_col0(sm, name);
     ports.push_back(PortEntry{
         .name = token_value_text(name),
-        .file_id = resolver.for_token(index, sm, name),
+        .file_id = resolver.for_declaration_token(index, sm, name),
         .direction = std::move(direction),
         .type = std::move(type),
         .decl_type = std::move(decl_type),
@@ -350,7 +303,7 @@ struct InstanceScan {
             entry.parent_module = std::string(parent_module);
             if (instance->decl) {
                 entry.instance_name = token_value_text(instance->decl->name);
-                entry.file_id = resolver->for_token(*index, *sm, instance->decl->name);
+                entry.file_id = resolver->for_declaration_token(*index, *sm, instance->decl->name);
                 entry.line = token_pos_line1_col0(*sm, instance->decl->name).first;
             }
             entry.start_line = entry.line > 0 ? entry.line - 1 : 0;
@@ -374,7 +327,7 @@ struct InstanceScan {
                 entry.connections.push_back(NamedPortConn{
                     .port_name = token_value_text(named->name),
                     .signal_name = simple_identifier_from_expr(named->expr),
-                    .file_id = resolver->for_token(*index, *sm, named->name),
+                    .file_id = resolver->for_declaration_token(*index, *sm, named->name),
                     .line = line,
                     .col = col,
                     .hint_col = paren_line == line ? paren_col + 1 : col,
@@ -410,14 +363,43 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                            std::string parent_scope);
+                            std::string parent_scope, bool scoped_lookup);
+
+// Emit one ImportEntry per imported item of a `import pkg::x;` / `import pkg::*;`
+// declaration.  Called from the member walks that every index depth already
+// performs, so closed project shards carry imports without paying a separate
+// whole-tree traversal for them.
+static void add_package_imports(const PackageImportDeclarationSyntax& node, SyntaxIndex& index,
+                                SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                                std::string_view parent_scope, int scope_end_line) {
+    const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
+    (void)decl_col;
+
+    for (const auto* item : node.items) {
+        if (!item)
+            continue;
+
+        ImportEntry entry;
+        entry.package_name = token_value_text(item->package);
+        if (entry.package_name.empty())
+            continue;
+        entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
+        if (!entry.wildcard)
+            entry.symbol_name = token_value_text(item->item);
+        entry.parent_scope = std::string(parent_scope);
+        entry.file_id = resolver.for_declaration_token(index, sm, item->package);
+        entry.start_line = decl_line;
+        entry.end_line = scope_end_line;
+        index.imports.push_back(std::move(entry));
+    }
+}
 
 static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& index,
                            SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                            std::string_view source, IndexDepth depth = IndexDepth::Full) {
     ModuleEntry entry;
     entry.name = token_value_text(module.header->name);
-    entry.file_id = resolver.for_token(index, sm, module.header->name);
+    entry.file_id = resolver.for_declaration_token(index, sm, module.header->name);
     auto [line, col] = token_pos_line1_col0(sm, module.header->name);
     entry.line = line;
     entry.col = col;
@@ -460,7 +442,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 auto [ml, mc] = token_pos_line1_col0(sm, item->name);
                 entry.modports.push_back(ModportEntry{
                     .name = token_value_text(item->name),
-                    .file_id = resolver.for_token(index, sm, item->name),
+                    .file_id = resolver.for_declaration_token(index, sm, item->name),
                     .line = ml,
                     .col = mc,
                 });
@@ -499,15 +481,24 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 package_scoped_key(entry.name, member_name), index.values.size());
     };
 
+    const auto module_end_line = source_range_lines(sm, module.sourceRange()).second;
+
     for (const auto* member : module.members) {
         if (!member)
             continue;
-        if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
+        if (const auto* import_decl = member->as_if<PackageImportDeclarationSyntax>()) {
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+        } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
             std::optional<std::string> type_text;
             for (const auto* decl : data->declarators) {
                 if (!decl)
                     continue;
-                if (!resolver.wants_declaration(index, sm, decl->name))
+                // A package builds its body out of `include`d files, and its
+                // members are exported API: whether the package's own root file
+                // happens to mention the name says nothing about who uses it.
+                // Applying the shared-header mentions filter here would drop
+                // most of a library package from the shard.
+                if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
                     continue;
                 if (!type_text)
                     type_text = render_syntax_node_text(sm, *data->type);
@@ -518,7 +509,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, *type_text, *decl),
                     .kind = "variable",
                     .parent_scope = entry.name,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .line = vl,
                     .col = vc,
                 });
@@ -536,10 +527,10 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 .type = render_syntax_node_text(sm, *proto.returnType),
                 .kind = std::string(proto.keyword.valueText()),
                 .parent_scope = entry.name,
-                .file_id = resolver.for_token(index, sm, name_tok),
+                .file_id = resolver.for_declaration_token(index, sm, name_tok),
                 .line = nl,
                 .col = nc,
-                .signature = make_fn_signature(proto, fn_name, sm),
+                .signature = make_subroutine_signature(proto, fn_name, sm),
             });
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
             // Body parameters (`localparam DEPTH = 1;`) as opposed to header
@@ -557,7 +548,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 for (const auto* decl : param->declarators) {
                     if (!decl)
                         continue;
-                    if (!resolver.wants_declaration(index, sm, decl->name))
+                    if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
                         continue;
                     if (!type_text) {
                         type_text = render_syntax_node_text(sm, *param->type);
@@ -573,7 +564,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                         .default_value = decl->initializer
                                              ? render_syntax_node_text(sm, *decl->initializer->expr)
                                              : std::string{},
-                        .file_id = resolver.for_token(index, sm, decl->name),
+                        .file_id = resolver.for_declaration_token(index, sm, decl->name),
                         .line = vl,
                         .col = vc,
                     });
@@ -591,7 +582,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // `obj.field` can resolve through find_typedef_field_definition().
             // The generic AST definition visitor intentionally skips aggregate
             // field declarators; member access is the correct path for fields.
-            process_typedef(*td, index, resolver, sm, entry.name);
+            process_typedef(*td, index, resolver, sm, entry.name, in_package);
         }
     }
 
@@ -634,7 +625,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -661,7 +652,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
                     .line = vl,
@@ -689,7 +680,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                            std::string parent_scope = {}) {
     ClassEntry entry;
     entry.name = token_value_text(cls.name);
-    entry.file_id = resolver.for_token(index, sm, cls.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, cls.name);
     entry.parent_scope = std::move(parent_scope);
     auto [line, col] = token_pos_line1_col0(sm, cls.name);
     entry.line = line;
@@ -702,7 +693,12 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         if (!item)
             continue;
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
-            if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
+            // `typedef registry #(T) type_id;` inside a class body is a member
+            // of that class, reached as `my_item::type_id`.  Indexing only the
+            // data declarators hides every such type from closed-file lookup.
+            if (const auto* nested = prop->declaration->as_if<TypedefDeclarationSyntax>()) {
+                process_typedef(*nested, index, resolver, sm, entry.name, /*scoped_lookup=*/true);
+            } else if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
                 const std::string type_text = render_syntax_node_text(sm, *data->type);
                 for (const auto* decl : data->declarators) {
                     if (!decl)
@@ -711,19 +707,49 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                     entry.fields.push_back(
                         FieldEntry{.name = token_value_text(decl->name),
                                    .type = type_text,
-                                   .file_id = resolver.for_token(index, sm, decl->name),
+                                   .file_id = resolver.for_declaration_token(index, sm, decl->name),
                                    .line = fl,
                                    .col = fc});
                 }
             }
         } else if (const auto* meth = item->as_if<ClassMethodDeclarationSyntax>()) {
             const auto& proto = *meth->declaration->prototype;
+            // A macro can generate a whole method (e.g. UVM's
+            // `UVM_SEQ_ITEM_PULL_IMP, which expands to `task get_next_item(...)`).
+            // render_syntax_node_text() deliberately renders such a name as its
+            // macro-invocation spelling (e.g. `` `FOO(bar)``) rather than the
+            // expanded identifier, which is right for hover/type text but wrong
+            // for a member's lookup key.  Use the resolved identifier text --
+            // and its own token, not the keyword's -- whenever the name is a
+            // simple identifier, matching the FunctionDeclarationSyntax handling
+            // above.
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
             MethodEntry m;
-            m.name = render_syntax_node_text(sm, *proto.name);
+            m.name = id_name ? std::string(id_name->identifier.valueText())
+                             : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
-            m.file_id = resolver.for_token(index, sm, proto.keyword);
-            auto [ml, mc] = token_pos_line1_col0(sm, proto.keyword);
+            m.file_id = resolver.for_declaration_token(index, sm, name_tok);
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
+            m.line = ml;
+            m.col = mc;
+            entry.methods.push_back(std::move(m));
+        } else if (const auto* proto_item = item->as_if<ClassMethodPrototypeSyntax>()) {
+            // `extern virtual function void raise_objection(...);` declares a
+            // member just as much as an inline body does — the body simply
+            // lives further down the file as `class::method`.  Indexing only
+            // inline bodies hides most of a class written in the extern style.
+            const auto& proto = *proto_item->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            MethodEntry m;
+            m.name = id_name ? std::string(id_name->identifier.valueText())
+                             : render_syntax_node_text(sm, *proto.name);
+            m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
+            m.file_id = resolver.for_declaration_token(index, sm, name_tok);
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             m.line = ml;
             m.col = mc;
             entry.methods.push_back(std::move(m));
@@ -739,11 +765,11 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
                              SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                             std::string parent_scope = {}) {
+                             std::string parent_scope = {}, bool scoped_lookup = false) {
     TypedefEntry entry;
     entry.name = token_value_text(td.name);
     entry.parent_scope = std::move(parent_scope);
-    entry.file_id = resolver.for_token(index, sm, td.name);
+    entry.file_id = resolver.for_declaration_token(index, sm, td.name);
     auto [td_line, td_col] = token_pos_line1_col0(sm, td.name);
     entry.line = td_line;
     entry.col = td_col;
@@ -755,7 +781,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 auto [em_line, em_col] = token_pos_line1_col0(sm, member->name);
                 entry.enum_members.push_back(EnumMemberEntry{
                     .name = token_value_text(member->name),
-                    .file_id = resolver.for_token(index, sm, member->name),
+                    .file_id = resolver.for_declaration_token(index, sm, member->name),
                     .line = em_line,
                     .col = em_col,
                 });
@@ -774,7 +800,7 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                 entry.fields.push_back(FieldEntry{
                     .name = token_value_text(decl->name),
                     .type = with_declarator_dimensions(sm, type_text, *decl),
-                    .file_id = resolver.for_token(index, sm, decl->name),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .line = fl,
                     .col = fc,
                 });
@@ -784,7 +810,13 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         entry.resolved = render_syntax_node_text(sm, *td.type);
     }
 
-    if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
+    // Any `::`-addressable owner, not just a package: a class-scoped `type_id`
+    // is spelled once per class, so keying only by bare name would let the
+    // first one seen win and drop every other class's copy at merge time.  A
+    // module scope is deliberately excluded — nothing can name `mod::t`, so the
+    // entry would never be looked up, and a shared header of N typedefs
+    // included by M modules would add N*M unreachable keys to the project.
+    if (scoped_lookup && !entry.parent_scope.empty())
         index.package_type_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
     index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
@@ -860,84 +892,52 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         } else {
             process_module(*mod, index, resolver, sm, source, depth);
         }
+    } else if (const auto* import_decl = member.as_if<PackageImportDeclarationSyntax>()) {
+        // Compilation-unit scope: visible to everything parsed after it, so it
+        // carries no enclosing scope name or end line.
+        add_package_imports(*import_decl, index, resolver, sm, {}, 0);
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
         process_class(*cls, index, resolver, sm);
     } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
         process_typedef(*td, index, resolver, sm);
-    }
-}
-
-static void collect_imports(const SyntaxNode& root, SyntaxIndex& index,
-                            SourceFileIdResolver& resolver, const slang::SourceManager& sm) {
-    struct ScopeFrame {
-        std::string name;
-        int end_line{0};
-    };
-
-    struct ImportVisitor : public SyntaxVisitor<ImportVisitor> {
-        SyntaxIndex& index;
-        SourceFileIdResolver& resolver;
-        const slang::SourceManager& sm;
-        std::vector<ScopeFrame> scope_stack;
-
-        ImportVisitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
-                      const slang::SourceManager& sm) :
-            index(index), resolver(resolver), sm(sm) {}
-
-        std::string current_scope() const {
-            return scope_stack.empty() ? std::string{} : scope_stack.back().name;
-        }
-
-        int current_end_line() const {
-            return scope_stack.empty() ? 0 : scope_stack.back().end_line;
-        }
-
-        void push_scope(std::string name, slang::SourceRange range) {
-            auto [start, end] = source_range_lines(sm, range);
-            (void)start;
-            scope_stack.push_back(ScopeFrame{.name = std::move(name), .end_line = end});
-        }
-
-        void handle(const ModuleDeclarationSyntax& node) {
-            push_scope(token_value_text(node.header->name), node.sourceRange());
-            visitDefault(node);
-            scope_stack.pop_back();
-        }
-
-        void handle(const ClassDeclarationSyntax& node) {
-            push_scope(token_value_text(node.name), node.sourceRange());
-            visitDefault(node);
-            scope_stack.pop_back();
-        }
-
-        void handle(const PackageImportDeclarationSyntax& node) {
-            const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
-            (void)decl_col;
-
-            for (const auto* item : node.items) {
-                if (!item)
-                    continue;
-
-                ImportEntry entry;
-                entry.package_name = token_value_text(item->package);
-                entry.wildcard = item->item.kind == slang::parsing::TokenKind::Star;
-                if (!entry.wildcard)
-                    entry.symbol_name = token_value_text(item->item);
-                entry.parent_scope = current_scope();
-                entry.file_id = resolver.for_token(index, sm, item->package);
-                entry.start_line = decl_line;
-                entry.end_line = current_end_line();
-
-                if (!entry.package_name.empty())
-                    index.imports.push_back(std::move(entry));
+    } else if (const auto* ps = member.as_if<ParameterDeclarationStatementSyntax>()) {
+        // Compilation-unit scope: `localparam int WIDTH = 8;` written outside
+        // any module or package.  A central params.svh is usually nothing but
+        // these, and without this branch none of it reached the project index —
+        // the file being edited still resolved such a name through its own AST,
+        // where the header's text is spliced in, so only closed files went
+        // without.  Carries no parent_scope, which is what makes it visible to
+        // every file that includes the header rather than to one module.
+        const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>();
+        if (!param)
+            return;
+        // Rendered on the first declarator actually kept, for the same reason
+        // the module-scope path defers it: a shared header's parameter bulk
+        // would otherwise pay type and initializer rendering per including file.
+        std::optional<std::string> type_text;
+        std::string kind;
+        for (const auto* decl : param->declarators) {
+            if (!decl || !resolver.wants_declaration(index, sm, decl->name))
+                continue;
+            if (!type_text) {
+                type_text = render_syntax_node_text(sm, *param->type);
+                kind = token_value_text(param->keyword);
             }
-
-            visitDefault(node);
+            auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+            index.values.push_back(ValueEntry{
+                .name = token_value_text(decl->name),
+                .type = *type_text,
+                .kind = kind,
+                .parent_scope = {},
+                .default_value = decl->initializer
+                                     ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                     : std::string{},
+                .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                .line = vl,
+                .col = vc,
+            });
         }
-    };
-
-    ImportVisitor visitor(index, resolver, sm);
-    root.visit(visitor);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -973,11 +973,19 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         // tree.  A header shard is built from an *includer's* tree and handed
         // the header's text instead, and it must keep every declaration it
         // finds, because it is the shard everyone else resolves against.
-        // Comparing against the buffer the tree root starts in tells the two
+        // Comparing against the buffer the tree was parsed from tells the two
         // apart in O(1), without normalizing any path.
-        const auto root_text = sm.getSourceText(root.sourceRange().start().buffer());
-        if (!source.empty() && root_text.data() == source.data() &&
-            root_text.size() == source.size())
+        //
+        // Not the buffer the *root node* starts in: a file whose first line is
+        // an `include has its first token in the header, so that test said "not
+        // my text" for the file's own build and left the mentions filter off.
+        // Every declaration in a shared header then landed in every includer's
+        // shard — 60 modules x 7501 parameters on tests/rtl/hpc60.
+        const auto own_buffers = tree.getSourceBufferIds();
+        const auto own_text =
+            own_buffers.empty() ? std::string_view{} : sm.getSourceText(own_buffers.front());
+        if (!source.empty() && own_text.data() == source.data() &&
+            own_text.size() == source.size())
             scoped_text = source;
     }
     auto ensure_mentions = [&]() -> const std::unordered_set<std::string_view>* {
@@ -1014,9 +1022,6 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         process_member(*member, index, resolver, sm, source, depth);
     }
 
-    if (depth == IndexDepth::Full)
-        collect_imports(root, index, resolver, sm);
-
     // Only filter the tables when collection already found something foreign to
     // drop.  If it did not, every value in the index is this file's own and
     // there is nothing the filter could remove.
@@ -1045,6 +1050,78 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
                 continue;
 
             index.macros.push_back(std::move(mac));
+        }
+    }
+
+    // A type written as a bare object-like macro (`` `define ITEM_T my_item ``)
+    // renders as its invocation spelling, and no class/typedef table can be
+    // keyed on `` `ITEM_T ``.  The live-AST path already reports the expanded
+    // name, so resolving the alias here is what keeps the shard and the AST
+    // representations of one file agreeing.
+    //
+    // Only a single-identifier body is substituted.  A macro standing for a
+    // dimension (`` [`WIDTH-1:0] ``) or a whole declaration has no base type
+    // name to resolve, and PortEntry text is deliberately left alone because
+    // Connect / Interface synthesize source from it and must keep the user's
+    // spelling.
+    //
+    // Which macro spellings this build could substitute is decided from the
+    // entries it just produced, before any `define is looked at.  Walking the
+    // macro table unconditionally is what a shared header makes expensive:
+    // one header defining N macros and included by M files builds the same
+    // N-entry string map M times, and almost every file wants none of it.
+    std::unordered_set<std::string_view> macro_typed_names;
+    auto note_macro_type = [&](const std::string& type) {
+        if (type.size() >= 2 && type.front() == '`')
+            macro_typed_names.insert(std::string_view(type).substr(1));
+    };
+    for (const auto& value : index.values)
+        note_macro_type(value.type);
+    for (const auto& cls : index.classes) {
+        note_macro_type(cls.base_class);
+        for (const auto& field : cls.fields)
+            note_macro_type(field.type);
+    }
+    for (const auto& td : index.typedefs) {
+        note_macro_type(td.resolved);
+        for (const auto& field : td.fields)
+            note_macro_type(field.type);
+    }
+
+    if (!macro_typed_names.empty()) {
+        // Token text outlives this function, so the table borrows rather than
+        // copying.  macro_typed_names borrows from the entries rewritten below
+        // and is not read again once rewriting starts.
+        std::unordered_map<std::string_view, std::string_view> macro_type_aliases;
+        for (const auto* def : tree.getDefinedMacros()) {
+            if (!def || def->formalArguments || !def->name || def->body.size() != 1)
+                continue;
+            const auto& body = def->body[0];
+            if (body.kind != slang::parsing::TokenKind::Identifier)
+                continue;
+            const auto name = def->name.valueText();
+            if (!macro_typed_names.contains(name))
+                continue;
+            macro_type_aliases.emplace(name, body.valueText());
+        }
+        auto resolve_macro_type = [&](std::string& type) {
+            if (type.size() < 2 || type.front() != '`')
+                return;
+            const auto alias = macro_type_aliases.find(std::string_view(type).substr(1));
+            if (alias != macro_type_aliases.end())
+                type.assign(alias->second);
+        };
+        for (auto& value : index.values)
+            resolve_macro_type(value.type);
+        for (auto& cls : index.classes) {
+            resolve_macro_type(cls.base_class);
+            for (auto& field : cls.fields)
+                resolve_macro_type(field.type);
+        }
+        for (auto& td : index.typedefs) {
+            resolve_macro_type(td.resolved);
+            for (auto& field : td.fields)
+                resolve_macro_type(field.type);
         }
     }
 
@@ -1144,10 +1221,16 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
         classes.push_back(std::move(copy));
     }
 
-    // typedefs — same scoped-key rule as classes above.
+    // typedefs — scoped by any `::`-addressable owner, not just a package, so
+    // that the same-named typedef each class declares survives instead of the
+    // first one seen claiming the bare name for the whole project.  A
+    // module-scoped typedef stays unscoped: it matches what build() records,
+    // and scoping it would append one copy per shard that saw the header
+    // declaring it.
     for (const auto& t : other.typedefs) {
-        const bool scoped =
-            !t.parent_scope.empty() && other.package_names.count(t.parent_scope) > 0;
+        const bool scoped = !t.parent_scope.empty() &&
+                            (other.package_names.count(t.parent_scope) > 0 ||
+                             other.class_by_name.count(t.parent_scope) > 0);
         const auto scoped_key = scoped ? package_scoped_key(t.parent_scope, t.name) : std::string{};
         const bool scoped_is_new = scoped && !package_type_by_scoped_name.count(scoped_key);
         if (typedef_by_name.count(t.name) && !scoped_is_new)

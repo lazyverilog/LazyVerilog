@@ -701,7 +701,7 @@ task automatic drive_bus(input logic [7:0] data);
 endtask
 ```
 
-Diagnostic: `[function] task declaration missing explicit lifetime (automatic/static)`
+Diagnostic: `[task] task declaration missing explicit lifetime (automatic/static)`
 
 ---
 

@@ -1,5 +1,7 @@
 #include "completion.hpp"
+#include "../dynamic_file_index.hpp"
 #include "../syntax_index.hpp"
+#include "../syntax_index_shared.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -274,53 +276,135 @@ static std::optional<std::string> text_scope_base_before_double_colon(const std:
     return text.substr(scan, ident_end - scan);
 }
 
+// Segment left of the scope base: `my_item` in `my_item::type_id::|`.
+//
+// The base alone is ambiguous whenever a name is declared once per class, which
+// is exactly the shape `type_id` has.  Read textually for the same reason the
+// base fallback above does: `::` is the user's explicit request for scope
+// completion, so this guesses no context from ordinary typing.
+static std::string text_scope_qualifier_before_double_colon(const std::string& text, size_t pos) {
+    if (pos < 2 || text[pos - 1] != ':' || text[pos - 2] != ':')
+        return {};
+
+    size_t scan = pos - 2;
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+    const size_t base_end = scan;
+    while (scan > 0 && is_ident_char(text[scan - 1]))
+        --scan;
+    if (scan == base_end)
+        return {};
+
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+    if (scan < 2 || text[scan - 1] != ':' || text[scan - 2] != ':')
+        return {};
+    scan -= 2;
+    while (scan > 0 && std::isspace(static_cast<unsigned char>(text[scan - 1])))
+        --scan;
+
+    const size_t qualifier_end = scan;
+    while (scan > 0 && is_ident_char(text[scan - 1]))
+        --scan;
+    if (scan == qualifier_end)
+        return {};
+    return text.substr(scan, qualifier_end - scan);
+}
+
 struct DotCompletionSyntaxContext {
     size_t dot_offset{0};
     std::string base_name;
+    // Set when the receiver is an implicit handle rather than a named value,
+    // i.e. SyntaxKind::ThisHandle or SyntaxKind::SuperHandle.  Those carry no
+    // identifier to look up -- their type comes from the enclosing class -- so
+    // base_name stays empty and the caller resolves the type directly.
+    slang::syntax::SyntaxKind base_handle{slang::syntax::SyntaxKind::Unknown};
 };
+
+// Offset of `token` in the document the user is editing.
+//
+// A token written inside a macro argument is reported at an expansion
+// location, whose offset belongs to the expansion buffer and has nothing to do
+// with the cursor.  Mapping it back to where it was typed is what lets
+// `` `uvm_info("ID", $sformatf("%0h", item.| ), UVM_MEDIUM) `` be recognized as
+// member access at all.
+static std::optional<size_t> completion_original_offset(const slang::SourceManager& sm,
+                                                        slang::BufferID document_buffer,
+                                                        slang::SourceLocation loc) {
+    if (!loc.valid())
+        return std::nullopt;
+    const auto file_loc = sm.isMacroLoc(loc) ? sm.getFullyOriginalLoc(loc) : loc;
+    if (!file_loc.valid() || file_loc.buffer() != document_buffer)
+        return std::nullopt;
+    return file_loc.offset();
+}
+
+static slang::BufferID completion_document_buffer(const slang::syntax::SyntaxTree& tree) {
+    const auto start = tree.root().sourceRange().start();
+    return start.valid() ? start.buffer() : slang::BufferID{};
+}
 
 static std::optional<DotCompletionSyntaxContext>
 syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t cursor_offset) {
     using namespace slang;
     using namespace slang::syntax;
 
+    const auto& sm = tree.sourceManager();
+    const auto document_buffer = completion_document_buffer(tree);
+
     struct DotVisitor : public SyntaxVisitor<DotVisitor> {
+        const slang::SourceManager& sm;
+        slang::BufferID document_buffer;
         size_t cursor_offset;
         size_t best_start{0};
         size_t best_end{0};
 
-        explicit DotVisitor(size_t cursor_offset) : cursor_offset(cursor_offset) {}
+        DotVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
+                   size_t cursor_offset)
+            : sm(sm), document_buffer(document_buffer), cursor_offset(cursor_offset) {}
 
         void visitToken(slang::parsing::Token token) {
-            if (token && !token.isMissing() && token.kind == parsing::TokenKind::Dot &&
-                token.location().valid()) {
-                const size_t start = token.location().offset();
-                const size_t end = start + token.rawText().size();
+            if (token && !token.isMissing() && token.kind == parsing::TokenKind::Dot) {
+                const auto start = completion_original_offset(sm, document_buffer, token.location());
+                if (!start)
+                    return;
+                const size_t end = *start + token.rawText().size();
                 if (end == cursor_offset && end >= best_end) {
-                    best_start = start;
+                    best_start = *start;
                     best_end = end;
                 }
             }
         }
     };
 
-    DotVisitor dots(cursor_offset);
+    DotVisitor dots(sm, document_buffer, cursor_offset);
     tree.root().visit(dots);
     if (dots.best_end == 0)
         return std::nullopt;
 
     struct NameVisitor : public SyntaxVisitor<NameVisitor> {
+        const slang::SourceManager& sm;
+        slang::BufferID document_buffer;
         size_t dot_start;
         size_t best_end{0};
         std::string result;
+        SyntaxKind handle_kind{SyntaxKind::Unknown};
 
-        explicit NameVisitor(size_t dot_start) : dot_start(dot_start) {}
+        NameVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
+                    size_t dot_start)
+            : sm(sm), document_buffer(document_buffer), dot_start(dot_start) {}
 
         void consider(const slang::syntax::NameSyntax& node) {
-            const auto range = node.sourceRange();
-            if (!range.start().valid() || !range.end().valid())
+            // Take the end from the last token rather than from the node range:
+            // an expansion range end cannot be mapped back to the document, but
+            // a token start can, and its raw text gives the width.
+            const auto last = node.getLastToken();
+            if (!last)
                 return;
-            const size_t end = range.end().offset();
+            const auto start = completion_original_offset(sm, document_buffer, last.location());
+            if (!start)
+                return;
+            const size_t end = *start + last.rawText().size();
             if (end == dot_start && end >= best_end) {
                 auto base = syntax_scope_base_name(node);
                 if (!base.empty()) {
@@ -344,11 +428,34 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
             consider(node);
             visitDefault(node);
         }
+
+        // `this` and `super` parse as KeywordNameSyntax, so they reach the
+        // visitor as names but have no identifier for syntax_scope_base_name()
+        // to return.  Record which handle it is instead; the type comes from
+        // the enclosing class, not from a declaration lookup.
+        void handle(const KeywordNameSyntax& node) {
+            if (node.kind != SyntaxKind::ThisHandle && node.kind != SyntaxKind::SuperHandle) {
+                visitDefault(node);
+                return;
+            }
+            const auto start = completion_original_offset(sm, document_buffer, node.keyword.location());
+            if (start) {
+                const size_t end = *start + node.keyword.rawText().size();
+                if (end == dot_start && end >= best_end) {
+                    best_end = end;
+                    result.clear();
+                    handle_kind = node.kind;
+                }
+            }
+            visitDefault(node);
+        }
     };
 
-    NameVisitor names(dots.best_start);
+    NameVisitor names(sm, document_buffer, dots.best_start);
     tree.root().visit(names);
-    return DotCompletionSyntaxContext{.dot_offset = dots.best_start, .base_name = names.result};
+    return DotCompletionSyntaxContext{.dot_offset = dots.best_start,
+                                      .base_name = names.result,
+                                      .base_handle = names.handle_kind};
 }
 
 static size_t token_start_offset(const slang::parsing::Token& token) {
@@ -819,6 +926,28 @@ static std::optional<std::string> type_of_value(const SyntaxIndex& index,
         if (!fallback_value) fallback_value = v.type;
     }
     if (fallback_value) return fallback_value;
+
+    // A field declared on the enclosing class (or one of its base classes)
+    // isn't in index.values -- process_class() files it under
+    // ClassEntry.fields instead. Walk the inheritance chain so a field used
+    // from an inherited method (a common UVM pattern, e.g. `vif` accessed
+    // from a subclass's build_phase) resolves too.
+    if (!scope.empty()) {
+        std::unordered_set<std::string> visited_classes;
+        std::string cls_name = scope;
+        while (!cls_name.empty() && visited_classes.insert(cls_name).second) {
+            const auto it = index.class_by_name.find(cls_name);
+            if (it == index.class_by_name.end())
+                break;
+            const auto& cls = index.classes[it->second];
+            for (const auto& f : cls.fields) {
+                if (f.name == name && !f.type.empty())
+                    return f.type;
+            }
+            cls_name = base_class_lookup_name(cls.base_class);
+        }
+    }
+
     std::optional<std::string> fallback_inst;
     for (const auto& inst : index.instances) {
         if (inst.instance_name != name) continue;
@@ -835,7 +964,26 @@ static std::string completion_base_type_name(std::string type) {
     const size_t paren = type.find("#(");
     if (paren != std::string::npos)
         type.erase(paren);
+    // A package qualifier has to go before the leading-identifier scan below,
+    // which would otherwise reduce `cfg_pkg::base_cfg` to the package name and
+    // make every class lookup on that type miss.  The scan itself must stay
+    // leading-component so ordinary declarations such as `logic [7:0]` still
+    // reduce to `logic`.
+    if (const size_t scope = type.rfind("::"); scope != std::string::npos)
+        type.erase(0, scope + 2);
     type = trim_completion_copy(std::move(type));
+    // A virtual interface handle's DataTypeSyntax node text includes the
+    // `virtual` (and optional `interface`) keyword ahead of the interface
+    // name, e.g. `virtual lv_full_if` or `virtual interface lv_full_if`.
+    // Strip those keywords so the identifier scan below lands on the actual
+    // interface name instead of returning "virtual" as the type.
+    for (const std::string_view kw : {"virtual", "interface"}) {
+        if (type.size() > kw.size() && type.compare(0, kw.size(), kw) == 0 &&
+            std::isspace(static_cast<unsigned char>(type[kw.size()]))) {
+            type.erase(0, kw.size());
+            type = trim_completion_copy(std::move(type));
+        }
+    }
     size_t end = 0;
     while (end < type.size() && is_ident_char(type[end]))
         ++end;
@@ -1398,13 +1546,28 @@ current_file_package_scope_items_from_ast(const DocumentState& state, std::strin
             if (std::string_view(node.name.valueText()) != scope)
                 return;
             for (const auto* item : node.items) {
-                const auto* method = item ? item->as_if<ClassMethodDeclarationSyntax>() : nullptr;
-                if (!method)
+                if (!item)
                     continue;
-                push_unique_item(items, seen, completion_ast_text(*method->declaration->prototype->name),
-                                 method->declaration->kind == SyntaxKind::TaskDeclaration
-                                     ? lsCompletionItemKind::Method
-                                     : lsCompletionItemKind::Function);
+                if (const auto* method = item->as_if<ClassMethodDeclarationSyntax>()) {
+                    push_unique_item(
+                        items, seen, completion_ast_text(*method->declaration->prototype->name),
+                        method->declaration->kind == SyntaxKind::TaskDeclaration
+                            ? lsCompletionItemKind::Method
+                            : lsCompletionItemKind::Function);
+                    continue;
+                }
+                // A typedef in a class body is reached through `::` just like a
+                // static method.  `uvm_object_utils(T)` declares `type_id` this
+                // way, and `T::type_id::create(...)` is the most-typed line in
+                // a UVM testbench, so omitting nested types hides it.
+                const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>();
+                const auto* td = prop ? prop->declaration->as_if<TypedefDeclarationSyntax>()
+                                      : item->as_if<TypedefDeclarationSyntax>();
+                if (td)
+                    push_unique_item(items, seen, std::string(td->name.valueText()),
+                                     td->type->kind == SyntaxKind::EnumType
+                                         ? lsCompletionItemKind::Enum
+                                         : lsCompletionItemKind::TypeParameter);
             }
         }
     } visitor(scope, items, seen);
@@ -1412,8 +1575,35 @@ current_file_package_scope_items_from_ast(const DocumentState& state, std::strin
     return items;
 }
 
+// Type a typedef declared anywhere in the current file names, or empty.
+//
+// This deliberately looks inside class bodies and through macro expansions:
+// `uvm_object_utils(T)` expands to `typedef uvm_object_registry #(T, "T")
+// type_id;`, and `T::type_id::create(...)` is the most-typed line in a UVM
+// testbench.  Without resolving the typedef, that scope has no members at all.
+static std::string current_file_typedef_target_from_ast(const DocumentState& state,
+                                                        std::string_view name) {
+    if (!state.tree || name.empty())
+        return {};
+    using namespace slang::syntax;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        std::string_view name;
+        std::string result;
+        explicit Visitor(std::string_view name) : name(name) {}
+        void handle(const TypedefDeclarationSyntax& node) {
+            if (result.empty() && std::string_view(node.name.valueText()) == name)
+                result = completion_base_type_name(current_ast_decl_text(*node.type));
+            visitDefault(node);
+        }
+    } visitor(name);
+    state.tree->root().visit(visitor);
+    return visitor.result;
+}
+
+/// Every class this buffer declares, for the contexts that admit only a class
+/// name: `new` and an `extends`/`implements` base.
 static std::vector<lsCompletionItem>
-current_file_new_expression_items_from_ast(const DocumentState& state) {
+current_file_class_name_items_from_ast(const DocumentState& state) {
     std::vector<lsCompletionItem> items;
     if (!state.tree)
         return items;
@@ -1481,9 +1671,110 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 }
             }
         }
+        // ANSI module port, e.g. `input uart_reg_pkg::uart_reg2hw_t reg2hw`.
+        // Without this, a receiver that is one of the current module's own
+        // ports resolves to nothing here, and the caller falls back to a
+        // same-name lookup across every other file's index instead.
+        void handle(const ImplicitAnsiPortSyntax& node) {
+            if (!result.empty() || !node.header || !node.declarator)
+                return;
+            if (before(node.declarator->name) &&
+                node.declarator->name.valueText() == ctx.scope_name)
+                result = completion_base_type_name(current_ast_port_type(*node.header));
+        }
+        // Non-ANSI port declaration, e.g. `input uart_reg_pkg::uart_reg2hw_t reg2hw;`
+        // inside the module body (paired with a bare name in the port list).
+        void handle(const PortDeclarationSyntax& node) {
+            if (!result.empty() || !node.header)
+                return;
+            for (const auto* decl : node.declarators) {
+                if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
+                    result = completion_base_type_name(current_ast_port_type(*node.header));
+                    return;
+                }
+            }
+        }
+        // `task run_phase(uvm_phase phase);` — the receiver is a subroutine
+        // argument, which is neither a data declaration nor an instance.
+        void handle(const FunctionPortSyntax& node) {
+            if (!result.empty() || !node.dataType || !node.declarator)
+                return;
+            if (before(node.declarator->name) &&
+                node.declarator->name.valueText() == ctx.scope_name)
+                result = completion_base_type_name(current_ast_decl_text(*node.dataType));
+        }
     } visitor(ctx, offset, result);
     state.tree->root().visit(visitor);
     return result.empty() ? ctx.scope_name : result;
+}
+
+struct CurrentFileClassBase {
+    bool declared_here{false}; // the class itself is declared in this file
+    std::string base;          // its extends clause, empty when it has none
+};
+
+/// What this file's AST says about @p class_name and its immediate base.
+///
+/// Both facts are reported because callers need to tell "this file does not
+/// declare the class" apart from "it declares it with no base"; collapsing them
+/// into one empty string loses the distinction that decides whether the shard
+/// layer should take over.
+static CurrentFileClassBase current_file_class_base(const DocumentState& state,
+                                                    std::string_view class_name) {
+    CurrentFileClassBase info;
+    if (!state.tree || class_name.empty())
+        return info;
+    using namespace slang::syntax;
+
+    struct ClassBaseVisitor : SyntaxVisitor<ClassBaseVisitor> {
+        std::string_view class_name;
+        CurrentFileClassBase& info;
+        ClassBaseVisitor(std::string_view class_name, CurrentFileClassBase& info)
+            : class_name(class_name), info(info) {}
+        void handle(const ClassDeclarationSyntax& node) {
+            if (std::string_view(node.name.valueText()) != class_name) {
+                visitDefault(node);
+                return;
+            }
+            info.declared_here = true;
+            if (node.extendsClause)
+                info.base = completion_base_type_name(
+                    current_ast_decl_text(*node.extendsClause->baseName));
+        }
+    } visitor(class_name, info);
+
+    state.tree->root().visit(visitor);
+    return info;
+}
+
+// Walk the current file's `extends` chain and return the first base class the
+// file does not declare itself.
+//
+// Member access is layered the same way the index is: the receiver's class can
+// be an open-buffer class while its base lives in a closed project shard.  The
+// AST walk above can only emit members it can see, so the caller needs the name
+// to continue the climb with in the shard layer.
+//
+// Note this deliberately answers only for bases the shard layer must resolve.
+// A `super.` receiver wants the immediate base whether or not this file
+// declares it, and so calls current_file_class_base() directly.
+static std::string current_file_unresolved_base_class(const DocumentState& state,
+                                                      std::string_view class_name) {
+    if (!state.tree || class_name.empty())
+        return {};
+
+    std::string current(class_name);
+    std::unordered_set<std::string> visited;
+    while (visited.insert(current).second) {
+        const auto info = current_file_class_base(state, current);
+        if (!info.declared_here || info.base.empty())
+            return {};
+        current = info.base;
+
+        if (!current_file_class_base(state, current).declared_here)
+            return current; // declared elsewhere — the shard layer takes over
+    }
+    return {};
 }
 
 static std::vector<lsCompletionItem>
@@ -1511,8 +1802,10 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
                     visitDefault(node);
                     return;
                 }
-                if (node.extendsClause)
-                    emit_class(completion_base_type_name(current_ast_decl_text(*node.extendsClause->baseName)));
+                if (node.extendsClause) {
+                    emit_class(completion_base_type_name(
+                        current_ast_decl_text(*node.extendsClause->baseName)));
+                }
                 for (const auto* item : node.items) {
                     if (const auto* prop = item ? item->as_if<ClassPropertyDeclarationSyntax>() : nullptr) {
                         if (const auto* data = prop->declaration->as_if<DataDeclarationSyntax>()) {
@@ -1861,6 +2154,51 @@ class IdentifierProvider : public CompletionProvider {
     }
 };
 
+// Type of `field_name` as declared on `class_name` or any of its ancestors
+// within one shard.  Used when the receiver itself is an inherited field, e.g.
+// `seq_item_port` declared by `uvm_driver` and used from a subclass.
+static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxIndex& index,
+                                                                std::string class_name,
+                                                                const std::string& field_name) {
+    std::unordered_set<std::string> visited;
+    while (!class_name.empty() && visited.insert(class_name).second) {
+        const auto it = index.class_by_name.find(class_name);
+        if (it == index.class_by_name.end() || it->second >= index.classes.size())
+            return std::nullopt;
+        const auto& cls = index.classes[it->second];
+        for (const auto& f : cls.fields) {
+            if (f.name == field_name && !f.type.empty())
+                return f.type;
+        }
+        class_name = base_class_lookup_name(cls.base_class);
+    }
+    return std::nullopt;
+}
+
+// Type that the typedef `name` aliases, read from one shard.  A class-scoped
+// typedef such as `my_item::type_id` lives in a file the editor may never open,
+// so the current-file AST pass cannot see it and only the shard knows what it
+// names.
+static std::string typedef_target_in_shard(const SyntaxIndex& index, const std::string& name) {
+    const auto it = index.typedef_by_name.find(name);
+    if (it == index.typedef_by_name.end() || it->second >= index.typedefs.size())
+        return {};
+    return completion_base_type_name(index.typedefs[it->second].resolved);
+}
+
+// Same, but for `owner::name`.  `typedef_by_name` holds one entry per bare
+// name, so a typedef every class declares — `type_id` above all — resolves
+// there to whichever class happened to be indexed first.  The owner-scoped
+// table is the only one that can tell them apart.
+static std::string scoped_typedef_target_in_shard(const SyntaxIndex& index,
+                                                  const std::string& owner,
+                                                  const std::string& name) {
+    const auto it = index.package_type_by_scoped_name.find(package_scoped_key(owner, name));
+    if (it == index.package_type_by_scoped_name.end() || it->second >= index.typedefs.size())
+        return {};
+    return completion_base_type_name(index.typedefs[it->second].resolved);
+}
+
 // MemberProvider: fields/methods for class, ports for module/interface.
 class MemberProvider : public CompletionProvider {
   public:
@@ -1892,7 +2230,10 @@ class MemberProvider : public CompletionProvider {
                 if (!visited_classes.insert(cls.name).second)
                     return; // cycle or diamond — stop
                 if (!cls.base_class.empty()) {
-                    if (const auto base_it = index.class_by_name.find(cls.base_class);
+                    // The clause is stored verbatim, so `extends pkg::base #(8)`
+                    // has to be reduced to `base` before it can be looked up.
+                    if (const auto base_it =
+                            index.class_by_name.find(base_class_lookup_name(cls.base_class));
                         base_it != index.class_by_name.end())
                         add_class_members(index.classes[base_it->second]);
                 }
@@ -2204,6 +2545,19 @@ class PackageScopeProvider : public CompletionProvider {
                     item.detail = optional<std::string>(field.type);
                 items.push_back(std::move(item));
             }
+            // A typedef declared in a class body is reached through `::` just
+            // like a static method.  UVM's factory macros make `type_id` the
+            // most-typed member of the lot, so omitting nested types drops it
+            // from every registered class.
+            for (const auto& td : index.typedefs) {
+                if (td.parent_scope != cls.name)
+                    continue;
+                auto item = make_item(td.name, td.is_enum ? lsCompletionItemKind::Enum
+                                                          : lsCompletionItemKind::TypeParameter);
+                if (!td.resolved.empty())
+                    item.detail = optional<std::string>(td.resolved);
+                items.push_back(std::move(item));
+            }
         }
         return items;
     }
@@ -2262,6 +2616,33 @@ class NewExpressionProvider : public CompletionProvider {
             item.detail = optional<std::string>("class constructor");
             item.insertText = optional<std::string>(c.name + "::new($0)");
             item.insertTextFormat = optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
+            items.push_back(std::move(item));
+        }
+        return items;
+    }
+};
+
+// BaseClassProvider: class names for an `extends`/`implements` clause.
+//
+// Unlike NewExpressionProvider this emits the bare name: the text being
+// completed is a type reference, not a constructor call, so a `::new()`
+// snippet would be wrong here.
+class BaseClassProvider : public CompletionProvider {
+  public:
+    bool accepts(const CompletionContext& ctx) const override {
+        return ctx.kind == CompletionContextKind::BaseClass;
+    }
+
+    std::vector<lsCompletionItem> provide(const CompletionContext& /*ctx*/,
+                                           const SyntaxIndex& index,
+                                           const CancellationToken& tok) const override {
+        std::vector<lsCompletionItem> items;
+        for (const auto& c : index.classes) {
+            if (tok.cancelled) throw CompletionCancelled{};
+            auto item = make_item(c.name, lsCompletionItemKind::Class);
+            item.detail = optional<std::string>(c.parent_scope.empty()
+                                                    ? std::string("class")
+                                                    : "class in " + c.parent_scope);
             items.push_back(std::move(item));
         }
         return items;
@@ -2423,6 +2804,7 @@ CompletionEngine::CompletionEngine() {
     providers_.push_back(std::make_unique<MacroProvider>());
     providers_.push_back(std::make_unique<FileProvider>());
     providers_.push_back(std::make_unique<NewExpressionProvider>());
+    providers_.push_back(std::make_unique<BaseClassProvider>());
     providers_.push_back(std::make_unique<EventControlProvider>());
     providers_.push_back(std::make_unique<IdentifierProvider>());
     providers_.push_back(std::make_unique<SnippetProvider>());
@@ -2450,6 +2832,14 @@ static bool completion_context_needs_project_index(CompletionContextKind kind) {
         // Class construction is an explicit class-oriented context.  Project
         // classes are useful here, but this context is much less frequent than
         // generic identifier completion.
+        return true;
+    case CompletionContextKind::BaseClass:
+        // `extends`/`implements` names a class, and a base class living in a
+        // different file is the normal case, not the exception: a child in a
+        // live buffer extending a base in a closed project file is exactly the
+        // shape UVM and any layered testbench has.  Like NewExpression this is
+        // an explicit, rare, class-only position, so consulting the project
+        // index here does not put a project-wide scan on ordinary typing.
         return true;
     case CompletionContextKind::Identifier:
     case CompletionContextKind::Macro:
@@ -2497,6 +2887,23 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
                 ctx.kind = CompletionContextKind::MemberAccess;
                 ctx.scope_name = std::move(dot_ctx->base_name);
                 return ctx;
+            }
+
+            // this.prefix / super.prefix → MemberAccess on a type we already
+            // know.  `this` is the enclosing class; `super` is deliberately its
+            // base, so that a member the current class overrides still resolves
+            // to the base declaration the user asked for by writing `super`.
+            if (dot_ctx->base_handle == slang::syntax::SyntaxKind::ThisHandle ||
+                dot_ctx->base_handle == slang::syntax::SyntaxKind::SuperHandle) {
+                std::string type = ctx.current_scope_name;
+                if (dot_ctx->base_handle == slang::syntax::SyntaxKind::SuperHandle && !type.empty())
+                    type = current_file_class_base(state, type).base;
+                if (!type.empty()) {
+                    ctx.kind = CompletionContextKind::MemberAccess;
+                    ctx.scope_name = type;
+                    ctx.receiver_type = std::move(type);
+                    return ctx;
+                }
             }
 
             // bare '.' (no preceding identifier) → NamedPort or Parameter.
@@ -2548,12 +2955,14 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
             ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
         if (!ctx.scope_name.empty()) {
             ctx.kind = CompletionContextKind::PackageScope;
+            ctx.scope_qualifier = text_scope_qualifier_before_double_colon(text, pos);
             return ctx;
         }
     } else {
         ctx.scope_name = text_scope_base_before_double_colon(text, pos).value_or(std::string{});
         if (!ctx.scope_name.empty()) {
             ctx.kind = CompletionContextKind::PackageScope;
+            ctx.scope_qualifier = text_scope_qualifier_before_double_colon(text, pos);
             return ctx;
         }
     }
@@ -2577,13 +2986,24 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
         return ctx;
     }
 
-    // --- class construction after "new " ---------------------------------
+    // --- keywords that admit only a class name ----------------------------
+    //
+    //   new |                    -> construction
+    //   extends | / implements | -> base class
+    //
+    // A qualified base (`extends pkg::base_`) has already been classified as
+    // PackageScope above, which is the more precise answer, so only the
+    // unqualified spelling reaches here.
     {
         size_t tmp = pos;
         backward_skip_ws(text, tmp);
         const std::string kw = backward_read_word(text, tmp);
         if (kw == "new") {
             ctx.kind = CompletionContextKind::NewExpression;
+            return ctx;
+        }
+        if (kw == "extends" || kw == "implements") {
+            ctx.kind = CompletionContextKind::BaseClass;
             return ctx;
         }
     }
@@ -2652,7 +3072,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     const int line = params.position.line;
     const int col  = params.position.character;
-    SyntaxIndex current_index;
+    SyntaxIndex context_index;
 
     CompletionContext ctx;
     try {
@@ -2662,13 +3082,25 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         // include, or explicit scope context.  Do not touch the .f project
         // cache until after we know this request actually needs project-wide
         // symbols.
-        ctx = detect_context(state, line, col, current_index);
+        //
+        // The index stays empty here on purpose.  Detection scans whatever it is
+        // given, and handing it the current file's full dynamic index measured
+        // ~18ms -> ~37ms per member-access completion on a UVM buffer for no
+        // change in results; the AST-based detection below already answers the
+        // questions detection actually asks.
+        ctx = detect_context(state, line, col, context_index);
     } catch (...) {
         ctx.kind = CompletionContextKind::Identifier;
     }
-    for (const auto& mac : current_index.macros)
+    // Imports and macros do come from the current file's cached dynamic index:
+    // they gate which package members are offered, and reading them costs one
+    // vector copy rather than a scan.  They describe the current file only --
+    // an import written in another buffer must not make its package visible
+    // here -- while the values they gate come from the other buffers' shards.
+    const SyntaxIndex& current_file_index = get_dynamic_index(state);
+    for (const auto& mac : current_file_index.macros)
         ctx.visible_macros.insert(mac.name);
-    ctx.visible_imports = current_index.imports;
+    ctx.visible_imports = current_file_index.imports;
 
     if (ctx.kind == CompletionContextKind::IncludeFile) {
         for (const auto& p : analyzer.extra_files()) {
@@ -2690,7 +3122,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     // current file index.  This avoids rebuilding a full "all open files except
     // current" SyntaxIndex on every edit-driven cache miss while still reusing
     // each immutable DocumentState's cached dynamic SyntaxIndex.
-    SyntaxIndex completion_index = std::move(current_index);
+    // Deliberately empty: the current file contributes through the AST paths
+    // below, not through a provider index.  Copying the cached dynamic index
+    // here would add a full per-keystroke index copy for items that are already
+    // being emitted from the live AST.
+    SyntaxIndex completion_index;
     auto opened_shards = analyzer.opened_file_index_shards(params.textDocument.uri.raw_uri_);
     // The snapshot owns the only guaranteed reference to these shards: a
     // concurrent didOpen/didChange replaces the per-file shard in the analyzer
@@ -2730,6 +3166,9 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             add_local_names(*shard.index);
 
     std::vector<lsCompletionItem> all_items;
+    // A second name the shard layer should also be asked about, when the typed
+    // scope only aliases the type that actually owns the members.
+    std::string aliased_scope_name;
 
     switch (ctx.kind) {
     case CompletionContextKind::Identifier:
@@ -2765,12 +3204,57 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     }
     case CompletionContextKind::PackageScope: {
         auto items = current_file_package_scope_items_from_ast(state, ctx.scope_name);
+        if (items.empty()) {
+            // `my_item::type_id::` — the scope is a typedef, so the members
+            // being asked for belong to the type it names.
+            const auto target = current_file_typedef_target_from_ast(state, ctx.scope_name);
+            if (!target.empty() && target != ctx.scope_name) {
+                aliased_scope_name = target;
+                items = current_file_package_scope_items_from_ast(state, target);
+            }
+        }
+        if (aliased_scope_name.empty()) {
+            // The typedef itself may be declared in a file that is never
+            // opened, leaving the shard as the only place that knows the type
+            // it names.  Try the qualifier-scoped table across every shard
+            // first; the bare-name table cannot distinguish two classes that
+            // declare the same typedef name, so it is only a last resort.
+            auto scan_shards = [&](auto&& lookup) {
+                for (const auto& shard : *opened_shards) {
+                    if (!shard.index)
+                        continue;
+                    aliased_scope_name = lookup(*shard.index);
+                    if (!aliased_scope_name.empty())
+                        return;
+                }
+                for (const auto* shard : project_shards) {
+                    if (!shard)
+                        continue;
+                    aliased_scope_name = lookup(*shard);
+                    if (!aliased_scope_name.empty())
+                        return;
+                }
+            };
+
+            if (!ctx.scope_qualifier.empty())
+                scan_shards([&](const SyntaxIndex& index) {
+                    return scoped_typedef_target_in_shard(index, ctx.scope_qualifier,
+                                                          ctx.scope_name);
+                });
+            if (aliased_scope_name.empty())
+                scan_shards([&](const SyntaxIndex& index) {
+                    return typedef_target_in_shard(index, ctx.scope_name);
+                });
+            if (aliased_scope_name == ctx.scope_name)
+                aliased_scope_name.clear();
+        }
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
         break;
     }
-    case CompletionContextKind::NewExpression: {
-        auto items = current_file_new_expression_items_from_ast(state);
+    case CompletionContextKind::NewExpression:
+    case CompletionContextKind::BaseClass: {
+        auto items = current_file_class_name_items_from_ast(state);
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
         break;
@@ -2781,6 +3265,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     try {
         CompletionContext indexed_ctx = ctx;
+        std::string inherited_scope;
         if (ctx.kind == CompletionContextKind::MemberAccess && !ctx.scope_name.empty()) {
             // Member access is inherently layered:
             //
@@ -2794,8 +3279,27 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // ask each shard for members of that type.  This keeps the
             // no-flat-merge rule without losing the common
             // "variable_of_other_file_class." completion case.
-            std::optional<std::string> value_type =
-                type_of_value(completion_index, ctx.current_scope_name, ctx.scope_name);
+            // A `this` / `super` receiver already carries its type: there is no
+            // variable of that name to look up, and asking for one would search
+            // for a declaration named after the class itself.
+            std::optional<std::string> value_type;
+            if (!ctx.receiver_type.empty()) {
+                value_type = ctx.receiver_type;
+            } else {
+                // didChange no longer stores current-file declarations in the
+                // index, so a receiver declared in the buffer being edited is
+                // only visible in its AST — check that first.  Asking the
+                // merged index before the AST let its unscoped fallback match
+                // a same-named symbol declared in an unrelated file (e.g. two
+                // modules that both happen to have a port named `reg2hw`) win
+                // over the receiver's real type in this file.
+                const std::string ast_type = current_file_type_of_name_from_ast(state, ctx);
+                if (!ast_type.empty() && ast_type != ctx.scope_name)
+                    value_type = ast_type;
+            }
+            if (!value_type)
+                value_type = type_of_value(completion_index, ctx.current_scope_name,
+                                           ctx.scope_name);
             if (!value_type) {
                 for (const auto& shard : *opened_shards) {
                     if (!shard.index)
@@ -2806,11 +3310,48 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         break;
                 }
             }
+            if (!value_type && !ctx.current_scope_name.empty()) {
+                // The receiver can also be a field the enclosing class only
+                // inherits, so its declaration is in whichever shard holds the
+                // base class.
+                const std::string base =
+                    current_file_unresolved_base_class(state, ctx.current_scope_name);
+                if (!base.empty()) {
+                    for (const auto& shard : *opened_shards) {
+                        if (!shard.index)
+                            continue;
+                        value_type =
+                            field_type_in_shard_hierarchy(*shard.index, base, ctx.scope_name);
+                        if (value_type)
+                            break;
+                    }
+                    for (const auto* shard : project_shards) {
+                        if (value_type)
+                            break;
+                        if (shard)
+                            value_type =
+                                field_type_in_shard_hierarchy(*shard, base, ctx.scope_name);
+                    }
+                }
+            }
             if (value_type) {
                 const std::string base = completion_base_type_name(*value_type);
                 if (!base.empty())
                     indexed_ctx.scope_name = base;
             }
+            // The receiver's class may be declared in this buffer while its
+            // base class is not.  The AST pass emitted what it could see; the
+            // shard layer has to be asked for the rest of the chain by name.
+            inherited_scope = current_file_unresolved_base_class(state, indexed_ctx.scope_name);
+        }
+
+        std::vector<CompletionContext> shard_contexts{indexed_ctx};
+        for (const auto& alias : {inherited_scope, aliased_scope_name}) {
+            if (alias.empty())
+                continue;
+            CompletionContext alias_ctx = indexed_ctx;
+            alias_ctx.scope_name = alias;
+            shard_contexts.push_back(std::move(alias_ctx));
         }
 
         for (const auto& provider : providers_) {
@@ -2820,21 +3361,23 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             all_items.insert(all_items.end(),
                              std::make_move_iterator(items.begin()),
                              std::make_move_iterator(items.end()));
-            for (const auto& shard : *opened_shards) {
-                if (!shard.index)
-                    continue;
-                auto open_items = provider->provide(indexed_ctx, *shard.index, tok);
-                all_items.insert(all_items.end(),
-                                 std::make_move_iterator(open_items.begin()),
-                                 std::make_move_iterator(open_items.end()));
-            }
-            for (const auto* shard : project_shards) {
-                if (!shard)
-                    continue;
-                auto project_items = provider->provide(indexed_ctx, *shard, tok);
-                all_items.insert(all_items.end(),
-                                 std::make_move_iterator(project_items.begin()),
-                                 std::make_move_iterator(project_items.end()));
+            for (const auto& shard_ctx : shard_contexts) {
+                for (const auto& shard : *opened_shards) {
+                    if (!shard.index)
+                        continue;
+                    auto open_items = provider->provide(shard_ctx, *shard.index, tok);
+                    all_items.insert(all_items.end(),
+                                     std::make_move_iterator(open_items.begin()),
+                                     std::make_move_iterator(open_items.end()));
+                }
+                for (const auto* shard : project_shards) {
+                    if (!shard)
+                        continue;
+                    auto project_items = provider->provide(shard_ctx, *shard, tok);
+                    all_items.insert(all_items.end(),
+                                     std::make_move_iterator(project_items.begin()),
+                                     std::make_move_iterator(project_items.end()));
+                }
             }
         }
     } catch (const CompletionCancelled&) {
@@ -2845,7 +3388,10 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     if (all_items.empty() && ctx.kind != CompletionContextKind::MemberAccess &&
         ctx.kind != CompletionContextKind::PackageScope &&
         ctx.kind != CompletionContextKind::NamedPort &&
-        ctx.kind != CompletionContextKind::Parameter) {
+        ctx.kind != CompletionContextKind::Parameter &&
+        // Only a class name is legal after `extends`/`implements`; offering the
+        // keyword list when the project has no matching class would be noise.
+        ctx.kind != CompletionContextKind::BaseClass) {
         KeywordProvider fallback;
         CancellationToken dummy;
         all_items = fallback.provide(ctx, completion_index, dummy);

@@ -354,6 +354,96 @@ endmodule
     std::filesystem::remove(path);
 }
 
+TEST_CASE("signature help: an ambiguous constructor name yields no signature", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_sig_new.sv";
+    // Two classes, two `new`s.  Which one `handle = new(` means depends on the
+    // declared type of `handle`, so answering with either would be a guess.
+    const std::string text = "class alpha_c;\n"
+                             "    function new(string alpha_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "class beta_c;\n"
+                             "    function new(string beta_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    beta_c handle;\n"
+                             "    initial handle = new(\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(10, (int)std::string("    initial handle = new(").size());
+
+    CHECK_FALSE(provide_signature_help(analyzer, params).has_value());
+}
+
+TEST_CASE("signature help: an unambiguous constructor still resolves", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_sig_new_single.sv";
+    const std::string text = "class only_c;\n"
+                             "    function new(string only_arg);\n"
+                             "    endfunction\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    only_c handle;\n"
+                             "    initial handle = new(\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(6, (int)std::string("    initial handle = new(").size());
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(!help->signatures.empty());
+    CHECK(help->signatures[0].label.find("only_arg") != std::string::npos);
+}
+
+TEST_CASE("hover: a macro-declared member resolves to the named owner class", "[hover]") {
+    const auto header = std::filesystem::temp_directory_path() / "lazyverilog_hover_utils.svh";
+    {
+        std::ofstream out(header);
+        out << "`define HOVER_UTILS(T) \\\n"
+               "    typedef registry_of #(T) type_id;\n";
+    }
+
+    // Both classes get a `type_id` from the same macro body, so both
+    // declarations report that one location.  Only the qualifier says which
+    // class the cursor meant.
+    Analyzer analyzer;
+    const std::string uri =
+        uri_from_path(std::filesystem::temp_directory_path() / "lazyverilog_hover_utils_user.sv");
+    const std::string text = "`include \"lazyverilog_hover_utils.svh\"\n"
+                             "class alpha_c;\n"
+                             "    `HOVER_UTILS(alpha_c)\n"
+                             "endclass\n"
+                             "class beta_c;\n"
+                             "    `HOVER_UTILS(beta_c)\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    initial handle = beta_c::type_id;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    const auto col = std::string("    initial handle = beta_c::type_id;").find("type_id");
+    params.position = lsPosition(8, (int)col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& value = hover->contents.second->value;
+    CHECK(value.find("beta_c") != std::string::npos);
+    CHECK(value.find("alpha_c") == std::string::npos);
+
+    std::filesystem::remove(header);
+}
+
 TEST_CASE("hover: resolves instance module names through extra files", "[hover]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_child.sv";
     {
@@ -777,6 +867,183 @@ endmodule
     CHECK(*help->activeParameter == 1);
 }
 
+// A call to a function imported from a package is normally a call into another
+// file, and that file is usually closed.  Hover and go-to-definition already
+// resolve these; signature help used to search only the current document's AST
+// and returned nothing, so the popup was empty for exactly the calls a
+// testbench makes most.
+TEST_CASE("signature help: a function declared in a closed project file resolves",
+          "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_closed_pkg.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_closed_pkg;\n"
+               "  function automatic int add3(int a, int b, int c);\n"
+               "    return a + b + c;\n"
+               "  endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_closed_use.sv";
+    analyzer.open(uri, R"(
+module top;
+    import sig_closed_pkg::*;
+    int r;
+    initial r = add3(1, , 3);
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(4, 24); // between the first and second commas
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int add3(int a, int b, int c)");
+    REQUIRE(help->signatures[0].parameters.size() == 3);
+    CHECK(help->signatures[0].parameters[0].label == "int a");
+    CHECK(help->signatures[0].parameters[2].label == "int c");
+    REQUIRE(help->activeParameter.has_value());
+    CHECK(*help->activeParameter == 1);
+
+    std::filesystem::remove(pkg_path);
+}
+
+// The shard stores one rendered string per subroutine, so directions and packed
+// dimensions have to survive being parsed back out of it.
+TEST_CASE("signature help: a closed-file task keeps directions and packed dimensions",
+          "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_closed_task.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_task_pkg;\n"
+               "  task automatic do_xfer(input bit [7:0] addr, output bit ok);\n"
+               "    ok = 1'b1;\n"
+               "  endtask\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_closed_task_use.sv";
+    analyzer.open(uri, R"(
+module top;
+    import sig_task_pkg::*;
+    bit good;
+    initial do_xfer(8'h10, );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(4, 27);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "task do_xfer(input bit [7:0] addr, output bit ok)");
+    REQUIRE(help->signatures[0].parameters.size() == 2);
+    CHECK(help->signatures[0].parameters[0].label == "input bit [7:0] addr");
+    CHECK(help->signatures[0].parameters[1].label == "output bit ok");
+
+    std::filesystem::remove(pkg_path);
+}
+
+// The current document keeps priority: a local declaration is what the call
+// means, even when a closed file declares the same name.
+TEST_CASE("signature help: a same-file declaration wins over a closed-file one", "[signature]") {
+    const auto pkg_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_signature_shadowed.sv";
+    {
+        std::ofstream out(pkg_path);
+        REQUIRE(out.good());
+        out << "package sig_shadow_pkg;\n"
+               "  function automatic int shared_fn(int from_package);\n"
+               "    return from_package;\n"
+               "  endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_signature_shadowed_use.sv";
+    analyzer.open(uri, R"(
+function int shared_fn(int from_current_file);
+    return from_current_file;
+endfunction
+
+module top;
+    int r;
+    initial r = shared_fn( );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(7, 26);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int shared_fn(int from_current_file)");
+
+    std::filesystem::remove(pkg_path);
+}
+
+TEST_CASE("signature help: a ::-qualified callee is not matched by bare name",
+          "[signature][scoped]") {
+    // `thing::type_id::create(...)` names `registry_base::create`.  Matching the
+    // bare name instead answered with `thing::create`, which is exactly the
+    // collision UVM's factory macros create: the class the call is written on
+    // always has its own `create`.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/signature_scoped_fixture.sv";
+    analyzer.open(uri, R"(
+class registry_base;
+    static function registry_base create(string name, int parent);
+        return null;
+    endfunction
+endclass
+
+class thing;
+    typedef registry_base type_id;
+
+    static function thing create(string name = "");
+        return null;
+    endfunction
+endclass
+
+module top;
+    initial thing::type_id::create("x", );
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(16, 40);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label ==
+          "function registry_base create(string name, int parent)");
+    REQUIRE(help->activeParameter.has_value());
+    CHECK(*help->activeParameter == 1);
+}
+
 TEST_CASE("workspace symbols: indexes top-level symbols from extra files", "[workspace]") {
     const auto path = std::filesystem::temp_directory_path() / "lazyverilog_workspace_symbols.sv";
     {
@@ -813,6 +1080,42 @@ endclass
     CHECK(symbols[2].kind == lsSymbolKind::Class);
 
     std::filesystem::remove(path);
+}
+
+TEST_CASE("workspace symbols: a declaration reachable from several indexes is reported once",
+          "[workspace]") {
+    const auto lib = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_lib.svh";
+    {
+        std::ofstream out(lib);
+        out << "class shared_cls;\nendclass\n";
+    }
+
+    // Both open buffers include the same header, and the header is a project
+    // file too.  Every one of those indexes carries shared_cls, but they all
+    // describe the same declaration at the same place.
+    Analyzer analyzer;
+    analyzer.set_extra_files({lib.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string include_line = "`include \"lazyverilog_wssym_dedup_lib.svh\"\n";
+    const auto first = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_a.sv";
+    const auto second = std::filesystem::temp_directory_path() / "lazyverilog_wssym_dedup_b.sv";
+    for (const auto& p : {first, second}) {
+        std::ofstream out(p);
+        out << include_line << "module " << p.stem().string() << ";\nendmodule\n";
+    }
+    analyzer.open(uri_from_path(first), include_line + "module lazyverilog_wssym_dedup_a;\nendmodule\n");
+    analyzer.open(uri_from_path(second), include_line + "module lazyverilog_wssym_dedup_b;\nendmodule\n");
+
+    WorkspaceSymbolParams params;
+    params.query = "shared_cls";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    CHECK(symbols.size() == 1);
+
+    std::filesystem::remove(lib);
+    std::filesystem::remove(first);
+    std::filesystem::remove(second);
 }
 
 TEST_CASE("autofunc: preserves positional call arguments", "[autofunc]") {
@@ -1178,4 +1481,165 @@ endmodule
           "**DEPTH** — *localparam*\n\n---\n\n```\nint = WIDTH*2\n```");
 
     std::filesystem::remove(path);
+}
+
+TEST_CASE("hover: an interface is not reported as a module", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_hover_iface_kind.sv";
+    const std::string text = "interface bus_if;\n"
+                             "    logic valid;\n"
+                             "endinterface\n"
+                             "module top;\n"
+                             "    bus_if the_bus();\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(0, (int)std::string("interface bu").size());
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& value = hover->contents.second->value;
+    CHECK(value.find("*interface*") != std::string::npos);
+    CHECK(value.find("*module*") == std::string::npos);
+}
+
+TEST_CASE("hover: resolves a declaration reached through a project file's include",
+          "[hover]") {
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto header = dir / "lazyverilog_hover_shard_inc.svh";
+    {
+        std::ofstream out(header);
+        out << "class lib_base_c;\n"
+               "endclass\n";
+    }
+    // Only the package is a filelist entry; the class lives in a header it
+    // includes, which is how UVM ships (uvm_pkg.sv includes every uvm_*.svh).
+    const auto pkg = dir / "lazyverilog_hover_shard_pkg.sv";
+    {
+        std::ofstream out(pkg);
+        out << "package lib_pkg;\n"
+               "`include \"lazyverilog_hover_shard_inc.svh\"\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({pkg.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "lazyverilog_hover_shard_user.sv");
+    const std::string text = "class user_c extends lib_base_c;\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(0, (int)std::string("class user_c extends lib_ba").size());
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    // Without shard-wide lookup this degrades to the bare "symbol" kind.
+    CHECK(hover->contents.second->value.find("*class*") != std::string::npos);
+
+    std::filesystem::remove(header);
+    std::filesystem::remove(pkg);
+}
+
+TEST_CASE("code action: RTL generators are not offered inside a class body", "[codeAction]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_class_scope.sv";
+    const std::string text = "class driver_c;\n"
+                             "    int depth;\n"
+                             "endclass\n"
+                             "module top;\n"
+                             "    logic clk;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto titles_at = [&](int line) {
+        lsCodeActionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.range.start = lsPosition(line, 0);
+        params.range.end = lsPosition(line, 0);
+        std::vector<std::string> titles;
+        for (const auto& a : provide_code_actions(analyzer, config, params))
+            titles.push_back(a.title);
+        return titles;
+    };
+
+    auto has = [](const std::vector<std::string>& titles, const std::string& needle) {
+        return std::any_of(titles.begin(), titles.end(), [&](const std::string& t) {
+            return t.find(needle) != std::string::npos;
+        });
+    };
+
+    // Line 1 is inside the class body: none of these are legal class items.
+    const auto in_class = titles_at(1);
+    CHECK_FALSE(has(in_class, "AutoWire"));
+    CHECK_FALSE(has(in_class, "AutoFF All"));
+    CHECK_FALSE(has(in_class, "always_ff"));
+    CHECK_FALSE(has(in_class, "always_comb"));
+
+    // Line 4 is module scope, where they belong.
+    const auto in_module = titles_at(4);
+    CHECK(has(in_module, "AutoWire"));
+    CHECK(has(in_module, "AutoFF All"));
+    CHECK(has(in_module, "always_ff"));
+    CHECK(has(in_module, "always_comb"));
+}
+
+TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
+    // UVM's `uvm_component_utils(T) reaches the typedef through a second macro:
+    //
+    //   `define m_uvm_component_registry_internal(T,S) \
+    //      typedef uvm_component_registry #(T,`"S`") type_id;
+    //
+    // Tokens produced inside that nested expansion share one expansion range
+    // that has no readable source text, so the "render a macro invocation once"
+    // rule used to drop all but the first of them and hover reported the
+    // truncated `uvm_component_registry lv_full_driver,`.
+    Analyzer analyzer;
+    const std::string uri = "file:///nested_macro_typedef.sv";
+    const std::string text = R"(`define mk_internal(T,S) \
+  typedef registry #(T,`"S`") type_id; \
+  static function type_id get_type(); \
+    return type_id::get(); \
+  endfunction
+`define mk(T) `mk_internal(T,T)
+class c;
+  `mk(c)
+  function void f();
+    c::type_id::create("x");
+  endfunction
+endclass
+)";
+    analyzer.open(uri, text);
+
+    const auto offset = text.find("type_id::create");
+    REQUIRE(offset != std::string::npos);
+    int line = 0;
+    int col = 0;
+    for (size_t i = 0; i < offset; ++i) {
+        if (text[i] == '\n') {
+            ++line;
+            col = 0;
+        } else {
+            ++col;
+        }
+    }
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value ==
+          "**type_id** — *typedef*\n\n---\n\n```\nregistry#(c, \"c\")\n```");
 }

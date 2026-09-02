@@ -19,6 +19,7 @@ namespace slang {
 class SourceManager;
 namespace syntax {
 class ExpressionSyntax;
+class FunctionPrototypeSyntax;
 class PropertyExprSyntax;
 class SyntaxTree;
 }
@@ -79,8 +80,14 @@ SourceFileID source_file_id_for_location(SyntaxIndex& index, const slang::Source
 /// shard from every dependent.
 class SourceFileIdResolver {
 public:
+    /// File of a reference occurrence: the call site, matching token_pos().
     SourceFileID for_token(SyntaxIndex& index, const slang::SourceManager& sm,
                            const slang::parsing::Token& token);
+    /// File of a declaration's name token: its true origin, matching
+    /// token_pos_line1_col0().  A member declared inside a macro body belongs
+    /// to the file that defined the macro, not the one that invoked it.
+    SourceFileID for_declaration_token(SyntaxIndex& index, const slang::SourceManager& sm,
+                                       const slang::parsing::Token& token);
     SourceFileID for_location(SyntaxIndex& index, const slang::SourceManager& sm,
                               slang::SourceLocation location);
 
@@ -139,6 +146,14 @@ std::string token_value_text(const slang::parsing::Token& token);
 
 bool syntax_fragment_edge_is_wordlike(char c);
 
+/// Return where @p token was actually written, redirecting a macro-body
+/// literal (e.g. the method name in a UVM-style `` `define FOO(...) task
+/// get_next_item(...); ... endtask ``) to its true origin instead of the
+/// macro-expansion buffer, which has no real line/column to report.  A plain
+/// token, or a substituted macro argument, is returned unchanged.
+slang::SourceLocation token_true_origin_location(const slang::SourceManager& sm,
+                                                 const slang::parsing::Token& token);
+
 /// Return a token position using slang's 1-based line numbers and LSP-style
 /// 0-based columns.  This is the historical coordinate shape stored in
 /// SyntaxIndex entries: callers convert the line to LSP coordinates at the
@@ -159,6 +174,19 @@ std::string render_syntax_token_text(const slang::SourceManager& sm,
                                      std::optional<slang::SourceRange>& last_macro_range);
 std::string render_syntax_node_text(const slang::SourceManager& sm,
                                     const slang::syntax::SyntaxNode& node);
+
+/// Render the hover/documentation signature block for a function or task
+/// prototype.  Shared so the closed-file shard and the open-buffer dynamic
+/// index produce byte-identical `ValueEntry::signature` text for the same
+/// declaration.
+std::string make_subroutine_signature(const slang::syntax::FunctionPrototypeSyntax& proto,
+                                      const std::string& name, const slang::SourceManager& sm);
+
+/// Reduce a verbatim `extends` clause to the bare class name used as the
+/// `ClassEntry` key.  The clause is stored as written, so it may carry a
+/// package qualifier and parameter overrides (`extends cfg_pkg::base_cfg #(8)`)
+/// that no index is keyed by.
+std::string base_class_lookup_name(std::string_view base_class);
 
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name);
 bool is_module_value_kind(std::string_view kind);

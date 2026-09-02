@@ -998,7 +998,14 @@ public:
                 in_covergroup = false;
         }
         size_t stmt_start = 0;
+        int stmt_pd = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
+            if (kind_is(tokens[i], TK::OpenParenthesis)) ++stmt_pd;
+            else if (kind_is(tokens[i], TK::CloseParenthesis)) stmt_pd = std::max(0, stmt_pd - 1);
+            // `for (int i = 0; i < n; i++)` — the header separators live inside
+            // the parens and do not end the enclosing statement.
+            if (kind_is(tokens[i], TK::Semicolon) && stmt_pd > 0)
+                continue;
             if (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::Comma)) {
                 for (size_t j = stmt_start; j <= i && j < tokens.size(); ++j) { tokens[j].immutable.syntax.stmt_begin = stmt_start; tokens[j].immutable.syntax.stmt_end = i; }
                 stmt_start = i + 1;
@@ -3813,8 +3820,11 @@ public:
             // pass through this spacing pass.
             if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
                 spaces = opts_.function_declaration.space_before_paren ? 1 : 0;
-            // Function/task call spacing
-            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage)))
+            // Function/task call spacing.  `new` lexes as its own keyword rather
+            // than an identifier, but `new(...)` is a constructor call and must
+            // follow the same option -- otherwise every class constructor
+            // renders as `new (name)`.
+            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword)))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::InstancePorts &&
                 opts_.instance.align)

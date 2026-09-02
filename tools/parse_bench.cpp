@@ -256,6 +256,13 @@ void print_stats(const char* label, const std::vector<FileResult>& results,
 } // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--version") {
+            std::cout << "parse-bench " << LAZYVERILOG_VERSION << "\n";
+            return 0;
+        }
+    }
+
     Options options;
     try {
         options = parse_args(argc, argv);
