@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <set>
 #include <filesystem>
 #include <fstream>
 
@@ -2165,4 +2166,171 @@ TEST_CASE("references: an open file reachable through a symlinked path is not "
 
     fs::remove(link_dir);
     fs::remove_all(real_dir);
+}
+
+TEST_CASE("references: package member is found through pkg::name qualification",
+          "[references]") {
+    // A file that qualifies states the owning package at the use site, so it
+    // must be found whether or not it also imports the package.  Before this
+    // was indexed, only importing files matched and renaming a package
+    // parameter silently left every qualifying file behind.
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string importer =
+        "import cfg_pkg::*;\n"
+        "module importer;\n"
+        "    logic [TL_AW-1:0] addr;\n"
+        "endmodule\n";
+    const std::string qualifier_a =
+        "module qualifier_a;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+    const std::string qualifier_b =
+        "module qualifier_b;\n"
+        "    localparam int W = cfg_pkg::TL_AW;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_refs_scoped_pkg.sv", pkg);
+    const auto importer_path = write_temp_sv("lazyverilog_refs_scoped_importer.sv", importer);
+    const auto qa_path = write_temp_sv("lazyverilog_refs_scoped_qa.sv", qualifier_a);
+    const auto qb_path = write_temp_sv("lazyverilog_refs_scoped_qb.sv", qualifier_b);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), importer_path.string(), qa_path.string(),
+                              qb_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "TL_AW");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    std::set<std::string> uris;
+    for (const auto& ref : refs)
+        uris.insert(ref.uri);
+
+    CHECK(uris.count(pkg_uri) == 1);
+    CHECK(uris.count(uri_from_path(importer_path)) == 1);
+    CHECK(uris.count(uri_from_path(qa_path)) == 1);
+    CHECK(uris.count(uri_from_path(qb_path)) == 1);
+    CHECK(refs.size() == 4);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(importer_path);
+    std::filesystem::remove(qa_path);
+    std::filesystem::remove(qb_path);
+}
+
+TEST_CASE("references: pkg::name search from a use site includes its own occurrence",
+          "[references]") {
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_refs_scoped_self_pkg.sv", pkg);
+    const auto user_path = write_temp_sv("lazyverilog_refs_scoped_self_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string user_uri = uri_from_path(user_path);
+    analyzer.open(user_uri, user);
+
+    const auto [line, col] = find_position(user, "cfg_pkg::TL_AW");
+    const auto refs = analyzer.find_references(user_uri, line + 0, col + 9, true);
+
+    bool has_self = false;
+    for (const auto& ref : refs)
+        if (ref.uri == user_uri && ref.line == 1)
+            has_self = true;
+    CHECK(has_self);
+    CHECK(refs.size() == 2);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(user_path);
+}
+
+TEST_CASE("references: pkg::name does not merge same-named members of other packages",
+          "[references]") {
+    const std::string pkg_a =
+        "package pkg_a;\n"
+        "    parameter int WIDTH = 8;\n"
+        "endpackage\n";
+    const std::string pkg_b =
+        "package pkg_b;\n"
+        "    parameter int WIDTH = 16;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [pkg_a::WIDTH-1:0] a;\n"
+        "    logic [pkg_b::WIDTH-1:0] b;\n"
+        "endmodule\n";
+
+    const auto a_path = write_temp_sv("lazyverilog_refs_scoped_pkg_a.sv", pkg_a);
+    const auto b_path = write_temp_sv("lazyverilog_refs_scoped_pkg_b.sv", pkg_b);
+    const auto user_path = write_temp_sv("lazyverilog_refs_scoped_two_pkg_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({a_path.string(), b_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string a_uri = uri_from_path(a_path);
+    analyzer.open(a_uri, pkg_a);
+
+    const auto [line, col] = find_position(pkg_a, "WIDTH");
+    const auto refs = analyzer.find_references(a_uri, line, col, true);
+
+    // pkg_a::WIDTH and its declaration only -- pkg_b::WIDTH is a different
+    // symbol that happens to share a name.
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri != uri_from_path(b_path));
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+    std::filesystem::remove(user_path);
+}
+
+TEST_CASE("rename: package member rewrites pkg::name qualified uses", "[references][rename]") {
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_rename_scoped_pkg.sv", pkg);
+    const auto user_path = write_temp_sv("lazyverilog_rename_scoped_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "TL_AW");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    // Rename edits are the reference set, so a qualified use left out here is a
+    // file the rename would silently break.
+    bool touches_user = false;
+    for (const auto& ref : refs)
+        if (ref.uri == uri_from_path(user_path))
+            touches_user = true;
+    CHECK(touches_user);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(user_path);
 }

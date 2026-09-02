@@ -1359,6 +1359,20 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             node.left->visit(*this);
                             return;
                         }
+                        // `p1::WIDTH` where this shard never parsed p1.  The
+                        // tables above only know packages declared here, so a
+                        // cross-file qualified reference would otherwise decay
+                        // to `name:<ident>` and be reachable only through the
+                        // import bridge -- which a file that qualifies instead
+                        // of importing can never satisfy.  The qualifier is
+                        // right there in the source, so record scope and name
+                        // and let find_references decide what kind it was.
+                        if (package_scope) {
+                            add_ref(rname->identifier,
+                                    symbol_canonical("scoped_member", scope_sv, name_sv));
+                            node.left->visit(*this);
+                            return;
+                        }
                     }
                     visitDefault(node);
                     return;
@@ -1378,6 +1392,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 }
                 if (package_scope && package_values.contains(key)) {
                     add_ref(name_token, symbol_canonical("package_value", scope, name));
+                    node.left->visit(*this);
+                    return;
+                }
+                // Same cross-shard recovery as the fast path above.
+                if (package_scope) {
+                    add_ref(name_token, symbol_canonical("scoped_member", scope, name));
                     node.left->visit(*this);
                     return;
                 }
