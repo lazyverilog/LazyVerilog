@@ -4086,8 +4086,15 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // merged by references/rename.
         auto current_structural_index = get_structural_index(*state);
         Location clicked_loc{uri, target->line, target->col, target->line, target->end_col};
-        if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc))
-            target_symbol_debug = *id;
+        if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc)) {
+            // `scoped_member::P::N` is what a shard records for `P::N` when it
+            // never parsed P.  It names the use site, not the declaration, so
+            // adopting it here would make a search started from a qualified use
+            // miss the declaration itself.  Leave it to the alias below and let
+            // the declaration's own shard supply the authoritative identity.
+            if (!id->starts_with("scoped_member::"))
+                target_symbol_debug = *id;
+        }
 
         // If the cursor was on a declaration or on a syntactic generic token
         // such as a hierarchy type, recover the project-index SymbolID from the
@@ -4207,6 +4214,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     }
     const SymbolID import_bridge_name_id =
         target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
+
+    // A file that writes `common_pkg::foo` instead of importing states the
+    // owning package at the use site, so its shard records
+    // `scoped_member::common_pkg::foo` without having parsed the package.  The
+    // spelling is deliberately kind-neutral: the referencing shard cannot tell
+    // a parameter from a typedef, a function or an enum member, and all four
+    // reach it the same way.  Matching on scope and name is what makes one
+    // alias cover them, and it stays additive -- a shard that did parse the
+    // package still emits the precise `package_value::` identity, which
+    // target_symbol_id already matches.
+    const SymbolID scoped_member_alias_id =
+        target_package.empty()
+            ? SymbolID{}
+            : SymbolID::from_canonical("scoped_member::" + target_package + "::" + target->name);
 
     // `handle.member` in another file is recorded under the receiver's bare
     // type name and a kind-neutral `class_member::` prefix, because that shard
@@ -4328,6 +4349,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
             imports_target_package(imports))
+            return true;
+        if (scoped_member_alias_id && ref.symbol_id == scoped_member_alias_id)
             return true;
         if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
             admits_class_member_alias(imports))
@@ -4498,7 +4521,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (open_uris.contains(extra.uri))
             continue;
         if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
-            !import_bridge_name_id)
+            !import_bridge_name_id && !scoped_member_alias_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
