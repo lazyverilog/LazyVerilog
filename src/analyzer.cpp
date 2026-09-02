@@ -3456,6 +3456,8 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
     return std::nullopt;
 }
 
+static std::optional<Location> include_target_at(const DocumentState& state, int line);
+
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
     auto state = get_state(uri);
     if (!state || !state->tree)
@@ -3545,6 +3547,18 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};
     }
 
+    // `` `include "path" `` — the cursor sits inside a string literal, so
+    // nothing above resolved a symbol.  Report the file the directive actually
+    // pulled in, using the same already-resolved relation goto-definition uses.
+    if (auto included = include_target_at(*state, line)) {
+        const std::filesystem::path path = path_from_file_uri(included->uri);
+        return SymbolInfo{.name = path.filename().string(),
+                          .kind = "include",
+                          .detail = path.string(),
+                          .line = line,
+                          .col = col};
+    }
+
     return SymbolInfo{.name = ident, .kind = "unknown", .line = line, .col = col};
 }
 
@@ -3609,6 +3623,51 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
     return std::nullopt;
 }
 
+static std::optional<Location> include_target_at(const DocumentState& state, int line) {
+    // The path in `` `include "..." `` is a string literal, so the identifier
+    // lookup that drives every other definition target cannot see it.  Nothing
+    // needs to be re-resolved though: slang already found the file while
+    // parsing, and each included buffer records the source location of the
+    // directive that pulled it in.  Mapping the cursor line through that
+    // relation avoids re-running an include-path search and touches no
+    // filesystem.
+    if (!state.source_manager)
+        return std::nullopt;
+    const auto& sm = *state.source_manager;
+
+    // Anchor on this document's own buffer.  Other open buffers are injected
+    // into the same SourceManager through assignText(), so without this check
+    // an overlay's includes would be attributed to this file.
+    const std::string normalized_uri = uri_from_path(state.normalized_path);
+    slang::BufferID owning_buffer;
+    for (auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (!full_path.empty() && uri_from_path(full_path) == normalized_uri) {
+            owning_buffer = buffer;
+            break;
+        }
+    }
+    if (!owning_buffer.valid())
+        return std::nullopt;
+
+    for (auto buffer : sm.getAllBuffers()) {
+        // Only directives written in this file.  A nested include's directive
+        // lives in the header that spells it, not here, so comparing the
+        // immediate parent is what keeps the cursor line meaningful.
+        const auto loc = sm.getIncludedFrom(buffer);
+        if (!loc.valid() || loc.buffer() != owning_buffer)
+            continue;
+        if (static_cast<int>(sm.getLineNumber(loc)) - 1 != line)
+            continue;
+
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        return Location{uri_from_path(full_path), 0, 0, 0, 0};
+    }
+    return std::nullopt;
+}
+
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
     const auto start = Clock::now();
     auto state = get_state(uri);
@@ -3621,6 +3680,10 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     // O(1) instead of copying and erase/removing a potentially large filelist
     // vector on every goto-definition request.
     auto result = definition_of_state(*state, uri, line, col, *extra, &uri);
+    // Miss path only: an `include directive resolves no identifier, and every
+    // successful definition keeps its current cost.
+    if (!result)
+        result = include_target_at(*state, line);
     log_perf("definition_of " + uri + ":" + std::to_string(line) + ":" + std::to_string(col),
              start);
     return result;
