@@ -2252,3 +2252,120 @@ TEST_CASE("completion: class scope offers typedefs declared in the class body",
 
     std::filesystem::remove(header);
 }
+
+TEST_CASE("completion: MemberAccess follows a nested struct chain", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_nested_struct.sv";
+    const std::string text =
+        "typedef struct packed {\n"
+        "    logic       q;\n"
+        "    logic       qe;\n"
+        "} field_t;\n"
+        "typedef struct packed {\n"
+        "    field_t     parity_en;\n"
+        "    field_t     nco;\n"
+        "} ctrl_t;\n"
+        "typedef struct packed {\n"
+        "    ctrl_t      ctrl;\n"
+        "    field_t     wdata;\n"
+        "} reg2hw_t;\n"
+        "module top;\n"
+        "    reg2hw_t reg2hw;\n"
+        "    initial reg2hw.ctrl.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "reg2hw.ctrl.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "parity_en"));
+    CHECK(has_label(result, "nco"));
+    // The receiver is `ctrl`, not `reg2hw`: the outer struct's own fields must
+    // not leak into a depth-2 completion.
+    CHECK_FALSE(has_label(result, "wdata"));
+}
+
+TEST_CASE("completion: MemberAccess follows a three-deep struct chain", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_nested_struct_deep.sv";
+    const std::string text =
+        "typedef struct packed {\n"
+        "    logic       q;\n"
+        "    logic       qe;\n"
+        "} field_t;\n"
+        "typedef struct packed {\n"
+        "    field_t     parity_en;\n"
+        "} ctrl_t;\n"
+        "typedef struct packed {\n"
+        "    ctrl_t      ctrl;\n"
+        "} reg2hw_t;\n"
+        "module top;\n"
+        "    reg2hw_t reg2hw;\n"
+        "    initial reg2hw.ctrl.parity_en.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "reg2hw.ctrl.parity_en.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "q"));
+    CHECK(has_label(result, "qe"));
+    CHECK_FALSE(has_label(result, "ctrl"));
+}
+
+TEST_CASE("completion: MemberAccess chain starts after a package qualifier", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_nested_qualified.sv";
+    // `cfg_pkg::outer_cfg` is a scope qualification followed by a declared
+    // value, so the chain must restart at `cfg` rather than treat it as a field
+    // of `cfg_pkg`.  A hop also has to work when it lands on a class property
+    // rather than a struct field.
+    const std::string text =
+        "package cfg_pkg;\n"
+        "    class inner_cfg;\n"
+        "        int inner_depth;\n"
+        "    endclass\n"
+        "    class outer_cfg;\n"
+        "        inner_cfg inner;\n"
+        "    endclass\n"
+        "endpackage\n"
+        "module top;\n"
+        "    cfg_pkg::outer_cfg cfg;\n"
+        "    initial cfg.inner.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "cfg.inner.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    CHECK(has_label(result, "inner_depth"));
+    CHECK_FALSE(has_label(result, "inner"));
+}
+
+TEST_CASE("completion: MemberAccess chain with an unresolvable hop stays empty", "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_member_nested_unknown.sv";
+    const std::string text =
+        "typedef struct packed {\n"
+        "    logic       q;\n"
+        "} field_t;\n"
+        "typedef struct packed {\n"
+        "    field_t     inner;\n"
+        "} outer_t;\n"
+        "module top;\n"
+        "    outer_t cfg;\n"
+        "    initial cfg.nosuch.\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "cfg.nosuch.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    // Degrade to nothing rather than offering the receiver's own fields.
+    CHECK_FALSE(has_label(result, "inner"));
+    CHECK_FALSE(has_label(result, "q"));
+}

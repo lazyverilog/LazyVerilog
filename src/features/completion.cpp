@@ -106,6 +106,38 @@ static std::string syntax_scope_base_name(const slang::syntax::NameSyntax& name)
     return {};
 }
 
+// Split a dotted receiver into the name that has a declaration and the field
+// hops that follow it:
+//
+//   reg2hw          -> base "reg2hw", hops {}
+//   reg2hw.ctrl     -> base "reg2hw", hops {"ctrl"}
+//   pkg::cfg.ctrl   -> base "cfg",    hops {"ctrl"}
+//
+// Only `.` extends a chain.  `::` is scope qualification, not member access, so
+// it restarts the base instead of contributing a hop -- otherwise `pkg::cfg.`
+// would try to read `cfg` as a field of `pkg`.
+static bool syntax_dot_chain(const slang::syntax::NameSyntax& name, std::string& base,
+                             std::vector<std::string>& hops) {
+    using namespace slang::syntax;
+
+    if (const auto* scoped = name.as_if<ScopedNameSyntax>()) {
+        if (scoped->separator.kind == slang::parsing::TokenKind::Dot && scoped->left &&
+            scoped->right) {
+            if (!syntax_dot_chain(*scoped->left, base, hops))
+                return false;
+            auto hop = syntax_scope_base_name(*scoped->right);
+            if (hop.empty())
+                return false;
+            hops.push_back(std::move(hop));
+            return true;
+        }
+    }
+
+    base = syntax_scope_base_name(name);
+    hops.clear();
+    return !base.empty();
+}
+
 static std::optional<std::string>
 syntax_scope_base_before_double_colon(const slang::syntax::SyntaxTree& tree,
                                       size_t cursor_offset) {
@@ -314,6 +346,14 @@ static std::string text_scope_qualifier_before_double_colon(const std::string& t
 struct DotCompletionSyntaxContext {
     size_t dot_offset{0};
     std::string base_name;
+    // Field hops written between base_name and the cursor's dot, in order.
+    //
+    //   reg2hw.            -> base_name "reg2hw", member_chain {}
+    //   reg2hw.ctrl.       -> base_name "reg2hw", member_chain {"ctrl"}
+    //
+    // Only the base names a declaration; every hop is a field of the type
+    // resolved so far, so the two cannot be looked up the same way.
+    std::vector<std::string> member_chain;
     // Set when the receiver is an implicit handle rather than a named value,
     // i.e. SyntaxKind::ThisHandle or SyntaxKind::SuperHandle.  Those carry no
     // identifier to look up -- their type comes from the enclosing class -- so
@@ -388,6 +428,7 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
         size_t dot_start;
         size_t best_end{0};
         std::string result;
+        std::vector<std::string> chain;
         SyntaxKind handle_kind{SyntaxKind::Unknown};
 
         NameVisitor(const slang::SourceManager& sm, slang::BufferID document_buffer,
@@ -405,13 +446,21 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
             if (!start)
                 return;
             const size_t end = *start + last.rawText().size();
-            if (end == dot_start && end >= best_end) {
-                auto base = syntax_scope_base_name(node);
-                if (!base.empty()) {
-                    best_end = end;
-                    result = std::move(base);
-                }
-            }
+            if (end != dot_start || end < best_end)
+                return;
+            std::string base;
+            std::vector<std::string> hops;
+            if (!syntax_dot_chain(node, base, hops))
+                return;
+            // `reg2hw.ctrl` and its own `ctrl` child both end at the cursor's
+            // dot.  Keep the outermost match, which is the one that still
+            // carries the hops -- the child alone would look like a receiver
+            // named `ctrl` that no declaration can explain.
+            if (end == best_end && hops.size() < chain.size())
+                return;
+            best_end = end;
+            result = std::move(base);
+            chain = std::move(hops);
         }
 
         void handle(const IdentifierNameSyntax& node) {
@@ -444,6 +493,7 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
                 if (end == dot_start && end >= best_end) {
                     best_end = end;
                     result.clear();
+                    chain.clear();
                     handle_kind = node.kind;
                 }
             }
@@ -455,6 +505,7 @@ syntax_dot_context_before_cursor(const slang::syntax::SyntaxTree& tree, size_t c
     tree.root().visit(names);
     return DotCompletionSyntaxContext{.dot_offset = dots.best_start,
                                       .base_name = names.result,
+                                      .member_chain = std::move(names.chain),
                                       .base_handle = names.handle_kind};
 }
 
@@ -1623,6 +1674,87 @@ current_file_class_name_items_from_ast(const DocumentState& state) {
     return items;
 }
 
+static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxIndex& index,
+                                                                std::string class_name,
+                                                                const std::string& field_name);
+
+// Type of `field_name` inside `type_name`, as declared in the buffer being
+// edited.  The current file contributes to completion only through its AST --
+// completion_index is deliberately empty -- so a type declared here is
+// invisible to the shard lookup used for everything else.
+//
+// Both aggregate forms are accepted: a `a.b.c` chain does not care whether a
+// hop lands on a struct field or a class property.
+static std::optional<std::string>
+current_file_field_type_from_ast(const DocumentState& state, const std::string& type_name,
+                                 const std::string& field_name) {
+    if (!state.tree || type_name.empty() || field_name.empty())
+        return std::nullopt;
+    using namespace slang::syntax;
+    std::optional<std::string> result;
+    struct Visitor : SyntaxVisitor<Visitor> {
+        const std::string& type_name;
+        const std::string& field_name;
+        std::optional<std::string>& result;
+        Visitor(const std::string& type_name, const std::string& field_name,
+                std::optional<std::string>& result)
+            : type_name(type_name), field_name(field_name), result(result) {}
+        void handle(const TypedefDeclarationSyntax& node) {
+            if (result || std::string(node.name.valueText()) != type_name)
+                return;
+            const auto* st = node.type->as_if<StructUnionTypeSyntax>();
+            if (!st)
+                return;
+            for (const auto* member : st->members) {
+                if (!member)
+                    continue;
+                for (const auto* decl : member->declarators) {
+                    if (decl && std::string(decl->name.valueText()) == field_name) {
+                        result = current_ast_decl_text(*member->type);
+                        return;
+                    }
+                }
+            }
+        }
+        void handle(const ClassDeclarationSyntax& node) {
+            if (result || std::string(node.name.valueText()) != type_name) {
+                visitDefault(node);
+                return;
+            }
+            for (const auto* item : node.items) {
+                const auto* prop = item ? item->as_if<ClassPropertyDeclarationSyntax>() : nullptr;
+                const auto* data =
+                    prop ? prop->declaration->as_if<DataDeclarationSyntax>() : nullptr;
+                if (!data)
+                    continue;
+                for (const auto* decl : data->declarators) {
+                    if (decl && std::string(decl->name.valueText()) == field_name) {
+                        result = current_ast_decl_text(*data->type);
+                        return;
+                    }
+                }
+            }
+        }
+    } visitor(type_name, field_name, result);
+    state.tree->root().visit(visitor);
+    return result;
+}
+
+// Same lookup against one shard.  Struct typedefs first, then classes, which
+// also walks the base-class chain.
+static std::optional<std::string> field_type_in_shard(const SyntaxIndex& index,
+                                                      const std::string& type_name,
+                                                      const std::string& field_name) {
+    if (const auto it = index.typedef_by_name.find(type_name);
+        it != index.typedef_by_name.end() && it->second < index.typedefs.size()) {
+        for (const auto& field : index.typedefs[it->second].fields) {
+            if (field.name == field_name && !field.type.empty())
+                return field.type;
+        }
+    }
+    return field_type_in_shard_hierarchy(index, type_name, field_name);
+}
+
 static std::string current_file_type_of_name_from_ast(const DocumentState& state,
                                                       const CompletionContext& ctx) {
     if (!state.tree || ctx.scope_name.empty())
@@ -1783,7 +1915,21 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
     if (!state.tree || ctx.scope_name.empty())
         return items;
     std::unordered_set<std::string> seen;
-    const std::string target = current_file_type_of_name_from_ast(state, ctx);
+    std::string target = current_file_type_of_name_from_ast(state, ctx);
+    // Follow `a.b.c.` one hop at a time: each hop is a field of the type
+    // resolved so far.  A hop this file cannot explain clears the target, and
+    // the shard layer is asked instead.
+    for (const auto& hop : ctx.member_chain) {
+        auto next = current_file_field_type_from_ast(
+            state, completion_base_type_name(target), hop);
+        if (!next) {
+            target.clear();
+            break;
+        }
+        target = completion_base_type_name(*next);
+    }
+    if (target.empty())
+        return items;
     using namespace slang::syntax;
 
     std::function<void(std::string_view)> emit_class;
@@ -2886,6 +3032,7 @@ CompletionContext CompletionEngine::detect_context(const DocumentState& state, i
                 // identifier.prefix → MemberAccess
                 ctx.kind = CompletionContextKind::MemberAccess;
                 ctx.scope_name = std::move(dot_ctx->base_name);
+                ctx.member_chain = std::move(dot_ctx->member_chain);
                 return ctx;
             }
 
@@ -3332,6 +3479,32 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                             value_type =
                                 field_type_in_shard_hierarchy(*shard, base, ctx.scope_name);
                     }
+                }
+            }
+            // `a.b.c.` — the steps above resolved the receiver `a`.  Each
+            // remaining hop is a field of the type resolved so far, and
+            // FieldEntry already carries the field's syntactic type, so a hop
+            // costs one map lookup per shard rather than another tree walk.
+            // A hop nothing can explain leaves value_type empty, which is the
+            // same state as an unresolvable receiver.
+            for (const auto& hop : ctx.member_chain) {
+                if (!value_type)
+                    break;
+                const std::string owner = completion_base_type_name(*value_type);
+                value_type = current_file_field_type_from_ast(state, owner, hop);
+                if (!value_type)
+                    value_type = field_type_in_shard(completion_index, owner, hop);
+                for (const auto& shard : *opened_shards) {
+                    if (value_type)
+                        break;
+                    if (shard.index)
+                        value_type = field_type_in_shard(*shard.index, owner, hop);
+                }
+                for (const auto* shard : project_shards) {
+                    if (value_type)
+                        break;
+                    if (shard)
+                        value_type = field_type_in_shard(*shard, owner, hop);
                 }
             }
             if (value_type) {
