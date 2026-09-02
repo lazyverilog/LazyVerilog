@@ -1,0 +1,6 @@
+# Stops `find_config_root`'s upward walk here, so the rtltree CLI smoke test
+# never inherits the repository's own lazyverilog.toml and its demo/ filelist.
+
+[rtltree]
+show_instance_name = true
+show_file = true
