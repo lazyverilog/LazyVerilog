@@ -1345,3 +1345,101 @@ TEST_CASE("definition: block-local declaration does not shadow a later sibling b
     CHECK(loc->line == 7);
 }
 
+
+TEST_CASE("definition: `include path resolves to the included file", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_definition_include_target.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_target.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = INCLUDED_PARAMETER;\n"
+                           "endmodule\n");
+
+    // Cursor inside the quoted path.  The path is a string literal, so this
+    // resolves through the preprocessor's include relation rather than through
+    // an identifier lookup.
+    auto loc = analyzer.definition_of(top_uri, 0, 14);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(inc_path));
+    CHECK(loc->line == 0);
+    CHECK(loc->col == 0);
+
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("definition: `include of a missing file stays unresolved", "[definition][include]") {
+    Analyzer analyzer;
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_missing.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_no_such_header.svh\"\n"
+                           "module top;\n"
+                           "endmodule\n");
+
+    CHECK_FALSE(analyzer.definition_of(top_uri, 0, 14).has_value());
+}
+
+TEST_CASE("definition: `include resolution reports the directly included file",
+          "[definition][include]") {
+    Analyzer analyzer;
+    const auto inner_path = write_temp_sv("lazyverilog_definition_include_inner.svh",
+                                          "parameter int INNER_PARAMETER = 2;\n");
+    const auto outer_path =
+        write_temp_sv("lazyverilog_definition_include_outer.svh",
+                      "`include \"lazyverilog_definition_include_inner.svh\"\n"
+                      "parameter int OUTER_PARAMETER = 1;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_nested_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_outer.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = INNER_PARAMETER;\n"
+                           "endmodule\n");
+
+    // The nested header is in the same SourceManager, but its directive lives in
+    // the outer header -- not on this line -- so it must not win here.
+    auto loc = analyzer.definition_of(top_uri, 0, 14);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(outer_path));
+
+    std::filesystem::remove(outer_path);
+    std::filesystem::remove(inner_path);
+}
+
+TEST_CASE("definition: a line without an `include is unaffected", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_definition_include_unaffected.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_unaffected_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_unaffected.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = 1;\n"
+                           "  logic unresolved_name;\n"
+                           "endmodule\n");
+
+    // An unresolvable position on an ordinary line must not fall back to the
+    // file's include target.
+    auto loc = analyzer.definition_of(top_uri, 2, 19);
+    CHECK((!loc.has_value() || loc->uri != uri_from_path(inc_path)));
+
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("hover: `include path reports the included file", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_hover_include_target.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_hover_include_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_hover_include_target.svh\"\n"
+                           "module top;\n"
+                           "endmodule\n");
+
+    auto info = analyzer.symbol_at(top_uri, 0, 14);
+    REQUIRE(info.has_value());
+    CHECK(info->kind == "include");
+    CHECK(info->name == "lazyverilog_hover_include_target.svh");
+
+    std::filesystem::remove(inc_path);
+}
