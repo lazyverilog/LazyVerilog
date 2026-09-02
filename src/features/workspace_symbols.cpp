@@ -2,6 +2,8 @@
 #include "../dynamic_file_index.hpp"
 #include <algorithm>
 #include <cctype>
+#include <string>
+#include <unordered_set>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -23,9 +25,20 @@ static bool matches_query(const std::string& name, const std::string& query) {
     return !name.empty() && (query.empty() || lower_copy(name).find(query) != std::string::npos);
 }
 
+// One declaration is reachable from many indexes: every open buffer that
+// includes or imports it carries it in its own structural index, and the
+// project shards do too.  They all describe the same declaration at the same
+// place, so key on identity and keep the first.
+static std::string symbol_key(const lsSymbolInformation& symbol) {
+    return symbol.location.uri.raw_uri_ + '\0' + std::to_string(symbol.location.range.start.line) +
+           '\0' + std::to_string(symbol.location.range.start.character) + '\0' +
+           std::to_string((int)symbol.kind) + '\0' + symbol.name;
+}
+
 static void append_index_symbols(const SyntaxIndex& index, const std::string& uri,
                                  const std::string& query,
-                                 std::vector<lsSymbolInformation>& symbols) {
+                                 std::vector<lsSymbolInformation>& symbols,
+                                 std::unordered_set<std::string>& seen) {
     for (const auto& module : index.modules) {
         if (!matches_query(module.name, query))
             continue;
@@ -44,7 +57,8 @@ static void append_index_symbols(const SyntaxIndex& index, const std::string& ur
         symbol.location.uri.raw_uri_ = module_uri.empty() ? uri : module_uri;
         symbol.location.range.start = lsPosition(line, module.col);
         symbol.location.range.end = lsPosition(line, module.col + (int)module.name.size());
-        symbols.push_back(std::move(symbol));
+        if (seen.insert(symbol_key(symbol)).second)
+            symbols.push_back(std::move(symbol));
     }
 
     for (const auto& cls : index.classes) {
@@ -58,7 +72,8 @@ static void append_index_symbols(const SyntaxIndex& index, const std::string& ur
         symbol.location.uri.raw_uri_ = class_uri.empty() ? uri : class_uri;
         symbol.location.range.start = lsPosition(line, cls.col);
         symbol.location.range.end = lsPosition(line, cls.col + (int)cls.name.size());
-        symbols.push_back(std::move(symbol));
+        if (seen.insert(symbol_key(symbol)).second)
+            symbols.push_back(std::move(symbol));
     }
 }
 } // namespace
@@ -67,15 +82,16 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
                                                            const WorkspaceSymbolParams& params) {
     const auto query = lower_copy(params.query);
     std::vector<lsSymbolInformation> symbols;
+    std::unordered_set<std::string> seen;
 
     analyzer.for_each_state([&](const std::string& uri,
                                 const std::shared_ptr<const DocumentState>& state) {
         if (state && state->tree)
-            append_index_symbols(get_structural_index(*state), uri, query, symbols);
+            append_index_symbols(get_structural_index(*state), uri, query, symbols, seen);
     });
 
     for (const auto& extra : *analyzer.extra_index_snapshot_ptr())
-        append_index_symbols(extra.index_ref(), extra.uri, query, symbols);
+        append_index_symbols(extra.index_ref(), extra.uri, query, symbols, seen);
 
     return symbols;
 }

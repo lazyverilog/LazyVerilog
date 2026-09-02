@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <tuple>
@@ -1270,6 +1271,39 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
             no_redundant_headers.push_back(outer);
     }
     folds.swap(no_redundant_headers);
+
+    // A parameterized instantiation ends up with two folds that start on the
+    // same line: the token scan sees "#(" and emits a paren region ending on
+    // the ")" line, while the AST pass emits the whole-statement instance fold.
+    //
+    //     memory #(          // token region [0,2]   AST instance [0,4]
+    //         .W (8)
+    //     ) u_mem (
+    //         .clk (clk)
+    //     );
+    //
+    // Vim's line-based fold model can only mark one fold start per line, so the
+    // shorter parameter-list region becomes the fold za/zc reach first and the
+    // instantiation itself never collapses as a whole -- which is the fold the
+    // instance pass exists to provide.  Drop the parameter-list region that a
+    // longer instance fold starts with.
+    std::map<int, int> instance_end_by_start;
+    for (const auto& r : folds) {
+        if (r.kind != "instance") continue;
+        auto [it, inserted] = instance_end_by_start.emplace(r.startLine, r.endLine);
+        if (!inserted)
+            it->second = std::max(it->second, r.endLine);
+    }
+    if (!instance_end_by_start.empty()) {
+        folds.erase(std::remove_if(folds.begin(), folds.end(),
+                                   [&](const FoldingRange& r) {
+                                       if (r.kind != "region") return false;
+                                       auto it = instance_end_by_start.find(r.startLine);
+                                       return it != instance_end_by_start.end() &&
+                                              it->second > r.endLine;
+                                   }),
+                    folds.end());
+    }
 
     // Neovim's built-in LSP fold expression currently projects LSP ranges onto
     // Vim's older line-based fold model.  That model cannot keep adjacent ranges

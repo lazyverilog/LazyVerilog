@@ -1,8 +1,8 @@
 # Linter CLI (`lazyverilog-lint`)
 
 `lazyverilog-lint` is a standalone command-line linter. It parses one file — or every file in a
-`-f` filelist — and pretty-prints lint diagnostics and compilation diagnostics (parse errors plus,
-when `[compilation] background_compilation` is enabled, semantic diagnostics) to stdout.
+`-f` filelist — and pretty-prints lint diagnostics and compilation diagnostics (parse errors plus
+semantic diagnostics) to stdout.
 
 ## Build
 
@@ -16,7 +16,7 @@ The binary is placed at `build/lazyverilog-lint`.
 ## Usage
 
 ```bash
-lazyverilog-lint [-f <filelist>] [--lint-only] [<file>]
+lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] [<file>]
 ```
 
 At least one of `-f <filelist>` or `<file>` is required.
@@ -32,7 +32,9 @@ At least one of `-f <filelist>` or `<file>` is required.
 | Flag | Description |
 |------|-------------|
 | `-f <filelist>`, `--filelist <filelist>` | Project filelist (`.f`) to index. With no `<file>`, lint every file it lists. With `<file>`, index the filelist for cross-file/semantic context but report only `<file>`'s diagnostics. Overrides `lazyverilog.toml`'s `[design] vcode`. |
-| `--lint-only` | Print only lint-rule diagnostics; drop parse and semantic (compilation) diagnostics. |
+| `--lint-only` | Print only lint-rule diagnostics; skip compilation and drop parse/semantic diagnostics. |
+| `--compile-only` | Print only compilation diagnostics (parse + semantic); skip lint rules. |
+| `--version` | Print the version and exit. |
 | `-h`, `--help` | Print usage and exit. |
 
 ## Configuration

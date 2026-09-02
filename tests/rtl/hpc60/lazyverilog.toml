@@ -1,0 +1,6 @@
+[design]
+vcode = "lazyverilog.f"   # startup-perf benchmark corpus: 60 modules sharing one huge params.svh
+define = []
+
+[compilation]
+background_compilation = false

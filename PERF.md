@@ -942,3 +942,69 @@ modules each including two of M headers, one `+incdir+`.  Any generator of that
 shape reproduces the header-bytes term.  The property that matters is many
 distinct headers with low per-header fan-in, which is what separates hdr100 and
 hdr200 from `shared2`.
+
+---
+
+# Round 6: a shared header's declarations stop being re-read per includer
+
+Round 5 removed the header-*bytes* term for designs with many distinct headers.
+The opposite shape — one huge header included by the whole design, the layout an
+HPC RTL tree with a central `params.svh` has — was untouched: `tests/rtl/hpc60`
+spent **98.7%** of its index time on the header (470 ms with it, 6.2 ms without),
+scaling linearly in header size (4x header -> 4.06x time, ~1.04 us per header
+line per includer).
+
+## What changed
+
+Re-parsing a header per includer is only irreducible for its **directives**: a
+`` `define `` means whatever it expands to where it is used.  Its declarations do
+not vary by includer, and since shard scoping they do not even end up in the
+includer's shard — the header's own shard is what everything else resolves
+against.
+
+So once a header has been parsed on its own and proved to stand alone, the
+burst's `HeaderTextCache` entry is replaced with a projection holding only its
+directive lines, every other line blanked (line-preserving, so a macro still
+reports the line it is defined on).  The existing seeding path serves that to
+every file still queued.
+
+Three correctness fixes were needed first, all of which the same investigation
+turned up: header shards were never invalidated on `didChangeWatchedFiles`, a
+header's shard was a copy of whichever includer claimed it, and compilation-unit
+scope `parameter` / `localparam` — the entire content of a typical `params.svh` —
+was never indexed at all.
+
+## Measured
+
+Ryzen 5 5600X (6C/12T), ext4 on NVMe, RelWithDebInfo, page cache warm, 3 runs:
+
+| Corpus | all CPUs | 1 CPU | user (1 CPU) | maxRSS (1 CPU) |
+|---|---|---|---|---|
+| hpc60 (61 shards) | 103.1 -> **51.2 ms** | 500.2 -> **43.5 ms** | 0.49 -> **0.04 s** | 37 -> **30 MB** |
+| opentitan (1093 shards) | 285 ms | — | — | 370 MB |
+
+Shard and module counts identical on both sides (hpc60 61/60, opentitan
+1093/816).  OpenTitan has no single dominant header and is flat, as expected.
+
+## The saving is bounded, and by what
+
+The projection can only be installed after some file has parsed the header and
+proved it stands alone.  Every worker running at that moment is already reading
+it, so the header's bulk is read **at most once per background worker** rather
+than once per includer — one read on a one-CPU slice, which is why the 1-CPU
+number improves 11.5x while the full-CPU number improves 2x.  Closing that
+remainder would need the header parsed before the burst fans out, which on a cold
+start means knowing the include graph before parsing anything.
+
+Guarded by `./build/lazyverilog-tests "[scaling]"`: the ratio between two file
+counts at the same header, which is worker-count independent and sits at the file
+ratio itself (8x) when the projection is disabled.
+
+## Still open from earlier rounds
+
+Unchanged from round 5, plus:
+
+- The projection is not applied to the open-buffer parse path, by design.  The
+  edit-path cost of a huge header is a separate problem: the null-tree window
+  after each keystroke (every AST feature early-returns while the reparse runs)
+  and the single-threaded LSP dispatch pool are what the user feels there.

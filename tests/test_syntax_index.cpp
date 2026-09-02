@@ -2,9 +2,11 @@
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <thread>
 #include <catch2/catch_test_macros.hpp>
 #include <slang/syntax/SyntaxTree.h>
 
@@ -727,6 +729,52 @@ TEST_CASE("header text cache: only widely shared headers are offered for seeding
     CHECK(candidates.front().first == "/proj/common.svh");
 }
 
+TEST_CASE("project index: a header is found through a configured include directory", "[index]") {
+    // The configured include directories are resolved once and handed to slang
+    // as additional include paths rather than rebuilt per SourceManager.  A
+    // header that lives outside the including file's own directory can only be
+    // resolved through them, so this is what proves they still reach the parse.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_incdir_resolution";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "include");
+    fs::create_directories(dir / "rtl");
+
+    const auto header_path = dir / "include" / "widths.svh";
+    const auto source_path = dir / "rtl" / "user.sv";
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    write_file(header_path, "package widths_pkg;\n    localparam int BUS_W = 24;\nendpackage\n");
+    write_file(source_path, "`include \"widths.svh\"\n"
+                            "module user;\n    logic [widths_pkg::BUS_W-1:0] d;\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({(dir / "include").string()});
+    analyzer.set_extra_files({source_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    bool found = false;
+    for (const auto& shard : snapshot->shards) {
+        if (!shard.index)
+            continue;
+        for (const auto& value : shard.index->values) {
+            if (value.name == "BUS_W" && value.default_value == "24")
+                found = true;
+        }
+    }
+    CHECK(found);
+
+    fs::remove_all(dir);
+}
+
 TEST_CASE("project index: shared header text is indexed once per including file", "[index]") {
     // Background indexing seeds already-known header text into each file's
     // SourceManager so a shared header is not re-read once per including file.
@@ -802,6 +850,75 @@ TEST_CASE("project index: shared header text is indexed once per including file"
     REQUIRE(reparsed);
     REQUIRE(reparsed->shards.size() == 3);
     CHECK(shared_width(*reparsed) == "32");
+
+    fs::remove_all(dir);
+}
+
+TEST_CASE("project index: typing in a header reaches the index without reparsing every includer",
+          "[index]") {
+    // The editor path is enqueue_parse, and its fanout to the files that
+    // `include the buffer is deferred until the typing stops and then reparses
+    // one closed includer rather than all of them.  What has to survive both is
+    // that the project index answers from the unsaved text; the rest of the
+    // closed includers refresh when the file is saved and the watcher reports
+    // it.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_header_edit_fanout";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    const auto header_path = dir / "shared.svh";
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+    auto shared_width = [](const ProjectIndexSnapshot& snapshot) -> std::string {
+        for (const auto& shard : snapshot.shards) {
+            if (!shard.index)
+                continue;
+            for (const auto& value : shard.index->values) {
+                if (value.name == "SHARED_W" && value.default_value == "32")
+                    return value.default_value;
+            }
+        }
+        return {};
+    };
+
+    write_file(header_path, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    std::vector<std::string> includers;
+    for (int i = 0; i < 4; ++i) {
+        const auto path = dir / ("blk" + std::to_string(i) + ".sv");
+        write_file(path, "`include \"shared.svh\"\nmodule blk" + std::to_string(i) +
+                             ";\n    logic [shared_pkg::SHARED_W-1:0] a;\nendmodule\n");
+        includers.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files(includers);
+    analyzer.wait_for_background_index_idle();
+
+    const auto header_uri = uri_from_path(header_path);
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(shared_width(*snapshot).empty());
+
+    analyzer.open(header_uri, "package shared_pkg;\n    localparam int SHARED_W = 8;\nendpackage\n");
+    analyzer.enqueue_parse(header_uri,
+                           "package shared_pkg;\n    localparam int SHARED_W = 32;\nendpackage\n");
+
+    // The fanout waits for the parse queue to go idle, so poll rather than
+    // asserting on one timing.
+    std::string width;
+    for (int attempt = 0; attempt < 100 && width != "32"; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        analyzer.wait_for_background_index_idle();
+        if (auto reparsed = analyzer.project_index_snapshot())
+            width = shared_width(*reparsed);
+    }
+    CHECK(width == "32");
 
     fs::remove_all(dir);
 }
@@ -1062,4 +1179,94 @@ TEST_CASE("project index: a header-heavy file still resolves every name it can r
     CHECK(declares(bigdefs_uri, "PAD3"));
 
     fs::remove_all(dir);
+}
+
+TEST_CASE("syntax_index: a macro-declared class member resolves to the macro's own file",
+          "[index]") {
+    // A macro body can declare a whole member (UVM does this pervasively, e.g.
+    // `UVM_SEQ_ITEM_PULL_IMP -> task get_next_item(...)).  Such a member's
+    // position is reported at the macro's own definition site, so its file_id
+    // must name that file too -- pairing an invocation-site file with a
+    // definition-site line/col yields a location that exists in neither.
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() / "lazyverilog_macro_decl_attribution";
+    fs::create_directories(root);
+    {
+        std::ofstream header(root / "decl_macros.svh");
+        header << "`define DECL_FIELD int magic_field;\n";
+    }
+    {
+        std::ofstream source(root / "macro_decl_top.sv");
+        source << "`include \"decl_macros.svh\"\n"
+                  "class my_cls;\n"
+                  "  `DECL_FIELD\n"
+                  "  int normal_field;\n"
+                  "endclass\n";
+    }
+
+    slang::SourceManager sm;
+    sm.addUserDirectories(std::string_view(root.string()));
+    auto tree = slang::syntax::SyntaxTree::fromFile((root / "macro_decl_top.sv").string(), sm);
+    REQUIRE(tree);
+
+    auto idx = SyntaxIndex::build(**tree);
+    REQUIRE(idx.classes.size() == 1);
+
+    auto field_named = [&](std::string_view name) -> const FieldEntry* {
+        for (const auto& field : idx.classes[0].fields)
+            if (field.name == name)
+                return &field;
+        return nullptr;
+    };
+
+    const auto* normal = field_named("normal_field");
+    REQUIRE(normal != nullptr);
+    CHECK(idx.source_uri(normal->file_id).ends_with("macro_decl_top.sv"));
+    CHECK(normal->line == 4);
+
+    // The macro-declared field is written at decl_macros.svh:1, not in the
+    // file that invokes the macro.
+    const auto* magic = field_named("magic_field");
+    REQUIRE(magic != nullptr);
+    CHECK(magic->line == 1);
+    CHECK(idx.source_uri(magic->file_id).ends_with("decl_macros.svh"));
+}
+
+TEST_CASE("syntax_index: a type spelled as an object-like macro resolves to the aliased name",
+          "[index]") {
+    // The shard stores rendered type text, which preserves a macro's invocation
+    // spelling.  That is right for dimensions -- Connect / Interface synthesize
+    // source from port text -- but a base type name spelled `ITEM_T matches no
+    // class in any lookup table, so member resolution on such a field dies at
+    // the shard boundary while the live-AST path resolves it fine.
+    const std::string source = "`define ITEM_T my_item\n"
+                               "`define WIDTH 8\n"
+                               "class my_item;\n"
+                               "  int data_field;\n"
+                               "endclass\n"
+                               "class holder;\n"
+                               "  `ITEM_T aliased;\n"
+                               "  my_item plain;\n"
+                               "  logic [`WIDTH-1:0] bus;\n"
+                               "endclass\n";
+    auto tree = slang::syntax::SyntaxTree::fromText(source);
+    REQUIRE(tree != nullptr);
+    auto idx = SyntaxIndex::build(*tree, source);
+
+    auto holder = std::find_if(idx.classes.begin(), idx.classes.end(),
+                               [](const ClassEntry& c) { return c.name == "holder"; });
+    REQUIRE(holder != idx.classes.end());
+
+    auto type_of = [&](std::string_view name) {
+        for (const auto& field : holder->fields)
+            if (field.name == name)
+                return field.type;
+        return std::string("<missing>");
+    };
+
+    CHECK(type_of("aliased") == "my_item");
+    CHECK(type_of("plain") == "my_item");
+    // A macro standing for a dimension keeps the user's spelling: there is no
+    // base type name to resolve, and port/signal text is used to generate code.
+    CHECK(type_of("bus").find("`WIDTH") != std::string::npos);
 }
