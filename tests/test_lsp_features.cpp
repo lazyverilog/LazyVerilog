@@ -1071,13 +1071,15 @@ endclass
     params.query = "p";
     auto symbols = provide_workspace_symbols(analyzer, params);
 
+    // Ranked, not in index order: a name starting with the query beats one that
+    // merely contains it, and a package outranks a class on equal footing.
     REQUIRE(symbols.size() == 3);
-    CHECK(symbols[0].name == "alpha");
-    CHECK(symbols[0].kind == lsSymbolKind::Module);
-    CHECK(symbols[1].name == "pkt_pkg");
-    CHECK(symbols[1].kind == lsSymbolKind::Package);
-    CHECK(symbols[2].name == "packet_class");
-    CHECK(symbols[2].kind == lsSymbolKind::Class);
+    CHECK(symbols[0].name == "pkt_pkg");
+    CHECK(symbols[0].kind == lsSymbolKind::Package);
+    CHECK(symbols[1].name == "packet_class");
+    CHECK(symbols[1].kind == lsSymbolKind::Class);
+    CHECK(symbols[2].name == "alpha");
+    CHECK(symbols[2].kind == lsSymbolKind::Module);
 
     std::filesystem::remove(path);
 }
@@ -1796,4 +1798,66 @@ endmodule
     REQUIRE(bump.has_value());
     REQUIRE(bump->signatures.size() == 1);
     CHECK(bump->signatures[0].label == "bump(int amount, int scale)");
+}
+
+// A project-wide query can match thousands of declarations; the response has to
+// be both bounded and ordered, or the client renders whichever shard happened to
+// be walked first and the exact hit is nowhere near the top.
+TEST_CASE("workspace symbols: the response is ranked and capped", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_cap.sv";
+    {
+        std::ofstream out(path);
+        for (int i = 0; i < 150; ++i)
+            out << "module lane_unit_" << i << ";\nendmodule\n";
+        out << "module lane;\nendmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "lane";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    CHECK(symbols.size() == 100);
+    // The exact match leads, ahead of the 150 names that merely start with it.
+    CHECK(symbols[0].name == "lane");
+
+    std::filesystem::remove(path);
+}
+
+// `base_c::bump` names one method of one class.  Without the scope half of the
+// query, every same-named member of every other class comes back too.
+TEST_CASE("workspace symbols: a qualified query filters by container", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_scope.sv";
+    {
+        std::ofstream out(path);
+        out << "package p;\n"
+               "    class base_c;\n"
+               "        function void bump(int amount);\n"
+               "        endfunction\n"
+               "    endclass\n"
+               "    class other_c;\n"
+               "        function void bump(int amount);\n"
+               "        endfunction\n"
+               "    endclass\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "bump";
+    CHECK(provide_workspace_symbols(analyzer, params).size() == 2);
+
+    params.query = "base_c::bump";
+    auto scoped = provide_workspace_symbols(analyzer, params);
+    REQUIRE(scoped.size() == 1);
+    REQUIRE(scoped[0].containerName.has_value());
+    CHECK(*scoped[0].containerName == "base_c");
+
+    std::filesystem::remove(path);
 }
