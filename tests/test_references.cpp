@@ -2467,3 +2467,58 @@ endmodule
 // `import p::*;` lets a file spell a package type without the `p::` prefix.
 // Those unqualified uses were invisible to references and rename, so renaming
 // the type left them pointing at a name that no longer exists.
+
+// `import p::*;` lets a file spell a package type without the `p::` prefix.
+// Those unqualified uses were invisible to references and rename, so renaming
+// the type left them pointing at a name that no longer exists.
+TEST_CASE("references: wildcard-imported package type used unqualified in another file",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-wildcard";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto pkg = dir / "p_pkg.sv";
+    const auto qualified = dir / "user_qualified.sv";
+    const auto wildcard = dir / "user_wildcard.sv";
+    {
+        std::ofstream out(pkg);
+        out << "package p;\n  class leaf_c;\n  endclass\nendpackage\n";
+    }
+    {
+        std::ofstream out(qualified);
+        out << "module user_qualified;\n  p::leaf_c h1;\nendmodule\n";
+    }
+    {
+        std::ofstream out(wildcard);
+        out << "module user_wildcard;\n  import p::*;\n  leaf_c h2;\nendmodule\n";
+    }
+    // The same import written in the module *header*, which is where RTL and UVM
+    // code usually puts it.
+    const auto header_wildcard = dir / "user_header_wildcard.sv";
+    {
+        std::ofstream out(header_wildcard);
+        out << "module user_header_wildcard\n  import p::*;\n(\n  input logic clk\n);\n"
+               "  leaf_c h3;\nendmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg.string(), qualified.string(), wildcard.string(),
+                              header_wildcard.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto pkg_uri = uri_from_path(pkg);
+    analyzer.open(pkg_uri, "package p;\n  class leaf_c;\n  endclass\nendpackage\n");
+
+    auto refs = analyzer.find_references(pkg_uri, 1, 8, true);
+    const auto wildcard_uri = uri_from_path(wildcard);
+    const auto qualified_uri = uri_from_path(qualified);
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == qualified_uri; }));
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == wildcard_uri && l.line == 2; }));
+    const auto header_uri = uri_from_path(header_wildcard);
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == header_uri && l.line == 5; }));
+
+    std::filesystem::remove_all(dir);
+}
