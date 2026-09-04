@@ -1,10 +1,144 @@
 #include "document_symbols.hpp"
 #include "../dynamic_file_index.hpp"
+#include "../syntax_index_shared.hpp"
+#include <functional>
 #include <unordered_map>
+#include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
+#include <slang/syntax/SyntaxVisitor.h>
+#include <slang/text/SourceManager.h>
 
 namespace {
 
 int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line - 1 : 0; }
+
+// ── Source extents, read from the open buffer's AST ───────────────────────────
+//
+// The index records where a declaration *starts*, which is all a jump target
+// needs.  An outline also needs where it ends: LSP gives `range` (the whole
+// declaration, used for breadcrumbs and folding) and `selectionRange` (the name
+// alone, used for the reveal).  Reporting the name span as both, which is what
+// this file used to do, collapses the outline to a list of points.
+//
+// documentSymbol only ever answers for the open buffer, whose AST is
+// authoritative, so these extents are derived here instead of being added to
+// SyntaxIndex.  Nothing on the closed-file path wants them, and the project
+// indexer should not pay for facts only the focused file uses.
+
+struct GenerateBlock {
+    std::string name;
+    int line{0}; // 1-based
+    int col{0};  // 0-based
+    int end_line{0};
+    int end_col{0};
+    int parent{-1}; // index into the module's block list
+};
+
+struct Extent {
+    int end_line{0}; // 1-based, 0 when unknown
+    int end_col{0};  // 0-based exclusive
+};
+
+struct ModuleShape {
+    Extent extent;
+    std::vector<GenerateBlock> blocks;
+};
+
+struct DocumentShape {
+    std::unordered_map<std::string, ModuleShape> modules;
+    std::unordered_map<std::string, Extent> classes;
+};
+
+struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
+    const slang::SourceManager& sm;
+    const std::string& uri;
+    DocumentShape& out;
+    ModuleShape* current{nullptr};
+    std::vector<int> block_stack;
+
+    ShapeVisitor(const slang::SourceManager& sm, const std::string& uri, DocumentShape& out)
+        : sm(sm), uri(uri), out(out) {}
+
+    // A tree may span several files through `include; only declarations written
+    // in the requested document have ranges this response can report.
+    bool in_document(slang::SourceLocation loc) const {
+        const auto actual = uri_from_source_location(sm, loc);
+        return actual.empty() || actual == uri;
+    }
+
+    Extent extent_of(const slang::syntax::SyntaxNode& node) const {
+        const auto end = node.sourceRange().end();
+        if (!end.valid())
+            return {};
+        const auto line = sm.getLineNumber(end);
+        const auto col = sm.getColumnNumber(end);
+        return Extent{(int)line, col > 0 ? (int)col - 1 : 0};
+    }
+
+    void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+        if (!in_document(node.header->name.location())) {
+            visitDefault(node);
+            return;
+        }
+        auto& shape = out.modules[std::string(node.header->name.valueText())];
+        shape.extent = extent_of(node);
+        ModuleShape* previous = current;
+        current = &shape;
+        visitDefault(node);
+        current = previous;
+    }
+
+    void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+        if (in_document(node.name.location()))
+            out.classes[std::string(node.name.valueText())] = extent_of(node);
+        visitDefault(node);
+    }
+
+    void handle(const slang::syntax::GenerateBlockSyntax& node) {
+        // Only a labelled block is a scope a reader navigates by; an unnamed
+        // one would clutter the outline with `genblk` nodes the source never
+        // spells.
+        const auto* name_clause = node.beginName ? node.beginName : node.endName;
+        std::string label =
+            name_clause ? std::string(name_clause->name.valueText()) : std::string{};
+        if (label.empty() && node.label)
+            label = std::string(node.label->name.valueText());
+        if (!current || label.empty() || !in_document(node.begin.location())) {
+            visitDefault(node);
+            return;
+        }
+
+        const auto begin = node.begin.location();
+        const auto extent = extent_of(node);
+        GenerateBlock block;
+        block.name = std::move(label);
+        block.line = (int)sm.getLineNumber(begin);
+        const auto col = sm.getColumnNumber(begin);
+        block.col = col > 0 ? (int)col - 1 : 0;
+        block.end_line = extent.end_line;
+        block.end_col = extent.end_col;
+        block.parent = block_stack.empty() ? -1 : block_stack.back();
+
+        const int self = (int)current->blocks.size();
+        current->blocks.push_back(std::move(block));
+        block_stack.push_back(self);
+        visitDefault(node);
+        block_stack.pop_back();
+    }
+};
+
+// The innermost generate block whose lines cover @p line, or -1 for none.
+int block_containing(const std::vector<GenerateBlock>& blocks, int line) {
+    int best = -1;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        const auto& b = blocks[i];
+        if (b.end_line <= 0 || line < b.line || line > b.end_line)
+            continue;
+        if (best < 0 || b.line >= blocks[(size_t)best].line)
+            best = (int)i;
+    }
+    return best;
+}
 
 lsDocumentSymbol make_symbol(const std::string& name, lsSymbolKind kind, int line, int col,
                              optional<std::string> detail = {}) {
@@ -21,6 +155,19 @@ lsDocumentSymbol make_symbol(const std::string& name, lsSymbolKind kind, int lin
 
 optional<std::string> opt_str(std::string text) {
     return text.empty() ? optional<std::string>{} : optional<std::string>(std::move(text));
+}
+
+// Widen `range` to the whole declaration, leaving `selectionRange` on the name.
+// LSP requires range to contain selectionRange, so a range that would not is
+// dropped rather than reported.
+void set_extent(lsDocumentSymbol& sym, const Extent& extent) {
+    if (extent.end_line <= 0)
+        return;
+    const int end_line = to_lsp_line(extent.end_line);
+    if (end_line < sym.range.end.line ||
+        (end_line == sym.range.end.line && extent.end_col < sym.range.end.character))
+        return;
+    sym.range.end = lsPosition(end_line, extent.end_col);
 }
 
 void push_child(lsDocumentSymbol& parent, lsDocumentSymbol child) {
@@ -41,6 +188,10 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
         return result;
 
     const SyntaxIndex& index = get_structural_index(*state);
+
+    DocumentShape shape;
+    ShapeVisitor shape_visitor(state->tree->sourceManager(), uri, shape);
+    state->tree->root().visit(shape_visitor);
 
     // lsDocumentSymbol carries no URI, so every range it reports is read against
     // the requested document.  Index entries, however, record where a
@@ -81,6 +232,39 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
 
         lsDocumentSymbol node = make_symbol(mod.name, kind, mod.line, mod.col);
 
+        // A labelled generate block is a named scope holding declarations, so
+        // it nests in the outline the way a package or class does.  Everything
+        // declared between its `begin` and `end` lines belongs under it.
+        const auto shape_it = shape.modules.find(mod.name);
+        const ModuleShape* module_shape = shape_it == shape.modules.end() ? nullptr
+                                                                         : &shape_it->second;
+        if (module_shape)
+            set_extent(node, module_shape->extent);
+
+        std::vector<lsDocumentSymbol> block_nodes;
+        std::vector<std::vector<int>> block_children;
+        std::vector<int> block_roots;
+        if (module_shape) {
+            const auto& blocks = module_shape->blocks;
+            block_children.resize(blocks.size());
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                const auto& b = blocks[i];
+                lsDocumentSymbol block_node =
+                    make_symbol(b.name, lsSymbolKind::Namespace, b.line, b.col,
+                                optional<std::string>("generate"));
+                set_extent(block_node, Extent{b.end_line, b.end_col});
+                block_nodes.push_back(std::move(block_node));
+                if (b.parent < 0)
+                    block_roots.push_back((int)i);
+                else
+                    block_children[(size_t)b.parent].push_back((int)i);
+            }
+        }
+        const auto target = [&](int line) -> lsDocumentSymbol& {
+            const int block = module_shape ? block_containing(module_shape->blocks, line) : -1;
+            return block < 0 ? node : block_nodes[(size_t)block];
+        };
+
         for (const auto& p : mod.ports) {
             if (!in_document(p.file_id))
                 continue;
@@ -105,8 +289,8 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
             if (v.parent_scope != mod.name || !in_document(v.file_id))
                 continue;
             if (v.kind == "variable") {
-                push_child(node, make_symbol(v.name, lsSymbolKind::Variable, v.line, v.col,
-                                             opt_str(v.type)));
+                push_child(target(v.line), make_symbol(v.name, lsSymbolKind::Variable, v.line,
+                                                       v.col, opt_str(v.type)));
             } else if (v.kind == "parameter" || v.kind == "localparam") {
                 // Parameter *ports* are already reported from mod.ports above.
                 if (mod.port_by_name.count(v.name))
@@ -114,20 +298,33 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
                 std::string detail = v.type;
                 if (!v.default_value.empty())
                     detail += (detail.empty() ? "= " : " = ") + v.default_value;
-                push_child(node, make_symbol(v.name, lsSymbolKind::Constant, v.line, v.col,
-                                             opt_str(std::move(detail))));
+                push_child(target(v.line), make_symbol(v.name, lsSymbolKind::Constant, v.line,
+                                                       v.col, opt_str(std::move(detail))));
             } else if (v.kind == "function" || v.kind == "task") {
-                push_child(node, make_symbol(v.name,
-                                             v.kind == "task" ? lsSymbolKind::Method
-                                                              : lsSymbolKind::Function,
-                                             v.line, v.col, opt_str(v.type)));
+                push_child(target(v.line), make_symbol(v.name,
+                                                       v.kind == "task" ? lsSymbolKind::Method
+                                                                        : lsSymbolKind::Function,
+                                                       v.line, v.col, opt_str(v.type)));
             }
         }
         for (const auto& inst : index.instances) {
             if (inst.parent_module != mod.name || !in_document(inst.file_id))
                 continue;
-            push_child(node, make_symbol(inst.instance_name, lsSymbolKind::Object, inst.line, 0,
-                                         opt_str(inst.module_name)));
+            push_child(target(inst.line), make_symbol(inst.instance_name, lsSymbolKind::Object,
+                                                      inst.line, 0, opt_str(inst.module_name)));
+        }
+
+        // Blocks are collected in source order, so a parent always precedes its
+        // children; assembling from the roots down keeps sibling order intact.
+        if (!block_nodes.empty()) {
+            std::function<lsDocumentSymbol(int)> collect = [&](int i) {
+                lsDocumentSymbol block_node = std::move(block_nodes[(size_t)i]);
+                for (int child : block_children[(size_t)i])
+                    push_child(block_node, collect(child));
+                return block_node;
+            };
+            for (int root : block_roots)
+                push_child(node, collect(root));
         }
 
         container_index.emplace(mod.name, Locator{result.size(), -1});
@@ -140,6 +337,8 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
         if (!in_document(cls.file_id))
             continue;
         lsDocumentSymbol node = make_symbol(cls.name, lsSymbolKind::Class, cls.line, cls.col);
+        if (const auto extent = shape.classes.find(cls.name); extent != shape.classes.end())
+            set_extent(node, extent->second);
         for (const auto& f : cls.fields) {
             if (!in_document(f.file_id))
                 continue;
