@@ -62,18 +62,38 @@ static void append_index_symbols(const SyntaxIndex& index, const std::string& ur
     }
 
     for (const auto& cls : index.classes) {
-        if (!matches_query(cls.name, query))
-            continue;
-        const int line = to_lsp_line(cls.line);
-        lsSymbolInformation symbol;
-        symbol.name = cls.name;
-        symbol.kind = lsSymbolKind::Class;
-        const auto class_uri = index.source_uri(cls.file_id);
-        symbol.location.uri.raw_uri_ = class_uri.empty() ? uri : class_uri;
-        symbol.location.range.start = lsPosition(line, cls.col);
-        symbol.location.range.end = lsPosition(line, cls.col + (int)cls.name.size());
-        if (seen.insert(symbol_key(symbol)).second)
-            symbols.push_back(std::move(symbol));
+        if (matches_query(cls.name, query)) {
+            const int line = to_lsp_line(cls.line);
+            lsSymbolInformation symbol;
+            symbol.name = cls.name;
+            symbol.kind = lsSymbolKind::Class;
+            const auto class_uri = index.source_uri(cls.file_id);
+            symbol.location.uri.raw_uri_ = class_uri.empty() ? uri : class_uri;
+            symbol.location.range.start = lsPosition(line, cls.col);
+            symbol.location.range.end = lsPosition(line, cls.col + (int)cls.name.size());
+            if (seen.insert(symbol_key(symbol)).second)
+                symbols.push_back(std::move(symbol));
+        }
+
+        // Methods are the names a UVM codebase is actually navigated by, and the
+        // outline already lists them; without this the project-wide jump can
+        // find a class but never any of its tasks or functions.
+        for (const auto& method : cls.methods) {
+            if (!matches_query(method.name, query))
+                continue;
+            const int method_line = to_lsp_line(method.line);
+            lsSymbolInformation member;
+            member.name = method.name;
+            member.kind = method.is_task ? lsSymbolKind::Method : lsSymbolKind::Function;
+            const auto method_uri = index.source_uri(method.file_id);
+            member.location.uri.raw_uri_ = method_uri.empty() ? uri : method_uri;
+            member.location.range.start = lsPosition(method_line, method.col);
+            member.location.range.end =
+                lsPosition(method_line, method.col + (int)method.name.size());
+            member.containerName = cls.name;
+            if (seen.insert(symbol_key(member)).second)
+                symbols.push_back(std::move(member));
+        }
     }
 }
 } // namespace

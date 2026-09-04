@@ -1718,3 +1718,38 @@ endmodule
 
     std::filesystem::remove(module_path);
 }
+
+TEST_CASE("workspace symbols: class methods are searchable", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_methods.sv";
+    {
+        std::ofstream out(path);
+        out << "package p;\n"
+               "    class base_c;\n"
+               "        extern function void bump(int amount);\n"
+               "        task drive();\n"
+               "        endtask\n"
+               "    endclass\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "bump";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    REQUIRE(symbols.size() == 1);
+    CHECK(symbols[0].name == "bump");
+    CHECK(symbols[0].kind == lsSymbolKind::Function);
+    REQUIRE(symbols[0].containerName.has_value());
+    CHECK(*symbols[0].containerName == "base_c");
+
+    params.query = "drive";
+    symbols = provide_workspace_symbols(analyzer, params);
+    REQUIRE(symbols.size() == 1);
+    CHECK(symbols[0].kind == lsSymbolKind::Method);
+
+    std::filesystem::remove(path);
+}
