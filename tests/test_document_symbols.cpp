@@ -302,3 +302,65 @@ TEST_CASE("documentSymbol: module localparams appear as constants", "[documentSy
     CHECK(std::count_if(children.begin(), children.end(),
                         [](const lsDocumentSymbol& s) { return s.name == "W"; }) == 1);
 }
+
+// A labelled generate block is a named scope: what it declares belongs under it
+// in the outline, not flattened into the module beside everything else.
+TEST_CASE("documentSymbol: a named generate block nests what it declares",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_generate.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    logic outside;\n"
+                       "    generate\n"
+                       "        for (genvar i = 0; i < 4; i++) begin : g_lane\n"
+                       "            sub u_sub ();\n"
+                       "        end\n"
+                       "    endgenerate\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* top = find_child(result, "top");
+    REQUIRE(top != nullptr);
+
+    const auto children = children_of(*top);
+    CHECK(find_child(children, "outside") != nullptr);
+    // Not flattened into the module.
+    CHECK(find_child(children, "u_sub") == nullptr);
+
+    const auto* block = find_child(children, "g_lane");
+    REQUIRE(block != nullptr);
+    CHECK(block->kind == lsSymbolKind::Namespace);
+
+    const auto block_children = children_of(*block);
+    CHECK(find_child(block_children, "u_sub") != nullptr);
+}
+
+// LSP splits the two ranges: `range` is the whole declaration, which is what
+// clients fold and show in breadcrumbs; `selectionRange` is the name they
+// reveal.  Reporting the name span as both collapses the outline to points.
+TEST_CASE("documentSymbol: a declaration's range spans its whole body",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_range.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    logic a;\n"
+                       "endmodule\n"
+                       "\n"
+                       "class driver;\n"
+                       "    int depth;\n"
+                       "endclass\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+
+    const auto* top = find_child(result, "top");
+    REQUIRE(top != nullptr);
+    CHECK(top->selectionRange.start.line == 0);
+    CHECK(top->selectionRange.end.line == 0);
+    CHECK(top->range.start.line == 0);
+    CHECK(top->range.end.line == 2); // through `endmodule`
+
+    const auto* cls = find_child(result, "driver");
+    REQUIRE(cls != nullptr);
+    CHECK(cls->selectionRange.start.line == 4);
+    CHECK(cls->range.end.line == 6); // through `endclass`
+}
