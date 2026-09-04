@@ -22,6 +22,10 @@ struct CallContext {
     // not be matched by bare name against the whole file.
     size_t name_offset{0};
     bool is_scoped{false};
+    // `handle.method(` — a call through an object, not a named port connection.
+    // The callee names a member of the receiver's type, so it is resolved the way
+    // a qualified call is: by asking go-to-definition which declaration is meant.
+    bool is_member_call{false};
 };
 
 struct ParamInfo {
@@ -99,6 +103,14 @@ static std::optional<std::string> dotted_ident_before(std::string_view text, siz
         --dot;
     if (dot == 0 || text[dot - 1] != '.')
         return std::nullopt;
+    // `.port(sig)` in an instantiation has nothing before the dot; `obj.method(`
+    // has the receiver.  Treating the latter as a named port is what left every
+    // method call without a signature.
+    size_t before_dot = dot - 1;
+    while (before_dot > 0 && std::isspace((unsigned char)text[before_dot - 1]))
+        --before_dot;
+    if (before_dot > 0 && (is_ident_char(text[before_dot - 1]) || text[before_dot - 1] == ']'))
+        return std::nullopt;
     return std::string(text.substr(name_start, name_end - name_start));
 }
 
@@ -137,10 +149,14 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
                 const size_t name_start = name_end - name.size();
                 const bool scoped =
                     name_start >= 2 && before.compare(name_start - 2, 2, "::") == 0;
-                return CallContext{name,
-                                   named_port ? std::variant<int, std::string>(*named_port)
-                                              : std::variant<int, std::string>(active),
-                                   module_param, name_start, scoped};
+                const bool member_call = !scoped && name_start >= 1 &&
+                                         before[name_start - 1] == '.';
+                CallContext ctx{name,
+                                named_port ? std::variant<int, std::string>(*named_port)
+                                           : std::variant<int, std::string>(active),
+                                module_param, name_start, scoped};
+                ctx.is_member_call = member_call;
+                return ctx;
             }
             --depth;
         } else if (c == ',' && depth == 0 && !named_port) {
@@ -148,6 +164,30 @@ static std::optional<CallContext> find_call_context(std::string_view prefix) {
         }
     }
     return std::nullopt;
+}
+
+static SubroutineInfo subroutine_info_from_prototype(const FunctionPrototypeSyntax& prototype) {
+    SubroutineInfo info;
+    info.kind = prototype.keyword.kind == parsing::TokenKind::TaskKeyword ? "task" : "function";
+    if (info.kind == "function")
+        info.return_type = trim(prototype.returnType->toString());
+    if (prototype.portList) {
+        for (const auto* port_base : prototype.portList->ports) {
+            const auto* port = port_base ? port_base->as_if<FunctionPortSyntax>() : nullptr;
+            if (!port || !port->declarator)
+                continue;
+            ParamInfo param;
+            param.name = token_text(port->declarator->name);
+            param.direction = token_text(port->direction);
+            if (port->dataType)
+                param.type = trim(port->dataType->toString());
+            if (port->declarator->initializer)
+                param.default_value = trim(port->declarator->initializer->expr->toString());
+            if (!param.name.empty())
+                info.args.push_back(std::move(param));
+        }
+    }
+    return info;
 }
 
 static SubroutineInfo subroutine_info_from_declaration(const FunctionDeclarationSyntax& node) {
@@ -225,18 +265,38 @@ static std::optional<SubroutineInfo> subroutine_at_declaration(const SyntaxTree&
 
         Visitor(const SourceManager& sm, int line, int col) : sm(sm), line(line), col(col) {}
 
-        void handle(const FunctionDeclarationSyntax& node) {
-            if (result)
-                return;
-            const auto token = node.prototype->name->getFirstToken();
+        /// Whether @p name spells its subroutine at the requested position.  An
+        /// out-of-body definition is written `base_c::bump`, so the token that
+        /// names the method is the last one, not the first.
+        bool names_position(const NameSyntax& name) const {
+            const auto* scoped = name.as_if<ScopedNameSyntax>();
+            const auto token =
+                scoped && scoped->right ? scoped->right->getFirstToken() : name.getFirstToken();
             if (!token)
-                return;
+                return false;
             const auto loc = token.location();
             if (!loc.valid())
+                return false;
+            return (int)sm.getLineNumber(loc) - 1 == line &&
+                   (int)sm.getColumnNumber(loc) - 1 == col;
+        }
+
+        void handle(const FunctionDeclarationSyntax& node) {
+            if (result || !node.prototype || !node.prototype->name)
                 return;
-            if ((int)sm.getLineNumber(loc) - 1 != line || (int)sm.getColumnNumber(loc) - 1 != col)
+            if (!names_position(*node.prototype->name))
                 return;
             result = subroutine_info_from_declaration(node);
+        }
+
+        // `extern function void bump(int amount);` is where go-to-definition
+        // lands for an extern-style method, and it carries the formals.
+        void handle(const ClassMethodPrototypeSyntax& node) {
+            if (result || !node.prototype || !node.prototype->name)
+                return;
+            if (!names_position(*node.prototype->name))
+                return;
+            result = subroutine_info_from_prototype(*node.prototype);
         }
     };
 
@@ -609,7 +669,7 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
     }
 
     std::optional<SubroutineInfo> subroutine;
-    if (ctx->is_scoped) {
+    if (ctx->is_scoped || ctx->is_member_call) {
         // `my_item::type_id::create(...)` names one declaration, and the class
         // the call is written on usually has a same-named method of its own --
         // UVM's factory macros give every class a `create`.  Ask go-to-definition
@@ -619,8 +679,15 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
         if (auto def = analyzer.definition_of(params.textDocument.uri.raw_uri_,
                                               params.position.line,
                                               (int)(ctx->name_offset - line_start))) {
-            if (def->uri == params.textDocument.uri.raw_uri_)
+            if (def->uri == params.textDocument.uri.raw_uri_) {
                 subroutine = subroutine_at_declaration(*state->tree, def->line, def->col);
+            } else if (auto other = analyzer.get_state(def->uri); other && other->tree) {
+                // The class often lives in another file.  An open buffer has a
+                // tree to read the parameter list from; a closed project file
+                // has only the compact shard, which does not carry formals, so
+                // no signature is the honest answer there.
+                subroutine = subroutine_at_declaration(*other->tree, def->line, def->col);
+            }
         }
         if (!subroutine)
             return std::nullopt;
