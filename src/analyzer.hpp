@@ -520,6 +520,13 @@ class Analyzer {
     /// SyntaxIndex entries on every live-file edit.
     std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot() const;
 
+    /// Definition for a hierarchical path such as `tb.u_dut.u_sub.sig`, resolved
+    /// by walking instance names through published index snapshots.  Returns
+    /// nothing when any segment is unresolved.
+    std::optional<Location> hierarchical_definition(const DocumentState& state,
+                                                    const std::string& uri, int line,
+                                                    int col) const;
+
     /// Register a callback fired whenever the merged project index snapshot is
     /// republished.  The callback may run on the background indexer thread, so
     /// it must be non-blocking and must not call back into Analyzer.

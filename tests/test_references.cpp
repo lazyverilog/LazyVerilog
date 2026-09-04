@@ -2334,3 +2334,136 @@ TEST_CASE("rename: package member rewrites pkg::name qualified uses", "[referenc
     std::filesystem::remove(pkg_path);
     std::filesystem::remove(user_path);
 }
+
+// References from the module-level declaration used to list the shadowing
+// generate-block declaration and its uses, and rename inherited that: renaming
+// the outer signal rewrote a different signal inside the generate block.
+TEST_CASE("references: a generate-block declaration is not reported for the outer signal",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_generate_shadow.sv";
+    const std::string text = R"(module top;
+  logic [7:0] dout;
+  assign dout = 8'h0;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    // From the module-level declaration (line 1, 0-based).
+    auto refs = analyzer.find_references(uri, 1, 14, true);
+    for (const auto& ref : refs) {
+        CAPTURE(ref.line);
+        CHECK(ref.line < 7);
+    }
+    CHECK(refs.size() == 2);
+}
+
+// Asking "who calls this?" from a method's declaration used to answer nothing,
+// while asking from the out-of-body definition or from a call site worked.  The
+// extern prototype is the declaration a UVM class body actually shows, so a
+// rename started there silently did nothing.
+
+// Asking "who calls this?" from a method's declaration used to answer nothing,
+// while asking from the out-of-body definition or from a call site worked.  The
+// extern prototype is the declaration a UVM class body actually shows, so a
+// rename started there silently did nothing.
+TEST_CASE("references: from an extern method prototype", "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_extern_proto.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    int unsigned tag;
+    extern function void bump(int amount);
+  endclass
+
+  function void base_c::bump(int amount);
+    tag += amount;
+  endfunction
+endpackage
+
+module top;
+  initial begin
+    p::base_c obj = new();
+    obj.bump(3);
+  end
+endmodule
+)");
+
+    // Cursor on the prototype's name (line 3, 0-based).
+    auto refs = analyzer.find_references(uri, 3, 25, true);
+    std::vector<int> lines;
+    for (const auto& ref : refs)
+        lines.push_back(ref.line);
+    std::sort(lines.begin(), lines.end());
+
+    CAPTURE(lines);
+    CHECK(std::find(lines.begin(), lines.end(), 3) != lines.end());  // prototype
+    CHECK(std::find(lines.begin(), lines.end(), 6) != lines.end());  // out-of-body body
+    CHECK(std::find(lines.begin(), lines.end(), 14) != lines.end()); // call site
+}
+
+// A method declaration knows its callers only if the call sites carry the same
+// identity.  `handle.method()` on a package class and `super.method()` were both
+// left unresolved, so references started from the declaration returned only the
+// declaration itself.
+
+// A method declaration knows its callers only if the call sites carry the same
+// identity.  `handle.method()` on a package class and `super.method()` were both
+// left unresolved, so references started from the declaration returned only the
+// declaration itself.
+TEST_CASE("references: from a class method declaration reaches handle and super calls",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_method_decl.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    virtual function string name();
+      return "base";
+    endfunction
+  endclass
+  class mid_c extends base_c;
+  endclass
+  class leaf_c extends mid_c;
+    virtual function string name();
+      string s = super.name();
+      return s;
+    endfunction
+  endclass
+endpackage
+
+module top;
+  initial begin
+    p::leaf_c leaf = new();
+    string nm;
+    nm = leaf.name();
+  end
+endmodule
+)");
+
+    auto contains_line = [](const std::vector<Location>& refs, int line) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& loc) { return loc.line == line; });
+    };
+
+    // From the base class declaration: the override and the `super.name()` call.
+    auto base_refs = analyzer.find_references(uri, 2, 28, true);
+    CHECK(contains_line(base_refs, 2));
+    CHECK(contains_line(base_refs, 10));
+
+    // From the derived declaration: the `leaf.name()` call site.
+    auto leaf_refs = analyzer.find_references(uri, 9, 28, true);
+    CHECK(contains_line(leaf_refs, 9));
+    CHECK(contains_line(leaf_refs, 20));
+}
+
+// `import p::*;` lets a file spell a package type without the `p::` prefix.
+// Those unqualified uses were invisible to references and rename, so renaming
+// the type left them pointing at a name that no longer exists.
