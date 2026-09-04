@@ -1643,3 +1643,78 @@ endclass
     CHECK(hover->contents.second->value ==
           "**type_id** — *typedef*\n\n---\n\n```\nregistry#(c, \"c\")\n```");
 }
+
+// AutoInst regenerated the instance header from module + instance name alone,
+// so an existing `#(...)` override was deleted and the module silently fell back
+// to its default parameter values.
+TEST_CASE("autoinst: preserves an existing parameter override", "[autoinst]") {
+    const auto module_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_autoinst_keep_param_mem.sv";
+    {
+        std::ofstream out(module_path);
+        out << R"SV(module memory #(parameter int WIDTH = 8) (
+    input  logic             i_clk,
+    input  logic [WIDTH-1:0] i_data,
+    output logic [WIDTH-1:0] o_data
+);
+endmodule
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({module_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_autoinst_keep_param_top.sv";
+
+    SECTION("single line") {
+        const std::string top = R"SV(module top;
+    memory #(.WIDTH(16)) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find("#(.WIDTH(16))") != std::string::npos);
+        CHECK(formatted.find("u_mem") != std::string::npos);
+        CHECK(formatted.find(".i_clk") != std::string::npos);
+    }
+
+    SECTION("positional") {
+        const std::string top = R"SV(module top;
+    memory #(16) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find("#(16)") != std::string::npos);
+    }
+
+    SECTION("multi line") {
+        const std::string top = R"SV(module top;
+    memory #(
+        .WIDTH(16)
+    ) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find(".WIDTH(16)") != std::string::npos);
+    }
+
+    std::filesystem::remove(module_path);
+}
