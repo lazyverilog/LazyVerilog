@@ -1861,3 +1861,43 @@ TEST_CASE("workspace symbols: a qualified query filters by container", "[workspa
 
     std::filesystem::remove(path);
 }
+
+// A method declared in a file the editor never opened has no AST anywhere, so
+// its formals have to come from the shard that indexed it.
+TEST_CASE("signature help: a method declared in a closed project file", "[signature]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_sighelp_closed.sv";
+    {
+        std::ofstream out(path);
+        out << "package sig_pkg;\n"
+               "    class base_c;\n"
+               "        extern function void bump(int amount, int scale);\n"
+               "    endclass\n"
+               "    function void base_c::bump(int amount, int scale);\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/signature_closed_caller.sv";
+    analyzer.open(uri, R"(module top;
+    initial begin
+        sig_pkg::base_c obj = new();
+        obj.bump();
+    end
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 17);
+    auto help = provide_signature_help(analyzer, params);
+
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "bump(int amount, int scale)");
+
+    std::filesystem::remove(path);
+}

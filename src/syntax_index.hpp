@@ -149,6 +149,15 @@ struct FieldEntry {
 struct MethodEntry {
     std::string name;
     std::string return_type;
+    // Declared formals exactly as written, parentheses included ("(int a, ref b)"),
+    // empty when the declaration has no port list.
+    //
+    // A closed project file keeps no AST, so a call into another file has no
+    // parameter list to read anywhere else.  ValueEntry::signature already
+    // carries the same fact for module- and package-level subroutines; this is
+    // the class-method half of it, kept as the raw text so indexing pays one
+    // render and the request path only formats it.
+    std::string params;
     bool is_task{false};
     SourceFileID file_id{kInvalidSourceFileID};
     int line{0};

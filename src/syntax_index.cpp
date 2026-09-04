@@ -738,6 +738,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.params = proto.portList ? trim_copy(proto.portList->toString()) : std::string{};
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
             m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
@@ -756,6 +757,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.params = proto.portList ? trim_copy(proto.portList->toString()) : std::string{};
             m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
             m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
