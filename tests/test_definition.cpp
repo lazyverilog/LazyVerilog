@@ -1443,3 +1443,31 @@ TEST_CASE("hover: `include path reports the included file", "[definition][includ
 
     std::filesystem::remove(inc_path);
 }
+
+// The open-buffer index skipped `extern` method prototypes that the closed-file
+// shard builder already indexed, so a class written in the extern style lost every
+// method the moment its file was opened: `obj.bump()` resolved while the file
+// was closed and stopped resolving once it was open.
+TEST_CASE("definition: a call to an extern-declared method in an open buffer", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_extern_method.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    extern function void bump(int amount);
+  endclass
+  function void base_c::bump(int amount);
+  endfunction
+endpackage
+
+module top;
+  initial begin
+    p::base_c obj = new();
+    obj.bump(3);
+  end
+endmodule
+)");
+
+    auto loc = analyzer.definition_of(uri, 11, 9);
+    REQUIRE(loc.has_value());
+    CHECK(loc->line == 2); // the extern prototype
+}

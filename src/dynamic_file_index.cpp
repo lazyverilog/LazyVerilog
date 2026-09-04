@@ -351,6 +351,23 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                                                 .file_id = resolver.for_declaration_token(index, sm, name_tok),
                                                 .line = ml,
                                                 .col = mc});
+        } else if (const auto* proto_item = item->as_if<ClassMethodPrototypeSyntax>()) {
+            // `extern function void bump(...);` declares a member too.  The shard
+            // builder indexes these (see process_class in syntax_index.cpp); the
+            // open-buffer index has to as well, or a class written in the extern
+            // style loses every method the moment its file is opened.
+            const auto& proto = *proto_item->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
+            entry.methods.push_back(
+                MethodEntry{.name = id_name ? std::string(id_name->identifier.valueText())
+                                            : node_text_raw(sm, *proto.name),
+                            .return_type = node_text_raw(sm, *proto.returnType),
+                            .is_task = proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword,
+                            .file_id = resolver.for_declaration_token(index, sm, name_tok),
+                            .line = ml,
+                            .col = mc});
         }
     }
     if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
