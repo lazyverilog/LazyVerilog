@@ -346,6 +346,9 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                                                     ? std::string(id_name->identifier.valueText())
                                                     : node_text_raw(sm, *proto.name),
                                                 .return_type = node_text_raw(sm, *proto.returnType),
+                                                .params = proto.portList
+                                                              ? trim_copy(proto.portList->toString())
+                                                              : std::string{},
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
                                                 .file_id = resolver.for_declaration_token(index, sm, name_tok),
@@ -364,6 +367,8 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
                 MethodEntry{.name = id_name ? std::string(id_name->identifier.valueText())
                                             : node_text_raw(sm, *proto.name),
                             .return_type = node_text_raw(sm, *proto.returnType),
+                            .params = proto.portList ? trim_copy(proto.portList->toString())
+                                                     : std::string{},
                             .is_task = proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword,
                             .file_id = resolver.for_declaration_token(index, sm, name_tok),
                             .line = ml,

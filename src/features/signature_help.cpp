@@ -569,6 +569,76 @@ static std::optional<SubroutineInfo> find_subroutine_outside_document(const Anal
     return result;
 }
 
+/// The class method declared at @p line (0-based) / @p col of @p uri, described
+/// from whichever shard indexed that file.
+///
+/// A closed project file keeps no AST, so `MethodEntry::params` is the only
+/// place its formals survive.  This is the class-method counterpart of
+/// find_subroutine_outside_document(), which reads ValueEntry::signature for
+/// module- and package-level subroutines.
+static std::optional<SubroutineInfo> method_at_index_declaration(const SyntaxIndex& index,
+                                                                 const std::string& shard_uri,
+                                                                 const std::string& uri, int line,
+                                                                 int col) {
+    for (const auto& cls : index.classes) {
+        for (const auto& method : cls.methods) {
+            const std::string method_uri = index.source_uri(method.file_id);
+            const std::string& actual = method_uri.empty() ? shard_uri : method_uri;
+            // MethodEntry lines are 1-based; an LSP location is 0-based.
+            if (actual != uri || method.line != line + 1 || method.col != col)
+                continue;
+
+            SubroutineInfo info;
+            info.kind = method.is_task ? "task" : "function";
+            info.return_type = method.return_type;
+            std::string ports = trim_ws(method.params);
+            if (ports.size() >= 2 && ports.front() == '(' && ports.back() == ')')
+                ports = trim_ws(std::string_view(ports).substr(1, ports.size() - 2));
+            if (!ports.empty()) {
+                for (const auto& part : split_top_level_commas(ports)) {
+                    const std::string trimmed = trim_ws(part);
+                    if (!trimmed.empty())
+                        info.args.push_back(parse_arg_text(trimmed));
+                }
+            }
+            return info;
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<SubroutineInfo> find_method_outside_document(const Analyzer& analyzer,
+                                                                  const std::string& current_uri,
+                                                                  const std::string& uri, int line,
+                                                                  int col) {
+    if (auto opened = analyzer.opened_file_index_shards(current_uri)) {
+        for (const auto& shard : *opened) {
+            if (!shard.index)
+                continue;
+            if (auto found = method_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+    }
+    if (auto project = analyzer.project_index_snapshot()) {
+        // The declaring file's own shard holds it in the ordinary case; a
+        // header's declarations live in the header's shard, which another
+        // shard's file table still points at.
+        for (const auto& shard : project->shards) {
+            if (!shard.index || shard.uri != uri)
+                continue;
+            if (auto found = method_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+        for (const auto& shard : project->shards) {
+            if (!shard.index || shard.uri == uri)
+                continue;
+            if (auto found = method_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+    }
+    return std::nullopt;
+}
+
 static std::string format_arg(const ParamInfo& param) {
     std::vector<std::string> parts;
     if (!param.direction.empty())
@@ -681,12 +751,16 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
                                               (int)(ctx->name_offset - line_start))) {
             if (def->uri == params.textDocument.uri.raw_uri_) {
                 subroutine = subroutine_at_declaration(*state->tree, def->line, def->col);
-            } else if (auto other = analyzer.get_state(def->uri); other && other->tree) {
+            } else {
                 // The class often lives in another file.  An open buffer has a
                 // tree to read the parameter list from; a closed project file
-                // has only the compact shard, which does not carry formals, so
-                // no signature is the honest answer there.
-                subroutine = subroutine_at_declaration(*other->tree, def->line, def->col);
+                // is described by its shard, whose MethodEntry carries the
+                // formals as written.
+                if (auto other = analyzer.get_state(def->uri); other && other->tree)
+                    subroutine = subroutine_at_declaration(*other->tree, def->line, def->col);
+                if (!subroutine)
+                    subroutine = find_method_outside_document(
+                        analyzer, params.textDocument.uri.raw_uri_, def->uri, def->line, def->col);
             }
         }
         if (!subroutine)
