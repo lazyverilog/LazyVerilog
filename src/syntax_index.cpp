@@ -483,6 +483,15 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     const auto module_end_line = source_range_lines(sm, module.sourceRange()).second;
 
+    // Imports written in the module header (`module m import pkg::*; (...)`) are
+    // not members, so the member loop below never sees them.  Without them the
+    // shard cannot say that this file makes the package's names visible
+    // unqualified, and references/rename skip every unqualified use in it.
+    for (const auto* import_decl : module.header->imports) {
+        if (import_decl)
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+    }
+
     for (const auto* member : module.members) {
         if (!member)
             continue;
