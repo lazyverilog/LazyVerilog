@@ -55,8 +55,21 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
 
     // Modules/interfaces/packages are always top-level containers.  Track
     // where each one landed in `result` so classes/typedefs declared inside
-    // one (most commonly a package) can be nested under it below.
-    std::unordered_map<std::string, size_t> container_index;
+    // one (most commonly a package) can be nested under it below.  Classes are
+    // registered the same way once they are placed, so a class-scoped typedef
+    // reaches its class instead of falling out to the top level.
+    struct Locator {
+        size_t top{0};
+        // Index into the top-level node's children, or -1 for the node itself.
+        int child{-1};
+    };
+    std::unordered_map<std::string, Locator> container_index;
+    const auto container_node = [&](const Locator& loc) -> lsDocumentSymbol& {
+        lsDocumentSymbol& top = result[loc.top];
+        if (loc.child < 0)
+            return top;
+        return (*top.children)[(size_t)loc.child];
+    };
     for (const auto& mod : index.modules) {
         if (!in_document(mod.file_id))
             continue;
@@ -94,6 +107,15 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
             if (v.kind == "variable") {
                 push_child(node, make_symbol(v.name, lsSymbolKind::Variable, v.line, v.col,
                                              opt_str(v.type)));
+            } else if (v.kind == "parameter" || v.kind == "localparam") {
+                // Parameter *ports* are already reported from mod.ports above.
+                if (mod.port_by_name.count(v.name))
+                    continue;
+                std::string detail = v.type;
+                if (!v.default_value.empty())
+                    detail += (detail.empty() ? "= " : " = ") + v.default_value;
+                push_child(node, make_symbol(v.name, lsSymbolKind::Constant, v.line, v.col,
+                                             opt_str(std::move(detail))));
             } else if (v.kind == "function" || v.kind == "task") {
                 push_child(node, make_symbol(v.name,
                                              v.kind == "task" ? lsSymbolKind::Method
@@ -108,7 +130,7 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
                                          opt_str(inst.module_name)));
         }
 
-        container_index.emplace(mod.name, result.size());
+        container_index.emplace(mod.name, Locator{result.size(), -1});
         result.push_back(std::move(node));
     }
 
@@ -131,19 +153,30 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
         }
 
         const auto it = container_index.find(cls.parent_scope);
-        if (!cls.parent_scope.empty() && it != container_index.end())
-            push_child(result[it->second], std::move(node));
-        else
+        if (!cls.parent_scope.empty() && it != container_index.end()) {
+            const Locator parent = it->second;
+            lsDocumentSymbol& target = container_node(parent);
+            push_child(target, std::move(node));
+            // Only a top-level container's direct children are addressable, which
+            // is as deep as class nesting goes in the shapes this index records.
+            if (parent.child < 0)
+                container_index.emplace(cls.name,
+                                        Locator{parent.top, (int)target.children->size() - 1});
+        } else {
+            container_index.emplace(cls.name, Locator{result.size(), -1});
             result.push_back(std::move(node));
+        }
     }
 
     // Typedefs: same nesting rule as classes.
     for (const auto& td : index.typedefs) {
         if (!in_document(td.file_id))
             continue;
+        // lspcpp's TypeAlias is 252, outside the 1..26 range LSP defines for
+        // SymbolKind, so a client that validates the enum drops the symbol.
         const lsSymbolKind kind = td.is_struct ? lsSymbolKind::Struct
                                   : td.is_enum ? lsSymbolKind::Enum
-                                               : lsSymbolKind::TypeAlias;
+                                               : lsSymbolKind::TypeParameter;
         lsDocumentSymbol node = make_symbol(td.name, kind, td.line, td.col, opt_str(td.resolved));
         if (td.is_enum) {
             for (const auto& em : td.enum_members) {
@@ -161,7 +194,7 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
 
         const auto it = container_index.find(td.parent_scope);
         if (!td.parent_scope.empty() && it != container_index.end())
-            push_child(result[it->second], std::move(node));
+            push_child(container_node(it->second), std::move(node));
         else
             result.push_back(std::move(node));
     }

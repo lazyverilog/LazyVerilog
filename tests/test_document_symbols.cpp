@@ -217,3 +217,88 @@ TEST_CASE("documentSymbol: every reported range lies inside the requested docume
     // The header's own class belongs to the header's document, not this one.
     CHECK(find_child(result, "header_cls") == nullptr);
 }
+
+// Every kind an outline reports must be one the LSP spec defines (1..26).
+// lspcpp carries extensions past that range (`TypeAlias = 252`), and a client
+// that validates the enum drops the symbol instead of drawing it.
+TEST_CASE("documentSymbol: every emitted kind is within the LSP SymbolKind range",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_kind_range.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    typedef logic [7:0] byte_t;\n"
+                       "    typedef struct packed { logic a; } pair_t;\n"
+                       "    typedef enum logic { E0, E1 } mode_e;\n"
+                       "endpackage\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    REQUIRE_FALSE(result.empty());
+
+    std::vector<const lsDocumentSymbol*> stack;
+    for (const auto& sym : result)
+        stack.push_back(&sym);
+    while (!stack.empty()) {
+        const auto* sym = stack.back();
+        stack.pop_back();
+        CAPTURE(sym->name);
+        CHECK((int)sym->kind >= 1);
+        CHECK((int)sym->kind <= 26);
+        if (sym->children)
+            for (const auto& child : *sym->children)
+                stack.push_back(&child);
+    }
+}
+
+// A typedef declared inside a class used to land next to the package instead of
+// under the class, because the container map held only modules and packages.
+
+// A typedef declared inside a class used to land next to the package instead of
+// under the class, because the container map held only modules and packages.
+TEST_CASE("documentSymbol: a class-scoped typedef nests under its class", "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_class_typedef.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    class box_c;\n"
+                       "        typedef int elem_t;\n"
+                       "        int store;\n"
+                       "    endclass\n"
+                       "endpackage\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    CHECK(find_child(result, "elem_t") == nullptr);
+
+    const auto* pkg = find_child(result, "p");
+    REQUIRE(pkg != nullptr);
+    // children_of() returns by value, so hold each level in a named vector
+    // rather than pointing into a temporary.
+    const auto pkg_children = children_of(*pkg);
+    const auto* cls = find_child(pkg_children, "box_c");
+    REQUIRE(cls != nullptr);
+    const auto cls_children = children_of(*cls);
+    CHECK(find_child(cls_children, "elem_t") != nullptr);
+}
+
+// Body localparams never appeared in the outline; only parameter *ports* did.
+
+// Body localparams never appeared in the outline; only parameter *ports* did.
+TEST_CASE("documentSymbol: module localparams appear as constants", "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_localparam.sv";
+    analyzer.open(uri, "module top #(parameter int W = 4) ();\n"
+                       "    localparam int DEPTH = 8;\n"
+                       "    logic [W-1:0] data;\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* top = find_child(result, "top");
+    REQUIRE(top != nullptr);
+
+    const auto children = children_of(*top);
+    const auto* depth = find_child(children, "DEPTH");
+    REQUIRE(depth != nullptr);
+    CHECK(depth->kind == lsSymbolKind::Constant);
+
+    // The parameter port is reported once, not twice.
+    CHECK(std::count_if(children.begin(), children.end(),
+                        [](const lsDocumentSymbol& s) { return s.name == "W"; }) == 1);
+}
