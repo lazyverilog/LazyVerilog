@@ -1753,3 +1753,47 @@ TEST_CASE("workspace symbols: class methods are searchable", "[workspace]") {
 
     std::filesystem::remove(path);
 }
+
+// `handle.method(` — the form that dominates UVM code — was mistaken for a named
+// port connection (`.port(sig)`) by the backwards text scan, so the callee was
+// never resolved and the popup stayed empty.
+TEST_CASE("signature help: a method called through an object handle", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/signature_handle_method.sv";
+    analyzer.open(uri, R"(package p;
+    class base_c;
+        int unsigned tag;
+        extern function void bump(int amount, int scale);
+        function void drive(int lane);
+        endfunction
+    endclass
+    function void base_c::bump(int amount, int scale);
+    endfunction
+endpackage
+
+module top;
+    initial begin
+        p::base_c obj = new();
+        obj.drive();
+        obj.bump();
+    end
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+
+    // Inside `obj.drive(`.
+    params.position = lsPosition(14, 18);
+    auto drive = provide_signature_help(analyzer, params);
+    REQUIRE(drive.has_value());
+    REQUIRE(drive->signatures.size() == 1);
+    CHECK(drive->signatures[0].label == "drive(int lane)");
+
+    // Inside `obj.bump(` — declared as an extern prototype.
+    params.position = lsPosition(15, 17);
+    auto bump = provide_signature_help(analyzer, params);
+    REQUIRE(bump.has_value());
+    REQUIRE(bump->signatures.size() == 1);
+    CHECK(bump->signatures[0].label == "bump(int amount, int scale)");
+}
