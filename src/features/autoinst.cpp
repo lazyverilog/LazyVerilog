@@ -238,6 +238,8 @@ static std::optional<AutoinstResult> autoinst_impl_layers(
 
         AutoinstResult result;
         result.module_name = module_type;
+        if (node->parameters)
+            result.parameter_text = node->parameters->toString();
         result.instance_name = inst_name;
         result.port_names = std::move(port_names);
         result.line_start = cand.first_line;
@@ -307,7 +309,10 @@ std::string format_autoinst(const AutoinstResult& result, const std::string& sou
         max_name_len = std::max(max_name_len, p.size());
 
     std::string out;
-    out += base_indent + result.module_name + " " + result.instance_name + " (\n";
+    out += base_indent + result.module_name + " ";
+    if (!result.parameter_text.empty())
+        out += result.parameter_text + " ";
+    out += result.instance_name + " (\n";
 
     for (size_t i = 0; i < result.port_names.size(); ++i) {
         const auto& name = result.port_names[i];

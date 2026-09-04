@@ -12,6 +12,10 @@ struct OpenIndexShard;
 
 struct AutoinstResult {
     std::string module_name;
+    // Verbatim `#(...)` override written on the existing instance, empty when
+    // there is none.  AutoInst rewrites the port list; deleting the parameter
+    // section would silently change the instantiated design.
+    std::string parameter_text;
     std::string instance_name;
     std::vector<std::string> port_names;
     std::map<std::string, std::string> existing_connections;
