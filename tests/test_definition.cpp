@@ -1471,3 +1471,119 @@ endmodule
     REQUIRE(loc.has_value());
     CHECK(loc->line == 2); // the extern prototype
 }
+
+// A declaration inside a generate block is a different signal from the
+// module-level one that shares its name.  The index recorded generate-block
+// declarations nowhere, so every use inside the block resolved to the outer
+// declaration.
+TEST_CASE("definition: a generate-block declaration shadows the module-level one",
+          "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_generate_shadow.sv";
+    const std::string text = R"(module top;
+  logic [7:0] dout;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    // `dout` on the assign inside the generate block (line 7, 0-based).
+    auto inner = analyzer.definition_of(uri, 7, 13);
+    REQUIRE(inner.has_value());
+    CHECK(inner->line == 6);
+
+    // The module-level declaration still answers for itself.
+    auto outer = analyzer.definition_of(uri, 1, 14);
+    REQUIRE(outer.has_value());
+    CHECK(outer->line == 1);
+}
+
+// Navigating a testbench by hierarchy (`tb.u_dut.sig`) resolved nothing: the
+// index knows instances and each module's signals, but nothing walked the path.
+
+// Navigating a testbench by hierarchy (`tb.u_dut.sig`) resolved nothing: the
+// index knows instances and each module's signals, but nothing walked the path.
+TEST_CASE("definition: hierarchical reference resolves through instance paths",
+          "[definition]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-definition-hier";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto sub = dir / "hier_sub.sv";
+    const auto dut = dir / "hier_dut.sv";
+    {
+        std::ofstream out(sub);
+        out << "module hier_sub (input logic clk);\n"
+               "  logic [7:0] stage;\n"
+               "endmodule\n";
+    }
+    {
+        std::ofstream out(dut);
+        out << "module hier_dut (input logic clk);\n"
+               "  logic [7:0] din;\n"
+               "  genvar i;\n"
+               "  generate\n"
+               "    for (i = 0; i < 2; i++) begin : g_lanes\n"
+               "      hier_sub u_sub (.clk(clk));\n"
+               "    end\n"
+               "  endgenerate\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({sub.string(), dut.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "hier_tb.sv");
+    const std::string text =
+        "module hier_tb;\n"
+        "  logic clk;\n"
+        "  hier_dut u_dut (.clk(clk));\n"
+        "  initial begin\n"
+        "    force hier_tb.u_dut.din = 8'h5a;\n"
+        "    $display(\"%0h\", hier_tb.u_dut.g_lanes[0].u_sub.stage);\n"
+        "    $display(\"%0h\", u_dut.nosuch_signal);\n"
+        "  end\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    SECTION("plain instance path") {
+        const auto col = (int)text.find("u_dut.din") + 6;
+        const auto line_start = text.rfind('\n', text.find("u_dut.din")) + 1;
+        auto loc = analyzer.definition_of(uri, 4, (int)(text.find("u_dut.din") + 6 - line_start));
+        (void)col;
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(dut));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("through a named generate block") {
+        const auto needle = text.find("u_sub.stage");
+        const auto line_start = text.rfind('\n', needle) + 1;
+        auto loc = analyzer.definition_of(uri, 5, (int)(needle + 6 - line_start));
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(sub));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("unresolvable path answers nothing") {
+        const auto needle = text.find("nosuch_signal");
+        const auto line_start = text.rfind('\n', needle) + 1;
+        auto loc = analyzer.definition_of(uri, 6, (int)(needle - line_start));
+        CHECK_FALSE(loc.has_value());
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// The open-buffer index skipped `extern` method prototypes that the closed-file
+// shard builder already indexed, so a class written in the extern style lost every
+// method the moment its file was opened: `obj.bump()` resolved while the file
+// was closed and stopped resolving once it was open.

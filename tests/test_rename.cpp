@@ -134,3 +134,37 @@ endmodule
     CHECK(edits[1].range.start.line == 4);  // body usage
     CHECK(edits[2].range.start.line == 9);  // .i_data named connection
 }
+
+// Renaming a module-level signal used to rewrite a same-named declaration inside
+// a generate block — a different signal — and its uses, silently rewiring the
+// block.
+TEST_CASE("rename: a module-level signal does not rewrite a generate-block declaration",
+          "[rename]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_generate_shadow.sv";
+    analyzer.open(uri, R"(module top;
+  logic [7:0] dout;
+  assign dout = 8'h0;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)");
+
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(1, 14); // module-level declaration
+    params.newName = "dout_o";
+
+    auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    const auto& edits = edit.changes->at(uri);
+    CHECK(edits.size() == 2);
+    for (const auto& e : edits)
+        CHECK(e.range.start.line < 7);
+}

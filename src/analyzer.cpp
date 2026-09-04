@@ -1599,6 +1599,12 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     int aggregate_type_depth{0};
     std::optional<Location> first_result;
     std::optional<Location> scoped_result;
+    // How many enclosing lexical scopes each recorded candidate sat in.  A
+    // declaration inside a generate block shadows a module-level one of the same
+    // name, and the module-level declaration is visited first, so "first match
+    // wins" would answer with the shadowed signal.
+    int first_result_depth{-1};
+    int scoped_result_depth{-1};
 
     GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
                              const std::string& name, const std::string& preferred_module,
@@ -1666,6 +1672,16 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     //     for (int i = 0; i < 10; i++) begin ... end
     //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
     //                                               ^ the second `i`, not the first
+    /// Enclosing scopes that really restrict visibility, i.e. how deeply
+    /// shadowed a declaration found here is.
+    int scope_depth() const {
+        int depth = 0;
+        for (const auto& [start_line, end_line] : scope_stack)
+            if (start_line > 0 || end_line > 0)
+                ++depth;
+        return depth;
+    }
+
     bool cursor_in_innermost_scope() const {
         if (scope_stack.empty())
             return true;
@@ -1686,11 +1702,16 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             return;
 
         auto loc = location_from_token_actual_uri(sm, uri, token);
-        if (!first_result)
+        const int depth = scope_sensitive ? scope_depth() : 0;
+        if (!first_result || depth > first_result_depth) {
             first_result = loc;
+            first_result_depth = depth;
+        }
         if (scope_sensitive && !preferred_module.empty() && current_module == preferred_module &&
-            !scoped_result)
+            (!scoped_result || depth > scoped_result_depth)) {
             scoped_result = loc;
+            scoped_result_depth = depth;
+        }
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
@@ -1756,6 +1777,17 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         maybe_set(node.name);
     }
 
+    // `extern function void bump(int amount);` is a declaration in its own
+    // right; without it the cursor on a prototype name resolves to nothing, and
+    // references/rename — which both start from the definition — return empty.
+    void handle(const slang::syntax::ClassMethodPrototypeSyntax& node) {
+        if (node.prototype && node.prototype->name)
+            if (const auto* identifier =
+                    node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
+                maybe_set(identifier->identifier, false);
+        visitDefault(node);
+    }
+
     void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
         if (const auto* identifier =
                 node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
@@ -1797,6 +1829,15 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     }
 
     void handle(const slang::syntax::ForeachLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    // A generate block owns its declarations exactly the way a begin/end block
+    // does: `logic [7:0] dout;` inside `for ... begin : g_lanes` is a different
+    // signal from a module-level `dout`.
+    void handle(const slang::syntax::GenerateBlockSyntax& node) {
         push_scope(node.sourceRange());
         visitDefault(node);
         scope_stack.pop_back();
@@ -3668,6 +3709,197 @@ static std::optional<Location> include_target_at(const DocumentState& state, int
     return std::nullopt;
 }
 
+// ── Hierarchical references (tb.u_dut.u_sub.sig) ─────────────────────────────
+//
+// The index already knows every instance and every module's signals; what was
+// missing is the walk between them.  Segments are resolved one at a time
+// against published index snapshots — no reparse, no project-wide merge — and
+// an unresolved segment ends the walk with no answer rather than a same-named
+// guess from an unrelated module.
+
+/// Dotted path the cursor sits in, e.g. {"tb","u_dut","g_lanes","u_sub","stage"}
+/// for a cursor anywhere in `tb.u_dut.g_lanes[0].u_sub.stage`.  Array indices are
+/// dropped; the clicked segment is the last one returned.
+static std::vector<std::string> hierarchical_path_at(const std::string& text, int line, int col,
+                                                     const IdentifierAtPosition& ident) {
+    size_t line_start = 0;
+    for (int i = 0; i < line; ++i) {
+        line_start = text.find('\n', line_start);
+        if (line_start == std::string::npos)
+            return {};
+        ++line_start;
+    }
+    size_t line_end = text.find('\n', line_start);
+    if (line_end == std::string::npos)
+        line_end = text.size();
+    const std::string_view src(text.data() + line_start, line_end - line_start);
+    (void)col;
+
+    const auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+
+    std::vector<std::string> segments{ident.name};
+    size_t i = (size_t)ident.col;
+    while (i > 0) {
+        size_t j = i;
+        while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+            --j;
+        if (j == 0 || src[j - 1] != '.')
+            break;
+        --j; // consume the dot
+        while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+            --j;
+        // An optional array index on the preceding segment: g_lanes[0].
+        if (j > 0 && src[j - 1] == ']') {
+            const size_t close = j - 1;
+            size_t open = close;
+            while (open > 0 && src[open - 1] != '[')
+                --open;
+            if (open == 0)
+                break;
+            j = open - 1;
+            while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+                --j;
+        }
+        const size_t word_end = j;
+        while (j > 0 && is_word(src[j - 1]))
+            --j;
+        if (j == word_end)
+            break;
+        segments.insert(segments.begin(), std::string(src.substr(j, word_end - j)));
+        i = j;
+    }
+    return segments;
+}
+
+/// A module declaration found in an index, together with the index that holds it.
+struct HierarchyModule {
+    const SyntaxIndex* index{nullptr};
+    std::string shard_uri;
+    const ModuleEntry* entry{nullptr};
+};
+
+static std::optional<Location> hierarchy_location(const SyntaxIndex& index,
+                                                  const std::string& shard_uri,
+                                                  SourceFileID file_id, int line_one_based,
+                                                  int col, int name_length) {
+    if (line_one_based <= 0)
+        return std::nullopt;
+    const auto file_uri = index.source_uri(file_id);
+    const int lsp_line = to_lsp_line(line_one_based);
+    return Location{file_uri.empty() ? shard_uri : file_uri, lsp_line, col, lsp_line,
+                    col + name_length};
+}
+
+std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& state,
+                                                          const std::string& uri, int line,
+                                                          int col) const {
+    auto ident = identifier_at(uri, line, col);
+    if (!ident || ident->name.empty())
+        return std::nullopt;
+    auto segments = hierarchical_path_at(state.text, line, col, *ident);
+    if (segments.size() < 2)
+        return std::nullopt;
+
+    // Snapshots this walk resolves against: open buffers first (an open file is
+    // authoritative for its own declarations), then the published project index.
+    std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
+    for_each_state([&](const std::string& state_uri,
+                       const std::shared_ptr<const DocumentState>& doc) {
+        if (doc && doc->tree)
+            open_states.emplace_back(state_uri, doc);
+    });
+    auto project = project_index_snapshot();
+
+    const auto find_module = [&](const std::string& name) -> std::optional<HierarchyModule> {
+        for (const auto& [state_uri, doc] : open_states) {
+            const auto& index = get_structural_index(*doc);
+            const auto it = index.module_by_name.find(name);
+            if (it != index.module_by_name.end())
+                return HierarchyModule{&index, state_uri, &index.modules[it->second]};
+        }
+        if (project) {
+            const auto it = project->module_by_name.find(name);
+            if (it != project->module_by_name.end() && it->second.shard) {
+                const auto& index = *it->second.shard;
+                // The shard's URI is the file it was built from; entries carry
+                // their own file_id for `include`d declarations.
+                std::string shard_uri;
+                for (const auto& shard : project->shards)
+                    if (shard.index == it->second.shard) {
+                        shard_uri = shard.uri;
+                        break;
+                    }
+                return HierarchyModule{&index, shard_uri, &index.modules[it->second.module_index]};
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto find_instance = [&](const HierarchyModule& owner,
+                                   const std::string& name) -> const InstanceEntry* {
+        for (const auto& inst : owner.index->instances)
+            if (inst.parent_module == owner.entry->name && inst.instance_name == name)
+                return &inst;
+        return nullptr;
+    };
+
+    // First segment: the enclosing module itself, an instance in it, or a module
+    // named directly.
+    std::optional<HierarchyModule> current;
+    size_t next = 1;
+    if (auto module = find_module(segments[0])) {
+        current = std::move(module);
+    } else {
+        // `u_dut.sig` written inside the testbench: resolve the instance against
+        // whichever module in this document declares it.
+        const auto& own_index = get_structural_index(state);
+        for (const auto& inst : own_index.instances) {
+            if (inst.instance_name != segments[0])
+                continue;
+            current = find_module(inst.module_name);
+            break;
+        }
+        if (!current)
+            return std::nullopt;
+    }
+
+    for (; next + 1 < segments.size(); ++next) {
+        const auto* inst = find_instance(*current, segments[next]);
+        if (!inst) {
+            // A named generate block sits in the path but is not an instance —
+            // the index records instances inside a generate under the enclosing
+            // module.  Skip the segment only when the next one really is an
+            // instance of the module reached so far, so an unknown name cannot
+            // silently disappear.
+            if (next + 2 < segments.size() && find_instance(*current, segments[next + 1]))
+                continue;
+            return std::nullopt;
+        }
+        auto target = find_module(inst->module_name);
+        if (!target)
+            return std::nullopt;
+        current = std::move(target);
+    }
+
+    // Last segment: a port, a value or an instance of the module reached.
+    const auto& leaf = segments.back();
+    const auto name_length = (int)leaf.size();
+    for (const auto& port : current->entry->ports)
+        if (port.name == leaf)
+            return hierarchy_location(*current->index, current->shard_uri, port.file_id, port.line,
+                                      port.col, name_length);
+    for (const auto& value : current->index->values)
+        if (value.name == leaf && value.parent_scope == current->entry->name)
+            return hierarchy_location(*current->index, current->shard_uri, value.file_id,
+                                      value.line, value.col, name_length);
+    if (const auto* inst = find_instance(*current, leaf))
+        return hierarchy_location(*current->index, current->shard_uri, inst->file_id, inst->line,
+                                  0, name_length);
+    return std::nullopt;
+}
+
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
     const auto start = Clock::now();
     auto state = get_state(uri);
@@ -3684,6 +3916,10 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     // successful definition keeps its current cost.
     if (!result)
         result = include_target_at(*state, line);
+    // Miss path only: a hierarchical path costs nothing until every other
+    // resolution has already failed.
+    if (!result)
+        result = hierarchical_definition(*state, uri, line, col);
     log_perf("definition_of " + uri + ":" + std::to_string(line) + ":" + std::to_string(col),
              start);
     return result;
