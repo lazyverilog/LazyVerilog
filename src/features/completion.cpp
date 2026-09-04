@@ -381,7 +381,22 @@ static std::optional<size_t> completion_original_offset(const slang::SourceManag
 
 static slang::BufferID completion_document_buffer(const slang::syntax::SyntaxTree& tree) {
     const auto start = tree.root().sourceRange().start();
-    return start.valid() ? start.buffer() : slang::BufferID{};
+    if (!start.valid())
+        return slang::BufferID{};
+
+    // The first token of the tree belongs to an `include`d header whenever the
+    // file opens with an include that carries declarations.  The document the
+    // user is editing is the root of that include chain, so walk out of every
+    // included buffer instead of trusting the first token's buffer.
+    const auto& sm = tree.sourceManager();
+    auto buffer = start.buffer();
+    while (buffer.valid()) {
+        const auto included_from = sm.getIncludedFrom(buffer);
+        if (!included_from.valid())
+            break;
+        buffer = included_from.buffer();
+    }
+    return buffer;
 }
 
 static std::optional<DotCompletionSyntaxContext>

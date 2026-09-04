@@ -2369,3 +2369,51 @@ TEST_CASE("completion: MemberAccess chain with an unresolvable hop stays empty",
     CHECK_FALSE(has_label(result, "inner"));
     CHECK_FALSE(has_label(result, "q"));
 }
+
+// An `include` whose header contributes tokens used to redirect the "which
+// buffer is the document" question at the header, because that answer was taken
+// from the first token of the parsed tree.  Every token the user actually typed
+// then looked foreign, the `.` before the cursor was never found, and member
+// access degraded to the plain scope list — for the whole file, including types
+// declared in the file itself.
+TEST_CASE("completion: member access survives an include above the first declaration",
+          "[completion]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-completion-include";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    write_text_file(dir / "decls.svh",
+                    "typedef struct packed {\n"
+                    "    logic [5:0] hh;\n"
+                    "    logic [5:0] ll;\n"
+                    "} hdr_t;\n");
+    analyzer.set_include_dirs({dir.string()});
+
+    const std::string uri = uri_from_path(dir / "includer.sv");
+    const std::string text =
+        "`include \"decls.svh\"\n"
+        "typedef struct packed {\n"
+        "    logic [2:0] p;\n"
+        "    logic [2:0] q;\n"
+        "} same_t;\n"
+        "module includer;\n"
+        "    same_t sm;\n"
+        "    hdr_t  hs;\n"
+        "    initial begin\n"
+        "        sm.\n"
+        "    end\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto [line, col] = pos_after(text, "sm.");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+
+    // The struct declared in this very file must complete even though the file
+    // opens with an include that carries declarations of its own.
+    CHECK(has_label(result, "p"));
+    CHECK(has_label(result, "q"));
+
+    std::filesystem::remove_all(dir);
+}
