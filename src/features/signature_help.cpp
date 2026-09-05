@@ -607,6 +607,33 @@ static std::optional<SubroutineInfo> method_at_index_declaration(const SyntaxInd
     return std::nullopt;
 }
 
+/// Package- or module-level subroutine declared at @p uri:@p line:@p col.
+///
+/// method_at_index_declaration() above reads MethodEntry, which only exists for
+/// class methods.  A free function in a package is described by
+/// ValueEntry::signature instead, and without this the scoped call path -- which
+/// deliberately looks a declaration up by location rather than by name -- had no
+/// way to read it, so `pkg::f(` returned no signatures at all.
+static std::optional<SubroutineInfo> subroutine_at_index_declaration(const SyntaxIndex& index,
+                                                                     const std::string& shard_uri,
+                                                                     const std::string& uri,
+                                                                     int line, int col) {
+    for (const auto& value : index.values) {
+        if (value.kind != "function" && value.kind != "task")
+            continue;
+        if (value.signature.empty())
+            continue;
+        const std::string value_uri = index.source_uri(value.file_id);
+        const std::string& actual = value_uri.empty() ? shard_uri : value_uri;
+        // ValueEntry lines are 1-based; an LSP location is 0-based.
+        if (actual != uri || value.line != line + 1 || value.col != col)
+            continue;
+        if (auto parsed = subroutine_from_index_signature(value.signature, value.name))
+            return parsed;
+    }
+    return std::nullopt;
+}
+
 static std::optional<SubroutineInfo> find_method_outside_document(const Analyzer& analyzer,
                                                                   const std::string& current_uri,
                                                                   const std::string& uri, int line,
@@ -633,6 +660,40 @@ static std::optional<SubroutineInfo> find_method_outside_document(const Analyzer
             if (!shard.index || shard.uri == uri)
                 continue;
             if (auto found = method_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+    }
+    return std::nullopt;
+}
+
+/// Same location-keyed lookup as find_method_outside_document(), for a
+/// package/module subroutine rather than a class method.  The declaring shard is
+/// tried first so only one shard is scanned in the ordinary case.
+static std::optional<SubroutineInfo> find_subroutine_at_declaration_outside_document(
+    const Analyzer& analyzer, const std::string& current_uri, const std::string& uri, int line,
+    int col) {
+    if (auto opened = analyzer.opened_file_index_shards(current_uri)) {
+        for (const auto& shard : *opened) {
+            if (!shard.index)
+                continue;
+            if (auto found =
+                    subroutine_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+    }
+    if (auto project = analyzer.project_index_snapshot()) {
+        for (const auto& shard : project->shards) {
+            if (!shard.index || shard.uri != uri)
+                continue;
+            if (auto found =
+                    subroutine_at_index_declaration(*shard.index, shard.uri, uri, line, col))
+                return found;
+        }
+        for (const auto& shard : project->shards) {
+            if (!shard.index || shard.uri == uri)
+                continue;
+            if (auto found =
+                    subroutine_at_index_declaration(*shard.index, shard.uri, uri, line, col))
                 return found;
         }
     }
@@ -760,6 +821,12 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
                     subroutine = subroutine_at_declaration(*other->tree, def->line, def->col);
                 if (!subroutine)
                     subroutine = find_method_outside_document(
+                        analyzer, params.textDocument.uri.raw_uri_, def->uri, def->line, def->col);
+                // `pkg::f(...)` where the package lives in a closed file: not a
+                // class method, so MethodEntry has nothing, but the shard's
+                // ValueEntry carries the formals.
+                if (!subroutine)
+                    subroutine = find_subroutine_at_declaration_outside_document(
                         analyzer, params.textDocument.uri.raw_uri_, def->uri, def->line, def->col);
             }
         }

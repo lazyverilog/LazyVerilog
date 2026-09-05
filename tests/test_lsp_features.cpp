@@ -1937,3 +1937,40 @@ TEST_CASE("autowire: insertion anchor ignores declarations nested in a subroutin
     // The declaration must land above the subroutine, not inside its body.
     CHECK(decl < function_start);
 }
+
+// The scoped-call path looks a declaration up by location, then read it back
+// through MethodEntry -- which only class methods have.  A package free function
+// in a closed file therefore produced no signatures at all, while the very same
+// function called unqualified through an import worked.
+TEST_CASE("signature help: package-qualified call to a closed-file function", "[signature]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_sig_pkg_scoped.sv";
+    {
+        std::ofstream out(path);
+        out << "package math_pkg;\n"
+               "    function automatic int add2(input int a, input int b);\n"
+               "        return a + b;\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_sig_pkg_scoped_caller.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    int r;\n"
+                       "    initial r = math_pkg::add2(1, 2);\n"
+                       "endmodule\n");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(2, 31);
+    auto help = provide_signature_help(analyzer, params);
+
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int add2(input int a, input int b)");
+
+    std::filesystem::remove(path);
+}
