@@ -68,6 +68,17 @@ static std::string type_of(const slang::SourceManager& sm, const PortHeaderSynta
         return render_syntax_node_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
         return render_syntax_node_text(sm, *net->dataType);
+    // `AXI_BUS.Slave bus` — an interface port names its interface, and without
+    // it the port has no recorded type at all, so `bus.aw_valid` had nothing to
+    // resolve against.  Kept as written, modport included, because that is what
+    // hover should show; interface_name_from_type_text() takes the half that
+    // names the interface.
+    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>()) {
+        std::string text = token_value_text(iface->nameOrKeyword);
+        if (iface->modport && iface->modport->member)
+            text += "." + token_value_text(iface->modport->member);
+        return text;
+    }
     return {};
 }
 

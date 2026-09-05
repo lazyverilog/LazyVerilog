@@ -2016,6 +2016,84 @@ static std::optional<std::string> class_type_for_object_reference(const SyntaxIn
     return result;
 }
 
+/// Declared type of `object_name`, exactly as written.
+///
+/// class_type_for_object_reference() canonicalises to the trailing identifier,
+/// which is right for `pkg::packet_t` but wrong for an interface port: the type
+/// text is `AXI_BUS.Slave`, whose trailing identifier is the modport.
+static std::optional<std::string> declared_type_text_for_object_reference(
+    const SyntaxIndex& index, std::string_view module_name, std::string_view object_name,
+    int use_line_one_based) {
+    if (module_name.empty() || object_name.empty())
+        return std::nullopt;
+
+    std::optional<std::string> result;
+    for (const auto& value : index.values) {
+        if (value.parent_scope != module_name || value.name != object_name ||
+            !is_module_value_kind(value.kind))
+            continue;
+        if (value.scope_start_line > 0 && use_line_one_based < value.scope_start_line)
+            continue;
+        if (value.scope_end_line > 0 && use_line_one_based > value.scope_end_line)
+            continue;
+        if (!value.type.empty())
+            result = value.type;
+    }
+    return result;
+}
+
+/// Interface half of an interface-port type text: `AXI_BUS.Slave` -> `AXI_BUS`.
+static std::string interface_name_from_type_text(std::string_view type_text) {
+    const auto dot = type_text.find('.');
+    return std::string(dot == std::string_view::npos ? type_text : type_text.substr(0, dot));
+}
+
+/// A signal, modport or parameter declared inside interface @p interface_name.
+///
+/// Everything needed is already in the shard — `interface_names` says which
+/// modules are interfaces, `ModuleEntry::modports` carries each modport's
+/// location, and the interface's signals are ordinary ports and values — so
+/// this is lookup only, with no extra indexing work.
+static std::optional<Location> find_interface_member_definition(const SyntaxIndex& index,
+                                                                const std::string& uri,
+                                                                std::string_view interface_name,
+                                                                std::string_view member_name) {
+    if (interface_name.empty() || member_name.empty())
+        return std::nullopt;
+    if (!index.interface_names.contains(std::string(interface_name)))
+        return std::nullopt;
+
+    const auto it = index.module_by_name.find(std::string(interface_name));
+    if (it == index.module_by_name.end() || it->second >= index.modules.size())
+        return std::nullopt;
+    const auto& iface = index.modules[it->second];
+
+    const auto locate = [&](SourceFileID file_id, int line, int col, size_t name_size)
+        -> std::optional<Location> {
+        if (line <= 0)
+            return std::nullopt;
+        const auto actual_uri = index.source_uri(file_id);
+        const int lsp_line = to_lsp_line(line);
+        return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
+                        col + (int)name_size};
+    };
+
+    for (const auto& modport : iface.modports) {
+        if (modport.name == member_name)
+            return locate(modport.file_id, modport.line, modport.col, modport.name.size());
+    }
+    for (const auto& port : iface.ports) {
+        if (port.name == member_name)
+            return locate(port.file_id, port.line, port.col, port.name.size());
+    }
+    for (const auto& value : index.values) {
+        if (value.parent_scope != interface_name || value.name != member_name)
+            continue;
+        return locate(value.file_id, value.line, value.col, value.name.size());
+    }
+    return std::nullopt;
+}
+
 static std::pair<int, int> source_range_lines_one_based(const slang::SourceManager& sm,
                                                         slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -4292,6 +4370,30 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                     continue;
                 if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
                                                              *class_type, target.name))
+                    return loc;
+            }
+        }
+
+        // Interface ports.  `AXI_BUS.Slave bus;` then `bus.aw_valid` — the
+        // receiver's declared type names an interface, and the member is one of
+        // that interface's signals.  Also covers a cursor on the modport of
+        // `AXI_BUS.Slave`, where the receiver is the interface name itself.
+        if (target.object_path.size() <= 1) {
+            std::string interface_name;
+            if (auto type_text = declared_type_text_for_object_reference(
+                    current_index, target.scope_module, base_receiver, use_line_one_based))
+                interface_name = interface_name_from_type_text(*type_text);
+            if (interface_name.empty())
+                interface_name = base_receiver;
+
+            if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
+                                                            target.name))
+                return loc;
+            for (const auto& extra : extra_files) {
+                if (skip_extra(extra))
+                    continue;
+                if (auto loc = find_interface_member_definition(extra.index_ref(), extra.uri,
+                                                                interface_name, target.name))
                     return loc;
             }
         }
