@@ -1,5 +1,6 @@
 #include "document_symbols.hpp"
 #include "../dynamic_file_index.hpp"
+#include "../string_utils.hpp"
 #include "../syntax_index_shared.hpp"
 #include <functional>
 #include <unordered_map>
@@ -25,13 +26,32 @@ int to_lsp_line(int one_based_line) { return one_based_line > 0 ? one_based_line
 // SyntaxIndex.  Nothing on the closed-file path wants them, and the project
 // indexer should not pay for facts only the focused file uses.
 
+/// A declaration written directly inside a labelled block.
+///
+/// These never reach the index: the closed-file shard skips them, and the
+/// open-buffer index has no block-local pass at all -- adding one would put a
+/// whole-tree walk on every edit.  documentSymbol already walks this file's AST
+/// for extents, so the outline collects them here instead, at no extra cost and
+/// with nothing added to the project index.
+struct BlockDecl {
+    std::string name;
+    std::string type;
+    int line{0}; // 1-based
+    int col{0};  // 0-based
+};
+
 struct GenerateBlock {
     std::string name;
+    // "generate" or "block" -- what the outline shows next to the name.  A named
+    // `always_comb begin : proc` is a navigable scope in exactly the same way a
+    // labelled generate is, and it holds declarations of its own.
+    std::string detail{"generate"};
     int line{0}; // 1-based
     int col{0};  // 0-based
     int end_line{0};
     int end_col{0};
     int parent{-1}; // index into the module's block list
+    std::vector<BlockDecl> decls;
 };
 
 struct Extent {
@@ -47,6 +67,12 @@ struct ModuleShape {
 struct DocumentShape {
     std::unordered_map<std::string, ModuleShape> modules;
     std::unordered_map<std::string, Extent> classes;
+    // Subroutine bodies, keyed by the 1-based line the declaration starts on.
+    // Modules and classes already report a full range; a function reported only
+    // the line its name sits on, so folding and breadcrumbs behaved differently
+    // for the two.  Keying on the line avoids inventing a unique name for a
+    // method that several classes declare (`new`, `run_phase`, ...).
+    std::unordered_map<int, Extent> subroutines;
 };
 
 struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
@@ -94,6 +120,55 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         visitDefault(node);
     }
 
+    void handle(const slang::syntax::DataDeclarationSyntax& node) {
+        if (current && !block_stack.empty()) {
+            auto& block = current->blocks[(size_t)block_stack.back()];
+            const std::string type = trim_copy(std::string(node.type->toString()));
+            for (const auto* decl : node.declarators) {
+                if (!decl || !decl->name || !in_document(decl->name.location()))
+                    continue;
+                const auto col = sm.getColumnNumber(decl->name.location());
+                block.decls.push_back(BlockDecl{std::string(decl->name.valueText()), type,
+                                                (int)sm.getLineNumber(decl->name.location()),
+                                                col > 0 ? (int)col - 1 : 0});
+            }
+        }
+        visitDefault(node);
+    }
+
+    void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
+        const auto first = node.getFirstToken();
+        if (first && in_document(first.location()))
+            out.subroutines[(int)sm.getLineNumber(first.location())] = extent_of(node);
+        visitDefault(node);
+    }
+
+    /// Record a labelled scope and walk its body inside it.
+    ///
+    /// Returns false when the node is not something the outline nests under, in
+    /// which case the caller just walks the body normally.
+    bool enter_labelled_block(const slang::syntax::SyntaxNode& node,
+                              slang::SourceLocation begin, std::string label,
+                              std::string detail) {
+        if (!current || label.empty() || !in_document(begin))
+            return false;
+
+        const auto extent = extent_of(node);
+        GenerateBlock block;
+        block.name = std::move(label);
+        block.detail = std::move(detail);
+        block.line = (int)sm.getLineNumber(begin);
+        const auto col = sm.getColumnNumber(begin);
+        block.col = col > 0 ? (int)col - 1 : 0;
+        block.end_line = extent.end_line;
+        block.end_col = extent.end_col;
+        block.parent = block_stack.empty() ? -1 : block_stack.back();
+
+        block_stack.push_back((int)current->blocks.size());
+        current->blocks.push_back(std::move(block));
+        return true;
+    }
+
     void handle(const slang::syntax::GenerateBlockSyntax& node) {
         // Only a labelled block is a scope a reader navigates by; an unnamed
         // one would clutter the outline with `genblk` nodes the source never
@@ -103,27 +178,25 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
             name_clause ? std::string(name_clause->name.valueText()) : std::string{};
         if (label.empty() && node.label)
             label = std::string(node.label->name.valueText());
-        if (!current || label.empty() || !in_document(node.begin.location())) {
-            visitDefault(node);
-            return;
-        }
 
-        const auto begin = node.begin.location();
-        const auto extent = extent_of(node);
-        GenerateBlock block;
-        block.name = std::move(label);
-        block.line = (int)sm.getLineNumber(begin);
-        const auto col = sm.getColumnNumber(begin);
-        block.col = col > 0 ? (int)col - 1 : 0;
-        block.end_line = extent.end_line;
-        block.end_col = extent.end_col;
-        block.parent = block_stack.empty() ? -1 : block_stack.back();
-
-        const int self = (int)current->blocks.size();
-        current->blocks.push_back(std::move(block));
-        block_stack.push_back(self);
+        const bool entered =
+            enter_labelled_block(node, node.begin.location(), std::move(label), "generate");
         visitDefault(node);
-        block_stack.pop_back();
+        if (entered)
+            block_stack.pop_back();
+    }
+
+    void handle(const slang::syntax::BlockStatementSyntax& node) {
+        std::string label = node.blockName ? std::string(node.blockName->name.valueText())
+                                           : std::string{};
+        if (label.empty() && node.label)
+            label = std::string(node.label->name.valueText());
+
+        const bool entered =
+            enter_labelled_block(node, node.begin.location(), std::move(label), "block");
+        visitDefault(node);
+        if (entered)
+            block_stack.pop_back();
     }
 };
 
@@ -251,8 +324,11 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
                 const auto& b = blocks[i];
                 lsDocumentSymbol block_node =
                     make_symbol(b.name, lsSymbolKind::Namespace, b.line, b.col,
-                                optional<std::string>("generate"));
+                                optional<std::string>(b.detail));
                 set_extent(block_node, Extent{b.end_line, b.end_col});
+                for (const auto& d : b.decls)
+                    push_child(block_node, make_symbol(d.name, lsSymbolKind::Variable, d.line,
+                                                       d.col, opt_str(d.type)));
                 block_nodes.push_back(std::move(block_node));
                 if (b.parent < 0)
                     block_roots.push_back((int)i);
@@ -301,10 +377,14 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
                 push_child(target(v.line), make_symbol(v.name, lsSymbolKind::Constant, v.line,
                                                        v.col, opt_str(std::move(detail))));
             } else if (v.kind == "function" || v.kind == "task") {
-                push_child(target(v.line), make_symbol(v.name,
-                                                       v.kind == "task" ? lsSymbolKind::Method
-                                                                        : lsSymbolKind::Function,
-                                                       v.line, v.col, opt_str(v.type)));
+                auto symbol = make_symbol(v.name,
+                                          v.kind == "task" ? lsSymbolKind::Method
+                                                           : lsSymbolKind::Function,
+                                          v.line, v.col, opt_str(v.type));
+                if (const auto extent = shape.subroutines.find(v.line);
+                    extent != shape.subroutines.end())
+                    set_extent(symbol, extent->second);
+                push_child(target(v.line), std::move(symbol));
             }
         }
         for (const auto& inst : index.instances) {
@@ -347,8 +427,13 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
         for (const auto& m : cls.methods) {
             if (!in_document(m.file_id))
                 continue;
-            push_child(node, make_symbol(m.name, m.is_task ? lsSymbolKind::Method : lsSymbolKind::Function,
-                                         m.line, m.col, opt_str(m.return_type)));
+            auto method = make_symbol(m.name,
+                                      m.is_task ? lsSymbolKind::Method : lsSymbolKind::Function,
+                                      m.line, m.col, opt_str(m.return_type));
+            if (const auto extent = shape.subroutines.find(m.line);
+                extent != shape.subroutines.end())
+                set_extent(method, extent->second);
+            push_child(node, std::move(method));
         }
 
         const auto it = container_index.find(cls.parent_scope);
