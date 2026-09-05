@@ -71,6 +71,38 @@ static std::string format_replacement_at_column(
     return out;
 }
 
+/// Leading whitespace of a 0-based line, or "" when the line has none.
+static std::string leading_whitespace_of_line(const std::string& text, int line) {
+    size_t pos = 0;
+    for (int cur = 0; cur < line && pos < text.size(); ++pos)
+        if (text[pos] == '\n')
+            ++cur;
+    size_t end = pos;
+    while (end < text.size() && (text[end] == ' ' || text[end] == '\t'))
+        ++end;
+    return text.substr(pos, end - pos);
+}
+
+/// Prefix every line of @p text with @p indent.
+///
+/// The formatter re-indents an isolated snippet from column 0 because the
+/// snippet carries no enclosing module, so an emitted instance came out flush
+/// left no matter how the original was indented.  This edit replaces whole
+/// lines, so the first line needs the prefix too.
+static std::string indent_replacement_lines(const std::string& text, const std::string& indent) {
+    if (indent.empty() || text.empty())
+        return text;
+    std::string out;
+    out.reserve(text.size() + indent.size() * 4);
+    out += indent;
+    for (size_t i = 0; i < text.size(); ++i) {
+        out += text[i];
+        if (text[i] == '\n' && i + 1 < text.size())
+            out += indent;
+    }
+    return out;
+}
+
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
@@ -180,8 +212,10 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                                                       : std::span<const OpenIndexShard>{},
                                         project_index.get());
             if (result) {
-                std::string formatted = format_emit_text(
-                    format_autoinst(*result, state->text, config.autoinst), config.format);
+                std::string formatted = indent_replacement_lines(
+                    format_emit_text(format_autoinst(*result, state->text, config.autoinst),
+                                     config.format),
+                    leading_whitespace_of_line(state->text, result->line_start));
                 // Replace the instantiation range
                 auto we = make_range_edit(uri, result->line_start, 0, result->line_end + 1, 0,
                                           formatted + "\n");

@@ -1345,3 +1345,455 @@ TEST_CASE("definition: block-local declaration does not shadow a later sibling b
     CHECK(loc->line == 7);
 }
 
+
+TEST_CASE("definition: `include path resolves to the included file", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_definition_include_target.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_target.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = INCLUDED_PARAMETER;\n"
+                           "endmodule\n");
+
+    // Cursor inside the quoted path.  The path is a string literal, so this
+    // resolves through the preprocessor's include relation rather than through
+    // an identifier lookup.
+    auto loc = analyzer.definition_of(top_uri, 0, 14);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(inc_path));
+    CHECK(loc->line == 0);
+    CHECK(loc->col == 0);
+
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("definition: `include of a missing file stays unresolved", "[definition][include]") {
+    Analyzer analyzer;
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_missing.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_no_such_header.svh\"\n"
+                           "module top;\n"
+                           "endmodule\n");
+
+    CHECK_FALSE(analyzer.definition_of(top_uri, 0, 14).has_value());
+}
+
+TEST_CASE("definition: `include resolution reports the directly included file",
+          "[definition][include]") {
+    Analyzer analyzer;
+    const auto inner_path = write_temp_sv("lazyverilog_definition_include_inner.svh",
+                                          "parameter int INNER_PARAMETER = 2;\n");
+    const auto outer_path =
+        write_temp_sv("lazyverilog_definition_include_outer.svh",
+                      "`include \"lazyverilog_definition_include_inner.svh\"\n"
+                      "parameter int OUTER_PARAMETER = 1;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_nested_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_outer.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = INNER_PARAMETER;\n"
+                           "endmodule\n");
+
+    // The nested header is in the same SourceManager, but its directive lives in
+    // the outer header -- not on this line -- so it must not win here.
+    auto loc = analyzer.definition_of(top_uri, 0, 14);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(outer_path));
+
+    std::filesystem::remove(outer_path);
+    std::filesystem::remove(inner_path);
+}
+
+TEST_CASE("definition: a line without an `include is unaffected", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_definition_include_unaffected.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_definition_include_unaffected_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_definition_include_unaffected.svh\"\n"
+                           "module top;\n"
+                           "  localparam int X = 1;\n"
+                           "  logic unresolved_name;\n"
+                           "endmodule\n");
+
+    // An unresolvable position on an ordinary line must not fall back to the
+    // file's include target.
+    auto loc = analyzer.definition_of(top_uri, 2, 19);
+    CHECK((!loc.has_value() || loc->uri != uri_from_path(inc_path)));
+
+    std::filesystem::remove(inc_path);
+}
+
+TEST_CASE("hover: `include path reports the included file", "[definition][include]") {
+    Analyzer analyzer;
+    const auto inc_path = write_temp_sv("lazyverilog_hover_include_target.svh",
+                                        "parameter int INCLUDED_PARAMETER = 7;\n");
+    const std::string top_uri = uri_from_path(std::filesystem::temp_directory_path() /
+                                              "lazyverilog_hover_include_top.sv");
+    analyzer.open(top_uri, "`include \"lazyverilog_hover_include_target.svh\"\n"
+                           "module top;\n"
+                           "endmodule\n");
+
+    auto info = analyzer.symbol_at(top_uri, 0, 14);
+    REQUIRE(info.has_value());
+    CHECK(info->kind == "include");
+    CHECK(info->name == "lazyverilog_hover_include_target.svh");
+
+    std::filesystem::remove(inc_path);
+}
+
+// The open-buffer index skipped `extern` method prototypes that the closed-file
+// shard builder already indexed, so a class written in the extern style lost every
+// method the moment its file was opened: `obj.bump()` resolved while the file
+// was closed and stopped resolving once it was open.
+TEST_CASE("definition: a call to an extern-declared method in an open buffer", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_extern_method.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    extern function void bump(int amount);
+  endclass
+  function void base_c::bump(int amount);
+  endfunction
+endpackage
+
+module top;
+  initial begin
+    p::base_c obj = new();
+    obj.bump(3);
+  end
+endmodule
+)");
+
+    auto loc = analyzer.definition_of(uri, 11, 9);
+    REQUIRE(loc.has_value());
+    CHECK(loc->line == 2); // the extern prototype
+}
+
+// A declaration inside a generate block is a different signal from the
+// module-level one that shares its name.  The index recorded generate-block
+// declarations nowhere, so every use inside the block resolved to the outer
+// declaration.
+TEST_CASE("definition: a generate-block declaration shadows the module-level one",
+          "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_generate_shadow.sv";
+    const std::string text = R"(module top;
+  logic [7:0] dout;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    // `dout` on the assign inside the generate block (line 7, 0-based).
+    auto inner = analyzer.definition_of(uri, 7, 13);
+    REQUIRE(inner.has_value());
+    CHECK(inner->line == 6);
+
+    // The module-level declaration still answers for itself.
+    auto outer = analyzer.definition_of(uri, 1, 14);
+    REQUIRE(outer.has_value());
+    CHECK(outer->line == 1);
+}
+
+// Navigating a testbench by hierarchy (`tb.u_dut.sig`) resolved nothing: the
+// index knows instances and each module's signals, but nothing walked the path.
+
+// Navigating a testbench by hierarchy (`tb.u_dut.sig`) resolved nothing: the
+// index knows instances and each module's signals, but nothing walked the path.
+TEST_CASE("definition: hierarchical reference resolves through instance paths",
+          "[definition]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-definition-hier";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto sub = dir / "hier_sub.sv";
+    const auto dut = dir / "hier_dut.sv";
+    {
+        std::ofstream out(sub);
+        out << "module hier_sub (input logic clk);\n"
+               "  logic [7:0] stage;\n"
+               "endmodule\n";
+    }
+    {
+        std::ofstream out(dut);
+        out << "module hier_dut (input logic clk);\n"
+               "  logic [7:0] din;\n"
+               "  genvar i;\n"
+               "  generate\n"
+               "    for (i = 0; i < 2; i++) begin : g_lanes\n"
+               "      hier_sub u_sub (.clk(clk));\n"
+               "    end\n"
+               "  endgenerate\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({sub.string(), dut.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "hier_tb.sv");
+    const std::string text =
+        "module hier_tb;\n"
+        "  logic clk;\n"
+        "  hier_dut u_dut (.clk(clk));\n"
+        "  initial begin\n"
+        "    force hier_tb.u_dut.din = 8'h5a;\n"
+        "    $display(\"%0h\", hier_tb.u_dut.g_lanes[0].u_sub.stage);\n"
+        "    $display(\"%0h\", u_dut.nosuch_signal);\n"
+        "  end\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    SECTION("plain instance path") {
+        const auto col = (int)text.find("u_dut.din") + 6;
+        const auto line_start = text.rfind('\n', text.find("u_dut.din")) + 1;
+        auto loc = analyzer.definition_of(uri, 4, (int)(text.find("u_dut.din") + 6 - line_start));
+        (void)col;
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(dut));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("through a named generate block") {
+        const auto needle = text.find("u_sub.stage");
+        const auto line_start = text.rfind('\n', needle) + 1;
+        auto loc = analyzer.definition_of(uri, 5, (int)(needle + 6 - line_start));
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(sub));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("unresolvable path answers nothing") {
+        const auto needle = text.find("nosuch_signal");
+        const auto line_start = text.rfind('\n', needle) + 1;
+        auto loc = analyzer.definition_of(uri, 6, (int)(needle - line_start));
+        CHECK_FALSE(loc.has_value());
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// The open-buffer index skipped `extern` method prototypes that the closed-file
+// shard builder already indexed, so a class written in the extern style lost every
+// method the moment its file was opened: `obj.bump()` resolved while the file
+// was closed and stopped resolving once it was open.
+
+// `parameter type foo_t = ...` parses as TypeParameterDeclarationSyntax, a
+// sibling of ParameterDeclarationSyntax, so every `as_if<ParameterDeclaration>`
+// site used to skip it and the whole declaration never reached the index.  It
+// then had no definition, no hover and no references — not even with the cursor
+// on the declaration itself.  cva6 parameterizes its entire core this way.
+TEST_CASE("definition: type parameter resolves from its use and its declaration",
+          "[definition][parameter]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_type_parameter.sv";
+    const std::string text = "module type_param #(\n"
+                             "    parameter type data_t = logic [7:0]\n"
+                             ") (\n"
+                             "    input  data_t d_i,\n"
+                             "    output data_t d_o\n"
+                             ");\n"
+                             "  assign d_o = d_i;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    SECTION("from the port that uses it") {
+        auto loc = analyzer.definition_of(uri, 3, 11);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 19);
+    }
+
+    SECTION("from the declaration itself") {
+        auto loc = analyzer.definition_of(uri, 1, 19);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 19);
+    }
+
+    SECTION("references cover the declaration and both uses") {
+        const auto refs = analyzer.find_references(uri, 1, 19, true);
+        CHECK(refs.size() == 3);
+    }
+}
+
+// A receiver was resolved from a single identifier, so the second dot of
+// `a.b.c` had nothing to look up: `b` is a field of `a`'s type, not something
+// the enclosing module declares.  cva6 writes `csr_addr.csr_decode.priv_lvl`.
+TEST_CASE("definition: member access resolves through a multi-level receiver",
+          "[definition][member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_member_chain.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    typedef struct packed {\n"
+                       "        logic [1:0] rw;\n"
+                       "        logic       priv_lvl;\n"
+                       "    } addr_t;\n"
+                       "    typedef struct packed {\n"
+                       "        addr_t decode;\n"
+                       "    } csr_t;\n"
+                       "endpackage\n"
+                       "module top;\n"
+                       "    p::csr_t csr_addr;\n"
+                       "    logic hit;\n"
+                       "    assign hit = csr_addr.decode.priv_lvl;\n"
+                       "endmodule\n");
+
+    SECTION("first hop still resolves") {
+        auto loc = analyzer.definition_of(uri, 12, 26);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 15);
+    }
+
+    SECTION("second hop resolves through the intermediate field's type") {
+        auto loc = analyzer.definition_of(uri, 12, 33);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 20);
+    }
+}
+
+// An interface port had no recorded type at all, so neither the modport name nor
+// any signal reached through the port could be resolved.  Both facts were already
+// in the index (interface_names, ModuleEntry::modports, the interface's ports) —
+// only the lookup was missing.
+TEST_CASE("definition: interface port members and modport names resolve", "[definition][interface]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_interface_port.sv";
+    analyzer.open(uri, "interface simple_bus;\n"
+                       "    logic aw_valid;\n"
+                       "    logic b_valid;\n"
+                       "    modport Slave (input aw_valid, output b_valid);\n"
+                       "endinterface\n"
+                       "module dev (\n"
+                       "    simple_bus.Slave bus\n"
+                       ");\n"
+                       "    assign bus.b_valid = bus.aw_valid;\n"
+                       "endmodule\n");
+
+    SECTION("modport name in the port header") {
+        auto loc = analyzer.definition_of(uri, 6, 16);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 12);
+    }
+
+    SECTION("signal reached through the interface port") {
+        auto loc = analyzer.definition_of(uri, 8, 30);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 10);
+    }
+
+    SECTION("the port itself still resolves to its declaration") {
+        auto loc = analyzer.definition_of(uri, 8, 12);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 21);
+    }
+}
+
+// Hierarchical references resolved only the simplest shape.  The instance name
+// itself matched no declarator, a generate-block label had no type so its
+// members were unreachable, and an indexed generate segment broke the walk at
+// the very first step.
+TEST_CASE("definition: hierarchical paths through instances and generate blocks",
+          "[definition][hierarchy]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_hier_generate";
+    std::filesystem::create_directories(dir);
+    const auto leaf = dir / "hier_leaf.sv";
+    {
+        std::ofstream out(leaf);
+        out << "module hier_leaf (input logic d_i);\n"
+               "  logic state_q;\n"
+               "  assign state_q = d_i;\n"
+               "endmodule\n";
+    }
+    const std::string top_text = "module hier_top;\n"
+                                 "  logic probe;\n"
+                                 "  for (genvar i = 0; i < 2; i++) begin : gen_lane\n"
+                                 "    logic [7:0] lane_count;\n"
+                                 "    hier_leaf u_leaf (.d_i(1'b0));\n"
+                                 "  end\n"
+                                 "  assign probe = gen_lane[0].u_leaf.state_q;\n"
+                                 "  assign probe = gen_lane.lane_count[0];\n"
+                                 "endmodule\n";
+    const auto top = dir / "hier_top.sv";
+    {
+        std::ofstream out(top);
+        out << top_text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({leaf.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(top);
+    analyzer.open(uri, top_text);
+
+    SECTION("instance name inside a hierarchical path") {
+        auto loc = analyzer.definition_of(uri, 6, 29);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 4);
+    }
+
+    SECTION("signal reached through an indexed generate segment") {
+        auto loc = analyzer.definition_of(uri, 6, 36);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(leaf));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("declaration inside a named generate block") {
+        auto loc = analyzer.definition_of(uri, 7, 27);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 16);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// `new` is lexed as a keyword rather than an identifier, so `super.new(...)`
+// never reached the member-access path.  `super` also has to resolve to the base
+// class explicitly: a constructor is always redeclared by the derived class, so
+// walking the hierarchy from the derived class stops at the wrong `new`.
+TEST_CASE("definition: super.new resolves to the base class constructor",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_super_new.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    class base_txn;\n"
+                       "        int payload;\n"
+                       "        function new(int payload);\n"
+                       "            this.payload = payload;\n"
+                       "        endfunction\n"
+                       "    endclass\n"
+                       "    class byte_txn extends base_txn;\n"
+                       "        function new(int payload);\n"
+                       "            super.new(payload);\n"
+                       "        endfunction\n"
+                       "    endclass\n"
+                       "endpackage\n");
+
+    auto loc = analyzer.definition_of(uri, 9, 18);
+    REQUIRE(loc.has_value());
+    // The base constructor, not byte_txn's own `new` on line 8.
+    CHECK(loc->line == 3);
+    // On `new`, not on the `function` keyword eight columns to its left:
+    // `        function new(int payload);`
+    CHECK(loc->col == 17);
+}

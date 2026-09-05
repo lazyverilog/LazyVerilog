@@ -1599,6 +1599,12 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     int aggregate_type_depth{0};
     std::optional<Location> first_result;
     std::optional<Location> scoped_result;
+    // How many enclosing lexical scopes each recorded candidate sat in.  A
+    // declaration inside a generate block shadows a module-level one of the same
+    // name, and the module-level declaration is visited first, so "first match
+    // wins" would answer with the shadowed signal.
+    int first_result_depth{-1};
+    int scoped_result_depth{-1};
 
     GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
                              const std::string& name, const std::string& preferred_module,
@@ -1666,6 +1672,16 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     //     for (int i = 0; i < 10; i++) begin ... end
     //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
     //                                               ^ the second `i`, not the first
+    /// Enclosing scopes that really restrict visibility, i.e. how deeply
+    /// shadowed a declaration found here is.
+    int scope_depth() const {
+        int depth = 0;
+        for (const auto& [start_line, end_line] : scope_stack)
+            if (start_line > 0 || end_line > 0)
+                ++depth;
+        return depth;
+    }
+
     bool cursor_in_innermost_scope() const {
         if (scope_stack.empty())
             return true;
@@ -1686,11 +1702,16 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             return;
 
         auto loc = location_from_token_actual_uri(sm, uri, token);
-        if (!first_result)
+        const int depth = scope_sensitive ? scope_depth() : 0;
+        if (!first_result || depth > first_result_depth) {
             first_result = loc;
+            first_result_depth = depth;
+        }
         if (scope_sensitive && !preferred_module.empty() && current_module == preferred_module &&
-            !scoped_result)
+            (!scoped_result || depth > scoped_result_depth)) {
             scoped_result = loc;
+            scoped_result_depth = depth;
+        }
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
@@ -1756,6 +1777,23 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         maybe_set(node.name);
     }
 
+    // `parameter type data_t = logic [7:0]` declares `data_t` through a
+    // TypeAssignmentSyntax, not a DeclaratorSyntax, so the handler above never
+    // sees it.  Like a module or class name it is a type identifier at its use
+    // sites, so it is not scope-sensitive.
+    void handle(const slang::syntax::TypeAssignmentSyntax& node) { maybe_set(node.name, false); }
+
+    // `extern function void bump(int amount);` is a declaration in its own
+    // right; without it the cursor on a prototype name resolves to nothing, and
+    // references/rename — which both start from the definition — return empty.
+    void handle(const slang::syntax::ClassMethodPrototypeSyntax& node) {
+        if (node.prototype && node.prototype->name)
+            if (const auto* identifier =
+                    node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
+                maybe_set(identifier->identifier, false);
+        visitDefault(node);
+    }
+
     void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
         if (const auto* identifier =
                 node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
@@ -1776,7 +1814,19 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         const int end_line = (int)sm.getLineNumber(range.end());
         if (use_line_one_based < start_line || use_line_one_based > end_line)
             return;
+
+        // A subroutine body is a scope in exactly the way a begin/end block is:
+        //
+        //     logic [7:0] count;                                     // module
+        //     function automatic f(input logic [7:0] count);         // shadows it
+        //         tmp = count + 1;                                   // means the formal
+        //
+        // Without pushing a scope here, formals and locals are recorded at the
+        // same depth as module declarations, the module one is visited first,
+        // and `depth > first_result_depth` then refuses to replace it.
+        push_scope(range);
         visitDefault(node);
+        scope_stack.pop_back();
     }
 
     void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
@@ -1797,6 +1847,15 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     }
 
     void handle(const slang::syntax::ForeachLoopStatementSyntax& node) {
+        push_scope(node.sourceRange());
+        visitDefault(node);
+        scope_stack.pop_back();
+    }
+
+    // A generate block owns its declarations exactly the way a begin/end block
+    // does: `logic [7:0] dout;` inside `for ... begin : g_lanes` is a different
+    // signal from a module-level `dout`.
+    void handle(const slang::syntax::GenerateBlockSyntax& node) {
         push_scope(node.sourceRange());
         visitDefault(node);
         scope_stack.pop_back();
@@ -1957,6 +2016,159 @@ static std::optional<std::string> class_type_for_object_reference(const SyntaxIn
     return result;
 }
 
+/// Declared type of `object_name`, exactly as written.
+///
+/// class_type_for_object_reference() canonicalises to the trailing identifier,
+/// which is right for `pkg::packet_t` but wrong for an interface port: the type
+/// text is `AXI_BUS.Slave`, whose trailing identifier is the modport.
+static std::optional<std::string> declared_type_text_for_object_reference(
+    const SyntaxIndex& index, std::string_view module_name, std::string_view object_name,
+    int use_line_one_based) {
+    if (module_name.empty() || object_name.empty())
+        return std::nullopt;
+
+    std::optional<std::string> result;
+    for (const auto& value : index.values) {
+        if (value.parent_scope != module_name || value.name != object_name ||
+            !is_module_value_kind(value.kind))
+            continue;
+        if (value.scope_start_line > 0 && use_line_one_based < value.scope_start_line)
+            continue;
+        if (value.scope_end_line > 0 && use_line_one_based > value.scope_end_line)
+            continue;
+        if (!value.type.empty())
+            result = value.type;
+    }
+    return result;
+}
+
+/// Interface half of an interface-port type text: `AXI_BUS.Slave` -> `AXI_BUS`.
+static std::string interface_name_from_type_text(std::string_view type_text) {
+    const auto dot = type_text.find('.');
+    return std::string(dot == std::string_view::npos ? type_text : type_text.substr(0, dot));
+}
+
+/// A signal, modport or parameter declared inside interface @p interface_name.
+///
+/// Everything needed is already in the shard — `interface_names` says which
+/// modules are interfaces, `ModuleEntry::modports` carries each modport's
+/// location, and the interface's signals are ordinary ports and values — so
+/// this is lookup only, with no extra indexing work.
+static std::optional<Location> find_interface_member_definition(const SyntaxIndex& index,
+                                                                const std::string& uri,
+                                                                std::string_view interface_name,
+                                                                std::string_view member_name) {
+    if (interface_name.empty() || member_name.empty())
+        return std::nullopt;
+    if (!index.interface_names.contains(std::string(interface_name)))
+        return std::nullopt;
+
+    const auto it = index.module_by_name.find(std::string(interface_name));
+    if (it == index.module_by_name.end() || it->second >= index.modules.size())
+        return std::nullopt;
+    const auto& iface = index.modules[it->second];
+
+    const auto locate = [&](SourceFileID file_id, int line, int col, size_t name_size)
+        -> std::optional<Location> {
+        if (line <= 0)
+            return std::nullopt;
+        const auto actual_uri = index.source_uri(file_id);
+        const int lsp_line = to_lsp_line(line);
+        return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
+                        col + (int)name_size};
+    };
+
+    for (const auto& modport : iface.modports) {
+        if (modport.name == member_name)
+            return locate(modport.file_id, modport.line, modport.col, modport.name.size());
+    }
+    for (const auto& port : iface.ports) {
+        if (port.name == member_name)
+            return locate(port.file_id, port.line, port.col, port.name.size());
+    }
+    for (const auto& value : index.values) {
+        if (value.parent_scope != interface_name || value.name != member_name)
+            continue;
+        return locate(value.file_id, value.line, value.col, value.name.size());
+    }
+    return std::nullopt;
+}
+
+/// Instantiation named @p instance_name inside @p module_name.
+///
+/// `u_leaf.state_q` resolves `state_q`, but a cursor on `u_leaf` itself is a
+/// plain identifier that no declarator matches, so it used to resolve to
+/// nothing.  InstanceEntry already records where the instance is written.
+static std::optional<Location> find_instance_definition(const SyntaxIndex& index,
+                                                        const std::string& uri,
+                                                        std::string_view module_name,
+                                                        std::string_view instance_name) {
+    if (instance_name.empty())
+        return std::nullopt;
+    for (const auto& inst : index.instances) {
+        if (inst.instance_name != instance_name)
+            continue;
+        if (!module_name.empty() && !inst.parent_module.empty() &&
+            inst.parent_module != module_name)
+            continue;
+        if (inst.line <= 0)
+            continue;
+        const auto actual_uri = index.source_uri(inst.file_id);
+        const int lsp_line = to_lsp_line(inst.line);
+        // InstanceEntry keeps the instantiation line but no column for the name,
+        // so anchor at the start of the line the instance is written on.
+        return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, 0, lsp_line, 0};
+    }
+    return std::nullopt;
+}
+
+/// Declaration of @p member_name inside the generate block labelled @p label.
+///
+/// `gen_stall_mem.rf_rd_a_hz` names a signal declared inside `begin :
+/// gen_stall_mem`.  A generate label is not a value, so the receiver had no
+/// type and the member lookup never started.  The block and the reference are
+/// in the same file by construction, so this reads the current AST rather than
+/// asking the index to carry a per-declaration block name.
+static std::optional<Location> find_generate_block_member_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view label,
+    std::string_view member_name) {
+    if (label.empty() || member_name.empty())
+        return std::nullopt;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view label;
+        std::string_view member_name;
+        int depth{0};
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view label,
+                std::string_view member_name)
+            : sm(sm), uri(uri), label(label), member_name(member_name) {}
+
+        void handle(const slang::syntax::GenerateBlockSyntax& node) {
+            const auto* name_clause = node.beginName ? node.beginName : node.endName;
+            const bool matches = name_clause && name_clause->name.valueText() == label;
+            if (matches)
+                ++depth;
+            visitDefault(node);
+            if (matches)
+                --depth;
+        }
+
+        void handle(const slang::syntax::DeclaratorSyntax& node) {
+            if (result || depth == 0 || !node.name || node.name.valueText() != member_name)
+                return;
+            result = location_from_token_actual_uri(sm, uri, node.name);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, label, member_name);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
 static std::pair<int, int> source_range_lines_one_based(const slang::SourceManager& sm,
                                                         slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -2062,6 +2274,31 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
     Visitor visitor(tree.sourceManager(), uri, module_name, object_name, use_line_one_based);
     tree.root().visit(visitor);
     return visitor.result;
+}
+
+/// Declared type of `type_name.field_name` when `type_name` is a typedef'd
+/// struct or union.  The struct-shaped counterpart of
+/// find_class_field_type_in_hierarchy(); aggregates have no base type to walk.
+static std::optional<std::string> find_typedef_field_type(const SyntaxIndex& index,
+                                                          std::string_view type_name,
+                                                          std::string_view field_name) {
+    if (type_name.empty() || field_name.empty())
+        return std::nullopt;
+
+    for (const auto& td : index.typedefs) {
+        const std::string scoped_name =
+            td.parent_scope.empty() ? td.name : td.parent_scope + "::" + td.name;
+        if (td.name != type_name && scoped_name != type_name)
+            continue;
+        for (const auto& field : td.fields) {
+            if (field.name != field_name || field.type.empty())
+                continue;
+            auto type = canonical_type_name_from_text(field.type);
+            if (!type.empty())
+                return type;
+        }
+    }
+    return std::nullopt;
 }
 
 static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& index,
@@ -2280,6 +2517,23 @@ static bool class_derives_from(std::span<const ClassLookupShard> shards, std::st
         derived = std::move(next);
     }
     return false;
+}
+
+/// Class that @p class_name extends, searched across shards.
+///
+/// `super.member` names a member of the base class specifically.  Letting it
+/// resolve against the derived class instead is only invisible while the derived
+/// class does not redeclare the member -- `super.new()` always does.
+static std::optional<std::string> find_class_base_name(std::span<const ClassLookupShard> shards,
+                                                       std::string_view class_name) {
+    if (class_name.empty())
+        return std::nullopt;
+    for (const auto& shard : shards) {
+        const auto* cls = find_class_entry(*shard.index, class_name);
+        if (cls && !cls->base_class.empty())
+            return base_class_lookup_name(cls->base_class);
+    }
+    return std::nullopt;
 }
 
 // Declared type of `field_name` on `class_name` or any ancestor, searched
@@ -2601,7 +2855,11 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // DeclaratorSyntax, but hover must still reconstruct the field's
             // declaration type from StructUnionMemberSyntax::type plus any
             // declarator-local unpacked dimensions.
-            auto base_type = render_syntax_node_text(sm, *node.type);
+            //
+            // Rendered expanded: a struct declared inside a shared header's
+            // macro body would otherwise report every field's type as the macro
+            // invocation the user wrote, which is not a type at all.
+            auto base_type = render_syntax_node_text_expanded(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -2609,7 +2867,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 auto detail = base_type;
                 detail = append_hover_suffix(detail,
                                              render_hover_dimensions(sm, declarator->dimensions));
-                set_from_token(declarator->name, "variable", detail);
+                set_from_token(declarator->name, "field", detail);
             }
         }
 
@@ -2696,6 +2954,21 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // cursor named an owner, only that owner's copy may answer.
             if (owner.empty() || (!enclosing_class.empty() && enclosing_class.back() == owner))
                 set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
+
+            // An enum member's useful hover fact is the enum it belongs to, and
+            // that name lives on the typedef, not on the member.  Without this
+            // a member declared in the file being edited hovered as a bare
+            // "symbol" with no body at all.
+            if (!result) {
+                if (const auto* enum_type =
+                        node.type->as_if<slang::syntax::EnumTypeSyntax>()) {
+                    const std::string enum_name(node.name.valueText());
+                    for (const auto* member : enum_type->members) {
+                        if (member)
+                            set_from_token(member->name, "enum_member", enum_name);
+                    }
+                }
+            }
             if (!result)
                 visitDefault(node);
         }
@@ -2783,6 +3056,17 @@ struct DefinitionTarget {
     std::string module_name;
     std::string subroutine_name;
     std::string object_name;
+    // Whole dotted receiver written before `name`, outermost first.
+    //
+    //     csr_addr.csr_decode.priv_lvl   cursor on priv_lvl
+    //     -> {"csr_addr", "csr_decode"}
+    //
+    // `object_name` is the innermost element and stays the answer for the common
+    // one-hop case.  The rest is what a chain deeper than one dot needs: the
+    // innermost element alone is a field name, not something declared in the
+    // enclosing module, so resolution has to start from the outermost receiver
+    // and follow each field's type in turn.
+    std::vector<std::string> object_path;
     // Left-hand side of a `pkg::name` qualification, verbatim.  The visitor only
     // has the syntax tree, so it cannot know whether this really names a
     // package; definition_of_state() decides that against the index.
@@ -2834,6 +3118,49 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         if (!token_contains_position_in_uri(sm, token, uri, line, col))
             return false;
         return !(sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()));
+    }
+
+    /// Whole dotted receiver written before @p token, outermost first.
+    ///
+    /// Scanning back only one word stops at the second dot of `a.b.c`, which is
+    /// why a chain deeper than one hop used to resolve to nothing.
+    std::vector<std::string> receiver_chain_before_member_dot(
+        const slang::parsing::Token& token) const {
+        if (!token || !token.location().valid())
+            return {};
+        // Ask the question of the text the user actually typed; see the note in
+        // object_before_member_dot() about macro arguments.
+        auto loc = token.location();
+        if (sm.isMacroArgLoc(loc))
+            loc = sm.getFullyOriginalLoc(loc);
+        if (!loc.valid())
+            return {};
+        const auto source = sm.getSourceText(loc.buffer());
+        size_t i = loc.offset();
+        if (i > source.size())
+            return {};
+
+        // Bounded: a receiver deeper than this is not something the compact
+        // index can follow anyway, and the cap keeps the scan off the hot path.
+        constexpr size_t kMaxReceiverChain = 8;
+        std::vector<std::string> chain;
+        while (chain.size() < kMaxReceiverChain) {
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            if (i == 0 || source[i - 1] != '.')
+                break;
+            --i;
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            const size_t end = i;
+            while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
+                --i;
+            if (i == end)
+                break;
+            chain.emplace_back(source.substr(i, end - i));
+        }
+        std::reverse(chain.begin(), chain.end());
+        return chain;
     }
 
     std::string object_before_member_dot(const slang::parsing::Token& token) const {
@@ -3071,11 +3398,34 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
     }
 
+    /// Receiver identifiers of a member-access expression, outermost first.
+    ///
+    /// An element select is transparent here: every copy of a generate loop
+    /// shares one declaration, so `gen[0].u.sig` resolves like `gen.u.sig`.
+    static void collect_receiver_chain(const slang::syntax::ExpressionSyntax* expr,
+                                       std::vector<std::string>& out) {
+        if (!expr || out.size() > 8)
+            return;
+        if (const auto* ident = expr->as_if<slang::syntax::IdentifierNameSyntax>()) {
+            out.emplace_back(ident->identifier.valueText());
+            return;
+        }
+        if (const auto* member = expr->as_if<slang::syntax::MemberAccessExpressionSyntax>()) {
+            collect_receiver_chain(member->left, out);
+            out.emplace_back(member->name.valueText());
+            return;
+        }
+        if (const auto* select = expr->as_if<slang::syntax::ElementSelectExpressionSyntax>())
+            collect_receiver_chain(select->left, out);
+    }
+
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
         if (token_claims_cursor(node.name)) {
             target.kind = DefinitionTargetKind::ClassMember;
             target.name = std::string(node.name.valueText());
-            target.object_name = simple_identifier_from_expr(node.left);
+            collect_receiver_chain(node.left, target.object_path);
+            target.object_name =
+                target.object_path.empty() ? std::string{} : target.object_path.back();
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
@@ -3116,13 +3466,21 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
 
-        if (token.kind == slang::parsing::TokenKind::Identifier &&
+        // `new` is lexed as a keyword, not an identifier, so `super.new(...)`
+        // never reached the member-access branch and resolved to nothing --
+        // while `super.arm(...)` right next to it worked.  The constructor is
+        // indexed like any other method; only this classification was missing.
+        const bool is_member_name_token =
+            token.kind == slang::parsing::TokenKind::Identifier ||
+            token.kind == slang::parsing::TokenKind::NewKeyword;
+        if (is_member_name_token &&
             token_contains_position_in_uri(sm, token, uri, line, col)) {
-            const auto object_name = object_before_member_dot(token);
-            if (!object_name.empty()) {
+            auto object_path = receiver_chain_before_member_dot(token);
+            if (!object_path.empty()) {
                 target.kind = DefinitionTargetKind::ClassMember;
                 target.name = std::string(token.valueText());
-                target.object_name = object_name;
+                target.object_name = object_path.back();
+                target.object_path = std::move(object_path);
                 target.scope_module = current_module;
                 target.scope_package = current_package;
                 // The receiver of `obj.member` inside a class body is looked up
@@ -3131,6 +3489,10 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.scope_class = current_class;
                 return;
             }
+            // A bare `new` is an object creation, not a name the user can be
+            // asking about; only `receiver.new` is a member reference.
+            if (token.kind == slang::parsing::TokenKind::NewKeyword)
+                return;
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
@@ -3277,18 +3639,21 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
         if (index_entry_location_matches(idx, td.file_id, td.line, td.col, definition))
             return symbol_info_for_typedef_entry(td, td.name, definition);
         for (const auto& field : td.fields) {
+            // A struct or union member is a field, not a free-standing variable.
             if (index_entry_location_matches(idx, field.file_id, field.line, field.col, definition))
                 return SymbolInfo{.name = field.name,
-                                  .kind = "variable",
+                                  .kind = "field",
                                   .detail = field.type,
                                   .line = definition.line,
                                   .col = definition.col};
         }
         for (const auto& member : td.enum_members) {
+            // Naming the enum it belongs to is what makes this hover useful;
+            // "enum member" repeated the kind label and said nothing else.
             if (index_entry_location_matches(idx, member.file_id, member.line, member.col, definition))
                 return SymbolInfo{.name = member.name,
                                   .kind = "enum_member",
-                                  .detail = "enum member",
+                                  .detail = td.name.empty() ? std::string("enum member") : td.name,
                                   .line = definition.line,
                                   .col = definition.col};
         }
@@ -3456,6 +3821,8 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
     return std::nullopt;
 }
 
+static std::optional<Location> include_target_at(const DocumentState& state, int line);
+
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
     auto state = get_state(uri);
     if (!state || !state->tree)
@@ -3545,6 +3912,18 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};
     }
 
+    // `` `include "path" `` — the cursor sits inside a string literal, so
+    // nothing above resolved a symbol.  Report the file the directive actually
+    // pulled in, using the same already-resolved relation goto-definition uses.
+    if (auto included = include_target_at(*state, line)) {
+        const std::filesystem::path path = path_from_file_uri(included->uri);
+        return SymbolInfo{.name = path.filename().string(),
+                          .kind = "include",
+                          .detail = path.string(),
+                          .line = line,
+                          .col = col};
+    }
+
     return SymbolInfo{.name = ident, .kind = "unknown", .line = line, .col = col};
 }
 
@@ -3609,6 +3988,257 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
     return std::nullopt;
 }
 
+static std::optional<Location> include_target_at(const DocumentState& state, int line) {
+    // The path in `` `include "..." `` is a string literal, so the identifier
+    // lookup that drives every other definition target cannot see it.  Nothing
+    // needs to be re-resolved though: slang already found the file while
+    // parsing, and each included buffer records the source location of the
+    // directive that pulled it in.  Mapping the cursor line through that
+    // relation avoids re-running an include-path search and touches no
+    // filesystem.
+    if (!state.source_manager)
+        return std::nullopt;
+    const auto& sm = *state.source_manager;
+
+    // Anchor on this document's own buffer.  Other open buffers are injected
+    // into the same SourceManager through assignText(), so without this check
+    // an overlay's includes would be attributed to this file.
+    const std::string normalized_uri = uri_from_path(state.normalized_path);
+    slang::BufferID owning_buffer;
+    for (auto buffer : sm.getAllBuffers()) {
+        const auto& full_path = sm.getFullPath(buffer);
+        if (!full_path.empty() && uri_from_path(full_path) == normalized_uri) {
+            owning_buffer = buffer;
+            break;
+        }
+    }
+    if (!owning_buffer.valid())
+        return std::nullopt;
+
+    for (auto buffer : sm.getAllBuffers()) {
+        // Only directives written in this file.  A nested include's directive
+        // lives in the header that spells it, not here, so comparing the
+        // immediate parent is what keeps the cursor line meaningful.
+        const auto loc = sm.getIncludedFrom(buffer);
+        if (!loc.valid() || loc.buffer() != owning_buffer)
+            continue;
+        if (static_cast<int>(sm.getLineNumber(loc)) - 1 != line)
+            continue;
+
+        const auto& full_path = sm.getFullPath(buffer);
+        if (full_path.empty())
+            continue;
+        return Location{uri_from_path(full_path), 0, 0, 0, 0};
+    }
+    return std::nullopt;
+}
+
+// ── Hierarchical references (tb.u_dut.u_sub.sig) ─────────────────────────────
+//
+// The index already knows every instance and every module's signals; what was
+// missing is the walk between them.  Segments are resolved one at a time
+// against published index snapshots — no reparse, no project-wide merge — and
+// an unresolved segment ends the walk with no answer rather than a same-named
+// guess from an unrelated module.
+
+/// Dotted path the cursor sits in, e.g. {"tb","u_dut","g_lanes","u_sub","stage"}
+/// for a cursor anywhere in `tb.u_dut.g_lanes[0].u_sub.stage`.  Array indices are
+/// dropped; the clicked segment is the last one returned.
+static std::vector<std::string> hierarchical_path_at(const std::string& text, int line, int col,
+                                                     const IdentifierAtPosition& ident) {
+    size_t line_start = 0;
+    for (int i = 0; i < line; ++i) {
+        line_start = text.find('\n', line_start);
+        if (line_start == std::string::npos)
+            return {};
+        ++line_start;
+    }
+    size_t line_end = text.find('\n', line_start);
+    if (line_end == std::string::npos)
+        line_end = text.size();
+    const std::string_view src(text.data() + line_start, line_end - line_start);
+    (void)col;
+
+    const auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    };
+
+    std::vector<std::string> segments{ident.name};
+    size_t i = (size_t)ident.col;
+    while (i > 0) {
+        size_t j = i;
+        while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+            --j;
+        if (j == 0 || src[j - 1] != '.')
+            break;
+        --j; // consume the dot
+        while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+            --j;
+        // An optional array index on the preceding segment: g_lanes[0].
+        if (j > 0 && src[j - 1] == ']') {
+            const size_t close = j - 1;
+            size_t open = close;
+            while (open > 0 && src[open - 1] != '[')
+                --open;
+            if (open == 0)
+                break;
+            j = open - 1;
+            while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))
+                --j;
+        }
+        const size_t word_end = j;
+        while (j > 0 && is_word(src[j - 1]))
+            --j;
+        if (j == word_end)
+            break;
+        segments.insert(segments.begin(), std::string(src.substr(j, word_end - j)));
+        i = j;
+    }
+    return segments;
+}
+
+/// A module declaration found in an index, together with the index that holds it.
+struct HierarchyModule {
+    const SyntaxIndex* index{nullptr};
+    std::string shard_uri;
+    const ModuleEntry* entry{nullptr};
+};
+
+static std::optional<Location> hierarchy_location(const SyntaxIndex& index,
+                                                  const std::string& shard_uri,
+                                                  SourceFileID file_id, int line_one_based,
+                                                  int col, int name_length) {
+    if (line_one_based <= 0)
+        return std::nullopt;
+    const auto file_uri = index.source_uri(file_id);
+    const int lsp_line = to_lsp_line(line_one_based);
+    return Location{file_uri.empty() ? shard_uri : file_uri, lsp_line, col, lsp_line,
+                    col + name_length};
+}
+
+std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& state,
+                                                          const std::string& uri, int line,
+                                                          int col) const {
+    auto ident = identifier_at(uri, line, col);
+    if (!ident || ident->name.empty())
+        return std::nullopt;
+    auto segments = hierarchical_path_at(state.text, line, col, *ident);
+    if (segments.size() < 2)
+        return std::nullopt;
+
+    // Snapshots this walk resolves against: open buffers first (an open file is
+    // authoritative for its own declarations), then the published project index.
+    std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
+    for_each_state([&](const std::string& state_uri,
+                       const std::shared_ptr<const DocumentState>& doc) {
+        if (doc && doc->tree)
+            open_states.emplace_back(state_uri, doc);
+    });
+    auto project = project_index_snapshot();
+
+    const auto find_module = [&](const std::string& name) -> std::optional<HierarchyModule> {
+        for (const auto& [state_uri, doc] : open_states) {
+            const auto& index = get_structural_index(*doc);
+            const auto it = index.module_by_name.find(name);
+            if (it != index.module_by_name.end())
+                return HierarchyModule{&index, state_uri, &index.modules[it->second]};
+        }
+        if (project) {
+            const auto it = project->module_by_name.find(name);
+            if (it != project->module_by_name.end() && it->second.shard) {
+                const auto& index = *it->second.shard;
+                // The shard's URI is the file it was built from; entries carry
+                // their own file_id for `include`d declarations.
+                std::string shard_uri;
+                for (const auto& shard : project->shards)
+                    if (shard.index == it->second.shard) {
+                        shard_uri = shard.uri;
+                        break;
+                    }
+                return HierarchyModule{&index, shard_uri, &index.modules[it->second.module_index]};
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto find_instance = [&](const HierarchyModule& owner,
+                                   const std::string& name) -> const InstanceEntry* {
+        for (const auto& inst : owner.index->instances)
+            if (inst.parent_module == owner.entry->name && inst.instance_name == name)
+                return &inst;
+        return nullptr;
+    };
+
+    // First segment: the enclosing module itself, an instance in it, or a module
+    // named directly.
+    std::optional<HierarchyModule> current;
+    size_t next = 1;
+    if (auto module = find_module(segments[0])) {
+        current = std::move(module);
+    } else {
+        // `u_dut.sig` written inside the testbench: resolve the instance against
+        // whichever module in this document declares it.
+        const auto& own_index = get_structural_index(state);
+        for (const auto& inst : own_index.instances) {
+            if (inst.instance_name != segments[0])
+                continue;
+            current = find_module(inst.module_name);
+            break;
+        }
+        if (!current && segments.size() > 2) {
+            // `g_lanes[0].u_leaf.sig`: the first segment is a generate block
+            // label.  A generate block is not a module and not an instance, and
+            // instances written inside one are filed under the enclosing module,
+            // so the label can be skipped — but only once the next segment is
+            // confirmed to be an instance, so an unknown name cannot silently
+            // disappear.  Same rule the middle of the walk already applies.
+            for (const auto& inst : own_index.instances) {
+                if (inst.instance_name != segments[1])
+                    continue;
+                current = find_module(inst.module_name);
+                next = 2;
+                break;
+            }
+        }
+        if (!current)
+            return std::nullopt;
+    }
+
+    for (; next + 1 < segments.size(); ++next) {
+        const auto* inst = find_instance(*current, segments[next]);
+        if (!inst) {
+            // A named generate block sits in the path but is not an instance —
+            // the index records instances inside a generate under the enclosing
+            // module.  Skip the segment only when the next one really is an
+            // instance of the module reached so far, so an unknown name cannot
+            // silently disappear.
+            if (next + 2 < segments.size() && find_instance(*current, segments[next + 1]))
+                continue;
+            return std::nullopt;
+        }
+        auto target = find_module(inst->module_name);
+        if (!target)
+            return std::nullopt;
+        current = std::move(target);
+    }
+
+    // Last segment: a port, a value or an instance of the module reached.
+    const auto& leaf = segments.back();
+    const auto name_length = (int)leaf.size();
+    for (const auto& port : current->entry->ports)
+        if (port.name == leaf)
+            return hierarchy_location(*current->index, current->shard_uri, port.file_id, port.line,
+                                      port.col, name_length);
+    for (const auto& value : current->index->values)
+        if (value.name == leaf && value.parent_scope == current->entry->name)
+            return hierarchy_location(*current->index, current->shard_uri, value.file_id,
+                                      value.line, value.col, name_length);
+    if (const auto* inst = find_instance(*current, leaf))
+        return hierarchy_location(*current->index, current->shard_uri, inst->file_id, inst->line,
+                                  0, name_length);
+    return std::nullopt;
+}
+
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
     const auto start = Clock::now();
     auto state = get_state(uri);
@@ -3621,6 +4251,14 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     // O(1) instead of copying and erase/removing a potentially large filelist
     // vector on every goto-definition request.
     auto result = definition_of_state(*state, uri, line, col, *extra, &uri);
+    // Miss path only: an `include directive resolves no identifier, and every
+    // successful definition keeps its current cost.
+    if (!result)
+        result = include_target_at(*state, line);
+    // Miss path only: a hierarchical path costs nothing until every other
+    // resolution has already failed.
+    if (!result)
+        result = hierarchical_definition(*state, uri, line, col);
     log_perf("definition_of " + uri + ":" + std::to_string(line) + ":" + std::to_string(col),
              start);
     return result;
@@ -3812,27 +4450,65 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         //
         // jumps to `class Packet::req_data`, not to an unrelated unit-level
         // `task req_data`.
-        auto class_type = class_type_for_object_reference(current_index, target.scope_module,
-                                                          target.object_name, use_line_one_based);
+        // Resolution starts at the outermost receiver.  For `a.b.c` that is `a`;
+        // `b` is a field of `a`'s type, not a declaration the module has.
+        const std::string& base_receiver =
+            target.object_path.empty() ? target.object_name : target.object_path.front();
+
+        // `super` and `this` are not declarations to look up; they name the base
+        // class and the enclosing class directly.  Resolving `super` explicitly
+        // matters for a member the derived class also declares -- a constructor
+        // always is one, which is why `super.arm()` worked and `super.new()`
+        // answered with the derived class's own `new`.
+        std::optional<std::string> class_type;
+        if (!target.scope_class.empty()) {
+            if (base_receiver == "super")
+                class_type = find_class_base_name(class_lookup_shards(), target.scope_class);
+            else if (base_receiver == "this")
+                class_type = target.scope_class;
+        }
+        if (!class_type)
+            class_type = class_type_for_object_reference(current_index, target.scope_module,
+                                                          base_receiver, use_line_one_based);
         if (!class_type) {
             class_type = class_type_for_object_reference_in_tree(
-                *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
+                *state.tree, uri, target.scope_module, base_receiver, use_line_one_based);
         }
         // Inside a class body the enclosing scope is the class, not a module,
         // and the receiver may be a property, a method local, an argument, or a
         // field the class only inherits.
         if (!class_type && !target.scope_class.empty()) {
             class_type = class_type_for_object_reference(current_index, target.scope_class,
-                                                         target.object_name, use_line_one_based);
+                                                         base_receiver, use_line_one_based);
             if (!class_type) {
                 class_type = class_type_for_object_reference_in_tree(
-                    *state.tree, uri, target.scope_class, target.object_name, use_line_one_based);
+                    *state.tree, uri, target.scope_class, base_receiver, use_line_one_based);
             }
             if (!class_type) {
-                class_type = find_class_field_type_in_hierarchy(
-                    class_lookup_shards(), target.scope_class, target.object_name);
+                class_type = find_class_field_type_in_hierarchy(class_lookup_shards(),
+                                                                target.scope_class, base_receiver);
             }
         }
+
+        // Follow the rest of the chain one field at a time: the type of `a.b` is
+        // the type of field `b` inside `a`'s type.  Bounded by the number of
+        // dots the user actually typed, and every step is a lookup in an index
+        // already held for this request.
+        for (size_t i = 1; class_type && i < target.object_path.size(); ++i) {
+            const auto shards = class_lookup_shards();
+            auto next = find_class_field_type_in_hierarchy(shards, *class_type,
+                                                           target.object_path[i]);
+            if (!next) {
+                for (const auto& shard : shards) {
+                    next = find_typedef_field_type(*shard.index, *class_type,
+                                                   target.object_path[i]);
+                    if (next)
+                        break;
+                }
+            }
+            class_type = std::move(next);
+        }
+
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
             // Search both compact index families so `obj.field` works for
@@ -3851,6 +4527,39 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                     return loc;
             }
         }
+
+        // Interface ports.  `AXI_BUS.Slave bus;` then `bus.aw_valid` — the
+        // receiver's declared type names an interface, and the member is one of
+        // that interface's signals.  Also covers a cursor on the modport of
+        // `AXI_BUS.Slave`, where the receiver is the interface name itself.
+        if (target.object_path.size() <= 1) {
+            std::string interface_name;
+            if (auto type_text = declared_type_text_for_object_reference(
+                    current_index, target.scope_module, base_receiver, use_line_one_based))
+                interface_name = interface_name_from_type_text(*type_text);
+            if (interface_name.empty())
+                interface_name = base_receiver;
+
+            if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
+                                                            target.name))
+                return loc;
+            for (const auto& extra : extra_files) {
+                if (skip_extra(extra))
+                    continue;
+                if (auto loc = find_interface_member_definition(extra.index_ref(), extra.uri,
+                                                                interface_name, target.name))
+                    return loc;
+            }
+        }
+
+        // `gen_stall_mem.rf_rd_a_hz` — the receiver is a generate block label,
+        // not a value, so nothing above can explain it.
+        if (state.tree && !target.object_path.empty()) {
+            if (auto loc = find_generate_block_member_in_tree(*state.tree, uri,
+                                                              target.object_path.back(),
+                                                              target.name))
+                return loc;
+        }
     }
 
     std::vector<ImportEntry> visible_imports;
@@ -3861,6 +4570,15 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                            target.scope_package, visible_imports,
                                            use_line_one_based))
         return loc;
+
+    // The receiver half of a hierarchical reference: in `u_leaf.state_q` the
+    // cursor on `u_leaf` is a plain identifier that matches no declarator, so it
+    // used to resolve to nothing even though `state_q` resolved fine.
+    if (target.kind == DefinitionTargetKind::Generic) {
+        if (auto loc = find_instance_definition(current_index, uri, target.scope_module,
+                                                target.name))
+            return loc;
+    }
 
     // An unqualified name inside a class body that the current file cannot
     // explain may be an inherited member:
@@ -4023,8 +4741,15 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // merged by references/rename.
         auto current_structural_index = get_structural_index(*state);
         Location clicked_loc{uri, target->line, target->col, target->line, target->end_col};
-        if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc))
-            target_symbol_debug = *id;
+        if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc)) {
+            // `scoped_member::P::N` is what a shard records for `P::N` when it
+            // never parsed P.  It names the use site, not the declaration, so
+            // adopting it here would make a search started from a qualified use
+            // miss the declaration itself.  Leave it to the alias below and let
+            // the declaration's own shard supply the authoritative identity.
+            if (!id->starts_with("scoped_member::"))
+                target_symbol_debug = *id;
+        }
 
         // If the cursor was on a declaration or on a syntactic generic token
         // such as a hierarchy type, recover the project-index SymbolID from the
@@ -4144,6 +4869,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     }
     const SymbolID import_bridge_name_id =
         target_package.empty() ? SymbolID{} : SymbolID::from_canonical("name:" + target->name);
+
+    // A file that writes `common_pkg::foo` instead of importing states the
+    // owning package at the use site, so its shard records
+    // `scoped_member::common_pkg::foo` without having parsed the package.  The
+    // spelling is deliberately kind-neutral: the referencing shard cannot tell
+    // a parameter from a typedef, a function or an enum member, and all four
+    // reach it the same way.  Matching on scope and name is what makes one
+    // alias cover them, and it stays additive -- a shard that did parse the
+    // package still emits the precise `package_value::` identity, which
+    // target_symbol_id already matches.
+    const SymbolID scoped_member_alias_id =
+        target_package.empty()
+            ? SymbolID{}
+            : SymbolID::from_canonical("scoped_member::" + target_package + "::" + target->name);
 
     // `handle.member` in another file is recorded under the receiver's bare
     // type name and a kind-neutral `class_member::` prefix, because that shard
@@ -4265,6 +5004,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return true;
         if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
             imports_target_package(imports))
+            return true;
+        if (scoped_member_alias_id && ref.symbol_id == scoped_member_alias_id)
             return true;
         if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
             admits_class_member_alias(imports))
@@ -4435,7 +5176,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (open_uris.contains(extra.uri))
             continue;
         if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
-            !import_bridge_name_id)
+            !import_bridge_name_id && !scoped_member_alias_id)
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference

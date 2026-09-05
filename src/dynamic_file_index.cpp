@@ -146,6 +146,14 @@ std::string port_type(const slang::SourceManager& sm, const PortHeaderSyntax& he
         return node_text_raw(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
         return node_text_raw(sm, *net->dataType);
+    // `AXI_BUS.Slave bus`: mirrors type_of() in syntax_index.cpp so an open
+    // buffer records the same interface port type a closed shard does.
+    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>()) {
+        std::string text = token_value_text(iface->nameOrKeyword);
+        if (iface->modport && iface->modport->member)
+            text += "." + token_value_text(iface->modport->member);
+        return text;
+    }
     return {};
 }
 
@@ -309,10 +317,22 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     if (cls.extendsClause)
         entry.base_class = node_text_raw(sm, *cls.extendsClause->baseName);
 
+    // A class declared inside another class body, collected first so the outer
+    // entry's own index is not shifted by the nested ones.
+    std::vector<const ClassDeclarationSyntax*> nested_classes;
+
     for (const auto* item : cls.items) {
         if (!item)
             continue;
+        if (const auto* nested = item->as_if<ClassDeclarationSyntax>()) {
+            nested_classes.push_back(nested);
+            continue;
+        }
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+            if (const auto* inner = prop->declaration->as_if<ClassDeclarationSyntax>()) {
+                nested_classes.push_back(inner);
+                continue;
+            }
             // `typedef registry #(T) type_id;` in a class body is a member of
             // that class, reached as `my_item::type_id`.  The shard builder
             // indexes these; the open-buffer index has to as well, or the same
@@ -340,24 +360,50 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // that identifier's own token, or the open-buffer index disagrees with
             // the shard index for the same file.
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             entry.methods.push_back(MethodEntry{.name = id_name
                                                     ? std::string(id_name->identifier.valueText())
                                                     : node_text_raw(sm, *proto.name),
                                                 .return_type = node_text_raw(sm, *proto.returnType),
+                                                .params = proto.portList
+                                                              ? trim_copy(proto.portList->toString())
+                                                              : std::string{},
                                                 .is_task = method->declaration->kind ==
                                                            SyntaxKind::TaskDeclaration,
                                                 .file_id = resolver.for_declaration_token(index, sm, name_tok),
                                                 .line = ml,
                                                 .col = mc});
+        } else if (const auto* proto_item = item->as_if<ClassMethodPrototypeSyntax>()) {
+            // `extern function void bump(...);` declares a member too.  The shard
+            // builder indexes these (see process_class in syntax_index.cpp); the
+            // open-buffer index has to as well, or a class written in the extern
+            // style loses every method the moment its file is opened.
+            const auto& proto = *proto_item->prototype;
+            const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
+            const auto name_tok = subroutine_name_token(proto);
+            auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
+            entry.methods.push_back(
+                MethodEntry{.name = id_name ? std::string(id_name->identifier.valueText())
+                                            : node_text_raw(sm, *proto.name),
+                            .return_type = node_text_raw(sm, *proto.returnType),
+                            .params = proto.portList ? trim_copy(proto.portList->toString())
+                                                     : std::string{},
+                            .is_task = proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword,
+                            .file_id = resolver.for_declaration_token(index, sm, name_tok),
+                            .line = ml,
+                            .col = mc});
         }
     }
     if (!entry.parent_scope.empty() && index.package_names.count(entry.parent_scope))
         index.package_class_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
+    const std::string own_name = entry.name;
     index.classes.push_back(std::move(entry));
+
+    for (const auto* nested : nested_classes)
+        process_class(*nested, index, resolver, sm, own_name);
 }
 
 void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
@@ -388,7 +434,8 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const auto type = node_text_raw(sm, *member->type);
+            // Expanded on purpose; see the same call in syntax_index.cpp.
+            const auto type = render_syntax_node_text_expanded(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;
@@ -430,6 +477,20 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
 
     if (node.header->parameters) {
         for (const auto* base : node.header->parameters->declarations) {
+            // `parameter type foo_t = ...` is a separate syntax node; without
+            // this branch it never reaches the open-buffer index either.
+            if (const auto* type_param =
+                    base ? base->as_if<TypeParameterDeclarationSyntax>() : nullptr) {
+                const std::string direction = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    add_port(module, index, resolver, sm, decl->name, direction, "type", "type", {},
+                             decl->assignment ? node_text_raw(sm, *decl->assignment->type)
+                                              : std::string{});
+                }
+                continue;
+            }
             const auto* param = base ? base->as_if<ParameterDeclarationSyntax>() : nullptr;
             if (!param)
                 continue;
@@ -623,7 +684,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
             // disk-backed one.
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             const auto name = id_name ? std::string(id_name->identifier.valueText())
                                       : node_text_raw(sm, *proto.name);
             auto [nl, nc] = token_pos_line1_col0(sm, name_tok);

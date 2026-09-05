@@ -1,5 +1,7 @@
 #include "analyzer.hpp"
 #include "features/autofunc.hpp"
+#include "features/autowire.hpp"
+#include "dynamic_file_index.hpp"
 #include "features/autoinst.hpp"
 #include "features/code_action.hpp"
 #include "features/hover.hpp"
@@ -765,14 +767,15 @@ endmodule
     auto struct_addr_hover = hover_on("struct_addr");
     REQUIRE(struct_addr_hover.has_value());
     REQUIRE(struct_addr_hover->contents.second.has_value());
+    // A struct member is a field, not a free-standing variable.
     CHECK(struct_addr_hover->contents.second->value ==
-          "**struct_addr** — *variable*\n\n---\n\n```\nlogic [7:0]\n```");
+          "**struct_addr** — *field*\n\n---\n\n```\nlogic [7:0]\n```");
 
     auto valid_hover = hover_on("valid");
     REQUIRE(valid_hover.has_value());
     REQUIRE(valid_hover->contents.second.has_value());
     CHECK(valid_hover->contents.second->value ==
-          "**valid** — *variable*\n\n---\n\n```\nlogic\n```");
+          "**valid** — *field*\n\n---\n\n```\nlogic\n```");
 
     auto data_hover = hover_on("data;");
     REQUIRE(data_hover.has_value());
@@ -1071,13 +1074,15 @@ endclass
     params.query = "p";
     auto symbols = provide_workspace_symbols(analyzer, params);
 
+    // Ranked, not in index order: a name starting with the query beats one that
+    // merely contains it, and a package outranks a class on equal footing.
     REQUIRE(symbols.size() == 3);
-    CHECK(symbols[0].name == "alpha");
-    CHECK(symbols[0].kind == lsSymbolKind::Module);
-    CHECK(symbols[1].name == "pkt_pkg");
-    CHECK(symbols[1].kind == lsSymbolKind::Package);
-    CHECK(symbols[2].name == "packet_class");
-    CHECK(symbols[2].kind == lsSymbolKind::Class);
+    CHECK(symbols[0].name == "pkt_pkg");
+    CHECK(symbols[0].kind == lsSymbolKind::Package);
+    CHECK(symbols[1].name == "packet_class");
+    CHECK(symbols[1].kind == lsSymbolKind::Class);
+    CHECK(symbols[2].name == "alpha");
+    CHECK(symbols[2].kind == lsSymbolKind::Module);
 
     std::filesystem::remove(path);
 }
@@ -1642,4 +1647,482 @@ endclass
     REQUIRE(hover->contents.second.has_value());
     CHECK(hover->contents.second->value ==
           "**type_id** — *typedef*\n\n---\n\n```\nregistry#(c, \"c\")\n```");
+}
+
+// AutoInst regenerated the instance header from module + instance name alone,
+// so an existing `#(...)` override was deleted and the module silently fell back
+// to its default parameter values.
+TEST_CASE("autoinst: preserves an existing parameter override", "[autoinst]") {
+    const auto module_path =
+        std::filesystem::temp_directory_path() / "lazyverilog_autoinst_keep_param_mem.sv";
+    {
+        std::ofstream out(module_path);
+        out << R"SV(module memory #(parameter int WIDTH = 8) (
+    input  logic             i_clk,
+    input  logic [WIDTH-1:0] i_data,
+    output logic [WIDTH-1:0] o_data
+);
+endmodule
+)SV";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({module_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_autoinst_keep_param_top.sv";
+
+    SECTION("single line") {
+        const std::string top = R"SV(module top;
+    memory #(.WIDTH(16)) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find("#(.WIDTH(16))") != std::string::npos);
+        CHECK(formatted.find("u_mem") != std::string::npos);
+        CHECK(formatted.find(".i_clk") != std::string::npos);
+    }
+
+    SECTION("positional") {
+        const std::string top = R"SV(module top;
+    memory #(16) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find("#(16)") != std::string::npos);
+    }
+
+    SECTION("multi line") {
+        const std::string top = R"SV(module top;
+    memory #(
+        .WIDTH(16)
+    ) u_mem (.i_clk(i_clk));
+endmodule
+)SV";
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 12, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        const auto formatted = format_autoinst(*result, top, AutoinstOptions{});
+        CHECK(formatted.find(".WIDTH(16)") != std::string::npos);
+    }
+
+    std::filesystem::remove(module_path);
+}
+
+TEST_CASE("workspace symbols: class methods are searchable", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_methods.sv";
+    {
+        std::ofstream out(path);
+        out << "package p;\n"
+               "    class base_c;\n"
+               "        extern function void bump(int amount);\n"
+               "        task drive();\n"
+               "        endtask\n"
+               "    endclass\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "bump";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    REQUIRE(symbols.size() == 1);
+    CHECK(symbols[0].name == "bump");
+    CHECK(symbols[0].kind == lsSymbolKind::Function);
+    REQUIRE(symbols[0].containerName.has_value());
+    CHECK(*symbols[0].containerName == "base_c");
+
+    params.query = "drive";
+    symbols = provide_workspace_symbols(analyzer, params);
+    REQUIRE(symbols.size() == 1);
+    CHECK(symbols[0].kind == lsSymbolKind::Method);
+
+    std::filesystem::remove(path);
+}
+
+// `handle.method(` — the form that dominates UVM code — was mistaken for a named
+// port connection (`.port(sig)`) by the backwards text scan, so the callee was
+// never resolved and the popup stayed empty.
+TEST_CASE("signature help: a method called through an object handle", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/signature_handle_method.sv";
+    analyzer.open(uri, R"(package p;
+    class base_c;
+        int unsigned tag;
+        extern function void bump(int amount, int scale);
+        function void drive(int lane);
+        endfunction
+    endclass
+    function void base_c::bump(int amount, int scale);
+    endfunction
+endpackage
+
+module top;
+    initial begin
+        p::base_c obj = new();
+        obj.drive();
+        obj.bump();
+    end
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+
+    // Inside `obj.drive(`.
+    params.position = lsPosition(14, 18);
+    auto drive = provide_signature_help(analyzer, params);
+    REQUIRE(drive.has_value());
+    REQUIRE(drive->signatures.size() == 1);
+    CHECK(drive->signatures[0].label == "drive(int lane)");
+
+    // Inside `obj.bump(` — declared as an extern prototype.
+    params.position = lsPosition(15, 17);
+    auto bump = provide_signature_help(analyzer, params);
+    REQUIRE(bump.has_value());
+    REQUIRE(bump->signatures.size() == 1);
+    CHECK(bump->signatures[0].label == "bump(int amount, int scale)");
+}
+
+// A project-wide query can match thousands of declarations; the response has to
+// be both bounded and ordered, or the client renders whichever shard happened to
+// be walked first and the exact hit is nowhere near the top.
+TEST_CASE("workspace symbols: the response is ranked and capped", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_cap.sv";
+    {
+        std::ofstream out(path);
+        for (int i = 0; i < 150; ++i)
+            out << "module lane_unit_" << i << ";\nendmodule\n";
+        out << "module lane;\nendmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "lane";
+    auto symbols = provide_workspace_symbols(analyzer, params);
+
+    CHECK(symbols.size() == 100);
+    // The exact match leads, ahead of the 150 names that merely start with it.
+    CHECK(symbols[0].name == "lane");
+
+    std::filesystem::remove(path);
+}
+
+// `base_c::bump` names one method of one class.  Without the scope half of the
+// query, every same-named member of every other class comes back too.
+TEST_CASE("workspace symbols: a qualified query filters by container", "[workspace]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_wssym_scope.sv";
+    {
+        std::ofstream out(path);
+        out << "package p;\n"
+               "    class base_c;\n"
+               "        function void bump(int amount);\n"
+               "        endfunction\n"
+               "    endclass\n"
+               "    class other_c;\n"
+               "        function void bump(int amount);\n"
+               "        endfunction\n"
+               "    endclass\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    WorkspaceSymbolParams params;
+    params.query = "bump";
+    CHECK(provide_workspace_symbols(analyzer, params).size() == 2);
+
+    params.query = "base_c::bump";
+    auto scoped = provide_workspace_symbols(analyzer, params);
+    REQUIRE(scoped.size() == 1);
+    REQUIRE(scoped[0].containerName.has_value());
+    CHECK(*scoped[0].containerName == "base_c");
+
+    std::filesystem::remove(path);
+}
+
+// A method declared in a file the editor never opened has no AST anywhere, so
+// its formals have to come from the shard that indexed it.
+TEST_CASE("signature help: a method declared in a closed project file", "[signature]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_sighelp_closed.sv";
+    {
+        std::ofstream out(path);
+        out << "package sig_pkg;\n"
+               "    class base_c;\n"
+               "        extern function void bump(int amount, int scale);\n"
+               "    endclass\n"
+               "    function void base_c::bump(int amount, int scale);\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/signature_closed_caller.sv";
+    analyzer.open(uri, R"(module top;
+    initial begin
+        sig_pkg::base_c obj = new();
+        obj.bump();
+    end
+endmodule
+)");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 17);
+    auto help = provide_signature_help(analyzer, params);
+
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "bump(int amount, int scale)");
+
+    std::filesystem::remove(path);
+}
+
+
+// AutoWire inserts module-level declarations, so its insertion anchor must be a
+// module-level declaration.  It used to take the last declaration found anywhere
+// in the module, so a subroutine local placed the new nets inside the function
+// body -- where they are function locals and the instance ports stay undeclared.
+TEST_CASE("autowire: insertion anchor ignores declarations nested in a subroutine",
+          "[autowire]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_autowire_nested_anchor.sv";
+    const std::string text = "module top;\n"
+                             "  logic [7:0] count;\n"
+                             "  function automatic logic [7:0] f(input logic [7:0] a);\n"
+                             "    logic [7:0] tmp;\n"
+                             "    tmp = a + 8'd1;\n"
+                             "    return tmp;\n"
+                             "  endfunction\n"
+                             "  assign count = f(8'h0);\n"
+                             "  sub u_sub (.o_data(net_y));\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state);
+    AutowireOptions options;
+    const auto applied = autowire_apply(*state, get_structural_index(*state), options, 8);
+
+    const auto decl = applied.find("net_y;");
+    REQUIRE(decl != std::string::npos);
+    const auto function_start = applied.find("function automatic");
+    REQUIRE(function_start != std::string::npos);
+    // The declaration must land above the subroutine, not inside its body.
+    CHECK(decl < function_start);
+}
+
+// The scoped-call path looks a declaration up by location, then read it back
+// through MethodEntry -- which only class methods have.  A package free function
+// in a closed file therefore produced no signatures at all, while the very same
+// function called unqualified through an import worked.
+TEST_CASE("signature help: package-qualified call to a closed-file function", "[signature]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_sig_pkg_scoped.sv";
+    {
+        std::ofstream out(path);
+        out << "package math_pkg;\n"
+               "    function automatic int add2(input int a, input int b);\n"
+               "        return a + b;\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_sig_pkg_scoped_caller.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    int r;\n"
+                       "    initial r = math_pkg::add2(1, 2);\n"
+                       "endmodule\n");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(2, 31);
+    auto help = provide_signature_help(analyzer, params);
+
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label == "function int add2(input int a, input int b)");
+
+    std::filesystem::remove(path);
+}
+
+// Project-wide symbol search indexed modules, classes and class methods only, so
+// a package helper function or a typedef could not be found at all -- while a
+// UVM method right next to it could.
+TEST_CASE("workspace symbols: package subroutines and typedefs are searchable",
+          "[workspace_symbols]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_ws_pkg_symbols.sv";
+    {
+        std::ofstream out(path);
+        out << "package shape_pkg;\n"
+               "    typedef struct packed { logic v; } outer_t;\n"
+               "    typedef enum logic { MODE_IDLE } mode_e;\n"
+               "    function automatic int clog2_ceil(input int v);\n"
+               "        return v;\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto query = [&](const std::string& text) {
+        WorkspaceSymbolParams params;
+        params.query = text;
+        return provide_workspace_symbols(analyzer, params);
+    };
+
+    SECTION("a package function is found") {
+        const auto symbols = query("clog2_ceil");
+        REQUIRE(symbols.size() == 1);
+        CHECK(symbols[0].name == "clog2_ceil");
+    }
+
+    SECTION("a struct typedef is found") {
+        const auto symbols = query("outer_t");
+        REQUIRE(symbols.size() == 1);
+        CHECK(symbols[0].name == "outer_t");
+    }
+
+    SECTION("an empty query still lists only the navigation-level declarations") {
+        const auto symbols = query("");
+        for (const auto& symbol : symbols)
+            CHECK(symbol.name == "shape_pkg");
+    }
+
+    std::filesystem::remove(path);
+}
+
+// Hover reported facts it had but rendered wrongly: a struct member declared
+// inside a shared header's macro body showed the whole macro invocation as its
+// "type", and an enum member showed nothing but the word "enum member".
+TEST_CASE("hover: macro-generated field type and enum member type", "[hover]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_hover_macro_field";
+    std::filesystem::create_directories(dir);
+    const auto header = dir / "defs.svh";
+    {
+        std::ofstream out(header);
+        out << "`define declare_cfg_bus_s(pfx)   \\\n"
+               "    typedef struct packed {      \\\n"
+               "        mode_e     pfx``_mode;   \\\n"
+               "        logic [1:0] pfx``_id;    \\\n"
+               "    } cfg_bus_s\n";
+    }
+    const std::string text = "`include \"defs.svh\"\n"
+                             "module top;\n"
+                             "    typedef enum logic [1:0] { MODE_IDLE, MODE_RUN } mode_e;\n"
+                             "    `declare_cfg_bus_s(icache);\n"
+                             "    cfg_bus_s bus;\n"
+                             "    logic hit;\n"
+                             "    assign hit = (bus.icache_mode == MODE_RUN);\n"
+                             "endmodule\n";
+    const auto source = dir / "top.sv";
+    {
+        std::ofstream out(source);
+        out << text;
+    }
+
+    Analyzer analyzer;
+    const std::string uri = uri_from_path(source);
+    analyzer.open(uri, text);
+
+    const auto hover_at = [&](int line, int character) {
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(line, character);
+        return provide_hover(analyzer, params);
+    };
+
+    SECTION("a macro-generated field shows its own type, not the macro call") {
+        auto hover = hover_at(6, 26);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        const auto& value = hover->contents.second->value;
+        CHECK(value.find("mode_e") != std::string::npos);
+        CHECK(value.find("`declare_cfg_bus_s") == std::string::npos);
+        CHECK(value.find("*field*") != std::string::npos);
+    }
+
+    SECTION("an enum member names the enum it belongs to") {
+        auto hover = hover_at(6, 42);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        CHECK(hover->contents.second->value.find("mode_e") != std::string::npos);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// The emitted instance is formatted as an isolated snippet, so the formatter
+// re-indented it from column 0 and the instantiation came out flush left no
+// matter how the original was indented.
+TEST_CASE("autoinst: expansion keeps the original indentation", "[autoinst]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_autoinst_indent_leaf.sv";
+    {
+        std::ofstream out(path);
+        out << "module indent_leaf (\n"
+               "    input  logic clk_i,\n"
+               "    output logic d_o\n"
+               ");\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_autoinst_indent_top.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    indent_leaf u_leaf ();\n"
+                       "endmodule\n");
+
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.range.start = lsPosition(1, 0);
+    params.range.end = lsPosition(1, 0);
+    const auto actions = provide_code_actions(analyzer, Config{}, params);
+
+    const CodeAction* autoinst = nullptr;
+    for (const auto& action : actions)
+        if (action.title.rfind("AutoInst", 0) == 0)
+            autoinst = &action;
+    REQUIRE(autoinst != nullptr);
+    REQUIRE(autoinst->edit.has_value());
+    REQUIRE(autoinst->edit->changes.has_value());
+    const auto& edits = autoinst->edit->changes->begin()->second;
+    REQUIRE(edits.size() == 1);
+    CHECK(edits[0].newText.rfind("    indent_leaf", 0) == 0);
+
+    std::filesystem::remove(path);
 }

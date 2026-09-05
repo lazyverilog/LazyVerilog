@@ -134,3 +134,89 @@ endmodule
     CHECK(edits[1].range.start.line == 4);  // body usage
     CHECK(edits[2].range.start.line == 9);  // .i_data named connection
 }
+
+// Renaming a module-level signal used to rewrite a same-named declaration inside
+// a generate block — a different signal — and its uses, silently rewiring the
+// block.
+TEST_CASE("rename: a module-level signal does not rewrite a generate-block declaration",
+          "[rename]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_generate_shadow.sv";
+    analyzer.open(uri, R"(module top;
+  logic [7:0] dout;
+  assign dout = 8'h0;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)");
+
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(1, 14); // module-level declaration
+    params.newName = "dout_o";
+
+    auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    const auto& edits = edit.changes->at(uri);
+    CHECK(edits.size() == 2);
+    for (const auto& e : edits)
+        CHECK(e.range.start.line < 7);
+}
+
+// `MK_REG(status)` declares `status_reg` by token pasting.  The declaration's
+// occurrence was anchored at the macro *argument* (`status`, 6 characters) but
+// carried the length of the expanded name (10), so the edit ran past the end of
+// the line and swallowed `);`.  No edit may rewrite a span whose current text is
+// not the identifier being renamed; when one would, the rename is refused
+// instead of corrupting the file.
+TEST_CASE("rename: refuses to rewrite a macro-pasted declaration", "[rename]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_macro_paste.sv";
+    const std::string text =
+        "`define MK_REG(nm) logic [31:0] nm``_reg\n"
+        "module top;\n"
+        "  `MK_REG(status);\n"
+        "  initial status_reg = 32'h1;\n"
+        "endmodule\n";
+    analyzer.open(uri, text);
+
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 10); // on `status_reg`
+    params.newName = "stat2_reg";
+
+    auto edit = provide_rename(analyzer, params);
+
+    // Either no edits at all, or only edits whose current text really is the old
+    // name.  What must never happen is an edit whose range covers other source.
+    if (edit.changes.has_value()) {
+        for (const auto& [edit_uri, edits] : *edit.changes) {
+            CHECK(edit_uri == uri);
+            for (const auto& e : edits) {
+                REQUIRE(e.range.start.line == e.range.end.line);
+                std::string line;
+                {
+                    size_t pos = 0;
+                    for (int i = 0; i < e.range.start.line; ++i)
+                        pos = text.find('\n', pos) + 1;
+                    const size_t end = text.find('\n', pos);
+                    line = text.substr(pos, end - pos);
+                }
+                REQUIRE(e.range.end.character <= (int)line.size());
+                CHECK(line.substr(e.range.start.character,
+                                  e.range.end.character - e.range.start.character) ==
+                      "status_reg");
+            }
+        }
+    }
+}
+
+// Renaming a module-level signal used to rewrite a same-named declaration inside
+// a generate block — a different signal — and its uses, silently rewiring the
+// block.

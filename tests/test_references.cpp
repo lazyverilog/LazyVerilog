@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <set>
 #include <filesystem>
 #include <fstream>
 
@@ -2165,4 +2166,408 @@ TEST_CASE("references: an open file reachable through a symlinked path is not "
 
     fs::remove(link_dir);
     fs::remove_all(real_dir);
+}
+
+TEST_CASE("references: package member is found through pkg::name qualification",
+          "[references]") {
+    // A file that qualifies states the owning package at the use site, so it
+    // must be found whether or not it also imports the package.  Before this
+    // was indexed, only importing files matched and renaming a package
+    // parameter silently left every qualifying file behind.
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string importer =
+        "import cfg_pkg::*;\n"
+        "module importer;\n"
+        "    logic [TL_AW-1:0] addr;\n"
+        "endmodule\n";
+    const std::string qualifier_a =
+        "module qualifier_a;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+    const std::string qualifier_b =
+        "module qualifier_b;\n"
+        "    localparam int W = cfg_pkg::TL_AW;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_refs_scoped_pkg.sv", pkg);
+    const auto importer_path = write_temp_sv("lazyverilog_refs_scoped_importer.sv", importer);
+    const auto qa_path = write_temp_sv("lazyverilog_refs_scoped_qa.sv", qualifier_a);
+    const auto qb_path = write_temp_sv("lazyverilog_refs_scoped_qb.sv", qualifier_b);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), importer_path.string(), qa_path.string(),
+                              qb_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "TL_AW");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    std::set<std::string> uris;
+    for (const auto& ref : refs)
+        uris.insert(ref.uri);
+
+    CHECK(uris.count(pkg_uri) == 1);
+    CHECK(uris.count(uri_from_path(importer_path)) == 1);
+    CHECK(uris.count(uri_from_path(qa_path)) == 1);
+    CHECK(uris.count(uri_from_path(qb_path)) == 1);
+    CHECK(refs.size() == 4);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(importer_path);
+    std::filesystem::remove(qa_path);
+    std::filesystem::remove(qb_path);
+}
+
+TEST_CASE("references: pkg::name search from a use site includes its own occurrence",
+          "[references]") {
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_refs_scoped_self_pkg.sv", pkg);
+    const auto user_path = write_temp_sv("lazyverilog_refs_scoped_self_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string user_uri = uri_from_path(user_path);
+    analyzer.open(user_uri, user);
+
+    const auto [line, col] = find_position(user, "cfg_pkg::TL_AW");
+    const auto refs = analyzer.find_references(user_uri, line + 0, col + 9, true);
+
+    bool has_self = false;
+    for (const auto& ref : refs)
+        if (ref.uri == user_uri && ref.line == 1)
+            has_self = true;
+    CHECK(has_self);
+    CHECK(refs.size() == 2);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(user_path);
+}
+
+TEST_CASE("references: pkg::name does not merge same-named members of other packages",
+          "[references]") {
+    const std::string pkg_a =
+        "package pkg_a;\n"
+        "    parameter int WIDTH = 8;\n"
+        "endpackage\n";
+    const std::string pkg_b =
+        "package pkg_b;\n"
+        "    parameter int WIDTH = 16;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [pkg_a::WIDTH-1:0] a;\n"
+        "    logic [pkg_b::WIDTH-1:0] b;\n"
+        "endmodule\n";
+
+    const auto a_path = write_temp_sv("lazyverilog_refs_scoped_pkg_a.sv", pkg_a);
+    const auto b_path = write_temp_sv("lazyverilog_refs_scoped_pkg_b.sv", pkg_b);
+    const auto user_path = write_temp_sv("lazyverilog_refs_scoped_two_pkg_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({a_path.string(), b_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string a_uri = uri_from_path(a_path);
+    analyzer.open(a_uri, pkg_a);
+
+    const auto [line, col] = find_position(pkg_a, "WIDTH");
+    const auto refs = analyzer.find_references(a_uri, line, col, true);
+
+    // pkg_a::WIDTH and its declaration only -- pkg_b::WIDTH is a different
+    // symbol that happens to share a name.
+    CHECK(refs.size() == 2);
+    for (const auto& ref : refs)
+        CHECK(ref.uri != uri_from_path(b_path));
+
+    std::filesystem::remove(a_path);
+    std::filesystem::remove(b_path);
+    std::filesystem::remove(user_path);
+}
+
+TEST_CASE("rename: package member rewrites pkg::name qualified uses", "[references][rename]") {
+    const std::string pkg =
+        "package cfg_pkg;\n"
+        "    parameter int TL_AW = 32;\n"
+        "endpackage\n";
+    const std::string user =
+        "module user;\n"
+        "    logic [cfg_pkg::TL_AW-1:0] addr;\n"
+        "endmodule\n";
+
+    const auto pkg_path = write_temp_sv("lazyverilog_rename_scoped_pkg.sv", pkg);
+    const auto user_path = write_temp_sv("lazyverilog_rename_scoped_user.sv", user);
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string(), user_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    analyzer.open(pkg_uri, pkg);
+
+    const auto [line, col] = find_position(pkg, "TL_AW");
+    const auto refs = analyzer.find_references(pkg_uri, line, col, true);
+
+    // Rename edits are the reference set, so a qualified use left out here is a
+    // file the rename would silently break.
+    bool touches_user = false;
+    for (const auto& ref : refs)
+        if (ref.uri == uri_from_path(user_path))
+            touches_user = true;
+    CHECK(touches_user);
+
+    std::filesystem::remove(pkg_path);
+    std::filesystem::remove(user_path);
+}
+
+// References from the module-level declaration used to list the shadowing
+// generate-block declaration and its uses, and rename inherited that: renaming
+// the outer signal rewrote a different signal inside the generate block.
+TEST_CASE("references: a generate-block declaration is not reported for the outer signal",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_generate_shadow.sv";
+    const std::string text = R"(module top;
+  logic [7:0] dout;
+  assign dout = 8'h0;
+
+  genvar i;
+  generate
+    for (i = 0; i < 2; i++) begin : g_lanes
+      logic [7:0] dout;
+      assign dout = 8'h1;
+    end
+  endgenerate
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    // From the module-level declaration (line 1, 0-based).
+    auto refs = analyzer.find_references(uri, 1, 14, true);
+    for (const auto& ref : refs) {
+        CAPTURE(ref.line);
+        CHECK(ref.line < 7);
+    }
+    CHECK(refs.size() == 2);
+}
+
+// Asking "who calls this?" from a method's declaration used to answer nothing,
+// while asking from the out-of-body definition or from a call site worked.  The
+// extern prototype is the declaration a UVM class body actually shows, so a
+// rename started there silently did nothing.
+
+// Asking "who calls this?" from a method's declaration used to answer nothing,
+// while asking from the out-of-body definition or from a call site worked.  The
+// extern prototype is the declaration a UVM class body actually shows, so a
+// rename started there silently did nothing.
+TEST_CASE("references: from an extern method prototype", "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_extern_proto.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    int unsigned tag;
+    extern function void bump(int amount);
+  endclass
+
+  function void base_c::bump(int amount);
+    tag += amount;
+  endfunction
+endpackage
+
+module top;
+  initial begin
+    p::base_c obj = new();
+    obj.bump(3);
+  end
+endmodule
+)");
+
+    // Cursor on the prototype's name (line 3, 0-based).
+    auto refs = analyzer.find_references(uri, 3, 25, true);
+    std::vector<int> lines;
+    for (const auto& ref : refs)
+        lines.push_back(ref.line);
+    std::sort(lines.begin(), lines.end());
+
+    CAPTURE(lines);
+    CHECK(std::find(lines.begin(), lines.end(), 3) != lines.end());  // prototype
+    CHECK(std::find(lines.begin(), lines.end(), 6) != lines.end());  // out-of-body body
+    CHECK(std::find(lines.begin(), lines.end(), 14) != lines.end()); // call site
+}
+
+// A method declaration knows its callers only if the call sites carry the same
+// identity.  `handle.method()` on a package class and `super.method()` were both
+// left unresolved, so references started from the declaration returned only the
+// declaration itself.
+
+// A method declaration knows its callers only if the call sites carry the same
+// identity.  `handle.method()` on a package class and `super.method()` were both
+// left unresolved, so references started from the declaration returned only the
+// declaration itself.
+TEST_CASE("references: from a class method declaration reaches handle and super calls",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_method_decl.sv";
+    analyzer.open(uri, R"(package p;
+  class base_c;
+    virtual function string name();
+      return "base";
+    endfunction
+  endclass
+  class mid_c extends base_c;
+  endclass
+  class leaf_c extends mid_c;
+    virtual function string name();
+      string s = super.name();
+      return s;
+    endfunction
+  endclass
+endpackage
+
+module top;
+  initial begin
+    p::leaf_c leaf = new();
+    string nm;
+    nm = leaf.name();
+  end
+endmodule
+)");
+
+    auto contains_line = [](const std::vector<Location>& refs, int line) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& loc) { return loc.line == line; });
+    };
+
+    // From the base class declaration: the override and the `super.name()` call.
+    auto base_refs = analyzer.find_references(uri, 2, 28, true);
+    CHECK(contains_line(base_refs, 2));
+    CHECK(contains_line(base_refs, 10));
+
+    // From the derived declaration: the `leaf.name()` call site.
+    auto leaf_refs = analyzer.find_references(uri, 9, 28, true);
+    CHECK(contains_line(leaf_refs, 9));
+    CHECK(contains_line(leaf_refs, 20));
+}
+
+// `import p::*;` lets a file spell a package type without the `p::` prefix.
+// Those unqualified uses were invisible to references and rename, so renaming
+// the type left them pointing at a name that no longer exists.
+
+// `import p::*;` lets a file spell a package type without the `p::` prefix.
+// Those unqualified uses were invisible to references and rename, so renaming
+// the type left them pointing at a name that no longer exists.
+TEST_CASE("references: wildcard-imported package type used unqualified in another file",
+          "[references]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-wildcard";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto pkg = dir / "p_pkg.sv";
+    const auto qualified = dir / "user_qualified.sv";
+    const auto wildcard = dir / "user_wildcard.sv";
+    {
+        std::ofstream out(pkg);
+        out << "package p;\n  class leaf_c;\n  endclass\nendpackage\n";
+    }
+    {
+        std::ofstream out(qualified);
+        out << "module user_qualified;\n  p::leaf_c h1;\nendmodule\n";
+    }
+    {
+        std::ofstream out(wildcard);
+        out << "module user_wildcard;\n  import p::*;\n  leaf_c h2;\nendmodule\n";
+    }
+    // The same import written in the module *header*, which is where RTL and UVM
+    // code usually puts it.
+    const auto header_wildcard = dir / "user_header_wildcard.sv";
+    {
+        std::ofstream out(header_wildcard);
+        out << "module user_header_wildcard\n  import p::*;\n(\n  input logic clk\n);\n"
+               "  leaf_c h3;\nendmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg.string(), qualified.string(), wildcard.string(),
+                              header_wildcard.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto pkg_uri = uri_from_path(pkg);
+    analyzer.open(pkg_uri, "package p;\n  class leaf_c;\n  endclass\nendpackage\n");
+
+    auto refs = analyzer.find_references(pkg_uri, 1, 8, true);
+    const auto wildcard_uri = uri_from_path(wildcard);
+    const auto qualified_uri = uri_from_path(qualified);
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == qualified_uri; }));
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == wildcard_uri && l.line == 2; }));
+    const auto header_uri = uri_from_path(header_wildcard);
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == header_uri && l.line == 5; }));
+
+    std::filesystem::remove_all(dir);
+}
+
+// A subroutine body and a named begin/end block are scopes of their own.  They
+// used to share the enclosing module's SymbolID, so find-references from a
+// module signal swallowed every same-named formal, local and block declaration,
+// and rename then rewrote all of them as if they were one object.
+TEST_CASE("references: module, block and subroutine scopes do not merge same-named signals",
+          "[references][rename][scope]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_scope_shadow.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    logic [7:0] count;\n"
+                       "    always_comb begin : proc_shadow\n"
+                       "        logic [7:0] count;\n"
+                       "        count = 8'hFF;\n"
+                       "    end\n"
+                       "    function automatic logic [7:0] f(input logic [7:0] count);\n"
+                       "        return count + 8'd1;\n"
+                       "    endfunction\n"
+                       "    assign count = f(8'h0);\n"
+                       "endmodule\n");
+
+    SECTION("module-level signal keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 1, 16, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 1 || ref.line == 9));
+    }
+
+    SECTION("named block local keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 3, 20, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 3 || ref.line == 4));
+    }
+
+    SECTION("subroutine formal keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 6, 55, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 6 || ref.line == 7));
+    }
+
+    SECTION("a use inside the subroutine resolves to the formal, not the module signal") {
+        auto loc = analyzer.definition_of(uri, 7, 15);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 55);
+    }
 }

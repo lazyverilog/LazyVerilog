@@ -12,6 +12,14 @@
 using namespace slang;
 using namespace slang::syntax;
 
+slang::parsing::Token subroutine_name_token(const FunctionPrototypeSyntax& proto) {
+    if (const auto* id = proto.name->as_if<IdentifierNameSyntax>())
+        return id->identifier;
+    if (proto.name->kind == SyntaxKind::ConstructorName)
+        return proto.name->as<KeywordNameSyntax>().keyword;
+    return proto.keyword;
+}
+
 std::string make_subroutine_signature(const FunctionPrototypeSyntax& proto,
                                       const std::string& name,
                                       const slang::SourceManager& sm) {
@@ -375,6 +383,24 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
         if (fragment.empty())
             continue;
 
+        if (syntax_needs_space_between_fragments(text, fragment))
+            text += ' ';
+        text += fragment;
+    }
+    return trim_copy(std::move(text));
+}
+
+std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
+                                             const slang::syntax::SyntaxNode& node) {
+    (void)sm;
+    std::string text;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (!token || token.isMissing())
+            continue;
+        const std::string fragment(token.rawText());
+        if (fragment.empty())
+            continue;
         if (syntax_needs_space_between_fragments(text, fragment))
             text += ' ';
         text += fragment;
@@ -945,11 +971,86 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // package prefix.  See the `class_member::` alias in visitToken().
         std::string current_class_bare;
         bool current_class_has_base{false};
+        // Bare name of the class this one extends, so `super.method()` can be
+        // attributed to the class that declares the method rather than left as
+        // an unresolved name.
+        std::string current_class_base;
         // Names declared inside the subroutine currently being walked.  A bare
         // identifier in a class body can only be an inherited member if it is
         // not one of these.
         std::unordered_set<std::string> subroutine_locals;
         bool in_subroutine_{false};
+
+        // Declarations written inside a generate block are separate signals from
+        // module-level ones that share the name:
+        //
+        //     logic [7:0] dout;                     // module_signal::top::dout
+        //     for (...) begin : g_lanes
+        //         logic [7:0] dout;                 // module_signal::top.g_lanes::dout
+        //
+        // Without the block in the identity, references and rename merge the two
+        // and renaming the outer signal rewrites the inner one.
+        // A subroutine body and a begin/end block shadow the enclosing module the
+        // same way a generate block does:
+        //
+        //     logic [7:0] count;                                 // module_signal::top::count
+        //     function automatic f(input logic [7:0] count);     // top.f::count
+        //     always_comb begin : proc                           //
+        //         logic [7:0] count;                             // top.proc::count
+        //
+        // Without a distinct identity, references and rename merge all three and
+        // renaming the module signal rewrites the other two.
+        // Heterogeneous lookup: generate_scope_for() runs for every identifier
+        // token in the file, and a plain unordered_set<std::string> would build
+        // a temporary std::string per scope level per token.
+        struct TransparentStringHash {
+            using is_transparent = void;
+            size_t operator()(std::string_view text) const {
+                return std::hash<std::string_view>{}(text);
+            }
+        };
+
+        struct GenerateScope {
+            std::string scope;                       // "<module>.<label>"
+            std::unordered_set<std::string, TransparentStringHash, std::equal_to<>>
+                names;                               // declared directly in the block
+            // Generate blocks pre-collect their direct member declarations.
+            // Subroutine and statement-block scopes instead pick declarators up
+            // as the walk reaches them, which is free: SystemVerilog requires a
+            // local to be declared before it is used, so the set is already
+            // complete by the time a use is visited.
+            bool collect_declarators{false};
+        };
+        std::vector<GenerateScope> generate_scopes;
+
+        /// Innermost enclosing lexical scope that declares @p name, if any.
+        const GenerateScope* generate_scope_for(std::string_view name) const {
+            for (auto it = generate_scopes.rbegin(); it != generate_scopes.rend(); ++it)
+                if (!it->names.empty() && it->names.find(name) != it->names.end())
+                    return &*it;
+            return nullptr;
+        }
+
+        /// Push a lexical scope that collects its declarations as they are met.
+        ///
+        /// The scope identity has to name an owner.  A bare `run::item` would be
+        /// spelled the same in every file that happens to declare a `run` task
+        /// with an `item` local, which would merge unrelated locals across the
+        /// project.  Without an owner, leave the declarations unresolved (`name:`)
+        /// and let the AST verification path in find_references() decide.
+        void push_declaring_scope(std::string_view label) {
+            const std::string_view owner =
+                !current_class_bare.empty()
+                    ? std::string_view(current_class_bare)
+                    : (!current_class.empty() ? std::string_view(current_class)
+                                              : std::string_view(current_module));
+            GenerateScope scope;
+            if (!owner.empty()) {
+                scope.scope = std::string(owner) + "." + std::string(label);
+                scope.collect_declarators = true;
+            }
+            generate_scopes.push_back(std::move(scope));
+        }
 
         struct TypeImport {
             std::string package_name;
@@ -1002,6 +1103,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         void handle(const DeclaratorSyntax& node) {
             if (in_subroutine_ && node.name)
                 subroutine_locals.insert(std::string(node.name.valueText()));
+            if (node.name && !generate_scopes.empty() &&
+                generate_scopes.back().collect_declarators)
+                generate_scopes.back().names.insert(std::string(node.name.valueText()));
             visitDefault(node);
         }
 
@@ -1102,6 +1206,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             auto previous_class = current_class;
             const auto previous_class_bare = current_class_bare;
             const bool previous_has_base = current_class_has_base;
+            auto previous_class_base = current_class_base;
             const auto import_stack_size = visible_type_imports.size();
             if (!current_class.empty())
                 current_class += "::" + class_name;
@@ -1109,10 +1214,16 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 current_class = parent_scope.empty() ? class_name : parent_scope + "::" + class_name;
             current_class_bare = class_name;
             current_class_has_base = node.extendsClause != nullptr;
+            current_class_base.clear();
+            if (node.extendsClause && node.extendsClause->baseName) {
+                const auto rendered = render_syntax_node_text(sm, *node.extendsClause->baseName);
+                current_class_base = base_class_lookup_name(rendered.substr(0, rendered.find('#')));
+            }
             visitDefault(node);
             current_class = std::move(previous_class);
             current_class_bare = previous_class_bare;
             current_class_has_base = previous_has_base;
+            current_class_base = std::move(previous_class_base);
             visible_type_imports.resize(import_stack_size);
         }
 
@@ -1170,7 +1281,15 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             current_class.empty()
                                 ? (current_module.empty() ? std::string_view(current_package)
                                                           : std::string_view(current_module))
-                                : std::string_view(current_class));
+                                // Call sites, out-of-body definitions and extern
+                                // prototypes all key a method on the bare class
+                                // name; spelling an inline declaration's owner
+                                // `pkg::cls` here would give the same method two
+                                // identities and leave references from the
+                                // declaration empty.
+                                : (current_class_bare.empty()
+                                       ? std::string_view(current_class)
+                                       : std::string_view(current_class_bare)));
                     declared_subroutines.insert_or_assign(
                         subroutine_scope_key(owner_kind, owner_name, name),
                         file_ids.for_token(index, sm, name_token));
@@ -1182,9 +1301,86 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             const bool previously_in_subroutine = in_subroutine_;
             subroutine_locals.clear();
             in_subroutine_ = true;
+            push_declaring_scope(subroutine_scope_label(node));
             visitDefault(node);
+            generate_scopes.pop_back();
             in_subroutine_ = previously_in_subroutine;
             subroutine_locals = std::move(previous_locals);
+        }
+
+        /// Stable label for a subroutine's lexical scope.
+        std::string subroutine_scope_label(const FunctionDeclarationSyntax& node) const {
+            if (node.prototype && node.prototype->name) {
+                if (const auto token = last_identifier_token(*node.prototype->name))
+                    return std::string(token.valueText());
+            }
+            const auto [line, col] = token_pos(sm, node.getFirstToken());
+            return "sub@" + std::to_string(line) + ":" + std::to_string(col);
+        }
+
+        // Same reasoning as the generate block below: a declaration written
+        // inside begin/end is a different object from a module-level one that
+        // shares its name.  A block that declares nothing never matches in
+        // generate_scope_for(), so unnamed blocks cost nothing.
+        /// Whether this block declares anything of its own.
+        ///
+        /// A block that declares nothing can never shadow, so it needs no scope
+        /// and no identity string.  Checking is a shallow walk over the block's
+        /// direct items; building the scope for every begin/end in the design
+        /// is not.
+        static bool block_declares_anything(const BlockStatementSyntax& node) {
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                if (item->kind == SyntaxKind::DataDeclaration ||
+                    item->kind == SyntaxKind::LocalVariableDeclaration ||
+                    item->kind == SyntaxKind::NetDeclaration)
+                    return true;
+            }
+            return false;
+        }
+
+        void handle(const BlockStatementSyntax& node) {
+            if (!block_declares_anything(node)) {
+                visitDefault(node);
+                return;
+            }
+            std::string label;
+            if (node.blockName)
+                label = std::string(node.blockName->name.valueText());
+            if (label.empty() && node.label)
+                label = std::string(node.label->name.valueText());
+            if (label.empty()) {
+                const auto [line, col] = token_pos(sm, node.begin);
+                label = "blk@" + std::to_string(line) + ":" + std::to_string(col);
+            }
+            push_declaring_scope(label);
+            visitDefault(node);
+            generate_scopes.pop_back();
+        }
+
+        // `extern function void bump(int amount);` declares the method just as
+        // much as the out-of-body `function void base_c::bump(...)` that follows
+        // it, and in UVM code the prototype is the only declaration visible in
+        // the class body.  Classifying it as an unresolved `name:` occurrence
+        // left references and rename empty when started from there.
+        void handle(const ClassMethodPrototypeSyntax& node) {
+            const auto& proto = *node.prototype;
+            if (proto.name) {
+                const auto name_token = last_identifier_token(*proto.name);
+                if (name_token && !current_class.empty()) {
+                    const auto name = std::string(name_token.valueText());
+                    const std::string_view owner =
+                        current_class_bare.empty() ? std::string_view(current_class)
+                                                   : std::string_view(current_class_bare);
+                    declared_subroutines.insert_or_assign(
+                        subroutine_scope_key(SubroutineOwnerKind::Class, owner, name),
+                        file_ids.for_token(index, sm, name_token));
+                    add_ref(name_token,
+                            subroutine_symbol_id(SubroutineOwnerKind::Class, owner, name));
+                }
+            }
+            visitDefault(node);
         }
 
         void add_subroutine_invocation_ref(const slang::parsing::Token& name_token,
@@ -1301,6 +1497,40 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::nullopt;
         }
 
+        void handle(const GenerateBlockSyntax& node) {
+            GenerateScope scope;
+            const auto* name_clause = node.beginName ? node.beginName : node.endName;
+            std::string label = name_clause ? std::string(name_clause->name.valueText())
+                                            : std::string{};
+            if (label.empty() && node.label)
+                label = std::string(node.label->name.valueText());
+            if (label.empty()) {
+                // An unnamed block still shadows; key it on where it starts so the
+                // identity is stable for a given source text.
+                const auto [line, col] = token_pos(sm, node.begin);
+                label = "genblk@" + std::to_string(line) + ":" + std::to_string(col);
+            }
+            scope.scope = current_module.empty() ? label : current_module + "." + label;
+
+            for (const auto* member : node.members) {
+                const auto* data = member ? member->as_if<DataDeclarationSyntax>() : nullptr;
+                const auto* net = member ? member->as_if<NetDeclarationSyntax>() : nullptr;
+                if (data) {
+                    for (const auto* decl : data->declarators)
+                        if (decl)
+                            scope.names.insert(std::string(decl->name.valueText()));
+                } else if (net) {
+                    for (const auto* decl : net->declarators)
+                        if (decl)
+                            scope.names.insert(std::string(decl->name.valueText()));
+                }
+            }
+
+            generate_scopes.push_back(std::move(scope));
+            visitDefault(node);
+            generate_scopes.pop_back();
+        }
+
         void handle(const TypedefDeclarationSyntax& node) {
             const std::string typedef_name(node.name.valueText());
             const std::string parent_scope = !current_package.empty() ? current_package : std::string{};
@@ -1359,6 +1589,20 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             node.left->visit(*this);
                             return;
                         }
+                        // `p1::WIDTH` where this shard never parsed p1.  The
+                        // tables above only know packages declared here, so a
+                        // cross-file qualified reference would otherwise decay
+                        // to `name:<ident>` and be reachable only through the
+                        // import bridge -- which a file that qualifies instead
+                        // of importing can never satisfy.  The qualifier is
+                        // right there in the source, so record scope and name
+                        // and let find_references decide what kind it was.
+                        if (package_scope) {
+                            add_ref(rname->identifier,
+                                    symbol_canonical("scoped_member", scope_sv, name_sv));
+                            node.left->visit(*this);
+                            return;
+                        }
                     }
                     visitDefault(node);
                     return;
@@ -1378,6 +1622,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 }
                 if (package_scope && package_values.contains(key)) {
                     add_ref(name_token, symbol_canonical("package_value", scope, name));
+                    node.left->visit(*this);
+                    return;
+                }
+                // Same cross-shard recovery as the fast path above.
+                if (package_scope) {
+                    add_ref(name_token, symbol_canonical("scoped_member", scope, name));
                     node.left->visit(*this);
                     return;
                 }
@@ -1750,6 +2000,29 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             // (`cfg.something`, `env.agt.drv`, ...) that quadruples work that
             // scales with member-access density for no behavioral benefit.
             const auto object_name = object_before_member_dot(token);
+            // `this.member` and `super.member` name a member of a class this walk
+            // already knows, but they are not values, so the receiver-type
+            // lookups below cannot resolve them and the member would be left as
+            // an unresolved `name:` occurrence — invisible to references and
+            // rename started from the declaration.
+            if ((object_name == "this" || object_name == "super") && !current_class_bare.empty()) {
+                const std::string_view owner =
+                    object_name == "this" ? std::string_view(current_class_bare)
+                                          : std::string_view(current_class_base);
+                if (!owner.empty()) {
+                    if (declared_subroutines.contains(
+                            subroutine_scope_key(SubroutineOwnerKind::Class, owner, name))) {
+                        add_ref(token, symbol_canonical("class_method", owner, name));
+                        return;
+                    }
+                    // The owner's declaration usually lives in another file, so
+                    // this shard cannot say which ancestor declares the member.
+                    // `class_member::` is the alias find_references completes by
+                    // checking the inheritance chain.
+                    add_ref(token, symbol_canonical("class_member", owner, name));
+                    return;
+                }
+            }
             if (!object_name.empty()) {
                 const auto object_type = current_module_object_type(object_name);
                 if (try_add_class_method_reference(token, name, object_name, object_type))
@@ -1769,6 +2042,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     add_ref(token, symbol_canonical("class_field", current_class, name));
                     return;
                 }
+            }
+            if (const auto* generate_scope = generate_scope_for(name)) {
+                add_ref(token, symbol_canonical("module_signal", generate_scope->scope, name));
+                return;
             }
             if (!current_module.empty()) {
                 scope_key = current_module;

@@ -68,6 +68,17 @@ static std::string type_of(const slang::SourceManager& sm, const PortHeaderSynta
         return render_syntax_node_text(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
         return render_syntax_node_text(sm, *net->dataType);
+    // `AXI_BUS.Slave bus` — an interface port names its interface, and without
+    // it the port has no recorded type at all, so `bus.aw_valid` had nothing to
+    // resolve against.  Kept as written, modport included, because that is what
+    // hover should show; interface_name_from_type_text() takes the half that
+    // names the interface.
+    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>()) {
+        std::string text = token_value_text(iface->nameOrKeyword);
+        if (iface->modport && iface->modport->member)
+            text += "." + token_value_text(iface->modport->member);
+        return text;
+    }
     return {};
 }
 
@@ -365,6 +376,44 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                             std::string parent_scope, bool scoped_lookup);
 
+// `parameter type foo_t = logic [7:0]` parses as TypeParameterDeclarationSyntax,
+// a sibling of ParameterDeclarationSyntax under ParameterDeclarationBaseSyntax.
+// Every `as_if<ParameterDeclarationSyntax>()` site therefore skips it, which is
+// why a type parameter used to have no index presence at all.
+//
+// It declares two things at once: a parameter that an instantiation may
+// override, and a type name usable wherever a type is written.  Record the
+// type half here; the parameter half stays with the caller, which already knows
+// whether it is filling a PortEntry or a ValueEntry.
+static void add_type_parameter_typedef(const TypeAssignmentSyntax& decl, SyntaxIndex& index,
+                                       SourceFileIdResolver& resolver,
+                                       const slang::SourceManager& sm, std::string parent_scope,
+                                       bool scoped_lookup) {
+    TypedefEntry entry;
+    entry.name = token_value_text(decl.name);
+    if (entry.name.empty())
+        return;
+    entry.parent_scope = std::move(parent_scope);
+    entry.file_id = resolver.for_declaration_token(index, sm, decl.name);
+    auto [line, col] = token_pos_line1_col0(sm, decl.name);
+    entry.line = line;
+    entry.col = col;
+    if (decl.assignment)
+        entry.resolved = render_syntax_node_text(sm, *decl.assignment->type);
+
+    if (scoped_lookup && !entry.parent_scope.empty())
+        index.package_type_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
+    index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
+    index.typedefs.push_back(std::move(entry));
+}
+
+/// Default type text of a `parameter type` declarator, for hover/outline detail.
+static std::string type_parameter_default(const TypeAssignmentSyntax& decl,
+                                          const slang::SourceManager& sm) {
+    return decl.assignment ? render_syntax_node_text(sm, *decl.assignment->type) : std::string{};
+}
+
 // Emit one ImportEntry per imported item of a `import pkg::x;` / `import pkg::*;`
 // declaration.  Called from the member walks that every index depth already
 // performs, so closed project shards carry imports without paying a separate
@@ -406,9 +455,22 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     // Extract parameter ports from #( ... )
     if (module.header->parameters) {
+        const bool header_scoped_lookup = index.package_names.count(entry.name) > 0;
         for (const auto* param_base : module.header->parameters->declarations) {
             if (!param_base)
                 continue;
+            if (const auto* type_param = param_base->as_if<TypeParameterDeclarationSyntax>()) {
+                const std::string direction = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    add_port(entry.ports, index, resolver, sm, decl->name, direction, "type", "type",
+                             {}, type_parameter_default(*decl, sm));
+                    add_type_parameter_typedef(*decl, index, resolver, sm, entry.name,
+                                               header_scoped_lookup);
+                }
+                continue;
+            }
             const auto* param = param_base->as_if<ParameterDeclarationSyntax>();
             if (!param)
                 continue;
@@ -483,6 +545,15 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     const auto module_end_line = source_range_lines(sm, module.sourceRange()).second;
 
+    // Imports written in the module header (`module m import pkg::*; (...)`) are
+    // not members, so the member loop below never sees them.  Without them the
+    // shard cannot say that this file makes the package's names visible
+    // unqualified, and references/rename skip every unqualified use in it.
+    for (const auto* import_decl : module.header->imports) {
+        if (import_decl)
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+    }
+
     for (const auto* member : module.members) {
         if (!member)
             continue;
@@ -517,7 +588,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             const auto fn_name = id_name ? std::string(id_name->identifier.valueText())
                                          : render_syntax_node_text(sm, *proto.name);
             auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
@@ -539,7 +610,29 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // go-to-definition nor hover can see them.  This is also the sole
             // owner of package parameter values: process_package() delegates
             // here rather than pushing its own duplicate ValueEntry.
-            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+            if (const auto* type_param =
+                    ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+                const std::string kind = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
+                        continue;
+                    auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                    note_package_member(token_value_text(decl->name));
+                    index.values.push_back(ValueEntry{
+                        .name = token_value_text(decl->name),
+                        .type = "type",
+                        .kind = kind,
+                        .parent_scope = entry.name,
+                        .default_value = type_parameter_default(*decl, sm),
+                        .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                        .line = vl,
+                        .col = vc,
+                    });
+                    add_type_parameter_typedef(*decl, index, resolver, sm, entry.name, in_package);
+                }
+            } else if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
                 // Rendered on the first declarator that is actually kept: a
                 // shared header's parameter bulk would otherwise pay type and
                 // initializer rendering once per including file.
@@ -607,6 +700,26 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         }
 
         void handle(const BlockStatementSyntax& node) {
+            scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
+        // A subroutine body restricts visibility exactly like begin/end does.
+        // Without this the enclosing module's range was used, so a function
+        // local was described as visible throughout the module.
+        void handle(const FunctionDeclarationSyntax& node) {
+            scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
+        // A generate block owns its declarations too.  Without a scope pushed
+        // here, `handle(DataDeclarationSyntax)` sees scope_stack.size() == 1 and
+        // records nothing at all, so a signal declared directly inside
+        // `for (...) begin : g_lanes` was missing from the index entirely — and
+        // therefore from the document outline.
+        void handle(const GenerateBlockSyntax& node) {
             scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
             visitDefault(node);
             scope_stack.pop_back();
@@ -689,10 +802,24 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     if (cls.extendsClause)
         entry.base_class = render_syntax_node_text(sm, *cls.extendsClause->baseName);
 
+    // A class declared inside another class body is a member of it and is
+    // reached as `outer::inner`.  Collected before the member loop so the outer
+    // ClassEntry, which is pushed at the end, does not shift the indices the
+    // nested classes register.
+    std::vector<const ClassDeclarationSyntax*> nested_classes;
+
     for (const auto* item : cls.items) {
         if (!item)
             continue;
+        if (const auto* nested = item->as_if<ClassDeclarationSyntax>()) {
+            nested_classes.push_back(nested);
+            continue;
+        }
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+            if (const auto* nested = prop->declaration->as_if<ClassDeclarationSyntax>()) {
+                nested_classes.push_back(nested);
+                continue;
+            }
             // `typedef registry #(T) type_id;` inside a class body is a member
             // of that class, reached as `my_item::type_id`.  Indexing only the
             // data declarators hides every such type from closed-file lookup.
@@ -724,11 +851,12 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // simple identifier, matching the FunctionDeclarationSyntax handling
             // above.
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             MethodEntry m;
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.params = proto.portList ? trim_copy(proto.portList->toString()) : std::string{};
             m.is_task = (meth->declaration->kind == SyntaxKind::TaskDeclaration);
             m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
@@ -742,11 +870,12 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // inline bodies hides most of a class written in the extern style.
             const auto& proto = *proto_item->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             MethodEntry m;
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
             m.return_type = render_syntax_node_text(sm, *proto.returnType);
+            m.params = proto.portList ? trim_copy(proto.portList->toString()) : std::string{};
             m.is_task = (proto.keyword.kind == slang::parsing::TokenKind::TaskKeyword);
             m.file_id = resolver.for_declaration_token(index, sm, name_tok);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
@@ -760,7 +889,11 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         index.package_class_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
+    const std::string own_name = entry.name;
     index.classes.push_back(std::move(entry));
+
+    for (const auto* nested : nested_classes)
+        process_class(*nested, index, resolver, sm, own_name);
 }
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
@@ -792,7 +925,11 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const std::string type_text = render_syntax_node_text(sm, *member->type);
+            // A struct declared inside a shared header's macro body would
+            // otherwise report every field's type as the macro invocation the
+            // user wrote, which is not a type.  The field's own tokens are the
+            // answer here; the invocation spelling belongs to the invocation.
+            const std::string type_text = render_syntax_node_text_expanded(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;
@@ -874,6 +1011,12 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                     if (decl)
                         symbols.push_back(token_value_text(decl->name));
                 }
+            } else if (const auto* type_param =
+                           ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+                for (const auto* decl : type_param->declarators) {
+                    if (decl)
+                        symbols.push_back(token_value_text(decl->name));
+                }
             }
         }
     }
@@ -908,6 +1051,26 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         // where the header's text is spliced in, so only closed files went
         // without.  Carries no parent_scope, which is what makes it visible to
         // every file that includes the header rather than to one module.
+        if (const auto* type_param = ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+            const std::string kind = token_value_text(type_param->keyword);
+            for (const auto* decl : type_param->declarators) {
+                if (!decl || !resolver.wants_declaration(index, sm, decl->name))
+                    continue;
+                auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                index.values.push_back(ValueEntry{
+                    .name = token_value_text(decl->name),
+                    .type = "type",
+                    .kind = kind,
+                    .parent_scope = {},
+                    .default_value = type_parameter_default(*decl, sm),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                    .line = vl,
+                    .col = vc,
+                });
+                add_type_parameter_typedef(*decl, index, resolver, sm, {}, false);
+            }
+            return;
+        }
         const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>();
         if (!param)
             return;
