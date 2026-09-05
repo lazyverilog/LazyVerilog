@@ -1777,6 +1777,12 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         maybe_set(node.name);
     }
 
+    // `parameter type data_t = logic [7:0]` declares `data_t` through a
+    // TypeAssignmentSyntax, not a DeclaratorSyntax, so the handler above never
+    // sees it.  Like a module or class name it is a type identifier at its use
+    // sites, so it is not scope-sensitive.
+    void handle(const slang::syntax::TypeAssignmentSyntax& node) { maybe_set(node.name, false); }
+
     // `extern function void bump(int amount);` is a declaration in its own
     // right; without it the cursor on a prototype name resolves to nothing, and
     // references/rename — which both start from the definition — return empty.

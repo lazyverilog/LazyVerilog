@@ -1587,3 +1587,43 @@ TEST_CASE("definition: hierarchical reference resolves through instance paths",
 // shard builder already indexed, so a class written in the extern style lost every
 // method the moment its file was opened: `obj.bump()` resolved while the file
 // was closed and stopped resolving once it was open.
+
+// `parameter type foo_t = ...` parses as TypeParameterDeclarationSyntax, a
+// sibling of ParameterDeclarationSyntax, so every `as_if<ParameterDeclaration>`
+// site used to skip it and the whole declaration never reached the index.  It
+// then had no definition, no hover and no references — not even with the cursor
+// on the declaration itself.  cva6 parameterizes its entire core this way.
+TEST_CASE("definition: type parameter resolves from its use and its declaration",
+          "[definition][parameter]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_type_parameter.sv";
+    const std::string text = "module type_param #(\n"
+                             "    parameter type data_t = logic [7:0]\n"
+                             ") (\n"
+                             "    input  data_t d_i,\n"
+                             "    output data_t d_o\n"
+                             ");\n"
+                             "  assign d_o = d_i;\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    SECTION("from the port that uses it") {
+        auto loc = analyzer.definition_of(uri, 3, 11);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 19);
+    }
+
+    SECTION("from the declaration itself") {
+        auto loc = analyzer.definition_of(uri, 1, 19);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 19);
+    }
+
+    SECTION("references cover the declaration and both uses") {
+        const auto refs = analyzer.find_references(uri, 1, 19, true);
+        CHECK(refs.size() == 3);
+    }
+}

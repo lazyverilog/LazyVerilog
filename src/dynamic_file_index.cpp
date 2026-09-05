@@ -452,6 +452,20 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
 
     if (node.header->parameters) {
         for (const auto* base : node.header->parameters->declarations) {
+            // `parameter type foo_t = ...` is a separate syntax node; without
+            // this branch it never reaches the open-buffer index either.
+            if (const auto* type_param =
+                    base ? base->as_if<TypeParameterDeclarationSyntax>() : nullptr) {
+                const std::string direction = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    add_port(module, index, resolver, sm, decl->name, direction, "type", "type", {},
+                             decl->assignment ? node_text_raw(sm, *decl->assignment->type)
+                                              : std::string{});
+                }
+                continue;
+            }
             const auto* param = base ? base->as_if<ParameterDeclarationSyntax>() : nullptr;
             if (!param)
                 continue;
