@@ -1814,7 +1814,19 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         const int end_line = (int)sm.getLineNumber(range.end());
         if (use_line_one_based < start_line || use_line_one_based > end_line)
             return;
+
+        // A subroutine body is a scope in exactly the way a begin/end block is:
+        //
+        //     logic [7:0] count;                                     // module
+        //     function automatic f(input logic [7:0] count);         // shadows it
+        //         tmp = count + 1;                                   // means the formal
+        //
+        // Without pushing a scope here, formals and locals are recorded at the
+        // same depth as module declarations, the module one is visited first,
+        // and `depth > first_result_depth` then refuses to replace it.
+        push_scope(range);
         visitDefault(node);
+        scope_stack.pop_back();
     }
 
     void handle(const slang::syntax::TypedefDeclarationSyntax& node) {

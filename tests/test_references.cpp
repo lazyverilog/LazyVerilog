@@ -2522,3 +2522,52 @@ TEST_CASE("references: wildcard-imported package type used unqualified in anothe
 
     std::filesystem::remove_all(dir);
 }
+
+// A subroutine body and a named begin/end block are scopes of their own.  They
+// used to share the enclosing module's SymbolID, so find-references from a
+// module signal swallowed every same-named formal, local and block declaration,
+// and rename then rewrote all of them as if they were one object.
+TEST_CASE("references: module, block and subroutine scopes do not merge same-named signals",
+          "[references][rename][scope]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_scope_shadow.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    logic [7:0] count;\n"
+                       "    always_comb begin : proc_shadow\n"
+                       "        logic [7:0] count;\n"
+                       "        count = 8'hFF;\n"
+                       "    end\n"
+                       "    function automatic logic [7:0] f(input logic [7:0] count);\n"
+                       "        return count + 8'd1;\n"
+                       "    endfunction\n"
+                       "    assign count = f(8'h0);\n"
+                       "endmodule\n");
+
+    SECTION("module-level signal keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 1, 16, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 1 || ref.line == 9));
+    }
+
+    SECTION("named block local keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 3, 20, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 3 || ref.line == 4));
+    }
+
+    SECTION("subroutine formal keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 6, 55, true);
+        CHECK(refs.size() == 2);
+        for (const auto& ref : refs)
+            CHECK((ref.line == 6 || ref.line == 7));
+    }
+
+    SECTION("a use inside the subroutine resolves to the formal, not the module signal") {
+        auto loc = analyzer.definition_of(uri, 7, 15);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 55);
+    }
+}
