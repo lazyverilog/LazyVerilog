@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 
@@ -363,4 +364,76 @@ TEST_CASE("documentSymbol: a declaration's range spans its whole body",
     REQUIRE(cls != nullptr);
     CHECK(cls->selectionRange.start.line == 4);
     CHECK(cls->range.end.line == 6); // through `endclass`
+}
+
+// The outline dropped everything declared inside a labelled block, showed no
+// named statement block at all, never nested a class declared inside another
+// class, and collapsed every subroutine to the single line its name sits on.
+TEST_CASE("document symbols: labelled blocks, nested classes and subroutine ranges",
+          "[document_symbols]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_docsym_blocks.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    logic [7:0] count;\n"
+                       "    always_comb begin : proc_shadow\n"
+                       "        logic [7:0] shadowed;\n"
+                       "        shadowed = 8'hFF;\n"
+                       "    end\n"
+                       "    for (genvar i = 0; i < 2; i++) begin : gen_lane\n"
+                       "        logic [7:0] lane_count;\n"
+                       "    end\n"
+                       "    function automatic logic [7:0] f(input logic [7:0] a);\n"
+                       "        return a;\n"
+                       "    endfunction\n"
+                       "endmodule\n"
+                       "class holder;\n"
+                       "    class inner_cfg;\n"
+                       "        int depth;\n"
+                       "    endclass\n"
+                       "endclass\n");
+
+    lsDocumentSymbolParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    const auto symbols = provide_document_symbols(analyzer, params);
+
+    const std::function<const lsDocumentSymbol*(const std::vector<lsDocumentSymbol>&,
+                                                const std::string&)>
+        find = [&](const std::vector<lsDocumentSymbol>& nodes,
+                   const std::string& name) -> const lsDocumentSymbol* {
+        for (const auto& node : nodes) {
+            if (node.name == name)
+                return &node;
+            if (node.children)
+                if (const auto* hit = find(*node.children, name))
+                    return hit;
+        }
+        return nullptr;
+    };
+
+    SECTION("a named statement block is a scope in the outline") {
+        const auto* block = find(symbols, "proc_shadow");
+        REQUIRE(block != nullptr);
+        REQUIRE(block->children.has_value());
+        CHECK(find(*block->children, "shadowed") != nullptr);
+    }
+
+    SECTION("a generate block reports its declarations") {
+        const auto* block = find(symbols, "gen_lane");
+        REQUIRE(block != nullptr);
+        REQUIRE(block->children.has_value());
+        CHECK(find(*block->children, "lane_count") != nullptr);
+    }
+
+    SECTION("a subroutine reports its whole body as its range") {
+        const auto* fn = find(symbols, "f");
+        REQUIRE(fn != nullptr);
+        CHECK(fn->range.end.line > fn->range.start.line);
+    }
+
+    SECTION("a nested class is nested in the outline") {
+        const auto* holder = find(symbols, "holder");
+        REQUIRE(holder != nullptr);
+        REQUIRE(holder->children.has_value());
+        CHECK(find(*holder->children, "inner_cfg") != nullptr);
+    }
 }

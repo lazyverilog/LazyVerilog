@@ -317,10 +317,22 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     if (cls.extendsClause)
         entry.base_class = node_text_raw(sm, *cls.extendsClause->baseName);
 
+    // A class declared inside another class body, collected first so the outer
+    // entry's own index is not shifted by the nested ones.
+    std::vector<const ClassDeclarationSyntax*> nested_classes;
+
     for (const auto* item : cls.items) {
         if (!item)
             continue;
+        if (const auto* nested = item->as_if<ClassDeclarationSyntax>()) {
+            nested_classes.push_back(nested);
+            continue;
+        }
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+            if (const auto* inner = prop->declaration->as_if<ClassDeclarationSyntax>()) {
+                nested_classes.push_back(inner);
+                continue;
+            }
             // `typedef registry #(T) type_id;` in a class body is a member of
             // that class, reached as `my_item::type_id`.  The shard builder
             // indexes these; the open-buffer index has to as well, or the same
@@ -387,7 +399,11 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         index.package_class_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
+    const std::string own_name = entry.name;
     index.classes.push_back(std::move(entry));
+
+    for (const auto* nested : nested_classes)
+        process_class(*nested, index, resolver, sm, own_name);
 }
 
 void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,

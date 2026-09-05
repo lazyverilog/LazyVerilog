@@ -714,6 +714,17 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             scope_stack.pop_back();
         }
 
+        // A generate block owns its declarations too.  Without a scope pushed
+        // here, `handle(DataDeclarationSyntax)` sees scope_stack.size() == 1 and
+        // records nothing at all, so a signal declared directly inside
+        // `for (...) begin : g_lanes` was missing from the index entirely — and
+        // therefore from the document outline.
+        void handle(const GenerateBlockSyntax& node) {
+            scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
         void handle(const LocalVariableDeclarationSyntax& node) {
             const auto type_text = render_syntax_node_text(sm, *node.type);
             const auto [scope_start, scope_end] =
@@ -791,10 +802,24 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     if (cls.extendsClause)
         entry.base_class = render_syntax_node_text(sm, *cls.extendsClause->baseName);
 
+    // A class declared inside another class body is a member of it and is
+    // reached as `outer::inner`.  Collected before the member loop so the outer
+    // ClassEntry, which is pushed at the end, does not shift the indices the
+    // nested classes register.
+    std::vector<const ClassDeclarationSyntax*> nested_classes;
+
     for (const auto* item : cls.items) {
         if (!item)
             continue;
+        if (const auto* nested = item->as_if<ClassDeclarationSyntax>()) {
+            nested_classes.push_back(nested);
+            continue;
+        }
         if (const auto* prop = item->as_if<ClassPropertyDeclarationSyntax>()) {
+            if (const auto* nested = prop->declaration->as_if<ClassDeclarationSyntax>()) {
+                nested_classes.push_back(nested);
+                continue;
+            }
             // `typedef registry #(T) type_id;` inside a class body is a member
             // of that class, reached as `my_item::type_id`.  Indexing only the
             // data declarators hides every such type from closed-file lookup.
@@ -864,7 +889,11 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
         index.package_class_by_scoped_name.try_emplace(
             package_scoped_key(entry.parent_scope, entry.name), index.classes.size());
     index.class_by_name.try_emplace(entry.name, index.classes.size());
+    const std::string own_name = entry.name;
     index.classes.push_back(std::move(entry));
+
+    for (const auto* nested : nested_classes)
+        process_class(*nested, index, resolver, sm, own_name);
 }
 
 static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
