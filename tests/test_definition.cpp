@@ -1704,3 +1704,65 @@ TEST_CASE("definition: interface port members and modport names resolve", "[defi
         CHECK(loc->col == 21);
     }
 }
+
+// Hierarchical references resolved only the simplest shape.  The instance name
+// itself matched no declarator, a generate-block label had no type so its
+// members were unreachable, and an indexed generate segment broke the walk at
+// the very first step.
+TEST_CASE("definition: hierarchical paths through instances and generate blocks",
+          "[definition][hierarchy]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_hier_generate";
+    std::filesystem::create_directories(dir);
+    const auto leaf = dir / "hier_leaf.sv";
+    {
+        std::ofstream out(leaf);
+        out << "module hier_leaf (input logic d_i);\n"
+               "  logic state_q;\n"
+               "  assign state_q = d_i;\n"
+               "endmodule\n";
+    }
+    const std::string top_text = "module hier_top;\n"
+                                 "  logic probe;\n"
+                                 "  for (genvar i = 0; i < 2; i++) begin : gen_lane\n"
+                                 "    logic [7:0] lane_count;\n"
+                                 "    hier_leaf u_leaf (.d_i(1'b0));\n"
+                                 "  end\n"
+                                 "  assign probe = gen_lane[0].u_leaf.state_q;\n"
+                                 "  assign probe = gen_lane.lane_count[0];\n"
+                                 "endmodule\n";
+    const auto top = dir / "hier_top.sv";
+    {
+        std::ofstream out(top);
+        out << top_text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({leaf.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(top);
+    analyzer.open(uri, top_text);
+
+    SECTION("instance name inside a hierarchical path") {
+        auto loc = analyzer.definition_of(uri, 6, 29);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 4);
+    }
+
+    SECTION("signal reached through an indexed generate segment") {
+        auto loc = analyzer.definition_of(uri, 6, 36);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri_from_path(leaf));
+        CHECK(loc->line == 1);
+    }
+
+    SECTION("declaration inside a named generate block") {
+        auto loc = analyzer.definition_of(uri, 7, 27);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 16);
+    }
+
+    std::filesystem::remove_all(dir);
+}
