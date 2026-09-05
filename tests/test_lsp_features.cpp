@@ -2083,3 +2083,46 @@ TEST_CASE("hover: macro-generated field type and enum member type", "[hover]") {
 
     std::filesystem::remove_all(dir);
 }
+
+// The emitted instance is formatted as an isolated snippet, so the formatter
+// re-indented it from column 0 and the instantiation came out flush left no
+// matter how the original was indented.
+TEST_CASE("autoinst: expansion keeps the original indentation", "[autoinst]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_autoinst_indent_leaf.sv";
+    {
+        std::ofstream out(path);
+        out << "module indent_leaf (\n"
+               "    input  logic clk_i,\n"
+               "    output logic d_o\n"
+               ");\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = "file:///tmp/lazyverilog_autoinst_indent_top.sv";
+    analyzer.open(uri, "module top;\n"
+                       "    indent_leaf u_leaf ();\n"
+                       "endmodule\n");
+
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.range.start = lsPosition(1, 0);
+    params.range.end = lsPosition(1, 0);
+    const auto actions = provide_code_actions(analyzer, Config{}, params);
+
+    const CodeAction* autoinst = nullptr;
+    for (const auto& action : actions)
+        if (action.title.rfind("AutoInst", 0) == 0)
+            autoinst = &action;
+    REQUIRE(autoinst != nullptr);
+    REQUIRE(autoinst->edit.has_value());
+    REQUIRE(autoinst->edit->changes.has_value());
+    const auto& edits = autoinst->edit->changes->begin()->second;
+    REQUIRE(edits.size() == 1);
+    CHECK(edits[0].newText.rfind("    indent_leaf", 0) == 0);
+
+    std::filesystem::remove(path);
+}
