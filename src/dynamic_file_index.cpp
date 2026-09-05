@@ -434,7 +434,8 @@ void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& index,
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const auto type = node_text_raw(sm, *member->type);
+            // Expanded on purpose; see the same call in syntax_index.cpp.
+            const auto type = render_syntax_node_text_expanded(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;

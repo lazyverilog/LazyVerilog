@@ -2855,7 +2855,11 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // DeclaratorSyntax, but hover must still reconstruct the field's
             // declaration type from StructUnionMemberSyntax::type plus any
             // declarator-local unpacked dimensions.
-            auto base_type = render_syntax_node_text(sm, *node.type);
+            //
+            // Rendered expanded: a struct declared inside a shared header's
+            // macro body would otherwise report every field's type as the macro
+            // invocation the user wrote, which is not a type at all.
+            auto base_type = render_syntax_node_text_expanded(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -2863,7 +2867,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 auto detail = base_type;
                 detail = append_hover_suffix(detail,
                                              render_hover_dimensions(sm, declarator->dimensions));
-                set_from_token(declarator->name, "variable", detail);
+                set_from_token(declarator->name, "field", detail);
             }
         }
 
@@ -2950,6 +2954,21 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // cursor named an owner, only that owner's copy may answer.
             if (owner.empty() || (!enclosing_class.empty() && enclosing_class.back() == owner))
                 set_from_token(node.name, "typedef", render_syntax_node_text(sm, *node.type));
+
+            // An enum member's useful hover fact is the enum it belongs to, and
+            // that name lives on the typedef, not on the member.  Without this
+            // a member declared in the file being edited hovered as a bare
+            // "symbol" with no body at all.
+            if (!result) {
+                if (const auto* enum_type =
+                        node.type->as_if<slang::syntax::EnumTypeSyntax>()) {
+                    const std::string enum_name(node.name.valueText());
+                    for (const auto* member : enum_type->members) {
+                        if (member)
+                            set_from_token(member->name, "enum_member", enum_name);
+                    }
+                }
+            }
             if (!result)
                 visitDefault(node);
         }
@@ -3620,18 +3639,21 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
         if (index_entry_location_matches(idx, td.file_id, td.line, td.col, definition))
             return symbol_info_for_typedef_entry(td, td.name, definition);
         for (const auto& field : td.fields) {
+            // A struct or union member is a field, not a free-standing variable.
             if (index_entry_location_matches(idx, field.file_id, field.line, field.col, definition))
                 return SymbolInfo{.name = field.name,
-                                  .kind = "variable",
+                                  .kind = "field",
                                   .detail = field.type,
                                   .line = definition.line,
                                   .col = definition.col};
         }
         for (const auto& member : td.enum_members) {
+            // Naming the enum it belongs to is what makes this hover useful;
+            // "enum member" repeated the kind label and said nothing else.
             if (index_entry_location_matches(idx, member.file_id, member.line, member.col, definition))
                 return SymbolInfo{.name = member.name,
                                   .kind = "enum_member",
-                                  .detail = "enum member",
+                                  .detail = td.name.empty() ? std::string("enum member") : td.name,
                                   .line = definition.line,
                                   .col = definition.col};
         }
