@@ -2519,6 +2519,23 @@ static bool class_derives_from(std::span<const ClassLookupShard> shards, std::st
     return false;
 }
 
+/// Class that @p class_name extends, searched across shards.
+///
+/// `super.member` names a member of the base class specifically.  Letting it
+/// resolve against the derived class instead is only invisible while the derived
+/// class does not redeclare the member -- `super.new()` always does.
+static std::optional<std::string> find_class_base_name(std::span<const ClassLookupShard> shards,
+                                                       std::string_view class_name) {
+    if (class_name.empty())
+        return std::nullopt;
+    for (const auto& shard : shards) {
+        const auto* cls = find_class_entry(*shard.index, class_name);
+        if (cls && !cls->base_class.empty())
+            return base_class_lookup_name(cls->base_class);
+    }
+    return std::nullopt;
+}
+
 // Declared type of `field_name` on `class_name` or any ancestor, searched
 // across shards.  The receiver of a member access is often itself an inherited
 // field, e.g. `seq_item_port` declared by `uvm_driver` and used from a subclass.
@@ -3430,7 +3447,14 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
 
-        if (token.kind == slang::parsing::TokenKind::Identifier &&
+        // `new` is lexed as a keyword, not an identifier, so `super.new(...)`
+        // never reached the member-access branch and resolved to nothing --
+        // while `super.arm(...)` right next to it worked.  The constructor is
+        // indexed like any other method; only this classification was missing.
+        const bool is_member_name_token =
+            token.kind == slang::parsing::TokenKind::Identifier ||
+            token.kind == slang::parsing::TokenKind::NewKeyword;
+        if (is_member_name_token &&
             token_contains_position_in_uri(sm, token, uri, line, col)) {
             auto object_path = receiver_chain_before_member_dot(token);
             if (!object_path.empty()) {
@@ -3446,6 +3470,10 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target.scope_class = current_class;
                 return;
             }
+            // A bare `new` is an object creation, not a name the user can be
+            // asking about; only `receiver.new` is a member reference.
+            if (token.kind == slang::parsing::TokenKind::NewKeyword)
+                return;
             target.kind = DefinitionTargetKind::Generic;
             target.name = std::string(token.valueText());
             target.scope_module = current_module;
@@ -4404,7 +4432,21 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // `b` is a field of `a`'s type, not a declaration the module has.
         const std::string& base_receiver =
             target.object_path.empty() ? target.object_name : target.object_path.front();
-        auto class_type = class_type_for_object_reference(current_index, target.scope_module,
+
+        // `super` and `this` are not declarations to look up; they name the base
+        // class and the enclosing class directly.  Resolving `super` explicitly
+        // matters for a member the derived class also declares -- a constructor
+        // always is one, which is why `super.arm()` worked and `super.new()`
+        // answered with the derived class's own `new`.
+        std::optional<std::string> class_type;
+        if (!target.scope_class.empty()) {
+            if (base_receiver == "super")
+                class_type = find_class_base_name(class_lookup_shards(), target.scope_class);
+            else if (base_receiver == "this")
+                class_type = target.scope_class;
+        }
+        if (!class_type)
+            class_type = class_type_for_object_reference(current_index, target.scope_module,
                                                           base_receiver, use_line_one_based);
         if (!class_type) {
             class_type = class_type_for_object_reference_in_tree(
