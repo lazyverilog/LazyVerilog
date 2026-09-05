@@ -1766,3 +1766,31 @@ TEST_CASE("definition: hierarchical paths through instances and generate blocks"
 
     std::filesystem::remove_all(dir);
 }
+
+// `new` is lexed as a keyword rather than an identifier, so `super.new(...)`
+// never reached the member-access path.  `super` also has to resolve to the base
+// class explicitly: a constructor is always redeclared by the derived class, so
+// walking the hierarchy from the derived class stops at the wrong `new`.
+TEST_CASE("definition: super.new resolves to the base class constructor",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_super_new.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    class base_txn;\n"
+                       "        int payload;\n"
+                       "        function new(int payload);\n"
+                       "            this.payload = payload;\n"
+                       "        endfunction\n"
+                       "    endclass\n"
+                       "    class byte_txn extends base_txn;\n"
+                       "        function new(int payload);\n"
+                       "            super.new(payload);\n"
+                       "        endfunction\n"
+                       "    endclass\n"
+                       "endpackage\n");
+
+    auto loc = analyzer.definition_of(uri, 9, 18);
+    REQUIRE(loc.has_value());
+    // The base constructor, not byte_txn's own `new` on line 8.
+    CHECK(loc->line == 3);
+}
