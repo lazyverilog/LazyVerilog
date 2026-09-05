@@ -159,6 +159,32 @@ static void append_index_symbols(const SyntaxIndex& index, const std::string& ur
                  method.file_id, method.line, method.col, cls.name);
         }
     }
+
+    // Package and module subroutines, and typedefs.
+    //
+    // These live in `values` / `typedefs`, which are far larger than `modules` +
+    // `classes` — on a UVM- or cva6-scale project they are the biggest
+    // collections in a shard.  Walking them for an empty query would build a
+    // vector of every value in the design only to throw all but kResultLimit of
+    // it away, and a client sends an empty query the moment the symbol picker
+    // opens.  So: only for a real query, and `emit()` scores before it allocates,
+    // which keeps a non-match down to one score call.
+    if (query.name.empty())
+        return;
+
+    for (const auto& value : index.values) {
+        if (value.kind != "function" && value.kind != "task")
+            continue;
+        emit(value.name, value.kind == "task" ? lsSymbolKind::Method : lsSymbolKind::Function,
+             value.file_id, value.line, value.col, value.parent_scope);
+    }
+
+    for (const auto& td : index.typedefs) {
+        const lsSymbolKind kind = td.is_struct  ? lsSymbolKind::Struct
+                                  : td.is_enum  ? lsSymbolKind::Enum
+                                                : lsSymbolKind::TypeParameter;
+        emit(td.name, kind, td.file_id, td.line, td.col, td.parent_scope);
+    }
 }
 } // namespace
 

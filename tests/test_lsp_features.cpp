@@ -1974,3 +1974,51 @@ TEST_CASE("signature help: package-qualified call to a closed-file function", "[
 
     std::filesystem::remove(path);
 }
+
+// Project-wide symbol search indexed modules, classes and class methods only, so
+// a package helper function or a typedef could not be found at all -- while a
+// UVM method right next to it could.
+TEST_CASE("workspace symbols: package subroutines and typedefs are searchable",
+          "[workspace_symbols]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_ws_pkg_symbols.sv";
+    {
+        std::ofstream out(path);
+        out << "package shape_pkg;\n"
+               "    typedef struct packed { logic v; } outer_t;\n"
+               "    typedef enum logic { MODE_IDLE } mode_e;\n"
+               "    function automatic int clog2_ceil(input int v);\n"
+               "        return v;\n"
+               "    endfunction\n"
+               "endpackage\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto query = [&](const std::string& text) {
+        WorkspaceSymbolParams params;
+        params.query = text;
+        return provide_workspace_symbols(analyzer, params);
+    };
+
+    SECTION("a package function is found") {
+        const auto symbols = query("clog2_ceil");
+        REQUIRE(symbols.size() == 1);
+        CHECK(symbols[0].name == "clog2_ceil");
+    }
+
+    SECTION("a struct typedef is found") {
+        const auto symbols = query("outer_t");
+        REQUIRE(symbols.size() == 1);
+        CHECK(symbols[0].name == "outer_t");
+    }
+
+    SECTION("an empty query still lists only the navigation-level declarations") {
+        const auto symbols = query("");
+        for (const auto& symbol : symbols)
+            CHECK(symbol.name == "shape_pkg");
+    }
+
+    std::filesystem::remove(path);
+}
