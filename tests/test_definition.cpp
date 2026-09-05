@@ -1664,3 +1664,43 @@ TEST_CASE("definition: member access resolves through a multi-level receiver",
         CHECK(loc->col == 20);
     }
 }
+
+// An interface port had no recorded type at all, so neither the modport name nor
+// any signal reached through the port could be resolved.  Both facts were already
+// in the index (interface_names, ModuleEntry::modports, the interface's ports) —
+// only the lookup was missing.
+TEST_CASE("definition: interface port members and modport names resolve", "[definition][interface]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_interface_port.sv";
+    analyzer.open(uri, "interface simple_bus;\n"
+                       "    logic aw_valid;\n"
+                       "    logic b_valid;\n"
+                       "    modport Slave (input aw_valid, output b_valid);\n"
+                       "endinterface\n"
+                       "module dev (\n"
+                       "    simple_bus.Slave bus\n"
+                       ");\n"
+                       "    assign bus.b_valid = bus.aw_valid;\n"
+                       "endmodule\n");
+
+    SECTION("modport name in the port header") {
+        auto loc = analyzer.definition_of(uri, 6, 16);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 12);
+    }
+
+    SECTION("signal reached through the interface port") {
+        auto loc = analyzer.definition_of(uri, 8, 30);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 10);
+    }
+
+    SECTION("the port itself still resolves to its declaration") {
+        auto loc = analyzer.definition_of(uri, 8, 12);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 21);
+    }
+}
