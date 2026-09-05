@@ -506,8 +506,25 @@ struct InsertionLineFinder : public SyntaxVisitor<InsertionLineFinder> {
         int line = token_line(sm, node.keyword);
         if (first_proc < 0 || line < first_proc)
             first_proc = line;
-        visitDefault(node);
+        // Deliberately no visitDefault: declarations inside the block body are
+        // not module-level anchors.  See handle(FunctionDeclarationSyntax).
     }
+
+    // AutoWire inserts module-level declarations, so only module-level
+    // declarations may anchor the insertion point.  Descending into a
+    // subroutine or a generate block made `last_decl` the line of a nested
+    // declaration, and the new nets were then written inside that body:
+    //
+    //     logic [7:0] count;        // the correct anchor
+    //     function automatic f(...);
+    //         logic [7:0] tmp;      // used to win, so nets landed below here
+    //         tmp = count + 1;      // ... which is inside the function
+    //     endfunction
+    //
+    // Skipping these subtrees is also strictly less work than walking them.
+    void handle(const FunctionDeclarationSyntax&) {}
+    void handle(const GenerateBlockSyntax&) {}
+    void handle(const BlockStatementSyntax&) {}
 };
 
 static int find_insertion_line(const DocumentState& state, LineRange range, BufferID host_buffer) {

@@ -1,5 +1,7 @@
 #include "analyzer.hpp"
 #include "features/autofunc.hpp"
+#include "features/autowire.hpp"
+#include "dynamic_file_index.hpp"
 #include "features/autoinst.hpp"
 #include "features/code_action.hpp"
 #include "features/hover.hpp"
@@ -1900,4 +1902,38 @@ endmodule
     CHECK(help->signatures[0].label == "bump(int amount, int scale)");
 
     std::filesystem::remove(path);
+}
+
+
+// AutoWire inserts module-level declarations, so its insertion anchor must be a
+// module-level declaration.  It used to take the last declaration found anywhere
+// in the module, so a subroutine local placed the new nets inside the function
+// body -- where they are function locals and the instance ports stay undeclared.
+TEST_CASE("autowire: insertion anchor ignores declarations nested in a subroutine",
+          "[autowire]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_autowire_nested_anchor.sv";
+    const std::string text = "module top;\n"
+                             "  logic [7:0] count;\n"
+                             "  function automatic logic [7:0] f(input logic [7:0] a);\n"
+                             "    logic [7:0] tmp;\n"
+                             "    tmp = a + 8'd1;\n"
+                             "    return tmp;\n"
+                             "  endfunction\n"
+                             "  assign count = f(8'h0);\n"
+                             "  sub u_sub (.o_data(net_y));\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state);
+    AutowireOptions options;
+    const auto applied = autowire_apply(*state, get_structural_index(*state), options, 8);
+
+    const auto decl = applied.find("net_y;");
+    REQUIRE(decl != std::string::npos);
+    const auto function_start = applied.find("function automatic");
+    REQUIRE(function_start != std::string::npos);
+    // The declaration must land above the subroutine, not inside its body.
+    CHECK(decl < function_start);
 }
