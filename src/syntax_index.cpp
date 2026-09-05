@@ -925,7 +925,11 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
         for (const auto* member : struct_type->members) {
             if (!member)
                 continue;
-            const std::string type_text = render_syntax_node_text(sm, *member->type);
+            // A struct declared inside a shared header's macro body would
+            // otherwise report every field's type as the macro invocation the
+            // user wrote, which is not a type.  The field's own tokens are the
+            // answer here; the invocation spelling belongs to the invocation.
+            const std::string type_text = render_syntax_node_text_expanded(sm, *member->type);
             for (const auto* decl : member->declarators) {
                 if (!decl)
                     continue;

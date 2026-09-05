@@ -767,14 +767,15 @@ endmodule
     auto struct_addr_hover = hover_on("struct_addr");
     REQUIRE(struct_addr_hover.has_value());
     REQUIRE(struct_addr_hover->contents.second.has_value());
+    // A struct member is a field, not a free-standing variable.
     CHECK(struct_addr_hover->contents.second->value ==
-          "**struct_addr** — *variable*\n\n---\n\n```\nlogic [7:0]\n```");
+          "**struct_addr** — *field*\n\n---\n\n```\nlogic [7:0]\n```");
 
     auto valid_hover = hover_on("valid");
     REQUIRE(valid_hover.has_value());
     REQUIRE(valid_hover->contents.second.has_value());
     CHECK(valid_hover->contents.second->value ==
-          "**valid** — *variable*\n\n---\n\n```\nlogic\n```");
+          "**valid** — *field*\n\n---\n\n```\nlogic\n```");
 
     auto data_hover = hover_on("data;");
     REQUIRE(data_hover.has_value());
@@ -2021,4 +2022,64 @@ TEST_CASE("workspace symbols: package subroutines and typedefs are searchable",
     }
 
     std::filesystem::remove(path);
+}
+
+// Hover reported facts it had but rendered wrongly: a struct member declared
+// inside a shared header's macro body showed the whole macro invocation as its
+// "type", and an enum member showed nothing but the word "enum member".
+TEST_CASE("hover: macro-generated field type and enum member type", "[hover]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_hover_macro_field";
+    std::filesystem::create_directories(dir);
+    const auto header = dir / "defs.svh";
+    {
+        std::ofstream out(header);
+        out << "`define declare_cfg_bus_s(pfx)   \\\n"
+               "    typedef struct packed {      \\\n"
+               "        mode_e     pfx``_mode;   \\\n"
+               "        logic [1:0] pfx``_id;    \\\n"
+               "    } cfg_bus_s\n";
+    }
+    const std::string text = "`include \"defs.svh\"\n"
+                             "module top;\n"
+                             "    typedef enum logic [1:0] { MODE_IDLE, MODE_RUN } mode_e;\n"
+                             "    `declare_cfg_bus_s(icache);\n"
+                             "    cfg_bus_s bus;\n"
+                             "    logic hit;\n"
+                             "    assign hit = (bus.icache_mode == MODE_RUN);\n"
+                             "endmodule\n";
+    const auto source = dir / "top.sv";
+    {
+        std::ofstream out(source);
+        out << text;
+    }
+
+    Analyzer analyzer;
+    const std::string uri = uri_from_path(source);
+    analyzer.open(uri, text);
+
+    const auto hover_at = [&](int line, int character) {
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(line, character);
+        return provide_hover(analyzer, params);
+    };
+
+    SECTION("a macro-generated field shows its own type, not the macro call") {
+        auto hover = hover_at(6, 26);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        const auto& value = hover->contents.second->value;
+        CHECK(value.find("mode_e") != std::string::npos);
+        CHECK(value.find("`declare_cfg_bus_s") == std::string::npos);
+        CHECK(value.find("*field*") != std::string::npos);
+    }
+
+    SECTION("an enum member names the enum it belongs to") {
+        auto hover = hover_at(6, 42);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        CHECK(hover->contents.second->value.find("mode_e") != std::string::npos);
+    }
+
+    std::filesystem::remove_all(dir);
 }

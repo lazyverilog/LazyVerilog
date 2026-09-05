@@ -382,6 +382,24 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
     return trim_copy(std::move(text));
 }
 
+std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
+                                             const slang::syntax::SyntaxNode& node) {
+    (void)sm;
+    std::string text;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (!token || token.isMissing())
+            continue;
+        const std::string fragment(token.rawText());
+        if (fragment.empty())
+            continue;
+        if (syntax_needs_space_between_fragments(text, fragment))
+            text += ' ';
+        text += fragment;
+    }
+    return trim_copy(std::move(text));
+}
+
 std::string base_class_lookup_name(std::string_view base_class) {
     auto name = base_class.substr(0, base_class.find('#'));
     if (const auto scope = name.rfind("::"); scope != std::string_view::npos)

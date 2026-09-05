@@ -175,6 +175,18 @@ std::string render_syntax_token_text(const slang::SourceManager& sm,
 std::string render_syntax_node_text(const slang::SourceManager& sm,
                                     const slang::syntax::SyntaxNode& node);
 
+/// Same, but always renders the tokens themselves instead of substituting the
+/// macro invocation they came from.
+///
+/// render_syntax_node_text() deliberately shows the user's spelling, which is
+/// right for a node the user wrote (`` `uvm_object_utils(T) ``).  It is wrong
+/// for a declaration that *lives inside* a macro body in a shared header: the
+/// field `bp_lce_mode_e icache_mode;` inside `declare_bp_cfg_bus_s` would
+/// otherwise report its type as the whole `` `declare_bp_cfg_bus_s(...) ``
+/// invocation, which is not a type at all.
+std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
+                                             const slang::syntax::SyntaxNode& node);
+
 /// Render the hover/documentation signature block for a function or task
 /// prototype.  Shared so the closed-file shard and the open-buffer dynamic
 /// index produce byte-identical `ValueEntry::signature` text for the same
