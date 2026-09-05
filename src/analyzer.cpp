@@ -2123,6 +2123,31 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
     return visitor.result;
 }
 
+/// Declared type of `type_name.field_name` when `type_name` is a typedef'd
+/// struct or union.  The struct-shaped counterpart of
+/// find_class_field_type_in_hierarchy(); aggregates have no base type to walk.
+static std::optional<std::string> find_typedef_field_type(const SyntaxIndex& index,
+                                                          std::string_view type_name,
+                                                          std::string_view field_name) {
+    if (type_name.empty() || field_name.empty())
+        return std::nullopt;
+
+    for (const auto& td : index.typedefs) {
+        const std::string scoped_name =
+            td.parent_scope.empty() ? td.name : td.parent_scope + "::" + td.name;
+        if (td.name != type_name && scoped_name != type_name)
+            continue;
+        for (const auto& field : td.fields) {
+            if (field.name != field_name || field.type.empty())
+                continue;
+            auto type = canonical_type_name_from_text(field.type);
+            if (!type.empty())
+                return type;
+        }
+    }
+    return std::nullopt;
+}
+
 static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& index,
                                                             const std::string& uri,
                                                             std::string_view type_name,
@@ -2842,6 +2867,17 @@ struct DefinitionTarget {
     std::string module_name;
     std::string subroutine_name;
     std::string object_name;
+    // Whole dotted receiver written before `name`, outermost first.
+    //
+    //     csr_addr.csr_decode.priv_lvl   cursor on priv_lvl
+    //     -> {"csr_addr", "csr_decode"}
+    //
+    // `object_name` is the innermost element and stays the answer for the common
+    // one-hop case.  The rest is what a chain deeper than one dot needs: the
+    // innermost element alone is a field name, not something declared in the
+    // enclosing module, so resolution has to start from the outermost receiver
+    // and follow each field's type in turn.
+    std::vector<std::string> object_path;
     // Left-hand side of a `pkg::name` qualification, verbatim.  The visitor only
     // has the syntax tree, so it cannot know whether this really names a
     // package; definition_of_state() decides that against the index.
@@ -2893,6 +2929,49 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         if (!token_contains_position_in_uri(sm, token, uri, line, col))
             return false;
         return !(sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()));
+    }
+
+    /// Whole dotted receiver written before @p token, outermost first.
+    ///
+    /// Scanning back only one word stops at the second dot of `a.b.c`, which is
+    /// why a chain deeper than one hop used to resolve to nothing.
+    std::vector<std::string> receiver_chain_before_member_dot(
+        const slang::parsing::Token& token) const {
+        if (!token || !token.location().valid())
+            return {};
+        // Ask the question of the text the user actually typed; see the note in
+        // object_before_member_dot() about macro arguments.
+        auto loc = token.location();
+        if (sm.isMacroArgLoc(loc))
+            loc = sm.getFullyOriginalLoc(loc);
+        if (!loc.valid())
+            return {};
+        const auto source = sm.getSourceText(loc.buffer());
+        size_t i = loc.offset();
+        if (i > source.size())
+            return {};
+
+        // Bounded: a receiver deeper than this is not something the compact
+        // index can follow anyway, and the cap keeps the scan off the hot path.
+        constexpr size_t kMaxReceiverChain = 8;
+        std::vector<std::string> chain;
+        while (chain.size() < kMaxReceiverChain) {
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            if (i == 0 || source[i - 1] != '.')
+                break;
+            --i;
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            const size_t end = i;
+            while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
+                --i;
+            if (i == end)
+                break;
+            chain.emplace_back(source.substr(i, end - i));
+        }
+        std::reverse(chain.begin(), chain.end());
+        return chain;
     }
 
     std::string object_before_member_dot(const slang::parsing::Token& token) const {
@@ -3130,11 +3209,34 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         visitDefault(node);
     }
 
+    /// Receiver identifiers of a member-access expression, outermost first.
+    ///
+    /// An element select is transparent here: every copy of a generate loop
+    /// shares one declaration, so `gen[0].u.sig` resolves like `gen.u.sig`.
+    static void collect_receiver_chain(const slang::syntax::ExpressionSyntax* expr,
+                                       std::vector<std::string>& out) {
+        if (!expr || out.size() > 8)
+            return;
+        if (const auto* ident = expr->as_if<slang::syntax::IdentifierNameSyntax>()) {
+            out.emplace_back(ident->identifier.valueText());
+            return;
+        }
+        if (const auto* member = expr->as_if<slang::syntax::MemberAccessExpressionSyntax>()) {
+            collect_receiver_chain(member->left, out);
+            out.emplace_back(member->name.valueText());
+            return;
+        }
+        if (const auto* select = expr->as_if<slang::syntax::ElementSelectExpressionSyntax>())
+            collect_receiver_chain(select->left, out);
+    }
+
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
         if (token_claims_cursor(node.name)) {
             target.kind = DefinitionTargetKind::ClassMember;
             target.name = std::string(node.name.valueText());
-            target.object_name = simple_identifier_from_expr(node.left);
+            collect_receiver_chain(node.left, target.object_path);
+            target.object_name =
+                target.object_path.empty() ? std::string{} : target.object_path.back();
             target.scope_module = current_module;
             target.scope_package = current_package;
             return;
@@ -3177,11 +3279,12 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
 
         if (token.kind == slang::parsing::TokenKind::Identifier &&
             token_contains_position_in_uri(sm, token, uri, line, col)) {
-            const auto object_name = object_before_member_dot(token);
-            if (!object_name.empty()) {
+            auto object_path = receiver_chain_before_member_dot(token);
+            if (!object_path.empty()) {
                 target.kind = DefinitionTargetKind::ClassMember;
                 target.name = std::string(token.valueText());
-                target.object_name = object_name;
+                target.object_name = object_path.back();
+                target.object_path = std::move(object_path);
                 target.scope_module = current_module;
                 target.scope_package = current_package;
                 // The receiver of `obj.member` inside a class body is looked up
@@ -4129,27 +4232,51 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         //
         // jumps to `class Packet::req_data`, not to an unrelated unit-level
         // `task req_data`.
+        // Resolution starts at the outermost receiver.  For `a.b.c` that is `a`;
+        // `b` is a field of `a`'s type, not a declaration the module has.
+        const std::string& base_receiver =
+            target.object_path.empty() ? target.object_name : target.object_path.front();
         auto class_type = class_type_for_object_reference(current_index, target.scope_module,
-                                                          target.object_name, use_line_one_based);
+                                                          base_receiver, use_line_one_based);
         if (!class_type) {
             class_type = class_type_for_object_reference_in_tree(
-                *state.tree, uri, target.scope_module, target.object_name, use_line_one_based);
+                *state.tree, uri, target.scope_module, base_receiver, use_line_one_based);
         }
         // Inside a class body the enclosing scope is the class, not a module,
         // and the receiver may be a property, a method local, an argument, or a
         // field the class only inherits.
         if (!class_type && !target.scope_class.empty()) {
             class_type = class_type_for_object_reference(current_index, target.scope_class,
-                                                         target.object_name, use_line_one_based);
+                                                         base_receiver, use_line_one_based);
             if (!class_type) {
                 class_type = class_type_for_object_reference_in_tree(
-                    *state.tree, uri, target.scope_class, target.object_name, use_line_one_based);
+                    *state.tree, uri, target.scope_class, base_receiver, use_line_one_based);
             }
             if (!class_type) {
-                class_type = find_class_field_type_in_hierarchy(
-                    class_lookup_shards(), target.scope_class, target.object_name);
+                class_type = find_class_field_type_in_hierarchy(class_lookup_shards(),
+                                                                target.scope_class, base_receiver);
             }
         }
+
+        // Follow the rest of the chain one field at a time: the type of `a.b` is
+        // the type of field `b` inside `a`'s type.  Bounded by the number of
+        // dots the user actually typed, and every step is a lookup in an index
+        // already held for this request.
+        for (size_t i = 1; class_type && i < target.object_path.size(); ++i) {
+            const auto shards = class_lookup_shards();
+            auto next = find_class_field_type_in_hierarchy(shards, *class_type,
+                                                           target.object_path[i]);
+            if (!next) {
+                for (const auto& shard : shards) {
+                    next = find_typedef_field_type(*shard.index, *class_type,
+                                                   target.object_path[i]);
+                    if (next)
+                        break;
+                }
+            }
+            class_type = std::move(next);
+        }
+
         if (class_type) {
             // The object type may name either a class or a typedef'd aggregate.
             // Search both compact index families so `obj.field` works for
