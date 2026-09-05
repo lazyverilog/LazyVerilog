@@ -187,6 +187,17 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
 std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
                                              const slang::syntax::SyntaxNode& node);
 
+/// Return the token a subroutine's *name* occupies.
+///
+/// A constructor's name parses as `SyntaxKind::ConstructorName`, which is a
+/// KeywordNameSyntax rather than an IdentifierNameSyntax, so an
+/// `as_if<IdentifierNameSyntax>()` test misses it.  Callers used to fall back to
+/// the `function` keyword there, which left go-to-definition on `super.new()`
+/// pointing a few columns left of `new`.  The keyword fallback is still the
+/// right answer for a name that is a macro-body literal, which has no
+/// identifier token of its own.
+slang::parsing::Token subroutine_name_token(const slang::syntax::FunctionPrototypeSyntax& proto);
+
 /// Render the hover/documentation signature block for a function or task
 /// prototype.  Shared so the closed-file shard and the open-buffer dynamic
 /// index produce byte-identical `ValueEntry::signature` text for the same
