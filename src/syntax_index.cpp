@@ -694,6 +694,15 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             scope_stack.pop_back();
         }
 
+        // A subroutine body restricts visibility exactly like begin/end does.
+        // Without this the enclosing module's range was used, so a function
+        // local was described as visible throughout the module.
+        void handle(const FunctionDeclarationSyntax& node) {
+            scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
+            visitDefault(node);
+            scope_stack.pop_back();
+        }
+
         void handle(const LocalVariableDeclarationSyntax& node) {
             const auto type_text = render_syntax_node_text(sm, *node.type);
             const auto [scope_start, scope_end] =

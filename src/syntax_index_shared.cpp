@@ -964,18 +964,66 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         //
         // Without the block in the identity, references and rename merge the two
         // and renaming the outer signal rewrites the inner one.
+        // A subroutine body and a begin/end block shadow the enclosing module the
+        // same way a generate block does:
+        //
+        //     logic [7:0] count;                                 // module_signal::top::count
+        //     function automatic f(input logic [7:0] count);     // top.f::count
+        //     always_comb begin : proc                           //
+        //         logic [7:0] count;                             // top.proc::count
+        //
+        // Without a distinct identity, references and rename merge all three and
+        // renaming the module signal rewrites the other two.
+        // Heterogeneous lookup: generate_scope_for() runs for every identifier
+        // token in the file, and a plain unordered_set<std::string> would build
+        // a temporary std::string per scope level per token.
+        struct TransparentStringHash {
+            using is_transparent = void;
+            size_t operator()(std::string_view text) const {
+                return std::hash<std::string_view>{}(text);
+            }
+        };
+
         struct GenerateScope {
             std::string scope;                       // "<module>.<label>"
-            std::unordered_set<std::string> names;   // declared directly in the block
+            std::unordered_set<std::string, TransparentStringHash, std::equal_to<>>
+                names;                               // declared directly in the block
+            // Generate blocks pre-collect their direct member declarations.
+            // Subroutine and statement-block scopes instead pick declarators up
+            // as the walk reaches them, which is free: SystemVerilog requires a
+            // local to be declared before it is used, so the set is already
+            // complete by the time a use is visited.
+            bool collect_declarators{false};
         };
         std::vector<GenerateScope> generate_scopes;
 
-        /// Innermost enclosing generate block that declares @p name, if any.
+        /// Innermost enclosing lexical scope that declares @p name, if any.
         const GenerateScope* generate_scope_for(std::string_view name) const {
             for (auto it = generate_scopes.rbegin(); it != generate_scopes.rend(); ++it)
-                if (it->names.contains(std::string(name)))
+                if (!it->names.empty() && it->names.find(name) != it->names.end())
                     return &*it;
             return nullptr;
+        }
+
+        /// Push a lexical scope that collects its declarations as they are met.
+        ///
+        /// The scope identity has to name an owner.  A bare `run::item` would be
+        /// spelled the same in every file that happens to declare a `run` task
+        /// with an `item` local, which would merge unrelated locals across the
+        /// project.  Without an owner, leave the declarations unresolved (`name:`)
+        /// and let the AST verification path in find_references() decide.
+        void push_declaring_scope(std::string_view label) {
+            const std::string_view owner =
+                !current_class_bare.empty()
+                    ? std::string_view(current_class_bare)
+                    : (!current_class.empty() ? std::string_view(current_class)
+                                              : std::string_view(current_module));
+            GenerateScope scope;
+            if (!owner.empty()) {
+                scope.scope = std::string(owner) + "." + std::string(label);
+                scope.collect_declarators = true;
+            }
+            generate_scopes.push_back(std::move(scope));
         }
 
         struct TypeImport {
@@ -1029,6 +1077,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         void handle(const DeclaratorSyntax& node) {
             if (in_subroutine_ && node.name)
                 subroutine_locals.insert(std::string(node.name.valueText()));
+            if (node.name && !generate_scopes.empty() &&
+                generate_scopes.back().collect_declarators)
+                generate_scopes.back().names.insert(std::string(node.name.valueText()));
             visitDefault(node);
         }
 
@@ -1224,9 +1275,62 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             const bool previously_in_subroutine = in_subroutine_;
             subroutine_locals.clear();
             in_subroutine_ = true;
+            push_declaring_scope(subroutine_scope_label(node));
             visitDefault(node);
+            generate_scopes.pop_back();
             in_subroutine_ = previously_in_subroutine;
             subroutine_locals = std::move(previous_locals);
+        }
+
+        /// Stable label for a subroutine's lexical scope.
+        std::string subroutine_scope_label(const FunctionDeclarationSyntax& node) const {
+            if (node.prototype && node.prototype->name) {
+                if (const auto token = last_identifier_token(*node.prototype->name))
+                    return std::string(token.valueText());
+            }
+            const auto [line, col] = token_pos(sm, node.getFirstToken());
+            return "sub@" + std::to_string(line) + ":" + std::to_string(col);
+        }
+
+        // Same reasoning as the generate block below: a declaration written
+        // inside begin/end is a different object from a module-level one that
+        // shares its name.  A block that declares nothing never matches in
+        // generate_scope_for(), so unnamed blocks cost nothing.
+        /// Whether this block declares anything of its own.
+        ///
+        /// A block that declares nothing can never shadow, so it needs no scope
+        /// and no identity string.  Checking is a shallow walk over the block's
+        /// direct items; building the scope for every begin/end in the design
+        /// is not.
+        static bool block_declares_anything(const BlockStatementSyntax& node) {
+            for (const auto* item : node.items) {
+                if (!item)
+                    continue;
+                if (item->kind == SyntaxKind::DataDeclaration ||
+                    item->kind == SyntaxKind::LocalVariableDeclaration ||
+                    item->kind == SyntaxKind::NetDeclaration)
+                    return true;
+            }
+            return false;
+        }
+
+        void handle(const BlockStatementSyntax& node) {
+            if (!block_declares_anything(node)) {
+                visitDefault(node);
+                return;
+            }
+            std::string label;
+            if (node.blockName)
+                label = std::string(node.blockName->name.valueText());
+            if (label.empty() && node.label)
+                label = std::string(node.label->name.valueText());
+            if (label.empty()) {
+                const auto [line, col] = token_pos(sm, node.begin);
+                label = "blk@" + std::to_string(line) + ":" + std::to_string(col);
+            }
+            push_declaring_scope(label);
+            visitDefault(node);
+            generate_scopes.pop_back();
         }
 
         // `extern function void bump(int amount);` declares the method just as
