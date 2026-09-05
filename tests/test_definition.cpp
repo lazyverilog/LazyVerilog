@@ -1627,3 +1627,40 @@ TEST_CASE("definition: type parameter resolves from its use and its declaration"
         CHECK(refs.size() == 3);
     }
 }
+
+// A receiver was resolved from a single identifier, so the second dot of
+// `a.b.c` had nothing to look up: `b` is a field of `a`'s type, not something
+// the enclosing module declares.  cva6 writes `csr_addr.csr_decode.priv_lvl`.
+TEST_CASE("definition: member access resolves through a multi-level receiver",
+          "[definition][member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_member_chain.sv";
+    analyzer.open(uri, "package p;\n"
+                       "    typedef struct packed {\n"
+                       "        logic [1:0] rw;\n"
+                       "        logic       priv_lvl;\n"
+                       "    } addr_t;\n"
+                       "    typedef struct packed {\n"
+                       "        addr_t decode;\n"
+                       "    } csr_t;\n"
+                       "endpackage\n"
+                       "module top;\n"
+                       "    p::csr_t csr_addr;\n"
+                       "    logic hit;\n"
+                       "    assign hit = csr_addr.decode.priv_lvl;\n"
+                       "endmodule\n");
+
+    SECTION("first hop still resolves") {
+        auto loc = analyzer.definition_of(uri, 12, 26);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 15);
+    }
+
+    SECTION("second hop resolves through the intermediate field's type") {
+        auto loc = analyzer.definition_of(uri, 12, 33);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 20);
+    }
+}
