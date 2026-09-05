@@ -1793,4 +1793,7 @@ TEST_CASE("definition: super.new resolves to the base class constructor",
     REQUIRE(loc.has_value());
     // The base constructor, not byte_txn's own `new` on line 8.
     CHECK(loc->line == 3);
+    // On `new`, not on the `function` keyword eight columns to its left:
+    // `        function new(int payload);`
+    CHECK(loc->col == 17);
 }

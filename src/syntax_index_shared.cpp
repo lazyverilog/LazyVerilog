@@ -12,6 +12,14 @@
 using namespace slang;
 using namespace slang::syntax;
 
+slang::parsing::Token subroutine_name_token(const FunctionPrototypeSyntax& proto) {
+    if (const auto* id = proto.name->as_if<IdentifierNameSyntax>())
+        return id->identifier;
+    if (proto.name->kind == SyntaxKind::ConstructorName)
+        return proto.name->as<KeywordNameSyntax>().keyword;
+    return proto.keyword;
+}
+
 std::string make_subroutine_signature(const FunctionPrototypeSyntax& proto,
                                       const std::string& name,
                                       const slang::SourceManager& sm) {

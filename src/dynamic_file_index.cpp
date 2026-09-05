@@ -360,7 +360,7 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // that identifier's own token, or the open-buffer index disagrees with
             // the shard index for the same file.
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             entry.methods.push_back(MethodEntry{.name = id_name
                                                     ? std::string(id_name->identifier.valueText())
@@ -381,7 +381,7 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // style loses every method the moment its file is opened.
             const auto& proto = *proto_item->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             auto [ml, mc] = token_pos_line1_col0(sm, name_tok);
             entry.methods.push_back(
                 MethodEntry{.name = id_name ? std::string(id_name->identifier.valueText())
@@ -684,7 +684,7 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
             // disk-backed one.
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             const auto name = id_name ? std::string(id_name->identifier.valueText())
                                       : node_text_raw(sm, *proto.name);
             auto [nl, nc] = token_pos_line1_col0(sm, name_tok);

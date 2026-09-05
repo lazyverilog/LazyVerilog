@@ -588,7 +588,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             const auto fn_name = id_name ? std::string(id_name->identifier.valueText())
                                          : render_syntax_node_text(sm, *proto.name);
             auto [nl, nc] = token_pos_line1_col0(sm, name_tok);
@@ -851,7 +851,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // simple identifier, matching the FunctionDeclarationSyntax handling
             // above.
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             MethodEntry m;
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
@@ -870,7 +870,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
             // inline bodies hides most of a class written in the extern style.
             const auto& proto = *proto_item->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
-            const auto name_tok = id_name ? id_name->identifier : proto.keyword;
+            const auto name_tok = subroutine_name_token(proto);
             MethodEntry m;
             m.name = id_name ? std::string(id_name->identifier.valueText())
                              : render_syntax_node_text(sm, *proto.name);
