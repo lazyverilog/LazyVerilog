@@ -2094,6 +2094,81 @@ static std::optional<Location> find_interface_member_definition(const SyntaxInde
     return std::nullopt;
 }
 
+/// Instantiation named @p instance_name inside @p module_name.
+///
+/// `u_leaf.state_q` resolves `state_q`, but a cursor on `u_leaf` itself is a
+/// plain identifier that no declarator matches, so it used to resolve to
+/// nothing.  InstanceEntry already records where the instance is written.
+static std::optional<Location> find_instance_definition(const SyntaxIndex& index,
+                                                        const std::string& uri,
+                                                        std::string_view module_name,
+                                                        std::string_view instance_name) {
+    if (instance_name.empty())
+        return std::nullopt;
+    for (const auto& inst : index.instances) {
+        if (inst.instance_name != instance_name)
+            continue;
+        if (!module_name.empty() && !inst.parent_module.empty() &&
+            inst.parent_module != module_name)
+            continue;
+        if (inst.line <= 0)
+            continue;
+        const auto actual_uri = index.source_uri(inst.file_id);
+        const int lsp_line = to_lsp_line(inst.line);
+        // InstanceEntry keeps the instantiation line but no column for the name,
+        // so anchor at the start of the line the instance is written on.
+        return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, 0, lsp_line, 0};
+    }
+    return std::nullopt;
+}
+
+/// Declaration of @p member_name inside the generate block labelled @p label.
+///
+/// `gen_stall_mem.rf_rd_a_hz` names a signal declared inside `begin :
+/// gen_stall_mem`.  A generate label is not a value, so the receiver had no
+/// type and the member lookup never started.  The block and the reference are
+/// in the same file by construction, so this reads the current AST rather than
+/// asking the index to carry a per-declaration block name.
+static std::optional<Location> find_generate_block_member_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view label,
+    std::string_view member_name) {
+    if (label.empty() || member_name.empty())
+        return std::nullopt;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view label;
+        std::string_view member_name;
+        int depth{0};
+        std::optional<Location> result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view label,
+                std::string_view member_name)
+            : sm(sm), uri(uri), label(label), member_name(member_name) {}
+
+        void handle(const slang::syntax::GenerateBlockSyntax& node) {
+            const auto* name_clause = node.beginName ? node.beginName : node.endName;
+            const bool matches = name_clause && name_clause->name.valueText() == label;
+            if (matches)
+                ++depth;
+            visitDefault(node);
+            if (matches)
+                --depth;
+        }
+
+        void handle(const slang::syntax::DeclaratorSyntax& node) {
+            if (result || depth == 0 || !node.name || node.name.valueText() != member_name)
+                return;
+            result = location_from_token_actual_uri(sm, uri, node.name);
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, label, member_name);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
 static std::pair<int, int> source_range_lines_one_based(const slang::SourceManager& sm,
                                                         slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -4060,6 +4135,21 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
             current = find_module(inst.module_name);
             break;
         }
+        if (!current && segments.size() > 2) {
+            // `g_lanes[0].u_leaf.sig`: the first segment is a generate block
+            // label.  A generate block is not a module and not an instance, and
+            // instances written inside one are filed under the enclosing module,
+            // so the label can be skipped — but only once the next segment is
+            // confirmed to be an instance, so an unknown name cannot silently
+            // disappear.  Same rule the middle of the walk already applies.
+            for (const auto& inst : own_index.instances) {
+                if (inst.instance_name != segments[1])
+                    continue;
+                current = find_module(inst.module_name);
+                next = 2;
+                break;
+            }
+        }
         if (!current)
             return std::nullopt;
     }
@@ -4397,6 +4487,15 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                     return loc;
             }
         }
+
+        // `gen_stall_mem.rf_rd_a_hz` — the receiver is a generate block label,
+        // not a value, so nothing above can explain it.
+        if (state.tree && !target.object_path.empty()) {
+            if (auto loc = find_generate_block_member_in_tree(*state.tree, uri,
+                                                              target.object_path.back(),
+                                                              target.name))
+                return loc;
+        }
     }
 
     std::vector<ImportEntry> visible_imports;
@@ -4407,6 +4506,15 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                            target.scope_package, visible_imports,
                                            use_line_one_based))
         return loc;
+
+    // The receiver half of a hierarchical reference: in `u_leaf.state_q` the
+    // cursor on `u_leaf` is a plain identifier that matches no declarator, so it
+    // used to resolve to nothing even though `state_q` resolved fine.
+    if (target.kind == DefinitionTargetKind::Generic) {
+        if (auto loc = find_instance_definition(current_index, uri, target.scope_module,
+                                                target.name))
+            return loc;
+    }
 
     // An unqualified name inside a class body that the current file cannot
     // explain may be an inherited member:
