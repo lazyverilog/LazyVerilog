@@ -365,6 +365,44 @@ static void process_typedef(const TypedefDeclarationSyntax& td, SyntaxIndex& ind
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
                             std::string parent_scope, bool scoped_lookup);
 
+// `parameter type foo_t = logic [7:0]` parses as TypeParameterDeclarationSyntax,
+// a sibling of ParameterDeclarationSyntax under ParameterDeclarationBaseSyntax.
+// Every `as_if<ParameterDeclarationSyntax>()` site therefore skips it, which is
+// why a type parameter used to have no index presence at all.
+//
+// It declares two things at once: a parameter that an instantiation may
+// override, and a type name usable wherever a type is written.  Record the
+// type half here; the parameter half stays with the caller, which already knows
+// whether it is filling a PortEntry or a ValueEntry.
+static void add_type_parameter_typedef(const TypeAssignmentSyntax& decl, SyntaxIndex& index,
+                                       SourceFileIdResolver& resolver,
+                                       const slang::SourceManager& sm, std::string parent_scope,
+                                       bool scoped_lookup) {
+    TypedefEntry entry;
+    entry.name = token_value_text(decl.name);
+    if (entry.name.empty())
+        return;
+    entry.parent_scope = std::move(parent_scope);
+    entry.file_id = resolver.for_declaration_token(index, sm, decl.name);
+    auto [line, col] = token_pos_line1_col0(sm, decl.name);
+    entry.line = line;
+    entry.col = col;
+    if (decl.assignment)
+        entry.resolved = render_syntax_node_text(sm, *decl.assignment->type);
+
+    if (scoped_lookup && !entry.parent_scope.empty())
+        index.package_type_by_scoped_name.try_emplace(
+            package_scoped_key(entry.parent_scope, entry.name), index.typedefs.size());
+    index.typedef_by_name.try_emplace(entry.name, index.typedefs.size());
+    index.typedefs.push_back(std::move(entry));
+}
+
+/// Default type text of a `parameter type` declarator, for hover/outline detail.
+static std::string type_parameter_default(const TypeAssignmentSyntax& decl,
+                                          const slang::SourceManager& sm) {
+    return decl.assignment ? render_syntax_node_text(sm, *decl.assignment->type) : std::string{};
+}
+
 // Emit one ImportEntry per imported item of a `import pkg::x;` / `import pkg::*;`
 // declaration.  Called from the member walks that every index depth already
 // performs, so closed project shards carry imports without paying a separate
@@ -406,9 +444,22 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
 
     // Extract parameter ports from #( ... )
     if (module.header->parameters) {
+        const bool header_scoped_lookup = index.package_names.count(entry.name) > 0;
         for (const auto* param_base : module.header->parameters->declarations) {
             if (!param_base)
                 continue;
+            if (const auto* type_param = param_base->as_if<TypeParameterDeclarationSyntax>()) {
+                const std::string direction = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    add_port(entry.ports, index, resolver, sm, decl->name, direction, "type", "type",
+                             {}, type_parameter_default(*decl, sm));
+                    add_type_parameter_typedef(*decl, index, resolver, sm, entry.name,
+                                               header_scoped_lookup);
+                }
+                continue;
+            }
             const auto* param = param_base->as_if<ParameterDeclarationSyntax>();
             if (!param)
                 continue;
@@ -548,7 +599,29 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             // go-to-definition nor hover can see them.  This is also the sole
             // owner of package parameter values: process_package() delegates
             // here rather than pushing its own duplicate ValueEntry.
-            if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
+            if (const auto* type_param =
+                    ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+                const std::string kind = token_value_text(type_param->keyword);
+                for (const auto* decl : type_param->declarators) {
+                    if (!decl)
+                        continue;
+                    if (!in_package && !resolver.wants_declaration(index, sm, decl->name))
+                        continue;
+                    auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                    note_package_member(token_value_text(decl->name));
+                    index.values.push_back(ValueEntry{
+                        .name = token_value_text(decl->name),
+                        .type = "type",
+                        .kind = kind,
+                        .parent_scope = entry.name,
+                        .default_value = type_parameter_default(*decl, sm),
+                        .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                        .line = vl,
+                        .col = vc,
+                    });
+                    add_type_parameter_typedef(*decl, index, resolver, sm, entry.name, in_package);
+                }
+            } else if (const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>()) {
                 // Rendered on the first declarator that is actually kept: a
                 // shared header's parameter bulk would otherwise pay type and
                 // initializer rendering once per including file.
@@ -885,6 +958,12 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
                     if (decl)
                         symbols.push_back(token_value_text(decl->name));
                 }
+            } else if (const auto* type_param =
+                           ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+                for (const auto* decl : type_param->declarators) {
+                    if (decl)
+                        symbols.push_back(token_value_text(decl->name));
+                }
             }
         }
     }
@@ -919,6 +998,26 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         // where the header's text is spliced in, so only closed files went
         // without.  Carries no parent_scope, which is what makes it visible to
         // every file that includes the header rather than to one module.
+        if (const auto* type_param = ps->parameter->as_if<TypeParameterDeclarationSyntax>()) {
+            const std::string kind = token_value_text(type_param->keyword);
+            for (const auto* decl : type_param->declarators) {
+                if (!decl || !resolver.wants_declaration(index, sm, decl->name))
+                    continue;
+                auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+                index.values.push_back(ValueEntry{
+                    .name = token_value_text(decl->name),
+                    .type = "type",
+                    .kind = kind,
+                    .parent_scope = {},
+                    .default_value = type_parameter_default(*decl, sm),
+                    .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                    .line = vl,
+                    .col = vc,
+                });
+                add_type_parameter_typedef(*decl, index, resolver, sm, {}, false);
+            }
+            return;
+        }
         const auto* param = ps->parameter->as_if<ParameterDeclarationSyntax>();
         if (!param)
             return;
