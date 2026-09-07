@@ -410,10 +410,17 @@ std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
 
 std::string render_declaration_type_text(const slang::SourceManager& sm,
                                          const slang::syntax::SyntaxNode& node) {
+    auto text = render_syntax_node_text(sm, node);
+    // Cheap gate first: this runs for every declaration in every shard, and
+    // isMacroLoc() is a locked buffer lookup.  A declaration a macro body
+    // created always renders as the invocation, which starts with a backtick,
+    // so only those few need the exact check.
+    if (text.empty() || text.front() != '`')
+        return text;
     const auto first = node.getFirstToken();
     if (first && first.location().valid() && sm.isMacroLoc(first.location()))
         return render_syntax_node_text_expanded(sm, node);
-    return render_syntax_node_text(sm, node);
+    return text;
 }
 
 std::string base_class_lookup_name(std::string_view base_class) {
@@ -1855,7 +1862,9 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     }
                 }
             }
-            if (try_add_generate_block_member_reference(node.name, field_name, object_name) ||
+            if (try_add_generate_block_member_reference(
+                    node.name, field_name, object_name,
+                    current_module_object_type(object_name).has_value()) ||
                 try_add_interface_member_reference(node.name, field_name, object_name)) {
                 if (node.left)
                     node.left->visit(*this);
@@ -1983,8 +1992,20 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         /// same-named signal of the enclosing module.
         bool try_add_generate_block_member_reference(const slang::parsing::Token& token,
                                                      std::string_view member_name,
-                                                     std::string_view object_name) {
+                                                     std::string_view object_name,
+                                                     bool receiver_has_declared_type) {
             if (member_name.empty() || object_name.empty() || current_module.empty())
+                return false;
+            // A generate-block label is not a value, so a receiver with a
+            // declared type cannot be one.  Checked first: this is what keeps a
+            // class-handle-heavy file from paying for the block scan at all.
+            if (receiver_has_declared_type)
+                return false;
+            // Nothing to match and nothing left to collect: the common case for
+            // a file whose member accesses are class handles.  Checked before
+            // the key is built, because this runs per unclassified member token.
+            if (generate_block_members.empty() &&
+                prescanned_generate_modules.contains(current_module))
                 return false;
             scope_key = current_module;
             scope_key += '.';
@@ -2106,6 +2127,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                                 std::string_view member_name,
                                                 std::string_view object_name) {
             if (member_name.empty() || object_name.empty() || current_module.empty())
+                return false;
+            if (interface_receivers_ready && interface_receivers.empty())
                 return false;
             const auto* iface = interface_type_for_receiver(current_module, object_name);
             if (!iface)
@@ -2280,7 +2303,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     return;
                 if (try_add_typedef_field_reference(token, name, object_name))
                     return;
-                if (try_add_generate_block_member_reference(token, name, object_name))
+                if (try_add_generate_block_member_reference(token, name, object_name,
+                                                           object_type.has_value()))
                     return;
                 if (try_add_interface_member_reference(token, name, object_name))
                     return;
