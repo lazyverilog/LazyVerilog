@@ -4964,6 +4964,31 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             if (target_def)
                 break;
         }
+    } else if (!target_def && target_info.kind == DefinitionTargetKind::ClassMember) {
+        // A member access whose declaring type lives in another file:
+        // `handle.field`, `iface.sig`, `iface.task()`, `pkt.header`.  The
+        // definition_of_state() call above deliberately ran with no extra files,
+        // so it could not leave the open buffers and left target_def null -- and
+        // without this recovery the request returns *nothing at all* from the use
+        // site, while the very same cursor position answers go-to-definition
+        // correctly and a search started from the declaration finds this use.
+        //
+        // Miss path only, so a references request that already resolves keeps its
+        // current cost.  The snapshot is the shared immutable one go-to-definition
+        // itself uses: closed project files carry only their compact index shard
+        // (ExtraFileInfo::state is null for them), so this resolves through the
+        // same index lookups and never walks a closed file's AST.
+        const auto extra_full = extra_file_snapshot_ptr();
+        target_def = definition_of_state(*state, uri, line, col, *extra_full, &uri);
+    }
+    if (!target_def) {
+        // Last resort, still miss-path only: a hierarchical path such as
+        // `u_mid.u_leaf.r_stage` is resolved by hierarchical_definition(), which
+        // definition_of() calls *after* definition_of_state() and which the
+        // recovery above therefore never reaches.  Without it, references from a
+        // hierarchical use site return nothing even though go-to-definition on
+        // the same token lands on the declaration.
+        target_def = hierarchical_definition(*state, uri, line, col);
     }
     if (!target_def)
         return {};
@@ -5552,9 +5577,17 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // SymbolID path avoids that by matching `module:memory` directly.
             const auto open_index = get_structural_index(*state);
             // The structural index deliberately omits imports; the dynamic
-            // shard is the cached view that carries them.
-            const auto& open_imports =
-                import_bridge_name_id ? get_dynamic_index(*state).imports : open_index.imports;
+            // shard is the cached view that carries them.  The class-member
+            // alias needs them too: admits_class_member_alias() proves a
+            // `handle.member` occurrence really means *this* package's class by
+            // finding the import that makes the class visible, so with an empty
+            // import list it refuses the occurrence and a use in an open buffer
+            // is dropped -- including the one under the cursor.  The dynamic
+            // index is cached per immutable DocumentState, so asking for it here
+            // is a lookup, not a rebuild.
+            const auto& open_imports = (import_bridge_name_id || class_member_alias_id)
+                                           ? get_dynamic_index(*state).imports
+                                           : open_index.imports;
             for (const auto& ref : open_index.references) {
                 if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
