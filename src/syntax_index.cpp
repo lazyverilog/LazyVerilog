@@ -63,6 +63,96 @@ static std::string declaration_type_text(const slang::SourceManager& sm,
     return render_declaration_type_text(sm, type_node);
 }
 
+static std::string with_declarator_dimensions(const slang::SourceManager& sm, std::string type,
+                                              const DeclaratorSyntax& declarator);
+
+/// Declarations directly inside a *named* generate block, recorded with the
+/// block label so `u_dut.g_lane[0].acc` can name them from another file.
+///
+/// Deliberately a member walk rather than a tree visitor: it descends into
+/// generate constructs and nothing else, so a module without them pays one
+/// switch per member and a module with them pays for their contents only.
+static void index_generate_block_declarations(const MemberSyntax& member, SyntaxIndex& index,
+                                              SourceFileIdResolver& resolver,
+                                              const slang::SourceManager& sm,
+                                              const std::string& module_name,
+                                              const std::string& label) {
+    const auto record = [&](const DataTypeSyntax& type,
+                            const SeparatedSyntaxList<DeclaratorSyntax>& declarators,
+                            std::string_view kind) {
+        if (label.empty())
+            return;
+        for (const auto* decl : declarators) {
+            if (!decl)
+                continue;
+            auto [vl, vc] = token_pos_line1_col0(sm, decl->name);
+            index.values.push_back(ValueEntry{
+                .name = token_value_text(decl->name),
+                // Type text is deliberately not rendered here.  These entries
+                // exist so `u_dut.g_lane[0].acc` can be *found* from another
+                // file, and rendering the type for every declaration in every
+                // generate block of a project is the whole cost of doing that:
+                // on caliptra it was the difference between 3341 ms and 2945 ms
+                // of single-CPU index time.  An open buffer indexes the same
+                // declarations with their types, so hover inside the file that
+                // declares them is unaffected.
+                .type = {},
+                .kind = std::string(kind),
+                .parent_scope = module_name,
+                .generate_label = label,
+                .file_id = resolver.for_declaration_token(index, sm, decl->name),
+                .line = vl,
+                .col = vc,
+            });
+        }
+    };
+
+    const auto recurse = [&](const MemberSyntax& child, const std::string& child_label) {
+        index_generate_block_declarations(child, index, resolver, sm, module_name, child_label);
+    };
+
+    if (const auto* data = member.as_if<DataDeclarationSyntax>()) {
+        record(*data->type, data->declarators, "variable");
+    } else if (const auto* net = member.as_if<NetDeclarationSyntax>()) {
+        record(*net->type, net->declarators, "net");
+    } else if (const auto* region = member.as_if<GenerateRegionSyntax>()) {
+        for (const auto* child : region->members)
+            if (child)
+                recurse(*child, label);
+    } else if (const auto* block = member.as_if<GenerateBlockSyntax>()) {
+        const auto* name_clause = block->beginName ? block->beginName : block->endName;
+        std::string block_label = name_clause ? std::string(name_clause->name.valueText())
+                                              : std::string{};
+        if (block_label.empty() && block->label)
+            block_label = std::string(block->label->name.valueText());
+        if (block_label.empty())
+            block_label = label;
+        for (const auto* child : block->members)
+            if (child)
+                recurse(*child, block_label);
+    } else if (const auto* loop = member.as_if<LoopGenerateSyntax>()) {
+        if (loop->block)
+            recurse(*loop->block, label);
+    } else if (const auto* cond = member.as_if<IfGenerateSyntax>()) {
+        if (cond->block)
+            recurse(*cond->block, label);
+        if (cond->elseClause) {
+            if (const auto* arm = cond->elseClause->clause->as_if<MemberSyntax>())
+                recurse(*arm, label);
+        }
+    } else if (const auto* sel = member.as_if<CaseGenerateSyntax>()) {
+        for (const auto* item : sel->items) {
+            const SyntaxNode* body = nullptr;
+            if (const auto* standard = item->as_if<StandardCaseItemSyntax>())
+                body = standard->clause;
+            else if (const auto* def = item->as_if<DefaultCaseItemSyntax>())
+                body = def->clause;
+            if (const auto* arm = body ? body->as_if<MemberSyntax>() : nullptr)
+                recurse(*arm, label);
+        }
+    }
+}
+
 static std::string direction_of(const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
         return token_value_text(variable->direction).empty() ? "unknown" : token_value_text(variable->direction);
@@ -692,6 +782,8 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         SourceFileIdResolver& resolver;
         const slang::SourceManager& sm;
         const std::string& parent_scope;
+        // Label of the named generate block being walked, empty outside one.
+        std::string current_generate_label;
         std::vector<std::pair<int, int>> scope_stack;
 
         LocalVariableVisitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
@@ -728,9 +820,22 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         // `for (...) begin : g_lanes` was missing from the index entirely — and
         // therefore from the document outline.
         void handle(const GenerateBlockSyntax& node) {
+            // The label is what a hierarchical reference addresses:
+            // `g_lane[0].acc` says "the acc of block g_lane", which is a
+            // different object from a same-named signal of the module.
+            const auto* name_clause = node.beginName ? node.beginName : node.endName;
+            std::string label = name_clause ? std::string(name_clause->name.valueText())
+                                            : std::string{};
+            if (label.empty() && node.label)
+                label = std::string(node.label->name.valueText());
+            const auto previous_label = current_generate_label;
+            if (!label.empty())
+                current_generate_label = std::move(label);
+
             scope_stack.push_back(source_range_lines(sm, node.sourceRange()));
             visitDefault(node);
             scope_stack.pop_back();
+            current_generate_label = previous_label;
         }
 
         void handle(const LocalVariableDeclarationSyntax& node) {
@@ -746,6 +851,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
+                    .generate_label = current_generate_label,
                     .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
@@ -773,6 +879,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .type = with_declarator_dimensions(sm, type_text, *decl),
                     .kind = "variable",
                     .parent_scope = parent_scope,
+                    .generate_label = current_generate_label,
                     .file_id = resolver.for_declaration_token(index, sm, decl->name),
                     .scope_start_line = scope_start,
                     .scope_end_line = scope_end,
@@ -788,6 +895,21 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
         LocalVariableVisitor locals(index, resolver, sm, entry.name,
                                     source_range_lines(sm, module.sourceRange()));
         module.visit(locals);
+    } else {
+        // Declarations depth skips LocalVariableVisitor because walking every
+        // always/initial/function body is what makes a full index expensive.
+        // Declarations directly inside a *named generate block* still have to be
+        // here: another file addresses them as `u_dut.g_lane[0].acc`, and
+        // without them that path resolves to nothing — or, worse, to a
+        // same-named signal of the file doing the addressing.
+        //
+        // This walks members, not the whole tree: it steps into generate
+        // constructs and stops everywhere else, so the cost tracks the number
+        // of generate blocks rather than the size of the module.
+        for (const auto* member : module.members) {
+            if (member)
+                index_generate_block_declarations(*member, index, resolver, sm, entry.name, {});
+        }
     }
 
     index.module_by_name.try_emplace(entry.name, index.modules.size());

@@ -905,9 +905,17 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         if (value.name.empty() || value.parent_scope.empty() || !is_module_value_kind(value.kind) ||
             value.line <= 0 || index.package_names.contains(value.parent_scope))
             continue;
+        // A declaration inside a named generate block belongs to the block, not
+        // to the module: `dut.g_lane[0].acc` and a module-level `acc` are
+        // different objects, and giving them one identity is what merged them.
+        // Uses inside the block already carry `<module>.<label>`, and that is
+        // also how another file spells the path.
+        const auto scope = value.generate_label.empty()
+                               ? value.parent_scope
+                               : value.parent_scope + "." + value.generate_label;
         add_reference_entry(index, value.name, value.file_id,
-                            symbol_canonical("module_signal", value.parent_scope, value.name),
-                            value.line, value.col);
+                            symbol_canonical("module_signal", scope, value.name), value.line,
+                            value.col);
     }
     for (const auto& value : index.values) {
         if (value.name.empty() || value.parent_scope.empty() ||
@@ -1947,6 +1955,64 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::string(source.substr(i, end - i));
         }
 
+        /// The segment one further left: for `dut.g_lane[0].acc` with the cursor
+        /// on `acc`, object_before_member_dot() gives `g_lane` and this gives
+        /// `dut`.  Empty when the receiver has no owner of its own.
+        std::string owner_before_receiver_dot(const slang::parsing::Token& token,
+                                              std::string_view receiver) const {
+            if (!token || !token.location().valid() || receiver.empty())
+                return {};
+            const auto source = sm.getSourceText(token.location().buffer());
+            size_t i = token.location().offset();
+            if (i > source.size())
+                return {};
+            // Step back over "<receiver>[...] ." to land just before the
+            // receiver, then read one more identifier.
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            if (i == 0 || source[i - 1] != '.')
+                return {};
+            --i;
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            if (i > 0 && source[i - 1] == ']') {
+                size_t depth = 0;
+                size_t j = i;
+                while (j > 0) {
+                    const char c = source[j - 1];
+                    if (c == ']')
+                        ++depth;
+                    else if (c == '[' && --depth == 0) {
+                        --j;
+                        break;
+                    }
+                    --j;
+                }
+                if (depth != 0)
+                    return {};
+                i = j;
+                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                    --i;
+            }
+            if (i < receiver.size() ||
+                source.substr(i - receiver.size(), receiver.size()) != receiver)
+                return {};
+            i -= receiver.size();
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            if (i == 0 || source[i - 1] != '.')
+                return {};
+            --i;
+            while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                --i;
+            const size_t end = i;
+            while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
+                --i;
+            if (i == end)
+                return {};
+            return std::string(source.substr(i, end - i));
+        }
+
         bool try_add_class_method_reference(const slang::parsing::Token& token,
                                             std::string_view method_name,
                                             std::string_view object_name,
@@ -2001,30 +2067,47 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             // class-handle-heavy file from paying for the block scan at all.
             if (receiver_has_declared_type)
                 return false;
-            // Nothing to match and nothing left to collect: the common case for
-            // a file whose member accesses are class handles.  Checked before
-            // the key is built, because this runs per unclassified member token.
-            if (generate_block_members.empty() &&
-                prescanned_generate_modules.contains(current_module))
-                return false;
-            scope_key = current_module;
-            scope_key += '.';
-            scope_key.append(object_name);
-            const auto scope = scope_key;
-            scope_key += '\n';
-            scope_key.append(member_name);
-            if (!generate_block_members.contains(scope_key)) {
-                // The use may be written above the block it names.  The walk
-                // records a block's members when it reaches it, so scan the
-                // enclosing module's generate blocks once — and only for a file
-                // that actually addresses one this way.
-                if (!prescan_generate_blocks_of_current_module())
-                    return false;
-                if (!generate_block_members.contains(scope_key))
-                    return false;
+            // A block of *this* module, the common case.  The scan of the
+            // enclosing module runs at most once, and only for a file that
+            // addresses a block this way.
+            const bool block_scan_worthwhile =
+                !generate_block_members.empty() ||
+                !prescanned_generate_modules.contains(current_module);
+            if (block_scan_worthwhile) {
+                scope_key = current_module;
+                scope_key += '.';
+                scope_key.append(object_name);
+                const auto scope = scope_key;
+                scope_key += '\n';
+                scope_key.append(member_name);
+                bool found = generate_block_members.contains(scope_key);
+                if (!found && prescan_generate_blocks_of_current_module())
+                    found = generate_block_members.contains(scope_key);
+                if (found) {
+                    add_ref(token, symbol_canonical("module_signal", scope, member_name));
+                    return true;
+                }
             }
-            add_ref(token, symbol_canonical("module_signal", scope, member_name));
-            return true;
+
+            // `dut.g_lane[0].acc` — the block belongs to a module this file only
+            // instantiates, so its declarations are in another shard.  The
+            // instance names that module, which is the whole identity: the
+            // declaring shard spells its block declarations the same way.
+            const auto owner = owner_before_receiver_dot(token, object_name);
+            if (owner.empty())
+                return false;
+            for (const auto& inst : index.instances) {
+                if (inst.instance_name != owner || inst.module_name.empty())
+                    continue;
+                if (!inst.parent_module.empty() && inst.parent_module != current_module)
+                    continue;
+                add_ref(token,
+                        symbol_canonical("module_signal",
+                                         inst.module_name + "." + std::string(object_name),
+                                         member_name));
+                return true;
+            }
+            return false;
         }
 
         /// Collect every named generate block of the module being walked, so a

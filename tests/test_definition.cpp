@@ -1896,6 +1896,32 @@ TEST_CASE("definition: hierarchical paths through instances and generate blocks"
         CHECK(loc->line == 4);
     }
 
+    // `dut.g_lane[0].acc` from another module: the block is the last hop and
+    // the leaf is one of its declarations, which carries the label in the index.
+    SECTION("a generate-block signal reached through an instance from another file") {
+        const auto tb = dir / "hier_tb.sv";
+        const std::string tb_text = "module hier_tb;\n"
+                                    "  logic [7:0] lane_count;\n"
+                                    "  hier_top u_top ();\n"
+                                    "  initial $display(\"%0h\", u_top.gen_lane[0].lane_count);\n"
+                                    "endmodule\n";
+        {
+            std::ofstream out(tb);
+            out << tb_text;
+        }
+
+        Analyzer tb_analyzer;
+        tb_analyzer.set_extra_files({leaf.string(), top.string(), tb.string()});
+        tb_analyzer.wait_for_background_index_idle();
+        const auto tb_uri = uri_from_path(tb);
+        tb_analyzer.open(tb_uri, tb_text);
+
+        auto loc = tb_analyzer.definition_of(uri_from_path(tb), 3, 44);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 3); // the declaration inside gen_lane, not the tb copy
+    }
+
     SECTION("signal reached through an indexed generate segment") {
         auto loc = analyzer.definition_of(uri, 6, 36);
         REQUIRE(loc.has_value());

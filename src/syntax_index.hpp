@@ -208,6 +208,11 @@ struct ValueEntry {
     std::string type;
     std::string kind; // variable/net/function/task/parameter/localparam/port
     std::string parent_scope; // module/interface/package/class name when known
+    // Label of the named generate block this declaration sits directly inside,
+    // empty otherwise.  `g_lane[0].acc` addresses the block, so a file that
+    // only instantiates the module still has to name the right `acc`; the
+    // identity for those is `module_signal::<parent_scope>.<generate_label>`.
+    std::string generate_label;
     // Initializer text for parameter/localparam kinds (empty for other kinds).
     // Mirrors PortEntry::default_value so hover can render `int = 8`.
     std::string default_value;

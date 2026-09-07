@@ -2605,6 +2605,21 @@ TEST_CASE("references: a hierarchical member is never claimed by the enclosing m
     CHECK(std::none_of(refs.begin(), refs.end(),
                        [](const Location& l) { return l.line == 3 && l.col > 40; }));
 
+    // And from the other end: the lane signal owns the testbench's use of it.
+    const auto dut_uri = uri_from_path(dut);
+    analyzer.open(dut_uri, "module lane_top;\n"
+                           "  for (genvar i = 0; i < 2; i++) begin : g_lane\n"
+                           "    logic [31:0] acc;\n"
+                           "  end\n"
+                           "endmodule\n");
+    const auto lane_refs = analyzer.find_references(dut_uri, 2, 17, true);
+    CHECK(std::any_of(lane_refs.begin(), lane_refs.end(), [&](const Location& l) {
+        return l.uri == tb_uri && l.line == 3 && l.col > 40;
+    }));
+    CHECK(std::none_of(lane_refs.begin(), lane_refs.end(), [&](const Location& l) {
+        return l.uri == tb_uri && l.line == 1;
+    }));
+
     std::filesystem::remove_all(dir);
 }
 

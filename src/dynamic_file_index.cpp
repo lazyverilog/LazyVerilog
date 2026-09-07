@@ -254,6 +254,70 @@ bool is_generate_construct(const MemberSyntax& member) {
     }
 }
 
+// Declarations directly inside a *named* generate block, recorded with the
+// block label.  `dut.g_lane[0].acc` addresses the block, so the label is part of
+// the identity — and an open buffer has to agree with its closed shard about
+// that, or the same signal changes meaning when the file is opened.
+void process_generate_declarations(const MemberSyntax& member, SyntaxIndex& index,
+                                   SourceFileIdResolver& resolver,
+                                   const slang::SourceManager& sm,
+                                   const std::string& parent_module, const std::string& label) {
+    const auto record = [&](const DataTypeSyntax& type,
+                            const SeparatedSyntaxList<DeclaratorSyntax>& declarators,
+                            std::string kind) {
+        if (label.empty())
+            return;
+        for (const auto* decl : declarators) {
+            if (!decl)
+                continue;
+            if (auto* value = add_value(index, resolver, sm, decl->name,
+                                        with_dims(sm, node_text_raw(sm, type), *decl), kind,
+                                        parent_module))
+                value->generate_label = label;
+        }
+    };
+
+    if (const auto* data = member.as_if<DataDeclarationSyntax>()) {
+        record(*data->type, data->declarators, "variable");
+    } else if (const auto* net = member.as_if<NetDeclarationSyntax>()) {
+        record(*net->type, net->declarators, "net");
+    } else if (const auto* region = member.as_if<GenerateRegionSyntax>()) {
+        for (const auto* child : region->members)
+            if (child)
+                process_generate_declarations(*child, index, resolver, sm, parent_module, label);
+    } else if (const auto* block = member.as_if<GenerateBlockSyntax>()) {
+        const auto* name_clause = block->beginName ? block->beginName : block->endName;
+        std::string block_label = name_clause ? std::string(name_clause->name.valueText())
+                                              : std::string{};
+        if (block_label.empty() && block->label)
+            block_label = std::string(block->label->name.valueText());
+        if (block_label.empty())
+            block_label = label;
+        for (const auto* child : block->members)
+            if (child)
+                process_generate_declarations(*child, index, resolver, sm, parent_module,
+                                              block_label);
+    } else if (const auto* loop = member.as_if<LoopGenerateSyntax>()) {
+        process_generate_declarations(*loop->block, index, resolver, sm, parent_module, label);
+    } else if (const auto* cond = member.as_if<IfGenerateSyntax>()) {
+        process_generate_declarations(*cond->block, index, resolver, sm, parent_module, label);
+        if (cond->elseClause) {
+            if (const auto* arm = cond->elseClause->clause->as_if<MemberSyntax>())
+                process_generate_declarations(*arm, index, resolver, sm, parent_module, label);
+        }
+    } else if (const auto* sel = member.as_if<CaseGenerateSyntax>()) {
+        for (const auto* item : sel->items) {
+            const SyntaxNode* body = nullptr;
+            if (const auto* standard = item->as_if<StandardCaseItemSyntax>())
+                body = standard->clause;
+            else if (const auto* def = item->as_if<DefaultCaseItemSyntax>())
+                body = def->clause;
+            if (const auto* arm = body ? body->as_if<MemberSyntax>() : nullptr)
+                process_generate_declarations(*arm, index, resolver, sm, parent_module, label);
+        }
+    }
+}
+
 // Instantiations also live inside generate constructs, which the parser keeps
 // as nested member lists rather than splicing into the enclosing module.  Walk
 // those bodies for instances only; every other member kind stays scoped to the
@@ -608,6 +672,7 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             process_hierarchy(*hierarchy, index, resolver, sm, lines, module.name);
         } else if (is_generate_construct(*member)) {
             process_generate_instances(*member, index, resolver, sm, lines, module.name);
+            process_generate_declarations(*member, index, resolver, sm, module.name, {});
         } else if (const auto* modport = member->as_if<ModportDeclarationSyntax>()) {
             for (const auto* item : modport->items) {
                 if (!item)

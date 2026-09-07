@@ -4339,6 +4339,18 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
             return std::nullopt;
     }
 
+    // Declaration inside a named generate block of the module reached so far.
+    const auto find_generate_member = [&](const HierarchyModule& owner, std::string_view label,
+                                          std::string_view name) -> const ValueEntry* {
+        for (const auto& value : owner.index->values) {
+            if (value.name != name || value.generate_label != label ||
+                value.parent_scope != owner.entry->name)
+                continue;
+            return &value;
+        }
+        return nullptr;
+    };
+
     for (; next + 1 < segments.size(); ++next) {
         const auto* inst = find_instance(*current, segments[next]);
         if (!inst) {
@@ -4349,6 +4361,15 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
             // silently disappear.
             if (next + 2 < segments.size() && find_instance(*current, segments[next + 1]))
                 continue;
+            // `dut.g_lane[0].acc`: the block is the last hop and the leaf is one
+            // of its declarations, which carries the label in the index.
+            if (next + 2 == segments.size()) {
+                if (const auto* value =
+                        find_generate_member(*current, segments[next], segments.back()))
+                    return hierarchy_location(*current->index, current->shard_uri, value->file_id,
+                                              value->line, value->col,
+                                              (int)segments.back().size());
+            }
             return std::nullopt;
         }
         auto target = find_module(inst->module_name);
@@ -4737,9 +4758,33 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // find-references and rename then merge the two.  Restricted to a receiver
     // that names a scope (a generate block here), because a handle whose type
     // this file cannot resolve still benefits from the generic fallback.
-    if (target.kind == DefinitionTargetKind::ClassMember && !target.object_path.empty() &&
-        state.tree &&
-        generate_block_label_exists_in_tree(*state.tree, target.object_path.front())) {
+    // Same rule when the path starts at an instance (`u_top.gen_lane[0].sig`):
+    // that is an address into another module, and the enclosing module's own
+    // same-named signal is a different object.  definition_of() still gets to
+    // try the hierarchical walk after this returns nothing.
+    const auto path_root_names_a_scope = [&](const std::string& root) {
+        if (root.empty())
+            return false;
+        return (state.tree && generate_block_label_exists_in_tree(*state.tree, root)) ||
+               find_instance_definition(current_index, uri, target.scope_module, root).has_value();
+    };
+
+    bool receiver_names_a_scope =
+        target.kind == DefinitionTargetKind::ClassMember && !target.object_path.empty() &&
+        path_root_names_a_scope(target.object_path.front());
+
+    // A longer path (`u_top.gen_lane[0].sig`) never reaches the ClassMember
+    // classification — slang spells it as a scoped name — so read the dotted
+    // path straight from the source and apply the same rule.
+    if (!receiver_names_a_scope) {
+        if (auto ident = identifier_at(uri, line, col)) {
+            const auto segments = hierarchical_path_at(state.text, line, col, *ident);
+            if (segments.size() >= 2)
+                receiver_names_a_scope = path_root_names_a_scope(segments.front());
+        }
+    }
+
+    if (receiver_names_a_scope) {
         // `gen_lane[0].u_leaf.state_q` with the cursor on the instance segment:
         // the name is an instantiation inside that block, not a member of it.
         if (auto loc = find_instance_definition(current_index, uri, target.scope_module,
