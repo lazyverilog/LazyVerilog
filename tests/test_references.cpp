@@ -2523,6 +2523,71 @@ TEST_CASE("references: wildcard-imported package type used unqualified in anothe
     std::filesystem::remove_all(dir);
 }
 
+// An interface member reached from another file — `bus.gnt` through a modport
+// port, `tb_bus.drive(...)` through an instance — was recorded by nothing, so
+// find-references returned only the uses written inside the interface itself
+// and rename left the rest of the design pointing at the old name.
+TEST_CASE("references: interface members used through a port or an instance",
+          "[references][interface]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-interface";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto iface = dir / "bus_if.sv";
+    const auto user = dir / "lane_unit.sv";
+    const auto tb = dir / "tb_bus_top.sv";
+    const std::string iface_text = "interface bus_if(input logic clk);\n"
+                                   "  logic req;\n"
+                                   "  logic gnt;\n"
+                                   "  modport slave (input req, output gnt);\n"
+                                   "  task automatic drive(input logic a);\n"
+                                   "    req <= a;\n"
+                                   "  endtask\n"
+                                   "endinterface\n";
+    {
+        std::ofstream out(iface);
+        out << iface_text;
+    }
+    {
+        std::ofstream out(user);
+        out << "module lane_unit(bus_if.slave bus, input logic ok);\n"
+               "  assign bus.gnt = ok;\n"
+               "endmodule\n";
+    }
+    {
+        std::ofstream out(tb);
+        out << "module tb_bus_top;\n"
+               "  logic clk;\n"
+               "  bus_if tb_bus (.clk(clk));\n"
+               "  initial tb_bus.drive(1'b1);\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({iface.string(), user.string(), tb.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto iface_uri = uri_from_path(iface);
+    analyzer.open(iface_uri, iface_text);
+
+    const auto user_uri = uri_from_path(user);
+    const auto tb_uri = uri_from_path(tb);
+
+    SECTION("a signal reached through a modport port") {
+        auto refs = analyzer.find_references(iface_uri, 2, 8, true); // `gnt` declaration
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& l) { return l.uri == user_uri && l.line == 1; }));
+    }
+
+    SECTION("a task called through an instance") {
+        auto refs = analyzer.find_references(iface_uri, 4, 17, true); // `drive` declaration
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& l) { return l.uri == tb_uri && l.line == 3; }));
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
 // A struct field is only recorded as `typedef_field::` by a shard that parsed
 // the typedef.  A file that merely *uses* the struct recorded nothing for
 // `handle.field`, so references from the declaration returned the declaration

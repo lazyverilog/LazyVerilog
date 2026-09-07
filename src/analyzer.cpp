@@ -4978,13 +4978,39 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     std::string class_member_package;
     std::string class_member_class;
     std::string class_member_name;
+    // An interface member — `bus.gnt`, `tb_bus.drive(...)` — is recorded by a
+    // file that only *uses* the interface under the same kind-neutral
+    // `class_member::` alias, so its declaration accepts that spelling too.
+    // Gated on the owner really being an interface, so an ordinary module
+    // signal never starts matching handle-shaped occurrences.
+    const auto owner_is_interface = [&](std::string_view owner) {
+        if (owner.empty())
+            return false;
+        const std::string owner_name(owner);
+        if (get_structural_index(*state).interface_names.contains(owner_name))
+            return true;
+        for (const auto& extra : *extra_idx) {
+            if (extra.index_ref().interface_names.contains(owner_name))
+                return true;
+        }
+        if (auto project = project_index_snapshot()) {
+            for (const auto& shard : project->shards) {
+                if (shard.index && shard.index->interface_names.contains(owner_name))
+                    return true;
+            }
+        }
+        return false;
+    };
+
     // `typedef_field::` joins the two class spellings here: a struct field
     // reached through a receiver whose typedef this shard never parsed is
     // recorded with the same kind-neutral `class_member::` alias, because that
     // shard cannot tell a struct field from a class member either.
     for (const auto prefix : {std::string_view("class_field::"),
                               std::string_view("class_method::"),
-                              std::string_view("typedef_field::")}) {
+                              std::string_view("typedef_field::"),
+                              std::string_view("module_signal::"),
+                              std::string_view("interface_subroutine::")}) {
         if (!target_symbol_debug.starts_with(prefix))
             continue;
         const std::string_view rest = std::string_view(target_symbol_debug).substr(prefix.size());
@@ -4992,6 +5018,12 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (member_sep == std::string_view::npos)
             break;
         const auto owner = rest.substr(0, member_sep);
+        // A module signal or subroutine only takes the handle-shaped alias when
+        // its owner really is an interface; a plain module signal is reached by
+        // a hierarchical path, which is a different question.
+        if ((prefix == "module_signal::" || prefix == "interface_subroutine::") &&
+            !owner_is_interface(owner))
+            break;
         const auto member = rest.substr(member_sep + 2);
         const auto scope_sep = owner.rfind("::");
         if (scope_sep == std::string_view::npos) {

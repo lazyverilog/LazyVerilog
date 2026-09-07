@@ -997,6 +997,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // Store them here instead of promoting every local variable into the
         // persistent SyntaxIndex value table.
         std::unordered_map<std::string, std::string> walked_value_types;
+        // "<module>\n<receiver>" -> interface named by that port or instance.
+        // Built on first member access this shard cannot explain otherwise.
+        std::unordered_map<std::string, std::string> interface_receivers;
+        bool interface_receivers_ready{false};
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
         const std::unordered_map<std::string, std::string>& unique_class_scopes;
@@ -1835,6 +1839,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     }
                 }
             }
+            if (try_add_interface_member_reference(node.name, field_name, object_name)) {
+                if (node.left)
+                    node.left->visit(*this);
+                return;
+            }
             visitDefault(node);
         }
 
@@ -1922,6 +1931,76 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (!scope)
                 return false;
             add_ref(token, symbol_canonical("class_field", *scope, std::string(field_name)));
+            return true;
+        }
+
+        /// Interface a receiver refers to: `bus_if.slave bus` names one in its
+        /// port type, and `bus_if u_bus (...)` names one as the instantiated
+        /// module.  Both facts are already in this shard; the map is built on
+        /// first use so files without interface member access never pay for it.
+        const std::string* interface_type_for_receiver(std::string_view module_name,
+                                                       std::string_view receiver) {
+            if (module_name.empty() || receiver.empty())
+                return nullptr;
+            if (!interface_receivers_ready) {
+                interface_receivers_ready = true;
+                for (const auto& module : index.modules) {
+                    for (const auto& port : module.ports) {
+                        // An interface port is written `iface.modport name` or,
+                        // without a modport, as a bare interface name.
+                        const bool has_modport = port.type.find('.') != std::string::npos;
+                        auto iface = base_type_identifier(port.type);
+                        if (iface.empty())
+                            continue;
+                        if (!has_modport && !index.interface_names.contains(iface))
+                            continue;
+                        interface_receivers.emplace(module.name + "\n" + port.name,
+                                                    std::move(iface));
+                    }
+                }
+                for (const auto& inst : index.instances) {
+                    if (inst.parent_module.empty() || inst.instance_name.empty() ||
+                        inst.module_name.empty())
+                        continue;
+                    interface_receivers.emplace(inst.parent_module + "\n" + inst.instance_name,
+                                                inst.module_name);
+                }
+            }
+            const auto it = interface_receivers.find(std::string(module_name) + "\n" +
+                                                     std::string(receiver));
+            return it == interface_receivers.end() ? nullptr : &it->second;
+        }
+
+        /// `bus.gnt`, `tb_bus.drive(...)` — a member reached through an
+        /// interface port or instance.  When this shard declares the interface
+        /// the member gets the same identity its declaration carries; when the
+        /// interface lives in a file this shard never parsed, it gets the
+        /// kind-neutral `class_member::` alias that find_references completes,
+        /// exactly as a foreign class member does.
+        bool try_add_interface_member_reference(const slang::parsing::Token& token,
+                                                std::string_view member_name,
+                                                std::string_view object_name) {
+            if (member_name.empty() || object_name.empty() || current_module.empty())
+                return false;
+            const auto* iface = interface_type_for_receiver(current_module, object_name);
+            if (!iface)
+                return false;
+            if (declared_subroutines.contains(subroutine_scope_key(SubroutineOwnerKind::Interface,
+                                                                   *iface, member_name))) {
+                add_ref(token, subroutine_symbol_id(SubroutineOwnerKind::Interface, *iface,
+                                                    member_name));
+                return true;
+            }
+            scope_key = *iface;
+            scope_key += '\n';
+            scope_key.append(member_name);
+            if (module_values.contains(scope_key)) {
+                add_ref(token, symbol_canonical("module_signal", *iface, member_name));
+                return true;
+            }
+            if (index.interface_names.contains(*iface))
+                return false; // the interface is here and declares no such member
+            add_ref(token, symbol_canonical("class_member", *iface, member_name));
             return true;
         }
 
@@ -2075,6 +2154,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 if (try_add_class_field_reference(token, name, object_name, object_type))
                     return;
                 if (try_add_typedef_field_reference(token, name, object_name))
+                    return;
+                if (try_add_interface_member_reference(token, name, object_name))
                     return;
                 if (try_add_foreign_member_reference(token, name, object_name, object_type))
                     return;
