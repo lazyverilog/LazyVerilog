@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "features/hover.hpp"
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -1920,6 +1921,26 @@ TEST_CASE("definition: hierarchical paths through instances and generate blocks"
         REQUIRE(loc.has_value());
         CHECK(loc->uri == uri);
         CHECK(loc->line == 3); // the declaration inside gen_lane, not the tb copy
+    }
+
+    // Hover resolves through definition_of_state(), which does not run the
+    // hierarchical walk, so a path go-to-definition answered had no hover at
+    // all.  Checked here with the declaring file open, which is when hover has
+    // a tree to describe the declaration from.
+    SECTION("hover describes a signal reached through a generate path") {
+        Analyzer hover_analyzer;
+        hover_analyzer.set_extra_files({leaf.string(), top.string()});
+        hover_analyzer.wait_for_background_index_idle();
+        hover_analyzer.open(uri_from_path(top), top_text);
+
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri_from_path(top);
+        params.position = lsPosition(6, 38); // `state_q` in gen_lane[0].u_leaf.state_q
+
+        auto hover = provide_hover(hover_analyzer, params);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        CHECK(hover->contents.second->value.find("state_q") != std::string::npos);
     }
 
     SECTION("signal reached through an indexed generate segment") {

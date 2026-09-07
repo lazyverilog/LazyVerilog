@@ -3990,6 +3990,12 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // filelist entries that can mean repeating live-buffer index work during a
     // single user-visible hover request.
     auto definition = definition_of_state(*state, uri, line, col, *extra_files, &uri);
+    // Miss path only, mirroring definition_of(): a hierarchical path such as
+    // `u_dut.g_lane[0].acc` is resolved by the walk below, not by the scope
+    // lookups above, and without this hover stays empty on a token that
+    // go-to-definition answers.
+    if (!definition)
+        definition = hierarchical_definition(*state, uri, line, col);
     if (definition) {
         std::string name = target.name.empty() ? ident : target.name;
 
