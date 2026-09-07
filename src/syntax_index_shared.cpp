@@ -486,8 +486,14 @@ std::string canonical_type_name_from_text(std::string_view type) {
     // A parameter list, e.g. `Container #(byte, byte)`, must not shift the
     // trailing-run scan onto the last parameter -- the class name is what
     // precedes `#(`, not what happens to sit at the end of the text.
-    if (const auto hash = type.find('#'); hash != std::string_view::npos)
-        type = type.substr(0, hash);
+    //
+    // An array dimension is dropped for the same reason: `el_t [0:3]` names
+    // `el_t`, but the trailing-run scan would otherwise return `3`, so
+    // `arr[0].field` could not find the element type that declares `field`.
+    // Both cut points are found in one scan to keep this off the index's
+    // hot path -- it runs once per indexed value declaration.
+    if (const auto cut = type.find_first_of("#["); cut != std::string_view::npos)
+        type = type.substr(0, cut);
 
     size_t end = type.size();
     while (end > 0 && !syntax_fragment_edge_is_wordlike(type[end - 1]))
