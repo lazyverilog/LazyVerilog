@@ -1943,6 +1943,38 @@ TEST_CASE("definition: hierarchical paths through instances and generate blocks"
         CHECK(hover->contents.second->value.find("state_q") != std::string::npos);
     }
 
+    // The declaring file is not open: hover has no tree to read the declaration
+    // from and has to describe it from that file's index shard instead.
+    SECTION("hover works when the declaring file is only a project file") {
+        const auto tb = dir / "hier_tb_hover.sv";
+        const std::string tb_text = "module hier_tb_hover;\n"
+                                    "  logic probe;\n"
+                                    "  hier_top u_top ();\n"
+                                    "  assign probe = u_top.gen_lane[0].lane_count[0];\n"
+                                    "endmodule\n";
+        {
+            std::ofstream out(tb);
+            out << tb_text;
+        }
+
+        Analyzer hover_analyzer;
+        hover_analyzer.set_extra_files({leaf.string(), top.string(), tb.string()});
+        hover_analyzer.wait_for_background_index_idle();
+        hover_analyzer.open(uri_from_path(tb), tb_text);
+
+        lsTextDocumentPositionParams params;
+        params.textDocument.uri.raw_uri_ = uri_from_path(tb);
+        params.position = lsPosition(3, 36); // `lane_count`
+
+        auto hover = provide_hover(hover_analyzer, params);
+        REQUIRE(hover.has_value());
+        REQUIRE(hover->contents.second.has_value());
+        CHECK(hover->contents.second->value.find("lane_count") != std::string::npos);
+        // The shard carries no type for a generate-block declaration; hover
+        // reads it back from the declaration's own line.
+        CHECK(hover->contents.second->value.find("logic [7:0]") != std::string::npos);
+    }
+
     SECTION("signal reached through an indexed generate segment") {
         auto loc = analyzer.definition_of(uri, 6, 36);
         REQUIRE(loc.has_value());

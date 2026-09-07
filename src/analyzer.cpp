@@ -3958,6 +3958,54 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
 
 static std::optional<Location> include_target_at(const DocumentState& state, int line);
 
+/// Type text of a declaration read back from its own source line.
+///
+/// A closed file's shard deliberately does not render the type of declarations
+/// inside a generate block — doing that for every such declaration in a project
+/// is the entire cost of indexing them, and they are indexed so a hierarchical
+/// path can *find* them.  Hover needs the type for exactly one declaration, so
+/// it reads the one line that holds it.
+static std::string declaration_type_from_source_line(const std::string& path, int line0, int col0,
+                                                     std::string_view name) {
+    if (path.empty() || line0 < 0 || col0 <= 0)
+        return {};
+    std::ifstream input(path);
+    if (!input)
+        return {};
+    std::string text;
+    for (int i = 0; i <= line0; ++i) {
+        if (!std::getline(input, text))
+            return {};
+    }
+    if ((size_t)col0 > text.size())
+        return {};
+    // Confirm the name really starts here before trusting the prefix: a stale
+    // shard would otherwise turn arbitrary source text into a "type".
+    if (text.compare(col0, name.size(), name) != 0)
+        return {};
+
+    std::string prefix = trim_copy(text.substr(0, col0));
+    // `logic [7:0] a, b;` — hovering `b` leaves `logic [7:0] a,` as the prefix.
+    // Drop the earlier declarators so the type alone remains.
+    while (!prefix.empty() && prefix.back() == ',') {
+        prefix.pop_back();
+        while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+            prefix.pop_back();
+        while (!prefix.empty() && prefix.back() == ']') {
+            const auto open = prefix.rfind('[');
+            if (open == std::string::npos)
+                return {};
+            prefix.erase(open);
+            while (!prefix.empty() && std::isspace(static_cast<unsigned char>(prefix.back())))
+                prefix.pop_back();
+        }
+        while (!prefix.empty() && syntax_fragment_edge_is_wordlike(prefix.back()))
+            prefix.pop_back();
+        prefix = trim_copy(std::move(prefix));
+    }
+    return prefix;
+}
+
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
     auto state = get_state(uri);
     if (!state || !state->tree)
@@ -4032,8 +4080,15 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         for (const auto& extra : *extra_files) {
             if (extra.uri != definition->uri)
                 continue;
-            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
+            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition)) {
+                // A generate-block declaration is indexed without its type, so
+                // recover it from the declaration's own line — one line read,
+                // and only when hover would otherwise show a bare name.
+                if (info->detail.empty())
+                    info->detail = declaration_type_from_source_line(
+                        extra.path, definition->line, definition->col, info->name);
                 return info;
+            }
             break;
         }
 
