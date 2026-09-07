@@ -1278,8 +1278,27 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     std::string base_scope;
                     if (const auto sep = qualified.rfind("::"); sep != std::string::npos)
                         base_scope = trim_copy(qualified.substr(0, sep));
-                    if (!base_name.empty())
+                    if (!base_name.empty()) {
+                        // An unqualified base inside a package resolves in that
+                        // package first, and that is where the declaration emits
+                        // its own `class::<package>::<name>` identity.  Without
+                        // this spelling the two never meet, so references started
+                        // from the `extends` clause find only the clause itself --
+                        // and rename then rewrites `extends` alone, leaving the
+                        // class declaration untouched and the code uncompilable.
+                        //
+                        // Emitted *before* the bare spelling on purpose:
+                        // symbol_id_for_index_location() takes the first
+                        // acceptable entry at a location, so the package-scoped
+                        // identity is the one a search started from this token
+                        // adopts.  The bare spelling is still emitted after it,
+                        // so a base reached by a wildcard import from another
+                        // package keeps matching through the `name:` bridge.
+                        if (base_scope.empty() && !current_package.empty())
+                            add_ref(base_token,
+                                    symbol_canonical("class", current_package, base_name));
                         add_ref(base_token, symbol_canonical("class", base_scope, base_name));
+                    }
                 }
             }
 

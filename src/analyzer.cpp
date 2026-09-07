@@ -5033,13 +5033,40 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // merged by references/rename.
         auto current_structural_index = get_structural_index(*state);
         Location clicked_loc{uri, target->line, target->col, target->line, target->end_col};
+        // Prefer the symbol identity at the token the user actually clicked.
+        // This matters for declaration tokens whose plain name appears in
+        // multiple declaration scopes:
+        //
+        //   typedef struct { logic addr; } a_t;
+        //   typedef struct { logic addr; } b_t;
+        //                          ^ clicked here
+        //
+        // A generic definition fallback may find the first `addr` declaration
+        // textually, but the current-file structural index has a scoped
+        // declaration occurrence at the clicked location:
+        //
+        //   typedef_field::b_t::addr
+        //
+        // Recovering that ID first prevents same-name typedef fields from being
+        // merged by references/rename.  It is also what identifies an override
+        // as itself rather than as the base method it resolves to.
         if (auto id = symbol_id_for_index_location(current_structural_index, clicked_loc)) {
-            // `scoped_member::P::N` is what a shard records for `P::N` when it
-            // never parsed P.  It names the use site, not the declaration, so
-            // adopting it here would make a search started from a qualified use
-            // miss the declaration itself.  Leave it to the alias below and let
-            // the declaration's own shard supply the authoritative identity.
-            if (!id->starts_with("scoped_member::"))
+            // Two spellings name a *use*, not a declaration, and must not be
+            // adopted here:
+            //
+            //   * `scoped_member::P::N` is what a shard records for `P::N` when
+            //     it never parsed P.
+            //   * `class_member::C::N` is the kind-neutral alias for
+            //     `handle.member`; for an inherited member C is the *deriving*
+            //     class, not the one that declares the member.
+            //
+            // Adopting either restricts the search to the occurrences spelled
+            // that same weak way, silently dropping the declaration and every
+            // sibling use -- which is what makes rename from such a use site
+            // rewrite only part of the symbol and leave the code uncompilable.
+            // Leave them to the alias bridging below and let the declaration's
+            // own shard supply the authoritative identity.
+            if (!id->starts_with("scoped_member::") && !id->starts_with("class_member::"))
                 target_symbol_debug = *id;
         }
 
