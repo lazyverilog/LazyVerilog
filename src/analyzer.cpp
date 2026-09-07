@@ -4978,8 +4978,13 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     std::string class_member_package;
     std::string class_member_class;
     std::string class_member_name;
+    // `typedef_field::` joins the two class spellings here: a struct field
+    // reached through a receiver whose typedef this shard never parsed is
+    // recorded with the same kind-neutral `class_member::` alias, because that
+    // shard cannot tell a struct field from a class member either.
     for (const auto prefix : {std::string_view("class_field::"),
-                              std::string_view("class_method::")}) {
+                              std::string_view("class_method::"),
+                              std::string_view("typedef_field::")}) {
         if (!target_symbol_debug.starts_with(prefix))
             continue;
         const std::string_view rest = std::string_view(target_symbol_debug).substr(prefix.size());
@@ -5039,15 +5044,64 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         return it->second;
     };
 
-    auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports) {
+    // A file may name a package type without importing it — `pkg::beat_t b;`
+    // then `b.field`.  Its shard has no ImportEntry, but it does declare
+    // something of that qualified type, which is the same proof that the
+    // occurrence means this package's type and not a same-named one elsewhere.
+    // Declarations are orders of magnitude fewer than occurrences, and the
+    // answer is cached per shard, so this stays off the hot path.
+    std::unordered_map<const SyntaxIndex*, bool> declares_qualified_owner_cache;
+    auto shard_declares_qualified_owner = [&](const SyntaxIndex& index) {
+        if (class_member_package.empty() || class_member_class.empty())
+            return false;
+        auto [it, inserted] = declares_qualified_owner_cache.try_emplace(&index, false);
+        if (!inserted)
+            return it->second;
+
+        const std::string qualified = class_member_package + "::" + class_member_class;
+        const auto names_type = [&](const std::string& type_text) {
+            if (type_text.rfind(qualified, 0) != 0)
+                return false;
+            // `pkg::beat_t` and `pkg::beat_t [3:0]`, but not `pkg::beat_two_t`.
+            return type_text.size() == qualified.size() ||
+                   !syntax_fragment_edge_is_wordlike(type_text[qualified.size()]);
+        };
+
+        bool found = false;
+        for (const auto& value : index.values) {
+            if (names_type(value.type)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (const auto& module : index.modules) {
+                for (const auto& port : module.ports) {
+                    if (names_type(port.type) || names_type(port.decl_type)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found)
+                    break;
+            }
+        }
+        it->second = found;
+        return found;
+    };
+
+    auto admits_class_member_alias = [&](const std::vector<ImportEntry>& imports,
+                                         const SyntaxIndex& index) {
         // A class outside any package is reached by bare name, so there is no
         // import to require.
         if (class_member_package.empty())
             return true;
-        return std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
-            return import.package_name == class_member_package &&
-                   (import.wildcard || import.symbol_name == class_member_class);
-        });
+        if (std::any_of(imports.begin(), imports.end(), [&](const ImportEntry& import) {
+                return import.package_name == class_member_package &&
+                       (import.wildcard || import.symbol_name == class_member_class);
+            }))
+            return true;
+        return shard_declares_qualified_owner(index);
     };
 
     auto imports_target_package = [&](const std::vector<ImportEntry>& imports) {
@@ -5091,9 +5145,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (scoped_member_alias_id && ref.symbol_id == scoped_member_alias_id)
             return true;
         if (class_member_alias_id && ref.symbol_id == class_member_alias_id &&
-            admits_class_member_alias(imports))
+            admits_class_member_alias(imports, index))
             return true;
-        if (is_inherited_member_occurrence(ref) && admits_class_member_alias(imports))
+        if (is_inherited_member_occurrence(ref) && admits_class_member_alias(imports, index))
             return true;
         return false;
     };

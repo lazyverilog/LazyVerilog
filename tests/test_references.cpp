@@ -2523,6 +2523,69 @@ TEST_CASE("references: wildcard-imported package type used unqualified in anothe
     std::filesystem::remove_all(dir);
 }
 
+// A struct field is only recorded as `typedef_field::` by a shard that parsed
+// the typedef.  A file that merely *uses* the struct recorded nothing for
+// `handle.field`, so references from the declaration returned the declaration
+// alone and rename left every use behind, broken.  Uses now carry the same
+// kind-neutral `class_member::` alias that a foreign class member does.
+TEST_CASE("references: struct field uses in other files, typedef in a package",
+          "[references][struct]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-struct-field";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto pkg = dir / "beat_pkg.sv";
+    const auto wildcard = dir / "user_wildcard.sv";
+    const auto qualified = dir / "user_qualified.sv";
+    const std::string pkg_text = "package beat_pkg;\n"
+                                 "  typedef struct packed {\n"
+                                 "    logic [7:0] tag;\n"
+                                 "    logic       vld;\n"
+                                 "  } beat_t;\n"
+                                 "endpackage\n";
+    {
+        std::ofstream out(pkg);
+        out << pkg_text;
+    }
+    {
+        std::ofstream out(wildcard);
+        out << "module user_wildcard(output logic o_hit);\n"
+               "  import beat_pkg::*;\n"
+               "  beat_t r_beat;\n"
+               "  assign o_hit = r_beat.vld;\n"
+               "endmodule\n";
+    }
+    {
+        // No import: the type is named qualified, which is just as common.
+        std::ofstream out(qualified);
+        out << "module user_qualified(output logic o_hit);\n"
+               "  beat_pkg::beat_t r_beat;\n"
+               "  assign o_hit = r_beat.vld;\n"
+               "endmodule\n";
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg.string(), wildcard.string(), qualified.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto pkg_uri = uri_from_path(pkg);
+    analyzer.open(pkg_uri, pkg_text);
+
+    // Cursor on the `vld` field declaration.
+    auto refs = analyzer.find_references(pkg_uri, 3, 16, true);
+
+    const auto wildcard_uri = uri_from_path(wildcard);
+    const auto qualified_uri = uri_from_path(qualified);
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == wildcard_uri && l.line == 3; }));
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == qualified_uri && l.line == 2; }));
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [&](const Location& l) { return l.uri == pkg_uri && l.line == 3; }));
+
+    std::filesystem::remove_all(dir);
+}
+
 // A subroutine body and a named begin/end block are scopes of their own.  They
 // used to share the enclosing module's SymbolID, so find-references from a
 // module signal swallowed every same-named formal, local and block declaration,
