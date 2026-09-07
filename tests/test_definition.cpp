@@ -2023,3 +2023,61 @@ TEST_CASE("definition: super.new resolves to the base class constructor",
     // `        function new(int payload);`
     CHECK(loc->col == 17);
 }
+
+// `arr[0].field` reaches its member through an element select.  The receiver
+// chain already treated the select as transparent, but the *type* text did not:
+// canonical_type_name_from_text() recovers a type name by scanning backwards for
+// the last word-like run, and `el_t unpk [0:3]` ends in the dimension, so the
+// scan returned "3" and member lookup searched for a type named `3`.  Arrays of
+// structs are ordinary RTL, so every register bank and per-lane state array lost
+// go-to-definition on its fields.
+TEST_CASE("definition: member access through an array element resolves to the field",
+          "[definition][struct]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_array_member.sv";
+    analyzer.open(uri, "module arr_top;\n"
+                       "  typedef struct packed {\n"
+                       "    logic [7:0] fa;\n"
+                       "    logic [7:0] fb;\n"
+                       "  } el_t;\n"
+                       "  el_t single;\n"
+                       "  el_t unpk [0:3];\n"
+                       "  el_t twod [0:1][0:1];\n"
+                       "  int  idx;\n"
+                       "  always_comb begin\n"
+                       "    single.fa     = 8'h01;\n"
+                       "    unpk[0].fa    = 8'h02;\n"
+                       "    unpk[idx].fb  = 8'h03;\n"
+                       "    twod[0][1].fa = 8'h04;\n"
+                       "  end\n"
+                       "endmodule\n");
+
+    // `fa` is declared on line 2 col 16, `fb` on line 3 col 16.
+    SECTION("no index at all still resolves") {
+        auto loc = analyzer.definition_of(uri, 10, 11);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 2);
+        CHECK(loc->col == 16);
+    }
+
+    SECTION("a constant index resolves to the element type's field") {
+        auto loc = analyzer.definition_of(uri, 11, 12);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 2);
+        CHECK(loc->col == 16);
+    }
+
+    SECTION("a variable index resolves too") {
+        auto loc = analyzer.definition_of(uri, 12, 14);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 16);
+    }
+
+    SECTION("a two-dimensional index resolves too") {
+        auto loc = analyzer.definition_of(uri, 13, 15);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 2);
+        CHECK(loc->col == 16);
+    }
+}

@@ -1,5 +1,6 @@
 #include "analyzer.hpp"
 #include "features/references.hpp"
+#include "features/rename.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
@@ -2818,5 +2819,200 @@ TEST_CASE("references: module, block and subroutine scopes do not merge same-nam
         REQUIRE(loc.has_value());
         CHECK(loc->line == 6);
         CHECK(loc->col == 55);
+    }
+}
+
+// find_references() resolved the clicked declaration with definition_of_state()
+// called deliberately without extra files, then recovered from the compact
+// shards for Generic and PackageMember targets only.  ClassMember — what `a.b`
+// becomes — was missing from that chain, so target_def stayed null and the
+// request returned nothing at all from the use site, even though
+// go-to-definition on the same token answered and a search started from the
+// declaration found the very same use.  Rename inherited the hole and returned
+// an empty edit with no error.
+TEST_CASE("references: a cross-file member answers from its use site",
+          "[references][struct][class][interface]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-crossfile-member";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto pkg = dir / "nav_pkg.sv";
+    const auto intf = dir / "nav_if.sv";
+    const auto user = dir / "nav_user.sv";
+
+    {
+        std::ofstream out(pkg);
+        out << "package nav_pkg;\n"
+               "  typedef struct packed {\n"
+               "    logic [7:0] tag;\n"
+               "    logic       vld;\n"
+               "  } beat_t;\n"
+               "  class packet;\n"
+               "    int depth;\n"
+               "  endclass\n"
+               "endpackage\n";
+    }
+    {
+        std::ofstream out(intf);
+        out << "interface nav_if;\n"
+               "  logic gnt;\n"
+               "endinterface\n";
+    }
+
+    const std::string user_text = "module nav_user (nav_if vif, output logic o_hit);\n"
+                                  "  import nav_pkg::*;\n"
+                                  "  beat_t r_beat;\n"
+                                  "  packet p;\n"
+                                  "  assign o_hit = r_beat.vld;\n"
+                                  "  initial begin\n"
+                                  "    p.depth = 7;\n"
+                                  "    o_hit   = vif.gnt;\n"
+                                  "  end\n"
+                                  "endmodule\n";
+    {
+        std::ofstream out(user);
+        out << user_text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg.string(), intf.string(), user.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto user_uri = uri_from_path(user);
+    const auto pkg_uri = uri_from_path(pkg);
+    const auto intf_uri = uri_from_path(intf);
+    analyzer.open(user_uri, user_text);
+
+    auto has = [](const std::vector<Location>& refs, const std::string& uri, int line) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& l) { return l.uri == uri && l.line == line; });
+    };
+
+    SECTION("a struct field whose typedef lives in a package") {
+        const auto [line, col] = find_position_after(user_text, "vld", "r_beat.");
+        auto refs = analyzer.find_references(user_uri, line, col, true);
+        CHECK(has(refs, pkg_uri, 3));   // the declaration
+        CHECK(has(refs, user_uri, 4));  // the use under the cursor
+    }
+
+    SECTION("a class field whose class lives in a package") {
+        const auto [line, col] = find_position_after(user_text, "depth", "p.");
+        auto refs = analyzer.find_references(user_uri, line, col, true);
+        CHECK(has(refs, pkg_uri, 6));
+        CHECK(has(refs, user_uri, 6));
+    }
+
+    SECTION("an interface signal reached through a port") {
+        const auto [line, col] = find_position_after(user_text, "gnt", "vif.");
+        auto refs = analyzer.find_references(user_uri, line, col, true);
+        CHECK(has(refs, intf_uri, 1));
+        CHECK(has(refs, user_uri, 7));
+    }
+
+    SECTION("rename from the use site rewrites the declaration too") {
+        const auto [line, col] = find_position_after(user_text, "vld", "r_beat.");
+        TextDocumentRename::Params params;
+        params.textDocument.uri.raw_uri_ = user_uri;
+        params.position = lsPosition(line, col);
+        params.newName = "valid";
+
+        auto edit = provide_rename(analyzer, params);
+        REQUIRE(edit.changes.has_value());
+        // Renaming a field from a use site must reach the declaration in the
+        // other file, not just the token under the cursor.
+        CHECK(edit.changes->contains(pkg_uri));
+        CHECK(edit.changes->contains(user_uri));
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// Two cursor positions returned a *partial* result — a plausible-looking,
+// non-empty list missing the declaration and the sibling uses — and rename then
+// rewrote only that subset, breaking compilation with no warning.  From an
+// `extends` clause the search matched a single token, so renaming a class left
+// its declaration behind and the derived class extended a name that no longer
+// existed.  From an inherited member used unqualified in the derived class the
+// search saw only that class's own uses, because the clicked token carries the
+// kind-neutral `class_member::<deriving class>::<name>` alias rather than the
+// declaring class's identity.
+TEST_CASE("references: an inherited member and an extends clause reach their declaration",
+          "[references][rename][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_inherited_member.sv";
+    const std::string text = "package inh_pkg;\n"
+                             "  class base_c;\n"
+                             "    int depth;\n"
+                             "    function void reset_base();\n"
+                             "      depth = 0;\n"
+                             "    endfunction\n"
+                             "  endclass\n"
+                             "  class child_c extends base_c;\n"
+                             "    function void bump();\n"
+                             "      depth = depth + 1;\n"
+                             "    endfunction\n"
+                             "  endclass\n"
+                             "  class other_c;\n"
+                             "    base_c handle;\n"
+                             "    function void go();\n"
+                             "      handle.depth = 9;\n"
+                             "    endfunction\n"
+                             "  endclass\n"
+                             "endpackage\n";
+    analyzer.open(uri, text);
+
+    auto lines_of = [](const std::vector<Location>& refs) {
+        std::set<int> out;
+        for (const auto& l : refs)
+            out.insert(l.line);
+        return out;
+    };
+
+    SECTION("an inherited member used in the derived class finds the whole symbol") {
+        const auto [line, col] = find_position_after(text, "depth", "void bump();");
+        auto refs = analyzer.find_references(uri, line, col, true);
+        const auto seen = lines_of(refs);
+        CHECK(seen.count(2) == 1);   // the declaration in the base class
+        CHECK(seen.count(4) == 1);   // a use in the base class
+        CHECK(seen.count(9) == 1);   // the uses under and beside the cursor
+        CHECK(seen.count(15) == 1);  // the `handle.depth` use in a third class
+    }
+
+    SECTION("a class name in an extends clause finds the declaration") {
+        const auto [line, col] = find_position_after(text, "base_c", "class child_c extends ");
+        auto refs = analyzer.find_references(uri, line, col, true);
+        const auto seen = lines_of(refs);
+        CHECK(seen.count(1) == 1);   // `class base_c;`
+        CHECK(seen.count(7) == 1);   // the extends clause itself
+        CHECK(seen.count(13) == 1);  // `base_c handle;`
+    }
+
+    SECTION("rename from an extends clause rewrites the declaration, not just the clause") {
+        const auto [line, col] = find_position_after(text, "base_c", "class child_c extends ");
+        TextDocumentRename::Params params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(line, col);
+        params.newName = "renamed_base";
+
+        auto edit = provide_rename(analyzer, params);
+        REQUIRE(edit.changes.has_value());
+        REQUIRE(edit.changes->contains(uri));
+        // Anything less than all three rewrites leaves the code uncompilable.
+        CHECK(edit.changes->at(uri).size() == 3);
+    }
+
+    SECTION("rename from an inherited member rewrites the base declaration too") {
+        const auto [line, col] = find_position_after(text, "depth", "void bump();");
+        TextDocumentRename::Params params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(line, col);
+        params.newName = "renamed_depth";
+
+        auto edit = provide_rename(analyzer, params);
+        REQUIRE(edit.changes.has_value());
+        REQUIRE(edit.changes->contains(uri));
+        // The declaration, the base's own use, both halves of `depth = depth + 1`
+        // and the `handle.depth` use: five rewrites, not just the derived class's.
+        CHECK(edit.changes->at(uri).size() == 5);
     }
 }
