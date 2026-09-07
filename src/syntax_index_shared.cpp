@@ -2111,6 +2111,27 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     interface_receivers.emplace(inst.parent_module + "\n" + inst.instance_name,
                                                 inst.module_name);
                 }
+                // A virtual interface handle is a class property, not a module
+                // value: `virtual bus_if vif;` inside a driver reaches the same
+                // members as the instance it is assigned from.  Keyed by class
+                // so `vif` in one class cannot answer for `vif` in another.
+                for (const auto& cls : index.classes) {
+                    for (const auto& field : cls.fields) {
+                        if (field.name.empty() || field.type.empty())
+                            continue;
+                        // Only the `virtual` spelling: any other field type is a
+                        // class or an aggregate, already handled above.
+                        if (field.type.rfind("virtual", 0) != 0 ||
+                            (field.type.size() > 7 &&
+                             syntax_fragment_edge_is_wordlike(field.type[7])))
+                            continue;
+                        auto iface = base_type_identifier(field.type);
+                        if (iface.empty())
+                            continue;
+                        interface_receivers.emplace(cls.name + "\n" + field.name,
+                                                    std::move(iface));
+                    }
+                }
             }
             const auto it = interface_receivers.find(std::string(module_name) + "\n" +
                                                      std::string(receiver));
@@ -2126,11 +2147,17 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         bool try_add_interface_member_reference(const slang::parsing::Token& token,
                                                 std::string_view member_name,
                                                 std::string_view object_name) {
-            if (member_name.empty() || object_name.empty() || current_module.empty())
+            if (member_name.empty() || object_name.empty())
                 return false;
             if (interface_receivers_ready && interface_receivers.empty())
                 return false;
-            const auto* iface = interface_type_for_receiver(current_module, object_name);
+            const std::string* iface = nullptr;
+            if (!current_module.empty())
+                iface = interface_type_for_receiver(current_module, object_name);
+            // Inside a class body the receiver may be a virtual interface
+            // property, which no module declares.
+            if (!iface && !current_class_bare.empty())
+                iface = interface_type_for_receiver(current_class_bare, object_name);
             if (!iface)
                 return false;
             if (declared_subroutines.contains(subroutine_scope_key(SubroutineOwnerKind::Interface,

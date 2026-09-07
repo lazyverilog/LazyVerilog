@@ -2594,6 +2594,13 @@ TEST_CASE("references: interface members used through a port or an instance",
                "  logic clk;\n"
                "  bus_if tb_bus (.clk(clk));\n"
                "  initial tb_bus.drive(1'b1);\n"
+               "  class driver;\n"
+               "    virtual bus_if vif;\n"
+               "    task automatic run();\n"
+               "      vif.drive(1'b1);\n"
+               "      if (vif.gnt) $display(\"granted\");\n"
+               "    endtask\n"
+               "  endclass\n"
                "endmodule\n";
     }
 
@@ -2617,6 +2624,20 @@ TEST_CASE("references: interface members used through a port or an instance",
         auto refs = analyzer.find_references(iface_uri, 4, 17, true); // `drive` declaration
         CHECK(std::any_of(refs.begin(), refs.end(),
                           [&](const Location& l) { return l.uri == tb_uri && l.line == 3; }));
+    }
+
+    // A virtual interface handle is a class property, so no module declares it;
+    // the receiver has to be resolved against the class that does.
+    SECTION("a task called through a virtual interface handle") {
+        auto refs = analyzer.find_references(iface_uri, 4, 17, true); // `drive` declaration
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& l) { return l.uri == tb_uri && l.line == 7; }));
+    }
+
+    SECTION("a signal read through a virtual interface handle") {
+        auto refs = analyzer.find_references(iface_uri, 2, 8, true); // `gnt` declaration
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [&](const Location& l) { return l.uri == tb_uri && l.line == 8; }));
     }
 
     std::filesystem::remove_all(dir);
