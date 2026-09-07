@@ -2523,6 +2523,40 @@ TEST_CASE("references: wildcard-imported package type used unqualified in anothe
     std::filesystem::remove_all(dir);
 }
 
+// `g_lane[0].acc` names the block's own signal.  It used to be recorded as an
+// occurrence of the enclosing module's same-named signal, so find-references
+// merged the two and rename rewrote a different object.
+TEST_CASE("references: an indexed generate path belongs to the block, not the module",
+          "[references][hierarchy]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_indexed_generate.sv";
+    analyzer.open(uri, "module gen_top;\n"
+                       "  logic [31:0] acc;\n"
+                       "  logic [31:0] o_sum;\n"
+                       "  assign o_sum = g_lane[0].acc;\n"
+                       "  for (genvar gi = 0; gi < 4; gi++) begin : g_lane\n"
+                       "    logic [31:0] acc;\n"
+                       "    always_comb acc = o_sum;\n"
+                       "  end\n"
+                       "  assign acc = o_sum;\n"
+                       "endmodule\n");
+
+    SECTION("the module signal keeps only its own uses") {
+        const auto refs = analyzer.find_references(uri, 1, 15, true);
+        CHECK(refs.size() == 2); // declaration + `assign acc = o_sum;`
+        CHECK(std::none_of(refs.begin(), refs.end(),
+                           [](const Location& l) { return l.line == 3; }));
+    }
+
+    SECTION("the block signal owns the hierarchical use, written above the block") {
+        const auto refs = analyzer.find_references(uri, 5, 17, true);
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [](const Location& l) { return l.line == 3 && l.col == 27; }));
+        CHECK(std::any_of(refs.begin(), refs.end(),
+                          [](const Location& l) { return l.line == 6; }));
+    }
+}
+
 // An interface member reached from another file — `bus.gnt` through a modport
 // port, `tb_bus.drive(...)` through an instance — was recorded by nothing, so
 // find-references returned only the uses written inside the interface itself

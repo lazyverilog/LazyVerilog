@@ -2170,6 +2170,36 @@ static std::optional<Location> find_generate_block_member_in_tree(
     return visitor.result;
 }
 
+/// True when this file declares a generate block labelled @p label.
+///
+/// Used to tell a hierarchical address (`g_lane[0].acc`) from a handle whose
+/// type simply could not be resolved: for the former, falling back to a
+/// same-named signal of the enclosing scope answers with a different object.
+static bool generate_block_label_exists_in_tree(const slang::syntax::SyntaxTree& tree,
+                                                std::string_view label) {
+    if (label.empty())
+        return false;
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        std::string_view label;
+        bool found{false};
+
+        explicit Visitor(std::string_view label) : label(label) {}
+
+        void handle(const slang::syntax::GenerateBlockSyntax& node) {
+            const auto* name_clause = node.beginName ? node.beginName : node.endName;
+            if (name_clause && name_clause->name.valueText() == label)
+                found = true;
+            if (!found)
+                visitDefault(node);
+        }
+    };
+
+    Visitor visitor(label);
+    tree.root().visit(visitor);
+    return visitor.found;
+}
+
 static std::pair<int, int> source_range_lines_one_based(const slang::SourceManager& sm,
                                                         slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
@@ -3379,6 +3409,37 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         // member-access path and must not be intercepted here.
         if (!node.left || !node.right ||
             node.separator.kind != slang::parsing::TokenKind::DoubleColon) {
+            // …with one exception: a dotted name whose receiver carries a
+            // select (`g_lane[0].acc`) parses as ScopedNameSyntax, not as a
+            // MemberAccessExpressionSyntax, so nothing below records the
+            // receiver.  The cursor then reached visitToken() as a bare
+            // identifier and resolved to whatever same-named signal the
+            // enclosing module happened to declare — a different object.
+            //
+            // Deliberately narrow: only `receiver[i].member`, the shape the
+            // deeper hierarchical walk cannot start from.  Longer paths
+            // (`u_dut.u_leaf.sig`) already resolve through the instance and
+            // hierarchy machinery, and claiming them here would take that away.
+            if (node.left && node.right &&
+                node.separator.kind == slang::parsing::TokenKind::Dot &&
+                node.left->kind == slang::syntax::SyntaxKind::IdentifierSelectName) {
+                if (const auto* right =
+                        node.right->as_if<slang::syntax::IdentifierNameSyntax>()) {
+                    if (token_claims_cursor(right->identifier)) {
+                        std::vector<std::string> chain;
+                        collect_dotted_name_chain(node.left, chain);
+                        if (chain.size() == 1) {
+                            target.kind = DefinitionTargetKind::ClassMember;
+                            target.name = std::string(right->identifier.valueText());
+                            target.object_path = std::move(chain);
+                            target.object_name = target.object_path.back();
+                            target.scope_module = current_module;
+                            target.scope_package = current_package;
+                            return;
+                        }
+                    }
+                }
+            }
             visitDefault(node);
             return;
         }
@@ -3467,6 +3528,30 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         }
         if (const auto* select = expr->as_if<slang::syntax::ElementSelectExpressionSyntax>())
             collect_receiver_chain(select->left, out);
+    }
+
+    /// Receiver names of a dotted *name* (as opposed to a member-access
+    /// expression): `g_lane[0].u_lane` -> {"g_lane", "u_lane"}.  Selects are
+    /// dropped: every copy of a generate loop shares one declaration, so the
+    /// index only says which block, never which iteration.
+    static void collect_dotted_name_chain(const slang::syntax::NameSyntax* name,
+                                          std::vector<std::string>& out) {
+        if (!name)
+            return;
+        if (const auto* ident = name->as_if<slang::syntax::IdentifierNameSyntax>()) {
+            out.emplace_back(ident->identifier.valueText());
+            return;
+        }
+        if (const auto* select = name->as_if<slang::syntax::IdentifierSelectNameSyntax>()) {
+            out.emplace_back(select->identifier.valueText());
+            return;
+        }
+        if (const auto* scoped = name->as_if<slang::syntax::ScopedNameSyntax>()) {
+            if (scoped->separator.kind != slang::parsing::TokenKind::Dot)
+                return;
+            collect_dotted_name_chain(scoped->left, out);
+            collect_dotted_name_chain(scoped->right, out);
+        }
     }
 
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
@@ -4643,6 +4728,24 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                               target.name))
                 return loc;
         }
+    }
+
+    // `g_lane[0].acc` addresses the `acc` inside that generate block, so the
+    // module's own same-named signal is a different object.  Once the member
+    // lookups above have missed, answering from the enclosing scope is worse
+    // than answering nothing — it sends the user to the wrong declaration, and
+    // find-references and rename then merge the two.  Restricted to a receiver
+    // that names a scope (a generate block here), because a handle whose type
+    // this file cannot resolve still benefits from the generic fallback.
+    if (target.kind == DefinitionTargetKind::ClassMember && !target.object_path.empty() &&
+        state.tree &&
+        generate_block_label_exists_in_tree(*state.tree, target.object_path.front())) {
+        // `gen_lane[0].u_leaf.state_q` with the cursor on the instance segment:
+        // the name is an instantiation inside that block, not a member of it.
+        if (auto loc = find_instance_definition(current_index, uri, target.scope_module,
+                                                target.name))
+            return loc;
+        return std::nullopt;
     }
 
     std::vector<ImportEntry> visible_imports;

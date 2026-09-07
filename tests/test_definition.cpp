@@ -1705,6 +1705,46 @@ TEST_CASE("definition: interface port members and modport names resolve", "[defi
     }
 }
 
+// `g_lane[0].acc` parses as a ScopedNameSyntax, not a member-access expression,
+// so the receiver was lost and the cursor resolved as a bare identifier — to the
+// module's own same-named signal, silently answering with a different object.
+TEST_CASE("definition: an indexed generate path resolves inside the block",
+          "[definition][hierarchy]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_indexed_generate.sv";
+    analyzer.open(uri, "module gen_top;\n"
+                       "  logic [31:0] acc;\n"
+                       "  logic [31:0] o_sum;\n"
+                       "  for (genvar gi = 0; gi < 4; gi++) begin : g_lane\n"
+                       "    logic [31:0] acc;\n"
+                       "    logic [31:0] lane_data;\n"
+                       "  end\n"
+                       "  assign o_sum = g_lane[0].acc + g_lane[1].lane_data;\n"
+                       "  assign acc   = o_sum;\n"
+                       "endmodule\n");
+
+    SECTION("the shadowed name resolves to the block declaration") {
+        auto loc = analyzer.definition_of(uri, 7, 27);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 4);
+        CHECK(loc->col == 17);
+    }
+
+    SECTION("a name only the block declares resolves too") {
+        auto loc = analyzer.definition_of(uri, 7, 43);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 5);
+        CHECK(loc->col == 17);
+    }
+
+    SECTION("the module's own signal still resolves to itself") {
+        auto loc = analyzer.definition_of(uri, 8, 9);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 15);
+    }
+}
+
 // `parameter type T_BEAT = pkg::outer_t` is indexed as a typedef with no fields
 // of its own, so member lookup on a value declared with it found a type name
 // that owns nothing and stopped.  The alias hop reaches the type the parameter

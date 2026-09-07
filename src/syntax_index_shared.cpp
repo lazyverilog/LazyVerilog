@@ -1001,6 +1001,13 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // Built on first member access this shard cannot explain otherwise.
         std::unordered_map<std::string, std::string> interface_receivers;
         bool interface_receivers_ready{false};
+        // "<module>.<label>\n<name>" for declarations inside a named generate
+        // block, so a use written outside the block can be classified.
+        std::unordered_set<std::string> generate_block_members;
+        // Modules whose generate blocks were collected ahead of the walk
+        // reaching them, for a use written above the block it names.
+        std::unordered_set<std::string> prescanned_generate_modules;
+        const ModuleDeclarationSyntax* current_module_node{nullptr};
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
         const std::unordered_map<std::string, std::string>& unique_class_scopes;
@@ -1194,6 +1201,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             auto previous_module = current_module;
             auto previous_module_kind = current_module_kind;
             auto previous_package = current_package;
+            const auto* previous_module_node = current_module_node;
+            current_module_node = &node;
             const auto import_stack_size = visible_type_imports.size();
             if (node.kind == SyntaxKind::PackageDeclaration) {
                 current_package = module_name;
@@ -1207,6 +1216,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             current_module = std::move(previous_module);
             current_module_kind = std::move(previous_module_kind);
             current_package = std::move(previous_package);
+            current_module_node = previous_module_node;
             visible_type_imports.resize(import_stack_size);
         }
 
@@ -1575,6 +1585,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 }
             }
 
+            // Keep the block's members reachable after the walk leaves it: a
+            // use written outside, `g_lane[0].acc`, names them through the
+            // label and must not be merged with a same-named module signal.
+            for (const auto& member_name : scope.names)
+                generate_block_members.insert(scope.scope + "\n" + member_name);
+
             generate_scopes.push_back(std::move(scope));
             visitDefault(node);
             generate_scopes.pop_back();
@@ -1839,7 +1855,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     }
                 }
             }
-            if (try_add_interface_member_reference(node.name, field_name, object_name)) {
+            if (try_add_generate_block_member_reference(node.name, field_name, object_name) ||
+                try_add_interface_member_reference(node.name, field_name, object_name)) {
                 if (node.left)
                     node.left->visit(*this);
                 return;
@@ -1888,6 +1905,31 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             --i;
             while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
                 --i;
+            // `g_lane[0].acc`, `bus_arr[i].req` — the receiver carries a select.
+            // Every copy of a generate loop shares one declaration and every
+            // element of an interface array one interface, so the index inside
+            // the brackets names no separate object: skip it and read the name.
+            if (i > 0 && source[i - 1] == ']') {
+                size_t depth = 0;
+                size_t j = i;
+                while (j > 0) {
+                    const char c = source[j - 1];
+                    if (c == ']')
+                        ++depth;
+                    else if (c == '[') {
+                        if (--depth == 0) {
+                            --j;
+                            break;
+                        }
+                    }
+                    --j;
+                }
+                if (depth != 0)
+                    return {};
+                i = j;
+                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                    --i;
+            }
             const size_t end = i;
             while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
                 --i;
@@ -1931,6 +1973,89 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (!scope)
                 return false;
             add_ref(token, symbol_canonical("class_field", *scope, std::string(field_name)));
+            return true;
+        }
+
+        /// `g_lane[0].acc` written outside the block: the receiver is a
+        /// generate-block label, and the member is declared inside it.  Those
+        /// declarations already carry the `module_signal::<module>.<label>::`
+        /// identity, so the use gets the same one and stops being merged with a
+        /// same-named signal of the enclosing module.
+        bool try_add_generate_block_member_reference(const slang::parsing::Token& token,
+                                                     std::string_view member_name,
+                                                     std::string_view object_name) {
+            if (member_name.empty() || object_name.empty() || current_module.empty())
+                return false;
+            scope_key = current_module;
+            scope_key += '.';
+            scope_key.append(object_name);
+            const auto scope = scope_key;
+            scope_key += '\n';
+            scope_key.append(member_name);
+            if (!generate_block_members.contains(scope_key)) {
+                // The use may be written above the block it names.  The walk
+                // records a block's members when it reaches it, so scan the
+                // enclosing module's generate blocks once — and only for a file
+                // that actually addresses one this way.
+                if (!prescan_generate_blocks_of_current_module())
+                    return false;
+                if (!generate_block_members.contains(scope_key))
+                    return false;
+            }
+            add_ref(token, symbol_canonical("module_signal", scope, member_name));
+            return true;
+        }
+
+        /// Collect every named generate block of the module being walked, so a
+        /// forward reference to one resolves.  Runs at most once per module and
+        /// only when an indexed/labelled member access asked for it.
+        bool prescan_generate_blocks_of_current_module() {
+            if (!current_module_node || current_module.empty())
+                return false;
+            if (!prescanned_generate_modules.insert(current_module).second)
+                return false;
+
+            struct Collector : public SyntaxVisitor<Collector> {
+                const slang::SourceManager& sm;
+                const std::string& module_name;
+                std::unordered_set<std::string>& out;
+
+                Collector(const slang::SourceManager& sm, const std::string& module_name,
+                          std::unordered_set<std::string>& out)
+                    : sm(sm), module_name(module_name), out(out) {}
+
+                void handle(const GenerateBlockSyntax& node) {
+                    const auto* name_clause = node.beginName ? node.beginName : node.endName;
+                    std::string label = name_clause ? std::string(name_clause->name.valueText())
+                                                    : std::string{};
+                    if (label.empty() && node.label)
+                        label = std::string(node.label->name.valueText());
+                    if (!label.empty()) {
+                        const std::string scope = module_name + "." + label;
+                        for (const auto* member : node.members) {
+                            const auto* data =
+                                member ? member->as_if<DataDeclarationSyntax>() : nullptr;
+                            const auto* net =
+                                member ? member->as_if<NetDeclarationSyntax>() : nullptr;
+                            if (data) {
+                                for (const auto* decl : data->declarators)
+                                    if (decl)
+                                        out.insert(scope + "\n" +
+                                                   std::string(decl->name.valueText()));
+                            } else if (net) {
+                                for (const auto* decl : net->declarators)
+                                    if (decl)
+                                        out.insert(scope + "\n" +
+                                                   std::string(decl->name.valueText()));
+                            }
+                        }
+                    }
+                    visitDefault(node);
+                }
+            };
+
+            Collector collector(sm, current_module, generate_block_members);
+            current_module_node->visit(collector);
             return true;
         }
 
@@ -2154,6 +2279,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 if (try_add_class_field_reference(token, name, object_name, object_type))
                     return;
                 if (try_add_typedef_field_reference(token, name, object_name))
+                    return;
+                if (try_add_generate_block_member_reference(token, name, object_name))
                     return;
                 if (try_add_interface_member_reference(token, name, object_name))
                     return;
