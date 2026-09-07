@@ -2302,6 +2302,55 @@ static std::optional<std::string> find_typedef_field_type(const SyntaxIndex& ind
     return std::nullopt;
 }
 
+/// The type an alias stands for, or nothing when @p type_name is not an alias.
+///
+/// `parameter type T_BEAT = corner_pkg::outer_t` is indexed as a typedef whose
+/// `resolved` text names the default type but which carries no fields of its
+/// own; a plain `typedef outer_t beat_t;` has the same shape.  Members are
+/// declared on the type the alias points at, so member lookup has to take that
+/// hop.  A typedef that owns fields is an aggregate and ends the chain.
+///
+/// The *default* is what an alias resolves to: an instantiation-time parameter
+/// override is not visible from the file being edited, which is the same choice
+/// the rest of the parameter handling already makes.
+static std::optional<std::string> typedef_alias_target(const SyntaxIndex& index,
+                                                       std::string_view type_name) {
+    if (type_name.empty())
+        return std::nullopt;
+    for (const auto& td : index.typedefs) {
+        if (td.name != type_name || !td.fields.empty() || td.resolved.empty())
+            continue;
+        auto target = canonical_type_name_from_text(td.resolved);
+        if (!target.empty() && target != type_name)
+            return target;
+    }
+
+    // A `parameter type` is recorded as a parameter whose type text is
+    // literally "type" and whose default value is the type it stands for —
+    // as a header parameter port, or as a value for a body parameter.
+    const auto from_default = [&](std::string_view default_value) -> std::optional<std::string> {
+        auto target = canonical_type_name_from_text(default_value);
+        if (target.empty() || target == type_name)
+            return std::nullopt;
+        return target;
+    };
+    for (const auto& module : index.modules) {
+        for (const auto& port : module.ports) {
+            if (port.name != type_name || port.type != "type" || port.default_value.empty())
+                continue;
+            if (auto target = from_default(port.default_value))
+                return target;
+        }
+    }
+    for (const auto& value : index.values) {
+        if (value.name != type_name || value.type != "type" || value.default_value.empty())
+            continue;
+        if (auto target = from_default(value.default_value))
+            return target;
+    }
+    return std::nullopt;
+}
+
 static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& index,
                                                             const std::string& uri,
                                                             std::string_view type_name,
@@ -4491,6 +4540,32 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             }
         }
 
+        // A receiver declared with a `parameter type` (or any typedef alias)
+        // names a stand-in, not the type that declares the members.  Take the
+        // alias hop before the lookups below, bounded by a visited set so a
+        // circular alias cannot spin.
+        const auto resolve_alias_chain = [&](std::optional<std::string> type) {
+            std::unordered_set<std::string> visited;
+            while (type && visited.insert(*type).second) {
+                auto next = typedef_alias_target(current_index, *type);
+                if (!next) {
+                    for (const auto& extra : extra_files) {
+                        if (skip_extra(extra))
+                            continue;
+                        next = typedef_alias_target(extra.index_ref(), *type);
+                        if (next)
+                            break;
+                    }
+                }
+                if (!next)
+                    break;
+                type = std::move(next);
+            }
+            return type;
+        };
+
+        class_type = resolve_alias_chain(std::move(class_type));
+
         // Follow the rest of the chain one field at a time: the type of `a.b` is
         // the type of field `b` inside `a`'s type.  Bounded by the number of
         // dots the user actually typed, and every step is a lookup in an index
@@ -4507,7 +4582,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                         break;
                 }
             }
-            class_type = std::move(next);
+            class_type = resolve_alias_chain(std::move(next));
         }
 
         if (class_type) {

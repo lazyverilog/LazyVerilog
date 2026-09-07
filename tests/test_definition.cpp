@@ -1705,6 +1705,64 @@ TEST_CASE("definition: interface port members and modport names resolve", "[defi
     }
 }
 
+// `parameter type T_BEAT = pkg::outer_t` is indexed as a typedef with no fields
+// of its own, so member lookup on a value declared with it found a type name
+// that owns nothing and stopped.  The alias hop reaches the type the parameter
+// stands for; a plain `typedef outer_t beat_t;` alias has the same shape.
+TEST_CASE("definition: member access resolves through a type-parameter alias",
+          "[definition][typeparam]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_type_parameter_alias.sv";
+    analyzer.open(uri, "package beat_pkg;\n"
+                       "    typedef struct packed {\n"
+                       "        logic [7:0] tag;\n"
+                       "        logic       vld;\n"
+                       "    } inner_t;\n"
+                       "    typedef struct packed {\n"
+                       "        inner_t      inner;\n"
+                       "        logic [31:0] payload;\n"
+                       "    } outer_t;\n"
+                       "endpackage\n"
+                       "module lane #(\n"
+                       "    parameter type T_BEAT = beat_pkg::outer_t\n"
+                       ") (\n"
+                       "    input  T_BEAT i_beat,\n"
+                       "    output logic  o_hit\n"
+                       ");\n"
+                       "    typedef T_BEAT beat_alias_t;\n"
+                       "    beat_alias_t r_beat;\n"
+                       "    assign o_hit = i_beat.inner.vld & r_beat.payload[0];\n"
+                       "endmodule\n");
+
+    SECTION("first level through the type parameter") {
+        auto loc = analyzer.definition_of(uri, 18, 26);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 6);
+        CHECK(loc->col == 21);
+    }
+
+    SECTION("second level through the type parameter") {
+        auto loc = analyzer.definition_of(uri, 18, 32);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 20);
+    }
+
+    SECTION("through a typedef alias of the type parameter") {
+        auto loc = analyzer.definition_of(uri, 18, 46);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 7);
+        CHECK(loc->col == 21);
+    }
+
+    SECTION("the type parameter itself still resolves") {
+        auto loc = analyzer.definition_of(uri, 13, 11);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 11);
+        CHECK(loc->col == 19);
+    }
+}
+
 // A virtual interface handle is spelled `virtual simple_bus #(...)`, so
 // splitting the declared type on its first dot returned `virtual simple_bus #(`
 // and every member lookup missed.  Completion already stripped those keywords;
