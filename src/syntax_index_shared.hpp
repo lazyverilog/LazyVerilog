@@ -215,6 +215,19 @@ std::string symbol_canonical(std::string_view kind, std::string_view scope, std:
 bool is_module_value_kind(std::string_view kind);
 std::string canonical_type_name_from_text(std::string_view type);
 
+/// Bare type identifier a declared-type text names, e.g.
+///
+///   `virtual bus_if #(.W_ADDR(8))`  -> `bus_if`
+///   `virtual interface axi_if`      -> `axi_if`
+///   `AXI_BUS.Slave`                 -> `AXI_BUS`
+///   `cfg_pkg::base_cfg #(8)`        -> `base_cfg`
+///   `logic [7:0]`                   -> `logic`
+///
+/// Unlike canonical_type_name_from_text(), which recovers the *trailing*
+/// identifier of a declaration, this keeps the leading component, so a modport
+/// suffix does not win over the interface name.
+std::string base_type_identifier(std::string_view type);
+
 /// Return the plain identifier name represented by a syntax expression, or an
 /// empty string if the expression is more complex than a single identifier.
 std::string simple_identifier_from_expr(const slang::syntax::ExpressionSyntax* expr);

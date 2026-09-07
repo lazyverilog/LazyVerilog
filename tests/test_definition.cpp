@@ -1705,6 +1705,55 @@ TEST_CASE("definition: interface port members and modport names resolve", "[defi
     }
 }
 
+// A virtual interface handle is spelled `virtual simple_bus #(...)`, so
+// splitting the declared type on its first dot returned `virtual simple_bus #(`
+// and every member lookup missed.  Completion already stripped those keywords;
+// definition and hover now share that reduction.
+TEST_CASE("definition: members resolve through a virtual interface handle",
+          "[definition][interface]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_virtual_interface.sv";
+    analyzer.open(uri, "interface simple_bus #(parameter int W_ADDR = 8) (input logic clk);\n"
+                       "    logic req;\n"
+                       "    task automatic drive(input logic [W_ADDR-1:0] a);\n"
+                       "        req <= 1'b1;\n"
+                       "    endtask\n"
+                       "endinterface\n"
+                       "module tb;\n"
+                       "    class driver;\n"
+                       "        virtual simple_bus #(.W_ADDR(8)) vif;\n"
+                       "        virtual interface simple_bus plain_vif;\n"
+                       "        task automatic run();\n"
+                       "            vif.drive(8'h10);\n"
+                       "            if (vif.req) $display(\"busy\");\n"
+                       "            plain_vif.drive(8'h20);\n"
+                       "        endtask\n"
+                       "    endclass\n"
+                       "endmodule\n");
+
+    // The task lands on its declaration line; which token of that declaration
+    // answers depends on whether the interface is reached from this file's own
+    // index or from a project shard, so only the line is pinned here.
+    SECTION("task called through a parameterised virtual interface") {
+        auto loc = analyzer.definition_of(uri, 11, 16);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 2);
+    }
+
+    SECTION("signal read through a virtual interface") {
+        auto loc = analyzer.definition_of(uri, 12, 20);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 1);
+        CHECK(loc->col == 10);
+    }
+
+    SECTION("`virtual interface` spelling resolves too") {
+        auto loc = analyzer.definition_of(uri, 13, 22);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 2);
+    }
+}
+
 // Hierarchical references resolved only the simplest shape.  The instance name
 // itself matched no declarator, a generate-block label had no type so its
 // members were unreachable, and an indexed generate segment broke the walk at

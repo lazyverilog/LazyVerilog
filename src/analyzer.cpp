@@ -2042,10 +2042,11 @@ static std::optional<std::string> declared_type_text_for_object_reference(
     return result;
 }
 
-/// Interface half of an interface-port type text: `AXI_BUS.Slave` -> `AXI_BUS`.
+/// Interface half of a declared-type text: `AXI_BUS.Slave` -> `AXI_BUS`, and
+/// `virtual bus_if #(.W_ADDR(8))` -> `bus_if`, so a virtual interface handle
+/// reaches its members like the interface instance it points at.
 static std::string interface_name_from_type_text(std::string_view type_text) {
-    const auto dot = type_text.find('.');
-    return std::string(dot == std::string_view::npos ? type_text : type_text.substr(0, dot));
+    return base_type_identifier(type_text);
 }
 
 /// A signal, modport or parameter declared inside interface @p interface_name.
@@ -4537,6 +4538,13 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             if (auto type_text = declared_type_text_for_object_reference(
                     current_index, target.scope_module, base_receiver, use_line_one_based))
                 interface_name = interface_name_from_type_text(*type_text);
+            // A virtual interface handle is a class property, not a module
+            // value, so the module-scope lookup above finds nothing.  The
+            // receiver type already resolved for the class path is the answer
+            // there: `virtual bus_if #(.W_ADDR(8)) vif;` reduces to `bus_if`,
+            // whose members live where an instance's do.
+            if (interface_name.empty() && class_type)
+                interface_name = interface_name_from_type_text(*class_type);
             if (interface_name.empty())
                 interface_name = base_receiver;
 

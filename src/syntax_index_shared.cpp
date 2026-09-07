@@ -483,6 +483,43 @@ std::string canonical_type_name_from_text(std::string_view type) {
     return std::string(type.substr(begin, end - begin));
 }
 
+std::string base_type_identifier(std::string_view type) {
+    const auto trim = [](std::string_view text) {
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+            text.remove_prefix(1);
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+            text.remove_suffix(1);
+        return text;
+    };
+
+    // A parameter override is dropped first: `virtual bus_if #(.W_ADDR(8))`
+    // carries a dot inside it, which would otherwise read as a modport suffix.
+    if (const auto hash = type.find('#'); hash != std::string_view::npos)
+        type = type.substr(0, hash);
+    type = trim(type);
+
+    // `virtual bus_if` / `virtual interface bus_if`: the keywords belong to the
+    // handle, not to the type it points at.
+    for (const std::string_view keyword : {"virtual", "interface"}) {
+        if (type.size() > keyword.size() && type.compare(0, keyword.size(), keyword) == 0 &&
+            std::isspace(static_cast<unsigned char>(type[keyword.size()]))) {
+            type.remove_prefix(keyword.size());
+            type = trim(type);
+        }
+    }
+
+    // A package qualifier has to go before the leading-identifier scan, which
+    // would otherwise stop at the package name.
+    if (const auto scope = type.rfind("::"); scope != std::string_view::npos)
+        type = type.substr(scope + 2);
+    type = trim(type);
+
+    size_t end = 0;
+    while (end < type.size() && syntax_fragment_edge_is_wordlike(type[end]))
+        ++end;
+    return std::string(type.substr(0, end));
+}
+
 std::vector<std::string> collect_include_dependency_uris(const slang::SourceManager& sm,
                                                          const std::string& owning_uri) {
     std::unordered_set<std::string> seen;
