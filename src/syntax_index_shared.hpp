@@ -184,6 +184,23 @@ std::string render_syntax_node_text(const slang::SourceManager& sm,
 /// field `bp_lce_mode_e icache_mode;` inside `declare_bp_cfg_bus_s` would
 /// otherwise report its type as the whole `` `declare_bp_cfg_bus_s(...) ``
 /// invocation, which is not a type at all.
+/// Type text of a declaration, resolved through macro expansion when the
+/// declaration itself was produced *inside* a macro body.
+///
+/// render_syntax_node_text() deliberately preserves macro spelling, so a
+/// hand-written `logic [`WIDTH-1:0] x;` keeps the `` `WIDTH `` the user typed in
+/// hover, in the outline and in generated code.  For a declaration a macro body
+/// created, every token maps back to the invocation, so that same rule reports
+/// the invocation as the declaration's type:
+///
+///     `DECLARE_COUNTER(beat, 8)  ->  beat_cnt : `DECLARE_COUNTER(beat, 8)
+///
+/// which is not a type.  The declaration's own tokens are the answer there.
+/// The check is on the node's first token, so a hand-written declaration that
+/// merely uses a macro in its dimensions keeps the spelling-preserving form.
+std::string render_declaration_type_text(const slang::SourceManager& sm,
+                                         const slang::syntax::SyntaxNode& node);
+
 std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
                                              const slang::syntax::SyntaxNode& node);
 

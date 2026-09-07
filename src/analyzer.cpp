@@ -1429,7 +1429,7 @@ static std::string render_hover_dimensions(
         if (!dimension)
             continue;
 
-        const auto rendered = render_syntax_node_text(sm, *dimension);
+        const auto rendered = render_declaration_type_text(sm, *dimension);
         if (rendered.empty())
             continue;
 
@@ -2734,13 +2734,13 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                 if (const auto* variable =
                         node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                     detail = token_text(variable->direction);
-                    auto type = render_syntax_node_text(sm, *variable->dataType);
+                    auto type = render_declaration_type_text(sm, *variable->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 } else if (const auto* net =
                                node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                     detail = token_text(net->direction);
-                    auto type = render_syntax_node_text(sm, *net->dataType);
+                    auto type = render_declaration_type_text(sm, *net->dataType);
                     if (!type.empty())
                         detail += (detail.empty() ? "" : " ") + type;
                 }
@@ -2769,12 +2769,12 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             if (const auto* variable =
                     node.header->as_if<slang::syntax::VariablePortHeaderSyntax>()) {
                 detail = token_text(variable->direction);
-                auto type = render_syntax_node_text(sm, *variable->dataType);
+                auto type = render_declaration_type_text(sm, *variable->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             } else if (const auto* net = node.header->as_if<slang::syntax::NetPortHeaderSyntax>()) {
                 detail = token_text(net->direction);
-                auto type = render_syntax_node_text(sm, *net->dataType);
+                auto type = render_declaration_type_text(sm, *net->dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }
@@ -2815,7 +2815,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             //
             // rather than the previous empty detail string, which made a
             // variable hover display only "**name** — *variable*".
-            auto base_type = render_syntax_node_text(sm, *node.type);
+            auto base_type = render_declaration_type_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -2829,7 +2829,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
 
         void handle(const slang::syntax::NetDeclarationSyntax& node) {
             auto detail = token_text(node.netType);
-            auto type = render_syntax_node_text(sm, *node.type);
+            auto type = render_declaration_type_text(sm, *node.type);
             if (!type.empty())
                 detail += (detail.empty() ? "" : " ") + type;
             for (const auto* declarator : node.declarators) {
@@ -2878,7 +2878,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
             // variable kind plus the declared data type.  Keep this in the
             // definition-to-symbol layer instead of the hover renderer so hover
             // formatting remains a pure presentation step over SymbolInfo.
-            auto base_type = render_syntax_node_text(sm, *node.type);
+            auto base_type = render_declaration_type_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -2891,7 +2891,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         }
 
         void handle(const slang::syntax::ParameterDeclarationSyntax& node) {
-            auto detail = render_syntax_node_text(sm, *node.type);
+            auto detail = render_declaration_type_text(sm, *node.type);
             for (const auto* declarator : node.declarators) {
                 if (!declarator)
                     continue;
@@ -2906,7 +2906,7 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
         void handle(const slang::syntax::FunctionPortSyntax& node) {
             auto detail = token_text(node.direction);
             if (node.dataType) {
-                auto type = render_syntax_node_text(sm, *node.dataType);
+                auto type = render_declaration_type_text(sm, *node.dataType);
                 if (!type.empty())
                     detail += (detail.empty() ? "" : " ") + type;
             }

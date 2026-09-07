@@ -408,6 +408,14 @@ std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
     return trim_copy(std::move(text));
 }
 
+std::string render_declaration_type_text(const slang::SourceManager& sm,
+                                         const slang::syntax::SyntaxNode& node) {
+    const auto first = node.getFirstToken();
+    if (first && first.location().valid() && sm.isMacroLoc(first.location()))
+        return render_syntax_node_text_expanded(sm, node);
+    return render_syntax_node_text(sm, node);
+}
+
 std::string base_class_lookup_name(std::string_view base_class) {
     auto name = base_class.substr(0, base_class.find('#'));
     if (const auto scope = name.rfind("::"); scope != std::string_view::npos)

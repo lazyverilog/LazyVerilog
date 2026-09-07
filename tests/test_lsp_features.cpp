@@ -168,6 +168,39 @@ endmodule
           "**non_ansi_macro** — *port*\n\n---\n\n```\ninput logic [`WIDTH-1:0] [`DEPTH]\n```");
 }
 
+// A declaration the macro *body* creates has every token mapped back to the
+// invocation, so the spelling-preserving renderer reported the invocation as
+// the variable's type.  The declaration's own tokens are the answer there; a
+// hand-written declaration that merely uses a macro keeps its spelling (the
+// port test above is the guard for that).
+TEST_CASE("hover: a macro-generated declaration reports its real type", "[hover]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_macro_generated_decl.sv";
+    const std::string text = R"(
+`define DECLARE_COUNTER(name, width) \
+  logic [width-1:0] name``_cnt;
+
+module macro_decl(input logic clk);
+  `DECLARE_COUNTER(beat, 8)
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    // Cursor on the macro invocation, which is where the generated declaration
+    // is reported.
+    params.position = lsPosition(5, 20);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& value = hover->contents.second->value;
+    CHECK(value.find("**beat_cnt**") != std::string::npos);
+    CHECK(value.find("logic") != std::string::npos);
+    CHECK(value.find("DECLARE_COUNTER") == std::string::npos);
+}
+
 TEST_CASE("hover: memory_top style non-ANSI port declaration keeps full dimensions", "[hover]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/hover_memory_top_style_port.sv";
