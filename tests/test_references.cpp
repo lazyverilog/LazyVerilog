@@ -2557,6 +2557,57 @@ TEST_CASE("references: an indexed generate path belongs to the block, not the mo
     }
 }
 
+// `dut.g_lane[0].acc` names a signal inside the DUT.  The testbench's own
+// same-named signal used to swallow it, because once every member-access
+// attempt missed the token fell through to the plain "any signal with this
+// name in this module" lookup — so renaming the testbench signal rewrote a
+// signal in another module.  A name written after a dot belongs to its
+// receiver; when that cannot be resolved, it belongs to nobody.
+TEST_CASE("references: a hierarchical member is never claimed by the enclosing module",
+          "[references][hierarchy]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-refs-hier-shadow";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto dut = dir / "lane_top.sv";
+    const auto tb = dir / "lane_tb.sv";
+    {
+        std::ofstream out(dut);
+        out << "module lane_top;\n"
+               "  for (genvar i = 0; i < 2; i++) begin : g_lane\n"
+               "    logic [31:0] acc;\n"
+               "  end\n"
+               "endmodule\n";
+    }
+    const std::string tb_text = "module lane_tb;\n"
+                                "  logic [31:0] acc;\n"
+                                "  lane_top dut ();\n"
+                                "  initial $display(\"%0h %0h\", acc, dut.g_lane[0].acc);\n"
+                                "endmodule\n";
+    {
+        std::ofstream out(tb);
+        out << tb_text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({dut.string(), tb.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto tb_uri = uri_from_path(tb);
+    analyzer.open(tb_uri, tb_text);
+
+    // Cursor on the testbench's own `acc` declaration.
+    const auto refs = analyzer.find_references(tb_uri, 1, 15, true);
+
+    // Its own use, yes; the DUT's lane signal, never.
+    CHECK(std::any_of(refs.begin(), refs.end(),
+                      [](const Location& l) { return l.line == 3 && l.col == 30; }));
+    CHECK(std::none_of(refs.begin(), refs.end(),
+                       [](const Location& l) { return l.line == 3 && l.col > 40; }));
+
+    std::filesystem::remove_all(dir);
+}
+
 // An interface member reached from another file — `bus.gnt` through a modport
 // port, `tb_bus.drive(...)` through an instance — was recorded by nothing, so
 // find-references returned only the uses written inside the interface itself

@@ -2337,6 +2337,17 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     return;
                 if (try_add_foreign_member_reference(token, name, object_name, object_type))
                     return;
+                // Every member-access attempt missed.  The name still belongs to
+                // the receiver, not to the enclosing scope, so the unqualified
+                // lookups below must not claim it: `dut.g_lane[0].acc` names a
+                // signal inside the DUT, and letting the testbench's own `acc`
+                // take it makes rename rewrite a different module's signal.
+                // The neutral `name:` occurrence is still emitted, so the
+                // include and import bridges keep working on this token.
+                scope_key = "name:";
+                scope_key += name;
+                add_ref(token, scope_key);
+                return;
             }
             if (!current_class.empty()) {
                 scope_key = current_class;
