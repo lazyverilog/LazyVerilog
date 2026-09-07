@@ -662,7 +662,12 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             diags_by_uri.try_emplace(old_uri);
         previously_published.clear();
 
-        for (const auto& [target_uri, all_diags] : diags_by_uri) {
+        for (auto& [target_uri, all_diags] : diags_by_uri) {
+            // One macro invocation expands its body N times, and slang reports
+            // a problem inside that body once per expansion at the same
+            // invocation location.  Publish each distinct problem once.
+            dedup_parse_diagnostics(all_diags);
+
             Notify_TextDocumentPublishDiagnostics::notify notif;
             notif.params.uri.raw_uri_ = target_uri;
             for (const auto& d : all_diags) {

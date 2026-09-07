@@ -23,6 +23,36 @@ struct ParseDiagInfo {
     std::string uri; // file URI for the diagnostic location; empty = owning document
 };
 
+/// Drop exact duplicates from @p diags, keeping the first of each.
+///
+/// slang reports a preprocessor problem once per macro *expansion*, and every
+/// copy maps back to the same invocation location, so one bad line inside a
+/// macro body becomes N identical diagnostics stacked on one position.  The
+/// user has one line to fix, so they are told once.  Two different problems at
+/// the same position, and the same message at different positions, both stay:
+/// the key is the whole (position, severity, message) triple.
+inline void dedup_parse_diagnostics(std::vector<ParseDiagInfo>& diags) {
+    if (diags.size() < 2)
+        return;
+    std::unordered_set<std::string> seen;
+    seen.reserve(diags.size());
+    std::vector<ParseDiagInfo> unique;
+    unique.reserve(diags.size());
+    for (auto& diag : diags) {
+        std::string key = std::to_string(diag.line);
+        key += ':';
+        key += std::to_string(diag.col);
+        key += ':';
+        key += std::to_string(diag.severity);
+        key += ':';
+        key += diag.message;
+        if (!seen.insert(std::move(key)).second)
+            continue;
+        unique.push_back(std::move(diag));
+    }
+    diags.swap(unique);
+}
+
 /// Immutable snapshot of a single open document.
 /// Handlers receive a shared_ptr<const DocumentState>; didChange atomically
 /// swaps in a new instance. No per-document locking needed on the read path.

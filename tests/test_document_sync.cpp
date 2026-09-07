@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "analyzer.hpp"
+#include <algorithm>
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -116,4 +117,65 @@ TEST_CASE("doc sync: a deferred live shard still reaches the project index", "[s
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// ── Diagnostic deduplication ────────────────────────────────────────────────
+// A macro body is expanded once per invocation, and slang reports a problem
+// inside that body once per expansion — every copy mapped back to the same
+// invocation location.  The user has one line to fix, so the server publishes
+// each distinct problem once.
+
+TEST_CASE("diagnostics: identical parse diagnostics from one macro invocation collapse",
+          "[diagnostics]") {
+    const std::string uri = "file:///dup_diag.sv";
+    const std::string src = R"SV(`define USES_MISSING(w) \
+  logic [`MISSING_W-1:0] a_``w; \
+  logic [`MISSING_W-1:0] b_``w; \
+  logic [`MISSING_W-1:0] c_``w;
+
+module dup_diag;
+  `USES_MISSING(x)
+endmodule
+)SV";
+
+    Analyzer a;
+    a.open(uri, src);
+    auto state = a.get_state(uri);
+    REQUIRE(state != nullptr);
+
+    const auto count_missing = [](const std::vector<ParseDiagInfo>& diags) {
+        return std::count_if(diags.begin(), diags.end(), [](const ParseDiagInfo& d) {
+            return d.message.find("MISSING_W") != std::string::npos;
+        });
+    };
+
+    // The raw parse really does report it once per expansion.
+    auto diags = state->parse_diagnostics;
+    REQUIRE(count_missing(diags) > 1);
+
+    dedup_parse_diagnostics(diags);
+    CHECK(count_missing(diags) == 1);
+}
+
+TEST_CASE("diagnostics: dedup keeps distinct positions, severities and messages",
+          "[diagnostics]") {
+    std::vector<ParseDiagInfo> diags{
+        {4, 2, 1, "same", {}},
+        {4, 2, 1, "same", {}},
+        {4, 2, 1, "different message", {}},
+        {4, 2, 2, "same", {}},
+        {4, 9, 1, "same", {}},
+        {9, 2, 1, "same", {}},
+    };
+
+    dedup_parse_diagnostics(diags);
+
+    REQUIRE(diags.size() == 5);
+    // First of each duplicate group is kept, in the original order.
+    CHECK(diags[0].message == "same");
+    CHECK(diags[0].severity == 1);
+    CHECK(diags[1].message == "different message");
+    CHECK(diags[2].severity == 2);
+    CHECK(diags[3].col == 9);
+    CHECK(diags[4].line == 9);
 }
