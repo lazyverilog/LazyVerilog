@@ -749,7 +749,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     std::unordered_set<std::string> class_fields;
     std::unordered_map<std::string, std::string> unique_class_scopes;
     std::unordered_set<std::string> ambiguous_class_names;
-    std::unordered_set<std::string> typedef_fields;
+    // Field -> canonical type of that field, so a receiver that is itself a
+    // member access (`o.a` in `o.a.f`) can be resolved one hop at a time.  A map
+    // rather than a second container: `contains()` reads the same either way, so
+    // the only cost over the old set is the value strings.
+    std::unordered_map<std::string, std::string> typedef_fields;
     std::unordered_map<std::string, std::string> unique_typedef_scopes;
     std::unordered_set<std::string> ambiguous_typedef_names;
     std::unordered_map<std::string, std::string> unique_enum_member_ids;
@@ -834,8 +838,18 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             unique_typedef_scopes.erase(td.name);
             ambiguous_typedef_names.insert(td.name);
         }
-        for (const auto& field : td.fields)
-            typedef_fields.insert(typedef_scope + "\n" + field.name);
+        for (const auto& field : td.fields) {
+            // Only a field that can itself be a receiver needs its type kept:
+            // the chain walk follows a hop only into a typedef this shard knows.
+            // Scalar fields (`logic [3:0]`) are the overwhelming majority and
+            // store nothing, so the map stays close in size to the set it
+            // replaced -- on OpenTitan this is the difference between +26 MB and
+            // +3 MB of maxRSS.
+            auto field_type = canonical_type_name_for_references(field.type);
+            if (!index.typedef_by_name.contains(field_type))
+                field_type.clear();
+            typedef_fields.emplace(typedef_scope + "\n" + field.name, std::move(field_type));
+        }
         if (td.is_enum) {
             for (const auto& member : td.enum_members) {
                 const auto member_id = symbol_canonical("enum_member", typedef_scope, member.name);
@@ -1032,7 +1046,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         const std::unordered_set<std::string>& package_values;
         const std::unordered_set<std::string>& class_fields;
         const std::unordered_map<std::string, std::string>& unique_class_scopes;
-        const std::unordered_set<std::string>& typedef_fields;
+        const std::unordered_map<std::string, std::string>& typedef_fields;
         const std::unordered_map<std::string, std::string>& unique_typedef_scopes;
         const std::unordered_map<std::string, std::string>& unique_enum_member_ids;
         const std::unordered_map<std::string, std::string>& unique_type_ids;
@@ -1193,7 +1207,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         const std::unordered_set<std::string>& package_values,
                         const std::unordered_set<std::string>& class_fields,
                         const std::unordered_map<std::string, std::string>& unique_class_scopes,
-                        const std::unordered_set<std::string>& typedef_fields,
+                        const std::unordered_map<std::string, std::string>& typedef_fields,
                         const std::unordered_map<std::string, std::string>& unique_typedef_scopes,
                         const std::unordered_map<std::string, std::string>& unique_enum_member_ids,
                         const std::unordered_map<std::string, std::string>& unique_type_ids,
@@ -1854,6 +1868,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             return std::nullopt;
         }
 
+        /// A bare type name mapped to the scope its typedef was declared in.
+        std::string typedef_scope_for_type(const std::string& type) const {
+            if (const auto it = unique_typedef_scopes.find(type);
+                it != unique_typedef_scopes.end())
+                return it->second;
+            return type;
+        }
+
         void handle(const MemberAccessExpressionSyntax& node) {
             const std::string field_name(node.name.valueText());
             const std::string object_name = simple_identifier_from_expr(node.left);
@@ -1978,6 +2000,107 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             if (i == end)
                 return {};
             return std::string(source.substr(i, end - i));
+        }
+
+        /// Every receiver segment to the left of a member dot, outermost first.
+        ///
+        /// `o.a.f` on `f` -> {"o", "a"};  `arr[1].b.g` on `g` -> {"arr", "b"}.
+        /// Empty when the token is not preceded by a dot at all.
+        ///
+        /// object_before_member_dot() reads one segment, which is all a one-dot
+        /// access needs.  A longer chain has to be walked whole: the type of
+        /// `o.a` is a step, not a name, so nothing shorter can name the field.
+        std::vector<std::string> receiver_chain_before_member_dot(
+            const slang::parsing::Token& token) const {
+            std::vector<std::string> chain;
+            if (!token || !token.location().valid())
+                return chain;
+            const auto source = sm.getSourceText(token.location().buffer());
+            size_t i = token.location().offset();
+            if (i > source.size())
+                return chain;
+            // Bounded so a pathological chain cannot walk far.
+            while (chain.size() < 8) {
+                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                    --i;
+                if (i == 0 || source[i - 1] != '.')
+                    break;
+                --i;
+                while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                    --i;
+                // A select names no separate object: every element of an array
+                // shares one declaration.  Same rule as object_before_member_dot().
+                if (i > 0 && source[i - 1] == ']') {
+                    size_t depth = 0;
+                    size_t j = i;
+                    while (j > 0) {
+                        const char c = source[j - 1];
+                        if (c == ']')
+                            ++depth;
+                        else if (c == '[') {
+                            if (--depth == 0) {
+                                --j;
+                                break;
+                            }
+                        }
+                        --j;
+                    }
+                    if (depth != 0)
+                        return {};
+                    i = j;
+                    while (i > 0 && std::isspace(static_cast<unsigned char>(source[i - 1])))
+                        --i;
+                }
+                const size_t end = i;
+                while (i > 0 && syntax_fragment_edge_is_wordlike(source[i - 1]))
+                    --i;
+                if (i == end)
+                    break;
+                chain.emplace_back(source.substr(i, end - i));
+            }
+            std::reverse(chain.begin(), chain.end());
+            return chain;
+        }
+
+        /// `o.a.f`, `deep.c.b.g`, `arr[1].b.g` — a struct/union field reached
+        /// through a receiver that is itself a member access.
+        ///
+        /// try_add_typedef_field_reference() resolves only `<value>.<field>`,
+        /// because the single segment it reads is looked up as a declaration of
+        /// the enclosing module.  In a longer chain that segment is a *field*,
+        /// which no module declares, so the lookup missed and the occurrence was
+        /// dropped -- while go-to-definition resolved the very same token.
+        /// References and rename therefore disagreed with definition, and rename
+        /// left the deeper use pointing at a field that no longer existed.
+        ///
+        /// Walks the chain one hop at a time: the head is a declaration this
+        /// scope knows, and each field after it carries its own type in
+        /// typedef_fields.  Runs only after the one-hop lookup has already
+        /// missed, so a one-dot access -- the overwhelmingly common case -- pays
+        /// nothing for this.
+        bool try_add_nested_typedef_field_reference(const slang::parsing::Token& token,
+                                                    std::string_view member_name) {
+            if (member_name.empty() || current_module.empty() || typedef_fields.empty())
+                return false;
+            const auto chain = receiver_chain_before_member_dot(token);
+            if (chain.size() < 2)
+                return false; // one-hop shape; already handled above
+            const auto head_type = current_module_object_type(chain.front());
+            if (!head_type || head_type->empty())
+                return false;
+            std::string scope = typedef_scope_for_type(*head_type);
+            for (size_t k = 1; k < chain.size(); ++k) {
+                const auto it = typedef_fields.find(scope + "\n" + chain[k]);
+                if (it == typedef_fields.end() || it->second.empty())
+                    return false;
+                scope = typedef_scope_for_type(it->second);
+            }
+            if (!typedef_fields.contains(scope + "\n" + std::string(member_name)))
+                return false;
+            // The same SymbolID a one-dot access records, so the declaration
+            // matches it with no change to find_references().
+            add_ref(token, symbol_canonical("typedef_field", scope, std::string(member_name)));
+            return true;
         }
 
         /// The segment one further left: for `dut.g_lane[0].acc` with the cursor
@@ -2437,6 +2560,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 if (try_add_class_field_reference(token, name, object_name, object_type))
                     return;
                 if (try_add_typedef_field_reference(token, name, object_name))
+                    return;
+                if (try_add_nested_typedef_field_reference(token, name))
                     return;
                 if (try_add_generate_block_member_reference(token, name, object_name,
                                                            object_type.has_value()))

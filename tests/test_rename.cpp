@@ -1,6 +1,7 @@
 #include "analyzer.hpp"
 #include "features/rename.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <set>
 
 TEST_CASE("rename: prepares identifier range and edits all resolved references", "[rename]") {
     Analyzer analyzer;
@@ -254,4 +255,44 @@ endmodule
     CHECK(edits.size() == 6);
     for (const auto& e : edits)
         CHECK(e.newText == "lane_idx");
+}
+
+TEST_CASE("rename: a depth-2 member chain is rewritten too", "[rename][nested-member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_nested_member.sv";
+    analyzer.open(uri, R"(
+module nest_rename;
+    typedef struct packed { logic [3:0] f; } in_t;
+    typedef struct packed { in_t a; }        out_t;
+
+    out_t o;
+    in_t  i;
+    logic [3:0] r1, r2;
+
+    assign r1 = i.f;
+    assign r2 = o.a.f;
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(2, 40); // the `f` field declaration
+    rename_params.newName = "f_r";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+    const auto& edits = edit.changes->at(uri);
+
+    // Declaration, `i.f`, and `o.a.f`.  Missing the last one leaves the design
+    // referring to a field that no longer exists.
+    REQUIRE(edits.size() == 3);
+    std::set<std::pair<int, int>> touched;
+    for (const auto& e : edits) {
+        CHECK(e.newText == "f_r");
+        touched.insert({e.range.start.line, e.range.start.character});
+    }
+    CHECK(touched.count({2, 40}) == 1);
+    CHECK(touched.count({9, 18}) == 1);
+    CHECK(touched.count({10, 20}) == 1);
 }

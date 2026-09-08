@@ -3083,3 +3083,131 @@ TEST_CASE("references: genvar use site finds the same set", "[references][genvar
     CHECK(found.count({10, 21}) == 1);
     CHECK(found.count({10, 29}) == 1);
 }
+
+// ── nested member chains ─────────────────────────────────────────────────────
+//
+// Go-to-definition resolves `o.a.f` correctly, but references and rename only
+// ever saw the one-dot form.  Rename therefore rewrote the declaration and the
+// depth-1 use and silently left `o.a.f` pointing at a field that no longer
+// exists.
+
+static const std::string kNestedMemberFixture = R"(
+module nest_refs;
+    typedef struct packed { logic [3:0] f; } in_t;
+    typedef struct packed { in_t a; }        out_t;
+
+    out_t o;
+    in_t  i;
+    logic [3:0] r1, r2, r3;
+
+    assign r1 = i.f;
+    assign r2 = o.a.f;
+    assign r3 = o.a.f;
+endmodule
+)";
+
+TEST_CASE("references: a depth-2 member chain is found from the declaration",
+          "[references][nested-member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_nested_member.sv";
+    analyzer.open(uri, kNestedMemberFixture);
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(2, 40); // the `f` field declaration
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({2, 40}) == 1);  // declaration
+    CHECK(found.count({9, 18}) == 1);  // i.f
+    CHECK(found.count({10, 20}) == 1); // o.a.f
+    CHECK(found.count({11, 20}) == 1); // o.a.f
+    CHECK(refs.size() == 4);
+}
+
+TEST_CASE("references: a depth-2 member chain finds the same set from its use site",
+          "[references][nested-member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_nested_member_use.sv";
+    analyzer.open(uri, kNestedMemberFixture);
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(10, 20); // o.a.f
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({2, 40}) == 1);
+    CHECK(found.count({9, 18}) == 1);
+    CHECK(found.count({10, 20}) == 1);
+    CHECK(found.count({11, 20}) == 1);
+}
+
+// The intermediate hop already worked -- its receiver is the plain identifier
+// `o` -- so it must keep working.
+TEST_CASE("references: the intermediate field of a chain is unchanged",
+          "[references][nested-member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_nested_member_mid.sv";
+    analyzer.open(uri, kNestedMemberFixture);
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 33); // the `a` field declaration
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({3, 33}) == 1);
+    CHECK(found.count({10, 18}) == 1);
+    CHECK(found.count({11, 18}) == 1);
+}
+
+TEST_CASE("references: a depth-3 chain and an array receiver resolve too",
+          "[references][nested-member]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_nested_member_deep.sv";
+    analyzer.open(uri, R"(
+module nest_deep;
+    typedef struct packed { logic [3:0] g; } lvl0_t;
+    typedef struct packed { lvl0_t b; }      lvl1_t;
+    typedef struct packed { lvl1_t c; }      lvl2_t;
+
+    lvl2_t  deep;
+    lvl1_t  arr [4];
+    logic [3:0] r1, r2;
+
+    assign r1 = deep.c.b.g;
+    assign r2 = arr[1].b.g;
+endmodule
+)");
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(2, 40); // the `g` field declaration
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({2, 40}) == 1);  // declaration
+    CHECK(found.count({10, 25}) == 1); // deep.c.b.g
+    CHECK(found.count({11, 25}) == 1); // arr[1].b.g
+}
