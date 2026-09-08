@@ -3016,3 +3016,70 @@ TEST_CASE("references: an inherited member and an extends clause reach their dec
         CHECK(edit.changes->at(uri).size() == 5);
     }
 }
+
+// ── genvar ───────────────────────────────────────────────────────────────────
+//
+// A genvar is a real declaration, so find-references has to see the loop header
+// and the body uses -- and rename has to rewrite all of them.  A rename that
+// silently edits nothing is worse than one that errors.
+
+static const std::string kGenvarReferencesFixture = R"(
+module genvar_refs #(
+    parameter int N = 4
+) (
+    input  logic [N-1:0] a,
+    output logic [N-1:0] y
+);
+    genvar gi;
+    generate
+        for (gi = 0; gi < N; gi++) begin : g_lane
+            assign y[gi] = a[gi];
+        end
+    endgenerate
+endmodule
+)";
+
+TEST_CASE("references: genvar declaration finds its loop and body uses", "[references][genvar]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_genvar.sv";
+    analyzer.open(uri, kGenvarReferencesFixture);
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(7, 11); // genvar gi;
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({7, 11}) == 1);  // the declaration
+    CHECK(found.count({9, 13}) == 1);  // for (gi = 0
+    CHECK(found.count({9, 21}) == 1);  // gi < N
+    CHECK(found.count({9, 29}) == 1);  // gi++
+    CHECK(found.count({10, 21}) == 1); // y[gi]
+    CHECK(found.count({10, 29}) == 1); // a[gi]
+}
+
+TEST_CASE("references: genvar use site finds the same set", "[references][genvar]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_genvar_use.sv";
+    analyzer.open(uri, kGenvarReferencesFixture);
+
+    TextDocumentReferences::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(10, 21); // y[gi]
+    params.context.includeDeclaration = true;
+
+    const auto refs = provide_references(analyzer, params);
+
+    std::set<std::pair<int, int>> found;
+    for (const auto& ref : refs)
+        found.insert({ref.range.start.line, ref.range.start.character});
+
+    CHECK(found.count({7, 11}) == 1);
+    CHECK(found.count({10, 21}) == 1);
+    CHECK(found.count({10, 29}) == 1);
+}

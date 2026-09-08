@@ -254,6 +254,27 @@ bool is_generate_construct(const MemberSyntax& member) {
     }
 }
 
+// A genvar names a declaration the same way `int i;` does, so it has to reach
+// the index or nothing can resolve it: definition, references, hover and rename
+// all start from the declaration, and find_references() gives up entirely when
+// there is none.  Both spellings land here -- the standalone `genvar i;` and the
+// inline `for (genvar i = 0; ...)` loop header.
+//
+// The scope is always the enclosing module, never a generate-block label: a
+// genvar controls the loop that creates the blocks, so it is not a member of any
+// one of them.  That also lines the entry up with the unqualified-identifier
+// fallback in syntax_index_shared.cpp, which reaches module scope only after
+// generate_scope_for() declines the name.
+void add_genvar(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                const slang::SourceManager& sm, const slang::parsing::Token& name,
+                const std::string& parent_module) {
+    if (!name || name.valueText().empty())
+        return;
+    if (!resolver.wants_declaration(index, sm, name))
+        return;
+    add_value(index, resolver, sm, name, "genvar", "genvar", parent_module);
+}
+
 // Declarations directly inside a *named* generate block, recorded with the
 // block label.  `dut.g_lane[0].acc` addresses the block, so the label is part of
 // the identity — and an open buffer has to agree with its closed shard about
@@ -297,7 +318,16 @@ void process_generate_declarations(const MemberSyntax& member, SyntaxIndex& inde
             if (child)
                 process_generate_declarations(*child, index, resolver, sm, parent_module,
                                               block_label);
+    } else if (const auto* gv = member.as_if<GenvarDeclarationSyntax>()) {
+        for (const auto* ident : gv->identifiers)
+            if (ident)
+                add_genvar(index, resolver, sm, ident->identifier, parent_module);
     } else if (const auto* loop = member.as_if<LoopGenerateSyntax>()) {
+        // `for (genvar i = 0; ...)` declares `i` on the header itself; the
+        // separate-declaration form leaves `genvar` empty and is recorded by the
+        // GenvarDeclaration arm above.
+        if (loop->genvar)
+            add_genvar(index, resolver, sm, loop->identifier, parent_module);
         process_generate_declarations(*loop->block, index, resolver, sm, parent_module, label);
     } else if (const auto* cond = member.as_if<IfGenerateSyntax>()) {
         process_generate_declarations(*cond->block, index, resolver, sm, parent_module, label);
@@ -670,6 +700,10 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
             process_typedef(*td, index, resolver, sm, module.name);
         } else if (const auto* hierarchy = member->as_if<HierarchyInstantiationSyntax>()) {
             process_hierarchy(*hierarchy, index, resolver, sm, lines, module.name);
+        } else if (const auto* gv = member->as_if<GenvarDeclarationSyntax>()) {
+            for (const auto* ident : gv->identifiers)
+                if (ident)
+                    add_genvar(index, resolver, sm, ident->identifier, module.name);
         } else if (is_generate_construct(*member)) {
             process_generate_instances(*member, index, resolver, sm, lines, module.name);
             process_generate_declarations(*member, index, resolver, sm, module.name, {});

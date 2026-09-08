@@ -1777,6 +1777,25 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         maybe_set(node.name);
     }
 
+    // A genvar is declared through an IdentifierNameSyntax list, not a
+    // DeclaratorSyntax, so the handler above never sees it and the name
+    // resolved to nothing at all -- taking references and rename down with it,
+    // since both start from the definition.
+    void handle(const slang::syntax::GenvarDeclarationSyntax& node) {
+        for (const auto* ident : node.identifiers)
+            if (ident)
+                maybe_set(ident->identifier);
+    }
+
+    // The inline form `for (genvar i = 0; ...)` declares `i` on the loop header
+    // itself; the separate-declaration form leaves `genvar` empty and is
+    // covered by the handler above.
+    void handle(const slang::syntax::LoopGenerateSyntax& node) {
+        if (node.genvar)
+            maybe_set(node.identifier);
+        visitDefault(node);
+    }
+
     // `parameter type data_t = logic [7:0]` declares `data_t` through a
     // TypeAssignmentSyntax, not a DeclaratorSyntax, so the handler above never
     // sees it.  Like a module or class name it is a type identifier at its use
@@ -2904,6 +2923,21 @@ symbol_info_from_definition(const slang::syntax::SyntaxTree& tree, const std::st
                                              render_hover_dimensions(sm, declarator->dimensions));
                 set_from_token(declarator->name, "variable", detail);
             }
+        }
+
+        // Hover on a genvar: without these the token resolved to a location but
+        // no declaration matched it, so hover degraded to the bare
+        // "**gi** — *symbol*" fallback.
+        void handle(const slang::syntax::GenvarDeclarationSyntax& node) {
+            for (const auto* ident : node.identifiers)
+                if (ident)
+                    set_from_token(ident->identifier, "genvar", "genvar");
+        }
+
+        void handle(const slang::syntax::LoopGenerateSyntax& node) {
+            if (node.genvar)
+                set_from_token(node.identifier, "genvar", "genvar");
+            visitDefault(node);
         }
 
         void handle(const slang::syntax::NetDeclarationSyntax& node) {

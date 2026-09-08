@@ -2081,3 +2081,84 @@ TEST_CASE("definition: member access through an array element resolves to the fi
         CHECK(loc->col == 16);
     }
 }
+
+// ── genvar ───────────────────────────────────────────────────────────────────
+//
+// A genvar is a declaration like any other: `gi` in `y[gi]` names the
+// `genvar gi;` above it.  Both spellings have to work -- the separate
+// declaration paired with a bare `for`, and the inline `for (genvar gj = 0;`.
+
+static const std::string kGenvarFixture = R"(
+module genvar_top #(
+    parameter int N = 4
+) (
+    input  logic [N-1:0] a,
+    output logic [N-1:0] y
+);
+    genvar gi;
+    generate
+        for (gi = 0; gi < N; gi++) begin : g_lane
+            assign y[gi] = a[gi];
+        end
+    endgenerate
+
+    for (genvar gj = 0; gj < N; gj++) begin : g_inline
+        logic lane_bit;
+        assign lane_bit = a[gj];
+    end
+endmodule
+)";
+
+TEST_CASE("definition: genvar use resolves to its declaration", "[definition][genvar]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_genvar.sv";
+    analyzer.open(uri, kGenvarFixture);
+
+    SECTION("from an index expression inside the generate block") {
+        auto loc = analyzer.definition_of(uri, 10, 21); // y[gi]
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 7);
+        CHECK(loc->col == 11);
+        CHECK(loc->end_col == 13);
+    }
+
+    SECTION("from the loop header") {
+        auto loc = analyzer.definition_of(uri, 9, 13); // for (gi = 0
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 7);
+        CHECK(loc->col == 11);
+    }
+
+    SECTION("the declaration itself resolves to itself") {
+        auto loc = analyzer.definition_of(uri, 7, 11);
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 7);
+        CHECK(loc->col == 11);
+    }
+
+    SECTION("an inline genvar resolves to its loop header declaration") {
+        auto loc = analyzer.definition_of(uri, 16, 28); // a[gj]
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 14);
+        CHECK(loc->col == 16);
+        CHECK(loc->end_col == 18);
+    }
+}
+
+TEST_CASE("hover: genvar reports its kind", "[definition][hover][genvar]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_genvar.sv";
+    analyzer.open(uri, kGenvarFixture);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(10, 21); // y[gi]
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& markup = hover->contents.second->value;
+    CHECK(markup.find("gi") != std::string::npos);
+    CHECK(markup.find("genvar") != std::string::npos);
+}

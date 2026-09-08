@@ -683,6 +683,24 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .col = vc,
                 });
             }
+        } else if (const auto* gv = member->as_if<GenvarDeclarationSyntax>()) {
+            // Mirrors the GenvarDeclaration arm in dynamic_file_index.cpp so an
+            // open buffer and its closed shard agree on genvar identity.
+            for (const auto* ident : gv->identifiers) {
+                if (!ident || !resolver.wants_declaration(index, sm, ident->identifier))
+                    continue;
+                auto [gl, gc] = token_pos_line1_col0(sm, ident->identifier);
+                note_package_member(token_value_text(ident->identifier));
+                index.values.push_back(ValueEntry{
+                    .name = token_value_text(ident->identifier),
+                    .type = "genvar",
+                    .kind = "genvar",
+                    .parent_scope = entry.name,
+                    .file_id = resolver.for_declaration_token(index, sm, ident->identifier),
+                    .line = gl,
+                    .col = gc,
+                });
+            }
         } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
             const auto& proto = *fn->prototype;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
@@ -836,6 +854,42 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
             visitDefault(node);
             scope_stack.pop_back();
             current_generate_label = previous_label;
+        }
+
+        // A genvar is scoped to the module, not to the blocks its loop creates,
+        // so it is recorded with `parent_scope` only -- no generate label.
+        void add_genvar_name(const slang::parsing::Token& name) {
+            if (!name || name.valueText().empty())
+                return;
+            auto [gl, gc] = token_pos_line1_col0(sm, name);
+            index.values.push_back(ValueEntry{
+                .name = token_value_text(name),
+                .type = "genvar",
+                .kind = "genvar",
+                .parent_scope = parent_scope,
+                .file_id = resolver.for_declaration_token(index, sm, name),
+                .line = gl,
+                .col = gc,
+            });
+        }
+
+        void handle(const GenvarDeclarationSyntax& node) {
+            // Module-level `genvar i;` is already recorded by the member loop in
+            // process_module(); only a nested one reaches here with a pushed scope.
+            if (scope_stack.size() > 1) {
+                for (const auto* ident : node.identifiers)
+                    if (ident)
+                        add_genvar_name(ident->identifier);
+            }
+            visitDefault(node);
+        }
+
+        void handle(const LoopGenerateSyntax& node) {
+            // `for (genvar i = 0; ...)` -- the separate-declaration form leaves
+            // `genvar` empty and is handled above.
+            if (node.genvar)
+                add_genvar_name(node.identifier);
+            visitDefault(node);
         }
 
         void handle(const LocalVariableDeclarationSyntax& node) {

@@ -220,3 +220,38 @@ TEST_CASE("rename: refuses to rewrite a macro-pasted declaration", "[rename]") {
 // Renaming a module-level signal used to rewrite a same-named declaration inside
 // a generate block — a different signal — and its uses, silently rewiring the
 // block.
+
+TEST_CASE("rename: genvar rewrites the loop header and body uses", "[rename][genvar]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_genvar.sv";
+    analyzer.open(uri, R"(
+module genvar_rename #(
+    parameter int N = 4
+) (
+    input  logic [N-1:0] a,
+    output logic [N-1:0] y
+);
+    genvar gi;
+    generate
+        for (gi = 0; gi < N; gi++) begin : g_lane
+            assign y[gi] = a[gi];
+        end
+    endgenerate
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(7, 11); // genvar gi;
+    rename_params.newName = "lane_idx";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+    const auto& edits = edit.changes->at(uri);
+
+    // Declaration + three loop-header uses + two body uses.
+    CHECK(edits.size() == 6);
+    for (const auto& e : edits)
+        CHECK(e.newText == "lane_idx");
+}

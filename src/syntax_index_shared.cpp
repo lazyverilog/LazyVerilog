@@ -450,7 +450,7 @@ std::string symbol_canonical(std::string_view kind, std::string_view scope, std:
 
 bool is_module_value_kind(std::string_view kind) {
     return kind == "variable" || kind == "net" || kind == "parameter" || kind == "localparam" ||
-           kind == "port";
+           kind == "port" || kind == "genvar";
 }
 
 
