@@ -51,6 +51,12 @@ struct GenerateBlock {
     int end_line{0};
     int end_col{0};
     int parent{-1}; // index into the module's block list
+    // A generate block's declarations reach the outline through index.values,
+    // which routes them here by line.  A statement block's do not: nothing
+    // indexes a `logic` declared inside `always_comb begin : proc`, so those are
+    // collected below and are this block's only source.  Reporting generate
+    // declarations from both is what listed each of them twice.
+    bool declarations_from_index{false};
     std::vector<BlockDecl> decls;
 };
 
@@ -157,7 +163,8 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         for (const auto* decl : node.declarators)
             if (decl)
                 note_macro_declarator(decl->name);
-        if (current && !block_stack.empty()) {
+        if (current && !block_stack.empty() &&
+            !current->blocks[(size_t)block_stack.back()].declarations_from_index) {
             auto& block = current->blocks[(size_t)block_stack.back()];
             const std::string type = trim_copy(std::string(node.type->toString()));
             for (const auto* decl : node.declarators) {
@@ -185,13 +192,14 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
     /// which case the caller just walks the body normally.
     bool enter_labelled_block(const slang::syntax::SyntaxNode& node,
                               slang::SourceLocation begin, std::string label,
-                              std::string detail) {
+                              std::string detail, bool declarations_from_index = false) {
         if (!current || label.empty() || !in_document(begin))
             return false;
 
         const auto extent = extent_of(node);
         GenerateBlock block;
         block.name = std::move(label);
+        block.declarations_from_index = declarations_from_index;
         block.detail = std::move(detail);
         block.line = (int)sm.getLineNumber(begin);
         const auto col = sm.getColumnNumber(begin);
@@ -215,8 +223,8 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         if (label.empty() && node.label)
             label = std::string(node.label->name.valueText());
 
-        const bool entered =
-            enter_labelled_block(node, node.begin.location(), std::move(label), "generate");
+        const bool entered = enter_labelled_block(node, node.begin.location(), std::move(label),
+                                                  "generate", /*declarations_from_index=*/true);
         visitDefault(node);
         if (entered)
             block_stack.pop_back();
@@ -362,6 +370,9 @@ std::vector<lsDocumentSymbol> provide_document_symbols(const Analyzer& analyzer,
                     make_symbol(b.name, lsSymbolKind::Namespace, b.line, b.col,
                                 optional<std::string>(b.detail));
                 set_extent(block_node, Extent{b.end_line, b.end_col});
+                // Empty for a generate block: the index.values loop below routes
+                // those in by line, and pushing them from both sources reported
+                // each one twice.
                 for (const auto& d : b.decls)
                     push_child(block_node, make_symbol(d.name, lsSymbolKind::Variable, d.line,
                                                        d.col, opt_str(d.type)));

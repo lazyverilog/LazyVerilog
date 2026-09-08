@@ -467,3 +467,54 @@ TEST_CASE("document symbols: macro-generated declarations report the invocation 
     CHECK(line_of("lane_0_valid") == 2);
     CHECK(line_of("lane_1_valid") == 3);
 }
+
+// A declaration inside a labelled generate block reached the outline twice: the
+// ShapeVisitor collected it into GenerateBlock::decls, and the index.values loop
+// routed the same declaration into the same block node through target().  Both
+// loop spellings were affected.
+TEST_CASE("documentSymbol: a generate-block declaration is reported once",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_generate_once.sv";
+    analyzer.open(uri, "module dupsym #(parameter int N = 2) (input logic clk);\n"
+                       "    for (genvar gj = 0; gj < N; gj++) begin : g_inline\n"
+                       "        logic sig_inline;\n"
+                       "        assign sig_inline = clk;\n"
+                       "    end\n"
+                       "\n"
+                       "    genvar gk;\n"
+                       "    generate\n"
+                       "        for (gk = 0; gk < N; gk++) begin : g_wrapped\n"
+                       "            logic sig_wrapped;\n"
+                       "            assign sig_wrapped = clk;\n"
+                       "        end\n"
+                       "    endgenerate\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* top = find_child(result, "dupsym");
+    REQUIRE(top != nullptr);
+
+    const auto count_named = [](const std::vector<lsDocumentSymbol>& symbols,
+                                const std::string& name) {
+        return std::count_if(symbols.begin(), symbols.end(),
+                             [&](const lsDocumentSymbol& s) { return s.name == name; });
+    };
+
+    const auto children = children_of(*top);
+
+    const auto* inline_block = find_child(children, "g_inline");
+    REQUIRE(inline_block != nullptr);
+    CHECK(count_named(children_of(*inline_block), "sig_inline") == 1);
+
+    const auto* wrapped_block = find_child(children, "g_wrapped");
+    REQUIRE(wrapped_block != nullptr);
+    CHECK(count_named(children_of(*wrapped_block), "sig_wrapped") == 1);
+
+    // And the declaration still carries its type, whichever source now supplies it.
+    const auto inline_children = children_of(*inline_block);
+    const auto* sig = find_child(inline_children, "sig_inline");
+    REQUIRE(sig != nullptr);
+    REQUIRE(sig->detail.has_value());
+    CHECK(sig->detail->find("logic") != std::string::npos);
+}
