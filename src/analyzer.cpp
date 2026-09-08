@@ -1373,6 +1373,44 @@ find_port_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::s
             }
             visitDefault(node);
         }
+
+        // `.WIDTH(16)` in an instantiation names a parameter of the child's
+        // `#(...)` list.  DefinitionTargetKind::NamedParameter resolves through
+        // this same walker, so without a handler here it only ever matched
+        // ports and a same-file parameter resolved to nothing at all.
+        //
+        // Deliberately scoped to ParameterPortListSyntax rather than to
+        // ParameterDeclarationSyntax at large: a body `localparam` is a
+        // ParameterDeclarationStatementSyntax and never reaches here, so it
+        // cannot be claimed by a `#(...)` override that merely shares its name.
+        void handle(const slang::syntax::ParameterPortListSyntax& node) {
+            if (!in_target_module)
+                return;
+            for (const auto* declaration : node.declarations) {
+                if (!declaration)
+                    continue;
+                if (const auto* value =
+                        declaration->as_if<slang::syntax::ParameterDeclarationSyntax>()) {
+                    for (const auto* declarator : value->declarators) {
+                        if (declarator)
+                            maybe_set(declarator->name);
+                        if (result)
+                            return;
+                    }
+                } else if (const auto* type_param =
+                               declaration
+                                   ->as_if<slang::syntax::TypeParameterDeclarationSyntax>()) {
+                    // `parameter type T = logic [7:0]` is overridden by name the
+                    // same way a value parameter is.
+                    for (const auto* declarator : type_param->declarators) {
+                        if (declarator)
+                            maybe_set(declarator->name);
+                        if (result)
+                            return;
+                    }
+                }
+            }
+        }
     };
 
     Visitor visitor(tree.sourceManager(), uri, module_name, port_name);

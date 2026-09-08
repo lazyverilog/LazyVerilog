@@ -2162,3 +2162,116 @@ TEST_CASE("hover: genvar reports its kind", "[definition][hover][genvar]") {
     CHECK(markup.find("gi") != std::string::npos);
     CHECK(markup.find("genvar") != std::string::npos);
 }
+
+// ── named parameter overrides ────────────────────────────────────────────────
+//
+// `.WIDTH(16)` in an instantiation names the child's parameter, exactly the way
+// `.clk(clk)` names its port.  Ports resolved; parameters did not, but only when
+// the child module happened to live in the same file -- cross-file took the
+// index path and worked, so the same cursor gave two answers depending on file
+// layout.
+
+static const std::string kNamedParameterFixture = R"(
+module param_child #(
+    parameter int WIDTH = 8,
+    parameter int DEPTH = 16
+) (
+    input  logic             clk,
+    input  logic [WIDTH-1:0] din,
+    output logic [WIDTH-1:0] dout
+);
+    always_ff @(posedge clk) dout <= din;
+endmodule
+
+module param_parent (input logic clk);
+    logic [15:0] a, b;
+    param_child #(
+        .WIDTH (16),
+        .DEPTH (32)
+    ) u_child (
+        .clk  (clk),
+        .din  (a),
+        .dout (b)
+    );
+endmodule
+)";
+
+TEST_CASE("definition: named parameter override resolves in the same file",
+          "[definition][named-parameter]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_named_parameter.sv";
+    analyzer.open(uri, kNamedParameterFixture);
+
+    SECTION("first parameter") {
+        auto loc = analyzer.definition_of(uri, 15, 9); // .WIDTH (16)
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 2);
+        CHECK(loc->col == 18);
+        CHECK(loc->end_col == 23);
+    }
+
+    SECTION("second parameter") {
+        auto loc = analyzer.definition_of(uri, 16, 9); // .DEPTH (32)
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 3);
+        CHECK(loc->col == 18);
+    }
+
+    SECTION("named ports keep working") {
+        auto loc = analyzer.definition_of(uri, 18, 9); // .clk (clk)
+        REQUIRE(loc.has_value());
+        CHECK(loc->line == 5);
+        CHECK(loc->col == 29);
+    }
+}
+
+TEST_CASE("hover: named parameter override reports the child parameter",
+          "[definition][hover][named-parameter]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_named_parameter.sv";
+    analyzer.open(uri, kNamedParameterFixture);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(15, 9); // .WIDTH (16)
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    const auto& markup = hover->contents.second->value;
+    CHECK(markup.find("WIDTH") != std::string::npos);
+    CHECK(markup.find("parameter") != std::string::npos);
+}
+
+TEST_CASE("definition: a body localparam is not mistaken for a parameter port",
+          "[definition][named-parameter]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_named_parameter_localparam.sv";
+    analyzer.open(uri, R"(
+module lp_child #(
+    parameter int WIDTH = 8
+) (
+    input logic clk
+);
+    localparam int DEPTH = 4;
+    always_ff @(posedge clk) begin
+    end
+endmodule
+
+module lp_parent (input logic clk);
+    lp_child #(
+        .WIDTH (16)
+    ) u_child (
+        .clk (clk)
+    );
+endmodule
+)");
+
+    // `.WIDTH` must reach the header parameter, not the body localparam that
+    // shares the module.
+    auto loc = analyzer.definition_of(uri, 13, 9);
+    REQUIRE(loc.has_value());
+    CHECK(loc->line == 2);
+    CHECK(loc->col == 18);
+}
