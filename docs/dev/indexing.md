@@ -105,11 +105,27 @@ Two consequences worth knowing before writing a feature:
 - An includer's shard no longer carries the header declarations it mentions.
   Resolve those through the header's own shard in the published snapshot.
 - The saving is bounded, not total: the projection can only be installed after
-  some file has proved the header stands alone, so the files already parsing at
-  that moment still read it whole.  The header's bulk is therefore read at most
-  once per background worker — one read on a single-core slice — instead of once
-  per includer.  Those few includers keep their mentioned header declarations,
-  which is a duplicate of what the header shard holds, not a different answer.
+  some file has proved the header stands alone, so that file reads the header
+  whole.  It is the only one.  A burst starts behind a **warmup gate** — one
+  worker takes the first queued file by itself and the rest wait — so by the time
+  the queue fans out the projection is already installed.  The header's bulk is
+  read exactly once instead of once per includer, and that does not move with the
+  core count or with how loaded the machine is.  The one includer that read it
+  keeps its mentioned header declarations, which is a duplicate of what the
+  header shard holds, not a different answer.
+
+  Before the gate the count was whatever the scheduler allowed: measured on a
+  four-core box as 1 file on a single-core slice, 9–12 idle, and 35 of 60 under
+  CPU contention, which is what made the `[scaling]` guard flaky on a shared CI
+  runner (issue #111).
+
+  The gate's cost is bounded at one file: a worker never waits for a second one,
+  so a project whose first filelist entry `include`s nothing pays one file's
+  parse of lost parallelism and no more.  On a single-worker slice — the HPC
+  target — there is nothing to gate and the wait is never entered.  It re-arms on
+  every background generation bump, which is what an edited header needs: that
+  path drops the header's shard and re-queues every includer, so the projection
+  has to be rebuilt before that fan-out is released.
 
 ## Editing a header: what an unsaved keystroke refreshes
 

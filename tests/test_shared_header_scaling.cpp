@@ -33,6 +33,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -410,10 +411,10 @@ TEST_CASE("header shard: a header that cannot stand alone still indexes its incl
 // N times buys nothing.
 //
 // The saving is not total, and the test says so.  The projection can only be
-// installed once some file has parsed the header and proved it stands alone, and
-// every worker running at that moment is already reading it — so the header's
-// bulk is read at most once per background worker, a bound that does not grow
-// with the project.  On the one-core slice this is aimed at, that is one read.
+// installed once some file has parsed the header and proved it stands alone, so
+// the file that does that reads the header whole.  It is the only one: a burst
+// releases its other workers only after that first file is done, so the header's
+// bulk is read exactly once no matter how many cores or how loaded the machine.
 //
 // So the ratio taken here is between two file counts at the *same* header, which
 // is exactly the claim: what a further includer costs no longer depends on how
@@ -422,21 +423,46 @@ TEST_CASE("header shard: a header that cannot stand alone still indexes its incl
 constexpr int kProjectionHeaderDecls = 4000;
 constexpr int kProjectionManyModules = 200;
 constexpr int kProjectionFewModules = 25;
-constexpr int kProjectionRuns = 3;
+// Five, not three.  Both halves are reduced to their fastest run, and the
+// smaller design is only ~13 ms, so on a loaded runner three samples are few
+// enough that a scheduling hiccup can land in all of them and inflate the
+// denominator.  Two extra runs of each cost well under 100 ms and are what keeps
+// the ratio a measurement rather than a coin flip; see issue #111 for what an
+// unhardened guard in this file costs a shared CI runner.
+constexpr int kProjectionRuns = 5;
 
-/// Fastest cold index of @p design over @p runs, each on a fresh Analyzer.
-double fastest_index_ms(const SharedHeaderDesign& design, int runs) {
-    std::vector<double> samples;
-    samples.reserve(static_cast<size_t>(runs));
+/// Fastest cold index of each design over @p runs, alternating between the two.
+///
+/// Interleaved rather than one design measured to completion and then the other.
+/// Both halves are reduced to their fastest run, and on a loaded runner what a
+/// minimum finds is a quiet window; measuring them in sequence lets one design
+/// own a window the other was never offered, which turns the ratio into a
+/// comparison of two load conditions instead of two designs.  Measured under 2x
+/// CPU oversubscription, the sequential form put `few` anywhere between 45 and
+/// 104 ms while `many` stayed within 131-159, and the runs where `few` got the
+/// quiet window are exactly the ones that tripped the bound below.
+std::pair<double, double> fastest_index_ms_paired(const SharedHeaderDesign& few,
+                                                  const SharedHeaderDesign& many, int runs) {
+    std::vector<double> few_samples;
+    std::vector<double> many_samples;
+    few_samples.reserve(static_cast<size_t>(runs));
+    many_samples.reserve(static_cast<size_t>(runs));
     for (int i = 0; i < runs; ++i) {
-        Analyzer analyzer;
-        samples.push_back(design.index_ms(analyzer));
+        {
+            Analyzer analyzer;
+            few_samples.push_back(few.index_ms(analyzer));
+        }
+        {
+            Analyzer analyzer;
+            many_samples.push_back(many.index_ms(analyzer));
+        }
     }
-    std::sort(samples.begin(), samples.end());
     // The minimum, for the same reason fastest_build_ms() takes it: what is
     // measured is a raised floor, and everything a loaded runner adds is noise
     // in one direction only.
-    return samples.front();
+    std::sort(few_samples.begin(), few_samples.end());
+    std::sort(many_samples.begin(), many_samples.end());
+    return {few_samples.front(), many_samples.front()};
 }
 
 TEST_CASE("shared header: indexing cost stops scaling with the includer count",
@@ -447,14 +473,13 @@ TEST_CASE("shared header: indexing cost stops scaling with the includer count",
     const SharedHeaderDesign few("projection-few", kProjectionFewModules, header,
                                  kIncludingModule);
 
-    // Warm the page cache and the allocator so the first-measured design is not
-    // charged for both.
+    // Warm the page cache and the allocator so the first sample of the pairing
+    // below is not charged for both.
     {
         Analyzer warm;
         (void)few.index_ms(warm);
     }
-    const double few_ms = fastest_index_ms(few, kProjectionRuns);
-    const double many_ms = fastest_index_ms(many, kProjectionRuns);
+    const auto [few_ms, many_ms] = fastest_index_ms_paired(few, many, kProjectionRuns);
 
     const double file_ratio =
         static_cast<double>(kProjectionManyModules) / kProjectionFewModules;
@@ -464,9 +489,13 @@ TEST_CASE("shared header: indexing cost stops scaling with the includer count",
               << " ratio=" << (many_ms / few_ms) << " file_ratio=" << file_ratio << "\n";
 
     // Re-reading the header per file puts this at the file ratio itself, 8x.
-    // Generous below that: the point is to catch the return of O(files x header)
-    // work, not to police noise on a shared runner.
-    CHECK(many_ms < few_ms * 3.0);
+    // Half of that: the point is to catch the return of O(files x header) work,
+    // not to police noise on a shared runner.  Idle this sits at ~1.5; under 2x
+    // CPU oversubscription the interleaved pairing above still produced a 2.98,
+    // so 3.0 was margin the runner can eat.  Coverage of the projection is not
+    // what this bound is for -- the carrier count below pins that exactly, and
+    // does it without a timer.
+    CHECK(many_ms < few_ms * 4.0);
 
     // The saving must not come from indexing less: the header's declarations
     // still have to reach the project index, through the header's own shard.
@@ -483,11 +512,18 @@ TEST_CASE("shared header: an includer's shard stops carrying the header's declar
     // every header declaration the file mentions; now the header's own shard is
     // where they live and what every other file resolves against.
     //
-    // The bound is "far fewer than all", not "none": the files already parsing
-    // when the projection is installed still see the whole header, so up to one
-    // file per background worker keeps its mentioned declarations.  That is a
-    // duplicate of what the header shard holds, which is the state every
-    // includer was in before, so nothing resolves differently either way.
+    // The bound is "one", not "none": the burst's warmup file parses the header
+    // before any shard for it exists, so it keeps the declarations it mentions.
+    // That is a duplicate of what the header shard holds, which is the state
+    // every includer was in before, so nothing resolves differently either way.
+    //
+    // Every other worker is held at the warmup gate (background_index_loop())
+    // until that file has installed the header's directives-only projection, so
+    // this count no longer depends on the core count or on machine load.  It
+    // used to: an earlier revision let workers race the projection install and
+    // measured 1 carrier on a single-core slice, 9-12 idle on four cores and 35
+    // of 60 under load, which made this assertion flaky on a shared CI runner
+    // (issue #111).
     constexpr int kModules = 60;
     SharedHeaderDesign design("projection-contract", kModules,
                               "localparam int SHARED_USED = 1;\n" + localparam_body(400),
@@ -505,8 +541,13 @@ TEST_CASE("shared header: an includer's shard stops carrying the header's declar
         if (shard_values(analyzer, design.module_uri(i)).contains("SHARED_USED"))
             ++carriers;
     }
+    // Printed rather than only reported on failure: the number is the whole
+    // measurement, and a CI log that shows 1 every time is what says the gate is
+    // still holding.
+    std::cout << "\n[header projection] includer shards carrying SHARED_USED: " << carriers
+              << " of " << kModules << "\n";
     INFO("includer shards still carrying SHARED_USED: " << carriers << " of " << kModules);
-    CHECK(carriers < design.module_count() / 2);
+    CHECK(carriers <= 1);
 }
 
 TEST_CASE("shared header: a macro the header defines still reaches its includers",
@@ -529,9 +570,9 @@ TEST_CASE("shared header: a macro the header defines still reaches its includers
     Analyzer analyzer;
     (void)design.index_ms(analyzer);
 
-    // Every module, not one: which of them parse before the header is projected
-    // depends on the worker count, so only checking all of them is certain to
-    // cover a file that parsed after it.
+    // Every module, not one: only the burst's warmup file parses before the
+    // header is projected, and nothing here fixes which file that is, so
+    // checking all of them is what covers a file that parsed after it.
     for (size_t i = 0; i < design.module_count(); ++i) {
         const auto values = shard_values(analyzer, design.module_uri(i));
         INFO("module " << design.module_uri(i));

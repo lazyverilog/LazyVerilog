@@ -6589,6 +6589,9 @@ void Analyzer::background_index_loop() const {
         std::vector<OpenTextOverlay> open_overlays;
         std::shared_ptr<const DocumentState> live_doc;
         uint64_t generation = 0;
+        // Whether this worker took the burst's warmup file; see
+        // background_warmup_generation_.
+        bool warmup_owner = false;
 
         {
             std::unique_lock<std::mutex> lock(map_mutex_);
@@ -6623,6 +6626,30 @@ void Analyzer::background_index_loop() const {
                 if (publish_callback)
                     publish_callback();
                 continue;
+            }
+
+            // Warmup gate: one worker takes the first file of a burst alone, so
+            // whatever it `include`s has a shard and a directives-only
+            // projection before the rest of the queue is released.  Without it
+            // the number of files that re-parse the whole header is whatever the
+            // scheduler allows -- measured on a 4-core box as 1 file on a
+            // single-core slice, 9-12 idle and 35 of 60 under load.
+            //
+            // The cost is bounded at exactly one file: a worker never waits for
+            // a second one, so a project whose first file `include`s nothing
+            // pays one file's parse of lost parallelism and no more.  On a
+            // single-worker slice -- the HPC target -- there is nothing to gate
+            // and the wait is never entered.
+            if (background_warmup_generation_ != background_generation_) {
+                if (background_warmup_running_) {
+                    background_cv_.wait(lock, [&] {
+                        return background_stop_.load() || !background_warmup_running_ ||
+                               background_warmup_generation_ == background_generation_;
+                    });
+                    continue;
+                }
+                background_warmup_running_ = true;
+                warmup_owner = true;
             }
 
             path_string = std::move(background_pending_files_.front());
@@ -6663,6 +6690,19 @@ void Analyzer::background_index_loop() const {
                 live_doc = doc->second;
             }
         }
+
+        // Release the warmup gate.  Must run on every path that leaves this
+        // iteration, or the workers waiting above never wake.  Called with
+        // map_mutex_ held.  Recording this worker's own generation rather than
+        // the current one is deliberate: if the generation moved on while this
+        // file was parsing, the gate stays armed for the new burst.
+        const auto release_warmup_locked = [&] {
+            if (!warmup_owner)
+                return;
+            warmup_owner = false;
+            background_warmup_running_ = false;
+            background_warmup_generation_ = generation;
+        };
 
         if (live_doc) {
             // The queued path may represent an indirect include dependency
@@ -6722,6 +6762,7 @@ void Analyzer::background_index_loop() const {
                     }
                     invalidate_extra_snapshots_locked();
                 }
+                release_warmup_locked();
                 --background_index_active_;
                 if (background_pending_files_.empty() && background_index_active_ == 0)
                     schedule_background_project_publish_locked();
@@ -6737,6 +6778,7 @@ void Analyzer::background_index_loop() const {
                                                   /*restrict_index_to_own_file=*/true);
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
+            release_warmup_locked();
             --background_index_active_;
             background_cv_.notify_all();
             continue;
@@ -6751,6 +6793,7 @@ void Analyzer::background_index_loop() const {
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
+                release_warmup_locked();
                 --background_index_active_;
                 background_cv_.notify_all();
                 continue;
@@ -6811,6 +6854,8 @@ void Analyzer::background_index_loop() const {
                 }
                 invalidate_extra_snapshots_locked();
             }
+
+            release_warmup_locked();
 
             // ProjectIndex is an immutable view derived from per-file shards.
             // Do not publish after every single file while the initial .f cache

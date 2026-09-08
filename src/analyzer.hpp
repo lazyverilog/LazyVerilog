@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -658,6 +659,23 @@ class Analyzer {
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
     mutable uint64_t background_generation_{0};
+    // Cold-burst warmup gate.
+    //
+    // A shared header is only discovered by parsing a file that `include`s it,
+    // and its directives-only projection is only installed once its own shard
+    // exists (see build_header_shards).  Every worker that starts a file before
+    // that lands re-parses the whole header, so how much the projection saves is
+    // decided by how many files slip through that window -- a scheduling race,
+    // not a bound.  Letting one worker take the first file of a burst by itself
+    // closes the window: the others wait exactly the time they would otherwise
+    // have spent each re-reading the same header.
+    //
+    // Keyed by generation rather than a flag, so the gate re-arms wherever the
+    // generation is bumped.  That is what a changed header needs: it drops the
+    // header's shard and re-queues every includer, so the projection has to be
+    // rebuilt before that fan-out is released.
+    mutable uint64_t background_warmup_generation_{std::numeric_limits<uint64_t>::max()};
+    mutable bool background_warmup_running_{false};
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;
@@ -672,8 +690,10 @@ class Analyzer {
     /// which file pulled it in, so rebuilding them inside every dependent is pure
     /// duplication: 60 modules sharing two large headers measured 7.9 s and
     /// 1.8 GB where the unique work is ~2.0 s.  The first worker to parse a file
-    /// that includes a header claims it, builds its shard from that file's tree,
-    /// and every later dependent skips the header entirely.
+    /// that includes a header claims it, builds its shard from a parse of the
+    /// header on its own, and every later dependent skips the header entirely.
+    /// The warmup gate above is what makes "every later dependent" mean all of
+    /// them rather than whichever ones the scheduler had not started yet.
     ///
     /// Both maps are guarded by map_mutex_ rather than a lock of their own.  The
     /// claim has to be taken in the same critical section that commits a shard,

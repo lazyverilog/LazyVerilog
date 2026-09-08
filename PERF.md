@@ -996,6 +996,10 @@ number improves 11.5x while the full-CPU number improves 2x.  Closing that
 remainder would need the header parsed before the burst fans out, which on a cold
 start means knowing the include graph before parsing anything.
 
+> Round 7 closes it, and corrects this bound: "once per background worker" was
+> optimistic even on an idle machine, and under CPU contention it does not hold
+> at all.  See below.
+
 Guarded by `./build/lazyverilog-tests "[scaling]"`: the ratio between two file
 counts at the same header, which is worker-count independent and sits at the file
 ratio itself (8x) when the projection is disabled.
@@ -1008,3 +1012,108 @@ Unchanged from round 5, plus:
   edit-path cost of a huge header is a separate problem: the null-tree window
   after each keystroke (every AST feature early-returns while the reparse runs)
   and the single-threaded LSP dispatch pool are what the user feels there.
+
+---
+
+# Round 7: the shared-header projection stops racing the scheduler
+
+Round 6 installs a header's directives-only projection once some file has parsed
+the header and proved it stands alone, and stated the remainder as "the header's
+bulk is read at most once per background worker".  That bound is wrong.
+
+What decides how many files read the header whole is not the worker count but how
+much wall time passes between the burst starting and the projection landing —
+one file's parse, plus the header's own standalone parse and index — divided by
+how fast the pool retires files.  Nothing bounds that ratio, and CPU contention
+stretches it: the one worker on the critical path is descheduled while the others
+keep retiring files against the full header.
+
+Measured on `tests/rtl/hpc60`-shaped input (60 modules, one 401-declaration
+header), counting includer shards that still carry a header declaration:
+
+| Condition | Carriers (of 60) |
+|---|---|
+| single-core slice (`taskset -c 0`) | 1 |
+| 4 cores, idle | 9 – 12 |
+| 4 cores, one busy loop per core | **35** |
+| 12 cores, contended (issue #111) | **37 – 51** |
+
+So on a many-core box under load, most of round 6's saving evaporated, and the
+`[scaling]` guard that pins the contract went red on shared CI runners for
+reasons unrelated to the change under test — issue #111.
+
+## What changed
+
+`background_index_loop()` gained a **warmup gate**: at the start of a burst one
+worker takes the first queued file by itself while the others wait, and the gate
+opens only once that file has committed and its headers have shards and
+projections.  By the time the queue fans out the projection is already installed,
+so the count above is **1 on every configuration** — the warmup file itself,
+which parsed the header before any shard for it existed.
+
+The gate is keyed on the background generation rather than a flag, so it re-arms
+wherever the generation is bumped.  That is what an edited header needs: that
+path drops the header's shard and re-queues every includer, which is the same
+fan-out racing the same projection.
+
+Its cost is bounded at exactly one file — a worker never waits for a second one —
+and on a single-worker slice, the HPC target, the wait is never entered at all.
+
+## Measured
+
+4-core Xeon @ 2.10GHz VM, `Release`, page cache warm.  Alternating A/B runs,
+fastest of each group, because this host's wall-clock noise band is ±10%.
+
+| Corpus | index ms | user CPU | maxRSS |
+|---|---|---|---|
+| hpc60, all CPUs | 47.0–49.5 -> **42.8–45.1** | 0.15–0.18 s -> **0.04–0.05 s** | 61 MB -> **39 MB** |
+| hpc60, 1 CPU | 52.8 -> 50.3 | 0.04 s -> 0.04 s | 34 MB -> 34 MB |
+| opentitan, all CPUs | 4522 -> 4529 (min of 8) | 12.85 s -> 12.90 s | 942–981 MB -> 927–990 MB |
+| opentitan, 1 CPU | 12919 -> 12814 | 12.50 s -> 12.37 s | 861 -> 863 MB |
+| 400 small files, no `include` | 55.9–58.3 -> 55.9–59.4 | flat | flat |
+
+hpc60 is the shape the projection exists for, and it is where the remainder was
+being paid: **-9% wall, -73% user CPU, -36% maxRSS**.  OpenTitan has no single
+dominant header and is flat, as in round 6.  The one-CPU slice is unchanged
+everywhere, by construction.
+
+## The cost, and where it is paid
+
+One file of lost parallelism at the start of a burst.  On a project whose files
+are of ordinary similar size that is below the noise floor (the 400-file row
+above).  It is visible only when the **first filelist entry is much larger than
+the rest and `include`s nothing**, so the pool idles through it and gets no
+projection in return:
+
+| Corpus | index ms |
+|---|---|
+| one 3.5 MB module ahead of 200 small ones | 197–215 -> **228–247** (+14%) |
+
+That is the whole exposure, and it does not grow with the project: the gate opens
+after one file no matter what that file turned out to be.  Removing it would need
+the warmup file's parse split from its index build, which buys back part of one
+file on a corpus shape no real filelist has; not worth the surgery.
+
+Guarded by `./build/lazyverilog-tests "[scaling]"`, which now asserts the count
+directly (`carriers <= 1`) and prints it on every run, instead of the fraction of
+an absolute count that made it scheduling-dependent.
+
+## Still open from earlier rounds
+
+Unchanged from round 6.
+
+## Reproduce
+
+```bash
+cmake --build build -j$(nproc)
+tools/startup_bench.py tests/rtl/hpc60             # the shared-header shape
+tools/startup_bench.py                             # opentitan, no dominant header
+tools/startup_bench.py --cpus 0                    # one-CPU slice
+
+# the pre-fix flake, on a multi-core host
+for j in $(seq 1 $(nproc)); do (timeout 45 bash -c 'while :; do :; done') & done
+for i in $(seq 1 10); do
+  ./build/lazyverilog-tests "shared header: an includer's shard stops carrying the header's declarations"
+done
+kill $(jobs -p)
+```
