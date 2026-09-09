@@ -4,9 +4,11 @@
 #include "string_utils.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -16,7 +18,24 @@ namespace {
 
 void print_usage() {
     std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] "
-                  "[--version] [<file>]\n";
+                  "[--maxerror <n>] [--version] [<file>]\n";
+}
+
+/// Parse a `--maxerror` value.  Returns false for anything that is not a plain
+/// non-negative decimal integer, so a typo'd flag value fails loudly instead of
+/// silently becoming 0 ("unlimited") and quietly changing what gets reported.
+bool parse_error_limit(const std::string& text, uint32_t& out) {
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    try {
+        unsigned long long value = std::stoull(text);
+        if (value > std::numeric_limits<uint32_t>::max())
+            return false;
+        out = static_cast<uint32_t>(value);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 std::string_view severity_text(int severity) {
@@ -52,6 +71,7 @@ int main(int argc, char* argv[]) {
     std::string file_arg;
     bool lint_only = false;
     bool compile_only = false;
+    uint32_t error_limit = kDefaultCompilationErrorLimit;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -61,6 +81,18 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             filelist_arg = argv[++i];
+        } else if (arg == "--maxerror" || arg == "--maxerrors") {
+            if (i + 1 >= argc) {
+                std::cerr << arg << " requires a value\n";
+                print_usage();
+                return 1;
+            }
+            const std::string value = argv[++i];
+            if (!parse_error_limit(value, error_limit)) {
+                std::cerr << "Invalid " << arg << " value: " << value
+                          << " (expected a non-negative integer; 0 means unlimited)\n";
+                return 1;
+            }
         } else if (arg == "--lint-only") {
             lint_only = true;
         } else if (arg == "--compile-only") {
@@ -113,7 +145,7 @@ int main(int argc, char* argv[]) {
 
     analyzer.wait_for_background_index_idle();
     if (!lint_only)
-        run_synchronous_semantic_compile(analyzer, project);
+        run_synchronous_semantic_compile(analyzer, project, error_limit);
 
     std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
     if (!compile_only && project.config.lint.instance.stale_instance_diagnostic)

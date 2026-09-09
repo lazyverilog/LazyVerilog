@@ -1,0 +1,7 @@
+# Stops `find_config_root`'s upward walk here so this fixture never inherits the
+# repository's own lazyverilog.toml.  Lint rules are off: this fixture exists to
+# exercise the slang compilation error limit, so the only diagnostics it should
+# produce are compilation ones.
+
+[lint]
+enable = false

@@ -32,6 +32,15 @@ void index_cli_project(Analyzer& analyzer, const CliProject& project);
 /// Run one synchronous, blocking semantic-compile pass over `project` and
 /// merge the result into `analyzer`'s semantic diagnostics cache. Reuses
 /// BackgroundCompiler so output matches the LSP server's `lazyverilog.lintAll`
-/// semantic diagnostics exactly. No-op if
-/// `project.config.compilation.background_compilation` is false.
-void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project);
+/// semantic diagnostics exactly.
+///
+/// This always compiles.  `[compilation] background_compilation` gates the LSP
+/// server's *interactive* compile loop, where the cost lands on every edit; a
+/// CLI run is a one-shot batch invocation the user asked for explicitly, so the
+/// toml flag does not disable it.
+///
+/// `error_limit` is forwarded to slang's `CompilationOptions::errorLimit`;
+/// 0 means unlimited.  See `kDefaultCompilationErrorLimit` for why raising it
+/// matters.
+void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project,
+                                      uint32_t error_limit = kDefaultCompilationErrorLimit);

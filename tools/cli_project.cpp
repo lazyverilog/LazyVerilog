@@ -31,7 +31,8 @@ void index_cli_project(Analyzer& analyzer, const CliProject& project) {
                                 resolve_vcode_path(project.root, project.config));
 }
 
-void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project) {
+void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project,
+                                      uint32_t error_limit) {
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
@@ -54,6 +55,7 @@ void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& proj
         .enabled = true,
         .debounce_ms = 0,
         .log_timing = project.config.compilation.log_timing,
+        .error_limit = error_limit,
     });
     compiler.schedule();
 

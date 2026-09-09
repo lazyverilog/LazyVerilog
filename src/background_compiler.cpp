@@ -136,6 +136,7 @@ void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
         std::unique_lock<std::mutex> lock(mutex_);
         enabled_ = config.enabled;
         log_timing_ = config.log_timing;
+        error_limit_ = config.error_limit;
         debounce_ms_ = config.debounce_ms;
 
         exited_threads = collect_exited_workers_locked();
@@ -306,6 +307,9 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
 
     slang::ast::CompilationOptions compilation_options;
     compilation_options.flags |= slang::ast::CompilationFlags::LintMode;
+    // slang treats 0 as "no limit", which is exactly the encoding callers use,
+    // so this passes straight through.
+    compilation_options.errorLimit = error_limit_.load(std::memory_order_relaxed);
 
     slang::Bag bag;
     bag.set(preprocessor_options);

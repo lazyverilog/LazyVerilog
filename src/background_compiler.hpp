@@ -20,6 +20,14 @@ struct BackgroundCompileResult {
     std::unordered_map<std::string, uint64_t> uri_versions;
 };
 
+/// slang's own `CompilationOptions::errorLimit` default.  Once elaboration has
+/// produced more than this many errors slang sets `sawFatalError` and abandons
+/// the rest of the pass, so every diagnostic it had not reached yet -- type
+/// mismatches, width checks, unused-variable warnings -- is silently never
+/// produced.  A design with one stray `timescale` reaches that limit on
+/// `MissingTimeScale` alone, so the cutoff is worth being able to raise.
+inline constexpr uint32_t kDefaultCompilationErrorLimit = 64;
+
 /// Worker count and thread priority are not user-configurable.  Every worker
 /// compiles the whole design rather than sharing one compile, so a second
 /// worker only lets a newer snapshot start before an older one finishes -- at
@@ -31,6 +39,9 @@ struct BackgroundCompilerConfig {
     int thread_count{1};
     int debounce_ms{1500};
     bool log_timing{false};
+    /// Forwarded to slang's `CompilationOptions::errorLimit`.  0 means
+    /// unlimited (slang's own encoding for "no limit").
+    uint32_t error_limit{kDefaultCompilationErrorLimit};
 };
 
 class BackgroundCompiler {
@@ -69,6 +80,9 @@ class BackgroundCompiler {
     bool stopping_{false};
     bool enabled_{false};
     std::atomic<bool> log_timing_{false};
+    // Read by compile() on worker threads without holding mutex_, same as
+    // log_timing_.
+    std::atomic<uint32_t> error_limit_{kDefaultCompilationErrorLimit};
     int debounce_ms_{1500};
     size_t next_worker_id_{0};
     uint64_t latest_generation_{0};
