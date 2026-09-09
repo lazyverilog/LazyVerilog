@@ -148,10 +148,6 @@ int main(int argc, char** argv) {
         expect(contains(raised.stdout_text, "implicit conversion from 'type_b' to 'type_a'"),
               "--maxerror 500 also clears the limit for this design");
 
-        auto alias = run_command(lint_bin, "--maxerrors 0" + flist);
-        expect(contains(alias.stdout_text, "implicit conversion from 'type_b' to 'type_a'"),
-              "--maxerrors is accepted as an alias for --maxerror");
-
         // Lowering the limit is honored too, so the flag is not just a
         // one-way "raise it" switch.
         auto lowered = run_command(lint_bin, "--maxerror 1" + flist);

@@ -34,7 +34,7 @@ At least one of `-f <filelist>` or `<file>` is required.
 | `-f <filelist>`, `--filelist <filelist>` | Project filelist (`.f`) to index. With no `<file>`, lint every file it lists. With `<file>`, index the filelist for cross-file/semantic context but report only `<file>`'s diagnostics. Overrides `lazyverilog.toml`'s `[design] vcode`. |
 | `--lint-only` | Print only lint-rule diagnostics; skip compilation and drop parse/semantic diagnostics. |
 | `--compile-only` | Print only compilation diagnostics (parse + semantic); skip lint rules. |
-| `--maxerror <n>` | Maximum compilation errors before slang stops elaborating. Default `64`; `0` means unlimited. `--maxerrors` is accepted as an alias. See [Error limit](#error-limit). |
+| `--maxerror <n>` | Maximum compilation errors before slang stops elaborating. Default `64`; `0` means unlimited. See [Error limit](#error-limit). |
 | `--version` | Print the version and exit. |
 | `-h`, `--help` | Print usage and exit. |
 

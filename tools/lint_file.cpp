@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             filelist_arg = argv[++i];
-        } else if (arg == "--maxerror" || arg == "--maxerrors") {
+        } else if (arg == "--maxerror") {
             if (i + 1 >= argc) {
                 std::cerr << arg << " requires a value\n";
                 print_usage();
