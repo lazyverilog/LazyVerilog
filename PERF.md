@@ -1117,3 +1117,123 @@ for i in $(seq 1 10); do
 done
 kill $(jobs -p)
 ```
+
+---
+
+# Round 8: a package's `include`d fragments stop re-walking its tree
+
+Rounds 6 and 7 are about a header that **stands alone**: parsed by itself it
+produces a tree, so it is indexed once and every includer after that is served
+its directives alone.  A header that cannot stand alone was left on the original
+path — its shard derived from an includer's tree with the build restricted to the
+header's URI — and that path was never measured, because no corpus in the tree
+has many of them.
+
+A UVM testbench is nothing but that shape.  `uvm_pkg.sv` opens one package and
+`include`s the whole library into it; every one of those files is a class body
+that leans on `uvm_macros.svh` having been included first, so not one of them
+parses standalone.
+
+## What was wrong
+
+Restricting a build to one URI does not make the walk any cheaper.  It visits
+every node of the includer's tree and discards what it finds, so N fragments cost
+N x the includer:
+
+```
+DERIVE_FROM_INCLUDER: 11.28 s over 116 headers, mean 97 ms
+```
+
+97 ms is the whole 86k-line UVM tree, walked again per fragment, and it does not
+move with the fragment's own size.  That was **11.3 s of a 12.5 s** project
+index — none of it visible in `LAZYVERILOG_TRACE_PERF=1`, which traces
+`make_file_state_with_options` and not `build_header_shards`.  A `gdb` sample of
+the workers put every stack in
+`build_header_shards -> SyntaxIndex::build -> collect_combined_occurrences`.
+
+The restriction did not filter either.  `SourceFileIdResolver::wants_declaration()`
+keeps every declaration when no mentions provider is set, and a header-derived
+build sets none, so each fragment's shard was a copy of the *includer's* whole
+declaration set — 116 copies of UVM under 116 different URIs, which is where the
+start-up memory went.  (The comment above `build_header_shards()` already said
+so; round 6 fixed it for headers that stand alone and left this path as it was.)
+
+## What changed
+
+`build_header_shards()` defers every fragment, walks the includer's tree **once**
+unrestricted, and `SyntaxIndex::split_by_source_file()` splits the result into
+one shard per fragment, keeping each entry with the file it originated in.
+
+Scope context that is not file-attributed — the set of package names, and the
+package-scoped lookup keys — is carried into every shard that keeps an entry: a
+class declared in a fragment is still a member of the package the includer
+opened, and nothing in the fragment says so.  Dropping it would leave
+`uvm_pkg::uvm_component` resolvable in no shard at all, because the package's own
+shard holds no entry for the class either.
+
+## Measured
+
+4-core Xeon @ 2.10GHz VM, `Release`, page cache warm, 3 runs, median.  Shard and
+module counts are identical on both sides of every row.
+
+| Corpus | index ms (all CPUs) | index ms (1 CPU) | user CPU (1 CPU) | maxRSS (1 CPU) |
+|---|---|---|---|---|
+| uvmproj (487 shards) | 12940 -> **1499** | 16525 -> **5104** | 16.23 -> **4.97 s** | 492 -> **158 MB** |
+| opentitan (5953 shards) | 6555 -> **2388** | 17658 -> **8366** | 17.01 -> **7.83 s** | 861 -> **625 MB** |
+| hpc60 (61 shards) | 71.5 -> 73.3 | 79.6 -> 76.2 | 0.07 -> 0.07 s | 34 -> 34 MB |
+
+`uvmproj` is the reported HPC shape, generated to match it: a 14.9k-line RTL
+header behind one `+incdir+`, 116 RTL modules that `include` it inside the module
+block, Accellera `uvm-core` behind `uvm.sv` / `uvm_pkg.sv` / `uvm_ams.sv` /
+`uvm_vmm_pkg.sv`, and 200 testbench files that `include "uvm_macros.svh"` and
+`import uvm_pkg::*`.  Split by group before the fix, the whole cost was the four
+UVM entries:
+
+| Group | files | index ms |
+|---|---|---|
+| RTL + its header | 116 | 338 |
+| testbench | 200 | 726 |
+| UVM library | 4 | **11973** |
+
+hpc60 is flat because its header stands alone — round 6's path, untouched here.
+OpenTitan is not flat: `.svh` fragments are common in it, and this is the first
+round to move it since round 0.
+
+Go-to-definition was checked over the LSP on `uvmproj` before and after, from a
+testbench file to `uvm_sequence_item` (a class in a fragment), `` `uvm_object_utils_begin ``
+and `` `uvm_info `` (macros in fragments).  All three resolve to the same file and
+line on both sides.
+
+Guarded by `./build/lazyverilog-tests "[scaling]"`: same total classes and bytes
+in one package, split across 8 fragments vs 32.  One walk per fragment puts that
+ratio at the fragment ratio itself (4x); it measures 1.1–1.2x.  Two correctness
+guards sit next to it — a fragment's shard holds its own declarations and not its
+siblings', and a class in a fragment stays addressable as `pkg::name`.
+
+## Still open from earlier rounds
+
+Unchanged from round 7.
+
+## Reproduce
+
+```bash
+cmake --build build -j$(nproc)
+tools/startup_bench.py tests/rtl/opentitan            # needs a lazyverilog.toml + .f
+tools/startup_bench.py tests/rtl/opentitan --cpus 0
+
+# the UVM shape
+git clone --depth 1 https://github.com/accellera-official/uvm-core.git
+# generate the corpus described above beside it, then:
+tools/startup_bench.py path/to/uvmproj --cpus 0 --trace
+```
+
+`--trace` will not show this cost: `build_header_shards()` is not traced.  What
+finds it is sampling the workers while a UVM-shaped index runs —
+
+```bash
+taskset -c 0 ./build/index-bench path/to/uvmproj 1 & pid=$!
+for i in $(seq 1 25); do gdb -p $pid -batch -ex "thread apply all bt 25"; done
+```
+
+— or a temporary `log_perf()` around the derive branch, which is what produced
+the 116 x 97 ms figure above.

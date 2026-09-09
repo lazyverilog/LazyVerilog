@@ -88,9 +88,24 @@ build of an includer keeps every declaration it finds, so deriving the header's
 shard from one produced a copy of that includer under the header's URI.
 
 A header that cannot stand alone — a port list, a module opened in one file and
-closed in another — has no tree of its own to index, and only for those is the
-shard still derived from the includer that pulled them in.  The parse itself is
-the test: a tree, and no error-severity parse diagnostic.
+closed in another, a class body a package `include`s — has no tree of its own to
+index, and only for those is the shard still derived from the includer that
+pulled them in.  The parse itself is the test: a tree, and no error-severity
+parse diagnostic.
+
+All of an includer's fragments are derived from **one** walk of its tree, which
+`SyntaxIndex::split_by_source_file()` then splits by originating file.  A
+restricted build is not a cheaper walk — it visits every node and discards what
+it finds — so building one per fragment cost `O(fragments x includer)`, and the
+shard it produced was an unfiltered copy of the includer besides.  A package
+that `include`s its whole library is the shape that makes both bite: UVM's
+`uvm_pkg.sv` pulls in 116 fragments across 86k lines.  See PERF.md round 8.
+
+Splitting carries over the scope context that is not itself file-attributed —
+the set of package names and the package-scoped lookup keys — because a class
+declared in a fragment is still a member of the package the includer opened, and
+nothing in the fragment says so.  Without that, `pkg::cls` resolves in no shard
+at all: the includer's own shard holds no entry for the class either.
 
 **The header's shard is where its declarations live.**  Once it stands alone, the
 rest of the indexing burst is served a projection of the header holding only its

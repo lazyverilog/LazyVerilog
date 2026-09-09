@@ -562,6 +562,10 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
                     HeaderTextCache& header_texts, uint64_t generation) {
     std::vector<BuiltHeaderShard> built;
     built.reserve(headers_to_build.size());
+    // Headers that did not parse standalone, in the order they were claimed.
+    // They are sharded together after this loop, from one walk of the
+    // includer's tree; see below.
+    std::vector<std::string> derived_uris;
     for (const auto& header_uri : headers_to_build) {
         // Parse the header on its own.  Deriving its shard from an includer's
         // tree cannot express "the header's declarations": the restriction
@@ -600,18 +604,53 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
             }
         } else {
             // A header that is a textual fragment — a port list, a module
-            // opened in one file and closed in another — has no tree of its
-            // own to index.  PERF.md documents this shape; keep deriving
-            // those from the includer that pulled them in.
-            header_index = std::make_shared<SyntaxIndex>(SyntaxIndex::build(
-                *includer.tree, header_source_text(*includer.source_manager, header_uri),
-                IndexDepth::Declarations, header_uri));
+            // opened in one file and closed in another, a class body a package
+            // `include`s — has no tree of its own to index, so its shard has to
+            // come from the includer that pulled it in.  Deferred: one walk of
+            // that tree serves all of them (see below).
+            derived_uris.push_back(header_uri);
         }
         built.push_back(BuiltHeaderShard{
             .uri = header_uri,
             .index = std::move(header_index),
             .stands_alone = stands_alone,
         });
+    }
+
+    if (!derived_uris.empty() && includer.tree) {
+        // One walk, then split, rather than one walk per header.  Restricting
+        // the build to a single header does not make the walk any cheaper — it
+        // still visits every node of the includer's tree and only discards what
+        // it finds — so N headers cost N x the includer.  A package that
+        // `include`s its whole library is exactly that shape: UVM's uvm_pkg.sv
+        // pulls in 116 fragments across 86k lines, and re-walking it once per
+        // fragment was 11.3 s of a 12.5 s project index.
+        //
+        // The walk is unrestricted so every fragment's declarations are found
+        // in it, and split_by_source_file() then keeps each entry with the file
+        // it came from.  That also fixes what the per-header build could not
+        // express: with no mentions provider set, its restriction did not
+        // filter declarations at all, so each fragment's shard was a copy of
+        // the whole includer's — 116 copies of UVM, which is where the start-up
+        // memory went.
+        //
+        // No source text is passed: it feeds only the ';'-scan fallback for an
+        // instantiation's end line, which one text cannot serve for many files,
+        // and which syntax_end_line0() uses only when the parsed range has no
+        // valid end.
+        auto derived = SyntaxIndex::build(*includer.tree, {}, IndexDepth::Declarations)
+                           .split_by_source_file(derived_uris);
+        // Both lists were appended to in the loop above, so the nth shard that
+        // did not stand alone is the nth entry of derived_uris.
+        size_t next = 0;
+        for (auto& shard : built) {
+            if (shard.stands_alone)
+                continue;
+            auto& index = derived[next++];
+            index.include_dependencies =
+                collect_include_dependency_uris(*includer.source_manager, shard.uri);
+            shard.index = std::make_shared<SyntaxIndex>(std::move(index));
+        }
     }
     return built;
 }

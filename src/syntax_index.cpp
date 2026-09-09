@@ -1500,6 +1500,183 @@ static SourceFileID remap_file_id(const std::vector<SourceFileID>& remap, Source
     return remap[id];
 }
 
+std::vector<SyntaxIndex>
+SyntaxIndex::split_by_source_file(const std::vector<std::string>& uris) const {
+    constexpr size_t kNoSlot = std::numeric_limits<size_t>::max();
+
+    std::vector<SyntaxIndex> shards(uris.size());
+    std::unordered_map<SourceFileID, size_t> slot_by_file;
+    for (size_t slot = 0; slot < uris.size(); ++slot) {
+        // The shard's own URI is interned first so source_files.front() names
+        // the file the shard is for, matching what a restricted build produces.
+        shards[slot].intern_source_file(uris[slot]);
+        if (const auto it = source_file_ids.find(uris[slot]); it != source_file_ids.end())
+            slot_by_file.try_emplace(it->second, slot);
+    }
+    if (slot_by_file.empty())
+        return shards;
+
+    auto slot_of = [&](SourceFileID file_id) {
+        const auto it = slot_by_file.find(file_id);
+        return it == slot_by_file.end() ? kNoSlot : it->second;
+    };
+
+    // Each shard keeps its own file table, holding only the files its entries
+    // actually name.  Interning lazily through this per-shard cache is what
+    // keeps that from becoming a copy of the whole build's table.
+    std::vector<std::vector<SourceFileID>> remaps(
+        uris.size(), std::vector<SourceFileID>(source_files.size(), kInvalidSourceFileID));
+    auto map_id = [&](size_t slot, SourceFileID file_id) {
+        if (file_id == kInvalidSourceFileID || file_id >= source_files.size())
+            return kInvalidSourceFileID;
+        auto& cached = remaps[slot][file_id];
+        if (cached == kInvalidSourceFileID)
+            cached = shards[slot].intern_source_file(source_files[file_id]);
+        return cached;
+    };
+
+    // A package name is scope context, not a file-attributed fact: a class in
+    // an `include`d header is still a member of the package the includer
+    // opened, and merge() reads this set to decide that.  Dropping it would
+    // leave `pkg::cls` resolvable in no shard at all, because the includer's
+    // own shard holds no entry for the class.
+    for (auto& shard : shards)
+        shard.package_names = package_names;
+
+    for (const auto& module : modules) {
+        const auto slot = slot_of(module.file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto& shard = shards[slot];
+        auto copy = module;
+        copy.file_id = map_id(slot, copy.file_id);
+        for (auto& port : copy.ports)
+            port.file_id = map_id(slot, port.file_id);
+        for (auto& modport : copy.modports)
+            modport.file_id = map_id(slot, modport.file_id);
+        if (interface_names.count(copy.name))
+            shard.interface_names.insert(copy.name);
+        // Exported-symbol lists follow the file that declares the package, not
+        // the headers whose declarations they name: one shard carries the list
+        // and merge() is first-wins over it.
+        if (const auto it = package_symbols.find(copy.name); it != package_symbols.end())
+            shard.package_symbols.try_emplace(copy.name, it->second);
+        shard.module_by_name.try_emplace(copy.name, shard.modules.size());
+        shard.modules.push_back(std::move(copy));
+    }
+
+    for (const auto& instance : instances) {
+        const auto slot = slot_of(instance.file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto copy = instance;
+        copy.file_id = map_id(slot, copy.file_id);
+        for (auto& connection : copy.connections)
+            connection.file_id = map_id(slot, connection.file_id);
+        shards[slot].instances.push_back(std::move(copy));
+    }
+
+    // Old index -> new index, so the package-scoped lookup maps can be carried
+    // over by remapping rather than re-deriving: the conditions that built them
+    // saw the whole tree, and a shard on its own cannot tell that the class it
+    // holds sits inside a package declared in another file.
+    std::vector<size_t> class_slot(classes.size(), kNoSlot);
+    std::vector<size_t> new_class_index(classes.size(), 0);
+    for (size_t i = 0; i < classes.size(); ++i) {
+        const auto slot = slot_of(classes[i].file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto& shard = shards[slot];
+        auto copy = classes[i];
+        copy.file_id = map_id(slot, copy.file_id);
+        for (auto& field : copy.fields)
+            field.file_id = map_id(slot, field.file_id);
+        for (auto& method : copy.methods)
+            method.file_id = map_id(slot, method.file_id);
+        class_slot[i] = slot;
+        new_class_index[i] = shard.classes.size();
+        shard.class_by_name.try_emplace(copy.name, shard.classes.size());
+        shard.classes.push_back(std::move(copy));
+    }
+
+    std::vector<size_t> typedef_slot(typedefs.size(), kNoSlot);
+    std::vector<size_t> new_typedef_index(typedefs.size(), 0);
+    for (size_t i = 0; i < typedefs.size(); ++i) {
+        const auto slot = slot_of(typedefs[i].file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto& shard = shards[slot];
+        auto copy = typedefs[i];
+        copy.file_id = map_id(slot, copy.file_id);
+        for (auto& member : copy.enum_members)
+            member.file_id = map_id(slot, member.file_id);
+        for (auto& field : copy.fields)
+            field.file_id = map_id(slot, field.file_id);
+        typedef_slot[i] = slot;
+        new_typedef_index[i] = shard.typedefs.size();
+        shard.typedef_by_name.try_emplace(copy.name, shard.typedefs.size());
+        shard.typedefs.push_back(std::move(copy));
+    }
+
+    std::vector<size_t> value_slot(values.size(), kNoSlot);
+    std::vector<size_t> new_value_index(values.size(), 0);
+    for (size_t i = 0; i < values.size(); ++i) {
+        const auto slot = slot_of(values[i].file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto& shard = shards[slot];
+        auto copy = values[i];
+        copy.file_id = map_id(slot, copy.file_id);
+        value_slot[i] = slot;
+        new_value_index[i] = shard.values.size();
+        shard.values.push_back(std::move(copy));
+    }
+
+    auto carry_scoped = [&](const std::unordered_map<std::string, size_t>& source_map,
+                            const std::vector<size_t>& slots,
+                            const std::vector<size_t>& new_indexes,
+                            std::unordered_map<std::string, size_t> SyntaxIndex::*target) {
+        for (const auto& [key, old_index] : source_map) {
+            if (old_index >= slots.size() || slots[old_index] == kNoSlot)
+                continue;
+            (shards[slots[old_index]].*target).emplace(key, new_indexes[old_index]);
+        }
+    };
+    carry_scoped(package_class_by_scoped_name, class_slot, new_class_index,
+                 &SyntaxIndex::package_class_by_scoped_name);
+    carry_scoped(package_type_by_scoped_name, typedef_slot, new_typedef_index,
+                 &SyntaxIndex::package_type_by_scoped_name);
+    carry_scoped(package_value_by_scoped_name, value_slot, new_value_index,
+                 &SyntaxIndex::package_value_by_scoped_name);
+
+    for (const auto& macro : macros) {
+        const auto slot = slot_of(macro.file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto copy = macro;
+        copy.file_id = map_id(slot, copy.file_id);
+        shards[slot].macros.push_back(std::move(copy));
+    }
+    for (const auto& import : imports) {
+        const auto slot = slot_of(import.file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto copy = import;
+        copy.file_id = map_id(slot, copy.file_id);
+        shards[slot].imports.push_back(std::move(copy));
+    }
+    for (const auto& reference : references) {
+        const auto slot = slot_of(reference.file_id);
+        if (slot == kNoSlot)
+            continue;
+        auto copy = reference;
+        copy.file_id = map_id(slot, copy.file_id);
+        shards[slot].references.push_back(std::move(copy));
+    }
+
+    return shards;
+}
+
 void SyntaxIndex::merge(const SyntaxIndex& other) {
     std::vector<SourceFileID> file_remap;
     file_remap.reserve(other.source_files.size());

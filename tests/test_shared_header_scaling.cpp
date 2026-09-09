@@ -611,3 +611,199 @@ TEST_CASE("project shard: a file-scope parameter is indexed", "[index][scaling]"
     std::error_code ec;
     std::filesystem::remove_all(canonical_dir, ec);
 }
+
+// ── What a package that `include`s its whole library costs ──────────────────
+//
+// The header shapes above all stand alone: parsed by themselves they produce a
+// tree, so each is indexed once from that tree and every includer is then served
+// its directives alone.  A fragment cannot do that, and its shard has to be
+// derived from an includer's tree instead.
+//
+// Deriving it with a build restricted to the fragment's URI does not make that
+// build any cheaper — the walk still visits every node of the includer's tree
+// and only discards what it finds — so N fragments cost N x the includer.  A
+// package that `include`s its whole library is exactly that shape: UVM's
+// uvm_pkg.sv pulls in 116 fragments across 86k lines, and re-walking it once per
+// fragment was 11.3 s of a 12.5 s project index on a 320-file design.
+//
+// The ratio taken here holds the includer constant — same classes, same bytes,
+// same one package — and only varies how many files that content is split
+// across.  Nothing about the tree being walked changes between the two halves,
+// so a cost that tracks the fragment count is the regression and nothing else
+// is.
+namespace {
+
+/// One package `include`-ing @p headers fragment files that together declare
+/// @p headers * @p classes_per_header classes.
+///
+/// Each fragment opens with a macro only the package defines, so parsing one by
+/// itself fails and it takes the derive-from-includer path.  That is why UVM's
+/// headers are fragments too: they are class bodies that lean on
+/// `uvm_macros.svh` having been included first.
+class PackageFragmentDesign {
+  public:
+    PackageFragmentDesign(const std::string& tag, int headers, int classes_per_header) {
+        dir_ = std::filesystem::temp_directory_path() / ("lazyverilog-fragments-" + tag);
+        std::filesystem::remove_all(dir_);
+        std::filesystem::create_directories(dir_);
+        dir_ = std::filesystem::canonical(dir_);
+
+        std::string package_text = "`define FRAG_NOTE\npackage frag_pkg;\n";
+        for (int h = 0; h < headers; ++h) {
+            const auto name = "frag_" + std::to_string(h) + ".svh";
+            write(dir_ / name, fragment_text(h, classes_per_header));
+            header_uris_.push_back(uri_from_path(dir_ / name));
+            package_text += "`include \"" + name + "\"\n";
+        }
+        package_text += "endpackage\n";
+        package_path_ = (dir_ / "frag_pkg.sv").string();
+        write(package_path_, package_text);
+    }
+
+    ~PackageFragmentDesign() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    PackageFragmentDesign(const PackageFragmentDesign&) = delete;
+    PackageFragmentDesign& operator=(const PackageFragmentDesign&) = delete;
+
+    const std::string& header_uri(size_t i) const { return header_uris_[i]; }
+    std::string package_uri() const { return uri_from_path(package_path_); }
+
+    double index_ms(Analyzer& analyzer) const {
+        analyzer.set_project_index_publish_debounce_ms(0);
+        const auto start = Clock::now();
+        analyzer.set_project_config({}, {dir_.string()}, {package_path_});
+        analyzer.wait_for_background_index_idle();
+        return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    }
+
+    static std::string class_name(int header, int index) {
+        return "frag_" + std::to_string(header) + "_" + std::to_string(index);
+    }
+
+  private:
+    static std::string fragment_text(int header, int classes) {
+        // The macro is what makes this file a fragment: standalone it is an
+        // unknown-directive error, so the header never claims to stand alone.
+        std::string text = "`FRAG_NOTE\n";
+        for (int i = 0; i < classes; ++i) {
+            const auto name = class_name(header, i);
+            text += "class " + name + ";\n"
+                    "    int " + name + "_field;\n"
+                    "    function void " + name + "_run();\n"
+                    "    endfunction\n"
+                    "endclass\n";
+        }
+        return text;
+    }
+
+    static void write(const std::filesystem::path& path, const std::string& text) {
+        std::ofstream out(path, std::ios::binary);
+        out << text;
+    }
+
+    std::filesystem::path dir_;
+    std::string package_path_;
+    std::vector<std::string> header_uris_;
+};
+
+std::set<std::string> shard_classes(const Analyzer& analyzer, const std::string& uri) {
+    std::set<std::string> names;
+    for (const auto& entry : *analyzer.extra_index_snapshot_ptr()) {
+        if (entry.uri != uri)
+            continue;
+        for (const auto& cls : entry.index_ref().classes)
+            names.insert(cls.name);
+    }
+    return names;
+}
+
+// 512 classes either way, so the tree being walked is the same size in both
+// halves and only the fragment count differs.
+constexpr int kFragmentClasses = 512;
+constexpr int kFewFragments = 8;
+constexpr int kManyFragments = 32;
+// Same reasoning as kProjectionRuns: both halves are reduced to their fastest
+// run, interleaved, so a scheduling hiccup cannot own one design's window.
+constexpr int kFragmentRuns = 5;
+
+} // namespace
+
+TEST_CASE("package fragments: sharding cost stops scaling with the fragment count",
+          "[index][scaling]") {
+    const PackageFragmentDesign few("few", kFewFragments, kFragmentClasses / kFewFragments);
+    const PackageFragmentDesign many("many", kManyFragments, kFragmentClasses / kManyFragments);
+
+    std::vector<double> few_samples;
+    std::vector<double> many_samples;
+    for (int i = 0; i < kFragmentRuns; ++i) {
+        {
+            Analyzer analyzer;
+            few_samples.push_back(few.index_ms(analyzer));
+        }
+        {
+            Analyzer analyzer;
+            many_samples.push_back(many.index_ms(analyzer));
+        }
+    }
+    std::sort(few_samples.begin(), few_samples.end());
+    std::sort(many_samples.begin(), many_samples.end());
+
+    const auto ratio = many_samples.front() / few_samples.front();
+    std::cout << "[scaling] package fragments: " << kFewFragments << " -> "
+              << few_samples.front() << " ms, " << kManyFragments << " -> "
+              << many_samples.front() << " ms, ratio " << ratio << "\n";
+
+    // One walk per fragment puts this at the fragment ratio itself (4x).  What
+    // is left once the walk is shared is the per-fragment standalone parse
+    // attempt and its shard bookkeeping, which is real but small.
+    CHECK(ratio < 2.0);
+}
+
+TEST_CASE("package fragment shard: holds its own declarations and not its siblings'",
+          "[index][scaling]") {
+    const PackageFragmentDesign design("scope", 4, 3);
+    Analyzer analyzer;
+    (void)design.index_ms(analyzer);
+
+    for (int h = 0; h < 4; ++h) {
+        const auto classes = shard_classes(analyzer, design.header_uri(static_cast<size_t>(h)));
+        CHECK(classes.size() == 3);
+        for (int i = 0; i < 3; ++i)
+            CHECK(classes.contains(PackageFragmentDesign::class_name(h, i)));
+    }
+    // The package's own shard still carries all of them, on purpose: a package
+    // builds its body out of `include`d files and its members are its exported
+    // API, so process_module() skips the mentions filter inside one.  What the
+    // fragment shards must not be is another copy of that -- 4 x 12 classes
+    // above, which at UVM's 116 fragments is where the start-up memory went.
+    CHECK(shard_classes(analyzer, design.package_uri()).size() == 12);
+}
+
+TEST_CASE("package fragment shard: a class in a fragment stays addressable as pkg::name",
+          "[index][scaling]") {
+    // The fragment's shard cannot re-derive this on its own: nothing in the
+    // fragment says it was `include`d inside a package.  Splitting one walk has
+    // to carry the scope over, or `frag_pkg::frag_0_0` resolves in no shard at
+    // all -- the package's own shard holds no entry for the class either.
+    const PackageFragmentDesign design("scoped", 2, 2);
+    Analyzer analyzer;
+    (void)design.index_ms(analyzer);
+
+    bool found = false;
+    for (const auto& entry : *analyzer.extra_index_snapshot_ptr()) {
+        if (entry.uri != design.header_uri(0))
+            continue;
+        const auto& index = entry.index_ref();
+        const auto it = index.package_class_by_scoped_name.find(
+            package_scoped_key("frag_pkg", PackageFragmentDesign::class_name(0, 0)));
+        if (it == index.package_class_by_scoped_name.end())
+            continue;
+        REQUIRE(it->second < index.classes.size());
+        CHECK(index.classes[it->second].name == PackageFragmentDesign::class_name(0, 0));
+        found = true;
+    }
+    CHECK(found);
+}

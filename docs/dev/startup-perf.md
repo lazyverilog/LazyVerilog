@@ -106,6 +106,27 @@ Use the same `CMAKE_BUILD_TYPE` on both sides — `Release` and `RelWithDebInfo`
 differ enough to swamp the effect being measured — and read `maxRSS` alongside
 the times: a per-file map that grows with header size shows up in memory first.
 
+## What `--trace` cannot see
+
+`LAZYVERILOG_TRACE_PERF=1` instruments `make_file_state_with_options()` — one
+file's parse and index build.  Work the background loop does *around* that is
+untraced, and `build_header_shards()` is the big one: on a UVM-shaped project it
+was 90% of start-up while every trace line summed to a tenth of the wall time
+(PERF.md round 8).  When the traced sum and the reported index time disagree,
+the answer is not in the trace.  Sample the workers instead:
+
+```bash
+taskset -c 0 ./build/index-bench <corpus> 1 & pid=$!
+sleep 1
+for i in $(seq 1 25); do gdb -p $pid -batch -ex "thread apply all bt 25"; done \
+  | grep '^#' | sed 's/^#[0-9]* *//; s/^0x[0-9a-f]* in //; s/ (.*//' \
+  | sort | uniq -c | sort -rn | head -20
+```
+
+A `Release` build keeps its symbols, so this needs no rebuild, and one CPU keeps
+the attribution clean.  `perf` is the better tool where it is available; in a
+container without `perf_event` access this is what there is.
+
 ## Related
 
 - `PERF.md` — measured optimization rounds and their evidence.

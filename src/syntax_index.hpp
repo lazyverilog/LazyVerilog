@@ -393,6 +393,24 @@ struct SyntaxIndex {
                              IndexDepth depth = IndexDepth::Full,
                              std::string_view restrict_to_uri = {});
 
+    /// Split this index into one shard per URI in @p uris, keeping each entry
+    /// with the file it originated in and dropping entries from files not
+    /// listed.  Shards come back in the order of @p uris; a URI this index
+    /// never saw yields an empty shard.
+    ///
+    /// This exists so a set of `include`d headers can be sharded from one walk
+    /// of the including file's tree.  Calling build() once per header instead
+    /// costs O(headers x includer) — a package that `include`s its whole
+    /// library, which is how UVM is written, made that the dominant term of
+    /// project start-up.  See PERF.md round 8.
+    ///
+    /// Scope context that is not itself file-attributed — the set of package
+    /// names, and the package-scoped lookup keys — is carried into every shard
+    /// that keeps an entry, because a class declared in a header is still a
+    /// member of the package the includer opened, and merge() re-derives those
+    /// keys from what the shard says about its own scopes.
+    std::vector<SyntaxIndex> split_by_source_file(const std::vector<std::string>& uris) const;
+
     /// Merge all collections from @p other into this index.
     /// Used to combine extra-file indexes with the current document's index.
     void merge(const SyntaxIndex& other);
