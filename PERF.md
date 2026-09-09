@@ -1098,6 +1098,39 @@ Guarded by `./build/lazyverilog-tests "[scaling]"`, which now asserts the count
 directly (`carriers <= 1`) and prints it on every run, instead of the fraction of
 an absolute count that made it scheduling-dependent.
 
+## Addendum: the gate is necessary, not sufficient
+
+The count above went to 2 roughly one burst in 60, and the gate was not the leak.
+Reaching the released workers also needs `HeaderTextCache` to keep offering the
+projection, and its popularity rule — seed a header at least half the burst's
+parses pulled in — was read while other workers were updating the two counters it
+divides.  `parses` was bumped in one critical section and each header's `hits` in
+another, and the burst's own standalone parse of a header bumped `parses` with no
+hit to match, which left the shared header at `hits=1, parses=2` the moment the
+gate opened: on the threshold, with nothing to spare.  A worker caught between
+the two updates published `hits=1, parses=3`, the header dropped off the seed
+list, and the next file read the whole thing from disk — the `O(files x header)`
+cost this round exists to remove, one file's worth of it.
+
+Recording a parse is now a single critical section over both counters
+(`HeaderTextCache::record_parse`), and a header's own parse is no longer charged
+to the denominator.  Reproduced beforehand by widening the window between the two
+updates to 300 µs, which took the count to 4–8; with the fix the same
+perturbation holds it at 1, and 150 unperturbed runs are all 1.
+
+Flat on both shapes (12-core box, Release, 3–5 runs each, A/B alternated):
+
+| Corpus | index ms | user CPU | maxRSS |
+|---|---|---|---|
+| hpc60, all CPUs | 60.2 -> 56.6 | 0.06 -> 0.05 s | 45 -> 45 MB |
+| 3988-file OpenTitan filelist | 1385 / 1308 -> 1375 / 1316 | 7.6 / 7.5 -> 7.5 / 7.2 s | 1132 -> 1114 MB |
+
+The OpenTitan row is the one that had to be checked: not charging a header's own
+parse to the denominator makes the rule slightly more permissive, and the rule is
+there to stop a design with hundreds of distinct headers copying all of them into
+every file's SourceManager.  Shard and module counts are identical and the cost
+does not move.
+
 ## Still open from earlier rounds
 
 Unchanged from round 6.

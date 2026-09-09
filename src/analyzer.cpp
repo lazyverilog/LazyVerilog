@@ -304,13 +304,14 @@ static void store_open_parse_headers(const slang::SourceManager& sm, const Docum
 /// can be seeded from memory instead of re-reading them.
 static void store_header_texts(const slang::SourceManager& sm, const DocumentState& state,
                                HeaderTextCache& cache, uint64_t generation,
-                               const std::unordered_set<std::string_view>& excluded) {
-    cache.note_parse(generation);
+                               const std::unordered_set<std::string_view>& excluded,
+                               bool count_as_burst_parse) {
+    std::vector<HeaderTextCache::ParsedHeader> headers;
     for (const auto buffer : sm.getAllBuffers()) {
         const auto& full_path = sm.getFullPath(buffer);
         if (full_path.empty())
             continue;
-        const auto path_string = full_path.string();
+        auto path_string = full_path.string();
         if (excluded.contains(path_string))
             continue;
         // Only genuine `include dependencies of this parse.  Seeded buffers and
@@ -318,8 +319,12 @@ static void store_header_texts(const slang::SourceManager& sm, const DocumentSta
         // dependency set is what distinguishes them.
         if (!state.include_dependency_set.contains(uri_from_path(full_path)))
             continue;
-        cache.store(generation, path_string, sm.getSourceText(buffer));
+        headers.emplace_back(std::move(path_string), sm.getSourceText(buffer));
     }
+    // Handed over in one call on purpose: this parse and the headers it wanted
+    // have to enter the cache together or a concurrent seed_candidates() reads a
+    // half-updated popularity ratio.  See HeaderTextCache::record_parse().
+    cache.record_parse(generation, headers, count_as_burst_parse);
 }
 
 /// Source text of the buffer @p uri was loaded into.
@@ -479,7 +484,8 @@ make_file_state_with_options(const std::filesystem::path& path,
                              HeaderTextCache* header_texts = nullptr,
                              uint64_t generation = 0,
                              bool collect_diagnostics = true,
-                             bool restrict_index_to_own_file = false) {
+                             bool restrict_index_to_own_file = false,
+                             bool count_as_burst_parse = true) {
     const auto start = Clock::now();
     const auto norm = normalize_filesystem_path(path);
     const std::string norm_string = norm.string();
@@ -528,7 +534,7 @@ make_file_state_with_options(const std::filesystem::path& path,
                                          state->include_dependencies.end());
     if (header_texts)
         store_header_texts(*state->source_manager, *state, *header_texts, generation,
-                           header_cache_excluded);
+                           header_cache_excluded, count_as_burst_parse);
     if (state->tree) {
         // A restricted build indexes only this file's own declarations and
         // occurrences; whatever it `include`s becomes one shard per header,
@@ -579,7 +585,11 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
         auto header_state = make_file_state_with_options(
             path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
             /*retain_text=*/false, &header_texts, generation,
-            /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true);
+            /*collect_diagnostics=*/true, /*restrict_index_to_own_file=*/true,
+            // Burst bookkeeping, not a file of the project: counting it would
+            // make the header look less shared than every file that includes it
+            // proves it is.  See HeaderTextCache::record_parse().
+            /*count_as_burst_parse=*/false);
         const bool stands_alone =
             header_state && header_state->tree &&
             std::none_of(header_state->parse_diagnostics.begin(),

@@ -2,11 +2,13 @@
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <thread>
+#include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <slang/syntax/SyntaxTree.h>
 
@@ -695,16 +697,16 @@ TEST_CASE("header text cache: a new generation drops previously cached text", "[
     // an older generation must never be handed to a parse running under a newer
     // one, or a shard would be built from text the edit already replaced.
     HeaderTextCache cache;
-    cache.note_parse(1);
-    cache.store(1, "/proj/shared.svh", "localparam int W = 8;\n");
+    cache.record_parse(1, {{"/proj/shared.svh", "localparam int W = 8;\n"}},
+                       /*count_as_burst_parse=*/true);
     REQUIRE(cache.seed_candidates(1).size() == 1);
 
     auto after_bump = cache.seed_candidates(2);
     CHECK(after_bump.empty());
 
     // The cache is usable again under the new generation.
-    cache.note_parse(2);
-    cache.store(2, "/proj/shared.svh", "localparam int W = 32;\n");
+    cache.record_parse(2, {{"/proj/shared.svh", "localparam int W = 32;\n"}},
+                       /*count_as_burst_parse=*/true);
     auto refilled = cache.seed_candidates(2);
     REQUIRE(refilled.size() == 1);
     CHECK(*refilled.front().second == "localparam int W = 32;\n");
@@ -718,15 +720,70 @@ TEST_CASE("header text cache: only widely shared headers are offered for seeding
     // of them into every file's SourceManager.
     HeaderTextCache cache;
     for (int parse = 0; parse < 10; ++parse) {
-        cache.note_parse(1);
-        cache.store(1, "/proj/common.svh", "localparam int W = 8;\n");
+        std::vector<HeaderTextCache::ParsedHeader> headers{
+            {"/proj/common.svh", "localparam int W = 8;\n"}};
         if (parse == 0)
-            cache.store(1, "/proj/onlyone.svh", "localparam int X = 1;\n");
+            headers.emplace_back("/proj/onlyone.svh", "localparam int X = 1;\n");
+        cache.record_parse(1, headers, /*count_as_burst_parse=*/true);
     }
 
     const auto candidates = cache.seed_candidates(1);
     REQUIRE(candidates.size() == 1);
     CHECK(candidates.front().first == "/proj/common.svh");
+}
+
+TEST_CASE("header text cache: the header's own parse is not charged to the burst",
+          "[index]") {
+    // build_header_shards() parses a header by itself to build its shard, and
+    // that parse goes through the same cache.  It is the one parse that can
+    // never want the header it is parsing, so counting it in the denominator
+    // would leave a header every project file includes sitting exactly on the
+    // popularity threshold from the very first file -- no margin for the next
+    // parse of anything else in the burst.
+    HeaderTextCache cache;
+    cache.record_parse(1, {{"/proj/defs.svh", "localparam int W = 8;\n"}},
+                       /*count_as_burst_parse=*/true);
+    cache.record_parse(1, {}, /*count_as_burst_parse=*/false);
+
+    const auto candidates = cache.seed_candidates(1);
+    REQUIRE(candidates.size() == 1);
+    CHECK(candidates.front().first == "/proj/defs.svh");
+}
+
+TEST_CASE("header text cache: a shared header stays on offer while a burst fans out",
+          "[index]") {
+    // The regression this pins is a torn read, not a wrong rule: recording a
+    // parse used to bump `parses` and each header's `hits` in two separate
+    // critical sections, so a worker between them made a header every file
+    // includes look unpopular for a moment.  A reader landing in that moment
+    // declined to seed it and sent the next file to read the whole header from
+    // disk again -- the exact O(files x header) cost the directives-only
+    // projection exists to remove, and the reason the [scaling] carrier count
+    // went to 2 on a shared CI runner roughly one run in 60.
+    //
+    // Recording is one critical section now, so no interleaving can expose a
+    // ratio no single parse ever produced.
+    constexpr char kHeader[] = "/proj/defs.svh";
+    HeaderTextCache cache;
+    cache.record_parse(1, {{kHeader, "localparam int W = 8;\n"}},
+                       /*count_as_burst_parse=*/true);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> misses{0};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (cache.seed_candidates(1).empty())
+                misses.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    for (int parse = 0; parse < 5000; ++parse)
+        cache.record_parse(1, {{kHeader, "localparam int W = 8;\n"}},
+                           /*count_as_burst_parse=*/true);
+
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+    CHECK(misses.load() == 0);
 }
 
 TEST_CASE("project index: a header is found through a configured include directory", "[index]") {

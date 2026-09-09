@@ -142,6 +142,18 @@ Two consequences worth knowing before writing a feature:
   path drops the header's shard and re-queues every includer, so the projection
   has to be rebuilt before that fan-out is released.
 
+  The gate alone did not quite deliver "exactly once".  Reaching the queued files
+  also needs `HeaderTextCache` to keep *offering* the projection, and its
+  popularity rule — seed a header at least half the burst's parses pulled in —
+  is read while other workers are updating the ratio it is computed from.
+  Recording a parse is therefore one critical section covering both the parse
+  count and every header's hit count (`HeaderTextCache::record_parse`), and the
+  burst's own parse of a header on its own is not charged to the denominator.
+  Split, they left the shared header at `hits=1, parses=2` when the gate opened —
+  exactly on the threshold — so one worker caught mid-update read `hits=1,
+  parses=3`, the header fell off the seed list, and the next file read it whole.
+  That put the carrier count at 2 about one burst in 60.
+
 ## Editing a header: what an unsaved keystroke refreshes
 
 Typing in a header used to queue every file that `include`s it, on every

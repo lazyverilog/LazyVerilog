@@ -44,10 +44,15 @@ struct HeaderTextCache {
         size_t hits{0};
     };
 
+    /// One header a parse pulled in: the key it is cached under, and its text.
+    using ParsedHeader = std::pair<std::string, std::string_view>;
+
     mutable std::mutex mutex;
     std::unordered_map<std::string, Entry> texts;
     size_t bytes{0};
-    /// Parses in this burst, the denominator for the popularity rule below.
+    /// Parses of *project files* in this burst, the denominator for the
+    /// popularity rule below.  A parse the burst makes of a header on its own is
+    /// not one of them; see record_parse().
     size_t parses{0};
     /// Background generation these texts were collected under.  Every path that
     /// invalidates parse results — config reload, a changed header, a changed
@@ -56,24 +61,32 @@ struct HeaderTextCache {
     /// themselves, which keeps this mutex off map_mutex_'s lock order.
     uint64_t generation{0};
 
-    /// Count one parse against the burst, whether or not it stored anything.
-    void note_parse(uint64_t gen) {
+    /// Record one parse of the burst together with every header it pulled in.
+    ///
+    /// Deliberately one call under one lock, rather than a parse counter plus a
+    /// store per header: `parses` is the denominator of the popularity rule in
+    /// seed_candidates() and `hits` its numerator, so a reader that catches the
+    /// two half updated sees a header as less shared than it is and declines to
+    /// seed it.  Split across two calls that window was real: a burst's shared
+    /// header sits at hits=1, parses=2 the moment the warmup gate opens, and one
+    /// worker between the two calls made it hits=1, parses=3 — the header
+    /// dropped off the seed list and the next file re-read it whole, which is
+    /// the O(files x header) cost the projection exists to prevent.  Measured at
+    /// roughly one indexing burst in 60.
+    ///
+    /// @p count_as_burst_parse is false for the parse build_header_shards() makes
+    /// of a header on its own.  That is the burst's own bookkeeping, not a file
+    /// of the project, and it is the one parse guaranteed never to want the
+    /// header it is parsing — charging it to the denominator biases the rule
+    /// against precisely the header being projected.
+    void record_parse(uint64_t gen, const std::vector<ParsedHeader>& headers,
+                      bool count_as_burst_parse) {
         std::lock_guard<std::mutex> lock(mutex);
         discard_stale(gen);
-        ++parses;
-    }
-
-    void store(uint64_t gen, const std::string& path, std::string_view text) {
-        std::lock_guard<std::mutex> lock(mutex);
-        discard_stale(gen);
-        if (const auto it = texts.find(path); it != texts.end()) {
-            ++it->second.hits;
-            return;
-        }
-        if (bytes + text.size() > kMaxBytes)
-            return;
-        bytes += text.size();
-        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
+        if (count_as_burst_parse)
+            ++parses;
+        for (const auto& [path, text] : headers)
+            store_locked(path, text);
     }
 
     /// Replace what this burst serves for @p path with @p text.
@@ -82,8 +95,8 @@ struct HeaderTextCache {
     /// declarations, once the header's own shard has recorded them; see
     /// header_directives_only() for why that is equivalent for an includer.
     /// Only an entry this burst already holds is replaced: an absent one means
-    /// store() judged the header not worth caching, and inserting it here would
-    /// enter it with a hit count no popularity rule can ever admit.
+    /// record_parse() judged the header not worth caching, and inserting it here
+    /// would enter it with a hit count no popularity rule can ever admit.
     void project(uint64_t gen, const std::string& path, std::string text) {
         std::lock_guard<std::mutex> lock(mutex);
         if (gen != generation)
@@ -128,6 +141,17 @@ struct HeaderTextCache {
     }
 
 private:
+    void store_locked(const std::string& path, std::string_view text) {
+        if (const auto it = texts.find(path); it != texts.end()) {
+            ++it->second.hits;
+            return;
+        }
+        if (bytes + text.size() > kMaxBytes)
+            return;
+        bytes += text.size();
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
+    }
+
     void discard_stale(uint64_t gen) {
         if (gen == generation)
             return;
