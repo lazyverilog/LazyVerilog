@@ -749,6 +749,39 @@ class Analyzer {
         index_cache_digests_;
     std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
                                                          uint64_t generation) const;
+
+    /// Shard writes, drained by one dedicated thread.
+    ///
+    /// A cache write is an optimization for the *next* launch, so it must never
+    /// delay this one.  Done inline in the worker it did exactly that: on a
+    /// 5953-shard project the serializing and writing of 116 MB sat between the
+    /// last parse and the publish, and cost 44% of a cold start.  Workers now
+    /// hand the finished shard over -- a shared_ptr and two strings -- and go
+    /// back to parsing.
+    struct PendingShardWrite {
+        std::string uri;
+        std::shared_ptr<const SyntaxIndex> index;
+        std::string extra_dependency_uri;
+        bool stands_alone{false};
+        uint64_t generation{0};
+    };
+    void queue_shard_write(PendingShardWrite write) const;
+    void index_cache_writer_loop() const;
+
+    mutable std::mutex index_cache_write_mutex_;
+    mutable std::condition_variable index_cache_write_cv_;
+    mutable std::deque<PendingShardWrite> index_cache_write_queue_;
+    mutable std::thread index_cache_writer_;
+    mutable bool index_cache_writer_stop_{false};
+    mutable bool index_cache_writing_{false};
+
+public:
+    /// Block until every queued shard write has been flushed.  Only tests need
+    /// this: the server has no reason to wait for a cache that exists for the
+    /// next launch.
+    void wait_for_index_cache_writes_idle() const;
+
+private:
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;

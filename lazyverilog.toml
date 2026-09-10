@@ -2,6 +2,9 @@
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]   # preprocessor defines passed to slang for parsing
 
+[index]
+cache = true                   # reuse per-file index shards from .cache/lazyverilog/index across launches
+
 [compilation]
 background_compilation = false # run semantic compilation in background workers (slower, richer diagnostics)
 background_compilation_debounce_ms = 10000 # wait after edits before starting semantic compilation

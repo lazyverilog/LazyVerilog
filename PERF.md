@@ -35,10 +35,9 @@ whole design a second time.
    sized from the CPU slice the process may actually use, capped at 8, nice'd.
    See "Round 4" below.
 
-2. **Persistent on-disk shard cache (clangd-style)** — every launch reparses
-   unchanged files. Serialize `SyntaxIndex` per file keyed by
-   `(path, mtime+size, hash(defines+incdirs))`; on startup load hits, parse
-   only misses. Biggest win for repeated startups on large designs.
+2. **Persistent on-disk shard cache (clangd-style)** — ✅ **DONE (round 9)**,
+   with one correction: the key is a **content digest**, not `mtime+size`.
+   mtime is unusable on the shared filesystems this targets. See round 9.
 
 3. **Cut redundant include I/O** — partially addressed in round 4. The
    *probe* cost is gone (`setDisableProximatePaths(true)` stopped slang
@@ -1270,3 +1269,112 @@ for i in $(seq 1 25); do gdb -p $pid -batch -ex "thread apply all bt 25"; done
 
 — or a temporary `log_perf()` around the derive branch, which is what produced
 the 116 x 97 ms figure above.
+
+---
+
+# Round 9: an unchanged project stops being reparsed
+
+Rounds 5 through 8 removed work that could be shared *inside* one indexing run.
+What round 8's profiling left was work that cannot be: on a UVM design, 45% of
+start-up is 200 testbench files each re-processing `uvm_macros.svh`'s 2500
+`` `define ``s, expanding them, and walking the expansion.  Three attempts to
+cut that measured flat or worse, and the reason is the same each time —
+`include` semantics make it genuinely per-file.
+
+So the remaining lever was never "make the parse cheaper".  It was "do not do
+it again on the next launch".
+
+## What changed
+
+Per-file shards are written to `<project_root>/.cache/lazyverilog/index` and
+reloaded on the next launch.  The model is clangd's background index
+(`clang-tools-extra/clangd/index/Background.cpp`), read rather than recalled,
+and it differs from what this file previously proposed in one important way.
+
+`PERF.md` item 2 said to key on `(path, mtime+size, hash(defines+incdirs))`.
+clangd keys on a **content digest** (`FileDigest`, `shardIsStale()`), and it is
+right: on a shared filesystem mtime is the one input that cannot be trusted —
+clock skew between nodes, NFS attribute caching, and a fresh checkout or rsync
+resetting stamps produce false hits as well as false misses.  Hashing costs one
+read of a file that was about to be read anyway, and the earlier rounds
+established that parse and index dwarf I/O by an order of magnitude on this
+corpus.
+
+A shard is reused only when its own content, the defines and include
+directories, and every file it `include`d all still hash the same.  Header
+shards are cached too, because skipping a file's parse skips the only thing
+that would build them; a stale header shard therefore forces its includers to
+be parsed after all.  Anything unreadable, truncated, corrupt, or written by
+another format version is a miss — the behaviour that existed before the cache.
+
+One worker runs the preload while the others wait, ahead of the warmup gate and
+for the same reason it exists: a worker that starts parsing a file the preload
+was about to satisfy has already spent what the cache is there to save.
+
+## Measured
+
+4-core Xeon @ 2.10GHz VM, `Release`, page cache warm.  Shard and module counts
+identical in every row (487/117 and 5953/1404).
+
+| Corpus | CPUs | no cache | cold (builds it) | warm |
+|---|---|---|---|---|
+| uvmproj | 1 | 5473 ms | 5893 ms | **291–298 ms** |
+| uvmproj | all | 1446 ms | 1588 ms | **280–306 ms** |
+| opentitan | 1 | 8480 ms | 12639 ms | **1445–1464 ms** |
+| opentitan | all | 2405 ms | 2650 ms | **1415–1442 ms** |
+
+Warm `maxRSS` also falls, 158 -> 119 MB on uvmproj and 624 -> 456 MB on
+opentitan: a restored shard is the index, with no parse trees or SourceManager
+buffers alongside it.
+
+## What the cold column costs, and why it is not hidden
+
+Building the cache is real work — 32 MB of shards for uvmproj, 116 MB for
+opentitan — and it is paid once per project, plus once per config change.
+
+Writing them from the indexing worker put that between the last parse and the
+publish.  Handing them to a dedicated writer thread fixes that where there is a
+second core (opentitan, all CPUs: 4149 -> 3123 ms) and makes it *worse* where
+there is not (opentitan, one CPU: 10816 -> 12878 ms), because a one-CPU slice
+has nowhere to move the work to and only pays the context switches.  So the
+writer thread exists exactly when `available_cpu_count() > 1`, and writes go
+inline otherwise — the same rule that already sizes the worker pool.
+
+That leaves opentitan's one-CPU cold start 49% slower than uncached.  It is the
+honest price: one launch pays four seconds to save seven on every launch after
+it.  `[index].cache = false` turns the whole thing off for a project that would
+rather not make that trade, or that must not have a directory written into it.
+
+## Format
+
+Versioned (`kFormatVersion`), magic-checked, byte-order-checked, with a string
+table because an OpenTitan shard set holds 2.3M reference entries drawn from far
+fewer distinct names.  Every read is bounds-checked into a sticky failure flag:
+a shard is whatever survived the last run, so a truncated length field has to
+become a miss rather than an allocation.
+
+The entry structs are size-frozen with `static_assert`.  Adding a field to
+`ValueEntry` without updating the codec would silently drop it from every
+cached shard, and that surfaces as a symbol that resolves before a restart and
+not after — the hardest kind of bug to report.  Now it fails to compile.
+
+## Still open from earlier rounds
+
+- Incremental publishing.  There is still exactly one `ProjectIndexSnapshot`
+  publish per burst, after the queue drains, so a *cold* start has no project
+  index at all until it finishes.  clangd instead serves whatever has loaded and
+  reindexes behind it.  The cache removes this for every launch after the first;
+  it does not remove it for the first, and that is the next thing worth doing.
+- Reusing a macro header's preprocessor state across the files that include it
+  (~8% of a UVM start-up); needs slang API support.
+- Everything else unchanged from round 7.
+
+## Reproduce
+
+```bash
+cmake --build build -j$(nproc)
+rm -rf <corpus>/.cache
+tools/startup_bench.py <corpus> --cpus 0    # cold: builds the cache
+tools/startup_bench.py <corpus> --cpus 0    # warm
+./build/lazyverilog-tests "[index-cache]"
+```

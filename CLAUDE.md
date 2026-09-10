@@ -64,6 +64,16 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
   millisecond budget — that is what survives a shared CI runner.
 - Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
 
+### Index Shard Cache
+- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
+  turns it off.  Keyed on **content digests** of the file, its `include`s, and the
+  defines/incdirs — never mtime, which is unusable on a shared filesystem.
+- Adding a field to any entry in `src/syntax_index.hpp` requires updating the codec in
+  `src/index_cache.cpp` and bumping `kFormatVersion`.  A `static_assert` on each struct's
+  size makes forgetting a compile error rather than a shard that silently drops the field.
+- Benchmark both halves: `rm -rf <corpus>/.cache` then two `tools/startup_bench.py` runs.
+  Report cold and warm separately — a change can improve warm and wreck cold.
+
 ### Releasing a New Version
 ```bash
 ctest --test-dir build                          # test gate — must pass first

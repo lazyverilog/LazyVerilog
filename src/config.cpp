@@ -232,7 +232,7 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 push_type_error(value_errors, path, "table", *node.node());
         };
 
-        for (const auto* section : {"design", "compilation", "inlay_hint", "format",
+        for (const auto* section : {"design", "compilation", "index", "inlay_hint", "format",
                                     "lint", "rtltree", "autoarg", "autowire", "autoff",
                                     "autofunc"}) {
             expect_table(&tbl, section, std::string("[") + section + "]");
@@ -260,6 +260,9 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
         }
 
         // [compilation]
+        if (auto p = tbl["index"].as_table()) {
+            read_bool(p, "cache", "[index].cache", cfg.index.cache, value_errors);
+        }
         if (auto p = tbl["compilation"].as_table()) {
             read_bool(p, "background_compilation",
                       "[compilation].background_compilation",

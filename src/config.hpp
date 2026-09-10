@@ -15,6 +15,16 @@ struct CompilationConfig {
     bool log_timing{false};
 };
 
+struct IndexConfig {
+    /// Reuse per-file index shards from <project_root>/.cache/lazyverilog/index
+    /// across launches.  On by default, as clangd's background index is.
+    ///
+    /// Turning it off is the escape hatch for a project that must not have a
+    /// directory written into it, or for a design large enough that building
+    /// the cache the first time costs more than the launches it saves.
+    bool cache{true};
+};
+
 struct InlayHintConfig {
     bool enable{true};
 };
@@ -280,6 +290,7 @@ struct ConfigWarning {
 struct Config {
     DesignConfig design;
     CompilationConfig compilation;
+    IndexConfig index;
     InlayHintConfig inlay_hint;
     FormatOptions format;
     LintConfig lint;

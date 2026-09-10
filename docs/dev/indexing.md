@@ -252,6 +252,44 @@ restarts.  Only extensions in `kWatchedSourceExtensions` are cached — that arr
 is also what builds the watcher glob registration in `server.cpp`, so a path the
 client is not asked to watch is one the cache refuses to hold.
 
+## Reusing shards across launches
+
+Shards are written to `<project_root>/.cache/lazyverilog/index` and reloaded on
+the next launch, the way clangd's background index uses
+`<project_root>/.cache/clangd/index`.  `[index].cache = false` turns it off.
+
+A shard is reused only when everything it was built from still hashes the same:
+
+- the file's own contents;
+- the defines and include directories, which change what a parse of an
+  unchanged file *means*;
+- every file it pulled in through `` `include ``.
+
+The key is a **content digest, never mtime**.  On a shared or batch-scheduled
+filesystem mtime produces false hits as well as false misses — clock skew
+between nodes, attribute caching, and a fresh checkout or rsync resetting
+stamps.  Hashing costs one read of a file that was about to be read anyway.
+
+Two consequences for anyone touching the index:
+
+- **Header shards are cached too, and a stale one invalidates its includers.**
+  Skipping a file's parse skips the only thing that would have built its header
+  shards, so a hit is only usable when the headers it recorded are hits as well.
+  A header that did not stand alone was sharded from *an includer's* tree, so
+  that includer is recorded as one of its dependencies — nothing inside the
+  shard says so.
+- **Anything a shard does not store is lost across a restart.**  `SyntaxIndex`
+  fields that a build *derives* (`module_by_name`, `port_by_name`, the
+  `source_file_ids` reverse table) are rebuilt on load with the same first-wins
+  rule the build uses.  Fields that a build *decides* — the package-scoped
+  lookup maps — are stored, because a shard on its own cannot re-derive them;
+  this is the same reason `split_by_source_file()` carries them.
+
+Adding a field to any indexed entry means updating `src/index_cache.cpp` and
+bumping `kFormatVersion`.  The entry structs are size-frozen with
+`static_assert` so that this cannot be forgotten: a dropped field would
+otherwise show up as a symbol that resolves before a restart and not after.
+
 ## Published project index snapshot
 
 The published project index is shard-based.  A `ProjectIndexSnapshot` contains

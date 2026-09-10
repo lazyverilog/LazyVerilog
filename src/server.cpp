@@ -840,7 +840,7 @@ void LazyVerilogServer::register_handlers() {
                 auto vcode = load_vcode(root_, config_);
                 analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                              vcode.files, resolve_vcode_path(root_, config_),
-                                             root_.string());
+                                             index_cache_root());
                 configure_background_compiler();
                 schedule_background_compilation();
             };
@@ -983,7 +983,7 @@ void LazyVerilogServer::register_handlers() {
                 { auto vcode = load_vcode(root_, config_);
                   analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                                vcode.files, resolve_vcode_path(root_, config_),
-                                             root_.string()); }
+                                             index_cache_root()); }
                 configure_background_compiler();
                 schedule_background_compilation();
             } catch (const std::exception& e) {
@@ -1048,7 +1048,7 @@ void LazyVerilogServer::register_handlers() {
                     { auto vcode = load_vcode(root_, config_);
                       analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                                    vcode.files, resolve_vcode_path(root_, config_),
-                                             root_.string()); }
+                                             index_cache_root()); }
                     configure_background_compiler();
                 }
             }

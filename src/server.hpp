@@ -28,6 +28,12 @@ class LazyVerilogServer {
     void configure_background_compiler();
     void schedule_background_compilation();
 
+    /// Project root handed to the analyzer's shard cache, or empty when
+    /// [index].cache is off -- an empty root is what makes it run uncached.
+    std::string index_cache_root() const {
+        return config_.index.cache ? root_.string() : std::string{};
+    }
+
     std::filesystem::path root_;
     bool config_found_{false};
     std::string config_diagnostic_uri_;
