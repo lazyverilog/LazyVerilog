@@ -1,5 +1,6 @@
 #pragma once
 #include "document_state.hpp"
+#include "index_cache.hpp"
 #include "syntax_index.hpp"
 #include <atomic>
 #include <chrono>
@@ -473,10 +474,14 @@ class Analyzer {
     /// schedule multiple full-project background reindex generations for a
     /// single user-visible config change.  This batched setter clears the old
     /// project cache once and schedules at most one asynchronous reindex.
+    /// @param project_root  directory holding lazyverilog.toml.  The on-disk
+    ///        shard cache lives under it; leaving it empty runs uncached, which
+    ///        is what a server with no project root should do.
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
-                            const std::string& filelist_path = {});
+                            const std::string& filelist_path = {},
+                            const std::string& project_root = {});
 
     /// Block until all currently queued project-index work is published.
     ///
@@ -624,6 +629,17 @@ class Analyzer {
     void schedule_background_reindex_locked() const;
     void schedule_background_project_publish_locked() const;
     void background_index_loop() const;
+    /// Install every shard the on-disk cache can still vouch for and drop those
+    /// files from @p background_pending_files_.  Runs on one worker with
+    /// map_mutex_ released: it reads and hashes files.
+    void preload_cached_shards(uint64_t generation) const;
+    /// Record @p index for @p uri, keyed on what it was built from.  @p extra
+    /// names a file the shard depends on beyond its own `include`s -- the
+    /// includer a fragment header's shard was derived from, which nothing in
+    /// the shard itself records.
+    void store_shard_in_cache(const std::string& uri, const SyntaxIndex& index,
+                              const std::string& extra_dependency_uri = {},
+                              bool stands_alone = false) const;
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
     void invalidate_extra_snapshots_locked() const;
@@ -700,6 +716,39 @@ class Analyzer {
     // rebuilt before that fan-out is released.
     mutable uint64_t background_warmup_generation_{std::numeric_limits<uint64_t>::max()};
     mutable bool background_warmup_running_{false};
+    // Cache-preload gate, ahead of the warmup gate and shaped the same way.
+    //
+    // A burst first asks the on-disk cache which of its files are unchanged
+    // since the last launch, installs those shards, and drops them from the
+    // queue; only what is left is parsed.  One worker does it while the others
+    // wait, for the same reason the warmup gate exists -- a worker that starts
+    // parsing a file the preload was about to satisfy has already paid the cost
+    // the cache is there to avoid.
+    //
+    // Keyed by generation, so a config reload re-runs it: new defines or
+    // include directories change what every shard's key hashes to.
+    mutable uint64_t background_preload_generation_{std::numeric_limits<uint64_t>::max()};
+    mutable bool background_preload_running_{false};
+    /// Cache for this project, and the config digest every shard is keyed on.
+    /// Empty when no project root is known or the directory cannot be written,
+    /// which is a normal read-only-checkout condition and simply runs uncached.
+    mutable std::optional<IndexCache> index_cache_;
+    mutable IndexCache::Digest index_cache_config_digest_;
+    /// Memoized content digests for the current generation, shared by the
+    /// preload and the store path.
+    ///
+    /// Storing a shard hashes every file it `include`s, and a central header is
+    /// included by every module in the design -- hashing it per includer put
+    /// the whole O(files x header) cost back, on the one launch that has to
+    /// build the cache from nothing.  Cleared whenever the generation moves,
+    /// which is the same point at which the parse path stops trusting anything
+    /// it read earlier.
+    mutable std::mutex index_cache_digest_mutex_;
+    mutable uint64_t index_cache_digest_generation_{std::numeric_limits<uint64_t>::max()};
+    mutable std::unordered_map<std::string, std::optional<IndexCache::Digest>>
+        index_cache_digests_;
+    std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
+                                                         uint64_t generation) const;
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;

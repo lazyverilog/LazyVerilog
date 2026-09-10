@@ -5857,7 +5857,8 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
 void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
-                                  const std::string& filelist_path) {
+                                  const std::string& filelist_path,
+                                  const std::string& project_root) {
     std::vector<std::string> normalized_include_dirs;
     normalized_include_dirs.reserve(include_dirs.size());
     for (const auto& dir : include_dirs)
@@ -5888,12 +5889,241 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     for (const auto& path : extra_files_)
         extra_file_set_.insert(path);
 
+    // Opened before the burst is scheduled so the preload gate finds it ready.
+    // The digest covers defines and include directories together: both change
+    // what a parse of an unchanged file means, and a shard keyed on only one of
+    // them would be served after the other moved.
+    index_cache_config_digest_ = IndexCache::config_digest(defines_, include_dir_paths_);
+    index_cache_ = project_root.empty() ? std::nullopt : IndexCache::open(project_root);
+
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
 
     if (!extra_files_.empty())
         schedule_background_reindex_locked();
+}
+
+std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string& uri,
+                                                               uint64_t generation) const {
+    {
+        std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
+        if (index_cache_digest_generation_ != generation) {
+            index_cache_digests_.clear();
+            index_cache_digest_generation_ = generation;
+        }
+        else if (const auto it = index_cache_digests_.find(uri);
+                 it != index_cache_digests_.end()) {
+            return it->second;
+        }
+    }
+
+    // Read and hash with the memo unlocked: two workers racing on the same file
+    // both hash it once, which is cheaper than either waiting for the other.
+    auto digest = IndexCache::digest_file(path_from_file_uri(uri));
+
+    std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
+    if (index_cache_digest_generation_ == generation)
+        index_cache_digests_.insert_or_assign(uri, digest);
+    return digest;
+}
+
+void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& index,
+                                    const std::string& extra_dependency_uri,
+                                    bool stands_alone) const {
+    std::optional<IndexCache> cache;
+    IndexCache::Digest config_digest;
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (!index_cache_)
+            return;
+        cache = index_cache_;
+        config_digest = index_cache_config_digest_;
+        generation = background_generation_;
+    }
+
+    // Hashing happens outside map_mutex_ -- it reads every file this shard
+    // depends on, which is exactly the work the lock must not serialize.
+    const auto content = cached_file_digest(uri, generation);
+    if (!content)
+        return;
+
+    IndexCache::Key key;
+    key.content = *content;
+    key.config = config_digest;
+
+    auto add_dependency = [&](const std::string& dependency_uri) {
+        if (dependency_uri.empty() || dependency_uri == uri)
+            return true;
+        const auto digest = cached_file_digest(dependency_uri, generation);
+        if (!digest)
+            return false;
+        key.dependencies.emplace_back(dependency_uri, *digest);
+        return true;
+    };
+
+    // A dependency that cannot be read now would be unreadable at validation
+    // too, so the shard could never be reused.  Storing it would only cost a
+    // write and a stat on every future launch.
+    for (const auto& dependency : index.include_dependencies) {
+        if (!add_dependency(dependency))
+            return;
+    }
+    if (!add_dependency(extra_dependency_uri))
+        return;
+
+    cache->store(uri, key, index, stands_alone);
+}
+
+void Analyzer::preload_cached_shards(uint64_t generation) const {
+    std::optional<IndexCache> cache;
+    IndexCache::Digest config_digest;
+    std::vector<std::string> files;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (!index_cache_ || generation != background_generation_)
+            return;
+        cache = index_cache_;
+        config_digest = index_cache_config_digest_;
+        files.assign(background_pending_files_.begin(), background_pending_files_.end());
+    }
+
+    // One digest per file for the whole burst, shared with the store path: a
+    // header shared by hundreds of modules is hashed once, whether it is being
+    // validated on the way in or recorded on the way out.
+    const auto digest_of = [&](const std::string& uri) {
+        return cached_file_digest(uri, generation);
+    };
+
+    // A shard is usable only when everything it was built from still hashes the
+    // same.  Content, then config, then every `include`d file: an edit to any
+    // of them changes what a parse of this file produces.
+    const auto still_valid = [&](const std::string& uri, const IndexCache::Key& key) {
+        if (key.config != config_digest)
+            return false;
+        const auto content = digest_of(uri);
+        if (!content || !(*content == key.content))
+            return false;
+        for (const auto& [dependency_uri, dependency_digest] : key.dependencies) {
+            const auto current = digest_of(dependency_uri);
+            if (!current || !(*current == dependency_digest))
+                return false;
+        }
+        return true;
+    };
+
+    struct Hit {
+        std::string path;
+        std::string uri;
+        std::shared_ptr<const SyntaxIndex> index;
+        std::vector<std::tuple<std::string, std::shared_ptr<const SyntaxIndex>, bool>> headers;
+    };
+    std::vector<Hit> hits;
+    struct HeaderHit {
+        std::shared_ptr<const SyntaxIndex> index;
+        bool stands_alone{false};
+    };
+    std::unordered_map<std::string, HeaderHit> header_hits;
+    std::unordered_set<std::string> header_misses;
+
+    for (const auto& path : files) {
+        const auto uri = uri_from_path(path);
+        auto loaded = cache->load(uri);
+        if (!loaded || !still_valid(uri, loaded->key))
+            continue;
+
+        // A file's shard is only usable together with shards for the headers it
+        // pulled in: skipping its parse skips the only thing that would have
+        // built them.  If any header shard is missing or stale, this file has to
+        // be parsed after all -- that parse is what produces them.
+        Hit hit{.path = path, .uri = uri};
+        bool headers_ok = true;
+        for (const auto& dependency : loaded->index.include_dependencies) {
+            if (header_misses.count(dependency)) {
+                headers_ok = false;
+                break;
+            }
+            if (const auto known = header_hits.find(dependency); known != header_hits.end()) {
+                hit.headers.emplace_back(dependency, known->second.index,
+                                         known->second.stands_alone);
+                continue;
+            }
+            auto header = cache->load(dependency);
+            if (!header || !still_valid(dependency, header->key)) {
+                header_misses.insert(dependency);
+                headers_ok = false;
+                break;
+            }
+            HeaderHit header_hit{std::make_shared<const SyntaxIndex>(std::move(header->index)),
+                                 header->stands_alone};
+            header_hits.emplace(dependency, header_hit);
+            hit.headers.emplace_back(dependency, header_hit.index, header_hit.stands_alone);
+        }
+        if (!headers_ok)
+            continue;
+
+        hit.index = std::make_shared<const SyntaxIndex>(std::move(loaded->index));
+        hits.push_back(std::move(hit));
+    }
+
+    if (hits.empty())
+        return;
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    if (generation != background_generation_)
+        return;
+
+    size_t installed = 0;
+    for (auto& hit : hits) {
+        // An open buffer is newer than anything on disk, exactly as in the
+        // parse path: never let a cached shard replace one.
+        if (const auto doc = docs_.find(hit.uri); doc != docs_.end() && doc->second)
+            continue;
+        extra_cache_[hit.uri] = ExtraFileCacheEntry{
+            .path = hit.path,
+            .uri = hit.uri,
+            .index = hit.index,
+        };
+        for (auto& [header_uri, header_index, stands_alone] : hit.headers) {
+            // Claimed as well as committed.  The claim is what stops a worker
+            // that parses some other includer from rebuilding a header this
+            // pass already has.
+            if (!background_header_claims_.insert(header_uri).second)
+                continue;
+            // Restored too: it is what lets an open buffer be served this
+            // header's directives alone instead of re-reading it per keystroke.
+            if (stands_alone)
+                standalone_header_uris_.insert(header_uri);
+            background_header_shards_[header_uri] = ExtraFileCacheEntry{
+                .path = path_from_file_uri(header_uri),
+                .uri = header_uri,
+                .index = header_index,
+            };
+        }
+        background_pending_set_.erase(hit.path);
+        ++installed;
+    }
+
+    if (installed == 0)
+        return;
+
+    // Rebuild the queue from what is left rather than erasing from the middle
+    // of a deque once per hit.
+    std::deque<std::string> remaining;
+    for (auto& path : background_pending_files_) {
+        if (background_pending_set_.count(path))
+            remaining.push_back(std::move(path));
+    }
+    background_pending_files_ = std::move(remaining);
+    invalidate_extra_snapshots_locked();
+
+    // The publish is otherwise requested only when a worker finishes parsing a
+    // file, and a project that is entirely unchanged has no such worker: every
+    // file was installed from disk.  Without this, a fully cached start-up
+    // produces no ProjectIndexSnapshot at all -- shards loaded, and nothing
+    // able to see them.
+    schedule_background_project_publish_locked();
 }
 
 void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& changed_uris,
@@ -6689,6 +6919,31 @@ void Analyzer::background_index_loop() const {
             // pays one file's parse of lost parallelism and no more.  On a
             // single-worker slice -- the HPC target -- there is nothing to gate
             // and the wait is never entered.
+            // Cache-preload gate.  One worker asks the on-disk cache which
+            // files are unchanged and installs their shards; the rest wait,
+            // because a worker that starts parsing a file the preload was about
+            // to satisfy has already spent what the cache exists to save.
+            if (index_cache_ && background_preload_generation_ != background_generation_) {
+                if (background_preload_running_) {
+                    background_cv_.wait(lock, [&] {
+                        return background_stop_.load() || !background_preload_running_ ||
+                               background_preload_generation_ == background_generation_;
+                    });
+                    continue;
+                }
+                background_preload_running_ = true;
+                const auto preload_generation = background_generation_;
+                lock.unlock();
+                preload_cached_shards(preload_generation);
+                lock.lock();
+                background_preload_running_ = false;
+                background_preload_generation_ = preload_generation;
+                background_cv_.notify_all();
+                // Back to the top: the preload may have emptied the queue
+                // outright, which is the whole point on an unchanged project.
+                continue;
+            }
+
             if (background_warmup_generation_ != background_generation_) {
                 if (background_warmup_running_) {
                     background_cv_.wait(lock, [&] {
@@ -6839,6 +7094,12 @@ void Analyzer::background_index_loop() const {
         auto committed_index = std::make_shared<SyntaxIndex>(std::move(state->index));
 
         std::vector<std::string> headers_to_build;
+        // Shards to write to the on-disk cache once map_mutex_ is released:
+        // storing hashes every file the shard depends on, which must not happen
+        // under the lock every request handler contends for.
+        std::shared_ptr<const SyntaxIndex> shard_to_cache;
+        std::vector<std::tuple<std::string, std::shared_ptr<const SyntaxIndex>, bool>>
+            headers_to_cache;
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
@@ -6860,9 +7121,10 @@ void Analyzer::background_index_loop() const {
                 extra_cache_[uri] = ExtraFileCacheEntry{
                     .path = path_string,
                     .uri = uri,
-                    .index = std::move(committed_index),
+                    .index = committed_index,
                 };
                 invalidate_extra_snapshots_locked();
+                shard_to_cache = std::move(committed_index);
             }
 
             // Claim the headers this parse pulled in.  Claiming inside the same
@@ -6895,6 +7157,7 @@ void Analyzer::background_index_loop() const {
                 for (auto& header : built_headers) {
                     if (header.stands_alone)
                         standalone_header_uris_.insert(header.uri);
+                    headers_to_cache.emplace_back(header.uri, header.index, header.stands_alone);
                     background_header_shards_[header.uri] = ExtraFileCacheEntry{
                         .path = path_from_file_uri(header.uri),
                         .uri = header.uri,
@@ -6918,6 +7181,21 @@ void Analyzer::background_index_loop() const {
             if (background_pending_files_.empty() && background_index_active_ == 0)
                 schedule_background_project_publish_locked();
             background_cv_.notify_all();
+        }
+
+        // Outside the lock, and after this file is already committed: a cache
+        // write is an optimization for the *next* launch and must never be on
+        // the path that makes this one usable.
+        if (shard_to_cache)
+            store_shard_in_cache(uri, *shard_to_cache);
+        for (const auto& [header_uri, header_index, stands_alone] : headers_to_cache) {
+            if (!header_index)
+                continue;
+            // A header that did not stand alone was sharded from this file's
+            // tree, so its shard is only valid while that file is unchanged --
+            // nothing inside the shard records that, so it is passed in.
+            store_shard_in_cache(header_uri, *header_index, stands_alone ? std::string{} : uri,
+                                 stands_alone);
         }
     }
 }

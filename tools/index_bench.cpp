@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
         analyzer.set_project_index_publish_debounce_ms(0);
         const auto start = std::chrono::steady_clock::now();
         analyzer.set_project_config(config.design.define, vcode.include_dirs, vcode.files,
-                                    resolve_vcode_path(root, config));
+                                    resolve_vcode_path(root, config), root.string());
         analyzer.wait_for_background_index_idle();
         const auto snapshot = analyzer.project_index_snapshot();
         const double ms =
