@@ -24,7 +24,7 @@ namespace {
 // the bottom of this file exist so that adding a field to one of them fails to
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
-constexpr uint32_t kFormatVersion = 4;
+constexpr uint32_t kFormatVersion = 6;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is
@@ -613,6 +613,7 @@ void write_reference(Writer& w, const ReferenceEntry& e) {
     w.i32(e.line);
     w.i32(e.col);
     w.i32(e.end_col);
+    w.u8(static_cast<uint8_t>(e.form));
 }
 
 ReferenceEntry read_reference(Reader& r) {
@@ -625,6 +626,7 @@ ReferenceEntry read_reference(Reader& r) {
     e.line = r.i32();
     e.col = r.i32();
     e.end_col = r.i32();
+    e.form = static_cast<RefForm>(r.u8());
     return e;
 }
 
@@ -697,6 +699,10 @@ static_assert(sizeof(TypedefEntry) == 160, "TypedefEntry changed: update codec +
 static_assert(sizeof(MacroEntry) == 72, "MacroEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ValueEntry) == 248, "ValueEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ImportEntry) == 120, "ImportEntry changed: update codec + kFormatVersion");
+// ReferenceEntry::form fits in the padding that already followed end_col, so
+// this guard does NOT fire for it -- a field added into existing padding leaves
+// sizeof() unchanged.  The codec and kFormatVersion still had to be updated by
+// hand; the assert catches a layout change, not every field change.
 static_assert(sizeof(ReferenceEntry) == 104, "ReferenceEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(SyntaxIndex) == 800, "SyntaxIndex changed: update codec + kFormatVersion");
 #endif

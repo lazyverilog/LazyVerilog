@@ -1,4 +1,5 @@
 #include "signature_help.hpp"
+#include "../lsp_position.hpp"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -277,8 +278,8 @@ static std::optional<SubroutineInfo> subroutine_at_declaration(const SyntaxTree&
             const auto loc = token.location();
             if (!loc.valid())
                 return false;
-            return (int)sm.getLineNumber(loc) - 1 == line &&
-                   (int)sm.getColumnNumber(loc) - 1 == col;
+            // `col` came from the request, so it is a UTF-16 column.
+            return (int)sm.getLineNumber(loc) - 1 == line && utf16_column(sm, loc) == col;
         }
 
         void handle(const FunctionDeclarationSyntax& node) {

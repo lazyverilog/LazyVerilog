@@ -1,4 +1,5 @@
 #include "background_compiler.hpp"
+#include "lsp_position.hpp"
 #include "cpu_budget.hpp"
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
@@ -54,9 +55,8 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
         uri = diagnostic_uri(sm, fallback_uri, loc);
         if (loc.valid() && sm.isFileLoc(loc)) {
             const size_t line = sm.getLineNumber(loc);
-            const size_t col = sm.getColumnNumber(loc);
             info.line = line > 0 ? static_cast<int>(line) - 1 : 0;
-            info.col = col > 0 ? static_cast<int>(col) - 1 : 0;
+            info.col = utf16_column(sm, loc);
         }
     } catch (...) {
         uri = fallback_uri;
