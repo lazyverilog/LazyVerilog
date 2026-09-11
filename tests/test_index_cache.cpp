@@ -1063,11 +1063,23 @@ TEST_CASE("index cache: shards from a previous format version are collected", "[
 
     // A shard that is ours -- same magic -- from a version this build does not
     // know.  Byte four of the header is the version.
+    //
+    // The shard is found by extension, not by taking the directory's first
+    // entry: the cache writes a .gitignore beside the shards and iteration
+    // order is whatever the filesystem says, so "first" was the .gitignore on
+    // CI and the shard here.  Copying the wrong file produced something with no
+    // magic at all, which the sweep then correctly left alone.
     const auto directory = IndexCache::directory_for(project.root());
+    std::filesystem::path source;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() == ".idx")
+            source = entry.path();
+    }
+    REQUIRE(!source.empty());
+
     const auto stale = directory / "ghost.sv.0123456789abcdef0123456789abcdef.idx";
     {
-        std::ifstream in((*std::filesystem::directory_iterator(directory)).path(),
-                         std::ios::binary);
+        std::ifstream in(source, std::ios::binary);
         std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         REQUIRE(bytes.size() > 12);
         bytes[4] = static_cast<char>(0xfe);  // a version number nothing wrote
