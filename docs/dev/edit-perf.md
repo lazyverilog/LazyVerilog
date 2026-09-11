@@ -44,12 +44,13 @@ is the server's fault and a fast one points at the editor or the transport.
 Three things this does **not** measure, which matter just as much:
 
 * **Reply size.**  The client decodes the JSON on its main loop.  A 13k-line RTL
-  file produces ~3800 folding ranges and ~364 KiB, which costs Neovim ~28 ms per
-  keystroke on top of whatever the server spent.
+  file produces ~3800 folding ranges and 327 KiB on the wire.  Measure this rather
+  than assume it: on that payload Neovim spends ~4 ms in `vim.json.decode` and ~2 ms
+  in the fold handler's walk, which is small next to the request it arrived on.
 * **What the client does with the reply.**  Neovim's
   `vim.lsp._folding_range.State:evaluate()` walks `for row = startLine, endLine`
   for *every* range it is handed, so the client-side cost tracks the sum of the
-  range spans, not the range count.
+  range spans, not the range count.  The 3803 ranges above cover 42684 rows.
 * **Whether the reply was right.**  An empty reply is the fastest possible one.
 
 That last point is the trap.  Benchmark an edit loop against a server that

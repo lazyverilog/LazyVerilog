@@ -77,10 +77,12 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   null.  A handler that gives up there answers *every* editor request with
   nothing — which is both wrong and the fastest possible benchmark result.  Serve
   the previous answer (`FoldingRangeCache`) or one derived from the text alone.
-- The bench measures round trips only.  Reply **size** is a real per-keystroke cost
-  the client pays on its main loop (~364 KiB / ~28 ms for a 13k-line file), and
-  Neovim's fold handler walks every row of every range it is handed, so client cost
-  tracks the **sum of range spans**, not the range count.
+- The bench measures round trips only.  The client also pays for the reply on its
+  main loop, and Neovim's fold handler walks every row of every range it is handed,
+  so that cost tracks the **sum of range spans**, not the range count.  Measured for
+  a 13k-line file (3803 ranges, 327 KiB on the wire, 42684 rows covered): ~4 ms to
+  `vim.json.decode` and ~2 ms to walk.  Small next to the request itself — do not
+  reach for a smaller payload before measuring that it is what hurts.
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
