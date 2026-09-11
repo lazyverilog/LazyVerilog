@@ -108,7 +108,9 @@ def summarize_trace(stderr: str, top: int = 10) -> list[tuple[str, float]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Benchmark cold project-index startup.",
+        description="Benchmark project-index startup.  Measures a cold start by "
+                    "default, clearing the on-disk shard cache before each run; "
+                    "--warm keeps it, --no-cache turns it off.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("project", nargs="?", default=str(DEFAULT_PROJECT),
@@ -125,6 +127,15 @@ def main() -> int:
                         help="collect per-file timings and print the slowest files. "
                              "Combine with --cpus 0: pool workers share an unsynchronized "
                              "stderr, so a parallel run splices and loses trace lines.")
+    parser.add_argument("--warm", action="store_true",
+                        help="keep the on-disk shard cache between runs, measuring a warm "
+                             "start.  The default clears it before each run, which is what "
+                             "makes repeated runs comparable: leaving it makes run 1 cold "
+                             "and every run after it warm, and reports the median of the "
+                             "mixture.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="run with the shard cache disabled entirely, measuring the "
+                             "parse with nothing written or read.  Overrides [index].cache.")
     parser.add_argument("--label", default="", help="tag printed with the results")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args()
@@ -136,7 +147,12 @@ def main() -> int:
     if not (project / "lazyverilog.toml").is_file():
         raise SystemExit(f"{project}/lazyverilog.toml not found")
 
+    if args.warm and args.no_cache:
+        raise SystemExit("--warm and --no-cache ask for opposite things")
+
     cmd = [str(binary), str(project), "1"]
+    if args.no_cache:
+        cmd += ["--cache", "off"]
     if args.cpus:
         if not shutil.which("taskset"):
             raise SystemExit("--cpus needs taskset (Linux only)")
@@ -148,7 +164,27 @@ def main() -> int:
     # Worker count comes from the CPU slice, so leave scheduler variables alone
     # and let --cpus be the single knob that changes it.
 
-    runs = [run_once(cmd, env) for _ in range(args.repeat)]
+    # index-bench reads and writes <project>/.cache/lazyverilog/index, and it
+    # survives the process.  So "3 runs" is one cold start and two warm ones
+    # unless something clears it, and the median of that mixture is a warm
+    # number wearing a cold label.
+    shard_cache = project / ".cache" / "lazyverilog" / "index"
+
+    def clear_shard_cache() -> None:
+        shutil.rmtree(shard_cache, ignore_errors=True)
+
+    runs = []
+    for _ in range(args.repeat):
+        if not args.warm and not args.no_cache:
+            clear_shard_cache()
+        runs.append(run_once(cmd, env))
+
+    if args.warm:
+        mode = "warm"
+    elif args.no_cache:
+        mode = "uncached"
+    else:
+        mode = "cold"
 
     shard_counts = {run["shards"] for run in runs}
     if len(shard_counts) > 1:
@@ -159,6 +195,7 @@ def main() -> int:
         "project": str(project),
         "cpus": args.cpus or "all",
         "repeat": args.repeat,
+        "mode": mode,
         "shards": runs[0]["shards"],
         "modules": runs[0]["modules"],
         "index_ms_median": statistics.median(r["index_ms"] for r in runs),
@@ -175,7 +212,7 @@ def main() -> int:
         head = f"startup: {project.name}"
         if args.label:
             head += f" [{args.label}]"
-        print(f"{head}  cpus={result['cpus']}  runs={args.repeat}")
+        print(f"{head}  cpus={result['cpus']}  runs={args.repeat}  {mode}")
         print(f"  shards={result['shards']} modules={result['modules']}")
         print(f"  index   {result['index_ms_median']:8.1f} ms median "
               f"({result['index_ms_min']:.1f}–{result['index_ms_max']:.1f})")
