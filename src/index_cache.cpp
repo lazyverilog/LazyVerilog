@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -667,6 +668,22 @@ std::string read_whole_file(const fs::path& path) {
 // resolves before a restart and not after.  Freeze the sizes: a change here is
 // a compile error that points at this file, and the fix is to serialize the new
 // field and bump kFormatVersion.
+//
+// The numbers are libstdc++ on a 64-bit target, and only that.  std::string,
+// std::vector and std::unordered_map are all laid out differently by libc++ and
+// by MSVC's STL -- ImportEntry is 96 bytes under libc++ against 120 here, and
+// SyntaxIndex 640 against 800 -- so a single number cannot hold everywhere this
+// ships.  Asserting one unconditionally did not catch a dropped field on macOS
+// or Windows; it stopped those builds from compiling at all, from the commit
+// that introduced the cache onwards.
+//
+// Restricting the guard costs nothing it was doing.  Its job is to make adding
+// a field to an indexed entry a compile error until someone has decided whether
+// it is serialized, and whoever adds one builds on a target that checks it --
+// as does CI, on four of its seven jobs.
+#if defined(__GLIBCXX__) && !defined(_WIN32)
+static_assert(sizeof(void*) == 8, "the entry sizes below are 64-bit libstdc++");
+
 static_assert(sizeof(PortEntry) == 208, "PortEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ModportEntry) == 48, "ModportEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ModuleEntry) == 168, "ModuleEntry changed: update codec + kFormatVersion");
@@ -682,6 +699,7 @@ static_assert(sizeof(ValueEntry) == 248, "ValueEntry changed: update codec + kFo
 static_assert(sizeof(ImportEntry) == 120, "ImportEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ReferenceEntry) == 104, "ReferenceEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(SyntaxIndex) == 800, "SyntaxIndex changed: update codec + kFormatVersion");
+#endif
 
 } // namespace
 
