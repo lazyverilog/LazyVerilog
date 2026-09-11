@@ -808,6 +808,9 @@ class Analyzer {
         std::string extra_dependency_uri;
         bool stands_alone{false};
         uint64_t generation{0};
+        /// Files the preload knows are on disk, for prune_only entries: their
+        /// shards are skipped by name instead of opened to read one back.
+        std::unordered_set<std::string> live_uris;
     };
     void queue_shard_write(PendingShardWrite write) const;
     void index_cache_writer_loop() const;
@@ -830,7 +833,8 @@ class Analyzer {
     /// "drained" cannot be observed in between.
     mutable size_t index_cache_writes_reserved_{0};
     void reserve_shard_writes(size_t count) const;
-    void prune_cache_once_per_generation(uint64_t generation) const;
+    void prune_cache_once_per_generation(uint64_t generation,
+                                         const std::unordered_set<std::string>& live_uris) const;
     /// Generation whose shards have been swept for sources that no longer
     /// exist, so it happens once per burst rather than once per write.
     mutable uint64_t index_cache_pruned_generation_{std::numeric_limits<uint64_t>::max()};

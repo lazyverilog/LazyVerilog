@@ -781,7 +781,13 @@ std::optional<IndexCache::Loaded> IndexCache::load(std::string_view uri) const {
     return deserialize_index_shard(bytes);
 }
 
-size_t IndexCache::prune_missing_sources() const {
+size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& live_uris) const {
+    // By shard name, so the check below is a lookup rather than a read.
+    std::unordered_set<std::string> live_names;
+    live_names.reserve(live_uris.size());
+    for (const auto& uri : live_uris)
+        live_names.insert(shard_path(uri).filename().string());
+
     // Header only: magic, version, byte order, then the length-prefixed URI.
     // Enough for any path a filesystem will hand back, and a short read simply
     // leaves the shard alone.
@@ -793,6 +799,8 @@ size_t IndexCache::prune_missing_sources() const {
         if (ec)
             break;
         if (entry.path().extension() != ".idx")
+            continue;
+        if (live_names.contains(entry.path().filename().string()))
             continue;
 
         std::string head(kHeaderBytes, '\0');

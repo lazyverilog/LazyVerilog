@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 /// On-disk cache of per-file `SyntaxIndex` shards.
@@ -128,16 +129,23 @@ public:
     void store(std::string_view uri, const Key& key, const SyntaxIndex& index,
                bool stands_alone = false) const;
 
-    /// Delete every shard whose source file no longer exists.
+    /// Delete every shard whose source file no longer exists, and every shard
+    /// this build's format cannot read.
     ///
     /// Shards are named from the file's URI, so an edit rewrites one in place
     /// and the directory only grows when a file is deleted or renamed.  Nothing
     /// else is removed: a file that is merely out of the project today is
-    /// legitimately reusable when it comes back, and a shard costs one stat to
-    /// skip.  Returns how many it removed.
+    /// legitimately reusable when it comes back.  Returns how many it removed.
     ///
-    /// Reads only each shard's header, not its body.
-    size_t prune_missing_sources() const;
+    /// @param live_uris  files the caller already knows are there -- the
+    ///        project's own list and the headers it validated.  Their shards
+    ///        are skipped by name, which on an unchanged project is every one
+    ///        of them: without it the sweep opens all of them to read back a
+    ///        URI it was in a position to derive.  Passing a URI that is *not*
+    ///        live only keeps a shard that could have gone.
+    ///
+    /// Reads only the header of the shards it does look at, not the body.
+    size_t prune_missing_sources(const std::unordered_set<std::string>& live_uris = {}) const;
 
     const std::filesystem::path& directory() const { return directory_; }
 

@@ -98,7 +98,21 @@ struct DocumentState {
     //
     // Stored as a plain pair so document_state.hpp stays independent of
     // index_cache.hpp; IndexCache::Digest is the same two words.
+    //
+    // Only for bytes that are *not* the file as slang read it -- today, a header
+    // served from the burst's directives-only projection, whose real digest the
+    // text cache carries.  Everything slang read itself is left as text in
+    // parsed_texts below and hashed at most once per file per generation.
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> parsed_digests;
+    // Bytes slang read, by file:// URI, pointing into this state's
+    // SourceManager -- so they stay valid as long as the state does.
+    //
+    // Deliberately not hashed here.  A shared header is read by one parse and
+    // then reached by every other file in the burst; hashing at the parse would
+    // put the whole O(files x header) term back, which is the cost the digest
+    // memo exists to remove.  Analyzer::remember_parsed_digests() hashes only
+    // what its memo does not already hold.
+    std::unordered_map<std::string, std::string_view> parsed_texts;
     // Derived syntax index built once per immutable document snapshot.
     SyntaxIndex index;
     // Lazy structural index cache — populated on first call to get_structural_index().

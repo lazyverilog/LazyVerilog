@@ -347,10 +347,8 @@ resolutions_written_in(const std::vector<IncludeResolution>& all, const std::str
 static void record_parsed_digests(
     DocumentState& state, std::string_view own_source,
     const std::unordered_map<std::string, IndexCache::Digest>& seeded) {
-    const auto pair_of = [](const IndexCache::Digest& d) { return std::make_pair(d.lo, d.hi); };
     if (!own_source.empty())
-        state.parsed_digests.emplace(state.uri,
-                                     pair_of(IndexCache::digest_source_buffer(own_source)));
+        state.parsed_texts.emplace(state.uri, own_source);
     if (!state.source_manager)
         return;
     for (const auto buffer : state.source_manager->getAllBuffers()) {
@@ -362,15 +360,15 @@ static void record_parsed_digests(
             continue;
         // A seeded header's digest is the one the cache carries for it, taken
         // when it was read in full; hashing the buffer would hash the
-        // projection.  Everything else slang read itself.
+        // projection instead.  Everything else slang read itself, and is left
+        // as text for the memo to hash at most once.
         if (const auto it = seeded.find(full_path.string()); it != seeded.end()) {
-            state.parsed_digests.emplace(std::move(dependency_uri), pair_of(it->second));
+            state.parsed_digests.emplace(std::move(dependency_uri),
+                                         std::make_pair(it->second.lo, it->second.hi));
             continue;
         }
-        state.parsed_digests.emplace(
-            std::move(dependency_uri),
-            pair_of(IndexCache::digest_source_buffer(
-                state.source_manager->getSourceText(buffer))));
+        state.parsed_texts.emplace(std::move(dependency_uri),
+                                   state.source_manager->getSourceText(buffer));
     }
 }
 
@@ -735,6 +733,17 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
         if (parsed_digest_sink && header_state) {
             for (const auto& [digest_uri, digest] : header_state->parsed_digests)
                 parsed_digest_sink->parsed_digests.try_emplace(digest_uri, digest);
+            // The text points into header_state's SourceManager, which this
+            // shard's DocumentState does not own -- so it is hashed now, while
+            // that manager is still alive, rather than carried as a view.
+            for (const auto& [text_uri, text] : header_state->parsed_texts) {
+                if (parsed_digest_sink->parsed_digests.contains(text_uri))
+                    continue;
+                const auto digest = IndexCache::digest_source_buffer(text);
+                parsed_digest_sink->parsed_digests.try_emplace(text_uri,
+                                                               std::make_pair(digest.lo,
+                                                                              digest.hi));
+            }
         }
         const bool stands_alone =
             header_state && header_state->tree &&
@@ -6068,7 +6077,8 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
         schedule_background_reindex_locked();
 }
 
-void Analyzer::prune_cache_once_per_generation(uint64_t generation) const {
+void Analyzer::prune_cache_once_per_generation(
+    uint64_t generation, const std::unordered_set<std::string>& live_uris) const {
     std::optional<IndexCache> cache;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
@@ -6081,7 +6091,7 @@ void Analyzer::prune_cache_once_per_generation(uint64_t generation) const {
     // On the writer thread, which already runs at the lowest priority this
     // process asks for, and after a shard has been written -- so it never sits
     // between a parse and the launch that wants it.  One stat per shard.
-    cache->prune_missing_sources();
+    cache->prune_missing_sources(live_uris);
 }
 
 void Analyzer::reserve_shard_writes(size_t count) const {
@@ -6117,7 +6127,7 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
                                  write.extra_dependency_uri, write.stands_alone);
         }
         if (write.prune_only)
-            prune_cache_once_per_generation(write.generation);
+            prune_cache_once_per_generation(write.generation, write.live_uris);
         release_reservation();
         return;
     }
@@ -6175,7 +6185,7 @@ void Analyzer::index_cache_writer_loop() const {
             store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
                                  write.extra_dependency_uri, write.stands_alone);
         if (write.prune_only)
-            prune_cache_once_per_generation(write.generation);
+            prune_cache_once_per_generation(write.generation, write.live_uris);
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
@@ -6217,7 +6227,7 @@ std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string
 }
 
 void Analyzer::remember_parsed_digests(const DocumentState& state, uint64_t generation) const {
-    if (state.parsed_digests.empty())
+    if (state.parsed_digests.empty() && state.parsed_texts.empty())
         return;
     std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
     if (index_cache_digest_generation_ != generation) {
@@ -6227,10 +6237,19 @@ void Analyzer::remember_parsed_digests(const DocumentState& state, uint64_t gene
     }
     // First parse of a file wins.  Every parse in a burst reads the same bytes
     // -- that is what the header projection guarantees -- so a later one has
-    // nothing to add, and keeping the first keeps this O(distinct files).
+    // nothing to add.
     for (const auto& [uri, digest] : state.parsed_digests)
         index_cache_parsed_digests_.try_emplace(uri, IndexCache::Digest{digest.first,
                                                                         digest.second});
+    // Hashed here rather than at the parse, and only when the memo does not
+    // already hold the file.  A header every module includes is read once and
+    // reached by every parse after it; hashing per parse is the O(files x
+    // header) term this memo exists to remove.
+    for (const auto& [uri, text] : state.parsed_texts) {
+        if (index_cache_parsed_digests_.contains(uri))
+            continue;
+        index_cache_parsed_digests_.emplace(uri, IndexCache::digest_source_buffer(text));
+    }
 }
 
 std::optional<IndexCache::Digest> Analyzer::parsed_file_digest(const std::string& uri,
@@ -6330,51 +6349,61 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     // parse path configures none, so it resolves to nothing; everything else
     // tries the including file's own directory and then the configured include
     // directories in order.
-    struct SearchKey {
-        std::string from_directory;
-        std::string spelling;
-        bool is_system;
-        bool operator==(const SearchKey&) const = default;
+    const auto resolved_uri_if_file = [](const std::filesystem::path& candidate) {
+        std::error_code ec;
+        return std::filesystem::is_regular_file(candidate, ec) ? uri_from_path(candidate)
+                                                               : std::string{};
     };
-    struct SearchKeyHash {
-        size_t operator()(const SearchKey& k) const {
-            const auto a = std::hash<std::string>{}(k.from_directory);
-            const auto b = std::hash<std::string>{}(k.spelling);
-            return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2)) ^ (k.is_system ? 1 : 0);
-        }
-    };
-    std::unordered_map<SearchKey, std::string, SearchKeyHash> resolution_memo;
 
-    const auto resolve_include = [&](const IncludeResolution& recorded) {
+    // Two memos, not one.  The include directories are searched identically for
+    // every file, so their answer depends only on the spelling -- folding them
+    // into a key that also carries the including directory recomputes the whole
+    // ordered walk once per directory that spells the same header.  On a design
+    // with a few dozen include directories that is the dominant cost of the
+    // check.  Split, it is one stat per (directory, spelling) plus one walk per
+    // distinct spelling.
+    std::unordered_map<std::string, std::string> incdir_resolution;
+    std::unordered_map<std::string, std::string> local_resolution;
+
+    const auto resolve_include = [&](const IncludeResolution& recorded) -> std::string {
+        const std::filesystem::path spelling(recorded.spelling);
+        if (spelling.is_absolute())
+            return resolved_uri_if_file(spelling);
+        // System includes search system directories only, and the parse path
+        // configures none, so they resolve to nothing.
+        if (recorded.is_system)
+            return {};
+
+        // The including file's own directory comes first.
         const auto from_directory =
             std::filesystem::path(path_from_file_uri(recorded.from_uri)).parent_path().string();
-        SearchKey search{from_directory, recorded.spelling, recorded.is_system};
-        if (const auto it = resolution_memo.find(search); it != resolution_memo.end())
+        if (!from_directory.empty()) {
+            auto local_key = from_directory;
+            local_key += '\n';
+            local_key += recorded.spelling;
+            const auto it = local_resolution.find(local_key);
+            const auto& local =
+                it != local_resolution.end()
+                    ? it->second
+                    : local_resolution
+                          .emplace(std::move(local_key),
+                                   resolved_uri_if_file(std::filesystem::path(from_directory) /
+                                                        spelling))
+                          .first->second;
+            if (!local.empty())
+                return local;
+        }
+
+        if (const auto it = incdir_resolution.find(recorded.spelling);
+            it != incdir_resolution.end())
             return it->second;
-
         std::string resolved;
-        const auto accept = [&](const std::filesystem::path& candidate) {
-            std::error_code ec;
-            if (!std::filesystem::is_regular_file(candidate, ec))
-                return false;
-            resolved = uri_from_path(candidate);
-            return true;
-        };
-
-        const std::filesystem::path spelling(recorded.spelling);
-        if (spelling.is_absolute()) {
-            accept(spelling);
+        for (const auto& directory : include_dirs) {
+            resolved = resolved_uri_if_file(directory / spelling);
+            if (!resolved.empty())
+                break;
         }
-        else if (!recorded.is_system) {
-            bool found = !from_directory.empty() &&
-                         accept(std::filesystem::path(from_directory) / spelling);
-            for (const auto& directory : include_dirs) {
-                if (found)
-                    break;
-                found = accept(directory / spelling);
-            }
-        }
-        resolution_memo.emplace(std::move(search), resolved);
+        incdir_resolution.emplace(recorded.spelling, resolved);
         return resolved;
     };
 
@@ -6459,8 +6488,23 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     // Queued whatever the preload found.  The sweep has to happen on the launch
     // that reuses everything just as much as on one that rebuilds, and that
     // launch writes no shards for it to hang off.
+    //
+    // Everything above was just proved to be on disk, so the sweep is told and
+    // skips those shards by name.  On an unchanged project that is all of them,
+    // which turns a read of every shard in the directory into a set lookup --
+    // the difference is most of a warm start on a one-CPU slice, where the
+    // sweep has no second core to run on.
+    std::unordered_set<std::string> live_uris;
+    live_uris.reserve(files.size() + header_hits.size());
+    for (const auto& path : files)
+        live_uris.insert(uri_from_path(path));
+    for (const auto& [header_uri, header_hit] : header_hits)
+        live_uris.insert(header_uri);
+
     reserve_shard_writes(1);
-    queue_shard_write(PendingShardWrite{.prune_only = true, .generation = generation});
+    queue_shard_write(PendingShardWrite{.prune_only = true,
+                                        .generation = generation,
+                                        .live_uris = std::move(live_uris)});
 
     if (hits.empty())
         return;
