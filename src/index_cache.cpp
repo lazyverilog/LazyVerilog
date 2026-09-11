@@ -760,12 +760,28 @@ void IndexCache::store(std::string_view uri, const Key& key, const SyntaxIndex& 
 
     // Unique temporary name, then rename.  Workers write shards concurrently
     // and a reader may be another process entirely; rename is what makes a
-    // shard appear whole or not at all.  The pid/counter pair keeps two
-    // processes indexing the same project from clobbering each other's
-    // temporary.
+    // shard appear whole or not at all.
+    //
+    // The name has to be unique across *processes*, not just across this
+    // process's workers: two servers on one project (two editors, or an editor
+    // and a second window) index it at the same time, and a counter that starts
+    // at zero in every process gives them both the same temporary.  Both then
+    // open it with trunc and write into one inode, and whichever renames first
+    // publishes the interleaving.  A torn shard that still parses is the worst
+    // outcome this cache has -- it passes the magic, the version, the string
+    // table and every bounds check, and is served as a real index -- so the
+    // salt is drawn once per process and mixed into every name.
+    static const uint64_t process_salt = [] {
+        std::random_device rd;
+        return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    }();
     static std::atomic<uint64_t> counter{0};
+    std::array<char, 33> suffix{};
+    std::snprintf(suffix.data(), suffix.size(), "%016llx%016llx",
+                  static_cast<unsigned long long>(process_salt),
+                  static_cast<unsigned long long>(counter.fetch_add(1, std::memory_order_relaxed)));
     auto temp_path = final_path;
-    temp_path += "." + std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
+    temp_path += "." + std::string(suffix.data()) + ".tmp";
 
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
