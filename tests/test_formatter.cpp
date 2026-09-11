@@ -4743,3 +4743,117 @@ TEST_CASE("formatter: a parenthesis that only looks like an attribute is left al
                                       "assign y = (a * b) * (c * d);\n"
                                       "endmodule\n");
 }
+
+TEST_CASE("formatter: a set-membership brace is an expression, not a block",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `{` is overloaded: it opens a constraint body, but it also opens a
+    // concatenation, a set-membership list, an assignment pattern and a
+    // streaming expression.  Only the first is a block, so only the first may
+    // push its closing brace onto its own line.
+    const std::string src = "class my_txn;\n"
+                            "rand bit [7:0] data;\n"
+                            "rand bit [3:0] len;\n"
+                            "constraint c_len { len inside {[1:8]}; data != 8'hFF; }\n"
+                            "endclass\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("len inside {[1:8]};") != std::string::npos);
+    // The constraint body itself is still a block and still breaks.
+    CHECK(formatted.find("constraint c_len {\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: an assignment pattern stays on one line", "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src = "module m_pat;\n"
+                            "s_t s = '{a: 1'b1, b: 4'hA};\n"
+                            "logic [3:0] arr [4] = '{default: '0};\n"
+                            "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("\n};") == std::string::npos);
+    CHECK(formatted.find("4'hA};") != std::string::npos);
+    CHECK(formatted.find("'0};") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a streaming operator stays on one line", "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src = "module m_stream;\n"
+                            "assign o_b = {<<8{i_a}};\n"
+                            "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("\n}") == std::string::npos);
+    CHECK(formatted.find("i_a}};") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a nested concatenation closes without a stray space",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // The "space after }" rule belongs to a brace that closes a block, not to
+    // an expression brace.
+    CHECK(format_source("module m;\n"
+                        "assign e = {f, {g, h}};\n"
+                        "assign a = {{b, c}, d};\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "assign e = {f, {g, h}};\n"
+                                 "assign a = {{b, c}, d};\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: a shift operator is not mistaken for a stream operator",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `<<` only streams directly after `{`; everywhere else it is the binary
+    // shift and keeps its spaces.
+    CHECK(format_source("module m;\n"
+                        "assign y = n << 2;\n"
+                        "assign z = {a, b << 1};\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "assign y = n << 2;\n"
+                                 "assign z = {a, b << 1};\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: an expression brace does not shift the lines after it",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 1;
+    opts.indent_size = 2;
+
+    // An expression brace opens no indent scope, so its closing brace must not
+    // drop one either -- otherwise every following line of the file is dedented.
+    CHECK(format_source("module m;\n"
+                        "s_t s = '{a: 1'b1};\n"
+                        "logic x;\n"
+                        "logic y;\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "  s_t s = '{a : 1'b1};\n"
+                                 "  logic x;\n"
+                                 "  logic y;\n"
+                                 "endmodule\n");
+}

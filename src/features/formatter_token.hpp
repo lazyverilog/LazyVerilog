@@ -111,6 +111,16 @@ struct TopologyFacts {
     bool opens_indent_scope{false};
     bool closes_indent_scope{false};
 
+    // `{` is overloaded in SystemVerilog: it opens a constraint or coverage
+    // body, but it also opens a concatenation, a set-membership list, an
+    // assignment pattern and a streaming expression.  Only a statement block
+    // holds a `;` at its own depth, so that is what separates the two -- a
+    // TokenKind fact, not a lookbehind on which keyword happens to precede it,
+    // which would have to enumerate `constraint`, `coverpoint`, `cross`, `dist`
+    // and every `foreach`/`if` nested inside a constraint body.  Set on the
+    // opening brace only.
+    bool opens_brace_block{false};
+
     bool starts_argument_list{false};
     bool ends_argument_list{false};
 
