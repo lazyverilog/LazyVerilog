@@ -829,7 +829,22 @@ void LazyVerilogServer::register_handlers() {
                 if (!std::filesystem::exists(p))
                     return;
 
+                // Walk up for lazyverilog.toml, the same search didOpen does.
+                // The client's root is whatever its own root markers picked --
+                // commonly a .git directory, or, when no marker matched, the
+                // opened file's own directory -- so the config often sits above
+                // it.  Leaving the search to didOpen is too late for one thing
+                // in particular: the capability reply below is built from this
+                // config and is never revised, so a config found afterwards
+                // cannot take inlay hints back off.
+                //
+                // root_ becomes the directory holding the config rather than
+                // the client's root, because vcode paths and the shard cache
+                // location are resolved relative to it.  That is the invariant
+                // didOpen and didChangeConfiguration already maintain.
                 root_ = p;
+                if (auto config_root = find_config_root(p); !config_root.empty())
+                    root_ = config_root;
                 config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
 
                 std::string warn;

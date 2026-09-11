@@ -86,9 +86,21 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
-- Editor-side switches for the two per-keystroke features live in
-  `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).  `[inlay_hint].enable`
-  in `lazyverilog.toml` does *not* stop Neovim asking — it only empties the reply.
+- `caps.inlayHintProvider` is built from `[inlay_hint].enable`, and capabilities are
+  exchanged **once and never revised**, so `initialize` must resolve the project's
+  real `lazyverilog.toml` — it walks up from the client's root, since that root is
+  regularly *below* the config (Neovim's `vim.fs.root` resolves a flat marker list by
+  marker order, so a high `.git` beats a nearer toml).  A config found later, by
+  didOpen's own walk-up, cannot take the capability back off: the client goes on
+  asking for the whole session and every reply is empty.  Guarded by
+  `ctest --test-dir build -R config-root-cli-smoke`.
+- That walk-up cannot reach a config *below* the client's root — `initialize` knows
+  only `rootUri`, not which file will be opened.  Fixing that case needs
+  `client/unregisterCapability`; Neovim allows it for `inlayHint`
+  (`dynamicRegistration = true`) but not for `foldingRange` (`false`).
+- `foldingRangeProvider` is hardcoded `true` — there is no folding config option, so
+  the client always asks.  Editor-side switches for both per-keystroke features live
+  in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
 - Details and prior measured rounds: `docs/dev/edit-perf.md`.
 
 ### Index Shard Cache

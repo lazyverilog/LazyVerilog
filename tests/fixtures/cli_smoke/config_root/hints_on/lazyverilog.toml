@@ -1,0 +1,9 @@
+# Fixture for config-root-cli-smoke.
+#
+# Also stops `find_config_root`'s upward walk here, so the test never inherits
+# the repository's own lazyverilog.toml (which enables inlay hints).
+[compilation]
+background_compilation = false
+
+[inlay_hint]
+enable = true
