@@ -1378,3 +1378,100 @@ tools/startup_bench.py <corpus> --cpus 0    # cold: builds the cache
 tools/startup_bench.py <corpus> --cpus 0    # warm
 ./build/lazyverilog-tests "[index-cache]"
 ```
+
+# Round 10: the shard cache stops answering from a decision that moved
+
+Round 9 keyed a shard on content digests and measured a 5.8-18.7x warm start.
+What it did not key on was how the parse *found* the files it hashed.  A
+digest answers "did what I read change".  It cannot answer "would I read the
+same file", and nothing else in the key could either.
+
+Reproduced against the server from nvim, on a project with
+`+incdir+./override` ahead of `+incdir+./base`:
+
+| | `header_byte_t` | `overridden_t` |
+|---|---|---|
+| cold, `override/` empty | 1 | 0 |
+| add `override/defs.svh`, warm | **1** | 1 |
+| same, cache cleared | **0** | 1 |
+
+The warm launch served symbols out of `base/defs.svh`, a file nothing includes
+any more, alongside the new ones.  No source file changed, so no digest moved,
+and no edit would ever have cleared it.  The same hole swallows a header
+written *after* the file that `` `include ``s it -- which is the usual order to
+work in.
+
+Four more, found reading the same code: a shard's temporary carried a counter
+that starts at zero in every process, so two servers on one project interleaved
+into one file (three processes, 200 rounds each: 21 of 600 shards deserialized
+cleanly carrying two writers' entries); digests were read from disk after the
+parse rather than taken from it, so a file edited in between was keyed on bytes
+it was not built from; the write-drain wait could not see writes a worker had
+not handed over yet; and nothing ever removed a shard whose file was deleted.
+
+## What changed
+
+The key now records how each `` `include `` resolved -- the file the directive
+is written in, its spelling, whether it is a system include, and what it found,
+with "nothing" recorded as a resolution in its own right.  slang reports the
+successful ones through the tree's include metadata and the failed ones only as
+a diagnostic, so both are read.  The preload re-runs
+`SourceManager::readHeader`'s search and rejects the shard if any answer moved.
+
+Also: a per-process salt in the temporary's name; digests taken from
+`DocumentState::parsed_digests` while the `SourceManager` still holds what slang
+loaded; a reservation the worker takes under `map_mutex_` so the drain wait is a
+barrier; and `IndexCache::prune_missing_sources()`, which collects shards whose
+file is gone and shards of any other format version.
+
+## Measured
+
+4-core VM, `Release`, interleaved base/head runs, each side with its own corpus
+directory -- sharing one makes every warm run a miss, since the two sides write
+incompatible format versions.  `min` is the honest column here: this is a shared
+runner and noise only ever adds time.
+
+| Corpus | CPUs | cold min | warm min | maxRSS |
+|---|---|---|---|---|
+| hpc60 (61 files) | all | 38.7 -> 37.3 ms (-3.5%) | 8.0 -> 8.5 ms (+6.5%) | 46 -> 46 MB |
+| hpc60 | 1 | 57.0 -> 56.3 ms (-1.1%) | 9.6 -> 10.5 ms (+9.8%) | 37 -> 36 MB |
+| uvm (166 shards) | all | 611 -> 576 ms (-5.7%) | 29.0 -> 31.7 ms (+9.2%) | 100 -> 107 MB |
+| uvm | 1 | 627 -> 691 ms (+10.2%) | 31.2 -> 33.7 ms (+8.0%) | 100 -> 104 MB |
+| opentitan (3985 files) | all | 2006 -> 2083 ms (+3.8%) | 807 -> 836 ms (+3.5%) | 895 -> 906 MB |
+| opentitan | 1 | 9760 -> 10096 ms (+3.4%) | 863 -> 835 ms (-3.3%) | 635 -> 638 MB |
+
+Round 9's win is intact: opentitan is 2006 ms cold against 836 ms warm on all
+CPUs and 9760 against 835 on one, and uvm 611 against 32.
+
+The cost is a few percent, and on the small corpora it is single-digit
+milliseconds against run-to-run spreads several times larger -- read the signs,
+not the magnitudes.  opentitan is the only corpus where it is consistent, at
+about +3%.
+
+Three things keep it there, none of them optional:
+
+- **Digests are hashed by the memo, not by the parse.**  Taking the bytes from
+  the parse is correct, but hashing them there made it once per parse instead of
+  once per generation -- a header every module includes rehashed by every file
+  that reaches it, which is the O(files x header) term round 6 removed.  Worth
+  ~40 ms of a 570 ms cold uvm start.
+- **The resolution memo is split in two.**  Include directories are searched
+  identically whatever file the directive is in, so a key carrying the including
+  directory recomputed the whole ordered walk once per directory spelling the
+  same header.  Split: one stat per (directory, spelling), one walk per distinct
+  spelling.
+- **The sweep skips what the preload already proved.**  It otherwise opened every
+  shard to read back a URI the caller could derive.  On an unchanged opentitan:
+  `live=3985 skipped=3985 opened=0 removed=0`.
+
+## What this cost the test suite
+
+The whole warm-cache group could not tell a hit from a reparse.  Every test
+asserted that the second launch produced the right index, which a launch that
+quietly reparsed everything also does -- so when hashing a `SourceManager`
+buffer (slang appends a `'\0'`) made every shard a permanent miss, 683 tests
+passed against a cache doing nothing at all.
+
+The shape that works is in `tests/test_index_cache.cpp` as "an unchanged project
+is served from the shards": edit the stored shard on disk, keep its key, and
+assert the edit comes back.  Only a reused shard can produce it.
