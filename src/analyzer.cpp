@@ -6060,6 +6060,22 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
         schedule_background_reindex_locked();
 }
 
+void Analyzer::prune_cache_once_per_generation(uint64_t generation) const {
+    std::optional<IndexCache> cache;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        if (!index_cache_ || generation != background_generation_ ||
+            index_cache_pruned_generation_ == generation)
+            return;
+        index_cache_pruned_generation_ = generation;
+        cache = index_cache_;
+    }
+    // On the writer thread, which already runs at the lowest priority this
+    // process asks for, and after a shard has been written -- so it never sits
+    // between a parse and the launch that wants it.  One stat per shard.
+    cache->prune_missing_sources();
+}
+
 void Analyzer::reserve_shard_writes(size_t count) const {
     if (count == 0)
         return;
@@ -6092,6 +6108,8 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
             store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
                                  write.extra_dependency_uri, write.stands_alone);
         }
+        if (write.prune_only)
+            prune_cache_once_per_generation(write.generation);
         release_reservation();
         return;
     }
@@ -6148,6 +6166,8 @@ void Analyzer::index_cache_writer_loop() const {
         if (write.index)
             store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
                                  write.extra_dependency_uri, write.stands_alone);
+        if (write.prune_only)
+            prune_cache_once_per_generation(write.generation);
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
@@ -6427,6 +6447,12 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         hit.index = std::make_shared<const SyntaxIndex>(std::move(loaded->index));
         hits.push_back(std::move(hit));
     }
+
+    // Queued whatever the preload found.  The sweep has to happen on the launch
+    // that reuses everything just as much as on one that rebuilds, and that
+    // launch writes no shards for it to hang off.
+    reserve_shard_writes(1);
+    queue_shard_write(PendingShardWrite{.prune_only = true, .generation = generation});
 
     if (hits.empty())
         return;

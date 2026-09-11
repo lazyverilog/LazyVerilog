@@ -23,7 +23,7 @@ namespace {
 // the bottom of this file exist so that adding a field to one of them fails to
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
-constexpr uint32_t kFormatVersion = 2;
+constexpr uint32_t kFormatVersion = 3;
 // Written and compared verbatim.  Shards are a local, per-machine cache, so
 // numbers are stored in native byte order and a file produced by a differently
 // ordered build is simply rejected.
@@ -213,6 +213,18 @@ public:
         d.lo = u64();
         d.hi = u64();
         return d;
+    }
+
+    /// A length-prefixed string written outside the string table.
+    std::string_view raw_str() {
+        const auto size = u32();
+        if (failed_ || size > remaining()) {
+            failed_ = true;
+            return {};
+        }
+        const auto value = bytes_.substr(offset_, size);
+        offset_ += size;
+        return value;
     }
 
     std::string_view str() {
@@ -760,9 +772,65 @@ std::optional<IndexCache::Loaded> IndexCache::load(std::string_view uri) const {
     return deserialize_index_shard(bytes);
 }
 
+size_t IndexCache::prune_missing_sources() const {
+    // Header only: magic, version, byte order, then the length-prefixed URI.
+    // Enough for any path a filesystem will hand back, and a short read simply
+    // leaves the shard alone.
+    constexpr size_t kHeaderBytes = 3 * sizeof(uint32_t) + sizeof(uint32_t) + 4096;
+
+    std::error_code ec;
+    size_t removed = 0;
+    for (const auto& entry : fs::directory_iterator(directory_, ec)) {
+        if (ec)
+            break;
+        if (entry.path().extension() != ".idx")
+            continue;
+
+        std::string head(kHeaderBytes, '\0');
+        {
+            std::ifstream in(entry.path(), std::ios::binary);
+            if (!in)
+                continue;
+            in.read(head.data(), static_cast<std::streamsize>(head.size()));
+            head.resize(static_cast<size_t>(in.gcount()));
+        }
+
+        Reader r(head);
+        // A shard from another format version is left where it is: this pass
+        // removes files whose source is gone, and guessing at a layout it does
+        // not know is how a sweep deletes the wrong thing.  kFormatVersion
+        // already makes such a shard a miss.
+        if (r.u32() != kMagic || r.u32() != kFormatVersion || r.u32() != kByteOrderMark)
+            continue;
+        const auto uri = r.raw_str();
+        if (r.failed() || uri.empty())
+            continue;
+
+        // Only a file that is definitely gone.  An unreadable directory, a
+        // permission error, a filesystem that is briefly unavailable -- all of
+        // those report an error rather than absence, and none of them is a
+        // reason to throw away work.
+        const auto path = path_from_file_uri(std::string(uri));
+        std::error_code exists_ec;
+        if (fs::exists(path, exists_ec) || exists_ec)
+            continue;
+
+        std::error_code remove_ec;
+        if (fs::remove(entry.path(), remove_ec))
+            ++removed;
+    }
+    return removed;
+}
+
 void IndexCache::store(std::string_view uri, const Key& key, const SyntaxIndex& index,
                        bool stands_alone) const {
     const auto final_path = shard_path(uri);
+
+    // Recorded from the argument rather than trusted from the caller's key:
+    // the shard's name is derived from this same string, so the two cannot
+    // disagree about which file the shard is for.
+    auto stored_key = key;
+    stored_key.uri = std::string(uri);
 
     // Unique temporary name, then rename.  Workers write shards concurrently
     // and a reader may be another process entirely; rename is what makes a
@@ -793,7 +861,7 @@ void IndexCache::store(std::string_view uri, const Key& key, const SyntaxIndex& 
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
         if (!out)
             return;
-        const auto bytes = serialize_index_shard(key, index, stands_alone);
+        const auto bytes = serialize_index_shard(stored_key, index, stands_alone);
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         if (!out)
             return;
@@ -815,6 +883,12 @@ std::string serialize_index_shard(const IndexCache::Key& key, const SyntaxIndex&
         h.u32(kMagic);
         h.u32(kFormatVersion);
         h.u32(kByteOrderMark);
+        // The shard's own URI, length-prefixed and written raw rather than
+        // through the string table.  A sweep for shards whose file is gone has
+        // to learn which file each one is for, and the table sits after this --
+        // megabytes of it on a large shard.  Here it is a fixed-size read.
+        h.u32(static_cast<uint32_t>(key.uri.size()));
+        h.raw(key.uri.data(), key.uri.size());
         header = h.buffer();
     }
 
@@ -874,12 +948,18 @@ std::optional<IndexCache::Loaded> deserialize_index_shard(std::string_view bytes
     Reader r(bytes);
     if (r.u32() != kMagic || r.u32() != kFormatVersion || r.u32() != kByteOrderMark)
         return std::nullopt;
-    if (!r.read_string_table())
-        return std::nullopt;
 
     IndexCache::Loaded loaded;
     auto& key = loaded.key;
     auto& index = loaded.index;
+
+    const auto uri = r.raw_str();
+    if (r.failed())
+        return std::nullopt;
+    key.uri = std::string(uri);
+
+    if (!r.read_string_table())
+        return std::nullopt;
 
     loaded.stands_alone = r.boolean();
     key.content = r.digest();

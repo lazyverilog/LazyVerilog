@@ -999,3 +999,50 @@ TEST_CASE("index cache: an unchanged include resolution is still a hit", "[index
     CHECK(project.shard_files() == shards_after_cold);
     CHECK(cold.count("shared_decl") == 1);
 }
+
+TEST_CASE("index cache: a shard whose file is gone is removed", "[index-cache]") {
+    // A shard is named from its file's URI, so editing a file rewrites its
+    // shard in place and the directory does not grow.  Deleting or renaming one
+    // is what leaves an orphan behind, and nothing ever collected them: on a
+    // tree with generated or frequently renamed RTL the directory grows without
+    // bound, inside the user's own checkout.
+    CacheProject project("analyzer-prune");
+    project.write("keep.sv", "module keep;\n  logic [7:0] kept;\nendmodule\n");
+    project.write("goes.sv", "module goes;\n  logic [7:0] gone;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"keep.sv", "goes.sv"});
+    }
+    REQUIRE(project.shard_files() == 2);
+
+    // Deleted from the project and from disk, which is what a rename looks like
+    // from the old name's side.
+    std::filesystem::remove(project.root() / "goes.sv");
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"keep.sv"});
+    CHECK(snapshot_values(warm).count("kept") == 1);
+    CHECK(project.shard_files() == 1);
+}
+
+TEST_CASE("index cache: a shard whose file still exists is kept", "[index-cache]") {
+    // Only files that are definitely gone.  A file out of the project today is
+    // legitimately reusable when it comes back -- a filelist edit, a branch
+    // switch -- and re-reading it costs a parse that the shard already paid
+    // for.  Skipping one costs a stat.
+    CacheProject project("analyzer-prune-keeps");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+    project.write("b.sv", "module b;\n  logic [7:0] sig_b;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv", "b.sv"});
+    }
+    REQUIRE(project.shard_files() == 2);
+
+    // b.sv drops out of the filelist but stays on disk.
+    Analyzer analyzer;
+    project.index(analyzer, {"a.sv"});
+    CHECK(project.shard_files() == 2);
+}

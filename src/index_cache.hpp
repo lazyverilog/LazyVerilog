@@ -48,6 +48,13 @@ public:
     /// What a stored shard was built from.  A shard is usable only when every
     /// one of these still matches the working tree.
     struct Key {
+        /// URI of the file this shard indexes.
+        ///
+        /// The shard is named from a hash of it, which is one-way, so without
+        /// this a sweep cannot tell which file a shard belongs to -- and a
+        /// shard whose file no longer exists is the one thing that makes this
+        /// directory grow without bound.  Set by store().
+        std::string uri;
         /// Bytes of the file the shard indexes.
         Digest content;
         /// Defines and include directories, which change what a parse means
@@ -120,6 +127,17 @@ public:
     /// cache that misses.
     void store(std::string_view uri, const Key& key, const SyntaxIndex& index,
                bool stands_alone = false) const;
+
+    /// Delete every shard whose source file no longer exists.
+    ///
+    /// Shards are named from the file's URI, so an edit rewrites one in place
+    /// and the directory only grows when a file is deleted or renamed.  Nothing
+    /// else is removed: a file that is merely out of the project today is
+    /// legitimately reusable when it comes back, and a shard costs one stat to
+    /// skip.  Returns how many it removed.
+    ///
+    /// Reads only each shard's header, not its body.
+    size_t prune_missing_sources() const;
 
     const std::filesystem::path& directory() const { return directory_; }
 

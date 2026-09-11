@@ -797,6 +797,11 @@ class Analyzer {
     /// hand the finished shard over -- a shared_ptr and two strings -- and go
     /// back to parsing.
     struct PendingShardWrite {
+        /// No shard to write: a request to sweep the cache directory, which the
+        /// preload queues once per burst.  A launch that reuses everything
+        /// writes nothing, and that is exactly the launch a stale shard
+        /// survives -- so the sweep cannot hang off a write.
+        bool prune_only{false};
         std::string uri;
         std::shared_ptr<const SyntaxIndex> index;
         std::vector<IncludeResolution> include_resolutions;
@@ -825,6 +830,10 @@ class Analyzer {
     /// "drained" cannot be observed in between.
     mutable size_t index_cache_writes_reserved_{0};
     void reserve_shard_writes(size_t count) const;
+    void prune_cache_once_per_generation(uint64_t generation) const;
+    /// Generation whose shards have been swept for sources that no longer
+    /// exist, so it happens once per burst rather than once per write.
+    mutable uint64_t index_cache_pruned_generation_{std::numeric_limits<uint64_t>::max()};
 
 public:
     /// Block until every shard write a finished parse will make has been
