@@ -36,6 +36,9 @@ Developer utilities for benchmarking and debugging the lazyverilog server. Not p
   (redraw, fold recompute, diagnostic rendering) or the transport, not at the server.  Check
   the `workspace/symbol -> N hits` line: zero hits means the project index never loaded and
   the edit numbers are measured against an empty server.
+- It does not check that a reply was *right*, and an empty reply is the fastest possible one.
+  A handler that gives up while the buffer's parse is in flight — which is exactly when an
+  editor asks — benchmarks beautifully and returns nothing.  See `docs/dev/edit-perf.md`.
 - Do not leave `LAZYVERILOG_TRACE_PERF=1` set for an interactive session.  `cerr` is
   unit-buffered, so it is one `write()` per record, and Neovim logs every stderr chunk to
   `stdpath('log')/lsp.log` with a flush per line on its main loop.

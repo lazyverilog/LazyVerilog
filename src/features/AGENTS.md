@@ -27,6 +27,7 @@ One C++ file per LSP feature or command. Each file implements the handler logic 
 | `inlay_hints.cpp/.hpp` | `textDocument/inlayHint` — inline type/value hints |
 | `code_action.cpp/.hpp` | `textDocument/codeAction` — quick fixes and refactoring |
 | `rename.cpp/.hpp` | `textDocument/rename` — symbol rename across workspace |
+| `folding_range.cpp/.hpp` | `textDocument/foldingRange` — fold regions; re-requested on every edit |
 
 ## For AI Agents
 
@@ -45,6 +46,14 @@ Config options: `../../docs/formatter/options.md`
 - New feature: add `feature.cpp` + `feature.hpp`, register handler in `../server.cpp`, add `../../tests/test_feature.cpp`
 - All features may use `../analyzer.hpp`, `../syntax_index.hpp`, `../config.hpp`, `../document_state.hpp`
 - Hot path: `formatter.cpp` (highest call frequency — optimize carefully)
+- Also hot: `folding_range.cpp` and `inlay_hints.cpp`.  Neovim re-requests both for the
+  whole file on every `didChange`, and requests are answered one at a time, so work here
+  lands between the user's keystroke and their completion popup.  See
+  `../../docs/dev/edit-perf.md`
+- A request can arrive while the buffer's parse is still running, which is exactly when an
+  editor sends one: `DocumentState::tree` is null and only `text` is available.  Returning
+  nothing there is not a safe default — the client applies the empty answer.  Serve the
+  previous answer, or one derived from the text alone
 
 ### Testing Requirements
 - Each feature has a corresponding `../../tests/test_<feature>.cpp`

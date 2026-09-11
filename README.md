@@ -248,6 +248,19 @@ require("lazyverilog").setup()
 require("lazyverilog").setup({
   cmd = "/path/to/lazyverilog-lsp",
 })
+
+-- Editor-side features that cost something on every edit.  Both default to
+-- true; turn them off for very large RTL files or on a machine with little CPU
+-- to spare, such as a shared HPC node.
+require("lazyverilog").setup({
+  -- 'foldmethod=expr' driven by the server's folding ranges.  Neovim
+  -- re-requests the whole file's folds from every change.
+  folding     = false,
+  -- Inlay hints.  Neovim requests them on every change even when the server is
+  -- configured to return none; this is the editor half of the switch, and
+  -- `[inlay_hint].enable` in lazyverilog.toml is the server half.
+  inlay_hints = false,
+})
 ```
 
 </details>
