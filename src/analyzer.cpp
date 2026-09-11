@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "lsp_position.hpp"
 #include "cpu_budget.hpp"
 #include "dynamic_file_index.hpp"
 #include "syntax_index_shared.hpp"
@@ -152,9 +153,8 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
             info.uri = location_to_uri(sm, loc, fallback_uri);
             if (loc.valid() && sm.isFileLoc(loc)) {
                 size_t ln = sm.getLineNumber(loc);
-                size_t col = sm.getColumnNumber(loc);
                 info.line = ln > 0 ? (int)ln - 1 : 0;
-                info.col = col > 0 ? (int)col - 1 : 0;
+                info.col = utf16_column(sm, loc);
             }
         } catch (...) {
         }
@@ -1359,7 +1359,7 @@ find_module_definition(const SyntaxIndex& index, const std::string& uri, const s
     const auto actual_uri = index.source_uri(module.file_id);
     const int line = to_lsp_line(module.line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, module.col, line,
-                    module.col + (int)module.name.size()};
+                    module.col + (int)utf16_length(module.name)};
 }
 
 static const ModuleEntry* find_module_entry(const SyntaxIndex& index, const std::string& name) {
@@ -1394,7 +1394,7 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
     const auto actual_uri = index.source_uri(port->file_id);
     const int line = to_lsp_line(port->line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, port->col, line,
-                    port->col + (int)port->name.size()};
+                    port->col + (int)utf16_length(port->name)};
 }
 
 // Class name that `owner::alias` names, for a `typedef` declared inside a class.
@@ -1434,7 +1434,7 @@ static std::optional<Location> find_package_member(const SyntaxIndex& index,
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)member_name.size()};
+                        col + (int)utf16_length(member_name)};
     };
 
     if (auto it = index.package_value_by_scoped_name.find(key);
@@ -1643,8 +1643,9 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
     const int line = to_lsp_line((int)sm.getLineNumber(location));
-    const int col = (int)sm.getColumnNumber(location) - 1;
-    return Location{uri, line, col, line, col + (int)token.valueText().size()};
+    const int col = utf16_column(sm, location);
+    return Location{uri, line, col, line,
+                    col + (int)utf16_length(token.valueText())};
 }
 
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
@@ -2167,7 +2168,7 @@ static std::optional<Location> find_generic_definition_from_index(
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)name.size()};
+                        col + (int)utf16_length(name)};
     };
 
     // Modules and packages — scope-insensitive, always visible (mirrors
@@ -2352,16 +2353,16 @@ static std::optional<Location> find_interface_member_definition(const SyntaxInde
 
     for (const auto& modport : iface.modports) {
         if (modport.name == member_name)
-            return locate(modport.file_id, modport.line, modport.col, modport.name.size());
+            return locate(modport.file_id, modport.line, modport.col, utf16_length(modport.name));
     }
     for (const auto& port : iface.ports) {
         if (port.name == member_name)
-            return locate(port.file_id, port.line, port.col, port.name.size());
+            return locate(port.file_id, port.line, port.col, utf16_length(port.name));
     }
     for (const auto& value : index.values) {
         if (value.parent_scope != interface_name || value.name != member_name)
             continue;
-        return locate(value.file_id, value.line, value.col, value.name.size());
+        return locate(value.file_id, value.line, value.col, utf16_length(value.name));
     }
     return std::nullopt;
 }
@@ -2670,7 +2671,7 @@ static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& 
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)field.name.size()};
+                            field.col + (int)utf16_length(field.name)};
         }
     }
     return std::nullopt;
@@ -2698,7 +2699,7 @@ static std::optional<Location> find_aggregate_field_declaration_at(const SyntaxI
             return std::nullopt;
 
         return Location{resolved_uri, field_lsp_line, field.col, field_lsp_line,
-                        field.col + (int)field.name.size()};
+                        field.col + (int)utf16_length(field.name)};
     };
 
     // Generic unqualified lookup intentionally ignores aggregate fields, but
@@ -2744,7 +2745,7 @@ static std::optional<Location> find_class_method_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)method.name.size()};
+                            method.col + (int)utf16_length(method.name)};
         }
     }
     return std::nullopt;
@@ -2774,7 +2775,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)field.name.size()};
+                            field.col + (int)utf16_length(field.name)};
         }
         for (const auto& method : cls.methods) {
             if (method.name != member_name || method.line <= 0)
@@ -2782,7 +2783,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)method.name.size()};
+                            method.col + (int)utf16_length(method.name)};
         }
 
         // A class-scoped typedef (`my_item::type_id`) is a member too, but it
@@ -2793,7 +2794,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(td.file_id);
             const int line = to_lsp_line(td.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
-                            td.col + (int)td.name.size()};
+                            td.col + (int)utf16_length(td.name)};
         }
     }
     return std::nullopt;
@@ -3371,10 +3372,11 @@ static bool contains_position(const slang::SourceManager& sm, slang::SourceRange
     if (!range.start().valid() || !range.end().valid())
         return false;
 
+    // Compared against a request position, which the client measures in UTF-16.
     const int start_line = to_lsp_line((int)sm.getLineNumber(range.start()));
-    const int start_col = (int)sm.getColumnNumber(range.start()) - 1;
+    const int start_col = utf16_column(sm, range.start());
     const int end_line = to_lsp_line((int)sm.getLineNumber(range.end()));
-    const int end_col = (int)sm.getColumnNumber(range.end()) - 1;
+    const int end_col = utf16_column(sm, range.end());
 
     if (line < start_line || line > end_line)
         return false;
@@ -4441,13 +4443,13 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
             const auto start = visible_range_for_token(sm, token).start();
             const int token_line = to_lsp_line((int)sm.getLineNumber(start));
-            const int token_col = (int)sm.getColumnNumber(start) - 1;
+            const int token_col = utf16_column(sm, start);
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
                 .line = token_line,
                 .col = token_col,
-                .end_col = token_col + (int)name.size(),
+                .end_col = token_col + (int)utf16_length(name),
             };
         }
     };
@@ -5748,7 +5750,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             if (!seen.insert(key).second)
                 return;
             result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
-                                      ref_col + (int)target->name.size()});
+                                      ref_col + (int)utf16_length(target->name)});
         };
 
     auto visit_tree =

@@ -1,4 +1,5 @@
 #include "folding_range.hpp"
+#include "../lsp_position.hpp"
 #include "document_state.hpp"
 #include "formatter_lexer.hpp"
 #include "formatter_token.hpp"
@@ -79,7 +80,7 @@ static int token_line(const SourceManager& sm, const Token& tok) {
 
 static int token_column(const SourceManager& sm, const Token& tok) {
     if (!tok || !tok.location().valid()) return 0;
-    return (int)sm.getColumnNumber(tok.location()) - 1;
+    return utf16_column(sm, tok.location());
 }
 
 static int first_line(const SourceManager& sm, const SyntaxNode& n) {

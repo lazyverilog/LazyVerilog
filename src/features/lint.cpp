@@ -1,4 +1,5 @@
 #include "lint.hpp"
+#include "../lsp_position.hpp"
 #include "../analyzer.hpp"
 #include "../dynamic_file_index.hpp"
 #include "../string_utils.hpp"
@@ -43,9 +44,8 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
                          "non-standard exception\n";
         }
         size_t ln = sm.getLineNumber(loc);
-        size_t co = sm.getColumnNumber(loc);
         d.line = ln > 0 ? (int)ln - 1 : 0;
-        d.col  = co > 0 ? (int)co - 1 : 0;
+        d.col  = utf16_column(sm, loc);
     }
     return d;
 }

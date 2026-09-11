@@ -134,6 +134,9 @@ static int token_line(const SourceManager& sm, const slang::parsing::Token& tok)
     return line > 0 ? (int)line - 1 : 0;
 }
 
+// Deliberately a byte column, not a UTF-16 one: the result is used to size an
+// indent string for generated text, never as an LSP Position.character.  Leading
+// whitespace is ASCII, so the two agree here anyway.
 static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid()) return 0;
     auto col = sm.getColumnNumber(tok.location());

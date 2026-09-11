@@ -24,7 +24,7 @@ namespace {
 // the bottom of this file exist so that adding a field to one of them fails to
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
-constexpr uint32_t kFormatVersion = 5;
+constexpr uint32_t kFormatVersion = 6;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is

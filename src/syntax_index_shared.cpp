@@ -1,5 +1,7 @@
 #include "syntax_index_shared.hpp"
 
+#include "lsp_position.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -280,9 +282,10 @@ std::pair<int, int> token_pos_line1_col0(const slang::SourceManager& sm,
     // handling of the same case.
     const auto location = token_true_origin_location(sm, token);
     const auto line = sm.getLineNumber(location);
-    const auto col = sm.getColumnNumber(location);
-    return {line > 0 ? static_cast<int>(line) : 0,
-            col > 0 ? static_cast<int>(col) - 1 : 0};
+    // Stored columns are UTF-16, converted here while the buffer is still in
+    // hand.  A shard keeps no source text, so a position recorded for a file
+    // that is later closed can never be converted after the fact.
+    return {line > 0 ? static_cast<int>(line) : 0, utf16_column(sm, location)};
 }
 
 std::pair<int, int> token_pos_line0_col0(const slang::SourceManager& sm,
@@ -709,8 +712,7 @@ std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsi
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
     const auto line = sm.getLineNumber(location);
-    const auto col = sm.getColumnNumber(location);
-    return {line > 0 ? static_cast<int>(line) : 0, col > 0 ? static_cast<int>(col) - 1 : 0};
+    return {line > 0 ? static_cast<int>(line) : 0, utf16_column(sm, location)};
 }
 
 void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file_id,
@@ -718,7 +720,10 @@ void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file
                          RefForm form = RefForm::Plain) {
     if (name.empty())
         return;
-    const auto end_col = col + static_cast<int>(name.size());
+    // UTF-16 units, to match `col`.  `name.size()` is a byte count and would
+    // overshoot the moment an identifier is not ASCII, which an escaped
+    // identifier is free to be.
+    const auto end_col = col + static_cast<int>(utf16_length(name));
     index.references.push_back(ReferenceEntry{
         .name = std::move(name),
         .file_id = file_id,
@@ -2526,7 +2531,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                     const auto macro_name = sm.getMacroName(token.location());
                     if (!macro_name.empty()) {
                         const int line_num = (int)sm.getLineNumber(range.start());
-                        int col = (int)sm.getColumnNumber(range.start()) - 1;
+                        int col = utf16_column(sm, range.start());
                         if (col < 0)
                             col = 0;
                         if (auto text = source_text_for_syntax_range(sm, range);
