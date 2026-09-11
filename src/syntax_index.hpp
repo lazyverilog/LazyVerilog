@@ -239,6 +239,15 @@ struct ImportEntry {
     int end_line{0};
 };
 
+/// Which half of an implicit `.p,` port connection an occurrence stands for.
+/// Plain covers every ordinary identifier, including the explicit `.p(expr)`
+/// form, which already spells both halves and needs no expansion.
+enum class RefForm : uint8_t {
+    Plain,
+    ImplicitPortName,  ///< `.p,` reached as the instantiated module's port
+    ImplicitPortValue, ///< `.p,` reached as the enclosing module's signal
+};
+
 struct ReferenceEntry {
     std::string name;
     // Actual source file for this occurrence when the token came from another
@@ -285,6 +294,16 @@ struct ReferenceEntry {
     int line{0};    // 1-based, 0 if unknown
     int col{0};     // 0-based
     int end_col{0}; // 0-based exclusive
+    // How the occurrence spells the symbol.  `.p,` in a port connection list is
+    // shorthand for `.p(p)`: one token that is both a port name and a
+    // same-spelled signal reference.  A rename changes one of those meanings, so
+    // the token has to be rewritten as the expanded `port(net)` form rather than
+    // replaced -- after the rename the two halves no longer spell alike.
+    //
+    // Deciding this in the index rather than by looking at source text is what
+    // keeps closed files working: rename must emit edits for files that were
+    // never parsed, and a shard retains no source text.
+    RefForm form{RefForm::Plain};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

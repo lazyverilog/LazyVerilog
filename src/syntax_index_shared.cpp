@@ -714,7 +714,8 @@ std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsi
 }
 
 void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file_id,
-                         std::string canonical_id, int line, int col) {
+                         std::string canonical_id, int line, int col,
+                         RefForm form = RefForm::Plain) {
     if (name.empty())
         return;
     const auto end_col = col + static_cast<int>(name.size());
@@ -726,7 +727,14 @@ void add_reference_entry(SyntaxIndex& index, std::string name, SourceFileID file
         .line = line,
         .col = col,
         .end_col = end_col,
+        .form = form,
     });
+}
+
+/// Identity of a token within the compilation: (buffer, offset).
+uint64_t source_token_key(const slang::parsing::Token& token) {
+    return (static_cast<uint64_t>(token.location().buffer().getId()) << 32) |
+           static_cast<uint64_t>(token.location().offset());
 }
 
 } // namespace
@@ -862,17 +870,30 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
     }
 
-    auto add_reference = [&](const slang::parsing::Token& token, std::string canonical_id) {
+    // Tokens already recorded as the port half of an implicit `.p,` connection.
+    // The instantiation handler reaches such a token before visitToken()'s
+    // generic fallback does -- handle() runs its own body, then visitDefault()
+    // descends to the token -- so the second, enclosing-module occurrence for
+    // the same token can be recognised here rather than by a separate pass.
+    std::unordered_set<uint64_t> implicit_port_connection_tokens;
+
+    auto add_reference = [&](const slang::parsing::Token& token, std::string canonical_id,
+                             RefForm form = RefForm::Plain) {
         if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
             !token.location().valid())
             return;
         // Occurrences from an `include`d header belong to that header's shard.
         if (!file_ids.accepts(index, sm, token))
             return;
+        const uint64_t key = source_token_key(token);
+        if (form == RefForm::ImplicitPortName)
+            implicit_port_connection_tokens.insert(key);
+        else if (implicit_port_connection_tokens.contains(key))
+            form = RefForm::ImplicitPortValue;
         const auto [line, col] = token_pos(sm, token);
         add_reference_entry(index, std::string(token.valueText()),
                             file_ids.for_token(index, sm, token),
-                            std::move(canonical_id), line, col);
+                            std::move(canonical_id), line, col, form);
     };
 
     auto module_owner_kind = [](SyntaxKind kind) -> SubroutineOwnerKind {
@@ -1790,12 +1811,22 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         continue;
                     const std::string port_name(named->name.valueText());
                     if (!module_name.empty() && !port_name.empty()) {
-                        add_ref(named->name, symbol_canonical("module_port", module_name, port_name));
+                        // `.p,` -- no parenthesised expression -- is shorthand
+                        // for `.p(p)`, so the token means the instantiated
+                        // module's port *and* the enclosing module's signal.
+                        const bool implicit = named->expr == nullptr;
+                        add_ref(named->name,
+                                symbol_canonical("module_port", module_name, port_name),
+                                implicit ? RefForm::ImplicitPortName : RefForm::Plain);
                         // `.p(expr)` names a port of the instantiated module.  It is
                         // not a reference to a same-named signal of the enclosing
                         // module, so keep the generic fallback from also tagging it
-                        // `module_signal::<enclosing>::p`.
-                        classified_tokens.insert(token_key(named->name));
+                        // `module_signal::<enclosing>::p`.  The shorthand *is* such
+                        // a reference, so it must go on to the fallback: suppressing
+                        // it there is what dropped those sites from references, and
+                        // so from rename.
+                        if (!implicit)
+                            classified_tokens.insert(token_key(named->name));
                     }
                 }
             }

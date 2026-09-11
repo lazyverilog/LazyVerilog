@@ -5843,6 +5843,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             .col = ref.col,
             .end_line = ref_line,
             .end_col = ref.end_col,
+            .form = ref.form,
         });
     };
 

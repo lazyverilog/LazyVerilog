@@ -84,7 +84,22 @@ lsWorkspaceEdit provide_rename(const Analyzer& analyzer, const TextDocumentRenam
         lsTextEdit edit;
         edit.range.start = lsPosition(ref.line, ref.col);
         edit.range.end = lsPosition(ref.end_line, ref.end_col);
-        edit.newText = params.newName;
+        // `.p,` is one token standing for both a port name and a same-spelled
+        // net.  Renaming either half makes the shorthand illegal, so the token
+        // is rewritten as the explicit `port(net)` form with the half that did
+        // not change keeping its old spelling.  Replacing it outright would
+        // silently rebind the connection to a net that does not exist.
+        switch (ref.form) {
+        case RefForm::ImplicitPortName:
+            edit.newText = params.newName + "(" + ident->name + ")";
+            break;
+        case RefForm::ImplicitPortValue:
+            edit.newText = ident->name + "(" + params.newName + ")";
+            break;
+        case RefForm::Plain:
+            edit.newText = params.newName;
+            break;
+        }
 
         // An identifier a macro pastes together (`` `MK_REG(status) `` declaring
         // `status_reg`) has no span in the source that spells it: the occurrence
