@@ -5972,6 +5972,15 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
         schedule_background_reindex_locked();
 }
 
+void Analyzer::reserve_shard_writes(size_t count) const {
+    if (count == 0)
+        return;
+    // Called with map_mutex_ held, which fixes the lock order against
+    // index_cache_writer_loop(): map_mutex_ first, then this one.
+    std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
+    index_cache_writes_reserved_ += count;
+}
+
 void Analyzer::queue_shard_write(PendingShardWrite write) const {
     // On a one-CPU slice there is no other core to move the write to, and a
     // second runnable thread only adds context switches and holds the shard
@@ -5980,17 +5989,34 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
     // *onto* it with one, and one is the slice a batch-scheduled node grants.
     // So the writer exists exactly when there is somewhere for it to run.
     static const bool use_writer_thread = available_cpu_count() > 1;
+
+    // Every exit from here releases exactly one reservation, or the drain wait
+    // never completes.
+    const auto release_reservation = [this] {
+        std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
+        if (index_cache_writes_reserved_ > 0)
+            --index_cache_writes_reserved_;
+        index_cache_write_cv_.notify_all();
+    };
+
     if (!use_writer_thread) {
         if (write.index) {
             store_shard_in_cache(write.uri, *write.index, write.extra_dependency_uri,
                                  write.stands_alone);
         }
+        release_reservation();
         return;
     }
 
     std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
-    if (index_cache_writer_stop_)
+    // Reservation to queue entry in one step: the wait counts both, so the
+    // write is never invisible to it.
+    if (index_cache_writes_reserved_ > 0)
+        --index_cache_writes_reserved_;
+    if (index_cache_writer_stop_) {
+        index_cache_write_cv_.notify_all();
         return;
+    }
     if (!index_cache_writer_.joinable()) {
         index_cache_writer_ = std::thread([this] {
             // Same courtesy the index workers extend: a cache write is the
@@ -6043,8 +6069,10 @@ void Analyzer::index_cache_writer_loop() const {
 
 void Analyzer::wait_for_index_cache_writes_idle() const {
     std::unique_lock<std::mutex> lock(index_cache_write_mutex_);
-    index_cache_write_cv_.wait(
-        lock, [&] { return index_cache_write_queue_.empty() && !index_cache_writing_; });
+    index_cache_write_cv_.wait(lock, [&] {
+        return index_cache_writes_reserved_ == 0 && index_cache_write_queue_.empty() &&
+               !index_cache_writing_;
+    });
 }
 
 std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string& uri,
@@ -7348,6 +7376,22 @@ void Analyzer::background_index_loop() const {
             }
 
             release_warmup_locked();
+
+            // Claim the shard writes below while still holding map_mutex_.  The
+            // handover happens after this block, but the wake that follows the
+            // decrement is what a test takes as "indexing finished" -- so the
+            // writes have to be countable before it, or the drain wait after it
+            // sees an empty queue and reports a cache that is not written yet.
+            {
+                size_t reserved = shard_to_cache ? 1 : 0;
+                for (const auto& [header_uri, header_index, stands_alone] : headers_to_cache) {
+                    (void)header_uri;
+                    (void)stands_alone;
+                    if (header_index)
+                        ++reserved;
+                }
+                reserve_shard_writes(reserved);
+            }
 
             // ProjectIndex is an immutable view derived from per-file shards.
             // Do not publish after every single file while the initial .f cache

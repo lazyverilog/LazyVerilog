@@ -865,3 +865,4 @@ TEST_CASE("index cache: a burst's projected header does not cost anyone a shard"
     for (int i = 0; i < 8; ++i)
         CHECK(snapshot_modules(warm).count("m" + std::to_string(i)) == 1);
 }
+

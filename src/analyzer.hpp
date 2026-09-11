@@ -809,11 +809,24 @@ class Analyzer {
     mutable std::thread index_cache_writer_;
     mutable bool index_cache_writer_stop_{false};
     mutable bool index_cache_writing_{false};
+    /// Shards a worker has committed and will hand over, but has not yet.
+    ///
+    /// A worker finishes a file inside map_mutex_ -- decrementing the active
+    /// count and waking wait_for_background_index_idle() -- and only then, with
+    /// the lock released, queues that file's shards.  Without this counter the
+    /// two waits in sequence are not a barrier: the first returns as the last
+    /// worker leaves the lock, and the second looks at a queue the worker has
+    /// not reached yet, finds it empty, and reports the cache flushed.  The
+    /// reservation is taken while the worker still holds map_mutex_, so
+    /// "drained" cannot be observed in between.
+    mutable size_t index_cache_writes_reserved_{0};
+    void reserve_shard_writes(size_t count) const;
 
 public:
-    /// Block until every queued shard write has been flushed.  Only tests need
-    /// this: the server has no reason to wait for a cache that exists for the
-    /// next launch.
+    /// Block until every shard write a finished parse will make has been
+    /// flushed, including the ones not handed over yet.  Only tests need this:
+    /// the server has no reason to wait for a cache that exists for the next
+    /// launch.
     void wait_for_index_cache_writes_idle() const;
 
 private:
