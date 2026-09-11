@@ -4623,3 +4623,54 @@ TEST_CASE("formatter: index bracket inside a for body keeps no space before the 
                                  "end\n"
                                  "endmodule\n");
 }
+
+TEST_CASE("formatter: escaped identifiers keep their terminating whitespace",
+          "[formatter][escaped_identifier]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // An escaped identifier runs to the next whitespace character, so the space
+    // that ends it is part of the name, not padding the formatter may drop.
+    // Removing it glues the following token onto the identifier and changes the
+    // token stream, which the safety net catches and reports as a whole-file
+    // abort -- one escaped name anywhere left the entire file unformatted.
+    const std::string src = "module m;\n"
+                            "    logic \\data[0] ;\n"
+                            "    assign o_q = \\data[0] ;\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == "module m;\n"
+                       "logic \\data[0] ;\n"
+                       "assign o_q = \\data[0] ;\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: an escaped identifier does not block formatting the rest of the file",
+          "[formatter][escaped_identifier]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // The surrounding file must still be formatted; the blast radius of one
+    // escaped name was previously the whole buffer.
+    const std::string src = "module m;\n"
+                            "logic \\esc ;\n"
+                            "always_comb begin\n"
+                            "x=1;\n"
+                            "end\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == "module m;\n"
+                       "logic \\esc ;\n"
+                       "always_comb begin\n"
+                       "    x = 1;\n"
+                       "end\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}

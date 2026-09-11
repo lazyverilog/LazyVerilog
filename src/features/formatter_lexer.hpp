@@ -231,6 +231,12 @@ private:
                                         slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
         lex.is_directive = is_directive;
         lex.is_whitespace_sensitive = whitespace_sensitive;
+        // Escaped-identifier spelling is a lexical fact, decided here from the
+        // token's own text rather than re-derived by a pass.  Gating on
+        // Identifier keeps macro line-continuations, which also begin with a
+        // backslash, out of it.
+        lex.is_escaped_identifier =
+            kind == slang::parsing::TokenKind::Identifier && !text.empty() && text.front() == '\\';
         lex.comment_kind = comment_kind;
         lex.is_format_off_marker = is_format_off_marker;
         lex.is_format_on_marker = is_format_on_marker;

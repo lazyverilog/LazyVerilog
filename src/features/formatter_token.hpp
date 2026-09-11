@@ -52,6 +52,13 @@ struct LexemeFacts {
     bool is_directive{false};
     bool is_whitespace_sensitive{false};
 
+    // An escaped identifier (`\\data[0] `) is terminated by whitespace, not by
+    // the end of its own spelling, so the separator that follows it belongs to
+    // the name.  Spacing rules that would otherwise close the gap must leave at
+    // least one separator here, or re-lexing glues the next token onto the
+    // identifier and the safety net aborts the whole file.
+    bool is_escaped_identifier{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.

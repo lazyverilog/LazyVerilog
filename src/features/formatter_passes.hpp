@@ -3739,11 +3739,26 @@ public:
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (i == 0 || t.mutable_.wrap.must_break_before || t.mutable_.comment.force_own_line || is_passthrough(t)) {
-                t.mutable_.space.spaces_before = 0;
+                // A line break terminates an escaped identifier just as a space
+                // does, so only the same-line case needs the separator kept.
+                const bool after_escaped_on_same_line =
+                    i > 0 && tokens[i - 1].lex.is_escaped_identifier &&
+                    !t.mutable_.wrap.must_break_before && !t.mutable_.comment.force_own_line;
+                t.mutable_.space.spaces_before = after_escaped_on_same_line ? 1 : 0;
                 continue;
             }
             const Tok& L = tokens[i - 1];
             int spaces = 1;
+
+            // An escaped identifier is delimited by whitespace, so the token
+            // after it can never be closed up against it -- `\\esc` + `;` would
+            // re-lex as the single identifier `\\esc;`.  This outranks every
+            // no-space rule below, so decide it before any of them run.
+            if (L.lex.is_escaped_identifier) {
+                t.mutable_.space.spaces_before = 1;
+                t.mutable_.space.suppress_space = false;
+                continue;
+            }
 
             // Basic no-space rules
             if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;

@@ -61,6 +61,8 @@ static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
             return false;
         if (x.lex.is_whitespace_sensitive != y.lex.is_whitespace_sensitive)
             return false;
+        if (x.lex.is_escaped_identifier != y.lex.is_escaped_identifier)
+            return false;
     }
     return true;
 }
