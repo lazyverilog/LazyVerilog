@@ -23,6 +23,9 @@
   <a href="https://github.com/lazyverilog/LazyVerilog/issues">
     <img alt="GitHub issues" src="https://img.shields.io/github/issues/lazyverilog/LazyVerilog?style=for-the-badge">
   </a>
+  <a href="https://github.com/sponsors/kjoonha">
+    <img alt="Sponsor kjoonha" src="https://img.shields.io/badge/Sponsor-kjoonha-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white&labelColor=2b2d42">
+  </a>
   <a href="https://github.com/MikePopoloski/slang">
     <img alt="Powered by slang" src="https://img.shields.io/badge/parser-slang-blueviolet?style=for-the-badge">
   </a>
