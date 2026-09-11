@@ -68,11 +68,30 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
 - Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
   turns it off.  Keyed on **content digests** of the file, its `include`s, and the
   defines/incdirs — never mtime, which is unusable on a shared filesystem.
+- A digest answers "did what I read change".  It cannot answer "would I read the same
+  file", so the key also records **how each `include` resolved**, unresolved ones
+  included: creating a header that satisfies an `include` for the first time, or
+  shadowing one from an earlier `+incdir+`, changes no file the key hashes.  The
+  preload re-runs slang's search (`SourceManager::readHeader`'s order) against a memo.
+- Digests come from **the bytes the parse read**, never a re-read of the file — see
+  `DocumentState::parsed_digests`.  Hashing a `SourceManager` buffer means
+  `IndexCache::digest_source_buffer()`, which drops the `'\0'` slang appends; hashing
+  `getSourceText()` directly compares against `digest_file()` and never matches.
 - Adding a field to any entry in `src/syntax_index.hpp` requires updating the codec in
   `src/index_cache.cpp` and bumping `kFormatVersion`.  A `static_assert` on each struct's
   size makes forgetting a compile error rather than a shard that silently drops the field.
-- Benchmark both halves: `rm -rf <corpus>/.cache` then two `tools/startup_bench.py` runs.
-  Report cold and warm separately — a change can improve warm and wreck cold.
+  Renaming shards (`shard_path()`) needs a bump too, or the old names are stranded.
+- The sweep (`IndexCache::prune_missing_sources()`, queued by the preload onto the
+  writer thread) removes shards whose source file is gone and shards of any other
+  format version.  Files without our magic are left alone.
+- Benchmark all three halves: `tools/startup_bench.py` clears the shard cache before
+  each run (**cold**), `--warm` keeps it, `--no-cache` turns the cache off entirely.
+  Report them separately — a change can improve warm and wreck cold.
+- A warm test must be able to tell a hit from a reparse.  Asserting the second launch
+  produces the right index does not: so does a launch that silently reparsed
+  everything, which is how a dead cache went unnoticed.  See "an unchanged project is
+  served from the shards" in `tests/test_index_cache.cpp` for the shape that works —
+  edit the stored shard, keep its key, assert the edit comes back.
 
 ### Releasing a New Version
 ```bash

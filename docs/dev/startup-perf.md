@@ -14,6 +14,8 @@ tools/startup_bench.py <project-root> -r 5  # any project with lazyverilog.toml
 tools/startup_bench.py --cpus 0             # emulate a 1-CPU slice
 tools/startup_bench.py --cpus 0 --trace     # per-file timings, slowest first
 tools/startup_bench.py --json               # machine-readable
+tools/startup_bench.py --warm               # keep the shard cache between runs
+tools/startup_bench.py --no-cache           # shard cache off entirely
 ```
 
 The script wraps `index-bench` and reports median index time, user/sys CPU, and
@@ -101,6 +103,13 @@ cmake --build /tmp/base/build --target index-bench -j$(nproc)
 tools/startup_bench.py <corpus> -r 3 --cpus 0 --binary /tmp/base/build/index-bench --label base
 tools/startup_bench.py <corpus> -r 3 --cpus 0 --label head
 ```
+
+Runs are **cold** by default: the on-disk shard cache is cleared before each one,
+which is what makes repeated runs comparable.  Leaving it in place makes run 1
+cold and every run after it warm, and the median of that mixture is a warm number
+wearing a cold label.  Add `--warm` to measure reuse deliberately and `--no-cache`
+to measure the parse with the cache out of the picture; the mode is printed with
+the results and carried in `--json`.
 
 Use the same `CMAKE_BUILD_TYPE` on both sides — `Release` and `RelWithDebInfo`
 differ enough to swamp the effect being measured — and read `maxRSS` alongside
