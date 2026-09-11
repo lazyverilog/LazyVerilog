@@ -1980,6 +1980,36 @@ private:
             }
             ctrl_just_closed = false;
         }
+
+        freeze_attribute_instances(tokens);
+    }
+
+    // An attribute instance is an atom: `(* async_reg = "true" *)` annotates the
+    // declaration that follows and is not a breakable list, however much its
+    // OpenParenthesis looks like one.  Breaking it apart moves only trivia, so
+    // the token-stream safety net cannot catch the damage -- and the result no
+    // longer parses.  Clearing the flags here, after every rule above has run,
+    // keeps the decision in one place instead of adding a guard to each.
+    static void freeze_attribute_instances(TokenStream& tokens) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!tokens[i].lex.in_attribute_instance)
+                continue;
+            size_t end = i;
+            while (end + 1 < tokens.size() && tokens[end + 1].lex.in_attribute_instance)
+                ++end;
+
+            // A break before the attribute and after it stays available; only
+            // the inside of the span is frozen.
+            for (size_t k = i; k <= end; ++k) {
+                if (k != end) {
+                    tokens[k].mutable_.wrap.must_break_after = false;
+                    tokens[k].mutable_.wrap.can_break_after = false;
+                }
+                if (k != i)
+                    tokens[k].mutable_.wrap.must_break_before = false;
+            }
+            i = end;
+        }
     }
 
     const FormatOptions& opts_;
@@ -3757,6 +3787,18 @@ public:
             if (L.lex.is_escaped_identifier) {
                 t.mutable_.space.spaces_before = 1;
                 t.mutable_.space.suppress_space = false;
+                continue;
+            }
+
+            // `(*` and `*)` are single lexemes in the LRM.  Letting the ordinary
+            // paren rules put a space between the halves turns an attribute into
+            // a parenthesised expression, so keep them closed up.  The text
+            // between the delimiters spaces like any other expression.
+            if (t.lex.in_attribute_instance && L.lex.in_attribute_instance &&
+                ((kind_is(L, TK::OpenParenthesis) && kind_is(t, TK::Star)) ||
+                 (kind_is(L, TK::Star) && kind_is(t, TK::CloseParenthesis)))) {
+                t.mutable_.space.spaces_before = 0;
+                t.mutable_.space.suppress_space = true;
                 continue;
             }
 

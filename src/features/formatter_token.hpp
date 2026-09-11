@@ -59,6 +59,13 @@ struct LexemeFacts {
     // identifier and the safety net aborts the whole file.
     bool is_escaped_identifier{false};
 
+    // Part of an attribute instance `(* ... *)`, delimiters included.  slang's
+    // lexer has no `(*` token -- the parser reconstructs attributes from an
+    // OpenParenthesis immediately followed by a Star -- so the adjacency is
+    // recorded here, where byte positions are known, rather than re-derived by
+    // a pass from input trivia.
+    bool in_attribute_instance{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.

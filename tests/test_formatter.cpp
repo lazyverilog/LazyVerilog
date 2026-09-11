@@ -4674,3 +4674,72 @@ TEST_CASE("formatter: an escaped identifier does not block formatting the rest o
                        "endmodule\n");
     CHECK(format_source(formatted, opts) == formatted);
 }
+
+TEST_CASE("formatter: attribute instances are not reflowed as argument lists",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // slang has no `(*` / `*)` token, so the formatter sees a plain
+    // OpenParenthesis and used to reflow it like a port or argument list.  The
+    // result did not parse, and the token-stream safety net cannot catch it
+    // because only the trivia moved.
+    const std::string src = "module m;\n"
+                            "(* async_reg = \"true\" *) logic r_meta;\n"
+                            "endmodule\n";
+
+    const std::string expected = "module m;\n"
+                                 "(* async_reg = \"true\" *) logic r_meta;\n"
+                                 "endmodule\n";
+
+    CHECK(format_source(src, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
+}
+
+TEST_CASE("formatter: every attribute instance form survives formatting",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src =
+        "module m;\n"
+        "(* dont_touch = \"true\" *) logic r_meta;\n"
+        "(* async_reg = \"true\", shreg_extract = \"no\" *) logic r_sync;\n"
+        "(* ram_style = \"block\" *) logic [7:0] r_mem [0:255];\n"
+        "(* keep *) logic r_q;\n"
+        "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    // Each attribute keeps its delimiters adjacent and stays on one line with
+    // the declaration it annotates.
+    CHECK(formatted.find("(\n") == std::string::npos);
+    CHECK(formatted.find("(* dont_touch = \"true\" *) logic r_meta;") != std::string::npos);
+    CHECK(formatted.find("(* async_reg = \"true\", shreg_extract = \"no\" *) logic r_sync;") !=
+          std::string::npos);
+    // Only the attribute is asserted here; how the unpacked dimension spaces is
+    // a separate, unrelated declaration-spacing option.
+    CHECK(formatted.find("(* ram_style = \"block\" *) logic [7:0] r_mem") != std::string::npos);
+    CHECK(formatted.find("(* keep *) logic r_q;") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a parenthesis that only looks like an attribute is left alone",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `(*` is one token in the LRM, so a space between the two characters is
+    // not an attribute.  Multiplication inside parentheses must keep formatting
+    // as an ordinary expression.
+    const std::string src = "module m;\n"
+                            "assign y = (a * b) * (c * d);\n"
+                            "endmodule\n";
+
+    CHECK(format_source(src, opts) == "module m;\n"
+                                      "assign y = (a * b) * (c * d);\n"
+                                      "endmodule\n");
+}
