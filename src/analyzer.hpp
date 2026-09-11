@@ -43,6 +43,12 @@ struct HeaderTextCache {
         std::shared_ptr<const std::string> text;
         /// Parses in this burst that included this header.
         size_t hits{0};
+        /// Digest of the header as first read, which `text` stops being once
+        /// project() replaces it with the directives alone.  The shard cache
+        /// keys a shard on the bytes its parse read, and a parse seeded from
+        /// here read whatever this holds -- so the digest has to be taken when
+        /// the full text enters, and travel with the entry from then on.
+        IndexCache::Digest digest;
     };
 
     /// One header a parse pulled in: the key it is cached under, and its text.
@@ -121,15 +127,21 @@ struct HeaderTextCache {
     /// nearly certain not to be.  Restricting the offer to the former keeps the
     /// shared-header win and drops the fan-out cost on designs with many
     /// distinct headers.
-    std::vector<std::pair<std::string, std::shared_ptr<const std::string>>>
-    seed_candidates(uint64_t gen) {
+    struct SeedCandidate {
+        std::string path;
+        std::shared_ptr<const std::string> text;
+        /// Of the header, not of `text`; see Entry::digest.
+        IndexCache::Digest digest;
+    };
+
+    std::vector<SeedCandidate> seed_candidates(uint64_t gen) {
         std::lock_guard<std::mutex> lock(mutex);
         discard_stale(gen);
-        std::vector<std::pair<std::string, std::shared_ptr<const std::string>>> candidates;
+        std::vector<SeedCandidate> candidates;
         candidates.reserve(texts.size());
         for (const auto& [path, entry] : texts) {
             if (entry.hits * 2 >= parses)
-                candidates.emplace_back(path, entry.text);
+                candidates.push_back(SeedCandidate{path, entry.text, entry.digest});
         }
         return candidates;
     }
@@ -150,7 +162,11 @@ private:
         if (bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
-        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
+        // Hashed once, on the parse that first read the header in full.  Every
+        // later parse in the burst is seeded from this entry, so this is the
+        // only reading of those bytes there is to key a shard on.
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1,
+                                  IndexCache::digest_bytes(text)});
     }
 
     void discard_stale(uint64_t gen) {
@@ -748,6 +764,25 @@ class Analyzer {
     mutable std::unordered_map<std::string, std::optional<IndexCache::Digest>>
         index_cache_digests_;
     std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
+                                                         uint64_t generation) const;
+    /// Digests of the bytes the burst's parses actually read, as opposed to
+    /// what the files hold now.
+    ///
+    /// These are two different questions and one memo cannot answer both.  The
+    /// preload asks what is on disk, because that is what it validates a stored
+    /// shard against.  The store path asks what this parse read, because that
+    /// is what the shard it is about to write was built from.  Answering the
+    /// second from a disk read -- which is what sharing one memo did -- keys a
+    /// shard built from bytes A on the digest of bytes B whenever the file
+    /// moves in between, and the writer thread makes that window seconds wide
+    /// on a large project.  The result is a false hit that no later launch can
+    /// detect.
+    ///
+    /// Filled from DocumentState::parsed_digests, first parse of a file wins,
+    /// and cleared with the generation like the disk memo beside it.
+    mutable std::unordered_map<std::string, IndexCache::Digest> index_cache_parsed_digests_;
+    void remember_parsed_digests(const DocumentState& state, uint64_t generation) const;
+    std::optional<IndexCache::Digest> parsed_file_digest(const std::string& uri,
                                                          uint64_t generation) const;
 
     /// Shard writes, drained by one dedicated thread.

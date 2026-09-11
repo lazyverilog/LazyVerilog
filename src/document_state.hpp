@@ -2,6 +2,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -80,6 +81,20 @@ struct DocumentState {
     // for O(1) dependency checks on the didChange path while map_mutex_ is held.
     std::vector<std::string> include_dependencies;
     std::unordered_set<std::string> include_dependency_set;
+    // 128-bit content digests of the bytes this parse actually read, keyed by
+    // file:// URI: this file's own buffer and every header it loaded from disk.
+    //
+    // The on-disk shard cache keys a shard on what it was built from, and
+    // re-reading the file to hash it after the parse is not that: a file edited
+    // in between yields a shard built from one set of bytes and keyed on
+    // another, which is a false hit that survives every future launch.  A
+    // header slang served from the burst's projection cache is deliberately
+    // absent -- the projection is a directives-only reduction, not the file --
+    // and its digest comes from the parse that first read it in full.
+    //
+    // Stored as a plain pair so document_state.hpp stays independent of
+    // index_cache.hpp; IndexCache::Digest is the same two words.
+    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> parsed_digests;
     // Derived syntax index built once per immutable document snapshot.
     SyntaxIndex index;
     // Lazy structural index cache — populated on first call to get_structural_index().

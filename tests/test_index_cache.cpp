@@ -805,3 +805,63 @@ TEST_CASE("index cache: [index].cache defaults on and can be turned off", "[inde
     CHECK(warning.empty());
     CHECK(!config.index.cache);
 }
+
+TEST_CASE("header text cache: a projected header keeps the digest of the real one",
+          "[index-cache]") {
+    // Once a header's own shard exists, the burst serves the rest of its files
+    // that header's *directives* instead of the header.  A parse seeded from
+    // here therefore never sees the file, and the shard cache still has to key
+    // that parse's shard on the file -- so the digest is taken when the full
+    // text enters and travels with the entry, unchanged, across project().
+    HeaderTextCache cache;
+    const std::string full = "`define A 1\nlocalparam int DECL = 3;\n";
+    const auto expected = IndexCache::digest_bytes(full);
+
+    cache.record_parse(1, {{"/proj/shared.svh", full}}, /*count_as_burst_parse=*/true);
+    REQUIRE(cache.seed_candidates(1).size() == 1);
+    CHECK(cache.seed_candidates(1).front().digest == expected);
+
+    cache.project(1, "/proj/shared.svh", "`define A 1\n");
+    const auto after = cache.seed_candidates(1);
+    REQUIRE(after.size() == 1);
+    CHECK(*after.front().text == "`define A 1\n");
+    CHECK(after.front().digest == expected);
+}
+
+TEST_CASE("index cache: a burst's projected header does not cost anyone a shard",
+          "[index-cache]") {
+    // The digests a shard is keyed on come from what the burst's parses read,
+    // and most of a burst reads a shared header only as the projection above.
+    // Every project file still has to end up with a shard, and the next launch
+    // still has to reuse them.
+    CacheProject project("analyzer-projected-header");
+
+    std::string shared = "`define SHARED_MACRO 1\n";
+    for (int i = 0; i < 4000; ++i)
+        shared += "// pad pad pad pad pad pad pad pad pad pad pad pad pad pad\n";
+    shared += "localparam int SHARED_FROM_HEADER = 7;\n";
+    project.write("shared.svh", shared);
+
+    std::vector<std::string> files;
+    for (int i = 0; i < 8; ++i) {
+        const auto name = "m" + std::to_string(i) + ".sv";
+        project.write(name, "`include \"shared.svh\"\nmodule m" + std::to_string(i) +
+                                ";\n  logic [7:0] sig_" + std::to_string(i) + ";\nendmodule\n");
+        files.push_back(name);
+    }
+
+    std::set<std::string> cold_values;
+    {
+        Analyzer analyzer;
+        cold_values = snapshot_values(project.index(analyzer, files));
+    }
+
+    // One per project file plus the header's own.
+    CHECK(project.shard_files() == files.size() + 1);
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, files);
+    CHECK(snapshot_values(warm) == cold_values);
+    for (int i = 0; i < 8; ++i)
+        CHECK(snapshot_modules(warm).count("m" + std::to_string(i)) == 1);
+}
