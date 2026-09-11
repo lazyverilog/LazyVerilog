@@ -1,5 +1,6 @@
 #pragma once
 
+#include "include_resolution.hpp"
 #include "syntax_index.hpp"
 
 #include <cstdint>
@@ -56,6 +57,13 @@ public:
         /// hashed to.  Stored as normalized file:// URIs, matching
         /// SyntaxIndex::include_dependencies.
         std::vector<std::pair<std::string, Digest>> dependencies;
+        /// How each `include` in this file resolved.  Digests answer "did the
+        /// file I read change"; this answers "would I read the same file", and
+        /// nothing else in the key can: creating a header that satisfies an
+        /// `include` for the first time, or shadowing one from a directory
+        /// earlier in the search order, changes no file anyone hashed.  See
+        /// IncludeResolution.
+        std::vector<IncludeResolution> include_resolutions;
     };
 
     struct Loaded {

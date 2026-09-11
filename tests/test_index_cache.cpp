@@ -43,6 +43,10 @@ class TempDir {
 
     std::filesystem::path write(const std::string& name, const std::string& text) const {
         const auto file = path_ / name;
+        // A name may address a subdirectory: include directories only mean
+        // something when there is more than one place a header can live.
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
         std::ofstream out(file, std::ios::binary);
         out << text;
         return file;
@@ -574,12 +578,18 @@ class CacheProject {
     /// server uses.  Returns the published snapshot.
     std::shared_ptr<const ProjectIndexSnapshot> index(Analyzer& analyzer,
                                                       const std::vector<std::string>& files,
-                                                      const std::vector<std::string>& defines = {}) const {
+                                                      const std::vector<std::string>& defines = {},
+                                                      const std::vector<std::string>& incdirs = {}) const {
         std::vector<std::string> paths;
         for (const auto& name : files)
             paths.push_back((root() / name).string());
+        std::vector<std::string> include_dirs;
+        for (const auto& dir : incdirs)
+            include_dirs.push_back((root() / dir).string());
+        if (include_dirs.empty())
+            include_dirs.push_back(root().string());
         analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_project_config(defines, {root().string()}, paths, {}, root().string());
+        analyzer.set_project_config(defines, include_dirs, paths, {}, root().string());
         analyzer.wait_for_background_index_idle();
         // Shard writes are deliberately off the indexing path, so a test that
         // asserts on what the *next* launch sees has to wait for them.  The
@@ -866,6 +876,58 @@ TEST_CASE("index cache: a burst's projected header does not cost anyone a shard"
         CHECK(snapshot_modules(warm).count("m" + std::to_string(i)) == 1);
 }
 
+
+TEST_CASE("index cache: a header created after its includer is picked up", "[index-cache]") {
+    // Writing the file that `include`s a header before writing the header is
+    // the ordinary order to work in.  The first index finds nothing, and no
+    // file the shard key hashes changes when the header appears -- so without
+    // recording that the search found nothing, the shard stays valid and the
+    // header is invisible until the includer itself is touched.
+    CacheProject project("analyzer-late-header");
+    project.write("a.sv", "`include \"late.svh\"\nmodule a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        const auto cold = project.index(analyzer, {"a.sv"});
+        CHECK(snapshot_values(cold).count("late_from_header") == 0);
+    }
+
+    project.write("late.svh", "localparam int late_from_header = 4;\n");
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"a.sv"});
+    CHECK(snapshot_values(warm).count("late_from_header") == 1);
+}
+
+TEST_CASE("index cache: a header shadowed from an earlier directory is picked up",
+          "[index-cache]") {
+    // An override directory ahead of the shared one in the search order is how
+    // a design substitutes a header without editing anything that includes it.
+    // Nothing hashed changes: the includer is untouched and the header it used
+    // to resolve to is still there, byte for byte.  Only the decision changed.
+    CacheProject project("analyzer-shadowed-header");
+    project.write("base/defs.svh", "localparam int from_base = 1;\n");
+    project.write("a.sv", "`include \"defs.svh\"\nmodule a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    const std::vector<std::string> incdirs{"override", "base"};
+    std::filesystem::create_directories(project.root() / "override");
+
+    {
+        Analyzer analyzer;
+        const auto cold = project.index(analyzer, {"a.sv"}, {}, incdirs);
+        CHECK(snapshot_values(cold).count("from_base") == 1);
+        CHECK(snapshot_values(cold).count("from_override") == 0);
+    }
+
+    project.write("override/defs.svh", "localparam int from_override = 2;\n");
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"a.sv"}, {}, incdirs);
+    CHECK(snapshot_values(warm).count("from_override") == 1);
+    // And the one it shadowed is gone: nothing includes it any more.
+    CHECK(snapshot_values(warm).count("from_base") == 0);
+}
+
 TEST_CASE("index cache: an unchanged project is served from the shards", "[index-cache]") {
     // Every other warm test here asserts the second launch produces the right
     // index -- which a launch that quietly reparsed everything also does.  That
@@ -914,4 +976,26 @@ TEST_CASE("index cache: an unchanged project is served from the shards", "[index
     const auto warm = snapshot_values(project.index(analyzer, {"a.sv"}));
     CHECK(warm.count("only_a_reused_shard_has_this") == 1);
     CHECK(warm.count("sig_a") == 1);
+}
+
+TEST_CASE("index cache: an unchanged include resolution is still a hit", "[index-cache]") {
+    // The check above must not cost the reuse it is guarding.  A project whose
+    // headers resolve exactly as they did is the case this cache exists for.
+    CacheProject project("analyzer-stable-resolution");
+    project.write("defs.svh", "localparam int shared_decl = 9;\n");
+    project.write("a.sv", "`include \"defs.svh\"\nmodule a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    std::set<std::string> cold;
+    {
+        Analyzer analyzer;
+        cold = snapshot_values(project.index(analyzer, {"a.sv"}));
+    }
+    const auto shards_after_cold = project.shard_files();
+
+    Analyzer analyzer;
+    CHECK(snapshot_values(project.index(analyzer, {"a.sv"})) == cold);
+    // A reparse would have rewritten them; the count is the same either way,
+    // so what this pins is that the index is reproduced, not that it was read.
+    CHECK(project.shard_files() == shards_after_cold);
+    CHECK(cold.count("shared_decl") == 1);
 }

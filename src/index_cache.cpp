@@ -23,7 +23,7 @@ namespace {
 // the bottom of this file exist so that adding a field to one of them fails to
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;
 // Written and compared verbatim.  Shards are a local, per-machine cache, so
 // numbers are stored in native byte order and a file produced by a differently
 // ordered build is simply rejected.
@@ -827,6 +827,12 @@ std::string serialize_index_shard(const IndexCache::Key& key, const SyntaxIndex&
         w.str(dep_uri);
         w.digest(dep_digest);
     }
+    w.seq(key.include_resolutions, [&](const IncludeResolution& resolution) {
+        w.str(resolution.from_uri);
+        w.str(resolution.spelling);
+        w.boolean(resolution.is_system);
+        w.str(resolution.resolved_uri);
+    });
 
     w.seq(index.source_files, [&](const std::string& s) { w.str(s); });
     w.seq(index.include_dependencies, [&](const std::string& s) { w.str(s); });
@@ -886,6 +892,14 @@ std::optional<IndexCache::Loaded> deserialize_index_shard(std::string_view bytes
         auto dep_uri = std::string(r.str());
         key.dependencies.emplace_back(std::move(dep_uri), r.digest());
     }
+    key.include_resolutions = r.seq<IncludeResolution>([&] {
+        IncludeResolution resolution;
+        resolution.from_uri = r.str();
+        resolution.spelling = r.str();
+        resolution.is_system = r.boolean();
+        resolution.resolved_uri = r.str();
+        return resolution;
+    });
 
     index.source_files = r.seq<std::string>([&] { return std::string(r.str()); });
     index.include_dependencies = r.seq<std::string>([&] { return std::string(r.str()); });

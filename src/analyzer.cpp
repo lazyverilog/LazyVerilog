@@ -15,6 +15,7 @@
 #include <memory>
 #include <set>
 #include <slang/diagnostics/DiagnosticEngine.h>
+#include <slang/diagnostics/PreprocessorDiags.h>
 #include <slang/parsing/Preprocessor.h>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -251,6 +252,88 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 }
 
 static std::string header_directives_only(std::string_view text);
+
+/// Record how every `include in @p tree resolved, so a later launch can tell
+/// whether the same directive would now find something else.
+///
+/// slang reports the ones that succeeded through the tree's include metadata,
+/// and the ones that found nothing only as a diagnostic -- which is the half
+/// that matters most here, because an unresolved `include leaves no file behind
+/// for the shard key to hash.  See IncludeResolution.
+static std::vector<IncludeResolution> collect_include_resolutions(
+    slang::syntax::SyntaxTree& tree, const slang::SourceManager& sm,
+    const std::string& own_uri) {
+    std::vector<IncludeResolution> resolutions;
+
+    // The file a directive is written in, which is the directory slang searches
+    // first.  A directive inside an `include`d header belongs to that header.
+    const auto directive_origin = [&](slang::SourceLocation loc) {
+        const auto expanded = sm.getFullyExpandedLoc(loc);
+        const auto& full_path = sm.getFullPath(expanded.buffer());
+        return full_path.empty() ? own_uri : uri_from_path(full_path);
+    };
+
+    for (const auto& include : tree.getIncludeDirectives()) {
+        if (!include.syntax)
+            continue;
+        std::string resolved;
+        if (include.buffer.id.valid()) {
+            const auto& full_path = sm.getFullPath(include.buffer.id);
+            if (!full_path.empty())
+                resolved = uri_from_path(full_path);
+        }
+        resolutions.push_back(IncludeResolution{
+            .from_uri = directive_origin(include.syntax->getFirstToken().location()),
+            .spelling = std::string(include.path),
+            .is_system = include.isSystem,
+            .resolved_uri = std::move(resolved),
+        });
+    }
+
+    for (const auto& diagnostic : tree.diagnostics()) {
+        if (diagnostic.code != slang::diag::CouldNotOpenIncludeFile)
+            continue;
+        // The formatter renders "'<path>': <reason>"; the path is the first
+        // argument, kept as a string by the emitter above.
+        if (diagnostic.args.empty())
+            continue;
+        const auto* spelling = std::get_if<std::string>(&diagnostic.args.front());
+        if (!spelling || spelling->empty())
+            continue;
+        resolutions.push_back(IncludeResolution{
+            .from_uri = directive_origin(diagnostic.location),
+            .spelling = *spelling,
+            // A system include that found nothing is recorded as one: the
+            // search it would re-run is a different search.
+            .is_system = spelling->front() == '<',
+            .resolved_uri = {},
+        });
+    }
+
+    std::sort(resolutions.begin(), resolutions.end(),
+              [](const IncludeResolution& a, const IncludeResolution& b) {
+                  return std::tie(a.from_uri, a.spelling, a.is_system) <
+                         std::tie(b.from_uri, b.spelling, b.is_system);
+              });
+    resolutions.erase(std::unique(resolutions.begin(), resolutions.end()), resolutions.end());
+    return resolutions;
+}
+
+/// The `include`s written in @p uri itself.
+///
+/// A parse records every directive in its tree, headers included.  A shard is
+/// per file, so it carries only its own: a nested header's directives belong to
+/// that header's shard, and the preload requires that shard to be a hit before
+/// it will reuse anything that included it, so the two compose.
+static std::vector<IncludeResolution>
+resolutions_written_in(const std::vector<IncludeResolution>& all, const std::string& uri) {
+    std::vector<IncludeResolution> own;
+    for (const auto& resolution : all) {
+        if (resolution.from_uri == uri)
+            own.push_back(resolution);
+    }
+    return own;
+}
 
 /// Digest the bytes this parse read, so the shard cache can key a shard on what
 /// it was actually built from rather than on a later re-read of the file.
@@ -583,6 +666,9 @@ make_file_state_with_options(const std::filesystem::path& path,
     state->include_dependency_set.insert(state->include_dependencies.begin(),
                                          state->include_dependencies.end());
     record_parsed_digests(*state, sm_source, seeded_header_paths);
+    if (state->tree)
+        state->include_resolutions =
+            collect_include_resolutions(*state->tree, *state->source_manager, uri);
     if (header_texts)
         store_header_texts(*state->source_manager, *state, *header_texts, generation,
                            header_cache_excluded, count_as_burst_parse);
@@ -6003,8 +6089,8 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
 
     if (!use_writer_thread) {
         if (write.index) {
-            store_shard_in_cache(write.uri, *write.index, write.extra_dependency_uri,
-                                 write.stands_alone);
+            store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                 write.extra_dependency_uri, write.stands_alone);
         }
         release_reservation();
         return;
@@ -6060,8 +6146,8 @@ void Analyzer::index_cache_writer_loop() const {
         }
 
         if (write.index)
-            store_shard_in_cache(write.uri, *write.index, write.extra_dependency_uri,
-                                 write.stands_alone);
+            store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                 write.extra_dependency_uri, write.stands_alone);
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
@@ -6131,6 +6217,7 @@ std::optional<IndexCache::Digest> Analyzer::parsed_file_digest(const std::string
 }
 
 void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& index,
+                                    const std::vector<IncludeResolution>& include_resolutions,
                                     const std::string& extra_dependency_uri,
                                     bool stands_alone) const {
     std::optional<IndexCache> cache;
@@ -6158,6 +6245,7 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
     IndexCache::Key key;
     key.content = *content;
     key.config = config_digest;
+    key.include_resolutions = include_resolutions;
 
     auto add_dependency = [&](const std::string& dependency_uri) {
         if (dependency_uri.empty() || dependency_uri == uri)
@@ -6182,6 +6270,7 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
 void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::optional<IndexCache> cache;
     IndexCache::Digest config_digest;
+    std::vector<std::filesystem::path> include_dirs;
     std::vector<std::string> files;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
@@ -6189,6 +6278,10 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
             return;
         cache = index_cache_;
         config_digest = index_cache_config_digest_;
+        // Copied out with the rest of the burst's inputs: re-running a header
+        // search below needs the same directories, in the same order, that a
+        // parse of these files would use.
+        include_dirs = include_dir_paths_;
         files.assign(background_pending_files_.begin(), background_pending_files_.end());
     }
 
@@ -6199,9 +6292,70 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         return cached_file_digest(uri, generation);
     };
 
-    // A shard is usable only when everything it was built from still hashes the
-    // same.  Content, then config, then every `include`d file: an edit to any
-    // of them changes what a parse of this file produces.
+    // Re-run slang's header search, memoized on what decides it.  A design
+    // includes a handful of distinct spellings from a handful of distinct
+    // directories, so this collapses to a few stats for the whole burst rather
+    // than one search per directive per file.
+    //
+    // Mirrors SourceManager::readHeader(): an absolute spelling is taken as
+    // written; a system include searches only system directories, of which the
+    // parse path configures none, so it resolves to nothing; everything else
+    // tries the including file's own directory and then the configured include
+    // directories in order.
+    struct SearchKey {
+        std::string from_directory;
+        std::string spelling;
+        bool is_system;
+        bool operator==(const SearchKey&) const = default;
+    };
+    struct SearchKeyHash {
+        size_t operator()(const SearchKey& k) const {
+            const auto a = std::hash<std::string>{}(k.from_directory);
+            const auto b = std::hash<std::string>{}(k.spelling);
+            return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2)) ^ (k.is_system ? 1 : 0);
+        }
+    };
+    std::unordered_map<SearchKey, std::string, SearchKeyHash> resolution_memo;
+
+    const auto resolve_include = [&](const IncludeResolution& recorded) {
+        const auto from_directory =
+            std::filesystem::path(path_from_file_uri(recorded.from_uri)).parent_path().string();
+        SearchKey search{from_directory, recorded.spelling, recorded.is_system};
+        if (const auto it = resolution_memo.find(search); it != resolution_memo.end())
+            return it->second;
+
+        std::string resolved;
+        const auto accept = [&](const std::filesystem::path& candidate) {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(candidate, ec))
+                return false;
+            resolved = uri_from_path(candidate);
+            return true;
+        };
+
+        const std::filesystem::path spelling(recorded.spelling);
+        if (spelling.is_absolute()) {
+            accept(spelling);
+        }
+        else if (!recorded.is_system) {
+            bool found = !from_directory.empty() &&
+                         accept(std::filesystem::path(from_directory) / spelling);
+            for (const auto& directory : include_dirs) {
+                if (found)
+                    break;
+                found = accept(directory / spelling);
+            }
+        }
+        resolution_memo.emplace(std::move(search), resolved);
+        return resolved;
+    };
+
+    // A shard is usable only when everything it was built from still holds.
+    // Content, config, and every `include`d file answer "did what I read
+    // change"; the recorded resolutions answer "would I read the same thing",
+    // which no digest can -- a header created for the first time, or one added
+    // to a directory earlier in the search order, changes no file the key
+    // hashes.
     const auto still_valid = [&](const std::string& uri, const IndexCache::Key& key) {
         if (key.config != config_digest)
             return false;
@@ -6211,6 +6365,10 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         for (const auto& [dependency_uri, dependency_digest] : key.dependencies) {
             const auto current = digest_of(dependency_uri);
             if (!current || !(*current == dependency_digest))
+                return false;
+        }
+        for (const auto& resolution : key.include_resolutions) {
+            if (resolve_include(resolution) != resolution.resolved_uri)
                 return false;
         }
         return true;
@@ -7413,9 +7571,12 @@ void Analyzer::background_index_loop() const {
         // is an optimization for the *next* launch and must never sit between
         // this one's last parse and its publish.
         if (shard_to_cache) {
-            queue_shard_write(PendingShardWrite{.uri = uri,
-                                                .index = std::move(shard_to_cache),
-                                                .generation = generation});
+            queue_shard_write(PendingShardWrite{
+                .uri = uri,
+                .index = std::move(shard_to_cache),
+                .include_resolutions = resolutions_written_in(state->include_resolutions, uri),
+                .generation = generation,
+            });
         }
         for (auto& [header_uri, header_index, stands_alone] : headers_to_cache) {
             if (!header_index)
@@ -7426,6 +7587,8 @@ void Analyzer::background_index_loop() const {
             queue_shard_write(PendingShardWrite{
                 .uri = header_uri,
                 .index = std::move(header_index),
+                .include_resolutions =
+                    resolutions_written_in(state->include_resolutions, header_uri),
                 .extra_dependency_uri = stands_alone ? std::string{} : uri,
                 .stands_alone = stands_alone,
                 .generation = generation,

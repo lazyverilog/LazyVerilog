@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "include_resolution.hpp"
 #include "syntax_index.hpp"
 #include <slang/text/SourceManager.h>
 
@@ -81,6 +82,9 @@ struct DocumentState {
     // for O(1) dependency checks on the didChange path while map_mutex_ is held.
     std::vector<std::string> include_dependencies;
     std::unordered_set<std::string> include_dependency_set;
+    // How every `include this parse saw resolved, including the ones that
+    // resolved to nothing.  See IncludeResolution.
+    std::vector<IncludeResolution> include_resolutions;
     // 128-bit content digests of the bytes this parse actually read, keyed by
     // file:// URI: this file's own buffer and every header it loaded from disk.
     //

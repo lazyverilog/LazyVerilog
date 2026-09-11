@@ -653,7 +653,10 @@ class Analyzer {
     /// names a file the shard depends on beyond its own `include`s -- the
     /// includer a fragment header's shard was derived from, which nothing in
     /// the shard itself records.
+    /// @param include_resolutions  how the `include`s written *in this file*
+    ///        resolved, filtered from the parse that produced @p index.
     void store_shard_in_cache(const std::string& uri, const SyntaxIndex& index,
+                              const std::vector<IncludeResolution>& include_resolutions,
                               const std::string& extra_dependency_uri = {},
                               bool stands_alone = false) const;
     std::function<void()> publish_project_index_snapshot_locked() const;
@@ -796,6 +799,7 @@ class Analyzer {
     struct PendingShardWrite {
         std::string uri;
         std::shared_ptr<const SyntaxIndex> index;
+        std::vector<IncludeResolution> include_resolutions;
         std::string extra_dependency_uri;
         bool stands_alone{false};
         uint64_t generation{0};
