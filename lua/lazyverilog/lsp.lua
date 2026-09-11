@@ -639,17 +639,23 @@ local function _configure_completion_options(bufnr)
 	end)
 end
 
-local function _default_on_attach(client, bufnr)
-	local opts = { buffer = bufnr, silent = true }
-
+local function _default_on_attach(cfg, client, bufnr)
 	-- Inlay hints (Neovim >= 0.10)
-	if vim.lsp.inlay_hint then
+	--
+	-- Enabling this makes Neovim request hints for the whole buffer on every
+	-- didChange, so it is a per-keystroke cost even when the server is
+	-- configured to return none.  See `inlay_hints` in config.lua.
+	if cfg.inlay_hints ~= false and vim.lsp.inlay_hint then
 		vim.lsp.inlay_hint.enable(true, { bufnr = bufnr })
 	end
 
 	-- LSP-driven folding (Neovim >= 0.10)
 	-- Sets foldmethod=expr so zM/za/zo work against LSP folding ranges.
-	if vim.lsp.foldexpr then
+	--
+	-- Neovim asks for the whole file's folding ranges from the didChange
+	-- notification itself, so this too is paid once per edit.  See `folding` in
+	-- config.lua for why a large file on a busy machine may want it off.
+	if cfg.folding ~= false and vim.lsp.foldexpr then
 		vim.api.nvim_buf_call(bufnr, function()
 			vim.wo.foldmethod = "expr"
 			vim.wo.foldexpr   = "v:lua.vim.lsp.foldexpr()"
@@ -673,7 +679,7 @@ local function start_lsp(cfg, cmd, bufnr)
 	-- Wrap user on_attach with our defaults
 	local user_on_attach = cfg.on_attach
 	local function combined_on_attach(client, buf)
-		_default_on_attach(client, buf)
+		_default_on_attach(cfg, client, buf)
 		_start_config_watcher_for_root(_client_root(client))
 		if user_on_attach then
 			user_on_attach(client, buf)

@@ -64,6 +64,31 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
   millisecond budget — that is what survives a shared CI runner.
 - Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
 
+### Edit-Path Performance
+```bash
+tools/edit_latency_bench.py <project-root> <file-in-it>   # steady-state edit loop
+tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
+```
+- Neovim sends a **whole-file `foldingRange` and `inlayHint` on every `didChange`**,
+  and requests are answered one at a time (`RemoteEndPoint(..., max_workers = 1)`),
+  so an expensive request delays the completion the user is waiting on.
+- It sends them **from the notification itself**, so the request lands while the
+  parse that notification started is still running and `DocumentState::tree` is
+  null.  A handler that gives up there answers *every* editor request with
+  nothing — which is both wrong and the fastest possible benchmark result.  Serve
+  the previous answer (`FoldingRangeCache`) or one derived from the text alone.
+- The bench measures round trips only.  Reply **size** is a real per-keystroke cost
+  the client pays on its main loop (~364 KiB / ~28 ms for a 13k-line file), and
+  Neovim's fold handler walks every row of every range it is handed, so client cost
+  tracks the **sum of range spans**, not the range count.
+- Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
+  startup guards: a **ratio against a structurally identical input at another
+  size**, never an absolute millisecond budget.
+- Editor-side switches for the two per-keystroke features live in
+  `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).  `[inlay_hint].enable`
+  in `lazyverilog.toml` does *not* stop Neovim asking — it only empties the reply.
+- Details and prior measured rounds: `docs/dev/edit-perf.md`.
+
 ### Index Shard Cache
 - Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
   turns it off.  Keyed on **content digests** of the file, its `include`s, and the

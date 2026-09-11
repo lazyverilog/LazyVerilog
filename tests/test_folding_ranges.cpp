@@ -3,10 +3,15 @@
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
+#include <string>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 static FoldingRangeRequestParams make_params(const std::string& uri) {
     FoldingRangeRequestParams p;
@@ -40,6 +45,17 @@ static bool has_fold_starting_at_and_ending_after(const std::vector<FoldingRange
     return std::any_of(folds.begin(), folds.end(), [&](const FoldingRange& r) {
         return r.startLine == start && r.endLine > after;
     });
+}
+
+static bool same_folds(const std::vector<FoldingRange>& a, const std::vector<FoldingRange>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].startLine != b[i].startLine || a[i].endLine != b[i].endLine ||
+            a[i].startCharacter != b[i].startCharacter ||
+            a[i].endCharacter != b[i].endCharacter || a[i].kind != b[i].kind)
+            return false;
+    }
+    return true;
 }
 
 static bool has_exact_duplicate_fold(const std::vector<FoldingRange>& folds) {
@@ -1202,3 +1218,195 @@ endmodule
     fs::remove(link_dir);
     fs::remove_all(real_dir);
 }
+
+// ── Cost model ────────────────────────────────────────────────────────────
+//
+// The editor asks for folds from the `didChange` notification itself, so every
+// keystroke pays for one whole-file fold computation.  Two steps here used to
+// grow with the square of the file:
+//
+//   * emit() rebuilt a line table over the whole buffer for each fold it
+//     produced, making N folds over an M-byte file cost O(N x M);
+//   * normalize_folds() answered its grouping questions by scanning the fold
+//     list, once per fold -- and one of those scans was nested two deep.
+//
+// Both are invisible on the small files the cases above use and dominate on a
+// real RTL block: a 13k-line file spent ~170 ms per request, which an editor
+// then serialized ahead of the completion the user was waiting for.
+//
+// Guard it as a ratio between two inputs of the same shape and different size,
+// never a millisecond budget: a doubled file should cost about twice as much,
+// and anything quadratic costs four times.
+
+namespace {
+
+/// @p stages structurally identical blocks: each one a state enum, a case
+/// statement, nested if/else, a loop, an always_ff and a function -- the fold
+/// shapes an RTL file is made of.
+static std::string folding_scaling_source(int stages) {
+    std::string text = "module scaling_block (input logic clk_i, input logic rst_ni);\n";
+    for (int i = 0; i < stages; ++i) {
+        const std::string n = std::to_string(i);
+        text += "  // ---- stage " + n + " ----\n";
+        text += "  typedef enum logic [1:0] {\n    S" + n + "_IDLE,\n    S" + n +
+                "_RUN,\n    S" + n + "_DONE\n  } state" + n + "_e;\n";
+        text += "  state" + n + "_e state" + n + "_q, state" + n + "_d;\n";
+        text += "  logic [31:0] stage" + n + "_q, stage" + n + "_d;\n";
+        text += "  always_comb begin\n    unique case (state" + n + "_q)\n";
+        text += "      S" + n + "_IDLE: begin\n        if (stage" + n +
+                "_q != '0) begin\n          state" + n + "_d = S" + n +
+                "_RUN;\n        end else begin\n          state" + n + "_d = S" + n +
+                "_IDLE;\n        end\n      end\n";
+        text += "      S" + n + "_RUN: begin\n        for (int j = 0; j < 8; j++) begin\n"
+                "          stage" + n + "_d[j] = ~stage" + n + "_q[j];\n        end\n"
+                "        state" + n + "_d = S" + n + "_DONE;\n      end\n";
+        text += "      default: state" + n + "_d = S" + n + "_IDLE;\n    endcase\n  end\n";
+        text += "  always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+                "    if (!rst_ni) begin\n      state" + n + "_q <= S" + n + "_IDLE;\n"
+                "      stage" + n + "_q <= '0;\n    end else begin\n      state" + n +
+                "_q <= state" + n + "_d;\n      stage" + n + "_q <= stage" + n +
+                "_d;\n    end\n  end\n";
+        text += "  function automatic logic [31:0] mix" + n + "(input logic [31:0] a);\n"
+                "    return a ^ 32'd" + n + ";\n  endfunction\n";
+    }
+    text += "endmodule\n";
+    return text;
+}
+
+/// Fastest of @p runs, for the reason test_shared_header_scaling.cpp takes the
+/// minimum: the cost being guarded is a fixed amount of extra work, so it raises
+/// the floor, and everything a shared runner adds only ever makes a sample
+/// slower.
+static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
+    Analyzer          analyzer;
+    const std::string uri = "file:///fold_scaling_" + std::to_string(stages) + ".sv";
+    analyzer.open(uri, folding_scaling_source(stages));
+
+    std::vector<double> samples;
+    samples.reserve((size_t)runs);
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        auto       folds = provide_folding_range(analyzer, make_params(uri));
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        folds_out = folds.size();
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples.front();
+}
+
+} // namespace
+
+TEST_CASE("foldingRange: cost grows with the file, not with its square",
+          "[folding][scaling]") {
+    constexpr int kStages = 240;
+    constexpr int kRuns   = 5;
+
+    size_t small_folds = 0;
+    size_t large_folds = 0;
+
+    // Warm the allocator and instruction cache so the first measured half is not
+    // charged for both.
+    (void)fastest_folding_ms(kStages, 2, small_folds);
+
+    const double small_ms = fastest_folding_ms(kStages, kRuns, small_folds);
+    const double large_ms = fastest_folding_ms(kStages * 2, kRuns, large_folds);
+
+    // Like for like: the large input must really be twice the small one.
+    REQUIRE(small_folds > 0);
+    // The module's own fold is the one that is not per stage.
+    CHECK(large_folds - 1 == (small_folds - 1) * 2);
+
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[folding scaling] stages=" << kStages << " folds=" << small_folds
+              << " ms=" << small_ms << "  stages=" << (kStages * 2)
+              << " folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio << "\n";
+
+    // Linear is 2.0 and quadratic is 4.0.  Measured at 2.2-2.5 across a 16x
+    // range of sizes, against 3.5 for the quadratic passes this replaced, which
+    // this threshold fails.
+    CHECK(ratio < 3.0);
+}
+
+// ── Folds while a parse is in flight ──────────────────────────────────────
+//
+// An editor asks for folds from the `didOpen`/`didChange` notification itself,
+// so its request reliably arrives while the parse that notification started is
+// still running and the snapshot carries text but no syntax tree.  Answering
+// "no folds" there is not harmless: Neovim applies the empty set to the whole
+// buffer and asks again only on the next change, so the file is left unfoldable
+// until the user types -- and typing lands in the same window again.
+
+TEST_CASE("foldingRange: an edit in flight does not blank the buffer's folds",
+          "[folding]") {
+    const std::string uri  = "file:///fold_reparse.sv";
+    const std::string text = folding_scaling_source(40);
+
+    Analyzer          analyzer;
+    FoldingRangeCache cache;
+    analyzer.open(uri, text);
+
+    const auto settled = provide_folding_range(analyzer, make_params(uri), &cache);
+    REQUIRE(!settled.empty());
+
+    // enqueue_parse() installs a text-only snapshot and hands the parse to a
+    // worker.  That window is what an editor's didChange-triggered request
+    // lands in; catch it, and require having caught it, so this cannot pass by
+    // quietly measuring a settled document instead.
+    bool observed_reparse_window = false;
+    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
+        analyzer.enqueue_parse(uri, text + "\n// edit " + std::to_string(attempt) + "\n");
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state != nullptr);
+        if (state->tree)
+            continue; // the worker beat us to it; try again
+        observed_reparse_window = true;
+
+        CHECK(same_folds(provide_folding_range(analyzer, make_params(uri), &cache), settled));
+    }
+    REQUIRE(observed_reparse_window);
+}
+
+TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
+          "[folding]") {
+    const std::string uri = "file:///fold_first_parse.sv";
+
+    Analyzer          analyzer;
+    FoldingRangeCache cache;
+
+    // Nothing open: there is no document to answer for.
+    CHECK(provide_folding_range(analyzer, make_params(uri), &cache).empty());
+
+    analyzer.enqueue_parse(uri, folding_scaling_source(40));
+
+    bool observed_first_parse = false;
+    for (int attempt = 0; attempt < 50 && !observed_first_parse; ++attempt) {
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state != nullptr);
+        if (state->tree)
+            break;
+        observed_first_parse = true;
+
+        // Nothing has been folded for this buffer yet, so there is nothing to
+        // remember -- but the token scan needs no syntax tree, so the answer is
+        // the folds it finds rather than none at all.
+        const auto early = provide_folding_range(analyzer, make_params(uri), &cache);
+        CHECK(!early.empty());
+
+        // Every fold the token scan produces is a real one, and the AST passes
+        // only add to them.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline && !analyzer.get_state(uri)->tree)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        REQUIRE(analyzer.get_state(uri)->tree != nullptr);
+
+        const auto settled = provide_folding_range(analyzer, make_params(uri), &cache);
+        CHECK(settled.size() >= early.size());
+        for (const auto& fold : early)
+            CHECK(has_fold_kind(settled, fold.startLine, fold.endLine, fold.kind));
+    }
+    REQUIRE(observed_first_parse);
+}
+
+
