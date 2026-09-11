@@ -29,6 +29,14 @@
 </p>
 
 <p align="center">
+  <b>English</b>
+  ·
+  <a href="README.ko.md">한국어</a>
+  ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="#-demo">Demo</a>
   ·
   <a href="#-why-lazyverilog">Why</a>
