@@ -6027,6 +6027,14 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
 
     auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
 
+    // Opened before the lock.  create_directories() plus a .gitignore write is
+    // filesystem work, and on the shared filesystems this cache is aimed at it
+    // is a round trip -- map_mutex_ is the lock every request handler contends
+    // for, and initialize and every config reload would otherwise hold it
+    // across that.
+    auto config_digest = IndexCache::config_digest(defines, resolved_include_dirs);
+    auto cache = project_root.empty() ? std::nullopt : IndexCache::open(project_root);
+
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     // Apply every parse-affecting project input under one lock.  A config reload
@@ -6045,12 +6053,12 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     for (const auto& path : extra_files_)
         extra_file_set_.insert(path);
 
-    // Opened before the burst is scheduled so the preload gate finds it ready.
-    // The digest covers defines and include directories together: both change
-    // what a parse of an unchanged file means, and a shard keyed on only one of
-    // them would be served after the other moved.
-    index_cache_config_digest_ = IndexCache::config_digest(defines_, include_dir_paths_);
-    index_cache_ = project_root.empty() ? std::nullopt : IndexCache::open(project_root);
+    // Installed before the burst is scheduled so the preload gate finds them
+    // ready.  The digest covers defines and include directories together: both
+    // change what a parse of an unchanged file means, and a shard keyed on only
+    // one of them would be served after the other moved.
+    index_cache_config_digest_ = config_digest;
+    index_cache_ = std::move(cache);
 
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();

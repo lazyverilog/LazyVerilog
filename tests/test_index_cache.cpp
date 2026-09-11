@@ -1046,3 +1046,60 @@ TEST_CASE("index cache: a shard whose file still exists is kept", "[index-cache]
     project.index(analyzer, {"a.sv"});
     CHECK(project.shard_files() == 2);
 }
+
+TEST_CASE("index cache: shards from a previous format version are collected", "[index-cache]") {
+    // A format bump makes every stored shard a miss, so nothing will rewrite or
+    // read one again.  Left alone they stay in the user's checkout forever, and
+    // a change to how shards are *named* strands them the same way without any
+    // bump at all.
+    CacheProject project("analyzer-prune-old-format");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv"});
+    }
+    REQUIRE(project.shard_files() == 1);
+
+    // A shard that is ours -- same magic -- from a version this build does not
+    // know.  Byte four of the header is the version.
+    const auto directory = IndexCache::directory_for(project.root());
+    const auto stale = directory / "ghost.sv.0123456789abcdef0123456789abcdef.idx";
+    {
+        std::ifstream in((*std::filesystem::directory_iterator(directory)).path(),
+                         std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        REQUIRE(bytes.size() > 12);
+        bytes[4] = static_cast<char>(0xfe);  // a version number nothing wrote
+        std::ofstream out(stale, std::ios::binary);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    REQUIRE(project.shard_files() == 2);
+
+    Analyzer analyzer;
+    project.index(analyzer, {"a.sv"});
+    CHECK(project.shard_files() == 1);
+    CHECK(!std::filesystem::exists(stale));
+}
+
+TEST_CASE("index cache: a file not written by this cache is left alone", "[index-cache]") {
+    // The sweep runs inside a directory under the user's project.  Anything
+    // without our magic is someone else's and is not ours to delete.
+    CacheProject project("analyzer-prune-foreign");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv"});
+    }
+
+    const auto foreign = IndexCache::directory_for(project.root()) / "someone-elses.idx";
+    {
+        std::ofstream out(foreign, std::ios::binary);
+        out << "this file belongs to something that is not lazyverilog";
+    }
+
+    Analyzer analyzer;
+    project.index(analyzer, {"a.sv"});
+    CHECK(std::filesystem::exists(foreign));
+}

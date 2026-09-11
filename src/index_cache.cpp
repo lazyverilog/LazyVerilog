@@ -23,10 +23,13 @@ namespace {
 // the bottom of this file exist so that adding a field to one of them fails to
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
-constexpr uint32_t kFormatVersion = 3;
-// Written and compared verbatim.  Shards are a local, per-machine cache, so
-// numbers are stored in native byte order and a file produced by a differently
-// ordered build is simply rejected.
+constexpr uint32_t kFormatVersion = 4;
+// Written and compared in native byte order, like every other number here --
+// which means it cannot, on its own, detect the foreign-endian file it is named
+// for: kMagic above is a native u32 too and already fails first on one.  It is
+// kept as a second constant in the fixed-size header so that a future change to
+// the byte order has an obvious place to be signalled from, not because it is
+// carrying a check of its own today.
 constexpr uint32_t kByteOrderMark = 0x01020304;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -759,9 +762,15 @@ fs::path IndexCache::shard_path(std::string_view uri) const {
     if (name.empty())
         name = "shard";
 
+    // Both halves of the digest.  With only the low 64 bits, two files sharing
+    // a basename and a truncated hash map to one shard: each launch overwrites
+    // the other's, so both miss forever, and nothing anywhere says why.  The
+    // extra 16 characters of filename buy that away.
     const auto hash = digest_bytes(uri);
-    std::array<char, 17> hex{};
-    std::snprintf(hex.data(), hex.size(), "%016llx", static_cast<unsigned long long>(hash.lo));
+    std::array<char, 33> hex{};
+    std::snprintf(hex.data(), hex.size(), "%016llx%016llx",
+                  static_cast<unsigned long long>(hash.lo),
+                  static_cast<unsigned long long>(hash.hi));
     return directory_ / (name + "." + std::string(hex.data()) + ".idx");
 }
 
@@ -796,11 +805,23 @@ size_t IndexCache::prune_missing_sources() const {
         }
 
         Reader r(head);
-        // A shard from another format version is left where it is: this pass
-        // removes files whose source is gone, and guessing at a layout it does
-        // not know is how a sweep deletes the wrong thing.  kFormatVersion
-        // already makes such a shard a miss.
-        if (r.u32() != kMagic || r.u32() != kFormatVersion || r.u32() != kByteOrderMark)
+        if (r.u32() != kMagic) {
+            // Not ours.  Something else's file in our directory is not ours to
+            // delete either.
+            continue;
+        }
+        if (r.u32() != kFormatVersion) {
+            // Ours, and dead: a shard of another version can never be a hit, so
+            // nothing will ever rewrite or read it.  Without this, every format
+            // bump strands the whole previous cache in the user's checkout --
+            // and a change to how shards are *named*, like widening the hash
+            // above, strands it under the current version too.
+            std::error_code stale_ec;
+            if (fs::remove(entry.path(), stale_ec))
+                ++removed;
+            continue;
+        }
+        if (r.u32() != kByteOrderMark)
             continue;
         const auto uri = r.raw_str();
         if (r.failed() || uri.empty())
