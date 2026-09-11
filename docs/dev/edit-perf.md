@@ -143,6 +143,31 @@ require("lazyverilog").setup({ folding = false, inlay_hints = false })
 
 `folding = false` leaves `foldmethod` alone, which takes fold computation — the
 request, the reply, and Neovim's own `evaluate()` walk — out of the edit loop
-entirely.  `inlay_hints = false` stops Neovim requesting hints on every change;
-note that the server's `[inlay_hint].enable` does *not* do this, because the
-client asks regardless and the server answers with an empty list.
+entirely.  `inlay_hints = false` stops Neovim requesting hints on every change.
+
+The server half of the hint switch works through capability negotiation, and it
+is worth knowing where that reaches.  `caps.inlayHintProvider` is built from
+`[inlay_hint].enable`, and with the capability off Neovim sends *no* inlayHint
+requests at all — measured 0 against 7 over five keystrokes — even though
+`vim.lsp.inlay_hint.enable(true)` was called and `is_enabled()` reports true.
+But capabilities are exchanged once and never revised, so this only works when
+`initialize` can find the config:
+
+| where `lazyverilog.toml` is, relative to the client's `root_dir` | found at `initialize`? |
+|---|---|
+| at it | yes |
+| above it | yes — `initialize` walks up, as didOpen does |
+| below it | **no** |
+
+The last row is not an oversight.  `initialize` knows only `rootUri`; it does not
+know which file is about to be opened, and this project's config rule is "walk up
+from the opened file".  Searching downward through a large repository is neither
+cheap nor unambiguous.  It is also the common case, because Neovim's
+`vim.fs.root` resolves a flat marker list by marker order rather than proximity,
+so the plugin's default `{ ".git", "lazyverilog.toml" }` roots at the repository
+whenever the config lives in a subdirectory.
+
+LSP's answer for exactly this is dynamic registration —
+`client/unregisterCapability` after the config turns up.  Neovim accepts it for
+`inlayHint` (`dynamicRegistration = true`) but not for `foldingRange` (`false`),
+and `foldingRangeProvider` has no config option to revoke in the first place.
