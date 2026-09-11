@@ -166,7 +166,7 @@ private:
         // later parse in the burst is seeded from this entry, so this is the
         // only reading of those bytes there is to key a shard on.
         texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1,
-                                  IndexCache::digest_bytes(text)});
+                                  IndexCache::digest_source_buffer(text)});
     }
 
     void discard_stale(uint64_t gen) {

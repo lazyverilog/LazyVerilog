@@ -71,6 +71,15 @@ public:
     };
 
     static Digest digest_bytes(std::string_view bytes);
+    /// Digest of a buffer slang loaded, which is the file plus a terminator.
+    ///
+    /// SourceManager appends a '\0' to every buffer it reads or is handed, so
+    /// hashing getSourceText() directly never equals digest_file() of the same
+    /// file -- and a shard keyed that way can never be reused.  The one trailing
+    /// terminator comes off; a source file that genuinely ends in a NUL byte is
+    /// left to hash differently and simply never hit, which is a miss and not a
+    /// wrong answer.
+    static Digest digest_source_buffer(std::string_view buffer);
     /// Digest of a file's contents, or nullopt when it cannot be read.  An
     /// unreadable file is deliberately not a zero digest: that would compare
     /// equal to another unreadable file and turn two different misses into a

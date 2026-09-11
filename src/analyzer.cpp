@@ -266,7 +266,8 @@ static void record_parsed_digests(
     const std::unordered_map<std::string, IndexCache::Digest>& seeded) {
     const auto pair_of = [](const IndexCache::Digest& d) { return std::make_pair(d.lo, d.hi); };
     if (!own_source.empty())
-        state.parsed_digests.emplace(state.uri, pair_of(IndexCache::digest_bytes(own_source)));
+        state.parsed_digests.emplace(state.uri,
+                                     pair_of(IndexCache::digest_source_buffer(own_source)));
     if (!state.source_manager)
         return;
     for (const auto buffer : state.source_manager->getAllBuffers()) {
@@ -285,7 +286,8 @@ static void record_parsed_digests(
         }
         state.parsed_digests.emplace(
             std::move(dependency_uri),
-            pair_of(IndexCache::digest_bytes(state.source_manager->getSourceText(buffer))));
+            pair_of(IndexCache::digest_source_buffer(
+                state.source_manager->getSourceText(buffer))));
     }
 }
 

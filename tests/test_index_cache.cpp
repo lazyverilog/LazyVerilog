@@ -815,7 +815,7 @@ TEST_CASE("header text cache: a projected header keeps the digest of the real on
     // text enters and travels with the entry, unchanged, across project().
     HeaderTextCache cache;
     const std::string full = "`define A 1\nlocalparam int DECL = 3;\n";
-    const auto expected = IndexCache::digest_bytes(full);
+    const auto expected = IndexCache::digest_source_buffer(full);
 
     cache.record_parse(1, {{"/proj/shared.svh", full}}, /*count_as_burst_parse=*/true);
     REQUIRE(cache.seed_candidates(1).size() == 1);
@@ -866,3 +866,52 @@ TEST_CASE("index cache: a burst's projected header does not cost anyone a shard"
         CHECK(snapshot_modules(warm).count("m" + std::to_string(i)) == 1);
 }
 
+TEST_CASE("index cache: an unchanged project is served from the shards", "[index-cache]") {
+    // Every other warm test here asserts the second launch produces the right
+    // index -- which a launch that quietly reparsed everything also does.  That
+    // blind spot hid a real regression: hashing slang's buffer instead of the
+    // file compared a NUL-terminated string against the file's bytes, so no
+    // shard ever validated and the cache was doing nothing at all.
+    //
+    // So this one makes a hit visibly different from a parse.  The stored shard
+    // is edited on disk, keeping its key, to hold a symbol the source does not
+    // contain.  If the symbol comes back, the shard was read; if it does not,
+    // the file was parsed and the cache is dead.
+    CacheProject project("analyzer-served-from-disk");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv"});
+    }
+
+    const auto directory = IndexCache::directory_for(project.root());
+    size_t edited = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() != ".idx")
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        auto loaded = deserialize_index_shard(bytes);
+        REQUIRE(loaded);
+
+        ValueEntry sentinel;
+        sentinel.name = "only_a_reused_shard_has_this";
+        sentinel.kind = "variable";
+        sentinel.file_id = kInvalidSourceFileID;
+        loaded->index.values.push_back(sentinel);
+
+        const auto rewritten =
+            serialize_index_shard(loaded->key, loaded->index, loaded->stands_alone);
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(rewritten.data(), static_cast<std::streamsize>(rewritten.size()));
+        ++edited;
+    }
+    REQUIRE(edited == 1);
+
+    Analyzer analyzer;
+    const auto warm = snapshot_values(project.index(analyzer, {"a.sv"}));
+    CHECK(warm.count("only_a_reused_shard_has_this") == 1);
+    CHECK(warm.count("sig_a") == 1);
+}

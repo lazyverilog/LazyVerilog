@@ -678,6 +678,12 @@ IndexCache::Digest IndexCache::digest_bytes(std::string_view bytes) {
     return Digest{xxhash64(bytes, 0), xxhash64(bytes, 0x9e3779b97f4a7c15ULL)};
 }
 
+IndexCache::Digest IndexCache::digest_source_buffer(std::string_view buffer) {
+    if (!buffer.empty() && buffer.back() == '\0')
+        buffer.remove_suffix(1);
+    return digest_bytes(buffer);
+}
+
 std::optional<IndexCache::Digest> IndexCache::digest_file(const fs::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in)
