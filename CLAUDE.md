@@ -75,8 +75,15 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - It sends them **from the notification itself**, so the request lands while the
   parse that notification started is still running and `DocumentState::tree` is
   null.  A handler that gives up there answers *every* editor request with
-  nothing — which is both wrong and the fastest possible benchmark result.  Serve
-  the previous answer (`FoldingRangeCache`) or one derived from the text alone.
+  nothing — which is both wrong and the fastest possible benchmark result.
+- `provide_folding_range()` therefore derives folds from the **token scan and
+  nothing else** — no syntax tree, no cache, the same answer whether or not the
+  parse has landed.  This is clangd's design (`getFoldingRanges(Code, ...)`, a
+  lex the AST never touches).  The cost is real: SystemVerilog cannot tell
+  `my_type_t state;` from `my_child u_inst (...);` lexically, so instance folds,
+  identifier-led declaration runs and module-header list trimming are gone.  Do
+  not reintroduce an AST pass here without also reintroducing the reparse-window
+  answer it needs.
 - The bench measures round trips only.  The client also pays for the reply on its
   main loop, and Neovim's fold handler walks every row of every range it is handed,
   so that cost tracks the **sum of range spans**, not the range count.  Measured for

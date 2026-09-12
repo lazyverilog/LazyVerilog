@@ -470,9 +470,6 @@ struct LazyVerilogServer::Impl {
     // owned by this server instance instead of using a function-local static
     // (global shared lifetime) or rebuilding providers on every keystroke.
     CompletionEngine completion_engine;
-    // Folds survive the reparse a didChange starts; see FoldingRangeCache.
-    // Owned here for the same reason as the completion engine above.
-    FoldingRangeCache folding_range_cache;
     std::shared_ptr<lsp::ProtocolJsonHandler> json_handler =
         std::make_shared<lsp::ProtocolJsonHandler>();
     std::shared_ptr<GenericEndpoint> endpoint = std::make_shared<GenericEndpoint>(log);
@@ -1234,8 +1231,7 @@ void LazyVerilogServer::register_handlers() {
         td_foldingRange::response rsp;
         rsp.id = req.id;
         try {
-            rsp.result =
-                provide_folding_range(analyzer_, req.params, &impl_->folding_range_cache);
+            rsp.result = provide_folding_range(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] foldingRange error: " << e.what() << "\n";
         }

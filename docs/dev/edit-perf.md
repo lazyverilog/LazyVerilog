@@ -117,19 +117,60 @@ the race opened unfoldable and stayed that way.  Measured in headless Neovim on 
 4k-line file: 4005 of 4008 lines carried a fold level after open, and 0 after
 typing five characters.
 
-Two changes, neither of which blocks the request thread:
+The first fix for this was a `FoldingRangeCache` that served the previous
+document's folds while a reparse was in flight, with the token scan as the
+fallback for a buffer that had nothing cached yet.  Round 2 replaced it.
 
-* `FoldingRangeCache` (`src/features/folding_range.hpp`) keeps the last folds
-  produced per document and serves them while a reparse is in flight.  For the
-  single-character edits that open this window the fold lines are unchanged.
-* With nothing cached — the first request for a buffer — the token scan is run on
-  its own.  `collect_token_folds()` needs only the document text, so it can
-  answer before there is a tree; the AST passes add instance, if/else-chain and
-  identifier-led declaration folds on the next request.
+## Round 2: folding left the AST entirely
 
-Both are guarded in `tests/test_folding_ranges.cpp`.  Those tests catch the
+The cache answered the reparse window, but it was only ever *read* in that
+window — `lookup()` sat inside the `if (!state->tree)` branch, so once the parse
+landed the request path recomputed everything.  Measured in headless Neovim on a
+42k-line file, the steady-state cost of a keystroke's `foldingRange` was ~80 ms
+on the one thread that answers requests.
+
+clangd solves the same problem by never deriving folds from the AST at all:
+
+```cpp
+// clang-tools-extra/clangd/SemanticSelection.h
+/// This version uses the pseudoparser which does not require the AST.
+llvm::Expected<std::vector<FoldingRange>>
+getFoldingRanges(const std::string &Code, bool LineFoldingOnly);
+```
+
+`provide_folding_range()` now does the same: `token_folds(state->text)`, with no
+tree check, no cache and no fallback path.  The answer for a given text is the
+same whether or not its parse has landed, which is what the two
+"parse in flight" tests in `tests/test_folding_ranges.cpp` pin — they catch the
 reparse window and `REQUIRE` having caught it, so they cannot pass by quietly
 measuring a settled document instead.
+
+### What this costs
+
+Not much time — the AST passes were ~17 ms of the ~80 ms; the token scan,
+`normalize_folds()` and JSON are the rest.  What it costs is folds that
+SystemVerilog cannot resolve lexically, because `my_type_t state;` and
+`my_child u_inst (...);` are the same token shape:
+
+| gone | consequence |
+|---|---|
+| `instance` folds | a `#(...)` fold now starts on the instance line, so `zc` there hides only the parameter overrides |
+| identifier-led declaration runs | `state_e state_q;` and friends produce no fold |
+| non-ANSI port declarations in a run | the run starts at the first keyword-led declaration |
+| module-header list trimming | `#(...)` and `(...)` share the `)(` line, so Neovim merges them into one header fold |
+
+Measured against the AST version over the RTL corpora — share of the fold set
+that changes: `bp_processor.sv` loses 11 of 29 folds, `cva6.sv` 27% differs,
+`ibex_core.sv` 18%, `ibex_pkg.sv` 2%.  Generated register files are nearly
+unaffected in count but not in kind: `pinmux_reg_top.sv` keeps 2593 of 2595
+ranges while 1400 of them change from `instance` to `region`.
+
+clangd accepts a narrower loss for the same design, because C++ folding only
+ever folds bracket pairs, `#if` regions and comments — it never attempts
+declaration runs or instance regions.  Note also that clangd's lex-only
+implementation is quadratic in practice (measured 3.5-3.9x per doubling, where
+this project's `[folding][scaling]` guard demands under 3.0); ours is not, and
+the guard stays.
 
 ## The editor half
 
