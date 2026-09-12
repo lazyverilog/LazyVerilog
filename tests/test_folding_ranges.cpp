@@ -1361,3 +1361,104 @@ TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
     }
     REQUIRE(observed_first_parse);
 }
+
+// ── the spans the token scan must keep frozen ─────────────────────────────
+//
+// Folding lexes the buffer itself (lex_fold_tokens) instead of borrowing the
+// formatter's collector.  Three spans have to stay frozen for the folds above
+// to come out the same, and each of them is a span whose *contents* would open
+// folds of their own if the scan let their tokens through.
+
+TEST_CASE("foldingRange: a directive's operands do not fold", "[folding]") {
+    const std::string uri = "file:///fold_directive_line.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, R"(module top;
+`ifdef SYNTHESIS
+  wire a;
+  wire b;
+`endif
+endmodule
+)");
+
+    const auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // The `ifdef/`endif pair folds, ...
+    CHECK(has_fold(folds, 1, 4));
+    // ... and nothing starts on a directive line: slang lexes `ifdef and
+    // SYNTHESIS as two tokens, and an operand read as an ordinary identifier
+    // would open a declaration run of its own.
+    for (const auto& f : folds)
+        CHECK(f.startLine != 4);
+}
+
+TEST_CASE("foldingRange: a multiline define body is one token", "[folding]") {
+    const std::string uri = "file:///fold_multiline_define.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, R"(`define WRAP(x) \
+  begin \
+    if (x) begin \
+      $display("x"); \
+    end \
+  end
+module top;
+  initial begin
+    $display("hi");
+  end
+endmodule
+)");
+
+    const auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // The begin/end keywords inside the define body are part of the frozen
+    // body, so they open nothing; the real begin/end below still folds.
+    for (const auto& f : folds)
+        CHECK(f.startLine > 5);
+    CHECK(has_fold(folds, 7, 9));
+}
+
+TEST_CASE("foldingRange: a format-off region does not fold", "[folding]") {
+    const std::string uri = "file:///fold_format_off.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, R"(module top;
+  // verilog-format: off
+  initial begin
+    $display("frozen");
+  end
+  // verilog-format: on
+  initial begin
+    $display("live");
+  end
+endmodule
+)");
+
+    const auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // Neither the disabled region's begin/end nor its marker comments fold; the
+    // block after the region does.
+    CHECK(!has_fold(folds, 2, 4));
+    for (const auto& f : folds)
+        CHECK(f.startLine != 1);
+    CHECK(has_fold(folds, 6, 8));
+}
+
+TEST_CASE("foldingRange: a macro usage is not a directive line", "[folding]") {
+    const std::string uri = "file:///fold_macro_usage.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, R"(module top;
+  `MY_MACRO function int f(input int a);
+    return a;
+  endfunction
+endmodule
+)");
+
+    const auto folds = provide_folding_range(analyzer, make_params(uri));
+
+    // A directive freezes the rest of its line so its operands cannot open
+    // folds.  A user macro invocation must not: `MY_MACRO is an ordinary token,
+    // and the function it precedes still folds.
+    CHECK(has_fold(folds, 1, 3));
+}
