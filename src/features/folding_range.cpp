@@ -1072,10 +1072,13 @@ namespace {
 /// active and inactive preprocessor branches appear in the stream.  It needs
 /// only the document text, which is what lets a buffer whose parse has not
 /// landed still be answered.
-std::vector<FoldingRange> token_folds_unnormalized(const std::string& text) {
+///
+/// Takes the line table rather than building one: both halves of a request need
+/// it, and it is a scan of the whole document.  Building one per half meant
+/// every keystroke walked the file an extra time for a table it already had.
+std::vector<FoldingRange> token_folds_unnormalized(const std::string& text, const LineTable& lt) {
     FormatOptions             default_opts;
     svfmt::TokenStream        tokens = svfmt::TokenCollector(text, default_opts).collect();
-    LineTable                 lt{text};
     std::vector<FoldingRange> out;
     collect_token_folds(tokens, lt, out);
     return out;
@@ -1083,7 +1086,7 @@ std::vector<FoldingRange> token_folds_unnormalized(const std::string& text) {
 
 std::vector<FoldingRange> token_folds(const std::string& text) {
     LineTable lt{text};
-    auto      out = token_folds_unnormalized(text);
+    auto      out = token_folds_unnormalized(text, lt);
     normalize_folds(out, lt);
     return out;
 }
