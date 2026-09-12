@@ -5344,7 +5344,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         //
         // Recovering that ID first prevents same-name typedef fields from being
         // merged by references/rename.
-        auto current_structural_index = get_structural_index(*state);
+        // By reference: this is the index cached on the immutable snapshot,
+        // and `state` holds it alive for the rest of the request.  Binding it
+        // to a value copied every declaration and reference occurrence in the
+        // file, on a path a click runs.
+        const auto& current_structural_index = get_structural_index(*state);
         Location clicked_loc{uri, target->line, target->col, target->line, target->end_col};
         // Prefer the symbol identity at the token the user actually clicked.
         // This matters for declaration tokens whose plain name appears in
@@ -5864,7 +5868,9 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // Resolving `memory` in memory_top.sv through definition_of_state()
             // would require closed/project-file ASTs in the resolver.  The
             // SymbolID path avoids that by matching `module:memory` directly.
-            const auto open_index = get_structural_index(*state);
+            // By reference, for the reason above; `state` is the loop's own
+            // snapshot handle and outlives every use below.
+            const auto& open_index = get_structural_index(*state);
             // The structural index deliberately omits imports; the dynamic
             // shard is the cached view that carries them.  The class-member
             // alias needs them too: admits_class_member_alias() proves a
@@ -7005,7 +7011,8 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
     auto state = get_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
-    const auto state_index = get_structural_index(*state);
+    // By reference, for the reason above.
+    const auto& state_index = get_structural_index(*state);
     if (state_index.modules.empty())
         return std::nullopt;
 
@@ -7083,7 +7090,8 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
     auto state = get_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
-    const auto state_index = get_structural_index(*state);
+    // By reference, for the reason above.
+    const auto& state_index = get_structural_index(*state);
     if (state_index.modules.empty())
         return std::nullopt;
 
