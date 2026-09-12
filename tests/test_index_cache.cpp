@@ -1115,3 +1115,95 @@ TEST_CASE("index cache: a file not written by this cache is left alone", "[index
     project.index(analyzer, {"a.sv"});
     CHECK(std::filesystem::exists(foreign));
 }
+
+TEST_CASE("index cache: a source replaced by a directory is a miss, not a crash",
+          "[index-cache]") {
+    // The shape that took the whole server down.  Digesting a path is how the
+    // preload decides whether a stored shard is still good, and it only reaches
+    // a path that already has one -- so this fires on the *second* launch, from
+    // a background worker, where an escaping exception is std::terminate.
+    //
+    // libstdc++ opens a directory without complaint and throws out of
+    // basic_filebuf::underflow on the first read, whatever the stream's
+    // exception mask says, so `if (!in)` never sees it.
+    CacheProject project("analyzer-source-is-directory");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+    project.write("b.sv", "module b;\n  logic [7:0] sig_b;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        const auto cold = project.index(analyzer, {"a.sv", "b.sv"});
+        CHECK(snapshot_modules(cold) == std::set<std::string>{"a", "b"});
+    }
+    REQUIRE(project.shard_files() > 0);
+
+    std::filesystem::remove(project.root() / "a.sv");
+    std::filesystem::create_directories(project.root() / "a.sv");
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"a.sv", "b.sv"});
+    // The unreadable entry drops out; every other file still indexes.
+    CHECK(snapshot_modules(warm) == std::set<std::string>{"b"});
+}
+
+TEST_CASE("index cache: an `include`d header replaced by a directory is a miss, not a crash",
+          "[index-cache]") {
+    // Same fault, reached through a dependency digest rather than the file's
+    // own: a shard is keyed on every header its parse read, so the preload
+    // digests those too.
+    CacheProject project("analyzer-header-is-directory");
+    project.write("defs.svh", "localparam int from_header = 1;\n");
+    project.write("a.sv", "`include \"defs.svh\"\nmodule a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    {
+        Analyzer analyzer;
+        const auto cold = project.index(analyzer, {"a.sv"});
+        CHECK(snapshot_values(cold).count("from_header") == 1);
+    }
+
+    std::filesystem::remove(project.root() / "defs.svh");
+    std::filesystem::create_directories(project.root() / "defs.svh");
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"a.sv"});
+    // The header is gone as far as the preprocessor is concerned, but the
+    // includer still parses and still has a module.
+    CHECK(snapshot_modules(warm) == std::set<std::string>{"a"});
+    CHECK(snapshot_values(warm).count("from_header") == 0);
+}
+
+TEST_CASE("index cache: a directory named like a shard is left alone by the sweep",
+          "[index-cache]") {
+    // The sweep reads the head of every *.idx in its directory to find out
+    // whose it is.  One that is a directory would throw there for the same
+    // reason, and it is not ours to delete either.
+    CacheProject project("analyzer-shard-is-directory");
+    project.write("a.sv", "module a;\nendmodule\n");
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv"});
+    }
+
+    const auto intruder = IndexCache::directory_for(project.root()) / "not-a-shard.idx";
+    std::filesystem::create_directories(intruder);
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"a.sv"});
+    CHECK(snapshot_modules(warm) == std::set<std::string>{"a"});
+    CHECK(std::filesystem::is_directory(intruder));
+}
+
+TEST_CASE("index cache: an unreadable path has no digest", "[index-cache]") {
+    // digest_file() answers "what did I read"; for anything that is not an
+    // ordinary file there is no answer, and nullopt is how the caller is told
+    // it cannot key a shard on this.
+    TempDir dir("digest-not-a-file");
+    const auto as_directory = dir.path() / "looks-like-source.sv";
+    std::filesystem::create_directories(as_directory);
+    CHECK(!IndexCache::digest_file(as_directory).has_value());
+    CHECK(!IndexCache::digest_file(dir.path()).has_value());
+
+    // And the ordinary case still works, so the guard has not swallowed it.
+    const auto file = dir.write("real.sv", "module m; endmodule\n");
+    CHECK(IndexCache::digest_file(file).has_value());
+}
