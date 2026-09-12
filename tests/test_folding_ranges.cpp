@@ -1462,3 +1462,51 @@ endmodule
     // and the function it precedes still folds.
     CHECK(has_fold(folds, 1, 3));
 }
+
+// ── one computation per snapshot ──────────────────────────────────────────
+
+TEST_CASE("foldingRange: a second request for an unchanged buffer reuses the folds",
+          "[folding]") {
+    const std::string uri = "file:///fold_snapshot_cache.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, folding_scaling_source(20));
+
+    const auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    // Nothing has asked for folds yet.
+    CHECK(state->folding_ranges() == nullptr);
+
+    const auto first = provide_folding_range(analyzer, make_params(uri));
+    REQUIRE(!first.empty());
+
+    const auto cached = state->folding_ranges();
+    REQUIRE(cached != nullptr);
+    CHECK(same_folds(*cached, first));
+
+    // The second request is answered from that same computation, not a new one.
+    const auto second = provide_folding_range(analyzer, make_params(uri));
+    CHECK(same_folds(second, first));
+    CHECK(state->folding_ranges() == cached);
+}
+
+TEST_CASE("foldingRange: an edit gets its own folds, not the previous snapshot's",
+          "[folding]") {
+    const std::string uri = "file:///fold_snapshot_invalidate.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, folding_scaling_source(20));
+    const auto before = provide_folding_range(analyzer, make_params(uri));
+    REQUIRE(!before.empty());
+
+    analyzer.change(uri, folding_scaling_source(40));
+    const auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    // A new snapshot starts with nothing cached; the text is what it folds.
+    CHECK(state->folding_ranges() == nullptr);
+
+    const auto after = provide_folding_range(analyzer, make_params(uri));
+    CHECK(after.size() > before.size());
+    REQUIRE(state->folding_ranges() != nullptr);
+    CHECK(same_folds(*state->folding_ranges(), after));
+}

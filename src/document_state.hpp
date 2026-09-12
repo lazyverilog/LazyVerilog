@@ -14,6 +14,10 @@
 namespace slang::syntax {
 class SyntaxTree;
 }
+// The LSP fold type.  Declared rather than included: folding is the only
+// consumer, and the cache below holds it behind a shared_ptr, so this core
+// header does not have to pull in the protocol headers to name it.
+struct FoldingRange;
 /// Pre-formatted diagnostic info extracted at parse time.
 /// Avoids copying slang::Diagnostic (whose ConstantValue args are
 /// not safely copyable — internal arena pointers become dangling).
@@ -140,6 +144,32 @@ struct DocumentState {
     // gets a new DocumentState and therefore a fresh once_flag/cache pair.
     mutable std::once_flag dynamic_index_once_;
     mutable SyntaxIndex dynamic_index_cache_;
+    // Folds derived from this snapshot's text, computed at most once.
+    //
+    // Whole-file foldingRange is the most expensive request on the edit path,
+    // the editor issues one per didChange, and requests are answered one at a
+    // time.  Edits that arrive faster than the server answers therefore leave
+    // several fold requests queued that all resolve to whatever snapshot is
+    // current when they finally run -- and after the last keystroke that is one
+    // snapshot for the whole remaining queue.  Recomputing the identical answer
+    // for each of them is the entire tail the user waits through.
+    //
+    // The text is immutable, so this needs no invalidation: a new edit gets a
+    // new DocumentState and an empty cache.
+    mutable std::mutex folding_ranges_mutex_;
+    mutable std::shared_ptr<const std::vector<FoldingRange>> folding_ranges_;
+
+    /// The folds computed from this snapshot, or null if none have been.
+    std::shared_ptr<const std::vector<FoldingRange>> folding_ranges() const {
+        std::lock_guard<std::mutex> lock(folding_ranges_mutex_);
+        return folding_ranges_;
+    }
+    void set_folding_ranges(std::shared_ptr<const std::vector<FoldingRange>> folds) const {
+        if (!folds)
+            return;
+        std::lock_guard<std::mutex> lock(folding_ranges_mutex_);
+        folding_ranges_ = std::move(folds);
+    }
     // The most recent snapshot of this document that had a tree, when this one
     // does not.  didChange installs a text-only placeholder and hands the parse
     // to a worker, and the editor issues its requests from that same

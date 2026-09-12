@@ -1271,9 +1271,18 @@ std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
 
     // Folds are derived from the token scan and nothing else, so this answer
     // does not depend on the parse the document's last notification started.
-    // There is no tree to wait for, no reparse window to bridge, and no earlier
-    // answer to remember: every request is served from the text the client last
-    // sent.  That is what keeps the editor's per-keystroke foldingRange off the
-    // AST entirely.
-    return token_folds(state->text);
+    // There is no tree to wait for and no reparse window to bridge: every
+    // request is served from the text the client last sent.  That is what keeps
+    // the editor's per-keystroke foldingRange off the AST entirely.
+    //
+    // It is also what makes the answer a property of the snapshot rather than
+    // of the request, so the whole queue of fold requests that piles up behind
+    // a fast burst -- key repeat, a paste, a macro -- shares one computation
+    // once the edits stop arriving, instead of repeating it once per request.
+    if (const auto cached = state->folding_ranges())
+        return *cached;
+
+    auto folds = std::make_shared<const std::vector<FoldingRange>>(token_folds(state->text));
+    state->set_folding_ranges(folds);
+    return *folds;
 }
