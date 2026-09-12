@@ -2,6 +2,9 @@
 vcode = "demo/vcode.f"
 define = ["RTL_SIM"]   # preprocessor defines passed to slang for parsing
 
+[index]
+cache = true                   # reuse per-file index shards from .cache/lazyverilog/index across launches
+
 [compilation]
 background_compilation = false # run semantic compilation in background workers (slower, richer diagnostics)
 background_compilation_debounce_ms = 10000 # wait after edits before starting semantic compilation
@@ -166,6 +169,9 @@ align_adaptive = true                  # if true, per-line gap; if false, all po
 
 [inlay_hint]
 enable = true  # set false to disable all inlay hints
+
+[folding]
+enable = true  # set false to stop the editor requesting folds on every edit
 
 [autoff]
 register_pattern = "^r_"  # regex — signal matching this is the register (dst); the other is the source

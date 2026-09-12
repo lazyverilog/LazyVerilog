@@ -32,3 +32,5 @@ Notable difference from older examples:
 - [Build and tests](dev/test.md)
 - [Design filelist cache](dev/files.md)
 - [Indexing philosophy](dev/indexing.md)
+- [Startup performance](dev/startup-perf.md)
+- [Edit-path performance](dev/edit-perf.md)

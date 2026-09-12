@@ -252,6 +252,86 @@ restarts.  Only extensions in `kWatchedSourceExtensions` are cached — that arr
 is also what builds the watcher glob registration in `server.cpp`, so a path the
 client is not asked to watch is one the cache refuses to hold.
 
+## Reusing shards across launches
+
+Shards are written to `<project_root>/.cache/lazyverilog/index` and reloaded on
+the next launch, the way clangd's background index uses
+`<project_root>/.cache/clangd/index`.  `[index].cache = false` turns it off.
+
+A shard is reused only when everything it was built from still holds:
+
+- the file's own contents;
+- the defines and include directories, which change what a parse of an
+  unchanged file *means*;
+- every file it pulled in through `` `include ``;
+- **how each of its `` `include ``s resolved**, including the ones that resolved
+  to nothing.
+
+That last one is not a digest, and cannot be.  A digest answers "did the file I
+read change".  An `` `include `` that now finds a *different* file changes
+nothing anyone hashed: the includer is untouched and the header it used to find
+is still there, byte for byte.  Two ordinary ways to hit it — writing a header
+that a file already `` `include ``s, which is the usual order to work in, and
+adding a header to a directory earlier in the search order, which is what an
+override directory is for.  So the decision is recorded next to the digests, and
+the preload re-runs slang's search (`SourceManager::readHeader`'s order: absolute
+as written, system includes against system directories of which the parse path
+configures none, otherwise the including file's own directory then the configured
+include directories in order).  Memoized on (directory, spelling, is_system),
+which keeps it a handful of stats per burst rather than one search per directive
+per file.
+
+The key is a **content digest, never mtime**.  On a shared or batch-scheduled
+filesystem mtime produces false hits as well as false misses — clock skew
+between nodes, attribute caching, and a fresh checkout or rsync resetting
+stamps.  Hashing costs one read of a file that was about to be read anyway.
+
+Two consequences for anyone touching the index:
+
+- **Header shards are cached too, and a stale one invalidates its includers.**
+  Skipping a file's parse skips the only thing that would have built its header
+  shards, so a hit is only usable when the headers it recorded are hits as well.
+  A header that did not stand alone was sharded from *an includer's* tree, so
+  that includer is recorded as one of its dependencies — nothing inside the
+  shard says so.
+- **Anything a shard does not store is lost across a restart.**  `SyntaxIndex`
+  fields that a build *derives* (`module_by_name`, `port_by_name`, the
+  `source_file_ids` reverse table) are rebuilt on load with the same first-wins
+  rule the build uses.  Fields that a build *decides* — the package-scoped
+  lookup maps — are stored, because a shard on its own cannot re-derive them;
+  this is the same reason `split_by_source_file()` carries them.
+
+Adding a field to any indexed entry means updating `src/index_cache.cpp` and
+bumping `kFormatVersion`.  The entry structs are size-frozen with
+`static_assert` so that this cannot be forgotten: a dropped field would
+otherwise show up as a symbol that resolves before a restart and not after.
+Changing how shards are *named* (`shard_path()`) needs a bump as well, or every
+shard under the old naming is stranded where nothing will read or rewrite it.
+
+Two more things that are easy to get wrong:
+
+- **Digest the bytes the parse read, not the file.**  `store_shard_in_cache()`
+  takes its digests from `DocumentState::parsed_digests`, filled while the
+  `SourceManager` still holds what slang loaded.  Re-reading the file to hash it
+  afterwards keys a shard built from one set of bytes on the digest of another
+  whenever the file moves in between — a false hit no later launch can detect.
+  Hashing a `SourceManager` buffer means `IndexCache::digest_source_buffer()`:
+  slang appends a `'\0'` to every buffer, so hashing `getSourceText()` directly
+  never equals `digest_file()` and nothing ever validates.
+- **A warm test has to distinguish a hit from a reparse.**  Asserting that the
+  second launch produces the right index does not — a launch that quietly
+  reparsed everything produces exactly that, which is how a completely dead
+  cache passed the whole suite.  Edit the stored shard on disk, keep its key,
+  and assert the edit comes back.
+
+Shards are swept by `IndexCache::prune_missing_sources()`, queued by the preload
+onto the cache writer thread.  It removes shards whose source file no longer
+exists — the only way this directory grows, since an edit rewrites a shard in
+place — and shards carrying our magic with another format version, which nothing
+will ever read again.  A file without our magic is someone else's and is left
+alone.  A file that has merely left the filelist is kept: it is legitimately
+reusable when it comes back, and skipping it costs one stat.
+
 ## Published project index snapshot
 
 The published project index is shard-based.  A `ProjectIndexSnapshot` contains

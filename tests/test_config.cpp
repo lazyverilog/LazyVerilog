@@ -25,6 +25,7 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.compilation.background_compilation_debounce_ms == 1500);
     CHECK(cfg.compilation.log_timing == false);
     CHECK(cfg.inlay_hint.enable == true);
+    CHECK(cfg.folding.enable == true);
     CHECK(cfg.format.indent_size == 2);
     CHECK(cfg.lint.statement.case_missing_default == false);
     CHECK(cfg.lint.style.trailing_whitespace == false);
@@ -59,6 +60,9 @@ background_compilation_debounce_ms = 750
 log_timing = true
 
 [inlay_hint]
+enable = false
+
+[folding]
 enable = false
 
 [format]
@@ -215,6 +219,8 @@ autoarg_on_save = true
     CHECK(cfg.compilation.log_timing == true);
 
     CHECK(cfg.inlay_hint.enable == false);
+
+    CHECK(cfg.folding.enable == false);
 
     CHECK(cfg.format.indent_size == 4);
     CHECK(cfg.format.blank_lines_between_items == 2);

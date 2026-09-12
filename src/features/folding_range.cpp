@@ -2,21 +2,18 @@
 #include "document_state.hpp"
 #include "formatter_lexer.hpp"
 #include "formatter_token.hpp"
-#include "string_utils.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <map>
-#include <optional>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <slang/syntax/AllSyntax.h>
-#include <slang/syntax/SyntaxTree.h>
-#include <slang/syntax/SyntaxVisitor.h>
-#include <slang/text/SourceLocation.h>
-#include <slang/text/SourceManager.h>
 
 using namespace slang;
 using namespace slang::syntax;
@@ -67,31 +64,15 @@ struct LineTable {
     }
 };
 
-// ── AST path helpers (used only by IfElseChainVisitor) ───────────────────
-
-static int token_line(const SourceManager& sm, const Token& tok) {
-    if (!tok || !tok.location().valid()) return -1;
-    return (int)sm.getLineNumber(tok.location()) - 1;
-}
-
-static int token_column(const SourceManager& sm, const Token& tok) {
-    if (!tok || !tok.location().valid()) return 0;
-    return (int)sm.getColumnNumber(tok.location()) - 1;
-}
-
-static int first_line(const SourceManager& sm, const SyntaxNode& n) {
-    return token_line(sm, n.getFirstToken());
-}
-
-static int last_line(const SourceManager& sm, const SyntaxNode& n) {
-    return token_line(sm, n.getLastToken());
-}
-
-static void emit(std::vector<FoldingRange>& out, const SourceManager& sm, BufferID buffer,
+// Emit a fold.  The LineTable is built once per request and handed in rather
+// than derived from the buffer here: it is a full scan of the file, and this is
+// called once per fold, so building it here made producing N folds for a file of
+// M bytes cost O(N x M).  On a 13k-line RTL file that was ~80 ms of a ~170 ms
+// foldingRange -- paid on every keystroke, because the editor re-requests folds
+// on every didChange.
+static void emit(std::vector<FoldingRange>& out, const LineTable& lt,
                  int start, int end, const std::string& kind = "region") {
     if (start < 0 || end < 0 || start >= end) return;
-    auto text_sv = sm.getSourceText(buffer);
-    LineTable lt{text_sv};
     FoldingRange r;
     r.startLine      = start;
     r.endLine        = end;
@@ -100,409 +81,8 @@ static void emit(std::vector<FoldingRange>& out, const SourceManager& sm, Buffer
     r.kind           = kind;
     out.push_back(r);
 }
-
-static void emit_node(std::vector<FoldingRange>& out, const SourceManager& sm,
-                      const SyntaxNode& node, const std::string& kind = "region") {
-    Token first = node.getFirstToken();
-    if (!first || !first.location().valid()) return;
-    emit(out, sm, first.location().buffer(), first_line(sm, node), last_line(sm, node), kind);
-}
-
-static void emit_token_fold(std::vector<FoldingRange>& out, const LineTable& lt,
-                            int start, int end, const std::string& kind = "region");
-
-static std::optional<BufferID> find_current_buffer(const SourceManager& sm,
-                                                   std::string_view text,
-                                                   const std::string& uri) {
-    const std::string path = path_from_file_uri(uri);
-    // Compare canonical spellings on both sides.  The client sends whatever path
-    // the user opened, while SourceManager reports the path it was handed, and
-    // the two only look alike on a filesystem that resolves paths to themselves.
-    // macOS resolves /tmp to /private/tmp and Windows resolves a drive-relative
-    // path to a drive-qualified one, so normalizing only one side finds nothing
-    // there -- and every AST-derived fold is silently dropped, because the
-    // visitors below skip nodes outside the buffer this returns.
-    const std::string normalized_path = normalize_filesystem_path(path).string();
-
-    for (BufferID buffer : sm.getAllBuffers()) {
-        if (sm.getIncludedFrom(buffer).valid())
-            continue;
-        if (sm.getSourceText(buffer) == text)
-            return buffer;
-        // Note that getRawFileName() is a bare filename for buffers created
-        // through make_lsp_source_manager(): slang only computes a fuller
-        // "proximate" name when proximate paths are enabled, and they are
-        // deliberately disabled to keep include resolution off the metadata
-        // path.  So this matches only the assignText() spellings that already
-        // carry a full path or URI.
-        if (sm.getRawFileName(buffer) == uri || sm.getRawFileName(buffer) == path)
-            return buffer;
-        if (const auto& full_path = sm.getFullPath(buffer);
-            !full_path.empty() &&
-            normalize_filesystem_path(full_path).string() == normalized_path)
-            return buffer;
-    }
-    return std::nullopt;
-}
-
-// ── minimal AST visitor: if/else chain linking only ──────────────────────
-//
-// Token-based fold detection cannot reliably link chained if/else-if/else
-// branches because it cannot distinguish them from independent blocks without
-// parsing context.  This minimal visitor handles exactly two node types where
-// AST precision is needed:
-//   - ConditionalStatementSyntax: fold the whole if/else chain as one region
-//   - IfGenerateSyntax: fold if-arm and else-arm as separate regions
-//
-// All other folds are produced by collect_token_folds() below.
-
-struct IfElseChainVisitor : public SyntaxVisitor<IfElseChainVisitor> {
-    const SourceManager&       sm;
-    BufferID                   current_buffer;
-    std::vector<FoldingRange>& out;
-
-    IfElseChainVisitor(const SourceManager& sm, BufferID current_buffer,
-                       std::vector<FoldingRange>& out)
-        : sm(sm), current_buffer(current_buffer), out(out) {}
-
-    bool in_current_buffer(const Token& tok) const {
-        return tok && tok.location().valid() &&
-               tok.location().buffer() == current_buffer;
-    }
-
-    void emit_node_if_current(const SyntaxNode& node) {
-        Token first = node.getFirstToken();
-        Token last  = node.getLastToken();
-        if (!in_current_buffer(first) || !in_current_buffer(last))
-            return;
-        emit(out, sm, current_buffer, token_line(sm, first), token_line(sm, last));
-    }
-
-    void handle(const ConditionalStatementSyntax& node) {
-        emit_node_if_current(node);
-        visitDefault(node);
-    }
-
-    void handle(const IfGenerateSyntax& node) {
-        Token first = node.getFirstToken();
-        Token last  = node.getLastToken();
-        if (!in_current_buffer(first) || !in_current_buffer(last)) {
-            visitDefault(node);
-            return;
-        }
-        int node_start = first_line(sm, node);
-        int node_end   = last_line(sm, node);
-        if (node.elseClause && in_current_buffer(node.elseClause->elseKeyword)) {
-            int else_line = token_line(sm, node.elseClause->elseKeyword);
-            emit(out, sm, current_buffer, node_start, else_line - 1);
-            emit(out, sm, current_buffer, else_line, node_end);
-        } else {
-            emit(out, sm, current_buffer, node_start, node_end);
-        }
-        visitDefault(node);
-    }
-};
-
-// AST-backed module/interface/program header list folds.
-//
-// The token scanner can usually split a parameterized ANSI header into "#(...)"
-// and "(...)" folds, but some malformed / partially edited headers can still be
-// parsed by slang as one header-shaped syntax region.  Use the current file AST
-// as a second source of truth for the two delimiter pairs that users actually
-// want to fold:
-//
-//     module m #(
-//         parameter int W = 8
-//     )(
-//         input logic clk
-//     );
-//     ^^^^^^^^^^^^^^^^^ parameter list fold
-//       ^^^^^^^^^^^^^^^ port list fold
-//
-// This intentionally does not emit a whole-header fold.  The enclosing module
-// fold already covers the whole declaration when an endmodule exists, and a
-// header-only fold such as (0, 11) competes with the more useful child folds in
-// editors that show only one fold marker per start line.
-struct HeaderListVisitor : public SyntaxVisitor<HeaderListVisitor> {
-    const SourceManager&       sm;
-    BufferID                   current_buffer;
-    std::vector<FoldingRange>& out;
-
-    HeaderListVisitor(const SourceManager& sm, BufferID current_buffer,
-                      std::vector<FoldingRange>& out)
-        : sm(sm), current_buffer(current_buffer), out(out) {}
-
-    void emit_tokens(Token open, Token close) {
-        if (!open || !close || !open.location().valid() ||
-            !close.location().valid())
-            return;
-        if (open.location().buffer() != current_buffer ||
-            close.location().buffer() != current_buffer)
-            return;
-
-        int start = token_line(sm, open);
-        int end   = token_line(sm, close);
-        if (start < 0 || end < 0 || start >= end)
-            return;
-
-        FoldingRange r;
-        r.startLine      = start;
-        r.endLine        = end;
-        r.startCharacter = token_column(sm, open);
-        r.endCharacter   = token_column(sm, close) + (int)close.rawText().length();
-        r.kind           = "region";
-        out.push_back(r);
-    }
-
-    void handle(const ModuleHeaderSyntax& node) {
-        if (node.parameters)
-            emit_tokens(node.parameters->openParen, node.parameters->closeParen);
-
-        if (node.ports) {
-            switch (node.ports->kind) {
-            case SyntaxKind::AnsiPortList: {
-                const auto& ports = node.ports->as<AnsiPortListSyntax>();
-                emit_tokens(ports.openParen, ports.closeParen);
-                break;
-            }
-            case SyntaxKind::NonAnsiPortList: {
-                const auto& ports = node.ports->as<NonAnsiPortListSyntax>();
-                emit_tokens(ports.openParen, ports.closeParen);
-                break;
-            }
-            case SyntaxKind::WildcardPortList: {
-                const auto& ports = node.ports->as<WildcardPortListSyntax>();
-                emit_tokens(ports.openParen, ports.closeParen);
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        visitDefault(node);
-    }
-};
-
-// AST-backed declaration collection.
-//
-// Token-only declaration detection is useful for inactive preprocessor branches,
-// but it cannot safely recognize declarations whose type starts with an
-// identifier:
-//
-//     my_type_t         state;
-//     pkg::payload_t    payload;
-//     some_class        handle;
-//
-// The same token shape can also be a module/interface instantiation, so guessing
-// lexically would either miss valid declarations or fold instances as variables.
-// For active code, slang's parsed syntax tree has already made that distinction,
-// so this visitor records declaration statement extents directly from AST nodes.
-struct DeclarationRunVisitor : public SyntaxVisitor<DeclarationRunVisitor> {
-    const SourceManager& sm;
-    BufferID current_buffer;
-    std::vector<std::pair<int, int>>& decls;
-
-    explicit DeclarationRunVisitor(const SourceManager& sm, BufferID current_buffer,
-                                   std::vector<std::pair<int, int>>& decls)
-        : sm(sm), current_buffer(current_buffer), decls(decls) {}
-
-    void record(const SyntaxNode& node) {
-        Token first = node.getFirstToken();
-        Token last  = node.getLastToken();
-        if (!first || !last || !first.location().valid() ||
-            !last.location().valid())
-            return;
-        if (first.location().buffer() != current_buffer ||
-            last.location().buffer() != current_buffer)
-            return;
-        int start = token_line(sm, first);
-        int end   = token_line(sm, last);
-        if (start >= 0 && end >= start)
-            decls.emplace_back(start, end);
-    }
-
-    void handle(const DataDeclarationSyntax& node) {
-        // Covers module/package/class data declarations, including user-defined
-        // type names and class handles:
-        //     my_type_t a;
-        //     pkg::type_t b;
-        //     my_class c;
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const NetDeclarationSyntax& node) {
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const UserDefinedNetDeclarationSyntax& node) {
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const PortDeclarationSyntax& node) {
-        // Non-ANSI module/interface headers declare only port names in the
-        // header, then provide semicolon-terminated port declarations in the
-        // body-like declaration area:
-        //
-        //     module m(clk, rst_n, data);
-        //         input  logic       clk;
-        //         input  logic       rst_n;
-        //         output logic [7:0] data;
-        //     endmodule
-        //
-        // These are declarations just like consecutive internal variables and
-        // should participate in the same declaration-run folding.  Recording the
-        // parsed AST node avoids lexical guesses and also handles typed ports
-        // that use user-defined types:
-        //
-        //     output payload_t payload;
-        //
-        // ANSI header ports are parsed as header port syntax, not as these
-        // semicolon-terminated PortDeclarationSyntax members, so this does not
-        // create extra folds inside "(input ..., output ...)" headers.
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const LocalVariableDeclarationSyntax& node) {
-        // Procedural / assertion-local declarations.  This also catches
-        // user-defined local variables inside begin/end blocks.
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const ParameterDeclarationStatementSyntax& node) {
-        // Semicolon-terminated parameter/localparam declarations in bodies.
-        // Parameter port-list entries are ParameterDeclarationSyntax nodes under
-        // ParameterPortListSyntax, not this statement wrapper, so recording only
-        // the statement avoids folding individual entries inside "#(...)".
-        record(node);
-        visitDefault(node);
-    }
-};
-
-static void collect_ast_declaration_folds(const SourceManager& sm,
-                                          BufferID current_buffer,
-                                          const LineTable& lt,
-                                          const SyntaxNode& root,
-                                          std::vector<FoldingRange>& out) {
-    std::vector<std::pair<int, int>> decls;
-    DeclarationRunVisitor v{sm, current_buffer, decls};
-    root.visit(v);
-
-    std::sort(decls.begin(), decls.end());
-    decls.erase(std::unique(decls.begin(), decls.end()), decls.end());
-
-    int run_start = -1;
-    int run_end   = -1;
-    auto flush = [&]() {
-        if (run_start >= 0 && run_end > run_start)
-            emit_token_fold(out, lt, run_start, run_end, "declarations");
-        run_start = -1;
-        run_end   = -1;
-    };
-
-    for (const auto& [start, end] : decls) {
-        if (run_start < 0) {
-            run_start = start;
-            run_end   = end;
-        } else if (start <= run_end + 1) {
-            run_end = std::max(run_end, end);
-        } else {
-            flush();
-            run_start = start;
-            run_end   = end;
-        }
-    }
-    flush();
-}
-
-// AST-backed instance folds.
-//
-// Instantiations are intentionally detected from the parsed syntax tree rather
-// than with token guesses.  A token-only pattern such as
-//
-//     identifier identifier #? ( ... ) ;
-//
-// is ambiguous with declarations, function calls in procedural code, and
-// partially edited source.  Slang has already disambiguated real module,
-// interface, primitive, and checker instantiations into dedicated syntax nodes,
-// so folding can safely use those node extents.
-//
-// Parameterized instances are handled by folding the whole instantiation
-// statement, not only the final connection list:
-//
-//     memory #(
-//         .WIDTH(DATA_W)
-//     ) u_mem (
-//         .clk_i(clk)
-//     );
-//
-// The resulting "instance" fold spans from the type line through the semicolon,
-// so the #(...) parameter override block and the (...) port connection block are
-// hidden together.
-struct InstanceFoldVisitor : public SyntaxVisitor<InstanceFoldVisitor> {
-    const SourceManager&       sm;
-    BufferID                   current_buffer;
-    std::vector<FoldingRange>& out;
-
-    InstanceFoldVisitor(const SourceManager& sm, BufferID current_buffer,
-                        std::vector<FoldingRange>& out)
-        : sm(sm), current_buffer(current_buffer), out(out) {}
-
-    void record(const SyntaxNode& node) {
-        Token first = node.getFirstToken();
-        Token last  = node.getLastToken();
-        if (!first || !last || !first.location().valid() ||
-            !last.location().valid())
-            return;
-        if (first.location().buffer() != current_buffer ||
-            last.location().buffer() != current_buffer)
-            return;
-        emit(out, sm, current_buffer, token_line(sm, first),
-             token_line(sm, last), "instance");
-    }
-
-    void handle(const HierarchyInstantiationSyntax& node) {
-        // Module and interface instances:
-        //     child #(...) u_child (...);
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const PrimitiveInstantiationSyntax& node) {
-        // Gate / UDP primitive instances use the same hierarchical-instance
-        // child shape and should fold like module instances.
-        record(node);
-        visitDefault(node);
-    }
-
-    void handle(const CheckerInstantiationSyntax& node) {
-        // Checker instances can also have parameter assignments and connection
-        // lists, so use the same whole-statement folding policy.
-        record(node);
-        visitDefault(node);
-    }
-};
 
 // ── token path helpers ────────────────────────────────────────────────────
-
-// Emit a fold using the LineTable for character-column computation.
-// Used exclusively by collect_token_folds(); the AST post-pass uses emit().
-static void emit_token_fold(std::vector<FoldingRange>& out, const LineTable& lt,
-                            int start, int end, const std::string& kind) {
-    if (start < 0 || end < 0 || start >= end) return;
-    FoldingRange r;
-    r.startLine      = start;
-    r.endLine        = end;
-    r.startCharacter = lt.first_non_space_column(start);
-    r.endCharacter   = lt.line_length(end);
-    r.kind           = kind;
-    out.push_back(r);
-}
 
 // True if only whitespace precedes `offset` on its line.
 // Used for comment role classification (own-line vs trailing).
@@ -709,22 +289,21 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
 
     auto flush_comment_run = [&]() {
         if (comment_run_start >= 0 && comment_run_last > comment_run_start)
-            emit_token_fold(out, lt, comment_run_start, comment_run_last, "comment");
+            emit(out, lt, comment_run_start, comment_run_last, "comment");
         comment_run_start = -1;
         comment_run_last  = -1;
     };
 
     auto flush_import_run = [&]() {
         if (import_run_start >= 0 && import_run_last > import_run_start)
-            emit_token_fold(out, lt, import_run_start, import_run_last, "imports");
+            emit(out, lt, import_run_start, import_run_last, "imports");
         import_run_start = -1;
         import_run_last  = -1;
     };
 
     auto flush_decl_run = [&]() {
         if (decl_run_start >= 0 && decl_run_last > decl_run_start)
-            emit_token_fold(out, lt, decl_run_start, decl_run_last,
-                            "declarations");
+            emit(out, lt, decl_run_start, decl_run_last, "declarations");
         decl_run_start = -1;
         decl_run_last  = -1;
     };
@@ -767,7 +346,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
                 // Comment role classification may reference source positioning
                 // (per CLAUDE.md exception for comment classification).
                 if (newlines > 0 && is_own_line_at_offset(lt.text, offset))
-                    emit_token_fold(out, lt, line, line + newlines, "comment");
+                    emit(out, lt, line, line + newlines, "comment");
             } else if (t.lex.comment_kind == svfmt::CommentLexemeKind::Line) {
                 if (!is_own_line_at_offset(lt.text, offset)) {
                     // Trailing comment breaks the run so it does not fold
@@ -802,19 +381,19 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
                 pp_stack.push_back(make_pp_frame(dir_line));
             } else if (t.lex.directive_kind == slang::syntax::SyntaxKind::ElsIfDirective) {
                 if (!pp_stack.empty()) {
-                    emit_token_fold(out, lt, pp_stack.back().branch_start_line, dir_line - 1);
+                    emit(out, lt, pp_stack.back().branch_start_line, dir_line - 1);
                     restore_to_pp_frame(pp_stack.back());
                     pp_stack.back().branch_start_line = dir_line;
                 }
             } else if (t.lex.directive_kind == slang::syntax::SyntaxKind::ElseDirective) {
                 if (!pp_stack.empty()) {
-                    emit_token_fold(out, lt, pp_stack.back().branch_start_line, dir_line - 1);
+                    emit(out, lt, pp_stack.back().branch_start_line, dir_line - 1);
                     restore_to_pp_frame(pp_stack.back());
                     pp_stack.back().branch_start_line = dir_line;
                 }
             } else if (t.lex.directive_kind == slang::syntax::SyntaxKind::EndIfDirective) {
                 if (!pp_stack.empty()) {
-                    emit_token_fold(out, lt, pp_stack.back().branch_start_line, dir_line);
+                    emit(out, lt, pp_stack.back().branch_start_line, dir_line);
                     restore_to_pp_frame(pp_stack.back());
                     pp_stack.pop_back();
                 }
@@ -822,7 +401,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
                 cell_stack.push_back(dir_line);
             } else if (t.lex.directive_kind == slang::syntax::SyntaxKind::EndCellDefineDirective) {
                 if (!cell_stack.empty()) {
-                    emit_token_fold(out, lt, cell_stack.back(), dir_line);
+                    emit(out, lt, cell_stack.back(), dir_line);
                     cell_stack.pop_back();
                 }
             }
@@ -925,7 +504,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::EndClockingKeyword: {
             int end_line = lt.line_of(t.lex.range.start().offset());
             if (!keyword_region_stack.empty()) {
-                emit_token_fold(out, lt, keyword_region_stack.back(), end_line);
+                emit(out, lt, keyword_region_stack.back(), end_line);
                 keyword_region_stack.pop_back();
             }
             pending_control_start = -1;
@@ -1000,8 +579,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
             if (brace_depth > 0) --brace_depth;
             if (!brace_region_stack.empty() &&
                 brace_region_stack.back().outer_depth == brace_depth) {
-                emit_token_fold(out, lt,
-                                brace_region_stack.back().start_line, close_line);
+                emit(out, lt, brace_region_stack.back().start_line, close_line);
                 brace_region_stack.pop_back();
             }
             pending_control_start = -1;
@@ -1030,7 +608,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::EndCaseKeyword: {
             int endcase_line = lt.line_of(t.lex.range.start().offset());
             if (!case_stack.empty()) {
-                emit_token_fold(out, lt, case_stack.back(), endcase_line);
+                emit(out, lt, case_stack.back(), endcase_line);
                 case_stack.pop_back();
             }
             pending_control_start = -1;
@@ -1048,7 +626,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
         case TK::EndKeyword: {
             int end_line = lt.line_of(t.lex.range.start().offset());
             if (!block_stack.empty()) {
-                emit_token_fold(out, lt, block_stack.back(), end_line);
+                emit(out, lt, block_stack.back(), end_line);
                 block_stack.pop_back();
             }
             pending_control_start = -1;
@@ -1096,8 +674,7 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
             if (!paren_region_stack.empty() &&
                 paren_region_stack.back().outer_depth == paren_depth) {
                 bool hash_from_header = paren_region_stack.back().hash_from_header;
-                emit_token_fold(out, lt,
-                                paren_region_stack.back().start_line, close_line);
+                emit(out, lt, paren_region_stack.back().start_line, close_line);
                 paren_region_stack.pop_back();
 
                 // Parameterized module/interface/program/checker/primitive
@@ -1201,66 +778,105 @@ static void collect_token_folds(const svfmt::TokenStream& tokens,
 
 // ── normalization ─────────────────────────────────────────────────────────
 
+// (startLine, endLine, kind) -- the triple normalize_folds() groups folds on.
+struct FoldKey {
+    int              startLine;
+    int              endLine;
+    std::string_view kind;
+
+    bool operator==(const FoldKey& other) const {
+        return startLine == other.startLine && endLine == other.endLine &&
+               kind == other.kind;
+    }
+};
+
+struct FoldKeyHash {
+    size_t operator()(const FoldKey& key) const {
+        size_t h = std::hash<std::string_view>{}(key.kind);
+        h = h * 31 + (size_t)(unsigned)key.startLine;
+        h = h * 31 + (size_t)(unsigned)key.endLine;
+        return h;
+    }
+};
+
+// One hashable value for a (startLine, endLine) pair.  Both are line numbers of
+// a file that has been read into memory, so neither comes close to 2^31.
+static int64_t span_key(int start_line, int end_line) {
+    return ((int64_t)(unsigned)start_line << 32) | (int64_t)(unsigned)end_line;
+}
+
 static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& lt) {
     std::sort(folds.begin(), folds.end(), [](const FoldingRange& a, const FoldingRange& b) {
         return std::tie(a.startLine, a.endLine, a.kind, a.startCharacter, a.endCharacter) <
                std::tie(b.startLine, b.endLine, b.kind, b.startCharacter, b.endCharacter);
     });
 
-    folds.erase(
-        std::unique(folds.begin(), folds.end(),
-                    [](const FoldingRange& a, const FoldingRange& b) {
-                        return a.startLine == b.startLine && a.endLine == b.endLine &&
-                               a.kind == b.kind && a.startCharacter == b.startCharacter &&
-                               a.endCharacter == b.endCharacter;
-                    }),
-        folds.end());
-
     // If the token pass and AST pass both found the same line range, prefer the
     // more precise AST delimiter columns over the token pass's line-indentation
     // columns.  This matters for parameterized module headers where a coarse
     // line-start range on the module line can compete with the enclosing module
     // fold in clients that pick one fold marker per line.
-    std::vector<FoldingRange> column_pruned;
-    column_pruned.reserve(folds.size());
-    for (const auto& candidate : folds) {
-        auto same_lines = [&](const FoldingRange& existing) {
-            return existing.startLine == candidate.startLine &&
-                   existing.endLine == candidate.endLine &&
-                   existing.kind == candidate.kind;
-        };
-
-        auto it = std::find_if(column_pruned.begin(), column_pruned.end(), same_lines);
-        if (it == column_pruned.end()) {
-            column_pruned.push_back(candidate);
-        } else {
-            if (candidate.startCharacter > it->startCharacter ||
-                (candidate.startCharacter == it->startCharacter &&
-                 candidate.endCharacter > it->endCharacter))
-                *it = candidate;
+    //
+    // Grouping by (startLine, endLine, kind) also drops folds the two passes
+    // produced identically, so no separate unique() step is needed.  The group
+    // lookup goes through a hash map because the fold list runs to thousands of
+    // entries on a large file, and scanning the kept folds for each candidate
+    // made this pass quadratic in the file's fold count.
+    {
+        std::vector<FoldingRange> column_pruned;
+        column_pruned.reserve(folds.size());
+        // The keys borrow each fold's kind, so this map must not outlive the
+        // list it was built from.
+        std::unordered_map<FoldKey, size_t, FoldKeyHash> kept_by_key;
+        kept_by_key.reserve(folds.size());
+        for (const auto& candidate : folds) {
+            auto [it, inserted] =
+                kept_by_key.try_emplace(FoldKey{candidate.startLine, candidate.endLine,
+                                                candidate.kind},
+                                        column_pruned.size());
+            if (inserted) {
+                column_pruned.push_back(candidate);
+                continue;
+            }
+            FoldingRange& existing = column_pruned[it->second];
+            if (candidate.startCharacter > existing.startCharacter ||
+                (candidate.startCharacter == existing.startCharacter &&
+                 candidate.endCharacter > existing.endCharacter))
+                existing = candidate;
         }
+        folds.swap(column_pruned);
     }
-    folds.swap(column_pruned);
 
     // Drop redundant "whole header" style folds when the useful split folds
     // already cover the exact same span.  Some clients effectively expose only
     // one fold marker per start line, so keeping (0,11) beside (0,4)+(4,11)
     // can hide the parameter-list fold from users.
+    //
+    // Index the multi-line region folds once by span and by start line.  The
+    // question this pass asks -- "does a region split this one at some interior
+    // line" -- then costs two hash lookups per candidate split point instead of
+    // a nested walk of the whole fold list, which was cubic in the worst case.
+    std::unordered_set<int64_t> region_spans;
+    std::unordered_map<int, std::vector<int>> region_ends_by_start;
+    region_spans.reserve(folds.size());
+    for (const auto& r : folds) {
+        if (r.kind != "region" || r.endLine <= r.startLine)
+            continue;
+        region_spans.insert(span_key(r.startLine, r.endLine));
+        region_ends_by_start[r.startLine].push_back(r.endLine);
+    }
+
     std::vector<FoldingRange> no_redundant_headers;
     no_redundant_headers.reserve(folds.size());
-    for (size_t i = 0; i < folds.size(); ++i) {
-        const auto& outer = folds[i];
+    for (const auto& outer : folds) {
         bool redundant_header = false;
         if (outer.kind == "region") {
-            for (const auto& left : folds) {
-                if (left.kind != "region" || left.endLine <= left.startLine ||
-                    left.startLine != outer.startLine ||
-                    left.endLine >= outer.endLine) continue;
-                for (const auto& right : folds) {
-                    if (right.kind == "region" &&
-                        right.startLine == left.endLine &&
-                        right.endLine == outer.endLine &&
-                        right.endLine > right.startLine) {
+            if (auto lefts = region_ends_by_start.find(outer.startLine);
+                lefts != region_ends_by_start.end()) {
+                for (int left_end : lefts->second) {
+                    if (left_end >= outer.endLine)
+                        continue;
+                    if (region_spans.contains(span_key(left_end, outer.endLine))) {
                         redundant_header = true;
                         break;
                     }
@@ -1335,10 +951,25 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
     // region starts later on the same line as an enclosing region (the "#(" on a
     // module/interface/program/checker/primitive header) and the next region
     // starts on the previous region's close line.
+    //
+    // A partner can only be a fold that starts on the exact line this one ends
+    // on, so count the start lines first and skip the inner walk when no fold
+    // starts there.  The count is kept current below, because a match moves the
+    // partner's start line.  Without it this pass walked the whole fold list for
+    // every fold, and every fold in indented RTL clears the startCharacter > 0
+    // test that used to be the only guard.
+    std::unordered_map<int, int> folds_starting_on;
+    folds_starting_on.reserve(folds.size());
+    for (const auto& r : folds)
+        ++folds_starting_on[r.startLine];
+
     for (size_t li = 0; li < folds.size(); ++li) {
         auto& left = folds[li];
         if (left.kind != "region" || left.startCharacter <= 0 ||
             left.endLine <= left.startLine)
+            continue;
+        if (auto on_line = folds_starting_on.find(left.endLine);
+            on_line == folds_starting_on.end() || on_line->second == 0)
             continue;
 
         for (size_t ri = 0; ri < folds.size(); ++ri) {
@@ -1363,10 +994,18 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
             left.endLine      = left_end;
             left.endCharacter = lt.line_length(left_end);
 
+            --folds_starting_on[right.startLine];
             right.startLine      = right_start;
+            ++folds_starting_on[right_start];
             right.startCharacter = lt.first_non_space_column(right_start);
             right.endLine        = right_end;
             right.endCharacter   = lt.line_length(right_end);
+
+            // `left` now ends on a different line, so the partner test above
+            // has to be re-asked against the new one.
+            if (auto on_line = folds_starting_on.find(left.endLine);
+                on_line == folds_starting_on.end() || on_line->second == 0)
+                break;
         }
     }
 
@@ -1386,30 +1025,67 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
     // produce the same or overlapping declaration range.  Keep the widest range
     // for each overlap group so clients do not show redundant nested folds like
     // [1,2] inside [1,3] for one consecutive declaration section.
+    //
+    // Ordering the declaration folds by start ascending, end descending makes
+    // "is any other declaration fold wide enough to contain this one" a running
+    // maximum over the ones already seen: every earlier entry starts no later,
+    // so it contains this one exactly when its end reaches at least as far.
+    // Comparing every declaration fold against every other one was the third
+    // quadratic pass here.  Exact duplicates cannot reach this point -- the
+    // grouping at the top of this function collapsed them -- so an equal end
+    // from an equal start is always a genuinely wider fold.
+    std::vector<size_t> declarations;
+    for (size_t i = 0; i < folds.size(); ++i)
+        if (folds[i].kind == "declarations")
+            declarations.push_back(i);
+
+    std::vector<char> contained_in_declaration(folds.size(), 0);
+    if (declarations.size() > 1) {
+        std::sort(declarations.begin(), declarations.end(), [&](size_t a, size_t b) {
+            if (folds[a].startLine != folds[b].startLine)
+                return folds[a].startLine < folds[b].startLine;
+            return folds[a].endLine > folds[b].endLine;
+        });
+        int widest_end = std::numeric_limits<int>::min();
+        for (size_t i : declarations) {
+            if (widest_end >= folds[i].endLine)
+                contained_in_declaration[i] = 1;
+            widest_end = std::max(widest_end, folds[i].endLine);
+        }
+    }
+
     std::vector<FoldingRange> pruned;
     pruned.reserve(folds.size());
-    for (size_t i = 0; i < folds.size(); ++i) {
-        const auto& current = folds[i];
-        bool contained_in_declaration = false;
-        if (current.kind == "declarations") {
-            for (size_t j = 0; j < folds.size(); ++j) {
-                if (i == j || folds[j].kind != "declarations")
-                    continue;
-                const bool contained =
-                    folds[j].startLine <= current.startLine &&
-                    folds[j].endLine >= current.endLine &&
-                    (folds[j].startLine != current.startLine ||
-                     folds[j].endLine != current.endLine);
-                if (contained) {
-                    contained_in_declaration = true;
-                    break;
-                }
-            }
-        }
-        if (!contained_in_declaration)
-            pruned.push_back(current);
-    }
+    for (size_t i = 0; i < folds.size(); ++i)
+        if (!contained_in_declaration[i])
+            pruned.push_back(folds[i]);
     folds.swap(pruned);
+}
+
+} // namespace
+
+namespace {
+
+/// The folds the token scan finds, before normalization.
+///
+/// TokenCollector does raw lexing without preprocessing, so tokens from both
+/// active and inactive preprocessor branches appear in the stream.  It needs
+/// only the document text, which is what lets a buffer whose parse has not
+/// landed still be answered.
+std::vector<FoldingRange> token_folds_unnormalized(const std::string& text) {
+    FormatOptions             default_opts;
+    svfmt::TokenStream        tokens = svfmt::TokenCollector(text, default_opts).collect();
+    LineTable                 lt{text};
+    std::vector<FoldingRange> out;
+    collect_token_folds(tokens, lt, out);
+    return out;
+}
+
+std::vector<FoldingRange> token_folds(const std::string& text) {
+    LineTable lt{text};
+    auto      out = token_folds_unnormalized(text);
+    normalize_folds(out, lt);
+    return out;
 }
 
 } // namespace
@@ -1419,45 +1095,14 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
 std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
                                                 const FoldingRangeRequestParams& params) {
     auto state = analyzer.get_state(params.textDocument.uri.raw_uri_);
-    if (!state || !state->tree) return {};
+    if (!state)
+        return {};
 
-    std::vector<FoldingRange> out;
-
-    // Primary path: unified token scan over the formatter's TokenStream.
-    // TokenCollector does raw lexing without preprocessing, so tokens from
-    // both active and inactive preprocessor branches appear in the stream.
-    FormatOptions default_opts;
-    svfmt::TokenStream tokens =
-        svfmt::TokenCollector(state->text, default_opts).collect();
-    LineTable lt{state->text};
-    collect_token_folds(tokens, lt, out);
-
-    // AST post-passes use only syntax nodes whose source tokens belong to the
-    // opened document buffer.  Included files can appear in slang's current
-    // SyntaxTree, but LSP folding ranges must always be expressed in the
-    // requested document's line coordinates.
-    if (state->source_manager) {
-        auto current_buffer = find_current_buffer(*state->source_manager, state->text,
-                                                  params.textDocument.uri.raw_uri_);
-        if (current_buffer) {
-            collect_ast_declaration_folds(*state->source_manager, *current_buffer,
-                                          lt, state->tree->root(), out);
-
-            HeaderListVisitor h{*state->source_manager, *current_buffer, out};
-            state->tree->root().visit(h);
-
-            InstanceFoldVisitor inst{*state->source_manager, *current_buffer, out};
-            state->tree->root().visit(inst);
-
-            // ConditionalStatementSyntax and IfGenerateSyntax require AST
-            // precision to link chained branches; token-only detection cannot
-            // reliably do this.  These visitors currently use emit(), so keep
-            // them after the current-buffer lookup succeeds.
-            IfElseChainVisitor v{*state->source_manager, *current_buffer, out};
-            state->tree->root().visit(v);
-        }
-    }
-
-    normalize_folds(out, lt);
-    return out;
+    // Folds are derived from the token scan and nothing else, so this answer
+    // does not depend on the parse the document's last notification started.
+    // There is no tree to wait for, no reparse window to bridge, and no earlier
+    // answer to remember: every request is served from the text the client last
+    // sent.  That is what keeps the editor's per-keystroke foldingRange off the
+    // AST entirely.
+    return token_folds(state->text);
 }

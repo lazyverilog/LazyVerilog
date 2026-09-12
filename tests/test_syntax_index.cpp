@@ -709,7 +709,7 @@ TEST_CASE("header text cache: a new generation drops previously cached text", "[
                        /*count_as_burst_parse=*/true);
     auto refilled = cache.seed_candidates(2);
     REQUIRE(refilled.size() == 1);
-    CHECK(*refilled.front().second == "localparam int W = 32;\n");
+    CHECK(*refilled.front().text == "localparam int W = 32;\n");
 }
 
 TEST_CASE("header text cache: only widely shared headers are offered for seeding", "[index]") {
@@ -729,7 +729,7 @@ TEST_CASE("header text cache: only widely shared headers are offered for seeding
 
     const auto candidates = cache.seed_candidates(1);
     REQUIRE(candidates.size() == 1);
-    CHECK(candidates.front().first == "/proj/common.svh");
+    CHECK(candidates.front().path == "/proj/common.svh");
 }
 
 TEST_CASE("header text cache: the header's own parse is not charged to the burst",
@@ -747,7 +747,7 @@ TEST_CASE("header text cache: the header's own parse is not charged to the burst
 
     const auto candidates = cache.seed_candidates(1);
     REQUIRE(candidates.size() == 1);
-    CHECK(candidates.front().first == "/proj/defs.svh");
+    CHECK(candidates.front().path == "/proj/defs.svh");
 }
 
 TEST_CASE("header text cache: a shared header stays on offer while a burst fans out",

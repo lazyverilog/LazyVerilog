@@ -3,10 +3,15 @@
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <map>
+#include <string>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 static FoldingRangeRequestParams make_params(const std::string& uri) {
     FoldingRangeRequestParams p;
@@ -40,6 +45,17 @@ static bool has_fold_starting_at_and_ending_after(const std::vector<FoldingRange
     return std::any_of(folds.begin(), folds.end(), [&](const FoldingRange& r) {
         return r.startLine == start && r.endLine > after;
     });
+}
+
+static bool same_folds(const std::vector<FoldingRange>& a, const std::vector<FoldingRange>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].startLine != b[i].startLine || a[i].endLine != b[i].endLine ||
+            a[i].startCharacter != b[i].startCharacter ||
+            a[i].endCharacter != b[i].endCharacter || a[i].kind != b[i].kind)
+            return false;
+    }
+    return true;
 }
 
 static bool has_exact_duplicate_fold(const std::vector<FoldingRange>& folds) {
@@ -951,22 +967,20 @@ endmodule
 )");
     auto folds = provide_folding_range(analyzer, make_params(uri));
 
-    // Pretty expected fold map for the user-facing example:
-    //   region [0,3]   module parameter port list "#(...)", excluding the
-    //                  shared ")(" delimiter line for Neovim's line fold model.
-    //   region [5,10]  ANSI port list "(...)", excluding both delimiter lines.
+    // Expected fold map for the user-facing example:
+    //   region [0,4]   module parameter port list "#(...)", paren to paren.
+    //   region [4,11]  ANSI port list "(...)", paren to paren.
     //   region [13,15] consecutive module-scoped declarations
     //   region [0,16]  whole module fold, including the header.
     //
-    // LSP can describe exact column-delimited folds, but Neovim's built-in
-    // foldexpr merges adjacent line ranges like [0,4] + [4,11] + [11,16].
-    // These intentionally non-touching header child folds avoid making the
-    // header lists one continuous line fold, while the enclosing module range
-    // still covers the whole module so folding from the body closes the module
-    // including its header.
-    CHECK(has_fold(folds, 0, 3));
-    CHECK(has_fold(folds, 5, 10));
-    CHECK_FALSE(has_fold(folds, 0, 11));
+    // The two header lists are matched paren to paren by the token scan, so
+    // they share the ")(" line.  Recognizing a module header as such -- and
+    // trimming the shared delimiter line out, which is what Neovim's line fold
+    // model wants -- needs ModuleHeaderSyntax, and folds are derived from the
+    // token scan alone.  Neovim's foldexpr therefore merges these two into one
+    // continuous header fold rather than offering them separately.
+    CHECK(has_fold(folds, 0, 4));
+    CHECK(has_fold(folds, 4, 11));
     CHECK(has_fold(folds, 13, 15));
     CHECK(has_fold(folds, 0, 16));
 }
@@ -1035,12 +1049,16 @@ endmodule
     auto folds = provide_folding_range(analyzer, make_params(uri));
 
     // Non-ANSI ports are declared as semicolon-terminated declarations after
-    // the header.  They should fold as one consecutive declaration run together
-    // with following ordinary variables, including user-defined port types.
-    CHECK(has_fold_kind(folds, 6, 11, "declarations"));
+    // the header.  Joining them to the following variables into one run [6,11]
+    // needs PortDeclarationSyntax: "input payload_t data_in;" is identifier-led
+    // once the direction keyword is consumed, and the token scan cannot tell it
+    // from an instantiation.  So the run starts where the keyword-led
+    // declarations do.
+    CHECK(has_fold_kind(folds, 10, 11, "declarations"));
+    CHECK_FALSE(has_fold_kind(folds, 6, 11, "declarations"));
 }
 
-TEST_CASE("foldingRange: user-defined type declarations join declaration runs",
+TEST_CASE("foldingRange: identifier-led declarations do not fold without the AST",
           "[folding]") {
     Analyzer    analyzer;
     std::string uri = "file:///tmp/fold_user_type_declarations.sv";
@@ -1064,15 +1082,19 @@ endmodule
 )");
     auto folds = provide_folding_range(analyzer, make_params(uri));
 
-    // The final declaration run must include the two identifier-led
-    // user-defined declarations as well as the keyword-led logic declaration.
-    // Lexically guessing "state_e state_q;" would be unsafe because a similar
-    // token sequence can be an instantiation; the implementation uses AST
-    // declaration nodes for this active-code case.
-    CHECK(has_fold_kind(folds, 13, 15, "declarations"));
+    // "state_e state_q;" and "my_child u_inst (...);" are the same token shape,
+    // so a lexical guess would fold instantiations as variables.  The token
+    // scan declines to guess, which means this run -- two identifier-led
+    // declarations and one keyword-led one -- produces no fold at all.  Telling
+    // the two apart needs DataDeclarationSyntax from the parsed tree, and folds
+    // are derived from the token scan alone.
+    CHECK_FALSE(has_fold_kind(folds, 13, 15, "declarations"));
+    CHECK_FALSE(std::any_of(folds.begin(), folds.end(), [](const FoldingRange& r) {
+        return r.startLine == 13;
+    }));
 }
 
-TEST_CASE("foldingRange: parameterized module instances fold as instance regions",
+TEST_CASE("foldingRange: parameterized instances fold only their parameter list",
           "[folding]") {
     Analyzer    analyzer;
     std::string uri = "file:///tmp/fold_parameterized_instance.sv";
@@ -1089,22 +1111,22 @@ endmodule
 )");
     auto folds = provide_folding_range(analyzer, make_params(uri));
 
-    // The instance fold should cover the complete instantiation statement, not
-    // only the connection list.  This is important for parameterized instances:
-    // folding from the instance line should hide the #(...) parameter override
-    // block and the (...) port connection block together.
-    CHECK(has_fold_kind(folds, 1, 8, "instance"));
-
-    // No shorter fold may start on the instance line.  Vim's line-based fold
-    // model marks one fold start per line, so a "#(...)" region ending on the
-    // ") u_mem (" line would be the fold za/zc reach first and the instance
-    // would never collapse as a whole.
-    CHECK_FALSE(std::any_of(folds.begin(), folds.end(), [](const FoldingRange& r) {
-        return r.startLine == 1 && r.endLine < 8;
-    }));
+    // Recognizing the whole statement [1,8] as one instance needs
+    // HierarchyInstantiationSyntax, and folds are derived from the token scan
+    // alone.  What the paren matcher produces instead is the "#(...)" override
+    // block on its own, ending on the ") u_mem (" line.
+    //
+    // Vim's line-based fold model marks one fold start per line, so this
+    // shorter range is the fold za/zc reaches first: closing a fold on the
+    // instance line hides the parameter overrides and leaves the port
+    // connection list open.  The instance never collapses as a whole.
+    CHECK(has_fold(folds, 1, 4));
+    CHECK_FALSE(has_fold_kind(folds, 1, 8, "instance"));
+    CHECK_FALSE(std::any_of(folds.begin(), folds.end(),
+                            [](const FoldingRange& r) { return r.kind == "instance"; }));
 }
 
-TEST_CASE("foldingRange: AST folds from included files are not emitted for current document",
+TEST_CASE("foldingRange: folds from included files are not emitted for current document",
           "[folding]") {
     const std::string include_path =
         (std::filesystem::temp_directory_path() / "lazyverilog_folding_include.svh").string();
@@ -1146,59 +1168,196 @@ endmodule
     CHECK_FALSE(has_fold(folds, 0, 4));
 }
 
-TEST_CASE("foldingRange: AST folds survive a symlinked document directory", "[folding]") {
-    // Locating the document's buffer compares the client's path spelling against
-    // the SourceManager's.  Those two must be canonicalized the same way, or the
-    // lookup fails and every AST-derived fold silently disappears while
-    // token-scan folds keep working.
-    //
-    // This is not hypothetical: macOS resolves /tmp to /private/tmp and Windows
-    // resolves a drive-relative path to a drive-qualified one, so on those
-    // platforms an uncanonicalized comparison never matches.  A symlinked
-    // directory reproduces the same mismatch on Linux.
-    namespace fs = std::filesystem;
-    const auto real_dir = fs::temp_directory_path() / "lazyverilog_fold_symlink_real";
-    const auto link_dir = fs::temp_directory_path() / "lazyverilog_fold_symlink_link";
-    fs::remove(link_dir);
-    fs::remove_all(real_dir);
-    fs::create_directories(real_dir);
-    std::error_code ec;
-    fs::create_directory_symlink(real_dir, link_dir, ec);
-    if (ec)
-        SUCCEED("symlinks unavailable on this platform");
-    else {
-        Analyzer analyzer;
-        // Build the URI from the uncanonicalized spelling on purpose.  A client
-        // sends the path the user opened, not its resolved form, and
-        // uri_from_path() would canonicalize the symlink away and hide the very
-        // mismatch under test.
-        const std::string uri = "file://" + link_dir.string() + "/fold_symlinked.sv";
-        analyzer.open(uri, R"(package types_pkg;
-    typedef struct packed {
-        logic valid;
-        logic [7:0] data;
-    } payload_t;
-endpackage
+// ── Cost model ────────────────────────────────────────────────────────────
+//
+// The editor asks for folds from the `didChange` notification itself, so every
+// keystroke pays for one whole-file fold computation.  Two steps here used to
+// grow with the square of the file:
+//
+//   * emit() rebuilt a line table over the whole buffer for each fold it
+//     produced, making N folds over an M-byte file cost O(N x M);
+//   * normalize_folds() answered its grouping questions by scanning the fold
+//     list, once per fold -- and one of those scans was nested two deep.
+//
+// Both are invisible on the small files the cases above use and dominate on a
+// real RTL block: a 13k-line file spent ~170 ms per request, which an editor
+// then serialized ahead of the completion the user was waiting for.
+//
+// Guard it as a ratio between two inputs of the same shape and different size,
+// never a millisecond budget: a doubled file should cost about twice as much,
+// and anything quadratic costs four times.
 
-module top;
-    typedef enum logic [1:0] {
-        IDLE,
-        BUSY
-    } state_e;
+namespace {
 
-    state_e              state_q;
-    types_pkg::payload_t payload_q;
-    logic                valid_q;
-endmodule
-)");
-        auto folds = provide_folding_range(analyzer, make_params(uri));
-
-        // Identifier-led user-defined declarations only fold through the AST
-        // pass, so this range is exactly the one that vanishes when buffer
-        // lookup fails.
-        CHECK(has_fold_kind(folds, 13, 15, "declarations"));
+/// @p stages structurally identical blocks: each one a state enum, a case
+/// statement, nested if/else, a loop, an always_ff and a function -- the fold
+/// shapes an RTL file is made of.
+static std::string folding_scaling_source(int stages) {
+    std::string text = "module scaling_block (input logic clk_i, input logic rst_ni);\n";
+    for (int i = 0; i < stages; ++i) {
+        const std::string n = std::to_string(i);
+        text += "  // ---- stage " + n + " ----\n";
+        text += "  typedef enum logic [1:0] {\n    S" + n + "_IDLE,\n    S" + n +
+                "_RUN,\n    S" + n + "_DONE\n  } state" + n + "_e;\n";
+        text += "  state" + n + "_e state" + n + "_q, state" + n + "_d;\n";
+        text += "  logic [31:0] stage" + n + "_q, stage" + n + "_d;\n";
+        text += "  always_comb begin\n    unique case (state" + n + "_q)\n";
+        text += "      S" + n + "_IDLE: begin\n        if (stage" + n +
+                "_q != '0) begin\n          state" + n + "_d = S" + n +
+                "_RUN;\n        end else begin\n          state" + n + "_d = S" + n +
+                "_IDLE;\n        end\n      end\n";
+        text += "      S" + n + "_RUN: begin\n        for (int j = 0; j < 8; j++) begin\n"
+                "          stage" + n + "_d[j] = ~stage" + n + "_q[j];\n        end\n"
+                "        state" + n + "_d = S" + n + "_DONE;\n      end\n";
+        text += "      default: state" + n + "_d = S" + n + "_IDLE;\n    endcase\n  end\n";
+        text += "  always_ff @(posedge clk_i or negedge rst_ni) begin\n"
+                "    if (!rst_ni) begin\n      state" + n + "_q <= S" + n + "_IDLE;\n"
+                "      stage" + n + "_q <= '0;\n    end else begin\n      state" + n +
+                "_q <= state" + n + "_d;\n      stage" + n + "_q <= stage" + n +
+                "_d;\n    end\n  end\n";
+        text += "  function automatic logic [31:0] mix" + n + "(input logic [31:0] a);\n"
+                "    return a ^ 32'd" + n + ";\n  endfunction\n";
     }
+    text += "endmodule\n";
+    return text;
+}
 
-    fs::remove(link_dir);
-    fs::remove_all(real_dir);
+/// Fastest of @p runs, for the reason test_shared_header_scaling.cpp takes the
+/// minimum: the cost being guarded is a fixed amount of extra work, so it raises
+/// the floor, and everything a shared runner adds only ever makes a sample
+/// slower.
+static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
+    Analyzer          analyzer;
+    const std::string uri = "file:///fold_scaling_" + std::to_string(stages) + ".sv";
+    analyzer.open(uri, folding_scaling_source(stages));
+
+    std::vector<double> samples;
+    samples.reserve((size_t)runs);
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        auto       folds = provide_folding_range(analyzer, make_params(uri));
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        folds_out = folds.size();
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples.front();
+}
+
+} // namespace
+
+TEST_CASE("foldingRange: cost grows with the file, not with its square",
+          "[folding][scaling]") {
+    constexpr int kStages = 240;
+    constexpr int kRuns   = 5;
+
+    size_t small_folds = 0;
+    size_t large_folds = 0;
+
+    // Warm the allocator and instruction cache so the first measured half is not
+    // charged for both.
+    (void)fastest_folding_ms(kStages, 2, small_folds);
+
+    const double small_ms = fastest_folding_ms(kStages, kRuns, small_folds);
+    const double large_ms = fastest_folding_ms(kStages * 2, kRuns, large_folds);
+
+    // Like for like: the large input must really be twice the small one.
+    REQUIRE(small_folds > 0);
+    // The module's own fold is the one that is not per stage.
+    CHECK(large_folds - 1 == (small_folds - 1) * 2);
+
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[folding scaling] stages=" << kStages << " folds=" << small_folds
+              << " ms=" << small_ms << "  stages=" << (kStages * 2)
+              << " folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio << "\n";
+
+    // Linear is 2.0 and quadratic is 4.0.  Measured at 2.2-2.5 across a 16x
+    // range of sizes, against 3.5 for the quadratic passes this replaced, which
+    // this threshold fails.
+    CHECK(ratio < 3.0);
+}
+
+// ── Folds while a parse is in flight ──────────────────────────────────────
+//
+// An editor asks for folds from the `didOpen`/`didChange` notification itself,
+// so its request reliably arrives while the parse that notification started is
+// still running and the snapshot carries text but no syntax tree.  Answering
+// "no folds" there is not harmless: Neovim applies the empty set to the whole
+// buffer and asks again only on the next change, so the file is left unfoldable
+// until the user types -- and typing lands in the same window again.
+//
+// Folds are derived from the token scan alone, so the syntax tree cannot change
+// the answer.  These two tests pin that: the reply for a given text is the same
+// whether or not its parse has landed.  They catch the reparse window and
+// `REQUIRE` having caught it, so neither can pass by quietly measuring a
+// settled document instead.
+
+TEST_CASE("foldingRange: an edit in flight folds the same as once it settles",
+          "[folding]") {
+    const std::string uri  = "file:///fold_reparse.sv";
+    const std::string text = folding_scaling_source(40);
+
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+    REQUIRE(!provide_folding_range(analyzer, make_params(uri)).empty());
+
+    // enqueue_parse() installs a text-only snapshot and hands the parse to a
+    // worker.  That window is what an editor's didChange-triggered request
+    // lands in.
+    bool observed_reparse_window = false;
+    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
+        const std::string edited = text + "\n// edit " + std::to_string(attempt) + "\n";
+        analyzer.enqueue_parse(uri, edited);
+
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state != nullptr);
+        if (state->tree)
+            continue; // the worker beat us to it; try again
+        observed_reparse_window = true;
+
+        const auto in_flight = provide_folding_range(analyzer, make_params(uri));
+        CHECK(!in_flight.empty());
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline && !analyzer.get_state(uri)->tree)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        REQUIRE(analyzer.get_state(uri)->tree != nullptr);
+
+        CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), in_flight));
+    }
+    REQUIRE(observed_reparse_window);
+}
+
+TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
+          "[folding]") {
+    const std::string uri = "file:///fold_first_parse.sv";
+
+    Analyzer analyzer;
+
+    // Nothing open: there is no document to answer for.
+    CHECK(provide_folding_range(analyzer, make_params(uri)).empty());
+
+    analyzer.enqueue_parse(uri, folding_scaling_source(40));
+
+    bool observed_first_parse = false;
+    for (int attempt = 0; attempt < 50 && !observed_first_parse; ++attempt) {
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state != nullptr);
+        if (state->tree)
+            break;
+        observed_first_parse = true;
+
+        // The very first request for a buffer, with no syntax tree yet.
+        const auto early = provide_folding_range(analyzer, make_params(uri));
+        CHECK(!early.empty());
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline && !analyzer.get_state(uri)->tree)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        REQUIRE(analyzer.get_state(uri)->tree != nullptr);
+
+        CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), early));
+    }
+    REQUIRE(observed_first_parse);
 }

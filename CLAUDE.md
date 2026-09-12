@@ -64,6 +64,92 @@ tools/startup_bench.py --cpus 0 --trace         # per-file timings, slowest firs
   millisecond budget — that is what survives a shared CI runner.
 - Details and prior measured rounds: `docs/dev/startup-perf.md`, `PERF.md`.
 
+### Edit-Path Performance
+```bash
+tools/edit_latency_bench.py <project-root> <file-in-it>   # steady-state edit loop
+tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
+```
+- Neovim sends a **whole-file `foldingRange` and `inlayHint` on every `didChange`**,
+  and requests are answered one at a time (`RemoteEndPoint(..., max_workers = 1)`),
+  so an expensive request delays the completion the user is waiting on.
+- It sends them **from the notification itself**, so the request lands while the
+  parse that notification started is still running and `DocumentState::tree` is
+  null.  A handler that gives up there answers *every* editor request with
+  nothing — which is both wrong and the fastest possible benchmark result.
+- `provide_folding_range()` therefore derives folds from the **token scan and
+  nothing else** — no syntax tree, no cache, the same answer whether or not the
+  parse has landed.  This is clangd's design (`getFoldingRanges(Code, ...)`, a
+  lex the AST never touches).  The cost is real: SystemVerilog cannot tell
+  `my_type_t state;` from `my_child u_inst (...);` lexically, so instance folds,
+  identifier-led declaration runs and module-header list trimming are gone.  Do
+  not reintroduce an AST pass here without also reintroducing the reparse-window
+  answer it needs.
+- The bench measures round trips only.  The client also pays for the reply on its
+  main loop, and Neovim's fold handler walks every row of every range it is handed,
+  so that cost tracks the **sum of range spans**, not the range count.  Measured for
+  a 13k-line file (3803 ranges, 327 KiB on the wire, 42684 rows covered): ~4 ms to
+  `vim.json.decode` and ~2 ms to walk.  Small next to the request itself — do not
+  reach for a smaller payload before measuring that it is what hurts.
+- Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
+  startup guards: a **ratio against a structurally identical input at another
+  size**, never an absolute millisecond budget.
+- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request,
+  and turning the capability off is what stops the client asking at all — measured 0
+  requests against 4-6 over five keystrokes in headless Neovim.  Both are read from
+  `<root>/lazyverilog.toml`, which is why `initialize` has to find the real one.
+- **Advertise a capability statically or register it dynamically, never both.**
+  Neovim's `client:supports_method()` answers from `server_capabilities` whenever
+  that field is present, so a later `client/unregisterCapability` changes nothing and
+  the client keeps requesting for the rest of the session — measured: unregister
+  accepted (`dynamic_capabilities:get()` → nil) while
+  `server_capabilities.inlayHintProvider` stayed `true` and requests kept coming.  So
+  when the client advertises `dynamicRegistration` for one of these, `initialize`
+  **omits** the provider field and the `initialized` handler registers instead.
+- `sync_dynamic_registration()` sends `client/registerCapability` /
+  `client/unregisterCapability` on `didChangeConfiguration`, so an edit to either
+  option takes effect mid-session with no restart — measured both directions, 4 → 0
+  and 0 → 4.  Neovim 0.12.5 opts in for `inlayHint` but **not** for `foldingRange`
+  (`dynamicRegistration = false`), so a `[folding].enable` edit there still needs a
+  restart, and the server logs that rather than sending a request the client may
+  ignore.  Registration ids are fixed (`kFoldingRegistrationId`,
+  `kInlayHintRegistrationId`) because the unregister has to name what the register used.
+- A registration carries a `documentSelector` of `systemverilog`/`verilog`.  A buffer
+  whose filetype is unset matches nothing, which looks exactly like a broken server —
+  check the filetype before the server when hints do not appear.
+- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins both the
+  static replies and the withheld-when-dynamic case.  Editor-side switches for both
+  features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
+- Details and prior measured rounds: `docs/dev/edit-perf.md`.
+
+### Index Shard Cache
+- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
+  turns it off.  Keyed on **content digests** of the file, its `include`s, and the
+  defines/incdirs — never mtime, which is unusable on a shared filesystem.
+- A digest answers "did what I read change".  It cannot answer "would I read the same
+  file", so the key also records **how each `include` resolved**, unresolved ones
+  included: creating a header that satisfies an `include` for the first time, or
+  shadowing one from an earlier `+incdir+`, changes no file the key hashes.  The
+  preload re-runs slang's search (`SourceManager::readHeader`'s order) against a memo.
+- Digests come from **the bytes the parse read**, never a re-read of the file — see
+  `DocumentState::parsed_digests`.  Hashing a `SourceManager` buffer means
+  `IndexCache::digest_source_buffer()`, which drops the `'\0'` slang appends; hashing
+  `getSourceText()` directly compares against `digest_file()` and never matches.
+- Adding a field to any entry in `src/syntax_index.hpp` requires updating the codec in
+  `src/index_cache.cpp` and bumping `kFormatVersion`.  A `static_assert` on each struct's
+  size makes forgetting a compile error rather than a shard that silently drops the field.
+  Renaming shards (`shard_path()`) needs a bump too, or the old names are stranded.
+- The sweep (`IndexCache::prune_missing_sources()`, queued by the preload onto the
+  writer thread) removes shards whose source file is gone and shards of any other
+  format version.  Files without our magic are left alone.
+- Benchmark all three halves: `tools/startup_bench.py` clears the shard cache before
+  each run (**cold**), `--warm` keeps it, `--no-cache` turns the cache off entirely.
+  Report them separately — a change can improve warm and wreck cold.
+- A warm test must be able to tell a hit from a reparse.  Asserting the second launch
+  produces the right index does not: so does a launch that silently reparsed
+  everything, which is how a dead cache went unnoticed.  See "an unchanged project is
+  served from the shards" in `tests/test_index_cache.cpp` for the shape that works —
+  edit the stored shard, keep its key, assert the edit comes back.
+
 ### Releasing a New Version
 ```bash
 ctest --test-dir build                          # test gate — must pass first

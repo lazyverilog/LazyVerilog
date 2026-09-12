@@ -139,6 +139,7 @@ set(LAZYVERILOG_SOURCES
     src/background_compiler.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
+    src/index_cache.cpp
     src/features/hover.cpp
     src/features/definition.cpp
     src/features/references.cpp
@@ -189,6 +190,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_open_shard_scope.cpp
     tests/test_syntax_index.cpp
     tests/test_shared_header_scaling.cpp
+    tests/test_index_cache.cpp
     tests/test_formatter.cpp
     tests/test_lint.cpp
     tests/test_autoff.cpp
@@ -214,6 +216,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/dynamic_file_index.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
+    src/index_cache.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp
@@ -250,7 +253,8 @@ add_executable(parse-bench
     tools/parse_bench.cpp
     src/dynamic_file_index.cpp
     src/syntax_index.cpp
-    src/syntax_index_shared.cpp)
+    src/syntax_index_shared.cpp
+    src/index_cache.cpp)
 target_include_directories(parse-bench PRIVATE src)
 target_link_libraries(parse-bench PRIVATE slang::slang)
 
@@ -262,7 +266,8 @@ add_executable(index-bench
     src/filelist.cpp
     src/dynamic_file_index.cpp
     src/syntax_index.cpp
-    src/syntax_index_shared.cpp)
+    src/syntax_index_shared.cpp
+    src/index_cache.cpp)
 target_include_directories(index-bench PRIVATE src)
 target_link_libraries(index-bench PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
@@ -286,6 +291,7 @@ set(LAZYVERILOG_CLI_PROJECT_SOURCES
     src/background_compiler.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
+    src/index_cache.cpp
     src/features/lint.cpp
 )
 
@@ -311,6 +317,15 @@ add_test(
     NAME lint-cli-smoke
     COMMAND lazyverilog-lint-cli-smoke
             $<TARGET_FILE:lazyverilog-lint>
+            ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(lazyverilog-config-root-cli-smoke tests/config_root_cli_smoke.cpp)
+target_include_directories(lazyverilog-config-root-cli-smoke PRIVATE tests)
+add_test(
+    NAME config-root-cli-smoke
+    COMMAND lazyverilog-config-root-cli-smoke
+            $<TARGET_FILE:lazyverilog-lsp>
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

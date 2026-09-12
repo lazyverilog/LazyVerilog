@@ -1,0 +1,6 @@
+# Fixture for config-root-cli-smoke.
+[compilation]
+background_compilation = false
+
+[folding]
+enable = false

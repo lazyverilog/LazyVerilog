@@ -1,5 +1,6 @@
 #pragma once
 #include "document_state.hpp"
+#include "index_cache.hpp"
 #include "syntax_index.hpp"
 #include <atomic>
 #include <chrono>
@@ -42,6 +43,12 @@ struct HeaderTextCache {
         std::shared_ptr<const std::string> text;
         /// Parses in this burst that included this header.
         size_t hits{0};
+        /// Digest of the header as first read, which `text` stops being once
+        /// project() replaces it with the directives alone.  The shard cache
+        /// keys a shard on the bytes its parse read, and a parse seeded from
+        /// here read whatever this holds -- so the digest has to be taken when
+        /// the full text enters, and travel with the entry from then on.
+        IndexCache::Digest digest;
     };
 
     /// One header a parse pulled in: the key it is cached under, and its text.
@@ -120,15 +127,21 @@ struct HeaderTextCache {
     /// nearly certain not to be.  Restricting the offer to the former keeps the
     /// shared-header win and drops the fan-out cost on designs with many
     /// distinct headers.
-    std::vector<std::pair<std::string, std::shared_ptr<const std::string>>>
-    seed_candidates(uint64_t gen) {
+    struct SeedCandidate {
+        std::string path;
+        std::shared_ptr<const std::string> text;
+        /// Of the header, not of `text`; see Entry::digest.
+        IndexCache::Digest digest;
+    };
+
+    std::vector<SeedCandidate> seed_candidates(uint64_t gen) {
         std::lock_guard<std::mutex> lock(mutex);
         discard_stale(gen);
-        std::vector<std::pair<std::string, std::shared_ptr<const std::string>>> candidates;
+        std::vector<SeedCandidate> candidates;
         candidates.reserve(texts.size());
         for (const auto& [path, entry] : texts) {
             if (entry.hits * 2 >= parses)
-                candidates.emplace_back(path, entry.text);
+                candidates.push_back(SeedCandidate{path, entry.text, entry.digest});
         }
         return candidates;
     }
@@ -149,7 +162,11 @@ private:
         if (bytes + text.size() > kMaxBytes)
             return;
         bytes += text.size();
-        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1});
+        // Hashed once, on the parse that first read the header in full.  Every
+        // later parse in the burst is seeded from this entry, so this is the
+        // only reading of those bytes there is to key a shard on.
+        texts.emplace(path, Entry{std::make_shared<const std::string>(text), 1,
+                                  IndexCache::digest_source_buffer(text)});
     }
 
     void discard_stale(uint64_t gen) {
@@ -473,10 +490,14 @@ class Analyzer {
     /// schedule multiple full-project background reindex generations for a
     /// single user-visible config change.  This batched setter clears the old
     /// project cache once and schedules at most one asynchronous reindex.
+    /// @param project_root  directory holding lazyverilog.toml.  The on-disk
+    ///        shard cache lives under it; leaving it empty runs uncached, which
+    ///        is what a server with no project root should do.
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
-                            const std::string& filelist_path = {});
+                            const std::string& filelist_path = {},
+                            const std::string& project_root = {});
 
     /// Block until all currently queued project-index work is published.
     ///
@@ -624,6 +645,20 @@ class Analyzer {
     void schedule_background_reindex_locked() const;
     void schedule_background_project_publish_locked() const;
     void background_index_loop() const;
+    /// Install every shard the on-disk cache can still vouch for and drop those
+    /// files from @p background_pending_files_.  Runs on one worker with
+    /// map_mutex_ released: it reads and hashes files.
+    void preload_cached_shards(uint64_t generation) const;
+    /// Record @p index for @p uri, keyed on what it was built from.  @p extra
+    /// names a file the shard depends on beyond its own `include`s -- the
+    /// includer a fragment header's shard was derived from, which nothing in
+    /// the shard itself records.
+    /// @param include_resolutions  how the `include`s written *in this file*
+    ///        resolved, filtered from the parse that produced @p index.
+    void store_shard_in_cache(const std::string& uri, const SyntaxIndex& index,
+                              const std::vector<IncludeResolution>& include_resolutions,
+                              const std::string& extra_dependency_uri = {},
+                              bool stands_alone = false) const;
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
     void invalidate_extra_snapshots_locked() const;
@@ -700,6 +735,118 @@ class Analyzer {
     // rebuilt before that fan-out is released.
     mutable uint64_t background_warmup_generation_{std::numeric_limits<uint64_t>::max()};
     mutable bool background_warmup_running_{false};
+    // Cache-preload gate, ahead of the warmup gate and shaped the same way.
+    //
+    // A burst first asks the on-disk cache which of its files are unchanged
+    // since the last launch, installs those shards, and drops them from the
+    // queue; only what is left is parsed.  One worker does it while the others
+    // wait, for the same reason the warmup gate exists -- a worker that starts
+    // parsing a file the preload was about to satisfy has already paid the cost
+    // the cache is there to avoid.
+    //
+    // Keyed by generation, so a config reload re-runs it: new defines or
+    // include directories change what every shard's key hashes to.
+    mutable uint64_t background_preload_generation_{std::numeric_limits<uint64_t>::max()};
+    mutable bool background_preload_running_{false};
+    /// Cache for this project, and the config digest every shard is keyed on.
+    /// Empty when no project root is known or the directory cannot be written,
+    /// which is a normal read-only-checkout condition and simply runs uncached.
+    mutable std::optional<IndexCache> index_cache_;
+    mutable IndexCache::Digest index_cache_config_digest_;
+    /// Memoized content digests for the current generation, shared by the
+    /// preload and the store path.
+    ///
+    /// Storing a shard hashes every file it `include`s, and a central header is
+    /// included by every module in the design -- hashing it per includer put
+    /// the whole O(files x header) cost back, on the one launch that has to
+    /// build the cache from nothing.  Cleared whenever the generation moves,
+    /// which is the same point at which the parse path stops trusting anything
+    /// it read earlier.
+    mutable std::mutex index_cache_digest_mutex_;
+    mutable uint64_t index_cache_digest_generation_{std::numeric_limits<uint64_t>::max()};
+    mutable std::unordered_map<std::string, std::optional<IndexCache::Digest>>
+        index_cache_digests_;
+    std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
+                                                         uint64_t generation) const;
+    /// Digests of the bytes the burst's parses actually read, as opposed to
+    /// what the files hold now.
+    ///
+    /// These are two different questions and one memo cannot answer both.  The
+    /// preload asks what is on disk, because that is what it validates a stored
+    /// shard against.  The store path asks what this parse read, because that
+    /// is what the shard it is about to write was built from.  Answering the
+    /// second from a disk read -- which is what sharing one memo did -- keys a
+    /// shard built from bytes A on the digest of bytes B whenever the file
+    /// moves in between, and the writer thread makes that window seconds wide
+    /// on a large project.  The result is a false hit that no later launch can
+    /// detect.
+    ///
+    /// Filled from DocumentState::parsed_digests, first parse of a file wins,
+    /// and cleared with the generation like the disk memo beside it.
+    mutable std::unordered_map<std::string, IndexCache::Digest> index_cache_parsed_digests_;
+    void remember_parsed_digests(const DocumentState& state, uint64_t generation) const;
+    std::optional<IndexCache::Digest> parsed_file_digest(const std::string& uri,
+                                                         uint64_t generation) const;
+
+    /// Shard writes, drained by one dedicated thread.
+    ///
+    /// A cache write is an optimization for the *next* launch, so it must never
+    /// delay this one.  Done inline in the worker it did exactly that: on a
+    /// 5953-shard project the serializing and writing of 116 MB sat between the
+    /// last parse and the publish, and cost 44% of a cold start.  Workers now
+    /// hand the finished shard over -- a shared_ptr and two strings -- and go
+    /// back to parsing.
+    struct PendingShardWrite {
+        /// No shard to write: a request to sweep the cache directory, which the
+        /// preload queues once per burst.  A launch that reuses everything
+        /// writes nothing, and that is exactly the launch a stale shard
+        /// survives -- so the sweep cannot hang off a write.
+        bool prune_only{false};
+        std::string uri;
+        std::shared_ptr<const SyntaxIndex> index;
+        std::vector<IncludeResolution> include_resolutions;
+        std::string extra_dependency_uri;
+        bool stands_alone{false};
+        uint64_t generation{0};
+        /// Files the preload knows are on disk, for prune_only entries: their
+        /// shards are skipped by name instead of opened to read one back.
+        std::unordered_set<std::string> live_uris;
+    };
+    void queue_shard_write(PendingShardWrite write) const;
+    void index_cache_writer_loop() const;
+
+    mutable std::mutex index_cache_write_mutex_;
+    mutable std::condition_variable index_cache_write_cv_;
+    mutable std::deque<PendingShardWrite> index_cache_write_queue_;
+    mutable std::thread index_cache_writer_;
+    mutable bool index_cache_writer_stop_{false};
+    mutable bool index_cache_writing_{false};
+    /// Shards a worker has committed and will hand over, but has not yet.
+    ///
+    /// A worker finishes a file inside map_mutex_ -- decrementing the active
+    /// count and waking wait_for_background_index_idle() -- and only then, with
+    /// the lock released, queues that file's shards.  Without this counter the
+    /// two waits in sequence are not a barrier: the first returns as the last
+    /// worker leaves the lock, and the second looks at a queue the worker has
+    /// not reached yet, finds it empty, and reports the cache flushed.  The
+    /// reservation is taken while the worker still holds map_mutex_, so
+    /// "drained" cannot be observed in between.
+    mutable size_t index_cache_writes_reserved_{0};
+    void reserve_shard_writes(size_t count) const;
+    void prune_cache_once_per_generation(uint64_t generation,
+                                         const std::unordered_set<std::string>& live_uris) const;
+    /// Generation whose shards have been swept for sources that no longer
+    /// exist, so it happens once per burst rather than once per write.
+    mutable uint64_t index_cache_pruned_generation_{std::numeric_limits<uint64_t>::max()};
+
+public:
+    /// Block until every shard write a finished parse will make has been
+    /// flushed, including the ones not handed over yet.  Only tests need this:
+    /// the server has no reason to wait for a cache that exists for the next
+    /// launch.
+    void wait_for_index_cache_writes_idle() const;
+
+private:
     // Guarded by its own mutex, never by map_mutex_: workers touch it while
     // parsing, which happens outside the analyzer lock.
     mutable HeaderTextCache background_header_texts_;
