@@ -153,37 +153,10 @@ struct StdInStream : lsp::base_istream<std::istream> {
 // ── Incremental-sync helpers ──────────────────────────────────────────────────
 
 // Advance past col UTF-16 code units from pos, staying on the current line.
-// 4-byte UTF-8 sequences (U+10000+) count as 2 UTF-16 units (surrogate pair).
+// One implementation, shared with the feature layer -- incremental sync and the
+// rename safety check must agree byte for byte on where a column lands.
 static size_t advance_utf16_cols(const std::string& text, size_t pos, int col) {
-    int units = 0;
-    while (pos < text.size() && text[pos] != '\n' && units < col) {
-        unsigned char c = static_cast<unsigned char>(text[pos]);
-        int bytes, extra;
-        if      (c < 0x80)           { bytes = 1; extra = 0; }
-        else if ((c & 0xE0) == 0xC0) { bytes = 2; extra = 0; }
-        else if ((c & 0xF0) == 0xE0) { bytes = 3; extra = 0; }
-        else if ((c & 0xF8) == 0xF0) { bytes = 4; extra = 1; } // surrogate pair
-        else                         { bytes = 1; extra = 0; } // continuation/invalid
-
-        // LSP text is specified as UTF-8, but be defensive: never skip past the
-        // buffer or across malformed continuation bytes.  Treat malformed
-        // sequences as one byte / one UTF-16 unit so incremental sync remains
-        // monotonic and cannot jump over unrelated text.
-        bool valid_sequence = pos + static_cast<size_t>(bytes) <= text.size();
-        for (int i = 1; valid_sequence && i < bytes; ++i) {
-            unsigned char cc = static_cast<unsigned char>(text[pos + static_cast<size_t>(i)]);
-            valid_sequence = (cc & 0xC0) == 0x80;
-        }
-        if (!valid_sequence) {
-            bytes = 1;
-            extra = 0;
-        }
-
-        if (units + 1 + extra > col) break;
-        units += 1 + extra;
-        pos   += bytes;
-    }
-    return pos;
+    return utf16_col_to_byte_offset(text, pos, col);
 }
 
 // Convert (line, col) LSP position to byte offset in text.

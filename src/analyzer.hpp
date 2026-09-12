@@ -320,6 +320,10 @@ struct Location {
     int col{0};
     int end_line{0};
     int end_col{0};
+    // How this occurrence spells the symbol.  Only rename looks at it; every
+    // other consumer treats an implicit `.p,` connection as an ordinary
+    // occurrence, which is what references should report.
+    RefForm form{RefForm::Plain};
 };
 
 struct IdentifierAtPosition {

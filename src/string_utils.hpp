@@ -1,6 +1,8 @@
 #pragma once
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -18,6 +20,110 @@ inline std::string trim_copy(std::string text) {
     if (first >= last)
         return {};
     return std::string(first, last);
+}
+
+/// Count the UTF-16 code units in a UTF-8 slice.
+///
+/// LSP measures `Position.character` in UTF-16 code units, while every byte
+/// column slang reports is a byte count, so this is the conversion that sits
+/// between them: take the bytes of a line up to a byte column and re-measure
+/// them here.  clangd calls the same primitive `lspLength()` and routes every
+/// SourceLocation through it for exactly this reason.
+///
+/// ASCII is the overwhelmingly common case and costs one predicted branch per
+/// byte.  Malformed UTF-8 is deliberately counted as one byte / one UTF-16 unit
+/// rather than rejected, so a partially-edited or mis-detected buffer still
+/// yields monotonic offsets instead of an error the caller cannot act on.
+inline size_t utf16_length(std::string_view text) {
+    size_t units = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Whole-word ASCII skip.  Source lines are ASCII almost everywhere, and
+        // a column conversion runs from the line start for every indexed token,
+        // so this is the loop that decides the cost.  A set high bit in any of
+        // the eight bytes means a multi-byte sequence starts somewhere in them;
+        // fall through to the per-byte walk and let it find the boundary.
+        while (pos + 8 <= text.size()) {
+            uint64_t chunk;
+            std::memcpy(&chunk, text.data() + pos, sizeof(chunk));
+            if (chunk & 0x8080808080808080ULL)
+                break;
+            units += 8;
+            pos += 8;
+        }
+        if (pos >= text.size())
+            break;
+
+        const unsigned char c = static_cast<unsigned char>(text[pos]);
+        if (c < 0x80) { // ASCII: one byte, one UTF-16 unit.
+            ++units;
+            ++pos;
+            continue;
+        }
+        int bytes = 1;
+        int width = 1;
+        if ((c & 0xE0) == 0xC0) {
+            bytes = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            bytes = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            bytes = 4;
+            width = 2; // Astral plane: encoded as a UTF-16 surrogate pair.
+        }
+
+        bool valid_sequence = pos + static_cast<size_t>(bytes) <= text.size();
+        for (int i = 1; valid_sequence && i < bytes; ++i) {
+            const unsigned char cc = static_cast<unsigned char>(text[pos + static_cast<size_t>(i)]);
+            valid_sequence = (cc & 0xC0) == 0x80;
+        }
+        if (!valid_sequence) {
+            bytes = 1;
+            width = 1;
+        }
+
+        units += static_cast<size_t>(width);
+        pos += static_cast<size_t>(bytes);
+    }
+    return units;
+}
+
+/// UTF-16 column -> byte offset, the inverse of utf16_length().
+///
+/// Advances from `pos` by `col` UTF-16 code units without leaving the current
+/// line, and returns the resulting byte offset.  This is the incoming half of
+/// the LSP position boundary: a client sends UTF-16 columns, and anything that
+/// slices the document text needs bytes.  clangd calls the same primitive
+/// `measureUnits()`.
+///
+/// Malformed UTF-8 is treated as one byte / one UTF-16 unit so the walk stays
+/// monotonic and can never step past the buffer or over unrelated text.
+inline size_t utf16_col_to_byte_offset(std::string_view text, size_t pos, int col) {
+    int units = 0;
+    while (pos < text.size() && text[pos] != '\n' && units < col) {
+        const unsigned char c = static_cast<unsigned char>(text[pos]);
+        int bytes, extra;
+        if      (c < 0x80)           { bytes = 1; extra = 0; }
+        else if ((c & 0xE0) == 0xC0) { bytes = 2; extra = 0; }
+        else if ((c & 0xF0) == 0xE0) { bytes = 3; extra = 0; }
+        else if ((c & 0xF8) == 0xF0) { bytes = 4; extra = 1; } // surrogate pair
+        else                         { bytes = 1; extra = 0; } // continuation/invalid
+
+        bool valid_sequence = pos + static_cast<size_t>(bytes) <= text.size();
+        for (int i = 1; valid_sequence && i < bytes; ++i) {
+            const unsigned char cc = static_cast<unsigned char>(text[pos + static_cast<size_t>(i)]);
+            valid_sequence = (cc & 0xC0) == 0x80;
+        }
+        if (!valid_sequence) {
+            bytes = 1;
+            extra = 0;
+        }
+
+        if (units + 1 + extra > col)
+            break;
+        units += 1 + extra;
+        pos += static_cast<size_t>(bytes);
+    }
+    return pos;
 }
 
 /// Count UTF-16 code units from byte offset `pos` until a newline or end of

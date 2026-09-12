@@ -1,4 +1,5 @@
 #include "code_action.hpp"
+#include "../lsp_position.hpp"
 #include "../syntax_index.hpp"
 #include "autoarg.hpp"
 #include "autoff.hpp"
@@ -113,8 +114,7 @@ static int token_line(const SourceManager& sm, const slang::parsing::Token& tok)
 static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
-    auto col = sm.getColumnNumber(tok.location());
-    return col > 0 ? (int)col - 1 : 0;
+    return utf16_column(sm, tok.location());
 }
 
 struct QuickFixLocator : public SyntaxVisitor<QuickFixLocator> {

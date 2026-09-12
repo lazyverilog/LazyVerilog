@@ -1,4 +1,5 @@
 #include "document_symbols.hpp"
+#include "../lsp_position.hpp"
 #include "../dynamic_file_index.hpp"
 #include "../string_utils.hpp"
 #include "../syntax_index_shared.hpp"
@@ -114,8 +115,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         if (!end.valid())
             return {};
         const auto line = sm.getLineNumber(end);
-        const auto col = sm.getColumnNumber(end);
-        return Extent{(int)line, col > 0 ? (int)col - 1 : 0};
+        return Extent{(int)line, utf16_column(sm, end)};
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
@@ -146,10 +146,9 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         const auto expansion = sm.getExpansionRange(name.location());
         if (!expansion.start().valid() || !in_document(expansion.start()))
             return;
-        const auto col = sm.getColumnNumber(expansion.start());
         out.macro_decl_sites.emplace(std::string(name.valueText()),
                                      std::make_pair((int)sm.getLineNumber(expansion.start()),
-                                                    col > 0 ? (int)col - 1 : 0));
+                                                    utf16_column(sm, expansion.start())));
     }
 
     void handle(const slang::syntax::NetDeclarationSyntax& node) {
@@ -170,10 +169,9 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
             for (const auto* decl : node.declarators) {
                 if (!decl || !decl->name || !in_document(decl->name.location()))
                     continue;
-                const auto col = sm.getColumnNumber(decl->name.location());
                 block.decls.push_back(BlockDecl{std::string(decl->name.valueText()), type,
                                                 (int)sm.getLineNumber(decl->name.location()),
-                                                col > 0 ? (int)col - 1 : 0});
+                                                utf16_column(sm, decl->name.location())});
             }
         }
         visitDefault(node);
@@ -202,8 +200,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         block.declarations_from_index = declarations_from_index;
         block.detail = std::move(detail);
         block.line = (int)sm.getLineNumber(begin);
-        const auto col = sm.getColumnNumber(begin);
-        block.col = col > 0 ? (int)col - 1 : 0;
+        block.col = utf16_column(sm, begin);
         block.end_line = extent.end_line;
         block.end_col = extent.end_col;
         block.parent = block_stack.empty() ? -1 : block_stack.back();
@@ -264,7 +261,7 @@ lsDocumentSymbol make_symbol(const std::string& name, lsSymbolKind kind, int lin
     sym.name = name;
     sym.kind = kind;
     sym.range.start = lsPosition(l, col);
-    sym.range.end = lsPosition(l, col + (int)name.size());
+    sym.range.end = lsPosition(l, col + (int)utf16_length(name));
     sym.selectionRange = sym.range;
     sym.detail = std::move(detail);
     return sym;

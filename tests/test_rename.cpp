@@ -296,3 +296,137 @@ endmodule
     CHECK(touched.count({9, 18}) == 1);
     CHECK(touched.count({10, 20}) == 1);
 }
+
+// `.p,` is shorthand for `.p(p)` -- a port name and a same-spelled signal
+// reference in one token.  A rename touches one of those two meanings, so it
+// has to expand the shorthand: after the rename the two halves no longer spell
+// alike.  Leaving the token alone silently rebinds the connection.
+TEST_CASE("rename: an implicit port connection expands when the port is renamed",
+          "[rename][implicit-port]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_implicit_port_fixture.sv";
+    analyzer.open(uri, R"(module leaf(
+    input logic clk_i
+);
+endmodule
+
+module top;
+    logic clk_i;
+    leaf u_leaf (
+        .clk_i
+    );
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(1, 16); // clk_i in leaf's port list
+    rename_params.newName = "zzz_clk";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+    const auto& edits = edit.changes->at(uri);
+    REQUIRE(edits.size() == 2);
+    CHECK(edits[0].range.start.line == 1);
+    CHECK(edits[0].newText == "zzz_clk");
+    // The port half is what changed, so the net keeps its own name.
+    CHECK(edits[1].range.start.line == 8);
+    CHECK(edits[1].newText == "zzz_clk(clk_i)");
+}
+
+TEST_CASE("rename: an implicit port connection expands when the net is renamed",
+          "[rename][implicit-port]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_implicit_net_fixture.sv";
+    analyzer.open(uri, R"(module leaf(
+    input logic clk_i
+);
+endmodule
+
+module top;
+    logic clk_i;
+    leaf u_leaf (
+        .clk_i
+    );
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(6, 10); // top's own clk_i declaration
+    rename_params.newName = "sys_clk";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+    const auto& edits = edit.changes->at(uri);
+    REQUIRE(edits.size() == 2);
+    CHECK(edits[0].range.start.line == 6);
+    CHECK(edits[0].newText == "sys_clk");
+    // The net half is what changed; leaf's port keeps its name.
+    CHECK(edits[1].range.start.line == 8);
+    CHECK(edits[1].newText == "clk_i(sys_clk)");
+}
+
+TEST_CASE("rename: an explicit port connection is still renamed in place",
+          "[rename][implicit-port]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_explicit_port_fixture.sv";
+    analyzer.open(uri, R"(module leaf(
+    input logic clk_i
+);
+endmodule
+
+module top;
+    logic other_clk;
+    leaf u_leaf (
+        .clk_i (other_clk)
+    );
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(1, 16); // clk_i in leaf's port list
+    rename_params.newName = "zzz_clk";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+    const auto& edits = edit.changes->at(uri);
+    REQUIRE(edits.size() == 2);
+    // `.p(expr)` already spells both halves, so it is a plain replacement.
+    CHECK(edits[1].range.start.line == 8);
+    CHECK(edits[1].newText == "zzz_clk");
+}
+
+TEST_CASE("rename: a wildcard port connection is left alone", "[rename][implicit-port]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_wildcard_port_fixture.sv";
+    analyzer.open(uri, R"(module leaf(
+    input logic clk_i
+);
+endmodule
+
+module top;
+    logic clk_i;
+    leaf u_leaf (
+        .*
+    );
+endmodule
+)");
+
+    TextDocumentRename::Params rename_params;
+    rename_params.textDocument.uri.raw_uri_ = uri;
+    rename_params.position = lsPosition(1, 16);
+    rename_params.newName = "zzz_clk";
+
+    auto edit = provide_rename(analyzer, rename_params);
+    REQUIRE(edit.changes.has_value());
+    const auto& edits = edit.changes->at(uri);
+    // Only the declaration; `.*` is not a NamedPortConnectionSyntax and must
+    // never be rewritten.
+    REQUIRE(edits.size() == 1);
+    CHECK(edits[0].range.start.line == 1);
+}

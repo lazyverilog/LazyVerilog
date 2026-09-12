@@ -3211,3 +3211,147 @@ endmodule
     CHECK(found.count({10, 25}) == 1); // deep.c.b.g
     CHECK(found.count({11, 25}) == 1); // arr[1].b.g
 }
+
+// LSP measures Position.character in UTF-16 code units, but every column
+// lazyverilog reported came from SourceManager::getColumnNumber(), which is a
+// byte count.  The two agree on an ASCII line and diverge the moment a line
+// holds a non-ASCII character -- CJK text in a $display or `uvm_info string is
+// ordinary in production RTL.  Every fixture in tests/ was ASCII, which is why
+// this went unnoticed.
+namespace {
+
+// Column of `needle` on its line, measured the way an LSP client measures it.
+int utf16_col_of(std::string_view text, std::string_view needle) {
+    const size_t pos = text.find(needle);
+    REQUIRE(pos != std::string_view::npos);
+    size_t line_start = text.rfind('\n', pos);
+    line_start = (line_start == std::string_view::npos) ? 0 : line_start + 1;
+    return (int)utf16_length(text.substr(line_start, pos - line_start));
+}
+
+int line_of(std::string_view text, std::string_view needle) {
+    const size_t pos = text.find(needle);
+    REQUIRE(pos != std::string_view::npos);
+    return (int)std::count(text.begin(), text.begin() + (long)pos, '\n');
+}
+
+const std::string kUtfFixture =
+    "module m_utf (\n"
+    "    input  logic i_clk,\n"
+    "    output logic o_data\n"
+    ");\n"
+    "    logic r_cnt;\n"
+    "\n"
+    "    always_ff @(posedge i_clk) begin\n"
+    "        $display(\"plain ascii %0d\", r_cnt);\n"
+    "    end\n"
+    "\n"
+    "    always_ff @(posedge i_clk) begin\n"
+    "        $display(\"\xEA\xB3\x84\xEC\x88\x98\xEA\xB8\xB0 \xEA\xB0\x92 = %0d\", r_cnt);\n"
+    "    end\n"
+    "\n"
+    "    assign o_data = r_cnt;\n"
+    "endmodule\n";
+
+} // namespace
+
+TEST_CASE("references: columns on a non-ASCII line are UTF-16, not bytes",
+          "[references][utf16]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/refs_utf16_fixture.sv";
+    analyzer.open(uri, kUtfFixture);
+
+    const int decl_line = line_of(kUtfFixture, "logic r_cnt;");
+    const int decl_col = utf16_col_of(kUtfFixture, "r_cnt;");
+
+    auto refs = analyzer.find_references(uri, decl_line, decl_col, true);
+    REQUIRE(!refs.empty());
+
+    // The occurrence on the Hangul line is the one that used to be reported at
+    // its byte column, eight units to the right of where the text actually is.
+    const int utf_line = line_of(kUtfFixture, "\xEA\xB3\x84\xEC\x88\x98\xEA\xB8\xB0");
+    const int expected_col = utf16_col_of(kUtfFixture, "r_cnt);\n    end\n\n    assign");
+
+    bool found = false;
+    for (const auto& ref : refs) {
+        if (ref.line == utf_line) {
+            found = true;
+            CHECK(ref.col == expected_col);
+            // end_col must be a second conversion, not col + byte length.
+            CHECK(ref.end_col == expected_col + 5);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("references: an ASCII line is unaffected by the conversion",
+          "[references][utf16]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/refs_utf16_ascii_fixture.sv";
+    analyzer.open(uri, kUtfFixture);
+
+    const int decl_line = line_of(kUtfFixture, "logic r_cnt;");
+    const int decl_col = utf16_col_of(kUtfFixture, "r_cnt;");
+
+    auto refs = analyzer.find_references(uri, decl_line, decl_col, true);
+    const int ascii_line = line_of(kUtfFixture, "plain ascii");
+    const int expected_col = utf16_col_of(kUtfFixture, "r_cnt);\n    end\n\n    always_ff");
+
+    bool found = false;
+    for (const auto& ref : refs) {
+        if (ref.line == ascii_line) {
+            found = true;
+            CHECK(ref.col == expected_col);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("definition: a request position on a non-ASCII line resolves",
+          "[definition][utf16]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/def_utf16_fixture.sv";
+    analyzer.open(uri, kUtfFixture);
+
+    // The client sends a UTF-16 column.  Before the fix this resolved to
+    // nothing, because the byte column was compared against it directly.
+    const int utf_line = line_of(kUtfFixture, "\xEA\xB3\x84\xEC\x88\x98\xEA\xB8\xB0");
+    const int utf_col = utf16_col_of(kUtfFixture, "r_cnt);\n    end\n\n    assign");
+
+    auto def = analyzer.definition_of(uri, utf_line, utf_col);
+    REQUIRE(def.has_value());
+    CHECK(def->line == line_of(kUtfFixture, "logic r_cnt;"));
+}
+
+TEST_CASE("rename: a non-ASCII line is rewritten in place, not past its end",
+          "[rename][utf16]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/rename_utf16_fixture.sv";
+    analyzer.open(uri, kUtfFixture);
+
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line_of(kUtfFixture, "logic r_cnt;"),
+                                 utf16_col_of(kUtfFixture, "r_cnt;"));
+    params.newName = "r_counter";
+
+    auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    REQUIRE(edit.changes->contains(uri));
+
+    // Every edit must land on text that actually spells the old name.  A byte
+    // column on the Hangul line pointed past the end of the line, so the client
+    // clamped it and appended the new name after the semicolon.
+    const int utf_line = line_of(kUtfFixture, "\xEA\xB3\x84\xEC\x88\x98\xEA\xB8\xB0");
+    bool checked = false;
+    for (const auto& e : edit.changes->at(uri)) {
+        if (e.range.start.line == utf_line) {
+            checked = true;
+            CHECK(e.range.start.character ==
+                  utf16_col_of(kUtfFixture, "r_cnt);\n    end\n\n    assign"));
+            CHECK(e.range.end.character == e.range.start.character + 5);
+            CHECK(e.newText == "r_counter");
+        }
+    }
+    CHECK(checked);
+}
