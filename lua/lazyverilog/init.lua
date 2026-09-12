@@ -5,13 +5,13 @@
 ---
 --- Full example:
 ---   require('lazyverilog').setup({
----     format = {
----       indent_size  = 2,
----     },
 ---     on_attach = function(client, bufnr)
 ---       -- your keymaps / extra config here
 ---     end,
 ---   })
+---
+--- Formatting/linting behavior is configured in `lazyverilog.toml` at the
+--- project root, not through setup().
 
 local config   = require("lazyverilog.config")
 local lsp      = require("lazyverilog.lsp")

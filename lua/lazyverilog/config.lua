@@ -17,18 +17,11 @@ M.defaults = {
 	-- Root directory markers used to detect the project root.
 	root_markers = { ".git", "lazyverilog.toml" },
 
-	-- Formatting options forwarded to the LazyVerilog server.
-	-- All fields are optional; unset fields use server defaults.
-	format = {
-		-- indent_size          = 4,
-		-- use_tabs             = false,
-		-- spaces_around_operators = true,
-		-- space_after_comma    = true,
-		-- align_port_declarations = true,
-		-- port_newline         = true,
-		-- max_line_length      = 120,
-		-- blank_lines_between_items = 1,
-	},
+	-- Formatting and linting are configured in `lazyverilog.toml` at the
+	-- project root, not here.  The server reads that file from disk and does
+	-- not accept formatter options over LSP settings, so there is no plugin
+	-- setting that mirrors them.  See the `[format]` section of
+	-- lazyverilog.toml for the full list.
 
 	-- nvim-lspconfig / vim.lsp.start options forwarded verbatim.
 	on_attach = nil,

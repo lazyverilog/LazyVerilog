@@ -688,11 +688,6 @@ local function start_lsp(cfg, cmd, bufnr)
 		filetypes    = cfg.filetypes,
 		capabilities = cfg.capabilities,
 		on_attach    = combined_on_attach,
-		settings     = {
-			lazyverilog = {
-				format = cfg.format,
-			},
-		},
 		handlers     = {
 			["window/showMessage"] = function(_, result, ctx, _)
 				local name = "lazyverilog"
