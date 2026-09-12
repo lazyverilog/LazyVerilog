@@ -432,6 +432,26 @@ class Analyzer {
     /// Return a snapshot (or nullptr if not open).
     std::shared_ptr<const DocumentState> get_state(const std::string& uri) const;
 
+    /// Return a snapshot that has a parsed tree, for handlers that cannot
+    /// answer without one.
+    ///
+    /// The editor issues its requests from the `didChange` notification itself,
+    /// so they routinely arrive while the parse that notification started is
+    /// still running and `get_state()` hands back a text-only placeholder.  A
+    /// handler that gives up there answers every request during typing with
+    /// nothing, and the client renders that.
+    ///
+    /// Waits up to @p timeout for the reparse to commit, then falls back to the
+    /// last snapshot that did parse -- one keystroke stale, which is what the
+    /// user was looking at a moment ago, rather than empty.  Returns whatever
+    /// `get_state()` would when neither exists.
+    ///
+    /// The wait is bounded because requests are answered one at a time: a file
+    /// whose parse never keeps up must not wedge the request thread.
+    std::shared_ptr<const DocumentState>
+    get_parsed_state(const std::string& uri,
+                     std::chrono::milliseconds timeout = std::chrono::milliseconds(150)) const;
+
     /// Find symbol at (line, col) using SyntaxTree only.
     std::optional<SymbolInfo> symbol_at(const std::string& uri, int line, int col) const;
 
@@ -914,6 +934,10 @@ private:
     std::unordered_map<std::string, ParseJob> parse_pending_;
     std::mutex parse_mutex_;
     std::condition_variable parse_cv_;
+    /// Notified under map_mutex_ whenever a parse commits a snapshot into
+    /// docs_, so get_parsed_state() can wait for the reparse it raced rather
+    /// than poll for it.  Paired with map_mutex_, not parse_mutex_.
+    mutable std::condition_variable parse_committed_cv_;
     std::atomic<bool> parse_stop_{false};
     std::thread parse_worker_;
 

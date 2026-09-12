@@ -295,3 +295,98 @@ endmodule
 
     std::filesystem::remove(extra_path);
 }
+
+// ── Hints while a parse is in flight ────────────────────────────────────────
+//
+// An editor asks for hints from the `didChange` notification itself, so the
+// request reliably arrives while the parse that notification started is still
+// running and the snapshot carries text but no syntax tree.
+//
+// Hints are derived from the AST and cannot be produced without one, so --
+// unlike folds, which leave the AST entirely -- the answer here is to wait for
+// the parse, and failing that to serve the snapshot the user was looking at a
+// keystroke ago.  Returning nothing is what this replaces, and it was not a
+// harmless failure: the client renders the empty reply, so hints blinked out
+// for as long as the user kept typing and came back only when an unrelated
+// project-index publish happened to fire a refresh.
+//
+// These tests catch the reparse window and `REQUIRE` having caught it, so they
+// cannot pass by quietly measuring a settled document instead.
+
+#include <chrono>
+#include <thread>
+
+TEST_CASE("inlay hints: an edit in flight still produces hints", "[inlay]") {
+    const std::string uri = "file:///tmp/inlay_reparse.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, kInlaySource);
+    const auto settled = provide_inlay_hints(analyzer, uri, 0, 20);
+    REQUIRE(settled.size() == 4);
+
+    bool observed_reparse_window = false;
+    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
+        // Appending comments below the instance leaves every hint where it was,
+        // so the in-flight answer and the settled one are comparable directly.
+        const std::string edited = kInlaySource + "\n// edit " + std::to_string(attempt) + "\n";
+        analyzer.enqueue_parse(uri, edited);
+
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state != nullptr);
+        if (state->tree)
+            continue; // the worker beat us to it; try again
+        observed_reparse_window = true;
+
+        const auto in_flight = provide_inlay_hints(analyzer, uri, 0, 20);
+        REQUIRE(in_flight.size() == settled.size());
+        for (size_t i = 0; i < in_flight.size(); ++i) {
+            CHECK(in_flight[i].label == settled[i].label);
+            CHECK(in_flight[i].position.line == settled[i].position.line);
+            CHECK(in_flight[i].position.character == settled[i].position.character);
+        }
+    }
+    REQUIRE(observed_reparse_window);
+}
+
+TEST_CASE("inlay hints: a text-only snapshot keeps the parse it replaced", "[inlay]") {
+    // The fallback the bounded wait lands on when the user types faster than
+    // the file parses.  Asked with no time to wait at all, the answer still has
+    // to come from a tree -- the previous one.
+    const std::string uri = "file:///tmp/inlay_fallback.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, kInlaySource);
+    REQUIRE(provide_inlay_hints(analyzer, uri, 0, 20).size() == 4);
+
+    bool observed_reparse_window = false;
+    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
+        analyzer.enqueue_parse(uri, kInlaySource + "\n// edit " + std::to_string(attempt) + "\n");
+
+        auto placeholder = analyzer.get_state(uri);
+        REQUIRE(placeholder != nullptr);
+        if (placeholder->tree)
+            continue;
+        observed_reparse_window = true;
+
+        // Carried forward by enqueue_parse(), and never deeper than one.
+        REQUIRE(placeholder->previous_parsed != nullptr);
+        CHECK(placeholder->previous_parsed->tree != nullptr);
+        CHECK(placeholder->previous_parsed->previous_parsed == nullptr);
+
+        const auto immediate = analyzer.get_parsed_state(uri, std::chrono::milliseconds(0));
+        REQUIRE(immediate != nullptr);
+        CHECK(immediate->tree != nullptr);
+    }
+    REQUIRE(observed_reparse_window);
+}
+
+TEST_CASE("inlay hints: a document that was never opened answers nothing", "[inlay]") {
+    // Guards the fallback against reaching into some other document: with no
+    // snapshot at all there is genuinely nothing to say.
+    Analyzer analyzer;
+    analyzer.open("file:///tmp/inlay_other.sv", kInlaySource);
+    REQUIRE(provide_inlay_hints(analyzer, "file:///tmp/inlay_other.sv", 0, 20).size() == 4);
+
+    CHECK(analyzer.get_parsed_state("file:///tmp/inlay_absent.sv") == nullptr);
+    CHECK(provide_inlay_hints(analyzer, "file:///tmp/inlay_absent.sv", 0, 20).empty());
+}

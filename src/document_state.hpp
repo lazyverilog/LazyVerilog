@@ -140,6 +140,23 @@ struct DocumentState {
     // gets a new DocumentState and therefore a fresh once_flag/cache pair.
     mutable std::once_flag dynamic_index_once_;
     mutable SyntaxIndex dynamic_index_cache_;
+    // The most recent snapshot of this document that had a tree, when this one
+    // does not.  didChange installs a text-only placeholder and hands the parse
+    // to a worker, and the editor issues its requests from that same
+    // notification -- so a handler that needs an AST is normally asked during
+    // the window where there is none.
+    //
+    // Answering nothing there is not a neutral failure: the client renders the
+    // empty result, so the feature blinks out for as long as the user keeps
+    // typing.  Holding the previous parse lets such a handler answer from a
+    // document one keystroke old instead, which is what the user was already
+    // looking at.
+    //
+    // Never more than one deep: a placeholder inherits its predecessor's
+    // predecessor rather than pointing at another placeholder, so this retains
+    // exactly one extra snapshot per open buffer and only while a reparse is in
+    // flight.  Null once the parse lands, since `tree` is then this snapshot's own.
+    std::shared_ptr<const DocumentState> previous_parsed;
     uint64_t doc_version{0};
     DocumentState() = default;
     DocumentState(std::string uri, std::string text,

@@ -79,7 +79,14 @@ static std::string display_port_direction(const std::string& direction) {
 
 std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std::string& uri,
                                              int range_start_line, int range_end_line) {
-    auto state = analyzer.get_state(uri);
+    // Not get_state(): Neovim issues this request from the didChange
+    // notification itself, so it lands while the parse that notification
+    // started is still running and the current snapshot is text-only.  Giving
+    // up there answered *every* request made during typing with nothing, and
+    // the client renders that -- hints measurably blinked out for the whole
+    // duration of a burst on a large file and came back only when an unrelated
+    // project-index publish happened to fire a refresh.
+    auto state = analyzer.get_parsed_state(uri);
     if (!state || !state->tree)
         return {};
 

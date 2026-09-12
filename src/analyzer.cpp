@@ -951,6 +951,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
         docs_[uri] = state;
         invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
+        parse_committed_cv_.notify_all();
     }
 
     // Building a dynamic/open-buffer SyntaxIndex may walk the full AST. Do that
@@ -975,6 +976,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
         docs_[uri] = state;
         invalidate_extra_snapshots_locked();
         listed_extra_file = extra_file_set_.contains(path_string);
+        parse_committed_cv_.notify_all();
 
         if (queue_include_dependents_locked(uri)) {
             ++background_generation_;
@@ -1014,6 +1016,13 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
             state->include_dependencies = it->second->include_dependencies;
             state->include_dependency_set = it->second->include_dependency_set;
+            // Keep the last snapshot that actually parsed, so an AST-shaped
+            // request arriving in this window has something true to answer
+            // from.  Taking the predecessor's own predecessor when it is
+            // itself a placeholder keeps the chain exactly one deep, however
+            // many keystrokes arrive before a parse commits.
+            state->previous_parsed =
+                it->second->tree ? it->second : it->second->previous_parsed;
         }
         docs_[uri] = state;
         latest_version_[uri] = version;
@@ -1128,6 +1137,10 @@ void Analyzer::parse_worker_loop() {
                 listed_extra = extra_file_set_.contains(state->normalized_path);
 
                 committed = true;
+                // Wake any handler parked in get_parsed_state() for this file.
+                // Broadcast: several requests can be waiting on the same
+                // notification's reparse.
+                parse_committed_cv_.notify_all();
             }
             // else: stale, discard
         }
@@ -1165,6 +1178,9 @@ void Analyzer::close(const std::string& uri) {
         latest_version_.erase(uri);
         semantic_diagnostics_.erase(uri);
         invalidate_extra_snapshots_locked();
+        // A closed document never gets its parse, so release anyone waiting on
+        // one instead of making them sit out the timeout.
+        parse_committed_cv_.notify_all();
         // If the closed file is also in the filelist cache, replace its live shard
         // with a disk-backed parse in the background.  Keeping this asynchronous is
         // important for large buffers: closing a split should not synchronously
@@ -1250,6 +1266,35 @@ std::shared_ptr<const DocumentState> Analyzer::get_state(const std::string& uri)
     if (it == docs_.end())
         return nullptr;
     return it->second;
+}
+
+std::shared_ptr<const DocumentState>
+Analyzer::get_parsed_state(const std::string& uri, std::chrono::milliseconds timeout) const {
+    std::unique_lock<std::mutex> lock(map_mutex_);
+    const auto current = [&]() -> std::shared_ptr<const DocumentState> {
+        const auto it = docs_.find(uri);
+        return it == docs_.end() ? nullptr : it->second;
+    };
+
+    auto state = current();
+    if (!state || state->tree)
+        return state;
+
+    // A reparse is in flight.  Wait for it rather than answer from a snapshot
+    // the user has already typed past -- but only for as long as the request
+    // thread can afford, since it answers one request at a time.
+    parse_committed_cv_.wait_for(lock, timeout, [&] {
+        const auto latest = current();
+        return !latest || latest->tree;
+    });
+
+    state = current();
+    if (!state || state->tree)
+        return state;
+
+    // Still no tree: the user is typing faster than this file parses, or the
+    // parse failed.  One keystroke stale beats nothing at all.
+    return state->previous_parsed ? state->previous_parsed : state;
 }
 
 struct IdentifierSpan {
