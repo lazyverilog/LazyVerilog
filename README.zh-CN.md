@@ -43,6 +43,8 @@
   ·
   <a href="#features">功能</a>
   ·
+  <a href="#comparison">对比</a>
+  ·
   <a href="#installation">安装</a>
   ·
   <a href="#usage">使用</a>
@@ -206,6 +208,36 @@
     <td>通过 <code>lazyverilog.toml</code> 定制工程内的行为。</td>
   </tr>
 </table>
+
+&nbsp;
+
+<a id="comparison"></a>
+
+## ⚖️ 对比
+
+LazyVerilog 与两个最常用的开源 SystemVerilog LSP：
+[`verible`](https://github.com/chipsalliance/verible/blob/master/verible/verilog/tools/ls/README.md)
+和 [`svlangserver`](https://github.com/imc-trading/svlangserver) 的对比。
+
+| | ⚡ LazyVerilog | Verible LS | svlangserver |
+|---|---|---|---|
+| **UVM / 类 / 包支持** | ✅ | ⚠️ | ❌ 其自身文档称："doesn't understand most verification specific concepts (e.g. classes)" |
+| **性能** | ✅ 原生 C++ | ✅ 原生 C++ | ❌ Node.js 运行时 |
+| 解析器 | [slang](https://github.com/MikePopoloski/slang) | Verible 自研的 SystemVerilog 解析器 | 自研的轻量索引器 |
+| 诊断 | ✅ 解析诊断 + 可配置的 lint 规则 + 可选的语义诊断 | 语法错误 + Verible 的 lint 规则集 | 委托给 Verilator |
+| 格式化 | 内置 | 内置 | 委托给 `verible-verilog-format` |
+| 跳转到定义 | ✅ | ✅ | ✅ |
+| 查找引用 | ✅ | ✅ | ❌ |
+| 重命名符号 | ✅ | ❌（仅列为计划中） | ❌ |
+| 悬停提示 | ✅ | ⚠️（实验性） | ✅ |
+| 自动补全 | ✅ | ❌ | ✅ |
+| 签名帮助 | ✅ | ❌ | ✅ |
+| 内联提示 | ✅ 例化时显示端口方向 | ❌ | ❌ |
+| 文档 / 工作区符号 | ✅ | ✅ 文档大纲 | ✅ |
+| lint 自动修复代码操作 | ❌ | ✅ | ❌ |
+| RTL 代码生成 | ✅ 自动例化 / 自动连线 / 自动端口列表 / 自动函数 / 自动寄存器 | ❌ | ❌ |
+| RTL 层次视图 | ✅ | ❌ | ✅ |
+| 接口 / 例化连接工具 | ✅ `:Interface`、`:Connect` | ❌ | ❌ |
 
 &nbsp;
 

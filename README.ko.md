@@ -43,6 +43,8 @@
   ·
   <a href="#features">기능</a>
   ·
+  <a href="#comparison">비교</a>
+  ·
   <a href="#installation">설치</a>
   ·
   <a href="#usage">사용법</a>
@@ -206,6 +208,36 @@
     <td><code>lazyverilog.toml</code>로 프로젝트별 동작을 지정할 수 있습니다.</td>
   </tr>
 </table>
+
+&nbsp;
+
+<a id="comparison"></a>
+
+## ⚖️ 비교
+
+LazyVerilog와 가장 널리 사용되는 두 가지 오픈소스 SystemVerilog LSP인
+[`verible`](https://github.com/chipsalliance/verible/blob/master/verible/verilog/tools/ls/README.md)
+과 [`svlangserver`](https://github.com/imc-trading/svlangserver)의 비교입니다.
+
+| | ⚡ LazyVerilog | Verible LS | svlangserver |
+|---|---|---|---|
+| **UVM / 클래스 / 패키지 지원** | ✅ | ⚠️ | ❌ 공식 문서: "doesn't understand most verification specific concepts (e.g. classes)" |
+| **성능** | ✅ 네이티브 C++ | ✅ 네이티브 C++ | ❌ Node.js 런타임 |
+| 파서 | [slang](https://github.com/MikePopoloski/slang) | Verible 자체 SystemVerilog 파서 | 자체 경량 인덱서 |
+| 진단 | ✅ 파싱 진단 + 설정 가능한 린트 규칙 + 선택적 시맨틱 진단 | 문법 오류 + Verible의 린트 규칙 집합 | Verilator에 위임 |
+| 포매팅 | 자체 구현 내장 | 자체 구현 내장 | `verible-verilog-format`에 위임 |
+| 정의로 이동 | ✅ | ✅ | ✅ |
+| 참조 찾기 | ✅ | ✅ | ❌ |
+| 심볼 이름 바꾸기 | ✅ | ❌ (계획으로만 명시됨) | ❌ |
+| 호버 | ✅ | ⚠️ (실험적) | ✅ |
+| 자동 완성 | ✅ | ❌ | ✅ |
+| 시그니처 도움말 | ✅ | ❌ | ✅ |
+| 인레이 힌트 | ✅ 인스턴스화 시 포트 방향 표시 | ❌ | ❌ |
+| 문서 / 워크스페이스 심볼 | ✅ | ✅ 문서 개요 | ✅ |
+| 린트 자동 수정 코드 액션 | ❌ | ✅ | ❌ |
+| RTL 코드 생성 | ✅ 자동 인스턴스화 / 자동 와이어 / 자동 포트 인자 / 자동 함수 / 자동 FF | ❌ | ❌ |
+| RTL 계층 구조 뷰 | ✅ | ❌ | ✅ |
+| 인터페이스 / 인스턴스 연결 도구 | ✅ `:Interface`, `:Connect` | ❌ | ❌ |
 
 &nbsp;
 
