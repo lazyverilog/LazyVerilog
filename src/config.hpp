@@ -29,6 +29,10 @@ struct InlayHintConfig {
     bool enable{true};
 };
 
+struct FoldingConfig {
+    bool enable{true};
+};
+
 struct StatementOptions {
     bool align{false};
     bool align_adaptive{false};
@@ -292,6 +296,7 @@ struct Config {
     CompilationConfig compilation;
     IndexConfig index;
     InlayHintConfig inlay_hint;
+    FoldingConfig folding;
     FormatOptions format;
     LintConfig lint;
     RtltreeOptions rtltree;

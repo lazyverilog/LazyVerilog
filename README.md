@@ -346,6 +346,9 @@ output_port_pattern = "^o_.*$" # regex; output ports should start with o_
 
 [inlay_hint]
 enable = true
+
+[folding]
+enable = true
 ```
 
 Example `vcode.f`:

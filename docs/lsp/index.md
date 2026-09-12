@@ -108,3 +108,23 @@ enable = true
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `true` | Set `false` to disable all inlay hints |
+
+## Folding ranges
+
+Neovim re-requests the whole file's folding ranges from every `didChange`, so on
+very large RTL files this is a per-keystroke cost.  Turning the capability off
+stops the client asking at all — measured 0 requests against 6 over five
+keystrokes.
+
+```toml
+[folding]
+enable = true
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enable` | bool | `true` | Set `false` to stop advertising `foldingRangeProvider` |
+
+Capabilities are exchanged once at `initialize`, so changing this mid-session
+only reaches clients that advertise `textDocument.foldingRange.dynamicRegistration`
+(VS Code does; Neovim does not).  Everywhere else it takes effect on restart.

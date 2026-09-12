@@ -129,6 +129,21 @@ int main(int argc, char** argv) {
                "no config in the workspace root, so defaults -- not the one above it");
     }
 
+    // `[folding].enable` reaches the wire the same way.  Neovim re-requests the
+    // whole file's folds from every didChange and answers `dynamicRegistration
+    // = false` for foldingRange, so this reply is the only chance to stop it
+    // asking -- there is no second one later in the session.
+    {
+        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "folding_off"));
+        expect(contains(out, R"("foldingRangeProvider":false)"),
+               "folding disabled by the config in the workspace root");
+    }
+    {
+        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "folding on by default when the config does not mention it");
+    }
+
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run
               << " checks passed\n";
     return checks_failed == 0 ? 0 : 1;

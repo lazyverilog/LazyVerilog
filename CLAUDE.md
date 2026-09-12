@@ -105,9 +105,14 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   only `rootUri`, not which file will be opened.  Fixing that case needs
   `client/unregisterCapability`; Neovim allows it for `inlayHint`
   (`dynamicRegistration = true`) but not for `foldingRange` (`false`).
-- `foldingRangeProvider` is hardcoded `true` — there is no folding config option, so
-  the client always asks.  Editor-side switches for both per-keystroke features live
-  in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
+- `caps.foldingRangeProvider` is built from `[folding].enable` the same way, and it is
+  the only switch that stops Neovim asking: measured 0 foldingRange requests against 6
+  over five keystrokes.  `sync_folding_registration()` will register/unregister the
+  capability mid-session, but only for a client that advertises
+  `textDocument.foldingRange.dynamicRegistration` — Neovim 0.12.5 answers `false` there
+  (it answers `true` for `inlayHint`), so on Neovim a `[folding].enable` edit takes
+  effect on restart and the server logs that.  Editor-side switches for both
+  per-keystroke features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
 - Details and prior measured rounds: `docs/dev/edit-perf.md`.
 
 ### Index Shard Cache

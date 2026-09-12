@@ -232,8 +232,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 push_type_error(value_errors, path, "table", *node.node());
         };
 
-        for (const auto* section : {"design", "compilation", "index", "inlay_hint", "format",
-                                    "lint", "rtltree", "autoarg", "autowire", "autoff",
+        for (const auto* section : {"design", "compilation", "index", "inlay_hint", "folding",
+                                    "format", "lint", "rtltree", "autoarg", "autowire", "autoff",
                                     "autofunc"}) {
             expect_table(&tbl, section, std::string("[") + section + "]");
         }
@@ -277,6 +277,12 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
         // [inlay_hint]
         if (auto ih = tbl["inlay_hint"].as_table()) {
             read_bool(ih, "enable", "[inlay_hint].enable", cfg.inlay_hint.enable,
+                      value_errors);
+        }
+
+        // [folding]
+        if (auto fold = tbl["folding"].as_table()) {
+            read_bool(fold, "enable", "[folding].enable", cfg.folding.enable,
                       value_errors);
         }
 

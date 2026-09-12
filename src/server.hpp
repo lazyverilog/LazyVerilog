@@ -37,6 +37,18 @@ class LazyVerilogServer {
     std::filesystem::path root_;
     std::string config_diagnostic_uri_;
     Config config_;
+
+    /// What `foldingRangeProvider` currently says, and whether the client will
+    /// let us change it.  Capabilities are normally exchanged once, so without
+    /// dynamic registration a later `[folding].enable` edit cannot reach the
+    /// client and only takes effect on restart.
+    bool folding_advertised_{true};
+    bool folding_dynamic_registration_{false};
+
+    /// Send client/registerCapability or client/unregisterCapability for
+    /// textDocument/foldingRange so it matches `[folding].enable`.  No-op when
+    /// the advertised state already matches, or when the client did not opt in.
+    void sync_folding_registration();
     Analyzer analyzer_;
     std::unique_ptr<BackgroundCompiler> background_compiler_;
     // Last observed textDocument version per open URI.  The server does not
