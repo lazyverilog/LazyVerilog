@@ -93,26 +93,32 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
-- `caps.inlayHintProvider` is built from `[inlay_hint].enable`, and capabilities are
-  exchanged **once and never revised**, so `initialize` must resolve the project's
-  real `lazyverilog.toml` — it walks up from the client's root, since that root is
-  regularly *below* the config (Neovim's `vim.fs.root` resolves a flat marker list by
-  marker order, so a high `.git` beats a nearer toml).  A config found later, by
-  didOpen's own walk-up, cannot take the capability back off: the client goes on
-  asking for the whole session and every reply is empty.  Guarded by
-  `ctest --test-dir build -R config-root-cli-smoke`.
-- That walk-up cannot reach a config *below* the client's root — `initialize` knows
-  only `rootUri`, not which file will be opened.  Fixing that case needs
-  `client/unregisterCapability`; Neovim allows it for `inlayHint`
-  (`dynamicRegistration = true`) but not for `foldingRange` (`false`).
-- `caps.foldingRangeProvider` is built from `[folding].enable` the same way, and it is
-  the only switch that stops Neovim asking: measured 0 foldingRange requests against 6
-  over five keystrokes.  `sync_folding_registration()` will register/unregister the
-  capability mid-session, but only for a client that advertises
-  `textDocument.foldingRange.dynamicRegistration` — Neovim 0.12.5 answers `false` there
-  (it answers `true` for `inlayHint`), so on Neovim a `[folding].enable` edit takes
-  effect on restart and the server logs that.  Editor-side switches for both
-  per-keystroke features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
+- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request,
+  and turning the capability off is what stops the client asking at all — measured 0
+  requests against 4-6 over five keystrokes in headless Neovim.  Both are read from
+  `<root>/lazyverilog.toml`, which is why `initialize` has to find the real one.
+- **Advertise a capability statically or register it dynamically, never both.**
+  Neovim's `client:supports_method()` answers from `server_capabilities` whenever
+  that field is present, so a later `client/unregisterCapability` changes nothing and
+  the client keeps requesting for the rest of the session — measured: unregister
+  accepted (`dynamic_capabilities:get()` → nil) while
+  `server_capabilities.inlayHintProvider` stayed `true` and requests kept coming.  So
+  when the client advertises `dynamicRegistration` for one of these, `initialize`
+  **omits** the provider field and the `initialized` handler registers instead.
+- `sync_dynamic_registration()` sends `client/registerCapability` /
+  `client/unregisterCapability` on `didChangeConfiguration`, so an edit to either
+  option takes effect mid-session with no restart — measured both directions, 4 → 0
+  and 0 → 4.  Neovim 0.12.5 opts in for `inlayHint` but **not** for `foldingRange`
+  (`dynamicRegistration = false`), so a `[folding].enable` edit there still needs a
+  restart, and the server logs that rather than sending a request the client may
+  ignore.  Registration ids are fixed (`kFoldingRegistrationId`,
+  `kInlayHintRegistrationId`) because the unregister has to name what the register used.
+- A registration carries a `documentSelector` of `systemverilog`/`verilog`.  A buffer
+  whose filetype is unset matches nothing, which looks exactly like a broken server —
+  check the filetype before the server when hints do not appear.
+- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins both the
+  static replies and the withheld-when-dynamic case.  Editor-side switches for both
+  features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
 - Details and prior measured rounds: `docs/dev/edit-perf.md`.
 
 ### Index Shard Cache

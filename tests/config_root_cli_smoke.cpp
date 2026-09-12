@@ -47,18 +47,23 @@ std::string frame(const std::string& body) {
 /// Send `initialize` for @p root_uri, then `exit`, and return the server's
 /// stdout.  Writing both messages up front and letting the server read to EOF
 /// keeps this to one blocking call with no timing assumptions.
-std::string initialize_with_root(const fs::path& server_bin, const std::string& root_uri) {
+std::string initialize_with_root(const fs::path& server_bin, const std::string& root_uri,
+                                 bool dynamic_registration = false) {
     static int counter = 0;
     const fs::path input = fs::temp_directory_path() /
                            ("lazyverilog-config-root-" +
                             std::to_string(cli_process::current_process_id()) + "-" +
                             std::to_string(counter++) + ".jsonrpc");
+    const std::string caps =
+        dynamic_registration
+            ? R"({"textDocument":{"inlayHint":{"dynamicRegistration":true},)"
+              R"("foldingRange":{"dynamicRegistration":true}}})"
+            : R"({"textDocument":{"inlayHint":{}}})";
     {
         std::ofstream out(input, std::ios::binary);
         out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
                      R"("processId":1,"rootUri":")" +
-                     root_uri +
-                     R"(","capabilities":{"textDocument":{"inlayHint":{}}}}})");
+                     root_uri + R"(","capabilities":)" + caps + "}}");
         out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
     }
 
@@ -142,6 +147,19 @@ int main(int argc, char** argv) {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("foldingRangeProvider":true)"),
                "folding on by default when the config does not mention it");
+    }
+
+    // A client that takes dynamic registration must NOT also be told statically.
+    // Neovim's supports_method() answers from the static capability when one is
+    // there, so advertising both makes a later client/unregisterCapability do
+    // nothing and the client keeps requesting for the rest of the session.
+    {
+        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"),
+                                              /*dynamic_registration=*/true);
+        expect(!contains(out, R"("inlayHintProvider")"),
+               "inlayHintProvider withheld from a client that registers dynamically");
+        expect(!contains(out, R"("foldingRangeProvider")"),
+               "foldingRangeProvider withheld from a client that registers dynamically");
     }
 
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run

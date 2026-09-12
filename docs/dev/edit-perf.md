@@ -186,29 +186,70 @@ require("lazyverilog").setup({ folding = false, inlay_hints = false })
 request, the reply, and Neovim's own `evaluate()` walk — out of the edit loop
 entirely.  `inlay_hints = false` stops Neovim requesting hints on every change.
 
-The server half of the hint switch works through capability negotiation, and it
-is worth knowing where that reaches.  `caps.inlayHintProvider` is built from
-`[inlay_hint].enable`, and with the capability off Neovim sends *no* inlayHint
-requests at all — measured 0 against 7 over five keystrokes — even though
+The server half of both switches works through capability negotiation.
+`caps.inlayHintProvider` is built from `[inlay_hint].enable` and
+`caps.foldingRangeProvider` from `[folding].enable`, and with a capability off
+Neovim sends *no* requests of that kind at all — measured 0 against 6 over five
+keystrokes for folding, and 0 against 4 for hints, even though
 `vim.lsp.inlay_hint.enable(true)` was called and `is_enabled()` reports true.
-But capabilities are exchanged once and never revised, so this only works when
-`initialize` can find the config:
 
-| where `lazyverilog.toml` is, relative to the client's `root_dir` | found at `initialize`? |
-|---|---|
-| at it | yes |
-| above it | yes — `initialize` walks up, as didOpen does |
-| below it | **no** |
+`lazyverilog.toml` is read from `<root>` and nowhere else (see
+[Usage step 1](../../README.md#-usage)), so a project whose config sits elsewhere
+gets defaults.  That used to be the end of the story, because capabilities are
+exchanged once at `initialize`.  It no longer is.
 
-The last row is not an oversight.  `initialize` knows only `rootUri`; it does not
-know which file is about to be opened, and this project's config rule is "walk up
-from the opened file".  Searching downward through a large repository is neither
-cheap nor unambiguous.  It is also the common case, because Neovim's
-`vim.fs.root` resolves a flat marker list by marker order rather than proximity,
-so the plugin's default `{ ".git", "lazyverilog.toml" }` roots at the repository
-whenever the config lives in a subdirectory.
+## Round 3: revising a capability mid-session
 
-LSP's answer for exactly this is dynamic registration —
-`client/unregisterCapability` after the config turns up.  Neovim accepts it for
-`inlayHint` (`dynamicRegistration = true`) but not for `foldingRange` (`false`),
-and `foldingRangeProvider` has no config option to revoke in the first place.
+`sync_dynamic_registration()` sends `client/registerCapability` or
+`client/unregisterCapability` when `didChangeConfiguration` reloads a config whose
+`enable` flag has flipped, so an edit takes effect without a restart.  Measured in
+headless Neovim, inlay hints, requests over four keystrokes on each side of the
+flip:
+
+| | before flip | after flip |
+|---|---|---|
+| `true` → `false` | 4 | **0** |
+| `false` → `true` | 0 | **4** |
+
+Three things make this work, and each of them silently breaks it if missed.
+
+**Advertise statically or register dynamically — never both.**  This is the one
+that cost the most time.  Neovim accepts the unregister
+(`client.dynamic_capabilities:get("textDocument/inlayHint")` becomes nil) and then
+goes on requesting anyway, because `client:supports_method()` consults
+`server_capabilities` first and that still carries the `initialize` answer:
+
+```
+after flip: supports_method(inlayHint)               = true
+after flip: server_capabilities.inlayHintProvider    = true
+after flip: dynamic get(inlayHint)                   = false
+phase 2 (enable=false) inlayHint sent                = 4
+```
+
+So when the client advertises `dynamicRegistration` for one of these, the
+`initialize` reply now **omits** the provider field entirely and the `initialized`
+handler registers instead.  `config-root-cli-smoke` pins this: a client that sends
+`dynamicRegistration: true` must get a reply with no `inlayHintProvider` and no
+`foldingRangeProvider` in it.
+
+**The client has to have opted in.**  Neovim 0.12.5:
+
+```
+foldingRange.dynamicRegistration = false
+inlayHint.dynamicRegistration    = true
+```
+
+So folding still takes the static path there and a `[folding].enable` edit needs a
+restart; the server logs that rather than sending a request the client is entitled
+to ignore.  VS Code's client opts in for both.
+
+**A registration needs a `documentSelector` that matches.**  Ours names
+`systemverilog` and `verilog`.  A buffer whose filetype is unset — `nvim -u NONE`
+without `filetype on`, which is exactly how the first version of this test was
+written — matches nothing, and the symptom is indistinguishable from a server that
+never registered.
+
+One asymmetry worth knowing: registering tells the client it *may* ask, not that it
+should.  Neovim re-requests hints on the next `didChange`, so a file nobody is
+typing in would sit without hints until touched.  `sync_inlay_hint_registration()`
+follows a fresh registration with `workspace/inlayHint/refresh` to prompt it.

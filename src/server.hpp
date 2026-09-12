@@ -38,17 +38,28 @@ class LazyVerilogServer {
     std::string config_diagnostic_uri_;
     Config config_;
 
-    /// What `foldingRangeProvider` currently says, and whether the client will
-    /// let us change it.  Capabilities are normally exchanged once, so without
-    /// dynamic registration a later `[folding].enable` edit cannot reach the
-    /// client and only takes effect on restart.
+    /// What the initialize reply said for each per-keystroke capability, and
+    /// whether the client will let us revise it.  Capabilities are normally
+    /// exchanged once, so without dynamic registration a later config edit
+    /// cannot reach the client and only takes effect on restart.  Neovim opts
+    /// in for `inlayHint` but not for `foldingRange`.
     bool folding_advertised_{true};
     bool folding_dynamic_registration_{false};
+    bool inlay_hint_advertised_{true};
+    bool inlay_hint_dynamic_registration_{false};
 
-    /// Send client/registerCapability or client/unregisterCapability for
-    /// textDocument/foldingRange so it matches `[folding].enable`.  No-op when
-    /// the advertised state already matches, or when the client did not opt in.
+    /// Send client/registerCapability or client/unregisterCapability so
+    /// @p method matches @p want.  No-op when @p advertised already says so, or
+    /// when @p client_supports is false -- then it only logs, naming
+    /// @p config_key.
+    void sync_dynamic_registration(const char* method, const char* registration_id,
+                                   const char* config_key, bool want, bool client_supports,
+                                   bool& advertised);
+
+    /// Bring textDocument/foldingRange and textDocument/inlayHint into line with
+    /// `[folding].enable` and `[inlay_hint].enable` after a config reload.
     void sync_folding_registration();
+    void sync_inlay_hint_registration();
     Analyzer analyzer_;
     std::unique_ptr<BackgroundCompiler> background_compiler_;
     // Last observed textDocument version per open URI.  The server does not

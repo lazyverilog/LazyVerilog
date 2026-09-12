@@ -114,36 +114,32 @@ MAKE_REFLECT_STRUCT(RegistrationParamsWithOptions, registrations);
 DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterFileWatchers, RegistrationParamsWithOptions,
                              JsonNull, "client/registerCapability");
 
-// client/registerCapability for textDocument/foldingRange.  LibLsp's plain
-// Registration carries no registerOptions, and a folding registration without a
-// documentSelector is not something a client can scope, so carry one.
-struct FoldingRangeRegistrationOptions {
-    std::vector<DocumentFilter> documentSelector;
-    MAKE_SWAP_METHOD(FoldingRangeRegistrationOptions, documentSelector);
-};
-MAKE_REFLECT_STRUCT(FoldingRangeRegistrationOptions, documentSelector);
-
-struct FoldingRegistration {
+// client/registerCapability for a per-document-language capability.  LibLsp's
+// plain Registration carries no registerOptions, and a registration without a
+// documentSelector is not something a client can scope, so carry
+// TextDocumentRegistrationOptions (from lsServerCapabilities.h) instead.
+struct ScopedRegistration {
     std::string id;
     std::string method;
-    FoldingRangeRegistrationOptions registerOptions;
-    MAKE_SWAP_METHOD(FoldingRegistration, id, method, registerOptions);
+    TextDocumentRegistrationOptions registerOptions;
+    MAKE_SWAP_METHOD(ScopedRegistration, id, method, registerOptions);
 };
-MAKE_REFLECT_STRUCT(FoldingRegistration, id, method, registerOptions);
+MAKE_REFLECT_STRUCT(ScopedRegistration, id, method, registerOptions);
 
-struct FoldingRegistrationParams {
-    std::vector<FoldingRegistration> registrations;
-    MAKE_SWAP_METHOD(FoldingRegistrationParams, registrations);
+struct ScopedRegistrationParams {
+    std::vector<ScopedRegistration> registrations;
+    MAKE_SWAP_METHOD(ScopedRegistrationParams, registrations);
 };
-MAKE_REFLECT_STRUCT(FoldingRegistrationParams, registrations);
+MAKE_REFLECT_STRUCT(ScopedRegistrationParams, registrations);
 
-DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterFolding, FoldingRegistrationParams, JsonNull,
+DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterScoped, ScopedRegistrationParams, JsonNull,
                              "client/registerCapability");
 
-// The id both sides use to refer to this registration.  Fixed rather than
-// generated: there is only ever one folding registration per session, and the
-// unregister has to name the same string the register used.
-constexpr const char* kFoldingRegistrationId = "lazyverilog-folding-range";
+// The ids both sides use to refer to these registrations.  Fixed rather than
+// generated: there is only ever one of each per session, and the unregister has
+// to name the same string the register used.
+constexpr const char* kFoldingRegistrationId   = "lazyverilog-folding-range";
+constexpr const char* kInlayHintRegistrationId = "lazyverilog-inlay-hint";
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -585,48 +581,72 @@ LazyVerilogServer::~LazyVerilogServer() {
 
 void LazyVerilogServer::run() { impl_->exit_event.wait(); }
 
-void LazyVerilogServer::sync_folding_registration() {
-    if (!impl_ || config_.folding.enable == folding_advertised_)
+void LazyVerilogServer::sync_dynamic_registration(const char* method,
+                                                  const char* registration_id,
+                                                  const char* config_key, bool want,
+                                                  bool client_supports, bool& advertised) {
+    if (!impl_ || want == advertised)
         return;
 
-    // Neovim advertises `foldingRange.dynamicRegistration = false`, so there
-    // the capability sent at initialize is final and an edit to
-    // `[folding].enable` only takes effect on restart.  Say so rather than
-    // sending a request the client is entitled to ignore.
-    if (!folding_dynamic_registration_) {
-        std::cerr << "[lazyverilog] [folding].enable changed to "
-                  << (config_.folding.enable ? "true" : "false")
-                  << ", but this client does not support dynamic registration for"
-                     " foldingRange -- restart the server for it to take effect\n";
+    // Capabilities are normally exchanged once, so a client that did not opt in
+    // keeps whatever initialize advertised.  Neovim answers
+    // `foldingRange.dynamicRegistration = false` (but `inlayHint` true), so say
+    // what happened rather than send a request it is entitled to ignore.
+    if (!client_supports) {
+        std::cerr << "[lazyverilog] " << config_key << " changed to "
+                  << (want ? "true" : "false")
+                  << ", but this client does not support dynamic registration for " << method
+                  << " -- restart the server for it to take effect\n";
         return;
     }
 
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
     try {
-        if (config_.folding.enable) {
-            auto req = impl_->remote_endpoint.createRequest<Req_ClientRegisterFolding::request>();
-            FoldingRegistration reg;
-            reg.id     = kFoldingRegistrationId;
-            reg.method = "textDocument/foldingRange";
+        if (want) {
+            auto req = impl_->remote_endpoint.createRequest<Req_ClientRegisterScoped::request>();
+            ScopedRegistration reg;
+            reg.id     = registration_id;
+            reg.method = method;
             DocumentFilter sv, v;
             sv.language = std::string("systemverilog");
             v.language  = std::string("verilog");
-            reg.registerOptions.documentSelector = {sv, v};
+            reg.registerOptions.documentSelector = DocumentSelector{sv, v};
             req.params.registrations.push_back(std::move(reg));
             (void)impl_->remote_endpoint.send(req);
         } else {
             auto req =
                 impl_->remote_endpoint.createRequest<Req_ClientUnregisterCapability::request>();
             Unregistration unreg;
-            unreg.id     = kFoldingRegistrationId;
-            unreg.method = "textDocument/foldingRange";
+            unreg.id     = registration_id;
+            unreg.method = method;
             req.params.unregisterations.push_back(std::move(unreg));
             (void)impl_->remote_endpoint.send(req);
         }
-        folding_advertised_ = config_.folding.enable;
+        advertised = want;
     } catch (const std::exception& e) {
-        std::cerr << "[lazyverilog] folding registration error: " << e.what() << "\n";
+        std::cerr << "[lazyverilog] " << method << " registration error: " << e.what() << "\n";
     }
+}
+
+void LazyVerilogServer::sync_folding_registration() {
+    sync_dynamic_registration("textDocument/foldingRange", kFoldingRegistrationId,
+                              "[folding].enable", config_.folding.enable,
+                              folding_dynamic_registration_, folding_advertised_);
+}
+
+void LazyVerilogServer::sync_inlay_hint_registration() {
+    const bool was_advertised = inlay_hint_advertised_;
+    sync_dynamic_registration("textDocument/inlayHint", kInlayHintRegistrationId,
+                              "[inlay_hint].enable", config_.inlay_hint.enable,
+                              inlay_hint_dynamic_registration_, inlay_hint_advertised_);
+
+    // Registering tells the client it may ask; it does not make it ask.  Neovim
+    // re-requests hints on the next didChange, which for a file nobody is
+    // typing in never comes -- so prompt it.  Must be outside the lock
+    // sync_dynamic_registration() holds: request_inlay_hint_refresh() takes the
+    // same one.
+    if (!was_advertised && inlay_hint_advertised_)
+        request_inlay_hint_refresh();
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
@@ -817,13 +837,16 @@ void LazyVerilogServer::register_handlers() {
         try {
             auto& caps = rsp.result.capabilities;
 
-            // Whether a later [folding].enable edit can reach this client at
-            // all.  Neovim answers false here; VS Code's client answers true.
-            if (req.params.capabilities.textDocument &&
-                req.params.capabilities.textDocument->foldingRange &&
-                req.params.capabilities.textDocument->foldingRange->dynamicRegistration)
-                folding_dynamic_registration_ =
-                    *req.params.capabilities.textDocument->foldingRange->dynamicRegistration;
+            // Whether a later [folding].enable / [inlay_hint].enable edit can
+            // reach this client at all.  Neovim answers false for foldingRange
+            // and true for inlayHint; VS Code's client answers true for both.
+            if (const auto& td = req.params.capabilities.textDocument) {
+                if (td->foldingRange && td->foldingRange->dynamicRegistration)
+                    folding_dynamic_registration_ =
+                        *td->foldingRange->dynamicRegistration;
+                if (td->inlayHint && td->inlayHint->dynamicRegistration)
+                    inlay_hint_dynamic_registration_ = *td->inlayHint->dynamicRegistration;
+            }
 
             // Text document sync: incremental + open/close notifications
             lsTextDocumentSyncOptions sync_opts;
@@ -948,16 +971,34 @@ void LazyVerilogServer::register_handlers() {
             }
 
             // Inlay hints
-            caps.inlayHintProvider = std::make_pair(optional<bool>(config_.inlay_hint.enable),
-                                                    optional<InlayHintOptions>{});
+            // A client that takes dynamic registration gets the capability that
+            // way and not here.  Advertising it statically as well is what makes
+            // a later client/unregisterCapability useless: Neovim's
+            // supports_method() falls back to the static capability and goes on
+            // requesting hints, which is exactly the bug this avoids.  The
+            // registration is sent from the `initialized` handler below.
+            if (inlay_hint_dynamic_registration_) {
+                inlay_hint_advertised_ = false;
+            } else {
+                caps.inlayHintProvider =
+                    std::make_pair(optional<bool>(config_.inlay_hint.enable),
+                                   optional<InlayHintOptions>{});
+                inlay_hint_advertised_ = config_.inlay_hint.enable;
+            }
 
             // Folding range.  Neovim re-requests the whole file's folds from
             // every didChange, so `[folding].enable = false` is the switch that
-            // stops the client asking at all.
-            caps.foldingRangeProvider =
-                std::make_pair(optional<bool>(config_.folding.enable),
-                               optional<FoldingRangeOptions>{});
-            folding_advertised_ = config_.folding.enable;
+            // stops the client asking at all.  Same rule as inlay hints above:
+            // a client that takes dynamic registration must not also be told
+            // statically, or the static answer is the one it keeps believing.
+            if (folding_dynamic_registration_) {
+                folding_advertised_ = false;
+            } else {
+                caps.foldingRangeProvider =
+                    std::make_pair(optional<bool>(config_.folding.enable),
+                                   optional<FoldingRangeOptions>{});
+                folding_advertised_ = config_.folding.enable;
+            }
 
             // Execute command — server-side commands
             lsExecuteCommandOptions exec_opts;
@@ -1009,6 +1050,12 @@ void LazyVerilogServer::register_handlers() {
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
         }
+
+        // Either capability may have been left out of the initialize reply for
+        // a client that takes dynamic registration, so make those first
+        // registrations now.
+        sync_folding_registration();
+        sync_inlay_hint_registration();
     });
 
     // ── shutdown ──────────────────────────────────────────────────────────────
@@ -1084,6 +1131,7 @@ void LazyVerilogServer::register_handlers() {
                 configure_background_compiler();
                 schedule_background_compilation();
                 sync_folding_registration();
+                sync_inlay_hint_registration();
             } catch (const std::exception& e) {
                 std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }

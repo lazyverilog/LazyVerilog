@@ -125,6 +125,10 @@ enable = true
 |--------|------|---------|-------------|
 | `enable` | bool | `true` | Set `false` to stop advertising `foldingRangeProvider` |
 
-Capabilities are exchanged once at `initialize`, so changing this mid-session
-only reaches clients that advertise `textDocument.foldingRange.dynamicRegistration`
-(VS Code does; Neovim does not).  Everywhere else it takes effect on restart.
+Changing this mid-session reaches only clients that advertise
+`textDocument.foldingRange.dynamicRegistration` — VS Code does, Neovim does not —
+because otherwise the capability sent at `initialize` is final.  Everywhere else
+it takes effect on restart, and the server says so on stderr.
+
+`[inlay_hint].enable` works the same way, and Neovim *does* opt in there, so
+editing it and saving takes effect immediately with no restart.
