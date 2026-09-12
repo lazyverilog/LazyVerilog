@@ -14,34 +14,56 @@
 namespace {
 
 
-using ModuleMap = std::unordered_map<std::string, ModuleEntry>;
+/// Every module this request can resolve an instance against, by name.
+///
+/// Entries are borrowed, not copied.  A ModuleEntry carries the module's whole
+/// port list, each port a handful of std::strings, so copying one per module in
+/// the design cost the request a deep copy of every port in the project -- once
+/// per keystroke, since Neovim asks for hints on every didChange.  The owners
+/// are kept alive alongside the pointers instead.
+struct ModuleMap {
+    std::unordered_map<std::string, const ModuleEntry*> by_name;
+    // What the pointers point into.  The project snapshot is immutable once
+    // published and each DocumentState is an immutable snapshot, so holding a
+    // reference to them is all it takes to keep every borrowed entry valid for
+    // the life of this request.
+    std::shared_ptr<const ProjectIndexSnapshot> project;
+    std::vector<std::shared_ptr<const DocumentState>> open_documents;
+};
 
 static void overlay_modules(ModuleMap& modules, const SyntaxIndex& index) {
     for (const auto& module : index.modules)
-        modules[module.name] = module;
+        modules.by_name[module.name] = &module;
 }
 
 static ModuleMap build_module_map(const Analyzer& analyzer) {
     ModuleMap modules;
 
-    if (auto project_index = analyzer.project_index_snapshot()) {
-        for (const auto& [name, ref] : project_index->module_by_name) {
+    modules.project = analyzer.project_index_snapshot();
+    if (modules.project) {
+        for (const auto& [name, ref] : modules.project->module_by_name) {
             if (ref.shard && ref.module_index < ref.shard->modules.size())
-                modules[name] = ref.shard->modules[ref.module_index];
+                modules.by_name[name] = &ref.shard->modules[ref.module_index];
         }
     }
 
     analyzer.for_each_state(
         [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {
-            if (state && state->tree)
-                overlay_modules(modules, get_structural_index(*state));
+            if (!state || !state->tree)
+                return;
+            // The structural index lives on the snapshot, so the snapshot has
+            // to outlive the pointers taken from it.
+            modules.open_documents.push_back(state);
+            overlay_modules(modules, get_structural_index(*state));
         });
 
     return modules;
 }
 
-static std::unordered_map<std::string, PortEntry> build_port_map(const ModuleEntry& module) {
-    std::unordered_map<std::string, PortEntry> ports;
+using PortMap = std::unordered_map<std::string, PortEntry>;
+
+static PortMap build_port_map(const ModuleEntry& module) {
+    PortMap ports;
     for (const auto& port : module.ports) {
         // module.ports also holds `#(...)` header parameters (direction
         // "parameter"/"localparam"); those aren't instance port connections
@@ -52,6 +74,25 @@ static std::unordered_map<std::string, PortEntry> build_port_map(const ModuleEnt
     }
     return ports;
 }
+
+/// Port maps built at most once per module for the life of one request.
+///
+/// A design instantiates the same few leaf modules over and over -- 600
+/// instances of one module is an ordinary generated netlist -- and the port map
+/// depends only on the module, so building it per instance did the same work
+/// 600 times.
+class PortMapCache {
+  public:
+    const PortMap& get(const std::string& module_name, const ModuleEntry& module) {
+        const auto it = cache_.find(module_name);
+        if (it != cache_.end())
+            return it->second;
+        return cache_.emplace(module_name, build_port_map(module)).first->second;
+    }
+
+  private:
+    std::unordered_map<std::string, PortMap> cache_;
+};
 
 static std::string display_port_direction(const std::string& direction) {
     // Keep the semantic direction stored in SyntaxIndex unchanged
@@ -91,16 +132,20 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
         return {};
 
     const auto lines = split_lines_view(state->text);
-    const auto current_index = get_structural_index(*state);
+    // By reference: get_structural_index() hands back the index cached on the
+    // snapshot, and binding it to a value copied every declaration, instance
+    // and reference occurrence in the file on every request.
+    const auto& current_index = get_structural_index(*state);
     const auto modules = build_module_map(analyzer);
+    PortMapCache port_maps;
     std::vector<lsInlayHint> hints;
 
     for (const auto& inst : current_index.instances) {
-        auto module_it = modules.find(inst.module_name);
-        if (module_it == modules.end())
+        auto module_it = modules.by_name.find(inst.module_name);
+        if (module_it == modules.by_name.end() || !module_it->second)
             continue;
 
-        const auto port_map = build_port_map(module_it->second);
+        const auto& port_map = port_maps.get(inst.module_name, *module_it->second);
         if (port_map.empty())
             continue;
 

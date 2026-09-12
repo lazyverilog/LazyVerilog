@@ -838,6 +838,15 @@ class Analyzer {
     };
     void queue_shard_write(PendingShardWrite write) const;
     void index_cache_writer_loop() const;
+    /// Perform every queued shard write on the calling thread.
+    ///
+    /// Only used when there is no writer thread, which is the one-CPU case:
+    /// see queue_shard_write().  Called once a burst has published its index,
+    /// and by wait_for_index_cache_writes_idle() so the queue can never be left
+    /// with nobody to drain it.
+    void drain_shard_writes_inline() const;
+    /// True when writes go on the queue with no thread behind it.
+    bool shard_writes_need_inline_drain() const;
 
     mutable std::mutex index_cache_write_mutex_;
     mutable std::condition_variable index_cache_write_cv_;
