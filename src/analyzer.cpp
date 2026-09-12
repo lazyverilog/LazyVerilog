@@ -821,6 +821,14 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
 }
 
 Analyzer::~Analyzer() {
+    // With no writer thread, the queue's only other drain point is the end of a
+    // burst.  A process that goes away mid-burst would drop everything queued
+    // since the last publish, which costs the next launch a reparse of exactly
+    // the files this launch just did.  Write them out instead, before the stop
+    // flag closes the queue.
+    if (shard_writes_need_inline_drain())
+        drain_shard_writes_inline();
+
     // Stopped first: it holds shared_ptrs into the shards the rest of teardown
     // is about to drop, and it takes map_mutex_ to check its generation.
     {
@@ -6112,7 +6120,7 @@ void Analyzer::reserve_shard_writes(size_t count) const {
     index_cache_writes_reserved_ += count;
 }
 
-void Analyzer::queue_shard_write(PendingShardWrite write) const {
+bool Analyzer::shard_writes_need_inline_drain() const {
     // On a one-CPU slice there is no other core to move the write to, and a
     // second runnable thread only adds context switches and holds the shard
     // alive while it queues.  Measured on a 5953-shard project: handing writes
@@ -6120,27 +6128,44 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
     // *onto* it with one, and one is the slice a batch-scheduled node grants.
     // So the writer exists exactly when there is somewhere for it to run.
     static const bool use_writer_thread = available_cpu_count() > 1;
+    return !use_writer_thread;
+}
 
-    // Every exit from here releases exactly one reservation, or the drain wait
-    // never completes.
-    const auto release_reservation = [this] {
-        std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
-        if (index_cache_writes_reserved_ > 0)
-            --index_cache_writes_reserved_;
-        index_cache_write_cv_.notify_all();
-    };
-
-    if (!use_writer_thread) {
-        if (write.index) {
-            store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                 write.extra_dependency_uri, write.stands_alone);
+void Analyzer::drain_shard_writes_inline() const {
+    for (;;) {
+        PendingShardWrite write;
+        {
+            std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
+            if (index_cache_write_queue_.empty())
+                return;
+            write = std::move(index_cache_write_queue_.front());
+            index_cache_write_queue_.pop_front();
+            index_cache_writing_ = true;
         }
-        if (write.prune_only)
-            prune_cache_once_per_generation(write.generation, write.live_uris);
-        release_reservation();
-        return;
-    }
 
+        // Same generation check the writer thread makes: a shard keyed on
+        // defines that have since moved would serve the wrong index.
+        bool current_generation = false;
+        {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            current_generation = write.generation == background_generation_;
+        }
+        if (current_generation) {
+            if (write.index) {
+                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                     write.extra_dependency_uri, write.stands_alone);
+            }
+            if (write.prune_only)
+                prune_cache_once_per_generation(write.generation, write.live_uris);
+        }
+
+        std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
+        index_cache_writing_ = false;
+        index_cache_write_cv_.notify_all();
+    }
+}
+
+void Analyzer::queue_shard_write(PendingShardWrite write) const {
     std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
     // Reservation to queue entry in one step: the wait counts both, so the
     // write is never invisible to it.
@@ -6150,7 +6175,19 @@ void Analyzer::queue_shard_write(PendingShardWrite write) const {
         index_cache_write_cv_.notify_all();
         return;
     }
-    if (!index_cache_writer_.joinable()) {
+    // The queue is the same either way; what differs is who empties it.  With a
+    // core to spare a thread takes it; on a one-CPU slice it is drained inline
+    // once the burst has published its index -- see drain_shard_writes_inline().
+    //
+    // The one-CPU case used to write here, on the indexing worker, which put
+    // serialization and a write() in the middle of the parse loop the user is
+    // waiting on: measured at +21 to +28% on a cold launch against the same
+    // build with the cache off.  The work is identical on one core; what
+    // changes is that it happens after the index is usable rather than before.
+    //
+    // Queueing it costs no memory worth counting: the SyntaxIndex held here is
+    // the same object extra_cache_ already points at.
+    if (!shard_writes_need_inline_drain() && !index_cache_writer_.joinable()) {
         index_cache_writer_ = std::thread([this] {
             // Same courtesy the index workers extend: a cache write is the
             // least urgent thing this process does.
@@ -6203,11 +6240,24 @@ void Analyzer::index_cache_writer_loop() const {
 }
 
 void Analyzer::wait_for_index_cache_writes_idle() const {
+    const bool inline_drain = shard_writes_need_inline_drain();
+
     std::unique_lock<std::mutex> lock(index_cache_write_mutex_);
-    index_cache_write_cv_.wait(lock, [&] {
-        return index_cache_writes_reserved_ == 0 && index_cache_write_queue_.empty() &&
-               !index_cache_writing_;
-    });
+    while (true) {
+        index_cache_write_cv_.wait(lock, [&] {
+            if (index_cache_writes_reserved_ == 0 && index_cache_write_queue_.empty() &&
+                !index_cache_writing_)
+                return true;
+            // With no writer thread behind the queue, waiting for it to empty
+            // would be waiting on this thread to empty it.  Wake and do that.
+            return inline_drain && !index_cache_write_queue_.empty();
+        });
+        if (!inline_drain || index_cache_write_queue_.empty())
+            return;
+        lock.unlock();
+        drain_shard_writes_inline();
+        lock.lock();
+    }
 }
 
 std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string& uri,
@@ -7354,6 +7404,12 @@ void Analyzer::background_index_loop() const {
                 background_header_texts_.clear();
                 if (publish_callback)
                     publish_callback();
+                // The burst is over and its index is published, so the shard
+                // writes it produced are no longer in anybody's way.  On a
+                // one-CPU slice this thread is the only one there is to do
+                // them; with a core to spare the writer thread already has.
+                if (shard_writes_need_inline_drain())
+                    drain_shard_writes_inline();
                 continue;
             }
 
