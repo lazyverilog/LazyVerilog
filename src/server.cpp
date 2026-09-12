@@ -489,7 +489,6 @@ struct LazyVerilogServer::Impl {
 
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
-    config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
     config_ = load_config(root_);
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
@@ -829,23 +828,16 @@ void LazyVerilogServer::register_handlers() {
                 if (!std::filesystem::exists(p))
                     return;
 
-                // Walk up for lazyverilog.toml, the same search didOpen does.
-                // The client's root is whatever its own root markers picked --
-                // commonly a .git directory, or, when no marker matched, the
-                // opened file's own directory -- so the config often sits above
-                // it.  Leaving the search to didOpen is too late for one thing
-                // in particular: the capability reply below is built from this
-                // config and is never revised, so a config found afterwards
-                // cannot take inlay hints back off.
-                //
-                // root_ becomes the directory holding the config rather than
-                // the client's root, because vcode paths and the shard cache
-                // location are resolved relative to it.  That is the invariant
-                // didOpen and didChangeConfiguration already maintain.
+                // lazyverilog.toml is read from the workspace root and nowhere
+                // else -- no upward search from here, and none from didOpen.
+                // The capability reply below is built from this config and is
+                // never revised, so a config found after initialize could not
+                // take inlay hints back off anyway; a single fixed location is
+                // the only one that can be honoured at the time it is needed.
+                // A project whose config sits elsewhere gets defaults, and the
+                // client can still point at one explicitly with the configFile
+                // payload of didChangeConfiguration.
                 root_ = p;
-                if (auto config_root = find_config_root(p); !config_root.empty())
-                    root_ = config_root;
-                config_found_ = std::filesystem::exists(root_ / "lazyverilog.toml");
 
                 std::string warn;
                 ConfigWarning warning_detail;
@@ -980,7 +972,6 @@ void LazyVerilogServer::register_handlers() {
                             config_path = root_ / config_path;
                         if (config_path.filename() == "lazyverilog.toml") {
                             root_ = config_path.parent_path();
-                            config_found_ = true;
                         }
                     }
                 }
@@ -1044,32 +1035,11 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── textDocument/didOpen ──────────────────────────────────────────────────
-    ep.registerHandler([&, show_warning](const Notify_TextDocumentDidOpen::notify& note) {
+    ep.registerHandler([&](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
-            // Walk up from file to find lazyverilog.toml if not already found
-            if (!config_found_) {
-                auto uri = td.uri.raw_uri_;
-                if (uri.starts_with("file://"))
-                    uri = path_from_file_uri(uri);
-                auto found = find_config_root(uri);
-                if (!found.empty()) {
-                    root_ = found;
-                    config_found_ = true;
-                    std::string warn;
-                    ConfigWarning warning_detail;
-                    config_ = load_config(root_, &warn, &warning_detail);
-
-                    if (!warn.empty())
-                        show_warning(warn);
-                    publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                    { auto vcode = load_vcode(root_, config_);
-                      analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
-                                                   vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root()); }
-                    configure_background_compiler();
-                }
-            }
+            // No config search here.  The config was resolved at initialize from
+            // the workspace root; opening a file cannot move it.
             analyzer_.enqueue_parse(td.uri.raw_uri_, td.text);
             document_versions_[td.uri.raw_uri_] = td.version;
             analyzer_.clear_semantic_diagnostics(td.uri.raw_uri_);

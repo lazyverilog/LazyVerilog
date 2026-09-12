@@ -249,17 +249,17 @@ require("lazyverilog").setup({
   cmd = "/path/to/lazyverilog-lsp",
 })
 
--- Editor-side features that cost something on every edit.  Both default to
--- true; turn them off for very large RTL files or on a machine with little CPU
--- to spare, such as a shared HPC node.
+-- Editor-side features that cost something on every edit.  Both shown at their
+-- defaults; set either to false for very large RTL files or on a machine with
+-- little CPU to spare, such as a shared HPC node.
 require("lazyverilog").setup({
   -- 'foldmethod=expr' driven by the server's folding ranges.  Neovim
   -- re-requests the whole file's folds from every change.
-  folding     = false,
+  folding     = true,
   -- Inlay hints.  Neovim requests them on every change even when the server is
   -- configured to return none; this is the editor half of the switch, and
   -- `[inlay_hint].enable` in lazyverilog.toml is the server half.
-  inlay_hints = false,
+  inlay_hints = true,
 })
 ```
 
@@ -303,6 +303,22 @@ Then install it from VS Code:
 
 Create `lazyverilog.toml` in the project root.  At minimum, point `design.vcode` to a filelist so
 LazyVerilog can index modules, packages, ports, and cross-file references.
+
+> **The file must sit exactly at the root your editor opens the project with.**
+> LazyVerilog reads `<root>/lazyverilog.toml` and does not search for it — not upward from the
+> root, and not upward from the file you open.  If it is anywhere else, the server starts with
+> built-in defaults and never reports an error, because from its point of view the project simply
+> has no config.
+>
+> The root is the one your LSP client sends in `initialize`, so make sure the two agree.  In
+> Neovim, `vim.fs.root` resolves its marker list **by marker order, not by proximity** — with
+> `{ ".git", "lazyverilog.toml" }` a `.git` higher in the tree wins over a nearer config — so keep
+> `lazyverilog.toml` beside `.git` at the top of the repository.  A monorepo with several RTL
+> projects needs either a config at the top or one client root per project.
+>
+> Capabilities are exchanged once at `initialize` and never revised, which is why this is strict:
+> a config discovered afterwards could not switch a feature back off, and the client would keep
+> requesting it for the rest of the session.
 
 For full configuration, refer to [`lazyverilog.toml`](lazyverilog.toml) — complete example configuration.
 
@@ -349,7 +365,7 @@ path/to/rtl3.sv
 
 Open a Verilog/SystemVerilog RTL file:
 
-Server will traverse toward the root(`/`) and look for `lazyverilog.toml`.
+Server reads `lazyverilog.toml` from the project root — see step 1; it does not search for it.
 
 ```bash
 nvim path/to/rtl.sv
@@ -506,7 +522,7 @@ Editors resolve the `lazyverilog-lsp` server in this order:
 
 ## ⚙️ Configuration
 
-LazyVerilog reads `lazyverilog.toml` from your project root. If neovim is opened in a subdirectory, LazyVerilog walks upward until it finds the nearest config file.
+LazyVerilog reads `lazyverilog.toml` from your project root, and only from there — see [Usage step 1](#1-add-a-project-config-to-your-rtl-project-root) for what the root means and why the location is fixed. Opening a subdirectory as the project root gives you built-in defaults, not the config above it.
 
 The config controls design inputs, semantic compilation, lint rules, formatter policy, RTL tree display, inlay hints, and automation helpers.
 

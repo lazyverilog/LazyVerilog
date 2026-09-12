@@ -1,5 +1,5 @@
-// The server's `initialize` reply must be built from the project's real
-// lazyverilog.toml.
+// The server's `initialize` reply must be built from the lazyverilog.toml in
+// the workspace root -- and from no other one.
 //
 // Capabilities are exchanged once and never revised, so a config found after
 // the reply cannot take a feature back off: the client goes on requesting it
@@ -7,12 +7,11 @@
 // `[inlay_hint].enable` is the case that actually reaches the wire --
 // `caps.inlayHintProvider` is built from it -- so it is what this test reads.
 //
-// The client's root is whatever its own root markers picked, which is regularly
-// *below* the config: Neovim's `vim.fs.root` resolves a flat marker list by
-// marker order rather than by proximity, so a `.git` high in the tree wins over
-// a nearer lazyverilog.toml, and with no marker at all the root is the opened
-// file's own directory.  So `initialize` has to walk up for the config the same
-// way didOpen does.
+// `<root>/lazyverilog.toml` is the whole contract: the server does not search
+// for the file, at initialize or at didOpen.  A project that puts it elsewhere
+// is configured wrong and gets built-in defaults, which is what the third case
+// below pins -- an upward walk would make it read the config two directories up
+// and answer `false`.
 //
 // This drives the real binary over stdio rather than calling into the server,
 // because the behaviour under test is the content of an LSP reply.
@@ -102,31 +101,32 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // The client's root is the config's own directory: the case that already
-    // worked, kept so a regression cannot pass by breaking everything equally.
+    // The supported layout: the config sits in the root the client sent, and a
+    // setting turned off in it reaches the capability reply.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("inlayHintProvider":false)"),
-               "hints disabled, client rooted at the config directory");
+               "hints disabled by the config in the workspace root");
     }
 
-    // The client's root is two directories below the config.  Before the
-    // upward walk this answered `true` from built-in defaults, and the client
-    // then requested hints on every keystroke for the rest of the session.
+    // The same layout against a config that turns the setting on.  Without this
+    // a server that always answered `false` would pass the case above, and a
+    // server that ignored the file entirely would pass the case below.
+    {
+        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"));
+        expect(contains(out, R"("inlayHintProvider":true)"),
+               "hints enabled by the config in the workspace root");
+    }
+
+    // The client's root is two directories below the config, so by the contract
+    // there is no config: the reply must come from built-in defaults, where
+    // inlay hints are on.  An upward walk would find `enable = false` above and
+    // answer `false` here.
     {
         const auto out = initialize_with_root(
             server_bin, path_to_uri(fixtures / "hints_off" / "rtl" / "core"));
-        expect(contains(out, R"("inlayHintProvider":false)"),
-               "hints disabled, client rooted below the config directory");
-    }
-
-    // The same depth against a config that enables hints.  Without this, a
-    // server that simply always answered `false` would pass the two above.
-    {
-        const auto out = initialize_with_root(
-            server_bin, path_to_uri(fixtures / "hints_on" / "rtl" / "core"));
         expect(contains(out, R"("inlayHintProvider":true)"),
-               "hints enabled, client rooted below the config directory");
+               "no config in the workspace root, so defaults -- not the one above it");
     }
 
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run
