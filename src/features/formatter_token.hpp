@@ -52,6 +52,20 @@ struct LexemeFacts {
     bool is_directive{false};
     bool is_whitespace_sensitive{false};
 
+    // An escaped identifier (`\\data[0] `) is terminated by whitespace, not by
+    // the end of its own spelling, so the separator that follows it belongs to
+    // the name.  Spacing rules that would otherwise close the gap must leave at
+    // least one separator here, or re-lexing glues the next token onto the
+    // identifier and the safety net aborts the whole file.
+    bool is_escaped_identifier{false};
+
+    // Part of an attribute instance `(* ... *)`, delimiters included.  slang's
+    // lexer has no `(*` token -- the parser reconstructs attributes from an
+    // OpenParenthesis immediately followed by a Star -- so the adjacency is
+    // recorded here, where byte positions are known, rather than re-derived by
+    // a pass from input trivia.
+    bool in_attribute_instance{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.
@@ -96,6 +110,16 @@ struct SyntaxFacts {
 struct TopologyFacts {
     bool opens_indent_scope{false};
     bool closes_indent_scope{false};
+
+    // `{` is overloaded in SystemVerilog: it opens a constraint or coverage
+    // body, but it also opens a concatenation, a set-membership list, an
+    // assignment pattern and a streaming expression.  Only a statement block
+    // holds a `;` at its own depth, so that is what separates the two -- a
+    // TokenKind fact, not a lookbehind on which keyword happens to precede it,
+    // which would have to enumerate `constraint`, `coverpoint`, `cross`, `dist`
+    // and every `foreach`/`if` nested inside a constraint body.  Set on the
+    // opening brace only.
+    bool opens_brace_block{false};
 
     bool starts_argument_list{false};
     bool ends_argument_list{false};

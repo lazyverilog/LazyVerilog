@@ -267,7 +267,27 @@ inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
         return is_fork_block_open(tokens, idx);
     if (is_covergroup_sample_function_header(tokens, idx))
         return false;
+    // is_open_block() lists OpenBrace unconditionally, but only a statement
+    // block indents its contents -- a concatenation or assignment pattern does
+    // not.  SyntaxPass froze which is which.
+    if (kind_is(tokens[idx], TK::OpenBrace))
+        return tokens[idx].immutable.topology.opens_brace_block;
     return is_open_block(tokens[idx].lex.kind);
+}
+
+// The dedent half of opens_indent_scope_at().  A closing brace dedents only
+// when its own opening brace indented; pairing them through matching_token is
+// what stops an expression brace from dropping a level it never added and
+// shifting every following line of the file.
+inline bool closes_indent_scope_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size())
+        return false;
+    if (kind_is(tokens[idx], TK::CloseBrace)) {
+        const size_t open = tokens[idx].immutable.syntax.matching_token;
+        return open != npos && kind_is(tokens[open], TK::OpenBrace) &&
+               tokens[open].immutable.topology.opens_brace_block;
+    }
+    return is_close_block(tokens[idx].lex.kind);
 }
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end) {
@@ -925,6 +945,9 @@ public:
     const char* name() const override { return "syntax"; }
     void run(TokenStream& tokens) override {
         std::vector<size_t> parens, brackets, braces;
+        // Paren/bracket depth at each open brace, so a `;` nested inside
+        // parentheses is not mistaken for the brace's own statement separator.
+        std::vector<std::pair<int, int>> brace_ctx;
         int pd = 0, bd = 0, brd = 0;
         bool in_function_decl = false;
         bool in_task_decl = false;
@@ -985,9 +1008,18 @@ public:
             else if (kind_is(t, TK::CloseParenthesis)) { if (!parens.empty()) { auto j = parens.back(); parens.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; t.immutable.topology.ends_argument_list = tokens[j].immutable.topology.starts_argument_list; } pd = std::max(0, pd - 1); }
             else if (kind_is(t, TK::OpenBracket)) { brackets.push_back(i); ++bd; }
             else if (kind_is(t, TK::CloseBracket)) { if (!brackets.empty()) { auto j = brackets.back(); brackets.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; } bd = std::max(0, bd - 1); }
-            else if (kind_is(t, TK::OpenBrace)) { braces.push_back(i); ++brd; }
-            else if (kind_is(t, TK::CloseBrace)) { if (!braces.empty()) { auto j = braces.back(); braces.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; } brd = std::max(0, brd - 1); }
+            // ApostropheOpenBrace (`'{`) is a single token but it opens a brace
+            // exactly like OpenBrace does.  Leaving it off the stack made every
+            // assignment pattern's `}` pop the wrong entry -- or nothing at all,
+            // leaving matching_token unset -- and left brace_depth short by one
+            // for the rest of the file.
+            else if (kind_is(t, TK::OpenBrace) || kind_is(t, TK::ApostropheOpenBrace)) { braces.push_back(i); brace_ctx.emplace_back(pd, bd); ++brd; }
+            else if (kind_is(t, TK::CloseBrace)) { if (!braces.empty()) { auto j = braces.back(); braces.pop_back(); brace_ctx.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; } brd = std::max(0, brd - 1); }
             if (kind_is(t, TK::Semicolon)) {
+                // A `;` at the brace's own depth makes the brace a statement
+                // block.  No expression brace can hold one.
+                if (!braces.empty() && brace_ctx.back() == std::pair<int, int>(pd, bd))
+                    tokens[braces.back()].immutable.topology.opens_brace_block = true;
                 in_function_decl = false;
                 in_task_decl = false;
                 in_modport = false;
@@ -1026,6 +1058,23 @@ public:
                     ++depth;
             }
         }
+
+        // Indent scopes for braces can only be settled once every brace has been
+        // classified and matched, which is why this is a second pass rather than
+        // part of the walk above.  An expression brace opens no scope, and its
+        // closing brace must close none either, or the indent level drifts for
+        // the rest of the file.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& t = tokens[i];
+            if (kind_is(t, TK::OpenBrace)) {
+                t.immutable.topology.opens_indent_scope = t.immutable.topology.opens_brace_block;
+            } else if (kind_is(t, TK::CloseBrace)) {
+                const size_t open = t.immutable.syntax.matching_token;
+                t.immutable.topology.closes_indent_scope =
+                    open != npos && kind_is(tokens[open], TK::OpenBrace) &&
+                    tokens[open].immutable.topology.opens_brace_block;
+            }
+        }
     }
 };
 
@@ -1044,13 +1093,32 @@ inline bool is_class_extends_parameter_list(const TokenStream& tokens, size_t op
     return false;
 }
 
+// Reads the classification SyntaxPass already froze.  The previous version
+// tested only the token before the brace for `=`, `'` or `[`, which recognised
+// an assignment pattern but missed `inside {...}`, `{<<8{...}}`, and every
+// concatenation reached through an operator or a comma -- their closing braces
+// were pushed onto their own line as if they were an `end`.
 inline bool is_expression_brace(const TokenStream& tokens, size_t brace) {
-    if (brace >= tokens.size() || !kind_is(tokens[brace], TK::OpenBrace))
+    if (brace >= tokens.size())
         return false;
-    size_t p = prev_code(tokens, brace);
-    return p != npos && (kind_is(tokens[p], TK::Equals) ||
-                         kind_is(tokens[p], TK::Apostrophe) ||
-                         kind_is(tokens[p], TK::OpenBracket));
+    // `'{` only ever opens an assignment pattern.
+    if (kind_is(tokens[brace], TK::ApostropheOpenBrace))
+        return true;
+    return kind_is(tokens[brace], TK::OpenBrace) &&
+           !tokens[brace].immutable.topology.opens_brace_block;
+}
+
+// `{<<8{data}}` -- the `<<` of a stream concatenation, not the shift operator
+// it shares a spelling with.  A shift can never appear directly after `{`,
+// because a concatenation element cannot begin with one, so the position alone
+// separates them without any lookahead.
+inline bool is_stream_operator_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size())
+        return false;
+    if (!kind_is(tokens[idx], TK::LeftShift) && !kind_is(tokens[idx], TK::RightShift))
+        return false;
+    const size_t p = prev_code(tokens, idx);
+    return p != npos && kind_is(tokens[p], TK::OpenBrace);
 }
 
 inline bool is_multiline_brace_construct(const TokenStream& tokens, size_t brace) {
@@ -1980,6 +2048,36 @@ private:
             }
             ctrl_just_closed = false;
         }
+
+        freeze_attribute_instances(tokens);
+    }
+
+    // An attribute instance is an atom: `(* async_reg = "true" *)` annotates the
+    // declaration that follows and is not a breakable list, however much its
+    // OpenParenthesis looks like one.  Breaking it apart moves only trivia, so
+    // the token-stream safety net cannot catch the damage -- and the result no
+    // longer parses.  Clearing the flags here, after every rule above has run,
+    // keeps the decision in one place instead of adding a guard to each.
+    static void freeze_attribute_instances(TokenStream& tokens) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!tokens[i].lex.in_attribute_instance)
+                continue;
+            size_t end = i;
+            while (end + 1 < tokens.size() && tokens[end + 1].lex.in_attribute_instance)
+                ++end;
+
+            // A break before the attribute and after it stays available; only
+            // the inside of the span is frozen.
+            for (size_t k = i; k <= end; ++k) {
+                if (k != end) {
+                    tokens[k].mutable_.wrap.must_break_after = false;
+                    tokens[k].mutable_.wrap.can_break_after = false;
+                }
+                if (k != i)
+                    tokens[k].mutable_.wrap.must_break_before = false;
+            }
+            i = end;
+        }
     }
 
     const FormatOptions& opts_;
@@ -2118,7 +2216,7 @@ public:
             if (kind_is(t, TK::Semicolon))      { in_import = false; in_extern = false; in_typedef = false; }
 
             // Compute indent — close tokens first so they dedent before assignment
-            bool closes = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind) ||
+            bool closes = closes_indent_scope_at(tokens, i) || is_outer_close(t.lex.kind) ||
                           t.mutable_.macro.closes_indent_scope;
             if (closes) level = std::max(0, level - 1);
 
@@ -3739,11 +3837,38 @@ public:
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (i == 0 || t.mutable_.wrap.must_break_before || t.mutable_.comment.force_own_line || is_passthrough(t)) {
-                t.mutable_.space.spaces_before = 0;
+                // A line break terminates an escaped identifier just as a space
+                // does, so only the same-line case needs the separator kept.
+                const bool after_escaped_on_same_line =
+                    i > 0 && tokens[i - 1].lex.is_escaped_identifier &&
+                    !t.mutable_.wrap.must_break_before && !t.mutable_.comment.force_own_line;
+                t.mutable_.space.spaces_before = after_escaped_on_same_line ? 1 : 0;
                 continue;
             }
             const Tok& L = tokens[i - 1];
             int spaces = 1;
+
+            // An escaped identifier is delimited by whitespace, so the token
+            // after it can never be closed up against it -- `\\esc` + `;` would
+            // re-lex as the single identifier `\\esc;`.  This outranks every
+            // no-space rule below, so decide it before any of them run.
+            if (L.lex.is_escaped_identifier) {
+                t.mutable_.space.spaces_before = 1;
+                t.mutable_.space.suppress_space = false;
+                continue;
+            }
+
+            // `(*` and `*)` are single lexemes in the LRM.  Letting the ordinary
+            // paren rules put a space between the halves turns an attribute into
+            // a parenthesised expression, so keep them closed up.  The text
+            // between the delimiters spaces like any other expression.
+            if (t.lex.in_attribute_instance && L.lex.in_attribute_instance &&
+                ((kind_is(L, TK::OpenParenthesis) && kind_is(t, TK::Star)) ||
+                 (kind_is(L, TK::Star) && kind_is(t, TK::CloseParenthesis)))) {
+                t.mutable_.space.spaces_before = 0;
+                t.mutable_.space.suppress_space = true;
+                continue;
+            }
 
             // Basic no-space rules
             if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
@@ -3842,8 +3967,12 @@ public:
             if (kind_is(t, TK::CloseParenthesis) && t.immutable.topology.ends_argument_list && opts_.function_call.space_inside_paren) spaces = 1;
             if ((kind_is(L, TK::OpenBracket) || kind_is(t, TK::CloseBracket)) && opts_.spacing.space_inside_dimension_brackets) spaces = 1;
 
-            // } brace: 1 space after (unless followed by ; or ,)
-            if (kind_is(L, TK::CloseBrace) && !kind_is(t, TK::Semicolon) && !kind_is(t, TK::Comma)) spaces = 1;
+            // } brace: 1 space after (unless followed by ; or ,).  Only a brace
+            // that closes a statement block takes this; an expression brace's
+            // `}` spaces like any other closing token, so a nested
+            // concatenation renders `{f, {g, h}}` rather than `{f, {g, h} }`.
+            if (kind_is(L, TK::CloseBrace) && closes_indent_scope_at(tokens, i - 1) &&
+                !kind_is(t, TK::Semicolon) && !kind_is(t, TK::Comma)) spaces = 1;
             if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis)) spaces = 0;
 
             // Apostrophe / cast: no space
@@ -3976,6 +4105,20 @@ public:
                 }
                 if (!event_control_close)
                 spaces = 0;
+            }
+
+            // Stream concatenation header: `{`, the stream operator, an optional
+            // slice size, then the braces holding the operand all bind tightly.
+            // This runs last because the operator-spacing rules above would
+            // otherwise re-separate `<<` as the binary shift it is spelled like.
+            {
+                const size_t pc = prev_code(tokens, i);
+                const size_t ppc = pc == npos ? npos : prev_code(tokens, pc);
+                if (is_stream_operator_at(tokens, i) ||
+                    (pc != npos && is_stream_operator_at(tokens, pc)) ||
+                    ((kind_is(t, TK::OpenBrace) || kind_is(t, TK::ApostropheOpenBrace)) &&
+                     ppc != npos && is_stream_operator_at(tokens, ppc)))
+                    spaces = 0;
             }
 
             t.mutable_.space.spaces_before = std::max(0, spaces);

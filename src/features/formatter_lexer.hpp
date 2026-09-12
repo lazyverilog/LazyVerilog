@@ -156,10 +156,44 @@ public:
                 add_slang_token(token);
             }
         }
+        mark_attribute_instances();
         return tokens_;
     }
 
 private:
+    // `(*` and `*)` are single lexemes in the LRM, so an attribute instance is
+    // exactly an OpenParenthesis whose Star follows with no gap, closed by a
+    // Star whose CloseParenthesis follows with no gap.  Comparing byte offsets
+    // makes any intervening trivia -- a space, a comment -- break the pairing,
+    // which is what separates `(* keep *)` from `(a * b)`.
+    void mark_attribute_instances() {
+        using TKind = slang::parsing::TokenKind;
+        auto adjacent = [&](size_t a, size_t b) {
+            return tokens_[a].lex.range.end().offset() == tokens_[b].lex.range.start().offset();
+        };
+
+        for (size_t i = 0; i + 1 < tokens_.size(); ++i) {
+            if (tokens_[i].lex.kind != TKind::OpenParenthesis ||
+                tokens_[i + 1].lex.kind != TKind::Star || !adjacent(i, i + 1))
+                continue;
+
+            for (size_t j = i + 2; j + 1 < tokens_.size(); ++j) {
+                // An attribute instance cannot span a statement boundary; stop
+                // rather than let an unterminated `(*` swallow the rest of the
+                // file.
+                if (tokens_[j].lex.kind == TKind::Semicolon)
+                    break;
+                if (tokens_[j].lex.kind != TKind::Star ||
+                    tokens_[j + 1].lex.kind != TKind::CloseParenthesis || !adjacent(j, j + 1))
+                    continue;
+                for (size_t k = i; k <= j + 1; ++k)
+                    tokens_[k].lex.in_attribute_instance = true;
+                i = j + 1;
+                break;
+            }
+        }
+    }
+
     const std::string& source_;
     const FormatOptions& opts_;
     FormatMarkerRegex format_off_re_;
@@ -231,6 +265,12 @@ private:
                                         slang::SourceLocation(slang::BufferID::getPlaceholder(), pos + text.size()));
         lex.is_directive = is_directive;
         lex.is_whitespace_sensitive = whitespace_sensitive;
+        // Escaped-identifier spelling is a lexical fact, decided here from the
+        // token's own text rather than re-derived by a pass.  Gating on
+        // Identifier keeps macro line-continuations, which also begin with a
+        // backslash, out of it.
+        lex.is_escaped_identifier =
+            kind == slang::parsing::TokenKind::Identifier && !text.empty() && text.front() == '\\';
         lex.comment_kind = comment_kind;
         lex.is_format_off_marker = is_format_off_marker;
         lex.is_format_on_marker = is_format_on_marker;

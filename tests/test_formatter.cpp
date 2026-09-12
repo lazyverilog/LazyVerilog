@@ -4623,3 +4623,237 @@ TEST_CASE("formatter: index bracket inside a for body keeps no space before the 
                                  "end\n"
                                  "endmodule\n");
 }
+
+TEST_CASE("formatter: escaped identifiers keep their terminating whitespace",
+          "[formatter][escaped_identifier]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // An escaped identifier runs to the next whitespace character, so the space
+    // that ends it is part of the name, not padding the formatter may drop.
+    // Removing it glues the following token onto the identifier and changes the
+    // token stream, which the safety net catches and reports as a whole-file
+    // abort -- one escaped name anywhere left the entire file unformatted.
+    const std::string src = "module m;\n"
+                            "    logic \\data[0] ;\n"
+                            "    assign o_q = \\data[0] ;\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == "module m;\n"
+                       "logic \\data[0] ;\n"
+                       "assign o_q = \\data[0] ;\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: an escaped identifier does not block formatting the rest of the file",
+          "[formatter][escaped_identifier]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // The surrounding file must still be formatted; the blast radius of one
+    // escaped name was previously the whole buffer.
+    const std::string src = "module m;\n"
+                            "logic \\esc ;\n"
+                            "always_comb begin\n"
+                            "x=1;\n"
+                            "end\n"
+                            "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted == "module m;\n"
+                       "logic \\esc ;\n"
+                       "always_comb begin\n"
+                       "    x = 1;\n"
+                       "end\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: attribute instances are not reflowed as argument lists",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // slang has no `(*` / `*)` token, so the formatter sees a plain
+    // OpenParenthesis and used to reflow it like a port or argument list.  The
+    // result did not parse, and the token-stream safety net cannot catch it
+    // because only the trivia moved.
+    const std::string src = "module m;\n"
+                            "(* async_reg = \"true\" *) logic r_meta;\n"
+                            "endmodule\n";
+
+    const std::string expected = "module m;\n"
+                                 "(* async_reg = \"true\" *) logic r_meta;\n"
+                                 "endmodule\n";
+
+    CHECK(format_source(src, opts) == expected);
+    CHECK(format_source(expected, opts) == expected);
+}
+
+TEST_CASE("formatter: every attribute instance form survives formatting",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src =
+        "module m;\n"
+        "(* dont_touch = \"true\" *) logic r_meta;\n"
+        "(* async_reg = \"true\", shreg_extract = \"no\" *) logic r_sync;\n"
+        "(* ram_style = \"block\" *) logic [7:0] r_mem [0:255];\n"
+        "(* keep *) logic r_q;\n"
+        "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    // Each attribute keeps its delimiters adjacent and stays on one line with
+    // the declaration it annotates.
+    CHECK(formatted.find("(\n") == std::string::npos);
+    CHECK(formatted.find("(* dont_touch = \"true\" *) logic r_meta;") != std::string::npos);
+    CHECK(formatted.find("(* async_reg = \"true\", shreg_extract = \"no\" *) logic r_sync;") !=
+          std::string::npos);
+    // Only the attribute is asserted here; how the unpacked dimension spaces is
+    // a separate, unrelated declaration-spacing option.
+    CHECK(formatted.find("(* ram_style = \"block\" *) logic [7:0] r_mem") != std::string::npos);
+    CHECK(formatted.find("(* keep *) logic r_q;") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a parenthesis that only looks like an attribute is left alone",
+          "[formatter][attribute]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `(*` is one token in the LRM, so a space between the two characters is
+    // not an attribute.  Multiplication inside parentheses must keep formatting
+    // as an ordinary expression.
+    const std::string src = "module m;\n"
+                            "assign y = (a * b) * (c * d);\n"
+                            "endmodule\n";
+
+    CHECK(format_source(src, opts) == "module m;\n"
+                                      "assign y = (a * b) * (c * d);\n"
+                                      "endmodule\n");
+}
+
+TEST_CASE("formatter: a set-membership brace is an expression, not a block",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `{` is overloaded: it opens a constraint body, but it also opens a
+    // concatenation, a set-membership list, an assignment pattern and a
+    // streaming expression.  Only the first is a block, so only the first may
+    // push its closing brace onto its own line.
+    const std::string src = "class my_txn;\n"
+                            "rand bit [7:0] data;\n"
+                            "rand bit [3:0] len;\n"
+                            "constraint c_len { len inside {[1:8]}; data != 8'hFF; }\n"
+                            "endclass\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("len inside {[1:8]};") != std::string::npos);
+    // The constraint body itself is still a block and still breaks.
+    CHECK(formatted.find("constraint c_len {\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: an assignment pattern stays on one line", "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src = "module m_pat;\n"
+                            "s_t s = '{a: 1'b1, b: 4'hA};\n"
+                            "logic [3:0] arr [4] = '{default: '0};\n"
+                            "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("\n};") == std::string::npos);
+    CHECK(formatted.find("4'hA};") != std::string::npos);
+    CHECK(formatted.find("'0};") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a streaming operator stays on one line", "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    const std::string src = "module m_stream;\n"
+                            "assign o_b = {<<8{i_a}};\n"
+                            "endmodule\n";
+
+    const std::string formatted = format_source(src, opts);
+
+    CHECK(formatted.find("\n}") == std::string::npos);
+    CHECK(formatted.find("i_a}};") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a nested concatenation closes without a stray space",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // The "space after }" rule belongs to a brace that closes a block, not to
+    // an expression brace.
+    CHECK(format_source("module m;\n"
+                        "assign e = {f, {g, h}};\n"
+                        "assign a = {{b, c}, d};\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "assign e = {f, {g, h}};\n"
+                                 "assign a = {{b, c}, d};\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: a shift operator is not mistaken for a stream operator",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // `<<` only streams directly after `{`; everywhere else it is the binary
+    // shift and keeps its spaces.
+    CHECK(format_source("module m;\n"
+                        "assign y = n << 2;\n"
+                        "assign z = {a, b << 1};\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "assign y = n << 2;\n"
+                                 "assign z = {a, b << 1};\n"
+                                 "endmodule\n");
+}
+
+TEST_CASE("formatter: an expression brace does not shift the lines after it",
+          "[formatter][brace]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 1;
+    opts.indent_size = 2;
+
+    // An expression brace opens no indent scope, so its closing brace must not
+    // drop one either -- otherwise every following line of the file is dedented.
+    CHECK(format_source("module m;\n"
+                        "s_t s = '{a: 1'b1};\n"
+                        "logic x;\n"
+                        "logic y;\n"
+                        "endmodule\n",
+                        opts) == "module m;\n"
+                                 "  s_t s = '{a : 1'b1};\n"
+                                 "  logic x;\n"
+                                 "  logic y;\n"
+                                 "endmodule\n");
+}
