@@ -658,11 +658,37 @@ bool read_scoped_map(Reader& r, size_t bound, std::unordered_map<std::string, si
     return true;
 }
 
+// Slurp a path that is expected to be an ordinary file, or give back nothing.
+//
+// `!in` does not mean "this is readable".  libstdc++ opens a directory
+// successfully and fails only in basic_filebuf::underflow, which *throws*
+// std::ios_base::failure whatever the stream's exception mask says -- so the
+// obvious ifstream + istreambuf_iterator pair terminates the process on a path
+// that is a directory, from a background thread with nothing to catch it.
+// Neither does a successful open promise the read returns: a FIFO opens, then
+// blocks forever on a writer that never comes.
+//
+// is_regular_file() answers both questions, and the catch is the backstop for a
+// path that stops being one between the check and the read.
+std::optional<std::string> read_regular_file(const fs::path& path) {
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec) || ec)
+        return std::nullopt;
+    try {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return std::nullopt;
+        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (in.bad())
+            return std::nullopt;
+        return bytes;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 std::string read_whole_file(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
-        return {};
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return read_regular_file(path).value_or(std::string{});
 }
 
 // A field added to any of these without a matching codec update would be
@@ -724,13 +750,15 @@ IndexCache::Digest IndexCache::digest_source_buffer(std::string_view buffer) {
 }
 
 std::optional<IndexCache::Digest> IndexCache::digest_file(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
+    // A path that is not an ordinary file has no digest, and saying so is the
+    // whole answer: the caller treats nullopt as "cannot key a shard on this",
+    // which is the correct outcome for a directory or a FIFO standing where a
+    // source file used to be.  See read_regular_file() for why the plain
+    // ifstream this replaced aborted the process instead.
+    const auto bytes = read_regular_file(path);
+    if (!bytes)
         return std::nullopt;
-    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (in.bad())
-        return std::nullopt;
-    return digest_bytes(bytes);
+    return digest_bytes(*bytes);
 }
 
 IndexCache::Digest IndexCache::config_digest(const std::vector<std::string>& defines,
@@ -826,14 +854,22 @@ size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& 
             continue;
         if (live_names.contains(entry.path().filename().string()))
             continue;
+        // Anything but an ordinary file is not a shard, and reading one would
+        // throw out of basic_filebuf rather than fail the stream -- the same
+        // trap read_regular_file() exists for.
+        std::error_code kind_ec;
+        if (!entry.is_regular_file(kind_ec) || kind_ec)
+            continue;
 
         std::string head(kHeaderBytes, '\0');
-        {
+        try {
             std::ifstream in(entry.path(), std::ios::binary);
             if (!in)
                 continue;
             in.read(head.data(), static_cast<std::streamsize>(head.size()));
             head.resize(static_cast<size_t>(in.gcount()));
+        } catch (const std::exception&) {
+            continue;
         }
 
         Reader r(head);
