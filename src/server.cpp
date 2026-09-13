@@ -6,6 +6,7 @@
 #include "cpu_budget.hpp"
 #include "dynamic_file_index.hpp"
 #include "filelist.hpp"
+#include "request_pool.hpp"
 
 // LspCpp headers
 #include "LibLsp/JsonRpc/Condition.h"
@@ -470,78 +471,6 @@ struct StderrLog : public lsp::Log {
     void log(Level, const std::string& msg) override { std::cerr << msg << "\n"; }
 };
 
-/// Runs read-only request handlers off the thread that reads messages.
-///
-/// clangd keeps message *dispatch* on one thread -- notifications stay in the
-/// order they arrived, and a document update is applied before anything queued
-/// behind it -- and hands the *work* of a request to other threads, replying
-/// from whichever one finishes.  This is that pool.
-///
-/// Small on purpose.  Its job is to stop one whole-file request standing in
-/// front of the completion the user is waiting for, not to run many at once;
-/// the cores beyond that belong to background indexing.
-class RequestPool {
-public:
-    explicit RequestPool(size_t threads) {
-        workers_.reserve(threads);
-        for (size_t i = 0; i < threads; ++i)
-            workers_.emplace_back([this] { run(); });
-    }
-
-    ~RequestPool() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& worker : workers_)
-            if (worker.joinable())
-                worker.join();
-    }
-
-    RequestPool(const RequestPool&) = delete;
-    RequestPool& operator=(const RequestPool&) = delete;
-
-    void submit(std::function<void()> task) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stop_)
-                return;
-            queue_.push_back(std::move(task));
-        }
-        cv_.notify_one();
-    }
-
-private:
-    void run() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty())
-                    return;
-                task = std::move(queue_.front());
-                queue_.pop_front();
-            }
-            // A handler that throws must not take the pool down with it: the
-            // request is answered or not, but the next one still runs.
-            try {
-                task();
-            } catch (const std::exception& e) {
-                std::cerr << "[lazyverilog] request worker error: " << e.what() << "\n";
-            } catch (...) {
-                std::cerr << "[lazyverilog] request worker error\n";
-            }
-        }
-    }
-
-    std::mutex                        mutex_;
-    std::condition_variable           cv_;
-    std::deque<std::function<void()>> queue_;
-    bool                              stop_{false};
-    std::vector<std::thread>          workers_;
-};
 
 struct LazyVerilogServer::Impl {
     StderrLog log;
@@ -642,6 +571,13 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
 }
 
 LazyVerilogServer::~LazyVerilogServer() {
+    // Before anything below runs.  A worker answering a deferred request reads
+    // analyzer_ and the background compiler, and this destructor is reached as
+    // soon as run() returns -- which the exit notification can do while such a
+    // worker is still mid-request.  The exit path drains the pool itself, but a
+    // server torn down any other way (a test harness, stdin closing under a
+    // client that never sends exit) gets the same guarantee from here.
+    impl_->request_pool.shutdown();
     analyzer_.set_project_index_publish_callback({});
     if (background_compiler_)
         background_compiler_->stop();
@@ -1142,6 +1078,20 @@ void LazyVerilogServer::register_handlers() {
     // ── exit ──────────────────────────────────────────────────────────────────
     ep.registerHandler([&, remote](const Notify_Exit::notify&) {
         try {
+            // Deferred requests are still in flight.  `exit` arrives on the
+            // dispatch thread while a worker may be halfway through the fold
+            // request that came in just before it, and stopping the transport
+            // -- then returning from run() and destroying this server under
+            // that worker -- races the reply against its own teardown.  It is
+            // the whole reason the two macOS runners saw a fold reply go
+            // missing and the process die on the way out.
+            //
+            // So drain first: every request that was accepted is answered
+            // before the transport that answers it is taken down.  Both
+            // deferred methods are pure computations over an immutable
+            // snapshot, so this waits on work that is already finishing, never
+            // on anything this thread still owes them.
+            impl_->request_pool.shutdown();
             remote->stop();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] endpoint stop during exit failed: " << e.what() << "\n";
@@ -2148,7 +2098,7 @@ void LazyVerilogServer::answer_off_the_dispatch_thread(const char* method) {
         // unique_ptr; hand it over through a shared_ptr and take it back once,
         // in the task that runs exactly once.
         auto owned = std::make_shared<std::unique_ptr<LspMessage>>(std::move(message));
-        impl_->request_pool.submit([this, inner, owned, key, id]() mutable {
+        auto answer = [this, inner, owned, key, id]() mutable {
             if (!*owned)
                 return;
             // Withdrawn before this got started.  LSP's answer is an error
@@ -2163,7 +2113,11 @@ void LazyVerilogServer::answer_off_the_dispatch_thread(const char* method) {
                 return;
             }
             inner(std::move(*owned));
-        });
+        };
+        // A pool that is shutting down takes nothing, and a request that
+        // carries an id must still be answered -- so answer it here instead.
+        if (!impl_->request_pool.submit(answer))
+            answer();
         return true;
     };
 }

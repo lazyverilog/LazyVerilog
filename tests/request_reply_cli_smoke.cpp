@@ -96,6 +96,7 @@ int cancelled_request_errors(const fs::path& server_bin, const fs::path& work) {
 
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after a burst of cancels");
 
     int cancelled = 0;
     for (int i = 0; i < 8; ++i) {
@@ -193,6 +194,13 @@ int main(int argc, char** argv) {
     }
 
     const auto result = run_command(server_bin, "< " + shell_quote(input));
+
+    // Checked before the replies.  foldingRange and inlayHint are answered off
+    // the dispatch thread and `exit` is the next message behind them, so a
+    // shutdown that does not wait for those workers loses a reply on some runs
+    // and takes the process down on others -- and the per-reply checks below
+    // cannot tell the second case from a server that simply said nothing.
+    expect(result.exit_code == 0, "the server exits cleanly after answering every request");
 
     for (const auto& c : cases)
         expect(contains(result.stdout_text, R"("id":)" + std::to_string(c.id)),
