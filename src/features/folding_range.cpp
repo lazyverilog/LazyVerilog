@@ -1314,11 +1314,11 @@ std::vector<FoldingRange> token_folds(const std::string& text) {
 
 // ── public API ────────────────────────────────────────────────────────────
 
-std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
-                                                const FoldingRangeRequestParams& params) {
+std::shared_ptr<const std::vector<FoldingRange>>
+provide_folding_range_shared(const Analyzer& analyzer, const FoldingRangeRequestParams& params) {
     auto state = analyzer.get_state(params.textDocument.uri.raw_uri_);
     if (!state)
-        return {};
+        return nullptr;
 
     // Folds are derived from the token scan and nothing else, so this answer
     // does not depend on the parse the document's last notification started.
@@ -1330,10 +1330,19 @@ std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
     // of the request, so the whole queue of fold requests that piles up behind
     // a fast burst -- key repeat, a paste, a macro -- shares one computation
     // once the edits stop arriving, instead of repeating it once per request.
-    if (const auto cached = state->folding_ranges())
-        return *cached;
+    if (auto cached = state->folding_ranges())
+        return cached;
 
-    auto folds = std::make_shared<const std::vector<FoldingRange>>(token_folds(state->text));
-    state->set_folding_ranges(folds);
-    return *folds;
+    state->set_folding_ranges(
+        std::make_shared<const std::vector<FoldingRange>>(token_folds(state->text)));
+    // Read back rather than returned directly: the slot keeps its first writer,
+    // so a request that raced another one hands back the vector everybody else
+    // is holding instead of an equal copy of its own.
+    return state->folding_ranges();
+}
+
+std::vector<FoldingRange> provide_folding_range(const Analyzer& analyzer,
+                                                const FoldingRangeRequestParams& params) {
+    auto folds = provide_folding_range_shared(analyzer, params);
+    return folds ? *folds : std::vector<FoldingRange>{};
 }

@@ -72,6 +72,41 @@ std::string initialize_with_root(const fs::path& server_bin, const std::string& 
     return result.stdout_text;
 }
 
+/// Send `initialize`, open a foldable buffer, ask for its folds, then `exit`.
+/// Returns the server's stdout.
+///
+/// `[folding].enable` has to reach the request handler and not only the
+/// capability reply: Neovim answers `foldingRange.dynamicRegistration = false`,
+/// so a config reload cannot unregister the capability and the client keeps
+/// asking for the rest of the session.  Computing whole-file folds nobody wants
+/// is the most expensive thing on the edit path, so "turned off" has to mean
+/// the handler declines too.
+std::string folds_for_root(const fs::path& server_bin, const std::string& root_uri) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-folds-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    const std::string doc_uri = root_uri + "/fold_probe.sv";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"rootUri":")" + root_uri +
+                     R"(","capabilities":{"textDocument":{"foldingRange":{}}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                     R"("uri":")" + doc_uri +
+                     R"(","languageId":"systemverilog","version":1,"text":)"
+                     R"("module m;\n  always_comb begin\n    x = 1;\n  end\nendmodule\n"}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":2,"method":"textDocument/foldingRange",)"
+                     R"("params":{"textDocument":{"uri":")" + doc_uri + R"("}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    return result.stdout_text;
+}
+
 bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
@@ -160,6 +195,20 @@ int main(int argc, char** argv) {
                "inlayHintProvider withheld from a client that registers dynamically");
         expect(!contains(out, R"("foldingRangeProvider")"),
                "foldingRangeProvider withheld from a client that registers dynamically");
+    }
+
+    // The switch has to reach the handler, not only the capability reply.
+    {
+        const auto out = folds_for_root(server_bin, path_to_uri(fixtures / "folding_off"));
+        expect(contains(out, R"("id":2)"), "a fold request is answered when folding is off");
+        expect(!contains(out, R"("startLine")"),
+               "no folds are computed when [folding].enable is false");
+    }
+    // And the same request against a root that leaves folding on must produce
+    // some, or the check above would pass against a server that never folds.
+    {
+        const auto out = folds_for_root(server_bin, path_to_uri(fixtures / "hints_off"));
+        expect(contains(out, R"("startLine")"), "folds are computed when folding is on");
     }
 
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run

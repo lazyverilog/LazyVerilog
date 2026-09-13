@@ -1376,6 +1376,16 @@ void LazyVerilogServer::register_handlers() {
             // no fold boundary -- and the last request of a burst is never
             // superseded, so the buffer always settles on folds for its real
             // text.
+            // `[folding].enable = false` decides this too, not only what
+            // `initialize` advertises.  Neovim answers
+            // `foldingRange.dynamicRegistration = false`, so a config reload
+            // cannot unregister the capability there and the client keeps
+            // asking for the rest of the session -- at which point computing
+            // whole-file folds nobody wants is the most expensive thing on the
+            // edit path.  `inlayHint` has always checked its own flag here.
+            if (!config_.folding.enable)
+                return rsp;
+
             if (edit_watermark_.superseded(uri)) {
                 const auto cached = last_folding_result_.find(uri);
                 if (cached != last_folding_result_.end() && cached->second) {
@@ -1383,8 +1393,12 @@ void LazyVerilogServer::register_handlers() {
                     return rsp;
                 }
             }
-            auto folds = std::make_shared<const std::vector<FoldingRange>>(
-                provide_folding_range(analyzer_, req.params));
+            // The snapshot already holds these as a shared vector, so take a
+            // reference to it rather than a copy: the response needs its own,
+            // and that is the only copy there is a reason to make.
+            auto folds = provide_folding_range_shared(analyzer_, req.params);
+            if (!folds)
+                return rsp;
             last_folding_result_[uri] = folds;
             rsp.result = *folds;
         } catch (const std::exception& e) {
