@@ -543,6 +543,12 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     configure_background_compiler();
     schedule_background_compilation();
     register_handlers();
+    // Runs on the thread that drains stdin, before each message is queued for a
+    // handler.  This is the only vantage point from which a keystroke that has
+    // arrived but not yet been applied is visible; see EditWatermark.  It must
+    // stay cheap -- whatever it does, the server is not reading input meanwhile.
+    impl_->remote_endpoint.setIncomingMessagePreview(
+        [this](const std::string& raw) { edit_watermark_.observe(raw); });
     impl_->remote_endpoint.startProcessingMessages(impl_->input, impl_->output);
 }
 
@@ -1163,6 +1169,10 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const Notify_TextDocumentDidChange::notify& note) {
         try {
             const auto& uri = note.params.textDocument.uri.raw_uri_;
+            // Before the stale/duplicate check below: the watermark's two counts
+            // only mean anything while they describe the same stream of
+            // messages, and the reader counted this one whatever we do with it.
+            edit_watermark_.on_dispatch(uri);
             if (note.params.textDocument.version) {
                 const int incoming_version = *note.params.textDocument.version;
                 const auto known = document_versions_.find(uri);
@@ -1193,6 +1203,8 @@ void LazyVerilogServer::register_handlers() {
             const auto& uri = note.params.textDocument.uri.raw_uri_;
             analyzer_.close(uri);
             document_versions_.erase(uri);
+            edit_watermark_.forget(uri);
+            last_folding_result_.erase(uri);
             clear_published_diagnostics_for_owner(uri);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didClose error: " << e.what() << "\n";
@@ -1344,7 +1356,34 @@ void LazyVerilogServer::register_handlers() {
         td_foldingRange::response rsp;
         rsp.id = req.id;
         try {
-            rsp.result = provide_folding_range(analyzer_, req.params);
+            const auto& uri = req.params.textDocument.uri.raw_uri_;
+            // An edit to this buffer that the transport has read but this thread
+            // has not applied yet means the folds computed here describe a
+            // document the user has already moved past -- and the client has a
+            // fold request for the newer text queued directly behind this one.
+            // Computing the obsolete answer costs the whole file scan and delays
+            // every request behind it, including the completion the user is
+            // actually waiting on.
+            //
+            // Answer from the last folds instead.  Not an error: a server is
+            // explicitly told not to report ContentModified for a change it
+            // spots in its own unprocessed messages, because "the result even
+            // computed on an older state might still be useful for the client".
+            // For folds that holds strongly -- a keystroke inside a block moves
+            // no fold boundary -- and the last request of a burst is never
+            // superseded, so the buffer always settles on folds for its real
+            // text.
+            if (edit_watermark_.superseded(uri)) {
+                const auto cached = last_folding_result_.find(uri);
+                if (cached != last_folding_result_.end() && cached->second) {
+                    rsp.result = *cached->second;
+                    return rsp;
+                }
+            }
+            auto folds = std::make_shared<const std::vector<FoldingRange>>(
+                provide_folding_range(analyzer_, req.params));
+            last_folding_result_[uri] = folds;
+            rsp.result = *folds;
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] foldingRange error: " << e.what() << "\n";
         }

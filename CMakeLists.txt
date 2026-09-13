@@ -109,6 +109,71 @@ string(REPLACE
     _caps_content "${_caps_content}")
 file(WRITE "${_caps_h}" "${_caps_content}")
 
+# EditWatermark parses the raw didChange messages LspCpp hands it through the
+# hook below, and parses them with the same JSON library LspCpp itself uses so
+# the two agree on what a message says.  LspCpp keeps RapidJSON a private
+# include, so name it here; this is the vendored copy its own configure reports
+# as "Using local RapidJSON".
+set(LAZYVERILOG_RAPIDJSON_INCLUDE "${lspcpp_SOURCE_DIR}/third_party/rapidjson/include")
+if(NOT EXISTS "${LAZYVERILOG_RAPIDJSON_INCLUDE}/rapidjson/document.h")
+    message(FATAL_ERROR
+        "RapidJSON headers not found at ${LAZYVERILOG_RAPIDJSON_INCLUDE}. LspCpp vendors them "
+        "as a submodule; src/edit_watermark.cpp needs them to read incoming messages.")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch: give LspCpp's RemoteEndPoint a reader-thread hook for incoming messages.
+#
+# LspCpp reads framed messages on one thread and asio::post()s each of them to a
+# thread pool; with max_workers = 1 that pool runs them strictly in order.  So a
+# handler only ever sees messages that have already been dispatched, and cannot
+# tell that a newer edit to the same document is already in flight — the pending
+# work is in asio's own task queue, which has no introspection API, and each
+# entry is an unparsed string besides.  The producer callback, which fires once
+# per complete framed message before that post, is the one place where it is
+# visible.  The hook itself takes no position on what a message means; see
+# EditWatermark in src/edit_watermark.hpp for what this server does with it.
+#
+# Applied as an idempotent edit after populate, for the same reason as the patch
+# above: FetchContent's PATCH_COMMAND runs only on the first populate, and a
+# dependency that silently loses its patch on a re-configure is worse than one
+# that never had it.  The inserted text is in cmake/lspcpp/ so it reads as C++
+# rather than as an escaped CMake string.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_rep_h "${lspcpp_SOURCE_DIR}/include/LibLsp/JsonRpc/RemoteEndPoint.h")
+set(_rep_cpp "${lspcpp_SOURCE_DIR}/src/jsonrpc/RemoteEndPoint.cpp")
+set(_rep_h_anchor "    void handle(MessageIssue&&) override;")
+set(_rep_cpp_anchor "                    asio::post(")
+
+file(READ "${_rep_h}" _rep_h_content)
+string(FIND "${_rep_h_content}" "setIncomingMessagePreview" _rep_h_done)
+if(_rep_h_done EQUAL -1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lspcpp/remote_endpoint_preview.h.in" _rep_h_insert)
+    string(REPLACE "${_rep_h_anchor}" "${_rep_h_anchor}\n${_rep_h_insert}"
+           _rep_h_content "${_rep_h_content}")
+    file(WRITE "${_rep_h}" "${_rep_h_content}")
+endif()
+
+file(READ "${_rep_cpp}" _rep_cpp_content)
+string(FIND "${_rep_cpp_content}" "incoming_message_preview_" _rep_cpp_done)
+if(_rep_cpp_done EQUAL -1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lspcpp/remote_endpoint_preview.cpp.in" _rep_cpp_insert)
+    string(REPLACE "${_rep_cpp_anchor}" "${_rep_cpp_insert}${_rep_cpp_anchor}"
+           _rep_cpp_content "${_rep_cpp_content}")
+    file(WRITE "${_rep_cpp}" "${_rep_cpp_content}")
+endif()
+
+# An upstream bump that moves either anchor must fail the configure, not produce
+# a server that has quietly stopped dropping superseded work.
+string(FIND "${_rep_h_content}" "setIncomingMessagePreview" _rep_h_ok)
+string(FIND "${_rep_cpp_content}" "incoming_message_preview_" _rep_cpp_ok)
+if(_rep_h_ok EQUAL -1 OR _rep_cpp_ok EQUAL -1)
+    message(FATAL_ERROR
+        "Could not patch LspCpp's RemoteEndPoint with the incoming-message preview hook. "
+        "The pinned LspCpp revision has probably moved and the anchors above no longer "
+        "match its source. Re-derive them before bumping GIT_TAG.")
+endif()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Version string for --version, from the nearest git tag
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,6 +205,7 @@ set(LAZYVERILOG_SOURCES
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/index_cache.cpp
+    src/edit_watermark.cpp
     src/features/hover.cpp
     src/features/definition.cpp
     src/features/references.cpp
@@ -165,6 +231,7 @@ add_executable(lazyverilog-lsp ${LAZYVERILOG_SOURCES})
 target_include_directories(lazyverilog-lsp PRIVATE
     src
     ${lspcpp_SOURCE_DIR}/include
+    ${LAZYVERILOG_RAPIDJSON_INCLUDE}
 )
 target_link_libraries(lazyverilog-lsp
     PRIVATE
@@ -191,6 +258,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_syntax_index.cpp
     tests/test_shared_header_scaling.cpp
     tests/test_index_cache.cpp
+    tests/test_edit_watermark.cpp
     tests/test_formatter.cpp
     tests/test_lint.cpp
     tests/test_autoff.cpp
@@ -217,6 +285,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/index_cache.cpp
+    src/edit_watermark.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp
@@ -237,6 +306,7 @@ add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
 target_include_directories(lazyverilog-tests PRIVATE
     src
     ${lspcpp_SOURCE_DIR}/include
+    ${LAZYVERILOG_RAPIDJSON_INCLUDE}
 )
 target_link_libraries(lazyverilog-tests
     PRIVATE

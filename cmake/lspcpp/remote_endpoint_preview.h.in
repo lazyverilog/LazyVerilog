@@ -1,0 +1,30 @@
+
+    // ── LazyVerilog patch: reader-thread message preview ──────────────────
+    //
+    /// Observe every incoming message as soon as it is framed, on the thread
+    /// that drains the input stream, before it is queued for dispatch.
+    ///
+    /// LspCpp reads messages on one thread and asio::post()s each of them to a
+    /// thread pool, so a handler only ever sees messages that have already been
+    /// dispatched.  From inside a handler there is no way to learn that a newer
+    /// message for the same document is already in flight: the pending work
+    /// sits in asio's own task queue, which exposes no introspection, and each
+    /// entry is still an unparsed string.  This callback is the one place where
+    /// that is visible.
+    ///
+    /// It runs on the reader thread, so it must be cheap and must never block —
+    /// anything it waits on stops the server reading its input.  It receives the
+    /// raw message and takes no position on what that means; the policy belongs
+    /// to the server.
+    ///
+    /// Set it before startProcessingMessages(); it is not synchronized.
+    void setIncomingMessagePreview(std::function<void(std::string const&)> preview)
+    {
+        incoming_message_preview_ = std::move(preview);
+    }
+
+private:
+    std::function<void(std::string const&)> incoming_message_preview_;
+
+public:
+    // ── end LazyVerilog patch ─────────────────────────────────────────────

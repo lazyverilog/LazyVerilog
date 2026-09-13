@@ -1,0 +1,8 @@
+                    // ── LazyVerilog patch ─────────────────────────────────
+                    // Before the message joins the dispatch queue, and while
+                    // earlier messages are still being handled.
+                    if (incoming_message_preview_)
+                    {
+                        incoming_message_preview_(*temp);
+                    }
+                    // ── end LazyVerilog patch ─────────────────────────────

@@ -1,6 +1,7 @@
 #pragma once
 #include "analyzer.hpp"
 #include "config.hpp"
+#include "edit_watermark.hpp"
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,6 +67,26 @@ class LazyVerilogServer {
     // predict WorkspaceEdits; it waits for the client to apply them and report
     // the resulting text through normal didChange notifications.
     std::unordered_map<std::string, int> document_versions_;
+    // Edits the transport has read against edits this thread has run.  Fed from
+    // the reader thread through RemoteEndPoint's message preview hook, which is
+    // the only place a newer keystroke is visible while an older request is
+    // still being answered.  See EditWatermark.
+    EditWatermark edit_watermark_;
+    // The folds last computed for each open buffer.
+    //
+    // When an edit is already in flight behind a foldingRange request, the folds
+    // this request would compute are obsolete before they are serialized, and
+    // the client has a request for the new text queued right behind it.  The
+    // protocol's own guidance for that case is that a result computed on an
+    // older state is still useful while an error is not -- see the note on
+    // lsErrorCodes::ContentModified, which a server is explicitly told NOT to
+    // send for a change it spots in its own unprocessed messages.  So the
+    // superseded request is answered from here instead of recomputing.
+    //
+    // Only ever touched from the single request/notification worker, so it needs
+    // no lock of its own.  Erased on didClose.
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<FoldingRange>>>
+        last_folding_result_;
     std::unordered_map<std::string, std::unordered_set<std::string>> diagnostic_uris_by_owner_;
 
     // Background project indexing and optional semantic compilation can request
