@@ -49,12 +49,23 @@ static ModuleMap build_module_map(const Analyzer& analyzer) {
 
     analyzer.for_each_state(
         [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {
-            if (!state || !state->tree)
+            if (!state)
+                return;
+            // A buffer whose reparse is in flight is a text-only placeholder.
+            // Skipping it dropped every module it declares from the map for as
+            // long as that parse ran, so an instance of a module declared in
+            // the file being typed in lost its hints even though the instance
+            // side had a tree to answer from -- the same blink the
+            // get_parsed_state() call below exists to prevent, arriving by the
+            // other half of the lookup.  One keystroke stale is the right
+            // answer here for the same reason it is there.
+            const auto& usable = state->tree ? state : state->previous_parsed;
+            if (!usable || !usable->tree)
                 return;
             // The structural index lives on the snapshot, so the snapshot has
             // to outlive the pointers taken from it.
-            modules.open_documents.push_back(state);
-            overlay_modules(modules, get_structural_index(*state));
+            modules.open_documents.push_back(usable);
+            overlay_modules(modules, get_structural_index(*usable));
         });
 
     return modules;

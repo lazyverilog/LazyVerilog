@@ -426,6 +426,21 @@ class Analyzer {
     void set_parse_complete_callback(
         std::function<void(const std::string& uri)> cb);
 
+    /// Hold queued parses instead of letting the worker take them.
+    ///
+    /// A snapshot with text and no tree is the state the editor's own requests
+    /// land in -- it sends them from the `didChange` notification, so they
+    /// arrive while the parse that notification started is still running.  The
+    /// tests that pin behaviour there have to *be* in that window, and racing
+    /// the worker for it is not something a test can win on a one-CPU slice:
+    /// the scheduler that runs the worker first runs it first on every retry,
+    /// so the test failed rather than skipped.  Pausing makes the window a
+    /// state the test enters, not one it hopes to catch.
+    ///
+    /// An unpause releases the worker; a parse already in progress when this is
+    /// set still commits.  Nothing in the server calls this.
+    void set_parse_paused(bool paused);
+
     /// Remove document from cache.
     void close(const std::string& uri);
 
@@ -948,6 +963,8 @@ private:
     /// than poll for it.  Paired with map_mutex_, not parse_mutex_.
     mutable std::condition_variable parse_committed_cv_;
     std::atomic<bool> parse_stop_{false};
+    /// See set_parse_paused().  Read by the worker under parse_mutex_.
+    std::atomic<bool> parse_paused_{false};
     std::thread parse_worker_;
 
     void parse_worker_loop();

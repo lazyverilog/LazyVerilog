@@ -1289,9 +1289,23 @@ TEST_CASE("foldingRange: cost grows with the file, not with its square",
 //
 // Folds are derived from the token scan alone, so the syntax tree cannot change
 // the answer.  These two tests pin that: the reply for a given text is the same
-// whether or not its parse has landed.  They catch the reparse window and
-// `REQUIRE` having caught it, so neither can pass by quietly measuring a
-// settled document instead.
+// whether or not its parse has landed.  Both hold the parse worker with
+// set_parse_paused() so the window is a state they enter rather than one they
+// race the worker for -- retrying until the worker happened to lose is not a
+// race a test can win on a one-CPU slice, where the scheduler that runs the
+// worker first runs it first on every attempt.
+
+// Block until `uri` has a parsed tree again.  Bounded so a wedged worker fails
+// the test instead of hanging the suite.
+static void wait_for_parse(Analyzer& analyzer, const std::string& uri) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto state = analyzer.get_state(uri);
+        if (state && state->tree) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    FAIL("timed out waiting for the parse of " << uri << " to commit");
+}
 
 TEST_CASE("foldingRange: an edit in flight folds the same as once it settles",
           "[folding]") {
@@ -1304,29 +1318,21 @@ TEST_CASE("foldingRange: an edit in flight folds the same as once it settles",
 
     // enqueue_parse() installs a text-only snapshot and hands the parse to a
     // worker.  That window is what an editor's didChange-triggered request
-    // lands in.
-    bool observed_reparse_window = false;
-    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
-        const std::string edited = text + "\n// edit " + std::to_string(attempt) + "\n";
-        analyzer.enqueue_parse(uri, edited);
+    // lands in; pausing the worker holds it open for the length of the check.
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, text + "\n// edit\n");
 
-        auto state = analyzer.get_state(uri);
-        REQUIRE(state != nullptr);
-        if (state->tree)
-            continue; // the worker beat us to it; try again
-        observed_reparse_window = true;
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree == nullptr);
 
-        const auto in_flight = provide_folding_range(analyzer, make_params(uri));
-        CHECK(!in_flight.empty());
+    const auto in_flight = provide_folding_range(analyzer, make_params(uri));
+    CHECK(!in_flight.empty());
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (std::chrono::steady_clock::now() < deadline && !analyzer.get_state(uri)->tree)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        REQUIRE(analyzer.get_state(uri)->tree != nullptr);
+    analyzer.set_parse_paused(false);
+    wait_for_parse(analyzer, uri);
 
-        CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), in_flight));
-    }
-    REQUIRE(observed_reparse_window);
+    CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), in_flight));
 }
 
 TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
@@ -1338,28 +1344,21 @@ TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
     // Nothing open: there is no document to answer for.
     CHECK(provide_folding_range(analyzer, make_params(uri)).empty());
 
+    analyzer.set_parse_paused(true);
     analyzer.enqueue_parse(uri, folding_scaling_source(40));
 
-    bool observed_first_parse = false;
-    for (int attempt = 0; attempt < 50 && !observed_first_parse; ++attempt) {
-        auto state = analyzer.get_state(uri);
-        REQUIRE(state != nullptr);
-        if (state->tree)
-            break;
-        observed_first_parse = true;
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree == nullptr);
 
-        // The very first request for a buffer, with no syntax tree yet.
-        const auto early = provide_folding_range(analyzer, make_params(uri));
-        CHECK(!early.empty());
+    // The very first request for a buffer, with no syntax tree yet.
+    const auto early = provide_folding_range(analyzer, make_params(uri));
+    CHECK(!early.empty());
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (std::chrono::steady_clock::now() < deadline && !analyzer.get_state(uri)->tree)
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        REQUIRE(analyzer.get_state(uri)->tree != nullptr);
+    analyzer.set_parse_paused(false);
+    wait_for_parse(analyzer, uri);
 
-        CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), early));
-    }
-    REQUIRE(observed_first_parse);
+    CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), early));
 }
 
 // ── the spans the token scan must keep frozen ─────────────────────────────

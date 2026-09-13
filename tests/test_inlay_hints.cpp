@@ -310,8 +310,11 @@ endmodule
 // for as long as the user kept typing and came back only when an unrelated
 // project-index publish happened to fire a refresh.
 //
-// These tests catch the reparse window and `REQUIRE` having caught it, so they
-// cannot pass by quietly measuring a settled document instead.
+// Both tests hold the parse worker with set_parse_paused() so the window is a
+// state they enter rather than one they race the worker for -- retrying until
+// the worker happened to lose is not a race a test can win on a one-CPU slice,
+// where the scheduler that runs the worker first runs it first on every
+// attempt.
 
 #include <chrono>
 #include <thread>
@@ -324,28 +327,24 @@ TEST_CASE("inlay hints: an edit in flight still produces hints", "[inlay]") {
     const auto settled = provide_inlay_hints(analyzer, uri, 0, 20);
     REQUIRE(settled.size() == 4);
 
-    bool observed_reparse_window = false;
-    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
-        // Appending comments below the instance leaves every hint where it was,
-        // so the in-flight answer and the settled one are comparable directly.
-        const std::string edited = kInlaySource + "\n// edit " + std::to_string(attempt) + "\n";
-        analyzer.enqueue_parse(uri, edited);
+    // Appending comments below the instance leaves every hint where it was, so
+    // the in-flight answer and the settled one are comparable directly.
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, kInlaySource + "\n// edit\n");
 
-        auto state = analyzer.get_state(uri);
-        REQUIRE(state != nullptr);
-        if (state->tree)
-            continue; // the worker beat us to it; try again
-        observed_reparse_window = true;
+    auto state = analyzer.get_state(uri);
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree == nullptr);
 
-        const auto in_flight = provide_inlay_hints(analyzer, uri, 0, 20);
-        REQUIRE(in_flight.size() == settled.size());
-        for (size_t i = 0; i < in_flight.size(); ++i) {
-            CHECK(in_flight[i].label == settled[i].label);
-            CHECK(in_flight[i].position.line == settled[i].position.line);
-            CHECK(in_flight[i].position.character == settled[i].position.character);
-        }
+    const auto in_flight = provide_inlay_hints(analyzer, uri, 0, 20);
+    REQUIRE(in_flight.size() == settled.size());
+    for (size_t i = 0; i < in_flight.size(); ++i) {
+        CHECK(in_flight[i].label == settled[i].label);
+        CHECK(in_flight[i].position.line == settled[i].position.line);
+        CHECK(in_flight[i].position.character == settled[i].position.character);
     }
-    REQUIRE(observed_reparse_window);
+
+    analyzer.set_parse_paused(false);
 }
 
 TEST_CASE("inlay hints: a text-only snapshot keeps the parse it replaced", "[inlay]") {
@@ -358,26 +357,54 @@ TEST_CASE("inlay hints: a text-only snapshot keeps the parse it replaced", "[inl
     analyzer.open(uri, kInlaySource);
     REQUIRE(provide_inlay_hints(analyzer, uri, 0, 20).size() == 4);
 
-    bool observed_reparse_window = false;
-    for (int attempt = 0; attempt < 50 && !observed_reparse_window; ++attempt) {
-        analyzer.enqueue_parse(uri, kInlaySource + "\n// edit " + std::to_string(attempt) + "\n");
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, kInlaySource + "\n// edit\n");
+
+    auto placeholder = analyzer.get_state(uri);
+    REQUIRE(placeholder != nullptr);
+    REQUIRE(placeholder->tree == nullptr);
+
+    // Carried forward by enqueue_parse(), and never deeper than one.
+    REQUIRE(placeholder->previous_parsed != nullptr);
+    CHECK(placeholder->previous_parsed->tree != nullptr);
+    CHECK(placeholder->previous_parsed->previous_parsed == nullptr);
+
+    const auto immediate = analyzer.get_parsed_state(uri, std::chrono::milliseconds(0));
+    REQUIRE(immediate != nullptr);
+    CHECK(immediate->tree != nullptr);
+
+    analyzer.set_parse_paused(false);
+}
+
+TEST_CASE("inlay hints: a burst of edits keeps the chain exactly one deep", "[inlay]") {
+    // enqueue_parse() takes the predecessor's own predecessor when the
+    // predecessor is itself a placeholder.  With the worker held, every edit in
+    // the burst lands on a placeholder, which is the case that would grow the
+    // chain if it took the predecessor unconditionally.
+    const std::string uri = "file:///tmp/inlay_burst.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, kInlaySource);
+    REQUIRE(provide_inlay_hints(analyzer, uri, 0, 20).size() == 4);
+    const auto parsed = analyzer.get_state(uri);
+    REQUIRE(parsed->tree != nullptr);
+
+    analyzer.set_parse_paused(true);
+    for (int i = 0; i < 8; ++i) {
+        analyzer.enqueue_parse(uri, kInlaySource + "\n// edit " + std::to_string(i) + "\n");
 
         auto placeholder = analyzer.get_state(uri);
         REQUIRE(placeholder != nullptr);
-        if (placeholder->tree)
-            continue;
-        observed_reparse_window = true;
-
-        // Carried forward by enqueue_parse(), and never deeper than one.
-        REQUIRE(placeholder->previous_parsed != nullptr);
-        CHECK(placeholder->previous_parsed->tree != nullptr);
+        REQUIRE(placeholder->tree == nullptr);
+        // Always the one snapshot that parsed, never a chain of placeholders.
+        REQUIRE(placeholder->previous_parsed == parsed);
         CHECK(placeholder->previous_parsed->previous_parsed == nullptr);
 
-        const auto immediate = analyzer.get_parsed_state(uri, std::chrono::milliseconds(0));
-        REQUIRE(immediate != nullptr);
-        CHECK(immediate->tree != nullptr);
+        // And the hints keep coming from it for the whole burst.
+        CHECK(provide_inlay_hints(analyzer, uri, 0, 20).size() == 4);
     }
-    REQUIRE(observed_reparse_window);
+
+    analyzer.set_parse_paused(false);
 }
 
 TEST_CASE("inlay hints: a document that was never opened answers nothing", "[inlay]") {

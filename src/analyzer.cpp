@@ -1052,6 +1052,16 @@ void Analyzer::set_parse_complete_callback(
     parse_complete_cb_ = std::move(cb);
 }
 
+void Analyzer::set_parse_paused(bool paused) {
+    {
+        std::lock_guard<std::mutex> lock(parse_mutex_);
+        parse_paused_.store(paused);
+    }
+    // Taken under parse_mutex_ above so the worker cannot miss the change
+    // between testing its predicate and going back to sleep.
+    parse_cv_.notify_all();
+}
+
 void Analyzer::parse_worker_loop() {
     // Live shards whose owning buffer has been reparsed but whose rebuild is
     // waiting for the typing to stop.  See the deferral note below.
@@ -1065,18 +1075,18 @@ void Analyzer::parse_worker_loop() {
         bool have_job = false;
         {
             std::unique_lock<std::mutex> lock(parse_mutex_);
+            const auto takeable = [&] {
+                return parse_stop_.load() ||
+                       (!parse_paused_.load() && !parse_pending_.empty());
+            };
             if (deferred_shards.empty() && deferred_dependents.empty()) {
-                parse_cv_.wait(lock, [&] {
-                    return parse_stop_.load() || !parse_pending_.empty();
-                });
+                parse_cv_.wait(lock, takeable);
             } else {
-                parse_cv_.wait_for(lock, kLiveShardIdleDelay, [&] {
-                    return parse_stop_.load() || !parse_pending_.empty();
-                });
+                parse_cv_.wait_for(lock, kLiveShardIdleDelay, takeable);
             }
             if (parse_stop_.load())
                 break;
-            if (!parse_pending_.empty()) {
+            if (!parse_paused_.load() && !parse_pending_.empty()) {
                 auto it = parse_pending_.begin();
                 job = std::move(it->second);
                 parse_pending_.erase(it);
