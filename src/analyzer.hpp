@@ -408,6 +408,18 @@ class Analyzer {
     Analyzer() = default;
     ~Analyzer();
 
+    /// Join every thread this analyzer started.  Idempotent.
+    ///
+    /// A parse worker calls the parse-complete callback, and the server's
+    /// callback publishes diagnostics through the LSP transport -- so these
+    /// threads outlive nothing that the transport's own teardown touches.
+    /// Leaving them to ~Analyzer is too late: the server's members are
+    /// destroyed in reverse declaration order, which frees the endpoint first
+    /// and leaves a worker mid-publish writing through it.  The server calls
+    /// this at the top of its destructor for that reason; ~Analyzer calls it
+    /// too, for every other owner.
+    void stop();
+
     /// Create a new DocumentState for uri with the given text.
     void open(const std::string& uri, const std::string& text);
 
@@ -979,6 +991,8 @@ private:
     /// than poll for it.  Paired with map_mutex_, not parse_mutex_.
     mutable std::condition_variable parse_committed_cv_;
     std::atomic<bool> parse_stop_{false};
+    /// Whether stop() has already run, so the destructor's call is a no-op.
+    std::atomic<bool> stopped_{false};
     /// See set_parse_paused().  Read by the worker under parse_mutex_.
     std::atomic<bool> parse_paused_{false};
     std::thread parse_worker_;
