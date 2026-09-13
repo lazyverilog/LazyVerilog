@@ -578,12 +578,48 @@ LazyVerilogServer::~LazyVerilogServer() {
     // server torn down any other way (a test harness, stdin closing under a
     // client that never sends exit) gets the same guarantee from here.
     impl_->request_pool.shutdown();
-    analyzer_.set_project_index_publish_callback({});
+    // Then the threads that publish on their own initiative.  A parse worker
+    // calls back into publish_diagnostics(), which writes through
+    // impl_->remote_endpoint -- and impl_ is the last member declared, so it is
+    // the first one destroyed, well before ~Analyzer would have joined that
+    // worker.  Under load that is a worker writing through a freed endpoint;
+    // it reproduces as a SIGSEGV in RemoteEndPoint::sendMsg() with the main
+    // thread already inside ~Analyzer, joining the thread that is crashing.
+    //
+    // Joining here is also what makes clearing the callback below safe: a
+    // std::function cannot be reassigned while another thread is calling it.
     if (background_compiler_)
         background_compiler_->stop();
+    analyzer_.stop();
+    analyzer_.set_project_index_publish_callback({});
+    analyzer_.set_parse_complete_callback({});
 }
 
-void LazyVerilogServer::run() { impl_->exit_event.wait(); }
+void LazyVerilogServer::run() {
+    impl_->exit_event.wait();
+
+    // Stopped here, on the thread that started it, and never from a handler.
+    //
+    // `RemoteEndPoint::startProcessingMessages()` starts its reader thread and
+    // only then stores the handle, and `stop()` reads that handle to detach it.
+    // A session whose input is already buffered -- every CLI smoke test, and a
+    // client that writes `initialize` and `exit` back to back -- can dispatch
+    // `exit` before the store lands, so a stop() called from the dispatch
+    // thread finds no handle, detaches nothing, and ~RemoteEndPoint then
+    // destroys a still-joinable std::thread: std::terminate, SIGABRT, no
+    // diagnostic.  Reproduced under load as roughly one run in ninety of the
+    // initialize-then-exit session, on Linux as well as macOS.
+    //
+    // This call is on the same thread as startProcessingMessages(), so the
+    // handle is visible by construction and the reader is always detached.
+    try {
+        impl_->remote_endpoint.stop();
+    } catch (const std::exception& e) {
+        std::cerr << "[lazyverilog] endpoint stop during exit failed: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[lazyverilog] endpoint stop during exit failed\n";
+    }
+}
 
 void LazyVerilogServer::sync_dynamic_registration(const char* method,
                                                   const char* registration_id,
@@ -1076,28 +1112,24 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── exit ──────────────────────────────────────────────────────────────────
-    ep.registerHandler([&, remote](const Notify_Exit::notify&) {
+    ep.registerHandler([&](const Notify_Exit::notify&) {
         try {
             // Deferred requests are still in flight.  `exit` arrives on the
             // dispatch thread while a worker may be halfway through the fold
-            // request that came in just before it, and stopping the transport
-            // -- then returning from run() and destroying this server under
-            // that worker -- races the reply against its own teardown.  It is
-            // the whole reason the two macOS runners saw a fold reply go
-            // missing and the process die on the way out.
-            //
-            // So drain first: every request that was accepted is answered
-            // before the transport that answers it is taken down.  Both
-            // deferred methods are pure computations over an immutable
-            // snapshot, so this waits on work that is already finishing, never
-            // on anything this thread still owes them.
+            // request that came in just before it, so drain before waking
+            // run(): every request that was accepted is answered before the
+            // transport that answers it is taken down.  Both deferred methods
+            // are pure computations over an immutable snapshot, so this waits
+            // on work that is already finishing, never on anything this thread
+            // still owes them.
             impl_->request_pool.shutdown();
-            remote->stop();
         } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] endpoint stop during exit failed: " << e.what() << "\n";
+            std::cerr << "[lazyverilog] request drain during exit failed: " << e.what() << "\n";
         } catch (...) {
-            std::cerr << "[lazyverilog] endpoint stop during exit failed\n";
+            std::cerr << "[lazyverilog] request drain during exit failed\n";
         }
+        // Stopping the transport is deliberately NOT done here; run() does it.
+        // See the comment there.
         impl_->exit_event.notify(std::make_unique<bool>(true));
     });
 

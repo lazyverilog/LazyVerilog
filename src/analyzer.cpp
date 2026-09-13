@@ -820,7 +820,12 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
     return built;
 }
 
-Analyzer::~Analyzer() {
+Analyzer::~Analyzer() { stop(); }
+
+void Analyzer::stop() {
+    if (stopped_.exchange(true))
+        return;
+
     // With no writer thread, the queue's only other drain point is the end of a
     // burst.  A process that goes away mid-burst would drop everything queued
     // since the last publish, which costs the next launch a reparse of exactly
