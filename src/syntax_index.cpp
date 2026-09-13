@@ -1,4 +1,5 @@
 #include "syntax_index.hpp"
+#include "perf_trace.hpp"
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
@@ -1291,6 +1292,8 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
 
 SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::string_view source,
                                IndexDepth depth, std::string_view restrict_to_uri) {
+    const perf_trace::ScopedPhase build_phase(perf_trace::Phase::IndexBuild);
+
     SyntaxIndex index;
     SourceFileIdResolver resolver;
     const auto& sm = tree.sourceManager();
@@ -1372,10 +1375,15 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
     // Only filter the tables when collection already found something foreign to
     // drop.  If it did not, every value in the index is this file's own and
     // there is nothing the filter could remove.
-    collect_combined_occurrences(tree, root, index, sm, restrict_to_uri,
-                                 mentions_ready ? &mentioned_names : nullptr);
-    if (!index.source_files.empty())
+    {
+        const perf_trace::ScopedPhase occurrences(perf_trace::Phase::Occurrences);
+        collect_combined_occurrences(tree, root, index, sm, restrict_to_uri,
+                                     mentions_ready ? &mentioned_names : nullptr);
+    }
+    if (!index.source_files.empty()) {
+        const perf_trace::ScopedPhase includes(perf_trace::Phase::IncludeDependencyUris);
         index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
+    }
 
     // Macros are queried from the live current-file layer.  Extra-file macro
     // entries are intentionally skipped by Declarations depth to avoid both

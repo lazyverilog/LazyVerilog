@@ -136,6 +136,61 @@ A `Release` build keeps its symbols, so this needs no rebuild, and one CPU keeps
 the attribution clean.  `perf` is the better tool where it is available; in a
 container without `perf_event` access this is what there is.
 
+## Sampling says where, timers say how much
+
+Use the stacks above to find out *what is running*, then time it before
+believing a number.  Sampling attributes to whichever frame is on top, and a
+short leaf function called very often collects samples out of all proportion to
+the time it holds.  Twice on this code that produced a confident wrong answer:
+
+| what sampling said | what a timer said |
+|---|---|
+| 13% of a cold start in slang's `SourceManager` lock, from the per-token line/column conversion | caching every one of those away — 434 345 hits against 4 351 misses — moved a single-core cold start from 822 ms to 821 ms |
+| 25% in `collect_include_dependency_uris` | 4 ms of 542 |
+
+The first is the trap in its purest form: an uncontended `std::shared_lock` is a
+handful of instructions, so the samples were real and the conclusion was not.
+
+`LAZYVERILOG_TRACE_PERF=1` therefore also reports phase totals, summed over
+every worker, alongside the per-file lines:
+
+```bash
+LAZYVERILOG_TRACE_PERF=1 taskset -c 0 ./build/index-bench <corpus> 1 --cache off
+# [lazyverilog][perf] index_build: 513ms
+# [lazyverilog][perf] occurrences: 435ms
+# [lazyverilog][perf] include_dependency_uris: 4ms
+```
+
+The phases nest — `occurrences` is inside `index_build` — and both are summed
+across threads, so on a multi-core slice they exceed the wall time.  Add one in
+`src/perf_trace.hpp` (an enum entry, a name, and a `ScopedPhase` where the work
+is); with tracing off a timer reads the clock twice and adds, which does not
+show up against the work it brackets.
+
+## Where a cold start actually goes
+
+Measured this way on 953 files of CVA6 and Ibex RTL, one core, uncached, so the
+numbers are not divided across workers:
+
+| | ms | share |
+|---|---|---|
+| whole cold start | 880 | |
+| `SyntaxIndex::build` | 482 | 55% |
+| — of which the occurrence collector | 410 | 47% |
+| — — traversal and classification | 373 | 42% |
+| — — building and recording the entries | 91 | 10% |
+| slang's parse and preprocess | ~340 | 39% |
+
+Two things follow.  The index build costs *more than the parse*, which is not
+where the earlier rounds were looking.  And four fifths of it is the classifier
+walking tokens and deciding what each identifier refers to — not the recording,
+and not any single call that can be cached away.  The 417 568 reference entries
+it produces cost about 220 ns each to construct, most of it in the canonical id
+the classifier builds before `add_reference_entry()` ever sees it, so clearing
+the strings at the point of storage recovers only 16 ms of the 91.
+
+Splitting those numbers further needs another `ScopedPhase`, not another guess.
+
 ## Related
 
 - `PERF.md` — measured optimization rounds and their evidence.

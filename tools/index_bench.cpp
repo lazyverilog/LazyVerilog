@@ -15,6 +15,7 @@
 #include "analyzer.hpp"
 #include "config.hpp"
 #include "filelist.hpp"
+#include "perf_trace.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -84,5 +85,9 @@ int main(int argc, char** argv) {
                   << (snapshot ? snapshot->shards.size() : 0) << ", modules="
                   << (snapshot ? snapshot->module_by_name.size() : 0) << "\n";
     }
+    // Phase totals, when LAZYVERILOG_TRACE_PERF asked for them.  These nest:
+    // `occurrences` is part of `index_build`, and each is summed over every
+    // worker, so they exceed the wall time above on a multi-core slice.
+    std::cerr << perf_trace::summary();
     return 0;
 }
