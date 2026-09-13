@@ -875,6 +875,21 @@ void LazyVerilogServer::register_handlers() {
         td_initialize::response rsp;
         rsp.id = req.id;
         try {
+            // Identify the server.  This is the only place a client can learn
+            // what it is talking to: Neovim assigns `client.server_info` from
+            // this field and nothing revises it later, so an absent one leaves
+            // `:LspInfo` printing "? (no serverInfo.version response)" for the
+            // whole session.  The version is the same string `--version`
+            // prints, so a bug report and a health check name one build.
+            //
+            // Set first, before anything below can throw: a capability that
+            // fails to build is caught and logged, and the client should still
+            // get an answer that says which build produced it.
+            lsServerInfo server_info;
+            server_info.name    = "lazyverilog";
+            server_info.version = std::string(LAZYVERILOG_VERSION);
+            rsp.result.serverInfo = std::move(server_info);
+
             auto& caps = rsp.result.capabilities;
 
             // Whether a later [folding].enable / [inlay_hint].enable edit can

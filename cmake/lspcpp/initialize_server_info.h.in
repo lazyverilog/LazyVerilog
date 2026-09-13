@@ -1,0 +1,39 @@
+// ── LazyVerilog patch: InitializeResult.serverInfo ────────────────────────
+//
+// `serverInfo` has been part of `InitializeResult` since LSP 3.15.  LspCpp's
+// declaration predates it and reflects `capabilities` alone, so a server
+// built on this header had no field to fill in and every client that shows
+// the server's version had nothing to show.  Neovim is the visible case:
+// `vim.lsp.client` assigns `self.server_info = result.serverInfo`, and with
+// that nil `:LspInfo` prints the literal "? (no serverInfo.version response)".
+//
+// `version` is optional in the spec, and the writer omits `optional<>`
+// members that are unset, so a server that fills in neither field sends
+// exactly the bytes it sent before this patch.
+
+/**
+ * Information about the server, as reported in its initialize reply.
+ */
+struct lsServerInfo
+{
+    /// The name of the server as defined by the server.
+    std::string name;
+    /// The server's version as defined by the server.
+    optional<std::string> version;
+    MAKE_SWAP_METHOD(lsServerInfo, name, version);
+};
+
+MAKE_REFLECT_STRUCT(lsServerInfo, name, version);
+
+/**
+ * The capabilities the language server provides.
+ */
+struct InitializeResult
+{
+    lsServerCapabilities capabilities;
+    optional<lsServerInfo> serverInfo;
+    MAKE_SWAP_METHOD(InitializeResult, capabilities, serverInfo);
+};
+
+MAKE_REFLECT_STRUCT(InitializeResult, capabilities, serverInfo);
+// ── end LazyVerilog patch ─────────────────────────────────────────────────

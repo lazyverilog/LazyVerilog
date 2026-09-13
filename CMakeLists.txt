@@ -109,6 +109,53 @@ string(REPLACE
     _caps_content "${_caps_content}")
 file(WRITE "${_caps_h}" "${_caps_content}")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch: give LspCpp's InitializeResult the `serverInfo` field.
+#
+# LSP 3.15 added it; LspCpp's declaration predates it and carries `capabilities`
+# alone, so there was no field for this server to fill in and clients that show
+# the server's version had nothing to show.  Neovim's `:LspInfo` is the case
+# that surfaces it -- it reads `client.server_info.version` and prints
+# "? (no serverInfo.version response)" when the reply omits it.
+#
+# Idempotent after populate for the same reason as the patches around it:
+# FetchContent's PATCH_COMMAND runs only on the first populate, and a dependency
+# that silently loses its patch on a re-configure is worse than one that never
+# had it.  The replacement text is in cmake/lspcpp/ so it reads as C++ rather
+# than as an escaped CMake string.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_init_h "${lspcpp_SOURCE_DIR}/include/LibLsp/lsp/general/initialize.h")
+set(_init_anchor
+"/**
+ * The capabilities the language server provides.
+ */
+struct InitializeResult
+{
+    lsServerCapabilities capabilities;
+    MAKE_SWAP_METHOD(InitializeResult, capabilities);
+};
+
+MAKE_REFLECT_STRUCT(InitializeResult, capabilities);")
+
+file(READ "${_init_h}" _init_content)
+string(FIND "${_init_content}" "serverInfo" _init_done)
+if(_init_done EQUAL -1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lspcpp/initialize_server_info.h.in" _init_insert)
+    string(STRIP "${_init_insert}" _init_insert)
+    string(REPLACE "${_init_anchor}" "${_init_insert}" _init_content "${_init_content}")
+    file(WRITE "${_init_h}" "${_init_content}")
+endif()
+
+# An upstream bump that moves the anchor must fail the configure, not produce a
+# server that has quietly stopped identifying itself.
+string(FIND "${_init_content}" "serverInfo" _init_ok)
+if(_init_ok EQUAL -1)
+    message(FATAL_ERROR
+        "Could not patch LspCpp's InitializeResult with the serverInfo field. The pinned "
+        "LspCpp revision has probably moved and the anchor above no longer matches its "
+        "source. Re-derive it before bumping GIT_TAG.")
+endif()
+
 # EditWatermark parses the raw didChange messages LspCpp hands it through the
 # hook below, and parses them with the same JSON library LspCpp itself uses so
 # the two agree on what a message says.  LspCpp keeps RapidJSON a private
@@ -406,6 +453,14 @@ target_include_directories(lazyverilog-request-reply-cli-smoke PRIVATE tests)
 add_test(
     NAME request-reply-cli-smoke
     COMMAND lazyverilog-request-reply-cli-smoke
+            $<TARGET_FILE:lazyverilog-lsp>
+)
+
+add_executable(lazyverilog-server-info-cli-smoke tests/server_info_cli_smoke.cpp)
+target_include_directories(lazyverilog-server-info-cli-smoke PRIVATE tests)
+add_test(
+    NAME server-info-cli-smoke
+    COMMAND lazyverilog-server-info-cli-smoke
             $<TARGET_FILE:lazyverilog-lsp>
 )
 
