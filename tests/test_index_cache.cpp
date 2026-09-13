@@ -978,6 +978,62 @@ TEST_CASE("index cache: an unchanged project is served from the shards", "[index
     CHECK(warm.count("sig_a") == 1);
 }
 
+TEST_CASE("index cache: a warm launch is identical however many threads preload it",
+          "[index-cache]") {
+    // The preload checks each file independently, so it runs on as many threads
+    // as the CPU slice allows.  What that must not change is the answer, and the
+    // part most easily lost is attribution: installing a hit claims the header
+    // shards it carries, first claim winning, so a result list ordered by which
+    // thread finished first would hand a shared header to a different includer
+    // from one launch to the next -- and every feature that resolves a header
+    // symbol reads that attribution.
+    //
+    // Enough files that a multi-core slice really does split them, all sharing
+    // one header, which is the shape where a claim has to be decided at all.
+    CacheProject project("analyzer-preload-parallel");
+    project.write("defs.svh", "localparam int shared_from_header = 3;\n");
+    std::vector<std::string> files;
+    for (int i = 0; i < 12; ++i) {
+        const std::string name = "m" + std::to_string(i) + ".sv";
+        project.write(name, "`include \"defs.svh\"\nmodule m" + std::to_string(i) +
+                                ";\n  logic [7:0] sig_" + std::to_string(i) + ";\nendmodule\n");
+        files.push_back(name);
+    }
+
+    // Where each name is reported from -- the attribution, not just the set.
+    const auto attribution = [](const std::shared_ptr<const ProjectIndexSnapshot>& snapshot) {
+        std::map<std::string, std::string> by_name;
+        if (!snapshot)
+            return by_name;
+        for (const auto& shard : snapshot->shards) {
+            if (!shard.index)
+                continue;
+            for (const auto& value : shard.index->values)
+                by_name.emplace(value.name, shard.uri);
+        }
+        return by_name;
+    };
+
+    {
+        Analyzer cold;
+        REQUIRE(project.index(cold, files) != nullptr);
+    }
+
+    std::map<std::string, std::string> first;
+    for (int launch = 0; launch < 5; ++launch) {
+        Analyzer   warm;
+        const auto snapshot = project.index(warm, files);
+        REQUIRE(snapshot != nullptr);
+        const auto seen = attribution(snapshot);
+        REQUIRE(seen.count("shared_from_header") == 1);
+        REQUIRE(seen.count("sig_11") == 1);
+        if (launch == 0)
+            first = seen;
+        else
+            CHECK(seen == first);
+    }
+}
+
 TEST_CASE("index cache: an unchanged include resolution is still a hit", "[index-cache]") {
     // The check above must not cost the reuse it is guarding.  A project whose
     // headers resolve exactly as they did is the case this cache exists for.

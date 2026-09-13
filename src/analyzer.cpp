@@ -6498,10 +6498,18 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     // with a few dozen include directories that is the dominant cost of the
     // check.  Split, it is one stat per (directory, spelling) plus one walk per
     // distinct spelling.
+    //
+    // Both are read and written from every preload thread.  A hit is a hash
+    // lookup and a miss is one stat, so a single mutex over both costs less
+    // than per-thread memos would: the whole burst resolves a handful of
+    // distinct spellings, and per-thread copies would turn "one stat per
+    // (directory, spelling)" back into one per thread.
+    std::mutex                                   resolution_mutex;
     std::unordered_map<std::string, std::string> incdir_resolution;
     std::unordered_map<std::string, std::string> local_resolution;
 
     const auto resolve_include = [&](const IncludeResolution& recorded) -> std::string {
+        std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
         const std::filesystem::path spelling(recorded.spelling);
         if (spelling.is_absolute())
             return resolved_uri_if_file(spelling);
@@ -6573,19 +6581,39 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         std::shared_ptr<const SyntaxIndex> index;
         std::vector<std::tuple<std::string, std::shared_ptr<const SyntaxIndex>, bool>> headers;
     };
-    std::vector<Hit> hits;
     struct HeaderHit {
         std::shared_ptr<const SyntaxIndex> index;
         bool stands_alone{false};
     };
+    std::mutex                                header_mutex;
     std::unordered_map<std::string, HeaderHit> header_hits;
     std::unordered_set<std::string> header_misses;
 
-    for (const auto& path : files) {
-        const auto uri = uri_from_path(path);
-        auto loaded = cache->load(uri);
+    // Checking one file is independent of checking any other: read a shard,
+    // hash what it was built from, and decide.  Nothing in it touches analyzer
+    // state -- the digest memo has its own lock, and the two maps above are the
+    // only other shared things -- so the whole sweep runs on as many threads as
+    // the CPU slice allows.
+    //
+    // It is the warm start's entire cost, and it was serial: one worker ran
+    // this while every other one waited on the cache-preload gate.  So a warm
+    // launch did not get faster with more cores, it got *slower* -- measured on
+    // a 1154-shard project at 99.8 / 114.5 / 128.7 ms for 1 / 2 / 4 CPUs, the
+    // extra threads paying wakeups for work they were not allowed to do.
+    //
+    // Results go into a slot per file rather than a shared list, so the order
+    // they are installed in does not depend on which thread finished first.
+    // That matters beyond tidiness: installing a hit claims the header shards
+    // it carries, first claim winning, so a shared list would make which
+    // includer claims a shared header vary run to run.
+    std::vector<std::optional<Hit>> results(files.size());
+
+    const auto check_one = [&](size_t index) {
+        const auto& path = files[index];
+        const auto  uri  = uri_from_path(path);
+        auto        loaded = cache->load(uri);
         if (!loaded || !still_valid(uri, loaded->key))
-            continue;
+            return;
 
         // A file's shard is only usable together with shards for the headers it
         // pulled in: skipping its parse skips the only thing that would have
@@ -6594,32 +6622,75 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         Hit hit{.path = path, .uri = uri};
         bool headers_ok = true;
         for (const auto& dependency : loaded->index.include_dependencies) {
-            if (header_misses.count(dependency)) {
-                headers_ok = false;
-                break;
+            {
+                std::lock_guard<std::mutex> header_lock(header_mutex);
+                if (header_misses.count(dependency)) {
+                    headers_ok = false;
+                    break;
+                }
+                if (const auto known = header_hits.find(dependency); known != header_hits.end()) {
+                    hit.headers.emplace_back(dependency, known->second.index,
+                                             known->second.stands_alone);
+                    continue;
+                }
             }
-            if (const auto known = header_hits.find(dependency); known != header_hits.end()) {
-                hit.headers.emplace_back(dependency, known->second.index,
-                                         known->second.stands_alone);
-                continue;
-            }
+            // Read and validate with the map unlocked.  Two threads reaching
+            // the same header both do the work, which is cheaper than either
+            // waiting for the other -- the same trade cached_file_digest()
+            // makes -- and the insert below keeps whichever arrives first, so
+            // every includer still ends up pointing at one shared index.
             auto header = cache->load(dependency);
-            if (!header || !still_valid(dependency, header->key)) {
+            const bool usable = header && still_valid(dependency, header->key);
+
+            std::lock_guard<std::mutex> header_lock(header_mutex);
+            if (!usable) {
                 header_misses.insert(dependency);
                 headers_ok = false;
                 break;
             }
-            HeaderHit header_hit{std::make_shared<const SyntaxIndex>(std::move(header->index)),
-                                 header->stands_alone};
-            header_hits.emplace(dependency, header_hit);
-            hit.headers.emplace_back(dependency, header_hit.index, header_hit.stands_alone);
+            auto [entry, inserted] = header_hits.try_emplace(
+                dependency,
+                HeaderHit{std::make_shared<const SyntaxIndex>(std::move(header->index)),
+                          header->stands_alone});
+            hit.headers.emplace_back(dependency, entry->second.index, entry->second.stands_alone);
         }
         if (!headers_ok)
-            continue;
+            return;
 
-        hit.index = std::make_shared<const SyntaxIndex>(std::move(loaded->index));
-        hits.push_back(std::move(hit));
+        hit.index      = std::make_shared<const SyntaxIndex>(std::move(loaded->index));
+        results[index] = std::move(hit);
+    };
+
+    const size_t worker_count =
+        std::min<size_t>(std::max<size_t>(available_cpu_count(), 1), files.size());
+    if (worker_count <= 1) {
+        for (size_t i = 0; i < files.size(); ++i)
+            check_one(i);
+    } else {
+        // Hand out indices one at a time rather than in blocks: a shard's cost
+        // tracks the size of the file it indexes, and a filelist is not sorted
+        // by size, so a static split strands one thread on the generated
+        // register blocks while the rest finish.
+        std::atomic<size_t>      next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count - 1);
+        const auto drain = [&] {
+            for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < files.size();
+                 i = next.fetch_add(1, std::memory_order_relaxed))
+                check_one(i);
+        };
+        for (size_t i = 0; i + 1 < worker_count; ++i)
+            workers.emplace_back(drain);
+        drain(); // this thread takes a share too
+        for (auto& worker : workers)
+            worker.join();
     }
+
+    std::vector<Hit> hits;
+    hits.reserve(results.size());
+    for (auto& result : results)
+        if (result)
+            hits.push_back(std::move(*result));
 
     // Queued whatever the preload found.  The sweep has to happen on the launch
     // that reuses everything just as much as on one that rebuilds, and that
