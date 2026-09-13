@@ -53,6 +53,66 @@ bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
+/// A request the client withdraws must come back as an error, not as a result.
+///
+/// Sent as a burst so that most of them are still queued when the cancels
+/// arrive: a cancel that overtakes work already running cannot stop it, which
+/// is true of every server (clangd documents the same caveat), so what is
+/// pinned here is the case a cancel exists for.
+int cancelled_request_errors(const fs::path& server_bin, const fs::path& work) {
+    const std::string root_uri = "file://" + (work / "").generic_string();
+    const std::string doc_uri  = "file://" + (work / "m.sv").generic_string();
+
+    std::string body = R"(module m;\n)";
+    for (int i = 0; i < 400; ++i)
+        body += R"(  always_comb begin\n    x = )" + std::to_string(i) + R"(;\n  end\n)";
+    body += R"(endmodule\n)";
+
+    const fs::path input = work / "cancel.jsonrpc";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"rootUri":")" + root_uri + R"(","capabilities":{}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                     R"("uri":")" + doc_uri + R"(","languageId":"systemverilog","version":1,"text":")" +
+                     body + R"("}}})");
+        // A fresh snapshot per request, so none of them is a cache hit.
+        for (int i = 0; i < 8; ++i) {
+            out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didChange","params":{)"
+                         R"("textDocument":{"uri":")" + doc_uri + R"(","version":)" +
+                         std::to_string(i + 2) + R"(},"contentChanges":[{"range":{)"
+                         R"("start":{"line":0,"character":0},"end":{"line":0,"character":0}},)"
+                         R"("text":"// x\n"}]}})");
+            out << frame(R"({"jsonrpc":"2.0","id":)" + std::to_string(300 + i) +
+                         R"(,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":")" +
+                         doc_uri + R"("}}})");
+        }
+        for (int i = 2; i < 8; ++i)
+            out << frame(R"({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":)" +
+                         std::to_string(300 + i) + "}}");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+
+    int cancelled = 0;
+    for (int i = 0; i < 8; ++i) {
+        const std::string id = R"("id":)" + std::to_string(300 + i);
+        auto at = result.stdout_text.find(id);
+        if (at == std::string::npos)
+            continue;
+        // -32800 is RequestCancelled.  Look only inside this reply.
+        const auto next = result.stdout_text.find("Content-Length", at);
+        if (result.stdout_text.substr(at, (next == std::string::npos ? result.stdout_text.size()
+                                                                     : next) - at)
+                .find("-32800") != std::string::npos)
+            ++cancelled;
+    }
+    return cancelled;
+}
+
 struct Case {
     int         id;
     std::string method;
@@ -137,6 +197,10 @@ int main(int argc, char** argv) {
     for (const auto& c : cases)
         expect(contains(result.stdout_text, R"("id":)" + std::to_string(c.id)),
                c.method + " answered " + c.what);
+
+    // A withdrawn request is answered with RequestCancelled rather than run.
+    expect(cancelled_request_errors(server_bin, work) > 0,
+           "a cancelled request comes back as RequestCancelled");
 
     fs::remove_all(work);
 

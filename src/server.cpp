@@ -3,6 +3,7 @@
 #include "string_utils.hpp"
 #include "background_compiler.hpp"
 #include "config.hpp"
+#include "cpu_budget.hpp"
 #include "dynamic_file_index.hpp"
 #include "filelist.hpp"
 
@@ -70,6 +71,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -468,6 +470,79 @@ struct StderrLog : public lsp::Log {
     void log(Level, const std::string& msg) override { std::cerr << msg << "\n"; }
 };
 
+/// Runs read-only request handlers off the thread that reads messages.
+///
+/// clangd keeps message *dispatch* on one thread -- notifications stay in the
+/// order they arrived, and a document update is applied before anything queued
+/// behind it -- and hands the *work* of a request to other threads, replying
+/// from whichever one finishes.  This is that pool.
+///
+/// Small on purpose.  Its job is to stop one whole-file request standing in
+/// front of the completion the user is waiting for, not to run many at once;
+/// the cores beyond that belong to background indexing.
+class RequestPool {
+public:
+    explicit RequestPool(size_t threads) {
+        workers_.reserve(threads);
+        for (size_t i = 0; i < threads; ++i)
+            workers_.emplace_back([this] { run(); });
+    }
+
+    ~RequestPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_)
+            if (worker.joinable())
+                worker.join();
+    }
+
+    RequestPool(const RequestPool&) = delete;
+    RequestPool& operator=(const RequestPool&) = delete;
+
+    void submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_)
+                return;
+            queue_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty())
+                    return;
+                task = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            // A handler that throws must not take the pool down with it: the
+            // request is answered or not, but the next one still runs.
+            try {
+                task();
+            } catch (const std::exception& e) {
+                std::cerr << "[lazyverilog] request worker error: " << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "[lazyverilog] request worker error\n";
+            }
+        }
+    }
+
+    std::mutex                        mutex_;
+    std::condition_variable           cv_;
+    std::deque<std::function<void()>> queue_;
+    bool                              stop_{false};
+    std::vector<std::thread>          workers_;
+};
+
 struct LazyVerilogServer::Impl {
     StderrLog log;
     // Completion providers are immutable after construction.  Keep the engine
@@ -482,6 +557,11 @@ struct LazyVerilogServer::Impl {
     // diagnostics/config notifications simple.  Expensive project indexing and
     // optional semantic compilation still run on their own background workers.
     RemoteEndPoint remote_endpoint{json_handler, endpoint, log, lsp::JSONStreamStyle::Standard, 1};
+    // Two is enough to keep a whole-file request from standing in front of the
+    // next one while still leaving the machine to the indexer; on a single-core
+    // slice there is nothing to overlap with, and one worker keeps the handoff
+    // without oversubscribing.
+    RequestPool request_pool{available_cpu_count() > 1 ? 2u : 1u};
     std::shared_ptr<StdOutStream> output = std::make_shared<StdOutStream>();
     std::shared_ptr<StdInStream> input = std::make_shared<StdInStream>();
     Condition<bool> exit_event;
@@ -491,6 +571,10 @@ struct LazyVerilogServer::Impl {
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
+    // Mirrors read by the handlers that run on the worker pool; see the
+    // declarations.  Refreshed everywhere config_ is.
+    folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
+    inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
 
@@ -550,8 +634,10 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     // handler.  This is the only vantage point from which a keystroke that has
     // arrived but not yet been applied is visible; see EditWatermark.  It must
     // stay cheap -- whatever it does, the server is not reading input meanwhile.
-    impl_->remote_endpoint.setIncomingMessagePreview(
-        [this](const std::string& raw) { edit_watermark_.observe(raw); });
+    impl_->remote_endpoint.setIncomingMessagePreview([this](const std::string& raw) {
+        edit_watermark_.observe(raw);
+        cancelled_requests_.observe(raw);
+    });
     impl_->remote_endpoint.startProcessingMessages(impl_->input, impl_->output);
 }
 
@@ -927,6 +1013,8 @@ void LazyVerilogServer::register_handlers() {
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
+                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
+                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
 
                 if (!warn.empty())
                     show_warning(warn);
@@ -1100,6 +1188,8 @@ void LazyVerilogServer::register_handlers() {
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
+                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
+                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
 
                 std::cerr << "[lazyverilog] reloaded config from "
                           << (root_ / "lazyverilog.toml").string() << "\n";
@@ -1207,7 +1297,10 @@ void LazyVerilogServer::register_handlers() {
             analyzer_.close(uri);
             document_versions_.erase(uri);
             edit_watermark_.forget(uri);
-            last_folding_result_.erase(uri);
+            {
+                std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
+                last_folding_result_.erase(uri);
+            }
             clear_published_diagnostics_for_owner(uri);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didClose error: " << e.what() << "\n";
@@ -1383,13 +1476,19 @@ void LazyVerilogServer::register_handlers() {
             // asking for the rest of the session -- at which point computing
             // whole-file folds nobody wants is the most expensive thing on the
             // edit path.  `inlayHint` has always checked its own flag here.
-            if (!config_.folding.enable)
+            if (!folding_enabled_.load(std::memory_order_relaxed))
                 return rsp;
 
             if (edit_watermark_.superseded(uri)) {
-                const auto cached = last_folding_result_.find(uri);
-                if (cached != last_folding_result_.end() && cached->second) {
-                    rsp.result = *cached->second;
+                std::shared_ptr<const std::vector<FoldingRange>> cached;
+                {
+                    std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
+                    if (const auto it = last_folding_result_.find(uri);
+                        it != last_folding_result_.end())
+                        cached = it->second;
+                }
+                if (cached) {
+                    rsp.result = *cached;
                     return rsp;
                 }
             }
@@ -1399,7 +1498,10 @@ void LazyVerilogServer::register_handlers() {
             auto folds = provide_folding_range_shared(analyzer_, req.params);
             if (!folds)
                 return rsp;
-            last_folding_result_[uri] = folds;
+            {
+                std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
+                last_folding_result_[uri] = folds;
+            }
             rsp.result = *folds;
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] foldingRange error: " << e.what() << "\n";
@@ -1446,7 +1548,7 @@ void LazyVerilogServer::register_handlers() {
         td_inlayHint::response rsp;
         rsp.id = req.id;
         try {
-            if (!config_.inlay_hint.enable)
+            if (!inlay_hint_enabled_.load(std::memory_order_relaxed))
                 return rsp;
             const auto& uri = req.params.textDocument.uri.raw_uri_;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
@@ -1952,6 +2054,13 @@ void LazyVerilogServer::register_handlers() {
     });
 
     harden_request_parsing();
+
+    // The two whole-file requests an editor issues from every didChange.  Both
+    // are pure functions of an immutable document snapshot, so neither needs the
+    // ordering the dispatch thread provides -- and both are expensive enough
+    // that standing in front of a completion is exactly what they must not do.
+    answer_off_the_dispatch_thread(td_foldingRange::request::kMethodInfo);
+    answer_off_the_dispatch_thread(td_inlayHint::request::kMethodInfo);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2013,6 +2122,51 @@ void clamp_position_members(rapidjson::Value& value) {
 }
 
 } // namespace
+
+void LazyVerilogServer::answer_off_the_dispatch_thread(const char* method) {
+    auto& handlers = impl_->endpoint->method2request;
+    const auto it = handlers.find(method);
+    if (it == handlers.end())
+        return;
+
+    // The handler registered above already builds the response and sends it,
+    // and `RemoteEndPoint::send()` takes the transport's own mutex -- the same
+    // guarantee clangd gets from its `TranspWriter` lock.  So moving the work
+    // is all this does: the body is unchanged and still replies exactly once.
+    handlers[method] = [this, inner = it->second](std::unique_ptr<LspMessage> message) {
+        const auto* request = dynamic_cast<const RequestInMessage*>(message.get());
+        if (!request) {
+            // Not the shape this can defer; answer it here rather than drop it.
+            return inner(std::move(message));
+        }
+        const auto id  = request->id;
+        const auto key = id.type == lsRequestId::kString ? CancelledRequests::key(id.k_string)
+                         : id.type == lsRequestId::kInt  ? CancelledRequests::key(id.value)
+                                                         : std::string{};
+
+        // std::function needs a copyable target, and the message is a
+        // unique_ptr; hand it over through a shared_ptr and take it back once,
+        // in the task that runs exactly once.
+        auto owned = std::make_shared<std::unique_ptr<LspMessage>>(std::move(message));
+        impl_->request_pool.submit([this, inner, owned, key, id]() mutable {
+            if (!*owned)
+                return;
+            // Withdrawn before this got started.  LSP's answer is an error
+            // rather than a fabricated result, and either way it releases the
+            // entry the client is holding for this id.
+            if (cancelled_requests_.take(key)) {
+                Rsp_Error cancelled;
+                cancelled.id            = id;
+                cancelled.error.code    = lsErrorCodes::RequestCancelled;
+                cancelled.error.message = "request cancelled";
+                impl_->remote_endpoint.send(cancelled);
+                return;
+            }
+            inner(std::move(*owned));
+        });
+        return true;
+    };
+}
 
 void LazyVerilogServer::harden_request_parsing() {
     auto& converters = impl_->json_handler->method2request;

@@ -1,7 +1,9 @@
 #pragma once
 #include "analyzer.hpp"
 #include "config.hpp"
+#include "cancelled_requests.hpp"
 #include "edit_watermark.hpp"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,6 +24,19 @@ class LazyVerilogServer {
 
   private:
     void register_handlers();
+    /// Move @p method's handler off the thread that reads messages.
+    ///
+    /// clangd's shape: one thread reads and dispatches, so notifications stay in
+    /// the order they arrived and a document update is applied before anything
+    /// behind it; the *work* of a read-only request is handed to a pool, and the
+    /// reply goes back from whichever thread finished it, serialized by the
+    /// transport's own send mutex.  See `ClangdLSPServer::MessageHandler` and
+    /// its `ReplyOnce`.
+    ///
+    /// Only for requests that are pure functions of an immutable document
+    /// snapshot.  Anything that mutates server state, or whose order relative to
+    /// a notification matters, stays on the dispatch thread.
+    void answer_off_the_dispatch_thread(const char* method);
     /// Wrap the transport's per-method JSON converters so a request whose
     /// params do not fit their fields is still answered.  See the comment at
     /// the definition; must run after every handler is registered, because the
@@ -43,6 +58,14 @@ class LazyVerilogServer {
     std::filesystem::path root_;
     std::string config_diagnostic_uri_;
     Config config_;
+
+    /// `[folding].enable` and `[inlay_hint].enable`, mirrored out of config_.
+    ///
+    /// Both are read by handlers that run on the worker pool, while a
+    /// didChangeConfiguration may be replacing config_ on the dispatch thread.
+    /// Mirroring the two flags keeps that off the whole config's lifetime.
+    std::atomic<bool> folding_enabled_{true};
+    std::atomic<bool> inlay_hint_enabled_{true};
 
     /// What the initialize reply said for each per-keystroke capability, and
     /// whether the client will let us revise it.  Capabilities are normally
@@ -77,6 +100,9 @@ class LazyVerilogServer {
     // the only place a newer keystroke is visible while an older request is
     // still being answered.  See EditWatermark.
     EditWatermark edit_watermark_;
+    // Request ids the client has withdrawn, noted from the reader thread so a
+    // cancel that overtakes its request still catches it.  See CancelledRequests.
+    CancelledRequests cancelled_requests_;
     // The folds last computed for each open buffer.
     //
     // When an edit is already in flight behind a foldingRange request, the folds
@@ -88,8 +114,10 @@ class LazyVerilogServer {
     // send for a change it spots in its own unprocessed messages.  So the
     // superseded request is answered from here instead of recomputing.
     //
-    // Only ever touched from the single request/notification worker, so it needs
-    // no lock of its own.  Erased on didClose.
+    // Guarded: the whole-file read-only requests are answered on a worker pool
+    // (see answer_off_the_dispatch_thread()), so a fold reply can be stored
+    // while didClose is erasing the entry on the dispatch thread.
+    mutable std::mutex last_folding_result_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const std::vector<FoldingRange>>>
         last_folding_result_;
     std::unordered_map<std::string, std::unordered_set<std::string>> diagnostic_uris_by_owner_;
