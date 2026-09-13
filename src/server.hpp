@@ -22,6 +22,11 @@ class LazyVerilogServer {
 
   private:
     void register_handlers();
+    /// Wrap the transport's per-method JSON converters so a request whose
+    /// params do not fit their fields is still answered.  See the comment at
+    /// the definition; must run after every handler is registered, because the
+    /// converters are what registering one installs.
+    void harden_request_parsing();
     void publish_diagnostics(const std::string& uri);
     void clear_published_diagnostics_for_owner(const std::string& owner_uri);
     void publish_config_diagnostic(const ConfigWarning* warning);

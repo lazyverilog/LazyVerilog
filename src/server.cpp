@@ -10,6 +10,9 @@
 #include "LibLsp/JsonRpc/Condition.h"
 #include "LibLsp/JsonRpc/Endpoint.h"
 #include "LibLsp/JsonRpc/RemoteEndPoint.h"
+// JsonReader, and with it the rapidjson value a request arrived as.
+// harden_request_parsing() repairs that value in place; see its definition.
+#include "LibLsp/JsonRpc/json.h"
 #include "LibLsp/JsonRpc/stream.h"
 #include "LibLsp/lsp/ProtocolJsonHandler.h"
 #include "LibLsp/lsp/general/exit.h"
@@ -1933,4 +1936,109 @@ void LazyVerilogServer::register_handlers() {
         }
         return rsp;
     });
+
+    harden_request_parsing();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Every request that carries an id must get a response.
+//
+// The transport turns a request's JSON into a typed message before any handler
+// of ours runs, and a member that does not fit its field throws out of that
+// conversion.  The exception is caught one level up, logged, and the message
+// dropped -- so the request is never answered at all, and the client's
+// pending-request table keeps that entry for the life of the session.  Measured
+// against the server with `position.character = -5`:
+//
+//     id=10  textDocument/definition    answered=NO
+//     id=12  textDocument/hover         answered=NO
+//     id=14  textDocument/completion    answered=NO
+//     id=15  textDocument/references    answered=NO
+//
+// A negative character is malformed, but it is reachable: clients send -1 for
+// "unknown", and any version mismatch or client bug produces the same shape.
+//
+// The fix is to make the conversion succeed rather than to report a failure,
+// because the reply then goes out through the transport's own writer -- the
+// server has no synchronized path of its own to the output stream, so
+// hand-writing an error response could interleave with a reply in flight.
+//
+// Two layers, both installed over the per-method converters the transport
+// built while the handlers above were registered:
+//
+//   * clamp an out-of-range position to the nearest valid one, so the request
+//     is answered on its merits.  LSP positions are unsigned, and the rest of
+//     this file already clamps positions that run past the end of a buffer.
+//   * if the conversion still throws, convert the request again with empty
+//     params.  The answer is then whatever the handler makes of a request that
+//     names nothing -- an empty result, in practice -- which is a poor answer
+//     but an answer, and the client's entry is released.
+namespace {
+
+// Clamp negative `line` / `character` members to 0, anywhere beneath `value`.
+// Narrow on purpose: these are the LSP fields that are unsigned in the wire
+// types and the ones a real client gets wrong.  Other members are left exactly
+// as they arrived, so a genuinely malformed request still reaches layer two.
+void clamp_position_members(rapidjson::Value& value) {
+    if (value.IsArray()) {
+        for (auto& element : value.GetArray())
+            clamp_position_members(element);
+        return;
+    }
+    if (!value.IsObject())
+        return;
+    for (auto& member : value.GetObject()) {
+        const std::string_view name(member.name.GetString(), member.name.GetStringLength());
+        if ((name == "line" || name == "character") && member.value.IsInt() &&
+            member.value.GetInt() < 0) {
+            member.value.SetInt(0);
+            continue;
+        }
+        clamp_position_members(member.value);
+    }
+}
+
+} // namespace
+
+void LazyVerilogServer::harden_request_parsing() {
+    auto& converters = impl_->json_handler->method2request;
+    for (auto& [method, converter] : converters) {
+        converters[method] = [inner = converter,
+                              method](Reader& reader) -> std::unique_ptr<LspMessage> {
+            auto* json = dynamic_cast<JsonReader*>(&reader);
+            if (!json || !json->m_)
+                return inner(reader); // not a shape this can repair
+            rapidjson::Value* root = json->m_;
+
+            if (root->IsObject()) {
+                if (const auto params = root->FindMember("params"); params != root->MemberEnd())
+                    clamp_position_members(params->value);
+            }
+
+            try {
+                return inner(reader);
+            } catch (const std::exception& e) {
+                std::cerr << "[lazyverilog] " << method
+                          << ": unusable params, answering with an empty request (" << e.what()
+                          << ")\n";
+            }
+
+            // Layer two.  Replace params wholesale and convert again, so the
+            // request is answered rather than dropped.  A second failure is out
+            // of reach from here: let it propagate to the transport's logging,
+            // which is the behaviour that existed before this.
+            if (!root->IsObject())
+                return inner(reader);
+            rapidjson::Document empty;
+            empty.SetObject();
+            if (const auto params = root->FindMember("params"); params != root->MemberEnd())
+                params->value.SetObject();
+            else
+                root->AddMember(rapidjson::Value("params", empty.GetAllocator()).Move(),
+                                rapidjson::Value(rapidjson::kObjectType).Move(),
+                                empty.GetAllocator());
+            JsonReader retry(root);
+            return inner(retry);
+        };
+    }
 }

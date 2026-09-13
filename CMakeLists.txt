@@ -399,6 +399,14 @@ add_test(
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+add_executable(lazyverilog-request-reply-cli-smoke tests/request_reply_cli_smoke.cpp)
+target_include_directories(lazyverilog-request-reply-cli-smoke PRIVATE tests)
+add_test(
+    NAME request-reply-cli-smoke
+    COMMAND lazyverilog-request-reply-cli-smoke
+            $<TARGET_FILE:lazyverilog-lsp>
+)
+
 add_executable(lazyverilog-rtltree-cli-smoke tests/rtltree_cli_smoke.cpp)
 target_include_directories(lazyverilog-rtltree-cli-smoke PRIVATE tests)
 add_test(
