@@ -1510,3 +1510,71 @@ TEST_CASE("foldingRange: an edit gets its own folds, not the previous snapshot's
     REQUIRE(state->folding_ranges() != nullptr);
     CHECK(same_folds(*state->folding_ranges(), after));
 }
+
+// ── folds stay inside the buffer ──────────────────────────────────────────
+
+// Index of the last line the editor actually holds.  A buffer whose text ends
+// in '\n' has no line after it: "a\nb\n" is two lines, not three.
+static int last_line_of(std::string_view text) {
+    if (text.empty()) return 0;
+    const int newlines = (int)std::count(text.begin(), text.end(), '\n');
+    return text.back() == '\n' ? std::max(0, newlines - 1) : newlines;
+}
+
+static void check_folds_in_range(const std::vector<FoldingRange>& folds, std::string_view text) {
+    const int last = last_line_of(text);
+    for (const auto& r : folds) {
+        INFO("fold " << r.startLine << "-" << r.endLine << " kind=" << r.kind
+                     << " last line=" << last);
+        CHECK(r.startLine <= last);
+        CHECK(r.endLine <= last);
+    }
+}
+
+TEST_CASE("foldingRange: an unterminated block comment does not fold past the last line",
+          "[folding]") {
+    Analyzer          analyzer;
+    std::string       uri  = "file:///tmp/fold_unterminated_block.sv";
+    const std::string text = R"(module top;
+endmodule
+/* this comment
+   is never closed
+)";
+    analyzer.open(uri, text);
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+    check_folds_in_range(folds, text);
+    // It still folds -- just to the real last line (3), not one past it.
+    CHECK(has_fold_kind(folds, 2, 3, "comment"));
+}
+
+TEST_CASE("foldingRange: an unterminated string does not fold past the last line", "[folding]") {
+    Analyzer          analyzer;
+    std::string       uri  = "file:///tmp/fold_unterminated_string.sv";
+    const std::string text = R"(module top;
+  initial $display("oops
+endmodule
+)";
+    analyzer.open(uri, text);
+    check_folds_in_range(provide_folding_range(analyzer, make_params(uri)), text);
+}
+
+TEST_CASE("foldingRange: a truncated buffer does not fold past the last line", "[folding]") {
+    const std::vector<std::string> sources = {
+        "module top;\n  logic a;\n",
+        "module top;\n  case (x)\n",
+        "module top;\n  initial begin\n",
+        "`ifdef FOO\nmodule top;\n",
+        "module top;\n  function int f(\n",
+        "// trailing comment run\n// second line\n",
+        "/* closed */\n",
+        "",
+        "module top;\nendmodule",
+    };
+    for (size_t i = 0; i < sources.size(); ++i) {
+        Analyzer    analyzer;
+        std::string uri = "file:///tmp/fold_truncated_" + std::to_string(i) + ".sv";
+        analyzer.open(uri, sources[i]);
+        INFO("source #" << i);
+        check_folds_in_range(provide_folding_range(analyzer, make_params(uri)), sources[i]);
+    }
+}

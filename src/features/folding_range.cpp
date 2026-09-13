@@ -62,6 +62,15 @@ struct LineTable {
         auto [s, e] = bounds(line);
         return (int)(e - s);
     }
+
+    // Index of the last line the buffer actually holds.  `starts` gains an
+    // entry past a trailing '\n', but that is not a line the editor has:
+    // "a\nb\n" is two lines, not three.
+    int last_line() const {
+        if (starts.size() <= 1) return 0;
+        if (!text.empty() && text.back() == '\n') return (int)starts.size() - 2;
+        return (int)starts.size() - 1;
+    }
 };
 
 // Emit a fold.  The LineTable is built once per request and handed in rather
@@ -72,6 +81,12 @@ struct LineTable {
 // on every didChange.
 static void emit(std::vector<FoldingRange>& out, const LineTable& lt,
                  int start, int end, const std::string& kind = "region") {
+    // Never hand back a range the buffer does not have.  An unterminated block
+    // comment produced exactly that: its lexeme runs to EOF, so it carries the
+    // file's final newline and its line count was one too many.  Clamping here
+    // rather than at each emit site covers every construct a truncated buffer
+    // can leave open.
+    end = std::min(end, lt.last_line());
     if (start < 0 || end < 0 || start >= end) return;
     FoldingRange r;
     r.startLine      = start;
