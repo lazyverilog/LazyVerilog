@@ -69,6 +69,7 @@ std::string initialize_with_root(const fs::path& server_bin, const std::string& 
 
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after an initialize");
     return result.stdout_text;
 }
 
@@ -104,6 +105,12 @@ std::string folds_for_root(const fs::path& server_bin, const std::string& root_u
     }
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
+    // `exit` arrives right behind the fold request, so this also pins that the
+    // deferred answer and the shutdown do not race: a server that tears itself
+    // down under a worker still holding the reply dies here instead of merely
+    // going quiet, which is how it stayed invisible on one runner while the
+    // stdout checks below passed anyway.
+    expect(result.exit_code == 0, "the server exits cleanly after a deferred fold request");
     return result.stdout_text;
 }
 
