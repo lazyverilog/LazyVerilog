@@ -1226,14 +1226,32 @@ static std::string folding_scaling_source(int stages) {
 /// minimum: the cost being guarded is a fixed amount of extra work, so it raises
 /// the floor, and everything a shared runner adds only ever makes a sample
 /// slower.
+///
+/// **Every run needs its own document snapshot.**  `provide_folding_range()`
+/// caches its answer on the immutable `DocumentState` it computed it from, so a
+/// second request against the same snapshot returns a copy of the first one's
+/// vector.  Sampling one document therefore measures one computation and N-1
+/// copies, and the *minimum* of that set is always a copy: measured 0.0087 ms
+/// against 7.21 ms for the same input, an 831x understatement that no threshold
+/// on the ratio can detect, because the ratio of two vector copies is linear by
+/// construction whatever folding itself does.
+///
+/// This is the trap docs/dev/indexing.md describes for the shard cache -- "a
+/// warm test has to distinguish a hit from a reparse" -- in the folding tests.
+/// A fresh `Analyzer` and a run-unique URI are what keep every sample a real
+/// computation.  `Analyzer::open()` parses synchronously and returns before the
+/// timed region starts, so it is not charged to the measurement.
 static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
-    Analyzer          analyzer;
-    const std::string uri = "file:///fold_scaling_" + std::to_string(stages) + ".sv";
-    analyzer.open(uri, folding_scaling_source(stages));
+    const std::string source = folding_scaling_source(stages);
 
     std::vector<double> samples;
     samples.reserve((size_t)runs);
     for (int i = 0; i < runs; ++i) {
+        Analyzer          analyzer;
+        const std::string uri = "file:///fold_scaling_" + std::to_string(stages) + "_" +
+                                std::to_string(i) + ".sv";
+        analyzer.open(uri, source);
+
         const auto start = std::chrono::steady_clock::now();
         auto       folds = provide_folding_range(analyzer, make_params(uri));
         samples.push_back(
@@ -1276,6 +1294,46 @@ TEST_CASE("foldingRange: cost grows with the file, not with its square",
     // range of sizes, against 3.5 for the quadratic passes this replaced, which
     // this threshold fails.
     CHECK(ratio < 3.0);
+}
+
+TEST_CASE("foldingRange: the scaling guard measures a computation, not a cache hit",
+          "[folding][scaling]") {
+    // The guard above is only meaningful while `fastest_folding_ms()` samples
+    // real computations.  A per-snapshot cache landed between that helper being
+    // written and this one, and turned every sample after the first into a
+    // vector copy -- so the guard reported 0.0087 ms for an input that costs
+    // 7.2 ms, and could no longer fail for any reason.
+    //
+    // Pin both halves of that story: the cache must serve a repeat, and the
+    // helper must not be measuring it.
+    constexpr int kStages = 240;
+
+    Analyzer          analyzer;
+    const std::string uri = "file:///fold_cache_probe.sv";
+    analyzer.open(uri, folding_scaling_source(kStages));
+
+    const auto time_one = [&] {
+        const auto start = std::chrono::steady_clock::now();
+        auto       folds = provide_folding_range(analyzer, make_params(uri));
+        REQUIRE(folds.size() > 0);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+
+    (void)time_one(); // populates the snapshot's cache
+    double cached_ms = time_one();
+    for (int i = 0; i < 4; ++i)
+        cached_ms = std::min(cached_ms, time_one());
+
+    size_t       folds       = 0;
+    const double computed_ms = fastest_folding_ms(kStages, 3, folds);
+
+    std::cout << "\n[folding cache] computed=" << computed_ms << " ms  cached repeat=" << cached_ms
+              << " ms\n";
+
+    // Measured ~7.2 ms against ~0.009 ms, so this has three orders of magnitude
+    // of headroom; it fires only if the helper starts sampling cached answers.
+    CHECK(computed_ms > cached_ms * 10.0);
 }
 
 // ── Folds while a parse is in flight ──────────────────────────────────────
