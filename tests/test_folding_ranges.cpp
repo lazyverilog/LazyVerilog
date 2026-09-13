@@ -1451,6 +1451,86 @@ TEST_CASE("foldingRange: a buffer whose first parse is in flight still folds",
     CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), early));
 }
 
+TEST_CASE("foldingRange: the parse commit keeps the folds the reparse window computed",
+          "[folding]") {
+    // One keystroke installs two snapshots of the same text -- the text-only
+    // placeholder and the parsed state that replaces it -- and the editor
+    // requests folds on both sides of that commit.  Folds depend on the text
+    // and on nothing else, so the second request must not recompute them.
+    const std::string uri  = "file:///fold_commit_carry.sv";
+    const std::string text = folding_scaling_source(40);
+
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, text + "\n// edit\n");
+
+    auto placeholder = analyzer.get_state(uri);
+    REQUIRE(placeholder != nullptr);
+    REQUIRE(placeholder->tree == nullptr);             // really in the window
+    REQUIRE(placeholder->folding_ranges() == nullptr); // nothing computed yet
+
+    const auto in_flight = provide_folding_range(analyzer, make_params(uri));
+    REQUIRE(!in_flight.empty());
+    const auto computed = placeholder->folding_ranges();
+    REQUIRE(computed != nullptr);
+
+    analyzer.set_parse_paused(false);
+    wait_for_parse(analyzer, uri);
+
+    auto parsed = analyzer.get_state(uri);
+    REQUIRE(parsed != nullptr);
+    REQUIRE(parsed != placeholder); // a new snapshot, as didChange always makes
+    REQUIRE(parsed->tree != nullptr);
+
+    // The same vector, not merely an equal one.  Comparing contents would pass
+    // just as happily against a snapshot that recomputed them, which is the
+    // thing being guarded against.
+    CHECK(parsed->folding_ranges() == computed);
+    CHECK(same_folds(provide_folding_range(analyzer, make_params(uri)), in_flight));
+}
+
+TEST_CASE("foldingRange: a fold slot is shared with the parse, not copied at the commit",
+          "[folding]") {
+    // The editor asks from the notification itself, so the request thread is
+    // normally still computing on the placeholder when the parse commits.  A
+    // result copied across at commit time is therefore usually copied while the
+    // slot is still empty, and both snapshots compute the same answer anyway --
+    // measured on a 57 890-line buffer, two edits in three.
+    //
+    // Provoke that order deliberately: let the parse commit first, then compute,
+    // and require the placeholder to see the result.  Only a shared slot can do
+    // that; a copy taken at the commit cannot reach backwards.
+    const std::string uri  = "file:///fold_commit_share.sv";
+    const std::string text = folding_scaling_source(40);
+
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, text + "\n// edit\n");
+
+    auto placeholder = analyzer.get_state(uri);
+    REQUIRE(placeholder != nullptr);
+    REQUIRE(placeholder->tree == nullptr);
+    REQUIRE(placeholder->folding_ranges() == nullptr);
+
+    analyzer.set_parse_paused(false);
+    wait_for_parse(analyzer, uri);
+
+    auto parsed = analyzer.get_state(uri);
+    REQUIRE(parsed != placeholder);
+    REQUIRE(parsed->tree != nullptr);
+    REQUIRE(parsed->folding_ranges() == nullptr); // nobody has asked yet
+
+    REQUIRE(!provide_folding_range(analyzer, make_params(uri)).empty());
+
+    const auto computed = parsed->folding_ranges();
+    REQUIRE(computed != nullptr);
+    CHECK(placeholder->folding_ranges() == computed);
+}
+
 // ── the spans the token scan must keep frozen ─────────────────────────────
 //
 // Folding lexes the buffer itself (lex_fold_tokens) instead of borrowing the

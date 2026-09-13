@@ -154,21 +154,49 @@ struct DocumentState {
     // snapshot for the whole remaining queue.  Recomputing the identical answer
     // for each of them is the entire tail the user waits through.
     //
-    // The text is immutable, so this needs no invalidation: a new edit gets a
-    // new DocumentState and an empty cache.
-    mutable std::mutex folding_ranges_mutex_;
-    mutable std::shared_ptr<const std::vector<FoldingRange>> folding_ranges_;
+    // The slot sits behind a shared_ptr so that two snapshots of the *same*
+    // text can share one.  A keystroke makes two: the text-only placeholder
+    // enqueue_parse() installs, and the parsed state that replaces it.  Folds
+    // are derived from the text and from nothing else, so their answers cannot
+    // differ -- and the editor asks on both sides of that commit.
+    //
+    // Sharing rather than copying the result across is what makes it race-free.
+    // The request thread computes on the placeholder while the parse worker
+    // commits the new state, so a copy taken at commit time finds the slot
+    // still empty about two edits in three (measured on a 57 890-line buffer),
+    // and the work is done twice anyway.  One shared slot is filled by whoever
+    // finishes first, whichever snapshot they were holding.
+    //
+    // The text is immutable, so this needs no invalidation: an edit that
+    // changes the text gets a new DocumentState and an unshared, empty slot.
+    struct FoldingRangeCache {
+        std::mutex                                       mutex;
+        std::shared_ptr<const std::vector<FoldingRange>> folds;
+    };
+    std::shared_ptr<FoldingRangeCache> folding_cache_ = std::make_shared<FoldingRangeCache>();
 
-    /// The folds computed from this snapshot, or null if none have been.
+    /// The folds computed from this snapshot's text, or null if none have been.
     std::shared_ptr<const std::vector<FoldingRange>> folding_ranges() const {
-        std::lock_guard<std::mutex> lock(folding_ranges_mutex_);
-        return folding_ranges_;
+        std::lock_guard<std::mutex> lock(folding_cache_->mutex);
+        return folding_cache_->folds;
     }
     void set_folding_ranges(std::shared_ptr<const std::vector<FoldingRange>> folds) const {
         if (!folds)
             return;
-        std::lock_guard<std::mutex> lock(folding_ranges_mutex_);
-        folding_ranges_ = std::move(folds);
+        std::lock_guard<std::mutex> lock(folding_cache_->mutex);
+        // First writer wins.  Two threads racing here computed the same answer
+        // from the same text, so keeping the established pointer means callers
+        // that already hold it keep comparing equal.
+        if (!folding_cache_->folds)
+            folding_cache_->folds = std::move(folds);
+    }
+    /// Answer fold requests from the same slot as @p other.
+    ///
+    /// Only ever called with a snapshot of byte-identical text; the caller owns
+    /// that check.  Must be called before this snapshot is published, which is
+    /// what keeps the assignment itself unsynchronized.
+    void share_folding_cache_with(const DocumentState& other) {
+        folding_cache_ = other.folding_cache_;
     }
     // The most recent snapshot of this document that had a tree, when this one
     // does not.  didChange installs a text-only placeholder and hands the parse

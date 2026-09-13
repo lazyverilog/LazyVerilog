@@ -1144,6 +1144,28 @@ void Analyzer::parse_worker_loop() {
         auto state = make_state(job.uri, job.pending->text); // outside all locks
         state->doc_version = job.version;
 
+        // One keystroke produces two snapshots of the same text: the text-only
+        // placeholder enqueue_parse() installed, and this one.  Folds are
+        // derived from the text and from nothing else, so the answer cannot
+        // differ between them -- but the slot that holds it lives on the
+        // snapshot, so without this the identical whole-file computation is
+        // paid twice per edit.  Measured on a 57 890-line buffer before the
+        // fold passes were made linear: 254 ms in the reparse window and 248 ms
+        // again once the parse landed, against 5 ms for a warm slot.
+        //
+        // Share the slot rather than copy the result out of it.  The editor
+        // asks from the notification itself, so the request thread is usually
+        // still computing on the placeholder when this runs -- a copy taken
+        // here finds it empty and both computations happen anyway.  Sharing
+        // lets whichever finishes first answer for both.
+        //
+        // The text check is not defensive about `make_state()`, which is handed
+        // exactly `job.pending->text`; it states the invariant the share relies
+        // on.  Nothing has published this state yet, so the assignment needs no
+        // synchronization of its own.
+        if (state->text == job.pending->text)
+            state->share_folding_cache_with(*job.pending);
+
         bool committed = false;
         bool listed_extra = false;
         {
