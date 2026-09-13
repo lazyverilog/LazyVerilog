@@ -305,6 +305,7 @@ set(LAZYVERILOG_TEST_SOURCES
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
 target_include_directories(lazyverilog-tests PRIVATE
     src
+    tests
     ${lspcpp_SOURCE_DIR}/include
     ${LAZYVERILOG_RAPIDJSON_INCLUDE}
 )

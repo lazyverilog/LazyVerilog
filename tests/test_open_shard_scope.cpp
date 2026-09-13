@@ -9,6 +9,8 @@
 // with the disk shard, a header declaration the file actually uses survives,
 // and one it never names does not.
 #include "analyzer.hpp"
+#include "cli_process.hpp"
+#include <atomic>
 #include "string_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -28,7 +30,17 @@ constexpr int kUnusedHeaderParams = 64;
 class SharedHeaderProject {
   public:
     SharedHeaderProject() {
-        dir_ = std::filesystem::temp_directory_path() / "lazyverilog-open-shard-scope";
+        // Unique per process and per instance.  A fixed path here is one
+        // directory shared by every test case running at once -- ctest gives
+        // each case its own process and runs them in parallel -- so one
+        // constructor's remove_all() deletes the project another case is in the
+        // middle of reading.  That flaked about one run in three at `-j2` and
+        // never serially.
+        static std::atomic<int> counter{0};
+        dir_ = std::filesystem::temp_directory_path() /
+               ("lazyverilog-open-shard-scope-" +
+                std::to_string(cli_process::current_process_id()) + "-" +
+                std::to_string(counter.fetch_add(1)));
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
         // Resolve once, up front: the analyzer identifies a shard by its

@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "cli_process.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -6,8 +7,23 @@
 
 namespace fs = std::filesystem;
 
+/// A directory holding just this config, for one test.
+///
+/// `catch_discover_tests` gives every test case its own process, and ctest runs
+/// those in parallel, so a fixed path here is one directory shared by however
+/// many config tests are running at once -- each overwriting the file the others
+/// are about to read.  That is a flake that only appears under `ctest -j`, which
+/// is how it survived: it reproduced about one run in four at `-j2` and never
+/// serially.
+///
+/// The process id separates concurrent test binaries and the counter separates
+/// cases within one, so no two callers can name the same directory.
 static fs::path make_temp_toml(const std::string& content) {
-    auto dir = fs::temp_directory_path() / "lv_test_config";
+    static int counter = 0;
+    auto dir = fs::temp_directory_path() /
+               ("lv_test_config_" + std::to_string(cli_process::current_process_id()) + "_" +
+                std::to_string(counter++));
+    fs::remove_all(dir);
     fs::create_directories(dir);
     auto p = dir / "lazyverilog.toml";
     std::ofstream f(p);
