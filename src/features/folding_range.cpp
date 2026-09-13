@@ -1137,59 +1137,83 @@ static void normalize_folds(std::vector<FoldingRange>& folds, const LineTable& l
     // starts on the previous region's close line.
     //
     // A partner can only be a fold that starts on the exact line this one ends
-    // on, so count the start lines first and skip the inner walk when no fold
-    // starts there.  The count is kept current below, because a match moves the
-    // partner's start line.  Without it this pass walked the whole fold list for
-    // every fold, and every fold in indented RTL clears the startCharacter > 0
-    // test that used to be the only guard.
-    std::unordered_map<int, int> folds_starting_on;
-    folds_starting_on.reserve(folds.size());
-    for (const auto& r : folds)
-        ++folds_starting_on[r.startLine];
+    // on, so index the folds by start line and walk only that line's bucket.
+    //
+    // This used to scan the whole fold list for every fold, guarded by a count
+    // of the folds starting on the candidate line.  That guard removes the walk
+    // only when *no* fold starts there, and in indented RTL a fold's end line is
+    // very often some other fold's start line -- `end else begin`, a `)` closing
+    // one region on the line a `begin` opens another.  So the guard let the walk
+    // through constantly and the pass stayed O(folds^2), which is what made
+    // whole-file foldingRange super-linear: measured 7.5 / 18.9 / 55.5 / 154 /
+    // 903 ms at 3k..50k folds, the last doubling alone costing 5.86x.
+    //
+    // Buckets are filled in index order, so iterating one visits candidates in
+    // the same order the array walk did.  `scan_from` reproduces the old loop's
+    // "continue from the match" behaviour, and a fold whose start line is moved
+    // below is inserted into its new bucket at the position its index belongs
+    // in -- it stays reachable for a later `left`, exactly as it was when every
+    // fold was reached by scanning the array.  Its stale entry in the old bucket
+    // needs no removal: the `startLine != boundary_line` test below rejects it.
+    std::unordered_map<int, std::vector<size_t>> folds_by_start_line;
+    folds_by_start_line.reserve(folds.size());
+    for (size_t i = 0; i < folds.size(); ++i)
+        folds_by_start_line[folds[i].startLine].push_back(i);
+
+    constexpr size_t kNoPartner = (size_t)-1;
 
     for (size_t li = 0; li < folds.size(); ++li) {
-        auto& left = folds[li];
-        if (left.kind != "region" || left.startCharacter <= 0 ||
-            left.endLine <= left.startLine)
-            continue;
-        if (auto on_line = folds_starting_on.find(left.endLine);
-            on_line == folds_starting_on.end() || on_line->second == 0)
+        if (folds[li].kind != "region" || folds[li].startCharacter <= 0 ||
+            folds[li].endLine <= folds[li].startLine)
             continue;
 
-        for (size_t ri = 0; ri < folds.size(); ++ri) {
-            if (li == ri)
-                continue;
-            auto& right = folds[ri];
-            if (right.kind != "region" || right.startLine != left.endLine ||
-                right.startCharacter >= left.startCharacter ||
-                right.endLine <= right.startLine)
-                continue;
+        size_t scan_from = 0;
+        while (true) {
+            // Re-read each time round: a match moves this fold's end line, so
+            // the partner test has to be re-asked against the new one.
+            const int boundary_line = folds[li].endLine; // the ")(" line
+            const auto on_line      = folds_by_start_line.find(boundary_line);
+            if (on_line == folds_by_start_line.end())
+                break;
 
-            const int boundary_line   = left.endLine;  // the ")(" line
+            size_t ri = kNoPartner;
+            for (size_t candidate : on_line->second) {
+                if (candidate < scan_from || candidate == li)
+                    continue;
+                const auto& right = folds[candidate];
+                if (right.kind != "region" || right.startLine != boundary_line ||
+                    right.startCharacter >= folds[li].startCharacter ||
+                    right.endLine <= right.startLine)
+                    continue;
+                ri = candidate;
+                break;
+            }
+            if (ri == kNoPartner)
+                break;
+
+            auto&     right           = folds[ri];
             const int terminator_line = right.endLine; // the ");" line
 
-            const int left_end   = boundary_line - 1;
+            const int left_end    = boundary_line - 1;
             const int right_start = boundary_line + 1;
             const int right_end   = terminator_line - 1;
 
             // Keep only meaningful multi-line folds.  If a tiny header has no
             // interior lines after removing delimiter lines, the invalid range
             // is pruned below instead of exposing a misleading one-line fold.
-            left.endLine      = left_end;
-            left.endCharacter = lt.line_length(left_end);
+            folds[li].endLine      = left_end;
+            folds[li].endCharacter = lt.line_length(left_end);
 
-            --folds_starting_on[right.startLine];
             right.startLine      = right_start;
-            ++folds_starting_on[right_start];
             right.startCharacter = lt.first_non_space_column(right_start);
             right.endLine        = right_end;
             right.endCharacter   = lt.line_length(right_end);
 
-            // `left` now ends on a different line, so the partner test above
-            // has to be re-asked against the new one.
-            if (auto on_line = folds_starting_on.find(left.endLine);
-                on_line == folds_starting_on.end() || on_line->second == 0)
-                break;
+            auto& moved_bucket = folds_by_start_line[right_start];
+            moved_bucket.insert(
+                std::lower_bound(moved_bucket.begin(), moved_bucket.end(), ri), ri);
+
+            scan_from = ri + 1;
         }
     }
 

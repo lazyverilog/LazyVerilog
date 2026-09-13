@@ -1296,6 +1296,38 @@ TEST_CASE("foldingRange: cost grows with the file, not with its square",
     CHECK(ratio < 3.0);
 }
 
+TEST_CASE("foldingRange: cost stays linear at large fold counts", "[folding][scaling]") {
+    // The guard above compares 3k folds against 6k, and a quadratic term can hide
+    // under a 3.0 threshold at that size: the header-partner pass measured 2.5 /
+    // 2.9 / 2.8 across the first three doublings and only broke out on the fourth,
+    // at 5.86x.  A file that large is not hypothetical -- a generated register
+    // block reaches it -- and 903 ms landed on the one thread that answers
+    // completions, once per keystroke.
+    //
+    // So take the doubling where the old shape actually showed itself.  Two runs
+    // per side: at ~80 ms a sample this is still well under a second, and the
+    // cost being guarded raises the floor, so the minimum is the honest statistic.
+    constexpr int kStages = 1920;
+    constexpr int kRuns   = 2;
+
+    size_t small_folds = 0;
+    size_t large_folds = 0;
+
+    const double small_ms = fastest_folding_ms(kStages, kRuns, small_folds);
+    const double large_ms = fastest_folding_ms(kStages * 2, kRuns, large_folds);
+
+    REQUIRE(small_folds > 20000);
+    CHECK(large_folds - 1 == (small_folds - 1) * 2);
+
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[folding scaling, large] folds=" << small_folds << " ms=" << small_ms
+              << "  folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio << "\n";
+
+    // Measured 1.7-1.8 once the partner pass stopped scanning the whole fold
+    // list; the version this replaced measures 5.86 and fails.
+    CHECK(ratio < 3.0);
+}
+
 TEST_CASE("foldingRange: the scaling guard measures a computation, not a cache hit",
           "[folding][scaling]") {
     // The guard above is only meaningful while `fastest_folding_ms()` samples
