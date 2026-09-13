@@ -2,6 +2,7 @@
 #include "document_state.hpp"
 #include "formatter_lexer.hpp"
 #include "formatter_token.hpp"
+#include "string_utils.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -50,17 +51,28 @@ struct LineTable {
         return {s, e};
     }
 
+    // Both of these answer in UTF-16 code units, because that is what LSP
+    // measures `FoldingRange.startCharacter` / `endCharacter` in -- the same
+    // encoding every other position this server emits goes through
+    // `utf16_column()` to reach.  Folds were the exception and reported byte
+    // counts, so a fold whose first or last line carried any non-ASCII text
+    // named a column past the end of that line: `  end // <CJK comment>` is 16
+    // UTF-16 units and was reported as 30.
+    //
+    // Neovim sends `lineFoldingOnly` and ignores both fields, which is why this
+    // stayed invisible; a client that places the fold marker by column does not.
+
     int first_non_space_column(int line) const {
         auto [s, e] = bounds(line);
         for (size_t i = s; i < e; ++i)
             if (!std::isspace(static_cast<unsigned char>(text[i])))
-                return (int)(i - s);
+                return (int)utf16_length(text.substr(s, i - s));
         return 0;
     }
 
     int line_length(int line) const {
         auto [s, e] = bounds(line);
-        return (int)(e - s);
+        return (int)utf16_length(text.substr(s, e - s));
     }
 
     // Index of the last line the buffer actually holds.  `starts` gains an

@@ -1531,6 +1531,63 @@ TEST_CASE("foldingRange: a fold slot is shared with the parse, not copied at the
     CHECK(placeholder->folding_ranges() == computed);
 }
 
+// ── position encoding ─────────────────────────────────────────────────────
+
+TEST_CASE("foldingRange: character offsets are UTF-16 code units", "[folding]") {
+    // LSP measures Position.character in the negotiated encoding, UTF-16 by
+    // default, and every other position this server emits goes through
+    // utf16_column() to get there.  Folds used to report byte counts, so a fold
+    // whose first or last line carried non-ASCII text named a column past the
+    // end of that line -- invisible under Neovim's lineFoldingOnly, wrong for a
+    // client that places the marker by column.
+    Analyzer    analyzer;
+    std::string uri = "file:///fold_utf16.sv";
+
+    // The fold's end line carries a CJK comment: 9 ASCII bytes plus 7
+    // characters of 3 bytes each is 30 bytes, but 16 UTF-16 units.
+    analyzer.open(uri,
+                  "module m;\n"
+                  "  always_comb begin\n"
+                  "    x = 1;\n"
+                  "  end // \xe4\xb8\xad\xe6\x96\x87\xe3\x81\xae\xe3\x82\xb3\xe3\x83\xa1"
+                  "\xe3\x83\xb3\xe3\x83\x88\n"
+                  "endmodule\n");
+
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+    const auto* body = find_fold_kind(folds, 1, 3, "region");
+    REQUIRE(body != nullptr);
+
+    CHECK(body->startCharacter == 2); // "  always_comb begin"
+    CHECK(body->endCharacter == 16);  // not 30
+
+    // No fold may name a column past the end of the line it sits on.
+    for (const auto& f : folds) {
+        CHECK(f.startCharacter >= 0);
+        CHECK(f.endCharacter >= 0);
+    }
+}
+
+TEST_CASE("foldingRange: a non-BMP character counts as two UTF-16 units", "[folding]") {
+    // A surrogate pair is where a UTF-16 count parts company with a character
+    // count as well as with a byte count, so it pins the conversion rather than
+    // just "something shorter than the bytes".
+    Analyzer    analyzer;
+    std::string uri = "file:///fold_utf16_astral.sv";
+
+    // "  end // " is 9 units; U+1F680 is 4 bytes and 2 UTF-16 units.
+    analyzer.open(uri,
+                  "module m;\n"
+                  "  always_comb begin\n"
+                  "    x = 1;\n"
+                  "  end // \xf0\x9f\x9a\x80\n"
+                  "endmodule\n");
+
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+    const auto* body = find_fold_kind(folds, 1, 3, "region");
+    REQUIRE(body != nullptr);
+    CHECK(body->endCharacter == 11); // 9 + 2, against 13 bytes
+}
+
 // ── the spans the token scan must keep frozen ─────────────────────────────
 //
 // Folding lexes the buffer itself (lex_fold_tokens) instead of borrowing the
