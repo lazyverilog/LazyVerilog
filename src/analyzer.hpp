@@ -725,6 +725,22 @@ class Analyzer {
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
     mutable std::vector<std::string> extra_files_;
+    // The same paths, largest first, which is the order the background queue is
+    // filled in.
+    //
+    // Indexing a file costs roughly what its size says it will, and a filelist
+    // is written in whatever order a design is assembled -- so the generated
+    // register blocks that dominate a project's total are as likely to be at
+    // the end as anywhere.  Taking them last strands one worker on a file the
+    // others cannot help with while they idle: simulated over 961 files of RTL
+    // whose four largest are 1.6 MB, 1.5 MB, 1.4 MB and 776 KB, filelist order
+    // finishes 18% behind longest-first on four workers, which itself reaches
+    // the ideal split.
+    //
+    // Built off map_mutex_ -- it costs one stat per file, and that lock is the
+    // one every request handler contends for.  Ties keep filelist order, so the
+    // queue stays deterministic for a given project.
+    mutable std::vector<std::string> extra_files_by_size_;
     // Membership mirror for extra_files_.  The vector remains the ordered
     // source for iteration/background scheduling, while this set keeps the
     // didOpen/didChange critical section from scanning large filelists.

@@ -978,6 +978,53 @@ TEST_CASE("index cache: an unchanged project is served from the shards", "[index
     CHECK(warm.count("sig_a") == 1);
 }
 
+TEST_CASE("index cache: the filelist's order does not change the index", "[index-cache]") {
+    // The background queue is filled largest-file-first rather than in filelist
+    // order, so that one worker is not left on a generated register block while
+    // the rest idle.  That is only allowed because the order a file is indexed
+    // in cannot change what is indexed -- including which file a shared
+    // header's declarations are reported from, which is decided by a claim that
+    // the first worker to reach the header takes.
+    //
+    // Sizes are deliberately uneven, so the two orders really do differ.
+    CacheProject project("analyzer-filelist-order");
+    project.write("defs.svh", "localparam int shared_from_header = 5;\n");
+    std::vector<std::string> files;
+    for (int i = 0; i < 8; ++i) {
+        const std::string name = "m" + std::to_string(i) + ".sv";
+        std::string       body = "`include \"defs.svh\"\nmodule m" + std::to_string(i) + ";\n";
+        for (int pad = 0; pad < i * 40; ++pad)
+            body += "  logic [7:0] pad_" + std::to_string(i) + "_" + std::to_string(pad) + ";\n";
+        body += "  logic [7:0] sig_" + std::to_string(i) + ";\nendmodule\n";
+        project.write(name, body);
+        files.push_back(name);
+    }
+
+    const auto attribution = [](const std::shared_ptr<const ProjectIndexSnapshot>& snapshot) {
+        std::map<std::string, std::string> by_name;
+        if (!snapshot)
+            return by_name;
+        for (const auto& shard : snapshot->shards) {
+            if (!shard.index)
+                continue;
+            for (const auto& value : shard.index->values)
+                by_name.emplace(value.name, shard.uri);
+        }
+        return by_name;
+    };
+
+    Analyzer   forward_analyzer;
+    const auto forward = attribution(project.index(forward_analyzer, files));
+    REQUIRE(forward.count("shared_from_header") == 1);
+    REQUIRE(forward.count("sig_7") == 1);
+
+    std::vector<std::string> reversed(files.rbegin(), files.rend());
+    Analyzer                 reversed_analyzer;
+    const auto               backward = attribution(project.index(reversed_analyzer, reversed));
+
+    CHECK(backward == forward);
+}
+
 TEST_CASE("index cache: a warm launch is identical however many threads preload it",
           "[index-cache]") {
     // The preload checks each file independently, so it runs on as many threads
