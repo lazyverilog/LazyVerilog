@@ -514,13 +514,31 @@ static std::string header_cache_key(const slang::SourceManager& sm, const std::s
     return {};
 }
 
+/// Where a line's block comments begin and end, for the projection below.
+struct LineCommentSpan {
+    /// End of a block comment that was already open when the line started and
+    /// closed on it -- so the text before this offset belongs to that comment.
+    /// Zero when the line did not start inside one.
+    size_t lead_end{0};
+    /// Start of a block comment still open when the line ended, or the line's
+    /// length when none is.  Text from here on is the beginning of a comment
+    /// whose closing `*/` is on a line the projection drops.
+    size_t open_start{0};
+};
+
 /// Whether @p line's first thing that is neither whitespace nor a comment is a
-/// backtick, updating @p in_block_comment for the line that follows.
+/// backtick, updating @p in_block_comment for the line that follows and
+/// reporting @p span so the caller can emit the line without its comments.
 ///
 /// The comment state has to be carried whether or not the answer is already
 /// known, or a dropped line that opens a block comment would leave a later
 /// `define inside it looking like a directive.
-static bool line_starts_directive(std::string_view line, bool& in_block_comment) {
+static bool line_starts_directive(std::string_view line, bool& in_block_comment,
+                                  LineCommentSpan& span) {
+    span = LineCommentSpan{0, line.size()};
+    // Whether the comment currently open was opened on this line, which is what
+    // separates a lead-in the caller must blank from a tail it must cut.
+    bool opened_here = false;
     bool starts = false;
     bool decided = false;
     for (size_t i = 0; i < line.size();) {
@@ -528,6 +546,12 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
             if (line.compare(i, 2, "*/") == 0) {
                 in_block_comment = false;
                 i += 2;
+                if (opened_here) {
+                    opened_here = false;
+                    span.open_start = line.size(); // closed again; nothing hangs over
+                } else {
+                    span.lead_end = i;
+                }
             } else {
                 ++i;
             }
@@ -537,6 +561,8 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
             break;
         if (line.compare(i, 2, "/*") == 0) {
             in_block_comment = true;
+            opened_here = true;
+            span.open_start = i;
             i += 2;
             continue;
         }
@@ -577,9 +603,20 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
 /// its definition, and anything that resolves one back to the header would
 /// otherwise report the wrong line.
 ///
-/// A directive inside a block comment stays dropped even though the preprocessor
-/// would ignore it either way — keeping the line without its opening /* would
-/// leave a stray */ in text that gets `include`d.
+/// A kept line is emitted without any block comment that crosses a line
+/// boundary, because the other end of such a comment is on a line this drops.
+/// Both directions lost macros before they were handled:
+///
+///   * a directive whose trailing `/*` closed on a later line was kept with the
+///     comment left open, so everything after it -- every later `define in the
+///     header -- was swallowed, and the includer got "block comment unclosed at
+///     end of file" on a header that parses cleanly on its own;
+///   * a directive written after a `*/` that closed a comment opened earlier was
+///     dropped outright, because the line *started* inside a comment even though
+///     the directive did not.
+///
+/// So the comment text is cut and the lead-in blanked, which leaves the
+/// directive itself and its columns untouched and can never emit half a comment.
 static std::string header_directives_only(std::string_view text) {
     std::string projected;
     projected.reserve(text.size() / 8 + 64);
@@ -592,15 +629,25 @@ static std::string header_directives_only(std::string_view text) {
         const auto line_end = eol == std::string_view::npos ? text.size() : eol;
         const auto line = text.substr(pos, line_end - pos);
 
-        const bool opened_in_comment = in_block_comment;
-        const bool directive = line_starts_directive(line, in_block_comment);
-        const bool keep = continuing || (!opened_in_comment && directive);
-        if (keep)
-            projected.append(line);
+        LineCommentSpan span;
+        const bool directive = line_starts_directive(line, in_block_comment, span);
+        const bool keep = continuing || directive;
 
-        auto body = line;
+        // Everything the directive needs sits between the comment that ended on
+        // this line and the one that starts on it; both ends belong to lines
+        // that are dropped, so neither can be emitted.
+        std::string_view body = line.substr(span.lead_end, span.open_start - span.lead_end);
+        if (keep) {
+            // Blanked rather than removed: a directive keeps the column it is
+            // written in, for the same reason a dropped line keeps its place.
+            projected.append(span.lead_end, ' ');
+            projected.append(body);
+        }
+
         while (!body.empty() && (body.back() == '\r' || body.back() == '\n'))
             body.remove_suffix(1);
+        // Read off what was emitted, not off the original: a backslash inside a
+        // comment this cut is not a line continuation of the text that remains.
         continuing = keep && !body.empty() && body.back() == '\\';
 
         if (eol == std::string_view::npos)

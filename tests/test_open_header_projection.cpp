@@ -37,10 +37,13 @@ class ProjectedHeaderProject {
     enum class Shape { StandsAlone, Fragment };
 
     /// @p filler_lines sets the header's size, which is the other thing that
-    /// decides whether the edit path projects it.
+    /// decides whether the edit path projects it.  @p extra_header is appended
+    /// after the filler, for tests that need a particular shape of header text.
     ProjectedHeaderProject(const std::string& tag, int filler_lines,
-                           Shape shape = Shape::StandsAlone)
-        : shape_(shape) {
+                           Shape shape = Shape::StandsAlone,
+                           const std::string& extra_header = {},
+                           const std::string& extra_body = {})
+        : shape_(shape), extra_body_(extra_body) {
         dir_ = std::filesystem::temp_directory_path() / ("lazyverilog-header-projection-" + tag);
         std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_ / "inc");
@@ -61,6 +64,7 @@ class ProjectedHeaderProject {
                       std::to_string(i) + ";\n";
         header += shape_ == Shape::StandsAlone ? "endpackage\ntypedef logic [7:0] byte_t;\n" : "";
         header += "`define HEADER_MACRO(x) ((x) + 1)\n";
+        header += extra_header;
         write(header_path(), header);
 
         write(opened_path(), opened_text());
@@ -125,7 +129,7 @@ class ProjectedHeaderProject {
                "module opened (input logic " + port + ");\n"
                "    localparam int USES = hdr_pkg::BIG_MARK;\n"
                "    localparam int MACRO_USES = `HEADER_MACRO(1);\n"
-               "    byte_t sig;\n"
+               "    byte_t sig;\n" + extra_body_ +
                "endmodule\n";
     }
 
@@ -136,6 +140,7 @@ class ProjectedHeaderProject {
     }
 
     Shape shape_;
+    std::string extra_body_;
     std::filesystem::path dir_;
 };
 
@@ -197,6 +202,50 @@ TEST_CASE("header projection: a projected header's macros still expand", "[sync]
     // would mean the projection dropped the half an includer genuinely needs.
     CHECK(std::none_of(state->parse_diagnostics.begin(), state->parse_diagnostics.end(),
                        [](const ParseDiagInfo& diag) { return diag.severity == 1; }));
+}
+
+TEST_CASE("header projection: a block comment crossing a line keeps its macros",
+          "[sync][index]") {
+    // The projection keeps directive lines and blanks the rest, so both ends of
+    // a block comment that spans lines cannot both survive -- and emitting
+    // either end without the other breaks the header for every includer.
+    //
+    // Two shapes, one per direction:
+    //
+    //   TRAILING opens a comment at the end of its own directive line.  Keeping
+    //   that line whole left the comment open, so slang reported "block comment
+    //   unclosed at end of file" and swallowed every later directive --
+    //   AFTER_BLOCK and AFTER_CLOSE both vanished from a header that parses
+    //   cleanly on its own.
+    //
+    //   AFTER_CLOSE is written after a `*/` that closes a comment opened on an
+    //   earlier line.  That line *starts* inside a comment while the directive
+    //   does not, and the two were conflated, so the directive was dropped.
+    const std::string extra_header =
+        "`define TRAILING 1  /* explains TRAILING\n"
+        "                       over two lines */\n"
+        "`define AFTER_BLOCK 2\n"
+        "/* a comment opened on its own line\n"
+        "*/ `define AFTER_CLOSE 3\n";
+    const std::string extra_body =
+        "    localparam int T = `TRAILING;\n"
+        "    localparam int A = `AFTER_BLOCK;\n"
+        "    localparam int C = `AFTER_CLOSE;\n";
+
+    ProjectedHeaderProject project("block-comment", 4000,
+                                   ProjectedHeaderProject::Shape::StandsAlone, extra_header,
+                                   extra_body);
+    Analyzer analyzer;
+    project.start(analyzer);
+    // The first parse reads the header whole and fills the cache; the edit is
+    // what gets served the projection.
+    REQUIRE(errors_in(analyzer, project.opened_uri()).empty());
+
+    analyzer.change(project.opened_uri(), project.opened_text("clk"));
+    const auto errors = errors_in(analyzer, project.opened_uri());
+    for (const auto& error : errors)
+        UNSCOPED_INFO("unexpected error: " << error.message);
+    CHECK(errors.empty());
 }
 
 TEST_CASE("header projection: a header symbol still resolves from the buffer", "[definition][index]") {
