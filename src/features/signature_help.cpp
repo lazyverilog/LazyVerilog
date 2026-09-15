@@ -279,7 +279,7 @@ static std::optional<SubroutineInfo> subroutine_at_declaration(const SyntaxTree&
             if (!loc.valid())
                 return false;
             // `col` came from the request, so it is a UTF-16 column.
-            return (int)sm.getLineNumber(loc) - 1 == line && utf16_column(sm, loc) == col;
+            return (int)sm.getLineNumber(loc) - 1 == line && lsp_column(sm, loc) == col;
         }
 
         void handle(const FunctionDeclarationSyntax& node) {
@@ -771,7 +771,7 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
     // position.character counts UTF-16 code units, so it is a byte offset only
     // on an all-ASCII line; see lsp_position_to_byte_offset().
     const size_t cursor =
-        std::min(utf16_col_to_byte_offset(state->text, line_start, params.position.character),
+        std::min(lsp_col_to_byte_offset(state->text, line_start, params.position.character),
                  state->text.size());
     prefix = state->text.substr(0, cursor);
 

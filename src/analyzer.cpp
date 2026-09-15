@@ -98,7 +98,7 @@ static void cache_document_end_position(DocumentState& state) {
             line_start = i + 1;
         }
     }
-    const size_t col = utf16_units_until_newline(state.text, line_start);
+    const size_t col = lsp_columns_until_newline(state.text, line_start);
     state.end_line = saturating_lsp_int(line);
     state.end_character = saturating_lsp_int(col);
 }
@@ -154,7 +154,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
             if (loc.valid() && sm.isFileLoc(loc)) {
                 size_t ln = sm.getLineNumber(loc);
                 info.line = ln > 0 ? (int)ln - 1 : 0;
-                info.col = utf16_column(sm, loc);
+                info.col = lsp_column(sm, loc);
             }
         } catch (...) {
         }
@@ -1442,7 +1442,7 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
 
     if (col < 0)
         return std::nullopt;
-    size_t ip = utf16_col_to_byte_offset(src, ls, col);
+    size_t ip = lsp_col_to_byte_offset(src, ls, col);
     if (ip >= le)
         return std::nullopt;
 
@@ -1488,7 +1488,7 @@ static bool is_backtick_identifier(std::string_view src, int line, int ident_sta
     size_t line_end = src.find('\n', pos);
     if (line_end == std::string_view::npos)
         line_end = src.size();
-    const size_t ident_start = utf16_col_to_byte_offset(src, line_start, ident_start_col);
+    const size_t ident_start = lsp_col_to_byte_offset(src, line_start, ident_start_col);
     if (ident_start <= line_start)
         return false;
     // One byte back, not one column: a backtick is ASCII wherever it appears.
@@ -1508,7 +1508,7 @@ static bool is_define_identifier(std::string_view src, int line, int ident_start
         return false;
 
     const size_t line_start = pos;
-    const size_t ident_start = utf16_col_to_byte_offset(src, line_start, ident_start_col);
+    const size_t ident_start = lsp_col_to_byte_offset(src, line_start, ident_start_col);
     if (ident_start > src.size())
         return false;
 
@@ -1533,7 +1533,7 @@ find_module_definition(const SyntaxIndex& index, const std::string& uri, const s
     const auto actual_uri = index.source_uri(module.file_id);
     const int line = to_lsp_line(module.line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, module.col, line,
-                    module.col + (int)utf16_length(module.name)};
+                    module.col + lsp_column_width(module.name)};
 }
 
 static const ModuleEntry* find_module_entry(const SyntaxIndex& index, const std::string& name) {
@@ -1568,7 +1568,7 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
     const auto actual_uri = index.source_uri(port->file_id);
     const int line = to_lsp_line(port->line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, port->col, line,
-                    port->col + (int)utf16_length(port->name)};
+                    port->col + lsp_column_width(port->name)};
 }
 
 // Class name that `owner::alias` names, for a `typedef` declared inside a class.
@@ -1608,7 +1608,7 @@ static std::optional<Location> find_package_member(const SyntaxIndex& index,
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)utf16_length(member_name)};
+                        col + lsp_column_width(member_name)};
     };
 
     if (auto it = index.package_value_by_scoped_name.find(key);
@@ -1817,9 +1817,9 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
     const int line = to_lsp_line((int)sm.getLineNumber(location));
-    const int col = utf16_column(sm, location);
+    const int col = lsp_column(sm, location);
     return Location{uri, line, col, line,
-                    col + (int)utf16_length(token.valueText())};
+                    col + lsp_column_width(token.valueText())};
 }
 
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
@@ -2342,7 +2342,7 @@ static std::optional<Location> find_generic_definition_from_index(
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)utf16_length(name)};
+                        col + lsp_column_width(name)};
     };
 
     // Modules and packages — scope-insensitive, always visible (mirrors
@@ -2527,16 +2527,16 @@ static std::optional<Location> find_interface_member_definition(const SyntaxInde
 
     for (const auto& modport : iface.modports) {
         if (modport.name == member_name)
-            return locate(modport.file_id, modport.line, modport.col, utf16_length(modport.name));
+            return locate(modport.file_id, modport.line, modport.col, lsp_column_width(modport.name));
     }
     for (const auto& port : iface.ports) {
         if (port.name == member_name)
-            return locate(port.file_id, port.line, port.col, utf16_length(port.name));
+            return locate(port.file_id, port.line, port.col, lsp_column_width(port.name));
     }
     for (const auto& value : index.values) {
         if (value.parent_scope != interface_name || value.name != member_name)
             continue;
-        return locate(value.file_id, value.line, value.col, utf16_length(value.name));
+        return locate(value.file_id, value.line, value.col, lsp_column_width(value.name));
     }
     return std::nullopt;
 }
@@ -2845,7 +2845,7 @@ static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& 
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)utf16_length(field.name)};
+                            field.col + lsp_column_width(field.name)};
         }
     }
     return std::nullopt;
@@ -2873,7 +2873,7 @@ static std::optional<Location> find_aggregate_field_declaration_at(const SyntaxI
             return std::nullopt;
 
         return Location{resolved_uri, field_lsp_line, field.col, field_lsp_line,
-                        field.col + (int)utf16_length(field.name)};
+                        field.col + lsp_column_width(field.name)};
     };
 
     // Generic unqualified lookup intentionally ignores aggregate fields, but
@@ -2919,7 +2919,7 @@ static std::optional<Location> find_class_method_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)utf16_length(method.name)};
+                            method.col + lsp_column_width(method.name)};
         }
     }
     return std::nullopt;
@@ -2949,7 +2949,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)utf16_length(field.name)};
+                            field.col + lsp_column_width(field.name)};
         }
         for (const auto& method : cls.methods) {
             if (method.name != member_name || method.line <= 0)
@@ -2957,7 +2957,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)utf16_length(method.name)};
+                            method.col + lsp_column_width(method.name)};
         }
 
         // A class-scoped typedef (`my_item::type_id`) is a member too, but it
@@ -2968,7 +2968,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(td.file_id);
             const int line = to_lsp_line(td.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
-                            td.col + (int)utf16_length(td.name)};
+                            td.col + lsp_column_width(td.name)};
         }
     }
     return std::nullopt;
@@ -3548,9 +3548,9 @@ static bool contains_position(const slang::SourceManager& sm, slang::SourceRange
 
     // Compared against a request position, which the client measures in UTF-16.
     const int start_line = to_lsp_line((int)sm.getLineNumber(range.start()));
-    const int start_col = utf16_column(sm, range.start());
+    const int start_col = lsp_column(sm, range.start());
     const int end_line = to_lsp_line((int)sm.getLineNumber(range.end()));
-    const int end_col = utf16_column(sm, range.end());
+    const int end_col = lsp_column(sm, range.end());
 
     if (line < start_line || line > end_line)
         return false;
@@ -4617,13 +4617,13 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
             const auto start = visible_range_for_token(sm, token).start();
             const int token_line = to_lsp_line((int)sm.getLineNumber(start));
-            const int token_col = utf16_column(sm, start);
+            const int token_col = lsp_column(sm, start);
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
                 .line = token_line,
                 .col = token_col,
-                .end_col = token_col + (int)utf16_length(name),
+                .end_col = token_col + lsp_column_width(name),
             };
         }
     };
@@ -5928,7 +5928,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             if (!seen.insert(key).second)
                 return;
             result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
-                                      ref_col + (int)utf16_length(target->name)});
+                                      ref_col + lsp_column_width(target->name)});
         };
 
     auto visit_tree =

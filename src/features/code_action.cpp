@@ -114,7 +114,7 @@ static int token_line(const SourceManager& sm, const slang::parsing::Token& tok)
 static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
-    return utf16_column(sm, tok.location());
+    return lsp_column(sm, tok.location());
 }
 
 struct QuickFixLocator : public SyntaxVisitor<QuickFixLocator> {

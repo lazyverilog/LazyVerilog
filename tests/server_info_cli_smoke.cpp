@@ -77,14 +77,18 @@ std::string version_from_cli(const fs::path& server_bin) {
 /// Send `initialize`, then `exit`, and return the server's stdout.  Writing
 /// both messages up front and letting the server read to EOF keeps this to one
 /// blocking call with no timing assumptions.
-std::string initialize_reply(const fs::path& server_bin) {
+///
+/// @p capabilities is the `capabilities` object of the request, so a caller can
+/// vary what the client offers.
+std::string initialize_reply(const fs::path& server_bin,
+                             const std::string& capabilities = "{}") {
     const fs::path input = fs::temp_directory_path() /
                            ("lazyverilog-server-info-" +
                             std::to_string(cli_process::current_process_id()) + ".jsonrpc");
     {
         std::ofstream out(input, std::ios::binary);
         out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
-                     R"("processId":1,"rootUri":null,"capabilities":{}}})");
+                     R"("processId":1,"rootUri":null,"capabilities":)" + capabilities + "}}");
         out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
     }
 
@@ -121,6 +125,42 @@ int main(int argc, char** argv) {
            "serverInfo names the server");
     expect(!version.empty() && contains(out, R"("version":")" + version + R"(")"),
            "serverInfo reports the same version the binary prints");
+
+    // ── positionEncoding (LSP 3.17) ──────────────────────────────────────────
+    //
+    // `ServerCapabilities.positionEncoding` is the other field LspCpp does not
+    // declare and this build patches in, from CMakeLists.txt rather than a
+    // template file.  It carries more than a label: it decides whether every
+    // Position on the wire is counted in UTF-16 units or bytes, and the two
+    // sides silently disagreeing is an off-by-a-few-columns bug that only
+    // appears on lines with non-ASCII text.
+    //
+    // The offers below are the real ones.  vscode-languageclient 9 hardcodes
+    // `positionEncodings = ['utf-16']` and *throws* on any other answer --
+    // "Unsupported position encoding ... received from server", which fails the
+    // session outright -- so answering a UTF-16-only client anything else is not
+    // a degraded mode, it is a client that will not start.  Neovim 0.12.5 offers
+    // all three with utf-8 first.
+    const auto encoding_for = [&](const char* offer) {
+        return initialize_reply(server_bin,
+                                std::string(R"({"general":{"positionEncodings":)") + offer + "}}");
+    };
+
+    expect(contains(encoding_for(R"(["utf-16"])"), R"("positionEncoding":"utf-16")"),
+           "a UTF-16-only client (VS Code) is answered utf-16");
+    expect(contains(encoding_for(R"(["utf-8","utf-16","utf-32"])"),
+                    R"("positionEncoding":"utf-8")"),
+           "a client offering utf-8 first (Neovim) is answered utf-8");
+    expect(contains(encoding_for(R"(["utf-16","utf-8"])"), R"("positionEncoding":"utf-8")"),
+           "utf-8 is taken wherever it appears in the offer");
+    expect(contains(encoding_for(R"(["utf-32"])"), R"("positionEncoding":"utf-16")"),
+           "an offer of only utf-32 falls back to the protocol default");
+    expect(contains(encoding_for("[]"), R"("positionEncoding":"utf-16")"),
+           "an empty offer falls back to the protocol default");
+    // A client from before 3.17 sends no `general` at all.  It ignores the
+    // field, but the reply must still say utf-16 rather than guess.
+    expect(contains(out, R"("positionEncoding":"utf-16")"),
+           "a client that offers nothing is answered utf-16");
 
     std::cerr << "server-info-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run
               << " checks passed\n";
