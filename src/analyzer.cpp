@@ -1348,7 +1348,11 @@ struct IdentifierSpan {
     int end_col{0};
 };
 
-// Extract identifier at (0-based line, 0-based col) from source text.
+// Extract identifier at (0-based line, 0-based LSP column) from source text.
+//
+// `col` is measured the way the client measures it -- UTF-16 code units -- and
+// the returned columns are too, because they are handed straight back to the
+// client as a rename range.  Only the walk in between is in bytes.
 static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, int line, int col) {
     int cur = 0;
     size_t pos = 0;
@@ -1365,9 +1369,11 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
     if (le == std::string_view::npos)
         le = src.size();
 
-    if (col < 0 || (size_t)col >= le - ls)
+    if (col < 0)
         return std::nullopt;
-    size_t ip = ls + col;
+    size_t ip = utf16_col_to_byte_offset(src, ls, col);
+    if (ip >= le)
+        return std::nullopt;
 
     auto is_id = [](char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; };
     if (!is_id(src[ip]))
@@ -1380,8 +1386,9 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
     while (end < le && is_id(src[end]))
         ++end;
 
-    return IdentifierSpan{std::string(src.substr(start, end - start)), (int)(start - ls),
-                          (int)(end - ls)};
+    return IdentifierSpan{std::string(src.substr(start, end - start)),
+                          lsp_column_from_byte_offset(src, ls, start),
+                          lsp_column_from_byte_offset(src, ls, end)};
 }
 
 static bool same_location(const Location& lhs, const Location& rhs) {
@@ -1393,6 +1400,8 @@ static std::string extract_ident(std::string_view src, int line, int col) {
     return span ? span->text : std::string{};
 }
 
+// @p ident_start_col is an LSP column, matching what extract_ident_span() and
+// identifier_at() report; it becomes a byte offset here and nowhere else.
 static bool is_backtick_identifier(std::string_view src, int line, int ident_start_col) {
     int cur = 0;
     size_t pos = 0;
@@ -1408,7 +1417,11 @@ static bool is_backtick_identifier(std::string_view src, int line, int ident_sta
     size_t line_end = src.find('\n', pos);
     if (line_end == std::string_view::npos)
         line_end = src.size();
-    const size_t backtick = line_start + (size_t)ident_start_col - 1;
+    const size_t ident_start = utf16_col_to_byte_offset(src, line_start, ident_start_col);
+    if (ident_start <= line_start)
+        return false;
+    // One byte back, not one column: a backtick is ASCII wherever it appears.
+    const size_t backtick = ident_start - 1;
     return backtick < line_end && src[backtick] == '`';
 }
 
@@ -1424,7 +1437,7 @@ static bool is_define_identifier(std::string_view src, int line, int ident_start
         return false;
 
     const size_t line_start = pos;
-    const size_t ident_start = line_start + (size_t)ident_start_col;
+    const size_t ident_start = utf16_col_to_byte_offset(src, line_start, ident_start_col);
     if (ident_start > src.size())
         return false;
 
