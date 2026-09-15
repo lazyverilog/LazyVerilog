@@ -321,9 +321,26 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     std::error_code ec;
     std::filesystem::path result;
 
+    // POSIX only, and the reason is the shortcut's correctness argument rather
+    // than any call it makes: appending a name to an already-canonical parent
+    // is the canonical spelling of the child *provided a symlink is the only
+    // thing canonical() would have rewritten*.  On Windows it is not -- that
+    // function also expands 8.3 short names (the RUNNER~1 -> runneradmin case
+    // this comment block already had in mind) and settles case, and a component
+    // needing either is not a symlink, so the leaf check below says "nothing to
+    // resolve" and the short spelling survives.  Two paths to one file then
+    // normalize differently, which is the single thing this function exists to
+    // prevent; it cost the CI's Windows job two tests, one of them the
+    // symlinked-directory case in test_references.cpp.
+    //
+    // Windows therefore keeps the full walk.  The cost this avoids is a
+    // per-component metadata round trip on a shared/HPC filesystem, which is
+    // not where that build runs.  A Windows fast path would need
+    // GetLongPathNameW and a Windows machine to prove it on.
+#ifndef _WIN32
     // The last component still has to be resolved itself -- a symlinked source
     // file is a real thing, and collapsing it is the point of this function --
-    // but that is one readlink rather than one per component.  "." and ".."
+    // but that is one lstat rather than one call per component.  "." and ".."
     // address the parent rather than naming a component, so they fall through
     // to the full walk, which already handles them.
     const auto parent = path.parent_path();
@@ -345,6 +362,7 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
             return cache_normalized(cache_mutex, cache, std::move(key),
                                     result.lexically_normal());
     }
+#endif
 
     result = std::filesystem::weakly_canonical(path, ec);
     if (!ec) {
