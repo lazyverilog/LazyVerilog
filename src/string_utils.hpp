@@ -225,22 +225,26 @@ inline std::optional<std::string> read_file_text_optional(const std::filesystem:
     // helper robust for paths where the size cannot be queried or the stream is
     // not seekable.  Large RTL sources are common, so avoiding repeated string
     // growth keeps project/background parsing from wasting allocator work.
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    if (!ec) {
-        std::string text(size, '\0');
-        if (size == 0)
+    //
+    // Sized by seeking the handle that is already open rather than by asking the
+    // filesystem about the path a second time: file_size() is another metadata
+    // call for a question this stream can answer, and on a shared filesystem
+    // that is a round trip per file read.
+    in.seekg(0, std::ios::end);
+    const auto end = in.tellg();
+    in.seekg(0, std::ios::beg);
+    if (end >= 0 && in) {
+        std::string text(static_cast<size_t>(end), '\0');
+        if (end == 0)
             return text;
-        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        in.read(text.data(), end);
         text.resize(static_cast<size_t>(in.gcount()));
         return text;
     }
 
+    // Not seekable: back to reading until it ends.
+    in.clear();
     std::string text;
-    in.seekg(0, std::ios::end);
-    if (const auto end = in.tellg(); end > 0)
-        text.reserve(static_cast<size_t>(end));
-    in.seekg(0, std::ios::beg);
     text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     return text;
 }
