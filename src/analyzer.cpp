@@ -253,6 +253,29 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 
 static std::string header_directives_only(std::string_view text);
 
+/// Whether the `` `include `` a CouldNotOpenIncludeFile diagnostic points at was
+/// written with angle brackets.
+///
+/// The diagnostic's own argument cannot answer this.  slang strips the
+/// delimiters before it formats the message -- `path = path.substr(1, len - 2)`
+/// in Preprocessor::handleIncludeDirective -- so an unresolved
+/// `` `include <x.svh> `` and `` `include "x.svh" `` both arrive here spelled
+/// `x.svh`, and a first-character test on that string is false for every
+/// include there is.
+///
+/// The diagnostic is raised on the file-name token's range and
+/// `Diagnostics::add(code, range)` keeps `range.start()` as the location, so the
+/// location addresses the delimiter itself.  Read it from the buffer rather than
+/// from the rendered message.
+static bool include_diagnostic_is_system(const slang::SourceManager& sm,
+                                         slang::SourceLocation location) {
+    if (!location.valid())
+        return false;
+    const auto buffer = sm.getSourceText(location.buffer());
+    const auto offset = location.offset();
+    return offset < buffer.size() && buffer[offset] == '<';
+}
+
 /// Record how every `include in @p tree resolved, so a later launch can tell
 /// whether the same directive would now find something else.
 ///
@@ -304,8 +327,9 @@ static std::vector<IncludeResolution> collect_include_resolutions(
             .from_uri = directive_origin(diagnostic.location),
             .spelling = *spelling,
             // A system include that found nothing is recorded as one: the
-            // search it would re-run is a different search.
-            .is_system = spelling->front() == '<',
+            // search it would re-run is a different search.  Taken from the
+            // source, not from `spelling` -- see include_diagnostic_is_system().
+            .is_system = include_diagnostic_is_system(sm, diagnostic.location),
             .resolved_uri = {},
         });
     }
