@@ -899,6 +899,68 @@ TEST_CASE("index cache: a header created after its includer is picked up", "[ind
     CHECK(snapshot_values(warm).count("late_from_header") == 1);
 }
 
+TEST_CASE("index cache: an unresolved system include still validates its shard",
+          "[index-cache]") {
+    // `` `include <x> `` searches system directories only, and the parse path
+    // configures none, so it resolves to nothing however many `+incdir+`s name a
+    // file of that name.  The preload re-runs that search against the recorded
+    // resolution -- so the recorded resolution has to say it was a system
+    // include, or the re-run is a *user* search, finds the file in an incdir,
+    // disagrees with the recorded "found nothing", and throws the shard away.
+    //
+    // It did exactly that: slang strips the delimiters before putting the path
+    // in the diagnostic, so the first-character test that classified these was
+    // false for every include, and any project using angle brackets rebuilt its
+    // whole cache on every launch with nothing to show it.
+    //
+    // The sentinel is what makes a hit visible -- see "an unchanged project is
+    // served from the shards" for why a warm assertion on the index alone
+    // cannot tell a hit from a silent reparse.
+    CacheProject project("analyzer-system-include");
+    project.write("inc/shared.svh", "localparam int from_shared = 1;\n");
+    project.write("a.sv", "`include <shared.svh>\nmodule a;\n  logic [7:0] sig_a;\nendmodule\n");
+
+    const std::vector<std::string> incdirs{"inc"};
+    {
+        Analyzer analyzer;
+        const auto cold = project.index(analyzer, {"a.sv"}, {}, incdirs);
+        // slang did not find it, so it is genuinely absent from the index.
+        CHECK(snapshot_values(cold).count("from_shared") == 0);
+    }
+
+    const auto directory = IndexCache::directory_for(project.root());
+    size_t edited = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        if (entry.path().extension() != ".idx")
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        auto loaded = deserialize_index_shard(bytes);
+        REQUIRE(loaded);
+
+        ValueEntry sentinel;
+        sentinel.name = "only_a_reused_shard_has_this";
+        sentinel.kind = "variable";
+        sentinel.file_id = kInvalidSourceFileID;
+        loaded->index.values.push_back(sentinel);
+
+        const auto rewritten =
+            serialize_index_shard(loaded->key, loaded->index, loaded->stands_alone);
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(rewritten.data(), static_cast<std::streamsize>(rewritten.size()));
+        ++edited;
+    }
+    REQUIRE(edited == 1);
+
+    Analyzer analyzer;
+    const auto warm = snapshot_values(project.index(analyzer, {"a.sv"}, {}, incdirs));
+    CHECK(warm.count("only_a_reused_shard_has_this") == 1);
+    CHECK(warm.count("sig_a") == 1);
+    // Still not found, because a system include still does not search incdirs.
+    CHECK(warm.count("from_shared") == 0);
+}
+
 TEST_CASE("index cache: a header shadowed from an earlier directory is picked up",
           "[index-cache]") {
     // An override directory ahead of the shared one in the search order is how
