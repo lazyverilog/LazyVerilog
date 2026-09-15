@@ -143,3 +143,27 @@ TEST_CASE("normalize_filesystem_path resolves through a memoized parent", "[path
 
     std::filesystem::remove_all(root, ec);
 }
+
+TEST_CASE("read_file_text_optional survives a path that is not a regular file", "[path]") {
+    // A filelist entry naming a directory is a typo, and the background compiler
+    // reads filelist entries on its own thread.  libstdc++ opens a directory
+    // successfully and reports LLONG_MAX as its size, so sizing a buffer from
+    // that seek throws bad_alloc where nothing catches it -- which is what this
+    // did, through reserve(), before the read path was rewritten.
+    const auto directory = std::filesystem::temp_directory_path();
+    const auto text = read_file_text_optional(directory);
+    // Empty or absent both mean "nothing to parse"; crashing does not.
+    CHECK((!text || text->empty()));
+
+    const auto missing = std::filesystem::temp_directory_path() / "lazyverilog-no-such-file.sv";
+    std::error_code ec;
+    std::filesystem::remove(missing, ec);
+    CHECK_FALSE(read_file_text_optional(missing).has_value());
+
+    const auto empty = std::filesystem::temp_directory_path() / "lazyverilog-empty.sv";
+    { std::ofstream out(empty); }
+    const auto empty_text = read_file_text_optional(empty);
+    REQUIRE(empty_text.has_value());
+    CHECK(empty_text->empty());
+    std::filesystem::remove(empty, ec);
+}

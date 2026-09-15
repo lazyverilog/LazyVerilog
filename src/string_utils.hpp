@@ -231,21 +231,36 @@ inline std::optional<std::string> read_file_text_optional(const std::filesystem:
     // call for a question this stream can answer, and on a shared filesystem
     // that is a round trip per file read.
     in.seekg(0, std::ios::end);
-    const auto end = in.tellg();
+    const auto hint = in.tellg();
     in.seekg(0, std::ios::beg);
-    if (end >= 0 && in) {
-        std::string text(static_cast<size_t>(end), '\0');
-        if (end == 0)
+
+    // tellg() is a hint, not a promise.  libstdc++ opens a directory
+    // successfully and reports LLONG_MAX as its size, so sizing a string from it
+    // outright throws bad_alloc -- on a background thread, with nothing to catch
+    // it.  A filelist naming a directory is a user's typo, not a reason to take
+    // the server down.  Cap what the hint may reserve and read anything larger
+    // in chunks, which costs one extra pass for a file nobody has and cannot be
+    // talked into an absurd allocation.
+    constexpr std::streamoff kMaxSizeHint = std::streamoff{1} << 30; // 1 GiB
+    if (in && hint >= 0 && hint <= kMaxSizeHint) {
+        std::string text(static_cast<size_t>(hint), '\0');
+        if (hint == 0)
             return text;
-        in.read(text.data(), end);
+        in.read(text.data(), hint);
         text.resize(static_cast<size_t>(in.gcount()));
         return text;
     }
 
-    // Not seekable: back to reading until it ends.
+    // No usable hint: unseekable, or a size that cannot be true.  Read what the
+    // stream actually gives.  An explicit read() loop rather than
+    // istreambuf_iterator, because the iterator reaches basic_filebuf::underflow,
+    // which throws on a directory whatever the stream's exception mask says.
     in.clear();
+    in.seekg(0, std::ios::beg);
     std::string text;
-    text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    char chunk[64 * 1024];
+    while (in.read(chunk, sizeof(chunk)) || in.gcount() > 0)
+        text.append(chunk, static_cast<size_t>(in.gcount()));
     return text;
 }
 
