@@ -133,7 +133,7 @@ static void append_index_symbols(const SyntaxIndex& index, const std::string& ur
         symbol.location.uri.raw_uri_ = symbol_uri.empty() ? uri : symbol_uri;
         const int lsp_line = to_lsp_line(line);
         symbol.location.range.start = lsPosition(lsp_line, col);
-        symbol.location.range.end = lsPosition(lsp_line, col + (int)utf16_length(symbol.name));
+        symbol.location.range.end = lsPosition(lsp_line, col + lsp_column_width(symbol.name));
         if (!container.empty())
             symbol.containerName = std::move(container);
         if (seen.insert(symbol_key(symbol)).second)

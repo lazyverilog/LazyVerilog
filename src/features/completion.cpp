@@ -1209,7 +1209,7 @@ static lsCompletionItem make_item(std::string label, lsCompletionItemKind kind) 
 }
 
 // Unused.  If it is ever revived and its result reaches the client, the column
-// has to go through utf16_column() like every other LSP position.
+// has to go through lsp_column() like every other LSP position.
 static std::pair<int, int> completion_ast_token_pos(const slang::SourceManager& sm,
                                                     const slang::parsing::Token& token) {
     if (!token || !token.location().valid())

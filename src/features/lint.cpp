@@ -45,7 +45,7 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
         }
         size_t ln = sm.getLineNumber(loc);
         d.line = ln > 0 ? (int)ln - 1 : 0;
-        d.col  = utf16_column(sm, loc);
+        d.col  = lsp_column(sm, loc);
     }
     return d;
 }

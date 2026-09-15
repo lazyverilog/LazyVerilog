@@ -795,6 +795,18 @@ IndexCache::Digest IndexCache::config_digest(const std::vector<std::string>& def
         joined += dir.string();
         joined += '\n';
     }
+    // The negotiated position encoding, because a shard stores columns in it.
+    //
+    // This is not a parse input like the two above -- the same bytes parse to
+    // the same declarations either way -- but it decides what a stored column
+    // *means*, and a shard cannot be converted after the fact: it keeps no
+    // source text, which is the reason positions are converted at index time in
+    // the first place (see lsp_position.hpp).  So a cache written for a UTF-16
+    // session must not be served to a UTF-8 one, and keying it here is what
+    // makes the switch a miss rather than an off-by-a-few-columns answer that
+    // only shows up on lines with non-ASCII text.
+    joined += "\x1e";
+    joined += position_encoding_name(negotiated_position_encoding());
     return digest_bytes(joined);
 }
 
