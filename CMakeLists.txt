@@ -299,6 +299,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_path_uri.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
+    tests/test_lsp_position_encoding.cpp
     tests/test_open_parse_header_cache.cpp
     tests/test_open_header_projection.cpp
     tests/test_open_shard_scope.cpp

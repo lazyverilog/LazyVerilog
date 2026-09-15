@@ -126,6 +126,56 @@ inline size_t utf16_col_to_byte_offset(std::string_view text, size_t pos, int co
     return pos;
 }
 
+/// Byte offset of the first character of 0-based @p line.
+///
+/// Returns the end of the text when the document has fewer lines than asked
+/// for, so a position past the end clamps instead of failing: LSP clients
+/// legitimately send one-past-the-end positions for an append at EOF.
+inline size_t lsp_line_start_offset(std::string_view text, int line) {
+    if (line <= 0)
+        return 0;
+    int cur = 0;
+    size_t pos = 0;
+    while (pos < text.size() && cur < line) {
+        if (text[pos] == '\n')
+            ++cur;
+        ++pos;
+    }
+    return pos;
+}
+
+/// Byte offset of an incoming LSP position.
+///
+/// The one place a `Position` from the client becomes an index into the
+/// document's UTF-8 bytes.  Every feature that slices document text at a
+/// request position must come through here, because `Position.character` is a
+/// count of UTF-16 code units and the text is UTF-8: on a line carrying any
+/// non-ASCII character the two disagree, and a handler that indexes with the
+/// raw column lands somewhere earlier in the line.
+///
+/// That is not a hypothetical.  Hover, completion and signature help each
+/// walked to the line themselves and then added `character` as if it were a
+/// byte count, so a Korean comment or a `µ` earlier on the line was enough to
+/// make hover answer nothing and completion fall back to a keyword dump.  The
+/// duplicated line walks are what let the three drift apart from the
+/// incremental-sync path, which had it right, so the walk lives here too.
+///
+/// This is also the single switch point for `positionEncoding`: a client that
+/// negotiates UTF-8 sends byte offsets and wants this to be the identity.
+inline size_t lsp_position_to_byte_offset(std::string_view text, int line, int character) {
+    return utf16_col_to_byte_offset(text, lsp_line_start_offset(text, line), character);
+}
+
+/// UTF-16 column of a byte offset that is known to lie on @p line_start's line.
+///
+/// The outgoing half of the boundary above, for positions the server computed
+/// as byte offsets into its own text rather than reading off a slang location.
+inline int lsp_column_from_byte_offset(std::string_view text, size_t line_start, size_t offset) {
+    if (offset <= line_start)
+        return 0;
+    return static_cast<int>(utf16_length(text.substr(line_start, offset - line_start)));
+}
+
 /// Count UTF-16 code units from byte offset `pos` until a newline or end of
 /// string.  LSP positions use UTF-16 columns, while lazyverilog stores document
 /// text as UTF-8, so this helper advances over one UTF-8 scalar at a time and

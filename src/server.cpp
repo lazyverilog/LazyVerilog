@@ -167,14 +167,7 @@ static size_t advance_utf16_cols(const std::string& text, size_t pos, int col) {
 
 // Convert (line, col) LSP position to byte offset in text.
 static size_t lsp_offset(const std::string& text, int line, int col) {
-    int cur = 0;
-    size_t pos = 0;
-    while (pos < text.size() && cur < line) {
-        if (text[pos] == '\n')
-            ++cur;
-        ++pos;
-    }
-    return advance_utf16_cols(text, pos, col);
+    return lsp_position_to_byte_offset(text, line, col);
 }
 
 // Compute two byte offsets in a single scan. Positions must be in document order
