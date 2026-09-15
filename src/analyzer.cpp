@@ -6205,6 +6205,15 @@ std::vector<std::string> order_by_descending_size(const std::vector<std::string>
     if (paths.size() < 3)
         return paths;
 
+    // One worker drains the queue in whatever order it is given and finishes at
+    // the same time either way, so the stats buy nothing there -- and the first
+    // entry, which is the only slot with a job to do, keeps its place with or
+    // without this.  That is the single-core slice a batch scheduler hands out,
+    // which is also where a stat is least affordable: nothing else is running to
+    // overlap it with.
+    if (available_cpu_count() <= 1)
+        return paths;
+
     std::vector<std::pair<uintmax_t, size_t>> keyed;
     keyed.reserve(paths.size() - 1);
     // The first entry keeps its place; see below.
