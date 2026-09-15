@@ -214,6 +214,12 @@ TEST_CASE("lsp_position_to_byte_offset converts, and clamps past the end",
 // session set to UTF-8, where the answers are byte columns instead.
 
 TEST_CASE("the encoding is read out of the initialize request", "[position_encoding]") {
+    // Every literal below is bound to a name before it reaches a CHECK.  MSVC's
+    // default preprocessor does not understand raw string literals inside a
+    // macro argument -- it ends the string at the first embedded quote and reads
+    // what follows as a UDL suffix -- so `CHECK(f(R"(...)"))` fails to compile
+    // there while building fine everywhere else.  Nothing else in tests/ does
+    // it; this file did, and only the Windows job said so.
     const auto offer = [](const char* encodings) {
         return std::string(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":)"
                            R"({"capabilities":{"general":{"positionEncodings":)") +
@@ -222,30 +228,33 @@ TEST_CASE("the encoding is read out of the initialize request", "[position_encod
 
     // UTF-8 anywhere in the offer wins: it is the only entry worth preferring,
     // and a client that lists it has said it is happy with it.
-    CHECK(position_encoding_from_initialize(offer(R"(["utf-8","utf-16"])")) ==
-          PositionEncoding::Utf8);
-    CHECK(position_encoding_from_initialize(offer(R"(["utf-16","utf-8"])")) ==
-          PositionEncoding::Utf8);
-    CHECK(position_encoding_from_initialize(offer(R"(["utf-16"])")) == PositionEncoding::Utf16);
+    const auto utf8_first = offer(R"(["utf-8","utf-16"])");
+    const auto utf8_second = offer(R"(["utf-16","utf-8"])");
+    const auto utf16_only = offer(R"(["utf-16"])");
+    CHECK(position_encoding_from_initialize(utf8_first) == PositionEncoding::Utf8);
+    CHECK(position_encoding_from_initialize(utf8_second) == PositionEncoding::Utf8);
+    CHECK(position_encoding_from_initialize(utf16_only) == PositionEncoding::Utf16);
 
     // Offered, but nothing this server implements.  Nothing was negotiated, so
     // the default stands rather than a claim neither side made.
-    CHECK_FALSE(position_encoding_from_initialize(offer(R"(["utf-32"])")).has_value());
-    CHECK_FALSE(position_encoding_from_initialize(offer("[]")).has_value());
+    const auto utf32_only = offer(R"(["utf-32"])");
+    const auto nothing_offered = offer("[]");
+    CHECK_FALSE(position_encoding_from_initialize(utf32_only).has_value());
+    CHECK_FALSE(position_encoding_from_initialize(nothing_offered).has_value());
 
     // Shapes that are not an offer at all.
-    CHECK_FALSE(position_encoding_from_initialize(
-                    R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}})")
-                    .has_value());
-    CHECK_FALSE(position_encoding_from_initialize(
-                    R"({"jsonrpc":"2.0","method":"textDocument/didChange","params":{}})")
-                    .has_value());
-    CHECK_FALSE(position_encoding_from_initialize("not json at all").has_value());
+    const std::string no_general =
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}})";
+    const std::string other_method =
+        R"({"jsonrpc":"2.0","method":"textDocument/didChange","params":{}})";
     // A document whose text merely contains the word passes the substring test
     // and must still be rejected by the parse.
-    CHECK_FALSE(position_encoding_from_initialize(
-                    R"({"method":"textDocument/didOpen","params":{"text":"\"initialize\""}})")
-                    .has_value());
+    const std::string word_in_a_document =
+        R"({"method":"textDocument/didOpen","params":{"text":"\"initialize\""}})";
+    CHECK_FALSE(position_encoding_from_initialize(no_general).has_value());
+    CHECK_FALSE(position_encoding_from_initialize(other_method).has_value());
+    CHECK_FALSE(position_encoding_from_initialize("not json at all").has_value());
+    CHECK_FALSE(position_encoding_from_initialize(word_in_a_document).has_value());
 }
 
 TEST_CASE("under UTF-8 the column primitives count bytes", "[position_encoding]") {
