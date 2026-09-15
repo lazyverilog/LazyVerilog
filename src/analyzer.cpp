@@ -6659,7 +6659,6 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::unordered_map<std::string, std::string> local_resolution;
 
     const auto resolve_include = [&](const IncludeResolution& recorded) -> std::string {
-        std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
         const std::filesystem::path spelling(recorded.spelling);
         if (spelling.is_absolute())
             return resolved_uri_if_file(spelling);
@@ -6668,6 +6667,29 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         if (recorded.is_system)
             return {};
 
+        // Look up under the lock, search with it released, then record.  The
+        // memo is shared by every preload thread precisely because a hit is a
+        // hash lookup and a miss is one stat -- but the lock has to cover the
+        // lookup only.  Held across the search, one slow stat stands in front of
+        // every other thread's hit, and on the shared filesystems this whole
+        // check is aimed at that stat is a round trip.
+        //
+        // Two threads reaching the same spelling therefore both stat it.  That
+        // is the trade cached_file_digest() already makes for the same reason:
+        // duplicating the work is cheaper than either one waiting, and whichever
+        // insert lands first is the answer both of them get.
+        const auto memoized = [&](std::unordered_map<std::string, std::string>& memo,
+                                  const std::string& key, auto&& search) -> std::string {
+            {
+                std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
+                if (const auto it = memo.find(key); it != memo.end())
+                    return it->second;
+            }
+            std::string resolved = search();
+            std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
+            return memo.emplace(key, std::move(resolved)).first->second;
+        };
+
         // The including file's own directory comes first.
         const auto from_directory =
             std::filesystem::path(path_from_file_uri(recorded.from_uri)).parent_path().string();
@@ -6675,30 +6697,22 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
             auto local_key = from_directory;
             local_key += '\n';
             local_key += recorded.spelling;
-            const auto it = local_resolution.find(local_key);
-            const auto& local =
-                it != local_resolution.end()
-                    ? it->second
-                    : local_resolution
-                          .emplace(std::move(local_key),
-                                   resolved_uri_if_file(std::filesystem::path(from_directory) /
-                                                        spelling))
-                          .first->second;
+            const auto local = memoized(local_resolution, local_key, [&] {
+                return resolved_uri_if_file(std::filesystem::path(from_directory) / spelling);
+            });
             if (!local.empty())
                 return local;
         }
 
-        if (const auto it = incdir_resolution.find(recorded.spelling);
-            it != incdir_resolution.end())
-            return it->second;
-        std::string resolved;
-        for (const auto& directory : include_dirs) {
-            resolved = resolved_uri_if_file(directory / spelling);
-            if (!resolved.empty())
-                break;
-        }
-        incdir_resolution.emplace(recorded.spelling, resolved);
-        return resolved;
+        return memoized(incdir_resolution, recorded.spelling, [&] {
+            std::string resolved;
+            for (const auto& directory : include_dirs) {
+                resolved = resolved_uri_if_file(directory / spelling);
+                if (!resolved.empty())
+                    break;
+            }
+            return resolved;
+        });
     };
 
     // A shard is usable only when everything it was built from still holds.
