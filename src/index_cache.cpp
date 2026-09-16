@@ -873,17 +873,24 @@ std::optional<IndexCache> IndexCache::open_fallback() {
 IndexCacheStorage::IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver)
     : resolver_(std::move(resolver)) {}
 
-const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
-    const auto path = path_from_file_uri(std::string(uri));
+std::shared_ptr<IndexCacheStorage> IndexCacheStorage::for_root(fs::path project_root) {
+    auto storage = std::make_shared<IndexCacheStorage>(nullptr);
+    storage->fixed_root_ = std::move(project_root);
+    return storage;
+}
 
+const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
     // Resolved outside the lock.  The walk stats directories, which on a shared
     // filesystem is a round trip, and every worker indexing a file in the same
     // tree would otherwise queue behind whichever one is waiting.  The resolver
     // has its own cache and its own lock.
     std::string key = kFallbackKey;
     std::optional<ProjectInfo> info;
-    if (resolver_) {
-        info = resolver_->project_info(path);
+    if (fixed_root_) {
+        info = ProjectInfo{*fixed_root_};
+        key = fixed_root_->string();
+    } else if (resolver_) {
+        info = resolver_->project_info(path_from_file_uri(std::string(uri)));
         if (info)
             key = info->source_root.string();
     }
