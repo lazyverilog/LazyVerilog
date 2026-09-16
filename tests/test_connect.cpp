@@ -614,3 +614,40 @@ TEST_CASE("connect: preview cost is linear in declaration count", "[connect][sca
     // back in.
     CHECK(ratio < 8.0);
 }
+
+TEST_CASE("connect: a hierarchy path with stray dots resolves like its canonical spelling",
+          "[connect]") {
+    // resolve_instance_route() splits on '.' and drops empty segments, so these
+    // spellings all name the same instance.  build_connect() used to keep the
+    // caller's text and look the hierarchy map up with it, which missed, threw
+    // std::out_of_range, and left the command answered with a bare null -- no
+    // edits and no error to show the user.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/connect_stray_dots.sv";
+    analyzer.open(uri, R"(
+module producer(output logic [7:0] data);
+endmodule
+module consumer(input logic [7:0] data);
+endmodule
+module top;
+    producer u_prod (.data());
+    consumer u_cons (.data());
+endmodule
+)");
+
+    const auto canonical = connect_apply_edit_json(analyzer, uri, "top.u_prod", "data",
+                                                   "top.u_cons", "data", "data_w");
+    REQUIRE(canonical.find(".data(data_w)") != std::string::npos);
+
+    for (const auto* spelling : {"top..u_prod", "top.u_prod."}) {
+        const auto edit = connect_apply_edit_json(analyzer, uri, spelling, "data",
+                                                  "top.u_cons", "data", "data_w");
+        INFO("source path spelled " << spelling);
+        CHECK(edit == canonical);
+    }
+
+    // A path that names nothing still reports why, rather than throwing.
+    const auto missing = connect_apply_edit_json(analyzer, uri, "top.u_nope", "data",
+                                                 "top.u_cons", "data", "data_w");
+    CHECK(missing.find("not found") != std::string::npos);
+}

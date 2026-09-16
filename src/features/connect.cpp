@@ -1322,15 +1322,34 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     // `top.u_a.u_leaf` is just a step-by-step walk through indexed instances:
     // root module -> child instance -> child module -> ... .
     auto source_route = resolve_instance_route(lookup, source_path, r.error);
-    if (!source_route)
+    if (!source_route || source_route->empty())
         return r;
     auto dest_route = resolve_instance_route(lookup, dest_path, r.error);
-    if (!dest_route)
+    if (!dest_route || dest_route->empty())
         return r;
     auto hierarchy = route_hierarchy_map(*source_route, *dest_route);
 
-    const auto& src = hierarchy.at(source_path);
-    const auto& dst = hierarchy.at(dest_path);
+    // From here on the routes' own spelling is the path, not the caller's.
+    //
+    // resolve_instance_route() splits on '.' and drops empty segments, so
+    // `top..u_src` and `top.u_src.` both resolve -- to a route whose path is
+    // `top.u_src`.  Everything downstream keys on that spelling: the hierarchy
+    // map, the common-ancestor walk, and the step lists.  Carrying the caller's
+    // text instead made a client typo miss every one of them, starting with a
+    // map lookup that threw std::out_of_range and left the request answered with
+    // a bare null instead of the error shape every other failure here returns.
+    const std::string& source_key = source_route->back().path;
+    const std::string& dest_key = dest_route->back().path;
+
+    const auto src_it = hierarchy.find(source_key);
+    const auto dst_it = hierarchy.find(dest_key);
+    if (src_it == hierarchy.end() || dst_it == hierarchy.end()) {
+        r.error = "instance '" + (src_it == hierarchy.end() ? source_path : dest_path) +
+                  "' not found";
+        return r;
+    }
+    const auto& src = src_it->second;
+    const auto& dst = dst_it->second;
     auto sp = port_on_module(files, src.module_name, source_port);
     auto dp = port_on_module(files, dst.module_name, dest_port);
     if (sp && sp->direction != "output") {
@@ -1355,13 +1374,14 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
 
     if (sp && dp && decl_type_for_port(*sp) != decl_type_for_port(*dp))
         r.warnings.push_back("type mismatch: source port '" + decl_type_for_port(*sp) + "' vs dest port '" + decl_type_for_port(*dp) + "' — using source type");
-    const std::string lca = lca_path(source_path, dest_path);
+    const std::string lca = lca_path(source_key, dest_key);
     if (lca.empty()) { r.error = "no common ancestor found"; return r; }
     const auto root_mod = lca.substr(lca.find_last_of('.') == std::string::npos ? 0 : lca.find_last_of('.') + 1);
-    r.lca_module = hierarchy.contains(lca) ? hierarchy.at(lca).module_name : root_mod;
+    const auto lca_it = hierarchy.find(lca);
+    r.lca_module = lca_it != hierarchy.end() ? lca_it->second.module_name : root_mod;
 
-    auto source_steps = path_pairs_to_lca(source_path, lca);
-    auto dest_steps = path_pairs_to_lca(dest_path, lca);
+    auto source_steps = path_pairs_to_lca(source_key, lca);
+    auto dest_steps = path_pairs_to_lca(dest_key, lca);
     const size_t needed_source_ports = source_steps.empty() ? 0 : source_steps.size() - 1;
     const size_t needed_dest_ports = dest_steps.empty() ? 0 : dest_steps.size() - 1;
     if (source_boundary_ports.size() < needed_source_ports) {
@@ -1381,19 +1401,29 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     // LCA bridge wire from those boundary ports rather than from the leaf cell
     // pin.  In the demo case `inv.o` is 1 bit, but `memory.o_data` is the real
     // exported bus that should determine the top-level bridge declaration.
+    const auto boundary_child = [&](const std::vector<std::string>& steps) -> const ResolvedInst* {
+        if (steps.empty())
+            return nullptr;
+        const auto it = hierarchy.find(steps.front());
+        return it == hierarchy.end() ? nullptr : &it->second;
+    };
     if (!source_boundary_ports.empty()) {
-        const auto& child = hierarchy.at(source_steps.front());
-        if (auto bp = port_on_module(files, child.parent_module, source_boundary_ports.front())) {
-            const auto typ = signal_decl_type_for_port(*bp);
-            if (!typ.empty())
-                r.wire_type = typ;
+        if (const auto* child = boundary_child(source_steps)) {
+            if (auto bp = port_on_module(files, child->parent_module,
+                                         source_boundary_ports.front())) {
+                const auto typ = signal_decl_type_for_port(*bp);
+                if (!typ.empty())
+                    r.wire_type = typ;
+            }
         }
     } else if (!dest_boundary_ports.empty()) {
-        const auto& child = hierarchy.at(dest_steps.front());
-        if (auto bp = port_on_module(files, child.parent_module, dest_boundary_ports.front())) {
-            const auto typ = signal_decl_type_for_port(*bp);
-            if (!typ.empty())
-                r.wire_type = typ;
+        if (const auto* child = boundary_child(dest_steps)) {
+            if (auto bp = port_on_module(files, child->parent_module,
+                                         dest_boundary_ports.front())) {
+                const auto typ = signal_decl_type_for_port(*bp);
+                if (!typ.empty())
+                    r.wire_type = typ;
+            }
         }
     }
 
