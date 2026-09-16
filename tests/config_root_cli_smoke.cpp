@@ -124,6 +124,49 @@ std::string folds_for_nested_file(const fs::path& server_bin, const std::string&
     return folds_for_uri(server_bin, root_uri, root_uri + "/rtl/core/fold_probe.sv");
 }
 
+/// Open two buffers from two different projects in ONE session and format both.
+/// Returns the server's stdout.
+///
+/// No rootUri is sent, so nothing but each file's own path says which project it
+/// belongs to.  A session-wide formatter config cannot answer both correctly,
+/// which is the point.
+std::string format_two_projects(const fs::path& server_bin, const std::string& uri_a,
+                                const std::string& uri_b) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-format-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    // Indented one level inside the module, so indent_size is what decides the
+    // leading whitespace of the middle line.
+    const std::string text = R"(module m;\nlogic x;\nendmodule\n)";
+    const std::string options =
+        R"({"tabSize":4,"insertSpaces":true})";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"capabilities":{"textDocument":{}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        for (const auto& uri : {uri_a, uri_b}) {
+            out << frame(
+                R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                R"("uri":")" + uri +
+                R"(","languageId":"systemverilog","version":1,"text":")" + text + R"("}}})");
+        }
+        out << frame(R"({"jsonrpc":"2.0","id":2,"method":"textDocument/formatting",)"
+                     R"("params":{"textDocument":{"uri":")" + uri_a +
+                     R"("},"options":)" + options + R"(}})");
+        out << frame(R"({"jsonrpc":"2.0","id":3,"method":"textDocument/formatting",)"
+                     R"("params":{"textDocument":{"uri":")" + uri_b +
+                     R"("},"options":)" + options + R"(}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after two formatting requests");
+    return result.stdout_text;
+}
+
 bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
@@ -231,6 +274,21 @@ int main(int argc, char** argv) {
         expect(contains(out, R"("id":2)"), "a rootless fold request is answered");
         expect(!contains(out, R"("startLine")"),
                "the config is found from the opened file when no root was sent");
+    }
+
+    // Formatter options are per file too, not only the two capability switches.
+    // One session, two buffers, two projects that disagree about indent_size --
+    // and no rootUri, so the only thing that can tell them apart is each file's
+    // own path.  A session-wide config gives both files the same indent, which
+    // fails whichever project it picked.
+    {
+        const auto out = format_two_projects(
+            server_bin, path_to_uri(fixtures / "indent_two" / "m.sv"),
+            path_to_uri(fixtures / "indent_eight" / "m.sv"));
+        expect(contains(out, R"(\n  logic x;)"),
+               "the 2-space project's file is formatted with its own indent_size");
+        expect(contains(out, R"(\n        logic x;)"),
+               "the 8-space project's file is formatted with its own indent_size");
     }
 
     // And the same request against a root that leaves folding on must produce
