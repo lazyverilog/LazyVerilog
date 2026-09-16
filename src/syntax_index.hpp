@@ -430,8 +430,15 @@ struct SyntaxIndex {
     /// keys from what the shard says about its own scopes.
     std::vector<SyntaxIndex> split_by_source_file(const std::vector<std::string>& uris) const;
 
-    /// Merge all collections from @p other into this index.
-    /// Used to combine extra-file indexes with the current document's index.
+    /// Merge all collections from @p other into this index, remapping its
+    /// SourceFileIDs into this one's table.
+    ///
+    /// No request path calls this, and none should: the project model is that a
+    /// handler consumes per-file shards from a published snapshot rather than a
+    /// merged whole, because merging is O(project) work that would then happen
+    /// per request.  What it still carries is a constraint -- it renumbers
+    /// SourceFileIDs, which is why no buffer-to-id cache may be stored inside a
+    /// SyntaxIndex (see PERF.md).  Only tests call it today.
     void merge(const SyntaxIndex& other);
 
     SourceFileID intern_source_file(std::string uri);

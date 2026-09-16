@@ -78,12 +78,6 @@ std::string uri_from_file_name(std::string_view file_name) {
     return uri_from_path(file);
 }
 
-std::unique_ptr<slang::SourceManager> make_lsp_source_manager() {
-    auto sm = std::make_unique<slang::SourceManager>();
-    sm->setDisableProximatePaths(true);
-    return sm;
-}
-
 std::string uri_from_source_buffer(const slang::SourceManager& sm, slang::BufferID buffer) {
     // Prefer the buffer's full path over getFileName().  getFileName() reports
     // the "proximate" spelling slang computed when the buffer was cached, which

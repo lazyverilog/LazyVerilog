@@ -529,8 +529,14 @@ class Analyzer {
     ///                       Request handlers deliberately do not poll or stat this file on
     ///                       shared filesystems; freshness is driven by explicit config reloads
     ///                       and watched-file notifications.
+    /// @param file_sizes  byte size of each entry of @p paths, in the same
+    ///        order, when the caller already knows them -- the filelist loader
+    ///        stats every entry it records, so handing those numbers over spares
+    ///        the background queue a second metadata pass over the project.
+    ///        Empty means "not known"; the sizes are then read here as before.
     void set_extra_files(const std::vector<std::string>& paths,
-                         const std::string& filelist_path = {});
+                         const std::string& filelist_path = {},
+                         const std::vector<uintmax_t>& file_sizes = {});
 
     /// Apply all project-parse inputs from one loaded configuration in a single
     /// analyzer transaction.
@@ -544,11 +550,13 @@ class Analyzer {
     /// @param project_root  directory holding lazyverilog.toml.  The on-disk
     ///        shard cache lives under it; leaving it empty runs uncached, which
     ///        is what a server with no project root should do.
+    /// @param extra_file_sizes  see set_extra_files(); empty when unknown.
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
                             const std::string& filelist_path = {},
-                            const std::string& project_root = {});
+                            const std::string& project_root = {},
+                            const std::vector<uintmax_t>& extra_file_sizes = {});
 
     /// Block until all currently queued project-index work is published.
     ///
