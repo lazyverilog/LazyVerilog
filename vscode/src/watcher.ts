@@ -18,7 +18,11 @@ export function createConfigWatcher(
   workspaceFolder: vscode.WorkspaceFolder,
 ): vscode.Disposable {
   const folderUri = workspaceFolder.uri.toString();
-  const pattern = new vscode.RelativePattern(workspaceFolder, "lazyverilog.toml");
+  // Nested configs matter now: the server resolves each file to the nearest
+  // lazyverilog.toml above it, so a monorepo can have one per sub-project.
+  // Watching only the folder root would miss every one of them, and the edit
+  // would appear not to take effect until a restart.
+  const pattern = new vscode.RelativePattern(workspaceFolder, "**/lazyverilog.toml");
   const watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
   function notify(uri: vscode.Uri): void {
