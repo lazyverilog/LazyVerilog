@@ -120,6 +120,14 @@ class LazyVerilogServer {
     mutable std::mutex last_folding_result_mutex_;
     std::unordered_map<std::string, std::shared_ptr<const std::vector<FoldingRange>>>
         last_folding_result_;
+    // The buffers didClose has not yet taken back, under the same lock.
+    //
+    // The mutex alone stops the two threads corrupting the map; it does not stop
+    // a fold reply *landing after* the erase, which strands that buffer's folds
+    // for the life of the process.  Storing only for a URI still in here, in the
+    // same critical section the erase takes, closes that: a reply that beats
+    // didClose is erased by it, and one that loses finds no entry to write to.
+    std::unordered_set<std::string> folding_result_live_uris_;
     std::unordered_map<std::string, std::unordered_set<std::string>> diagnostic_uris_by_owner_;
 
     // Background project indexing and optional semantic compilation can request
