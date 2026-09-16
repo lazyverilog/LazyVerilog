@@ -23,14 +23,11 @@ static bool is_ident_char(char c) {
 }
 
 // Convert 0-based LSP (line, character) to byte offset in text.
+//
+// `character` is a UTF-16 code unit count, not a byte count, so it cannot be
+// added to the line start directly -- see lsp_position_to_byte_offset().
 static size_t position_to_offset(const std::string& text, int line, int col) {
-    int cur_line = 0;
-    size_t i = 0;
-    while (i < text.size() && cur_line < line) {
-        if (text[i] == '\n') ++cur_line;
-        ++i;
-    }
-    return std::min(i + (size_t)std::max(0, col), text.size());
+    return std::min(lsp_position_to_byte_offset(text, line, col), text.size());
 }
 
 // Read an identifier backwards from pos. Returns the word in forward order;
@@ -1212,7 +1209,7 @@ static lsCompletionItem make_item(std::string label, lsCompletionItemKind kind) 
 }
 
 // Unused.  If it is ever revived and its result reaches the client, the column
-// has to go through utf16_column() like every other LSP position.
+// has to go through lsp_column() like every other LSP position.
 static std::pair<int, int> completion_ast_token_pos(const slang::SourceManager& sm,
                                                     const slang::parsing::Token& token) {
     if (!token || !token.location().valid())

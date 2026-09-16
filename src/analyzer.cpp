@@ -98,7 +98,7 @@ static void cache_document_end_position(DocumentState& state) {
             line_start = i + 1;
         }
     }
-    const size_t col = utf16_units_until_newline(state.text, line_start);
+    const size_t col = lsp_columns_until_newline(state.text, line_start);
     state.end_line = saturating_lsp_int(line);
     state.end_character = saturating_lsp_int(col);
 }
@@ -154,7 +154,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
             if (loc.valid() && sm.isFileLoc(loc)) {
                 size_t ln = sm.getLineNumber(loc);
                 info.line = ln > 0 ? (int)ln - 1 : 0;
-                info.col = utf16_column(sm, loc);
+                info.col = lsp_column(sm, loc);
             }
         } catch (...) {
         }
@@ -253,6 +253,29 @@ static void preload_cached_header_texts(slang::SourceManager& sm, HeaderTextCach
 
 static std::string header_directives_only(std::string_view text);
 
+/// Whether the `` `include `` a CouldNotOpenIncludeFile diagnostic points at was
+/// written with angle brackets.
+///
+/// The diagnostic's own argument cannot answer this.  slang strips the
+/// delimiters before it formats the message -- `path = path.substr(1, len - 2)`
+/// in Preprocessor::handleIncludeDirective -- so an unresolved
+/// `` `include <x.svh> `` and `` `include "x.svh" `` both arrive here spelled
+/// `x.svh`, and a first-character test on that string is false for every
+/// include there is.
+///
+/// The diagnostic is raised on the file-name token's range and
+/// `Diagnostics::add(code, range)` keeps `range.start()` as the location, so the
+/// location addresses the delimiter itself.  Read it from the buffer rather than
+/// from the rendered message.
+static bool include_diagnostic_is_system(const slang::SourceManager& sm,
+                                         slang::SourceLocation location) {
+    if (!location.valid())
+        return false;
+    const auto buffer = sm.getSourceText(location.buffer());
+    const auto offset = location.offset();
+    return offset < buffer.size() && buffer[offset] == '<';
+}
+
 /// Record how every `include in @p tree resolved, so a later launch can tell
 /// whether the same directive would now find something else.
 ///
@@ -304,8 +327,9 @@ static std::vector<IncludeResolution> collect_include_resolutions(
             .from_uri = directive_origin(diagnostic.location),
             .spelling = *spelling,
             // A system include that found nothing is recorded as one: the
-            // search it would re-run is a different search.
-            .is_system = spelling->front() == '<',
+            // search it would re-run is a different search.  Taken from the
+            // source, not from `spelling` -- see include_diagnostic_is_system().
+            .is_system = include_diagnostic_is_system(sm, diagnostic.location),
             .resolved_uri = {},
         });
     }
@@ -490,13 +514,31 @@ static std::string header_cache_key(const slang::SourceManager& sm, const std::s
     return {};
 }
 
+/// Where a line's block comments begin and end, for the projection below.
+struct LineCommentSpan {
+    /// End of a block comment that was already open when the line started and
+    /// closed on it -- so the text before this offset belongs to that comment.
+    /// Zero when the line did not start inside one.
+    size_t lead_end{0};
+    /// Start of a block comment still open when the line ended, or the line's
+    /// length when none is.  Text from here on is the beginning of a comment
+    /// whose closing `*/` is on a line the projection drops.
+    size_t open_start{0};
+};
+
 /// Whether @p line's first thing that is neither whitespace nor a comment is a
-/// backtick, updating @p in_block_comment for the line that follows.
+/// backtick, updating @p in_block_comment for the line that follows and
+/// reporting @p span so the caller can emit the line without its comments.
 ///
 /// The comment state has to be carried whether or not the answer is already
 /// known, or a dropped line that opens a block comment would leave a later
 /// `define inside it looking like a directive.
-static bool line_starts_directive(std::string_view line, bool& in_block_comment) {
+static bool line_starts_directive(std::string_view line, bool& in_block_comment,
+                                  LineCommentSpan& span) {
+    span = LineCommentSpan{0, line.size()};
+    // Whether the comment currently open was opened on this line, which is what
+    // separates a lead-in the caller must blank from a tail it must cut.
+    bool opened_here = false;
     bool starts = false;
     bool decided = false;
     for (size_t i = 0; i < line.size();) {
@@ -504,6 +546,12 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
             if (line.compare(i, 2, "*/") == 0) {
                 in_block_comment = false;
                 i += 2;
+                if (opened_here) {
+                    opened_here = false;
+                    span.open_start = line.size(); // closed again; nothing hangs over
+                } else {
+                    span.lead_end = i;
+                }
             } else {
                 ++i;
             }
@@ -513,6 +561,8 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
             break;
         if (line.compare(i, 2, "/*") == 0) {
             in_block_comment = true;
+            opened_here = true;
+            span.open_start = i;
             i += 2;
             continue;
         }
@@ -553,9 +603,20 @@ static bool line_starts_directive(std::string_view line, bool& in_block_comment)
 /// its definition, and anything that resolves one back to the header would
 /// otherwise report the wrong line.
 ///
-/// A directive inside a block comment stays dropped even though the preprocessor
-/// would ignore it either way — keeping the line without its opening /* would
-/// leave a stray */ in text that gets `include`d.
+/// A kept line is emitted without any block comment that crosses a line
+/// boundary, because the other end of such a comment is on a line this drops.
+/// Both directions lost macros before they were handled:
+///
+///   * a directive whose trailing `/*` closed on a later line was kept with the
+///     comment left open, so everything after it -- every later `define in the
+///     header -- was swallowed, and the includer got "block comment unclosed at
+///     end of file" on a header that parses cleanly on its own;
+///   * a directive written after a `*/` that closed a comment opened earlier was
+///     dropped outright, because the line *started* inside a comment even though
+///     the directive did not.
+///
+/// So the comment text is cut and the lead-in blanked, which leaves the
+/// directive itself and its columns untouched and can never emit half a comment.
 static std::string header_directives_only(std::string_view text) {
     std::string projected;
     projected.reserve(text.size() / 8 + 64);
@@ -568,15 +629,25 @@ static std::string header_directives_only(std::string_view text) {
         const auto line_end = eol == std::string_view::npos ? text.size() : eol;
         const auto line = text.substr(pos, line_end - pos);
 
-        const bool opened_in_comment = in_block_comment;
-        const bool directive = line_starts_directive(line, in_block_comment);
-        const bool keep = continuing || (!opened_in_comment && directive);
-        if (keep)
-            projected.append(line);
+        LineCommentSpan span;
+        const bool directive = line_starts_directive(line, in_block_comment, span);
+        const bool keep = continuing || directive;
 
-        auto body = line;
+        // Everything the directive needs sits between the comment that ended on
+        // this line and the one that starts on it; both ends belong to lines
+        // that are dropped, so neither can be emitted.
+        std::string_view body = line.substr(span.lead_end, span.open_start - span.lead_end);
+        if (keep) {
+            // Blanked rather than removed: a directive keeps the column it is
+            // written in, for the same reason a dropped line keeps its place.
+            projected.append(span.lead_end, ' ');
+            projected.append(body);
+        }
+
         while (!body.empty() && (body.back() == '\r' || body.back() == '\n'))
             body.remove_suffix(1);
+        // Read off what was emitted, not off the original: a backslash inside a
+        // comment this cut is not a line continuation of the text that remains.
         continuing = keep && !body.empty() && body.back() == '\\';
 
         if (eol == std::string_view::npos)
@@ -1348,7 +1419,11 @@ struct IdentifierSpan {
     int end_col{0};
 };
 
-// Extract identifier at (0-based line, 0-based col) from source text.
+// Extract identifier at (0-based line, 0-based LSP column) from source text.
+//
+// `col` is measured the way the client measures it -- UTF-16 code units -- and
+// the returned columns are too, because they are handed straight back to the
+// client as a rename range.  Only the walk in between is in bytes.
 static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, int line, int col) {
     int cur = 0;
     size_t pos = 0;
@@ -1365,9 +1440,11 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
     if (le == std::string_view::npos)
         le = src.size();
 
-    if (col < 0 || (size_t)col >= le - ls)
+    if (col < 0)
         return std::nullopt;
-    size_t ip = ls + col;
+    size_t ip = lsp_col_to_byte_offset(src, ls, col);
+    if (ip >= le)
+        return std::nullopt;
 
     auto is_id = [](char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '$'; };
     if (!is_id(src[ip]))
@@ -1380,8 +1457,9 @@ static std::optional<IdentifierSpan> extract_ident_span(std::string_view src, in
     while (end < le && is_id(src[end]))
         ++end;
 
-    return IdentifierSpan{std::string(src.substr(start, end - start)), (int)(start - ls),
-                          (int)(end - ls)};
+    return IdentifierSpan{std::string(src.substr(start, end - start)),
+                          lsp_column_from_byte_offset(src, ls, start),
+                          lsp_column_from_byte_offset(src, ls, end)};
 }
 
 static bool same_location(const Location& lhs, const Location& rhs) {
@@ -1393,6 +1471,8 @@ static std::string extract_ident(std::string_view src, int line, int col) {
     return span ? span->text : std::string{};
 }
 
+// @p ident_start_col is an LSP column, matching what extract_ident_span() and
+// identifier_at() report; it becomes a byte offset here and nowhere else.
 static bool is_backtick_identifier(std::string_view src, int line, int ident_start_col) {
     int cur = 0;
     size_t pos = 0;
@@ -1408,7 +1488,11 @@ static bool is_backtick_identifier(std::string_view src, int line, int ident_sta
     size_t line_end = src.find('\n', pos);
     if (line_end == std::string_view::npos)
         line_end = src.size();
-    const size_t backtick = line_start + (size_t)ident_start_col - 1;
+    const size_t ident_start = lsp_col_to_byte_offset(src, line_start, ident_start_col);
+    if (ident_start <= line_start)
+        return false;
+    // One byte back, not one column: a backtick is ASCII wherever it appears.
+    const size_t backtick = ident_start - 1;
     return backtick < line_end && src[backtick] == '`';
 }
 
@@ -1424,7 +1508,7 @@ static bool is_define_identifier(std::string_view src, int line, int ident_start
         return false;
 
     const size_t line_start = pos;
-    const size_t ident_start = line_start + (size_t)ident_start_col;
+    const size_t ident_start = lsp_col_to_byte_offset(src, line_start, ident_start_col);
     if (ident_start > src.size())
         return false;
 
@@ -1449,7 +1533,7 @@ find_module_definition(const SyntaxIndex& index, const std::string& uri, const s
     const auto actual_uri = index.source_uri(module.file_id);
     const int line = to_lsp_line(module.line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, module.col, line,
-                    module.col + (int)utf16_length(module.name)};
+                    module.col + lsp_column_width(module.name)};
 }
 
 static const ModuleEntry* find_module_entry(const SyntaxIndex& index, const std::string& name) {
@@ -1484,7 +1568,7 @@ static std::optional<Location> find_port_definition(const SyntaxIndex& index,
     const auto actual_uri = index.source_uri(port->file_id);
     const int line = to_lsp_line(port->line);
     return Location{actual_uri.empty() ? uri : actual_uri, line, port->col, line,
-                    port->col + (int)utf16_length(port->name)};
+                    port->col + lsp_column_width(port->name)};
 }
 
 // Class name that `owner::alias` names, for a `typedef` declared inside a class.
@@ -1524,7 +1608,7 @@ static std::optional<Location> find_package_member(const SyntaxIndex& index,
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)utf16_length(member_name)};
+                        col + lsp_column_width(member_name)};
     };
 
     if (auto it = index.package_value_by_scoped_name.find(key);
@@ -1733,9 +1817,9 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
     const int line = to_lsp_line((int)sm.getLineNumber(location));
-    const int col = utf16_column(sm, location);
+    const int col = lsp_column(sm, location);
     return Location{uri, line, col, line,
-                    col + (int)utf16_length(token.valueText())};
+                    col + lsp_column_width(token.valueText())};
 }
 
 static Location location_from_token_actual_uri(const slang::SourceManager& sm,
@@ -2258,7 +2342,7 @@ static std::optional<Location> find_generic_definition_from_index(
         const auto actual_uri = index.source_uri(file_id);
         const int lsp_line = to_lsp_line(line);
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
-                        col + (int)utf16_length(name)};
+                        col + lsp_column_width(name)};
     };
 
     // Modules and packages — scope-insensitive, always visible (mirrors
@@ -2443,16 +2527,16 @@ static std::optional<Location> find_interface_member_definition(const SyntaxInde
 
     for (const auto& modport : iface.modports) {
         if (modport.name == member_name)
-            return locate(modport.file_id, modport.line, modport.col, utf16_length(modport.name));
+            return locate(modport.file_id, modport.line, modport.col, lsp_column_width(modport.name));
     }
     for (const auto& port : iface.ports) {
         if (port.name == member_name)
-            return locate(port.file_id, port.line, port.col, utf16_length(port.name));
+            return locate(port.file_id, port.line, port.col, lsp_column_width(port.name));
     }
     for (const auto& value : index.values) {
         if (value.parent_scope != interface_name || value.name != member_name)
             continue;
-        return locate(value.file_id, value.line, value.col, utf16_length(value.name));
+        return locate(value.file_id, value.line, value.col, lsp_column_width(value.name));
     }
     return std::nullopt;
 }
@@ -2761,7 +2845,7 @@ static std::optional<Location> find_typedef_field_definition(const SyntaxIndex& 
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)utf16_length(field.name)};
+                            field.col + lsp_column_width(field.name)};
         }
     }
     return std::nullopt;
@@ -2789,7 +2873,7 @@ static std::optional<Location> find_aggregate_field_declaration_at(const SyntaxI
             return std::nullopt;
 
         return Location{resolved_uri, field_lsp_line, field.col, field_lsp_line,
-                        field.col + (int)utf16_length(field.name)};
+                        field.col + lsp_column_width(field.name)};
     };
 
     // Generic unqualified lookup intentionally ignores aggregate fields, but
@@ -2835,7 +2919,7 @@ static std::optional<Location> find_class_method_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)utf16_length(method.name)};
+                            method.col + lsp_column_width(method.name)};
         }
     }
     return std::nullopt;
@@ -2865,7 +2949,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(field.file_id);
             const int line = to_lsp_line(field.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, field.col, line,
-                            field.col + (int)utf16_length(field.name)};
+                            field.col + lsp_column_width(field.name)};
         }
         for (const auto& method : cls.methods) {
             if (method.name != member_name || method.line <= 0)
@@ -2873,7 +2957,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(method.file_id);
             const int line = to_lsp_line(method.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, method.col, line,
-                            method.col + (int)utf16_length(method.name)};
+                            method.col + lsp_column_width(method.name)};
         }
 
         // A class-scoped typedef (`my_item::type_id`) is a member too, but it
@@ -2884,7 +2968,7 @@ static std::optional<Location> find_class_member_definition(const SyntaxIndex& i
             const std::string actual_uri = index.source_uri(td.file_id);
             const int line = to_lsp_line(td.line);
             return Location{actual_uri.empty() ? uri : actual_uri, line, td.col, line,
-                            td.col + (int)utf16_length(td.name)};
+                            td.col + lsp_column_width(td.name)};
         }
     }
     return std::nullopt;
@@ -3464,9 +3548,9 @@ static bool contains_position(const slang::SourceManager& sm, slang::SourceRange
 
     // Compared against a request position, which the client measures in UTF-16.
     const int start_line = to_lsp_line((int)sm.getLineNumber(range.start()));
-    const int start_col = utf16_column(sm, range.start());
+    const int start_col = lsp_column(sm, range.start());
     const int end_line = to_lsp_line((int)sm.getLineNumber(range.end()));
-    const int end_col = utf16_column(sm, range.end());
+    const int end_col = lsp_column(sm, range.end());
 
     if (line < start_line || line > end_line)
         return false;
@@ -4533,13 +4617,13 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
 
             const auto start = visible_range_for_token(sm, token).start();
             const int token_line = to_lsp_line((int)sm.getLineNumber(start));
-            const int token_col = utf16_column(sm, start);
+            const int token_col = lsp_column(sm, start);
             const std::string name(token.valueText());
             result = IdentifierAtPosition{
                 .name = name,
                 .line = token_line,
                 .col = token_col,
-                .end_col = token_col + (int)utf16_length(name),
+                .end_col = token_col + lsp_column_width(name),
             };
         }
     };
@@ -5844,7 +5928,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             if (!seen.insert(key).second)
                 return;
             result.push_back(Location{file_uri, ref_line, ref_col, ref_line,
-                                      ref_col + (int)utf16_length(target->name)});
+                                      ref_col + lsp_column_width(target->name)});
         };
 
     auto visit_tree =
@@ -6119,6 +6203,15 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
 /// Ties keep filelist order, so the queue is the same on every launch.
 std::vector<std::string> order_by_descending_size(const std::vector<std::string>& paths) {
     if (paths.size() < 3)
+        return paths;
+
+    // One worker drains the queue in whatever order it is given and finishes at
+    // the same time either way, so the stats buy nothing there -- and the first
+    // entry, which is the only slot with a job to do, keeps its place with or
+    // without this.  That is the single-core slice a batch scheduler hands out,
+    // which is also where a stat is least affordable: nothing else is running to
+    // overlap it with.
+    if (available_cpu_count() <= 1)
         return paths;
 
     std::vector<std::pair<uintmax_t, size_t>> keyed;
@@ -6566,7 +6659,6 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::unordered_map<std::string, std::string> local_resolution;
 
     const auto resolve_include = [&](const IncludeResolution& recorded) -> std::string {
-        std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
         const std::filesystem::path spelling(recorded.spelling);
         if (spelling.is_absolute())
             return resolved_uri_if_file(spelling);
@@ -6575,6 +6667,29 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         if (recorded.is_system)
             return {};
 
+        // Look up under the lock, search with it released, then record.  The
+        // memo is shared by every preload thread precisely because a hit is a
+        // hash lookup and a miss is one stat -- but the lock has to cover the
+        // lookup only.  Held across the search, one slow stat stands in front of
+        // every other thread's hit, and on the shared filesystems this whole
+        // check is aimed at that stat is a round trip.
+        //
+        // Two threads reaching the same spelling therefore both stat it.  That
+        // is the trade cached_file_digest() already makes for the same reason:
+        // duplicating the work is cheaper than either one waiting, and whichever
+        // insert lands first is the answer both of them get.
+        const auto memoized = [&](std::unordered_map<std::string, std::string>& memo,
+                                  const std::string& key, auto&& search) -> std::string {
+            {
+                std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
+                if (const auto it = memo.find(key); it != memo.end())
+                    return it->second;
+            }
+            std::string resolved = search();
+            std::lock_guard<std::mutex> resolution_lock(resolution_mutex);
+            return memo.emplace(key, std::move(resolved)).first->second;
+        };
+
         // The including file's own directory comes first.
         const auto from_directory =
             std::filesystem::path(path_from_file_uri(recorded.from_uri)).parent_path().string();
@@ -6582,30 +6697,22 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
             auto local_key = from_directory;
             local_key += '\n';
             local_key += recorded.spelling;
-            const auto it = local_resolution.find(local_key);
-            const auto& local =
-                it != local_resolution.end()
-                    ? it->second
-                    : local_resolution
-                          .emplace(std::move(local_key),
-                                   resolved_uri_if_file(std::filesystem::path(from_directory) /
-                                                        spelling))
-                          .first->second;
+            const auto local = memoized(local_resolution, local_key, [&] {
+                return resolved_uri_if_file(std::filesystem::path(from_directory) / spelling);
+            });
             if (!local.empty())
                 return local;
         }
 
-        if (const auto it = incdir_resolution.find(recorded.spelling);
-            it != incdir_resolution.end())
-            return it->second;
-        std::string resolved;
-        for (const auto& directory : include_dirs) {
-            resolved = resolved_uri_if_file(directory / spelling);
-            if (!resolved.empty())
-                break;
-        }
-        incdir_resolution.emplace(recorded.spelling, resolved);
-        return resolved;
+        return memoized(incdir_resolution, recorded.spelling, [&] {
+            std::string resolved;
+            for (const auto& directory : include_dirs) {
+                resolved = resolved_uri_if_file(directory / spelling);
+                if (!resolved.empty())
+                    break;
+            }
+            return resolved;
+        });
     };
 
     // A shard is usable only when everything it was built from still holds.

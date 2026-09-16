@@ -162,19 +162,12 @@ struct StdInStream : lsp::base_istream<std::istream> {
 // One implementation, shared with the feature layer -- incremental sync and the
 // rename safety check must agree byte for byte on where a column lands.
 static size_t advance_utf16_cols(const std::string& text, size_t pos, int col) {
-    return utf16_col_to_byte_offset(text, pos, col);
+    return lsp_col_to_byte_offset(text, pos, col);
 }
 
 // Convert (line, col) LSP position to byte offset in text.
 static size_t lsp_offset(const std::string& text, int line, int col) {
-    int cur = 0;
-    size_t pos = 0;
-    while (pos < text.size() && cur < line) {
-        if (text[pos] == '\n')
-            ++cur;
-        ++pos;
-    }
-    return advance_utf16_cols(text, pos, col);
+    return lsp_position_to_byte_offset(text, line, col);
 }
 
 // Compute two byte offsets in a single scan. Positions must be in document order
@@ -566,6 +559,17 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     impl_->remote_endpoint.setIncomingMessagePreview([this](const std::string& raw) {
         edit_watermark_.observe(raw);
         cancelled_requests_.observe(raw);
+        // Read here rather than from the parsed request, for two reasons.
+        // lspcpp's lsClientCapabilities has no `general` member, so the offer is
+        // not in the request object at all; and this runs before the message is
+        // queued, which is before the `initialize` handler configures the
+        // project and starts indexing.  The index stores columns, so the
+        // encoding has to be settled before the first shard is built.
+        if (auto encoding = position_encoding_from_initialize(raw)) {
+            set_negotiated_position_encoding(*encoding);
+            std::cerr << "[lazyverilog] position encoding: "
+                      << position_encoding_name(*encoding) << "\n";
+        }
     });
     impl_->remote_endpoint.startProcessingMessages(impl_->input, impl_->output);
 }
@@ -891,6 +895,18 @@ void LazyVerilogServer::register_handlers() {
             rsp.result.serverInfo = std::move(server_info);
 
             auto& caps = rsp.result.capabilities;
+
+            // Answer the client's `general.positionEncodings` offer, which the
+            // preview hook resolved before this handler was queued.
+            //
+            // Stated unconditionally, including when the answer is the UTF-16
+            // default.  Saying it costs nothing -- every client must support
+            // UTF-16, and one too old to know the field ignores it -- while
+            // leaving it out makes "negotiated UTF-16" and "never looked"
+            // indistinguishable from the outside, which is exactly the question
+            // to ask first when columns come out wrong.
+            caps.positionEncoding =
+                std::string(position_encoding_name(negotiated_position_encoding()));
 
             // Whether a later [folding].enable / [inlay_hint].enable edit can
             // reach this client at all.  Neovim answers false for foldingRange

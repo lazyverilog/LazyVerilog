@@ -65,8 +65,8 @@ std::optional<std::string_view> text_in_range(std::string_view text, const lsRan
     // ASCII line the two coincide, which is why treating them as byte indices
     // went unnoticed until a line carried non-ASCII text -- there the range
     // reached past the end of the line and the whole rename was refused.
-    const size_t start_byte = utf16_col_to_byte_offset(line, 0, range.start.character);
-    const size_t end_byte = utf16_col_to_byte_offset(line, 0, range.end.character);
+    const size_t start_byte = lsp_col_to_byte_offset(line, 0, range.start.character);
+    const size_t end_byte = lsp_col_to_byte_offset(line, 0, range.end.character);
     if (start_byte > line.size() || end_byte > line.size() || end_byte < start_byte)
         return std::nullopt;
     return line.substr(start_byte, end_byte - start_byte);

@@ -678,9 +678,27 @@ std::optional<std::string> read_regular_file(const fs::path& path) {
         std::ifstream in(path, std::ios::binary);
         if (!in)
             return std::nullopt;
-        std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        // Sized in one read rather than assembled a character at a time.  The
+        // istreambuf_iterator pair this replaces went through the streambuf's
+        // virtual sgetc/sbumpc per byte and grew the string as it went: 1.17 ms
+        // for a 636 KiB header against 0.036 ms here, and this path reads every
+        // file in the project on a warm start to hash it, plus every shard.
+        //
+        // The size comes from seeking the handle that is already open, not from
+        // a second look at the path: file_size() would be another metadata call
+        // per file, which is the thing a shared filesystem charges for.
+        in.seekg(0, std::ios::end);
+        const auto end = in.tellg();
+        if (end < 0)
+            return std::nullopt;
+        in.seekg(0, std::ios::beg);
+        std::string bytes(static_cast<size_t>(end), '\0');
+        if (end > 0)
+            in.read(bytes.data(), end);
         if (in.bad())
             return std::nullopt;
+        // A file that shrank between the seek and the read is short, not broken.
+        bytes.resize(static_cast<size_t>(in.gcount()));
         return bytes;
     } catch (const std::exception&) {
         return std::nullopt;
@@ -777,6 +795,18 @@ IndexCache::Digest IndexCache::config_digest(const std::vector<std::string>& def
         joined += dir.string();
         joined += '\n';
     }
+    // The negotiated position encoding, because a shard stores columns in it.
+    //
+    // This is not a parse input like the two above -- the same bytes parse to
+    // the same declarations either way -- but it decides what a stored column
+    // *means*, and a shard cannot be converted after the fact: it keeps no
+    // source text, which is the reason positions are converted at index time in
+    // the first place (see lsp_position.hpp).  So a cache written for a UTF-16
+    // session must not be served to a UTF-8 one, and keying it here is what
+    // makes the switch a miss rather than an off-by-a-few-columns answer that
+    // only shows up on lines with non-ASCII text.
+    joined += "\x1e";
+    joined += position_encoding_name(negotiated_position_encoding());
     return digest_bytes(joined);
 }
 

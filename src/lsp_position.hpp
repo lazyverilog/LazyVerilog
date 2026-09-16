@@ -24,13 +24,19 @@
 /// Cost is one pass over the bytes from the line start to the column, with a
 /// predicted branch per ASCII byte.  That is what clangd pays per indexed
 /// token, unconditionally and with no per-file fast path.
-inline int utf16_column(const slang::SourceManager& sm, slang::SourceLocation location) {
+inline int lsp_column(const slang::SourceManager& sm, slang::SourceLocation location) {
     if (!location.valid())
         return 0;
 
     const size_t byte_col = sm.getColumnNumber(location);
     if (byte_col <= 1)
         return 0;
+
+    // A session that negotiated UTF-8 wants exactly what slang already has, so
+    // there is nothing to convert and nothing to read the line for.  This is the
+    // whole of what `positionEncoding: "utf-8"` buys on the way out.
+    if (lsp_columns_are_bytes())
+        return static_cast<int>(byte_col - 1);
 
     // getColumnNumber() is 1-based, so the line starts this many bytes back.
     const size_t bytes_into_line = byte_col - 1;
@@ -42,5 +48,6 @@ inline int utf16_column(const slang::SourceManager& sm, slang::SourceLocation lo
     if (buffer.empty() || offset > buffer.size())
         return static_cast<int>(bytes_into_line);
 
+    // UTF-16 by construction: the byte-column case returned above.
     return static_cast<int>(utf16_length(buffer.substr(offset - bytes_into_line, bytes_into_line)));
 }
