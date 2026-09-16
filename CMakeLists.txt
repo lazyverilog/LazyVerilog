@@ -107,7 +107,36 @@ string(REPLACE
     "monikerProvider, semanticTokensProvider\n)"
     "monikerProvider, semanticTokensProvider, inlayHintProvider\n)"
     _caps_content "${_caps_content}")
+
+# Patch: and the same for `positionEncoding` (LSP 3.17).  Without it the server
+# has no field to answer the client's `general.positionEncodings` offer in, so
+# every session falls back to the protocol's UTF-16 default and pays a
+# conversion on both sides of every position.  Guarded on the field's own name
+# so a re-configure does not add it twice.
+string(FIND "${_caps_content}" "positionEncoding" _caps_encoding_done)
+if(_caps_encoding_done EQUAL -1)
+    string(REPLACE
+        "    optional<lsp::Any> experimental;"
+        "    // The position encoding the server selected from the client's offer.\n    // \"utf-8\" | \"utf-16\" | \"utf-32\"; absent means the 3.17 default, UTF-16.\n    optional<std::string> positionEncoding;\n\n    optional<lsp::Any> experimental;"
+        _caps_content "${_caps_content}")
+    string(REPLACE
+        "monikerProvider, semanticTokensProvider, inlayHintProvider\n)"
+        "monikerProvider, semanticTokensProvider, inlayHintProvider, positionEncoding\n)"
+        _caps_content "${_caps_content}")
+endif()
 file(WRITE "${_caps_h}" "${_caps_content}")
+
+# An upstream bump that moves either anchor must fail the configure rather than
+# produce a server that silently stopped negotiating and started answering
+# UTF-8 columns to a client counting UTF-16.
+string(FIND "${_caps_content}" "optional<std::string> positionEncoding;" _caps_field_ok)
+string(FIND "${_caps_content}" "inlayHintProvider, positionEncoding" _caps_reflect_ok)
+if(_caps_field_ok EQUAL -1 OR _caps_reflect_ok EQUAL -1)
+    message(FATAL_ERROR
+        "Could not patch LspCpp's lsServerCapabilities with the positionEncoding field. The "
+        "pinned LspCpp revision has probably moved and the anchors above no longer match its "
+        "source. Re-derive them before bumping GIT_TAG.")
+endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Patch: give LspCpp's InitializeResult the `serverInfo` field.
@@ -253,6 +282,7 @@ set(LAZYVERILOG_SOURCES
     src/syntax_index_shared.cpp
     src/index_cache.cpp
     src/edit_watermark.cpp
+    src/position_encoding.cpp
     src/features/hover.cpp
     src/features/definition.cpp
     src/features/references.cpp
@@ -299,6 +329,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_path_uri.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
+    tests/test_lsp_position_encoding.cpp
     tests/test_open_parse_header_cache.cpp
     tests/test_open_header_projection.cpp
     tests/test_open_shard_scope.cpp
@@ -334,6 +365,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/syntax_index_shared.cpp
     src/index_cache.cpp
     src/edit_watermark.cpp
+    src/position_encoding.cpp
     src/features/formatter.cpp
     src/features/lint.cpp
     src/features/autoff.cpp

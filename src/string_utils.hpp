@@ -1,4 +1,6 @@
 #pragma once
+#include "position_encoding.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -165,6 +167,99 @@ inline size_t utf16_units_until_newline(std::string_view text, size_t pos) {
     return units;
 }
 
+// ── The LSP column boundary ───────────────────────────────────────────────────
+//
+// The four functions above measure UTF-16 unconditionally, which is what they
+// are for: they are the definition of the conversion, and the tests that pin it
+// call them directly.  The four below are what the rest of the server uses.
+// They answer in whatever unit this session negotiated, so a client that asked
+// for UTF-8 is served byte offsets with no conversion at all and every caller
+// stays as it was.
+//
+// The split is deliberate and the names are the whole point: `utf16_` says "a
+// UTF-16 count, always", `lsp_` says "whatever the client is counting in".
+// Anything reaching a Position, a Range or an index shard wants the second.
+
+/// Width of @p text in LSP columns.
+inline int lsp_column_width(std::string_view text) {
+    return static_cast<int>(lsp_columns_are_bytes() ? text.size() : utf16_length(text));
+}
+
+/// Byte offset of LSP column @p col within the line starting at @p line_start.
+inline size_t lsp_col_to_byte_offset(std::string_view text, size_t line_start, int col) {
+    if (!lsp_columns_are_bytes())
+        return utf16_col_to_byte_offset(text, line_start, col);
+    if (col <= 0)
+        return line_start;
+    // Already a byte count, but still bounded by the line: a column past the end
+    // of one must not run into the next, which is the guarantee the UTF-16 walk
+    // gives and every caller slicing document text relies on.
+    auto line_end = text.find('\n', line_start);
+    if (line_end == std::string_view::npos)
+        line_end = text.size();
+    const size_t wanted = line_start + static_cast<size_t>(col);
+    return wanted < line_end ? wanted : line_end;
+}
+
+/// LSP columns from byte offset @p pos until a newline or the end of @p text.
+inline size_t lsp_columns_until_newline(std::string_view text, size_t pos) {
+    if (!lsp_columns_are_bytes())
+        return utf16_units_until_newline(text, pos);
+    const auto line_end = text.find('\n', pos);
+    return (line_end == std::string_view::npos ? text.size() : line_end) - pos;
+}
+
+/// Byte offset of the first character of 0-based @p line.
+///
+/// Returns the end of the text when the document has fewer lines than asked
+/// for, so a position past the end clamps instead of failing: LSP clients
+/// legitimately send one-past-the-end positions for an append at EOF.
+inline size_t lsp_line_start_offset(std::string_view text, int line) {
+    if (line <= 0)
+        return 0;
+    int cur = 0;
+    size_t pos = 0;
+    while (pos < text.size() && cur < line) {
+        if (text[pos] == '\n')
+            ++cur;
+        ++pos;
+    }
+    return pos;
+}
+
+/// Byte offset of an incoming LSP position.
+///
+/// The one place a `Position` from the client becomes an index into the
+/// document's UTF-8 bytes.  Every feature that slices document text at a
+/// request position must come through here, because `Position.character` is a
+/// count of UTF-16 code units and the text is UTF-8: on a line carrying any
+/// non-ASCII character the two disagree, and a handler that indexes with the
+/// raw column lands somewhere earlier in the line.
+///
+/// That is not a hypothetical.  Hover, completion and signature help each
+/// walked to the line themselves and then added `character` as if it were a
+/// byte count, so a Korean comment or a `µ` earlier on the line was enough to
+/// make hover answer nothing and completion fall back to a keyword dump.  The
+/// duplicated line walks are what let the three drift apart from the
+/// incremental-sync path, which had it right, so the walk lives here too.
+///
+/// This is also the single switch point for `positionEncoding`: a client that
+/// negotiates UTF-8 sends byte offsets and wants this to be the identity.
+inline size_t lsp_position_to_byte_offset(std::string_view text, int line, int character) {
+    return lsp_col_to_byte_offset(text, lsp_line_start_offset(text, line), character);
+}
+
+/// UTF-16 column of a byte offset that is known to lie on @p line_start's line.
+///
+/// The outgoing half of the boundary above, for positions the server computed
+/// as byte offsets into its own text rather than reading off a slang location.
+inline int lsp_column_from_byte_offset(std::string_view text, size_t line_start, size_t offset) {
+    if (offset <= line_start)
+        return 0;
+    return lsp_column_width(text.substr(line_start, offset - line_start));
+}
+
+
 
 inline std::optional<std::string> read_file_text_optional(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
@@ -175,28 +270,59 @@ inline std::optional<std::string> read_file_text_optional(const std::filesystem:
     // helper robust for paths where the size cannot be queried or the stream is
     // not seekable.  Large RTL sources are common, so avoiding repeated string
     // growth keeps project/background parsing from wasting allocator work.
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    if (!ec) {
-        std::string text(size, '\0');
-        if (size == 0)
+    //
+    // Sized by seeking the handle that is already open rather than by asking the
+    // filesystem about the path a second time: file_size() is another metadata
+    // call for a question this stream can answer, and on a shared filesystem
+    // that is a round trip per file read.
+    in.seekg(0, std::ios::end);
+    const auto hint = in.tellg();
+    in.seekg(0, std::ios::beg);
+
+    // tellg() is a hint, not a promise.  libstdc++ opens a directory
+    // successfully and reports LLONG_MAX as its size, so sizing a string from it
+    // outright throws bad_alloc -- on a background thread, with nothing to catch
+    // it.  A filelist naming a directory is a user's typo, not a reason to take
+    // the server down.  Cap what the hint may reserve and read anything larger
+    // in chunks, which costs one extra pass for a file nobody has and cannot be
+    // talked into an absurd allocation.
+    constexpr std::streamoff kMaxSizeHint = std::streamoff{1} << 30; // 1 GiB
+    if (in && hint >= 0 && hint <= kMaxSizeHint) {
+        std::string text(static_cast<size_t>(hint), '\0');
+        if (hint == 0)
             return text;
-        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        in.read(text.data(), hint);
         text.resize(static_cast<size_t>(in.gcount()));
         return text;
     }
 
-    std::string text;
-    in.seekg(0, std::ios::end);
-    if (const auto end = in.tellg(); end > 0)
-        text.reserve(static_cast<size_t>(end));
+    // No usable hint: unseekable, or a size that cannot be true.  Read what the
+    // stream actually gives.  An explicit read() loop rather than
+    // istreambuf_iterator, because the iterator reaches basic_filebuf::underflow,
+    // which throws on a directory whatever the stream's exception mask says.
+    in.clear();
     in.seekg(0, std::ios::beg);
-    text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    std::string text;
+    char chunk[64 * 1024];
+    while (in.read(chunk, sizeof(chunk)) || in.gcount() > 0)
+        text.append(chunk, static_cast<size_t>(in.gcount()));
     return text;
 }
 
 inline std::string read_file_text_or_empty(const std::filesystem::path& path) {
     return read_file_text_optional(path).value_or(std::string{});
+}
+
+inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path);
+
+/// Record @p result for @p key and hand it back, so each return path below is
+/// one line rather than three.
+inline std::filesystem::path
+cache_normalized(std::mutex& mutex, std::unordered_map<std::string, std::string>& cache,
+                 std::string key, std::filesystem::path result) {
+    std::lock_guard<std::mutex> lock(mutex);
+    cache.insert_or_assign(std::move(key), result.string());
+    return result;
 }
 
 inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path) {
@@ -216,6 +342,17 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     // spelling: a path that resolves on disk does not change spelling while the
     // server is alive, and a not-yet-created file resolves through its existing
     // parent directory, so its result is stable across creation too.
+    //
+    // Memoizing the whole spelling is not enough on its own, because the files
+    // of one project share their directories: every file still paid the full
+    // walk of a prefix the walk before it had just resolved.  Measured on a
+    // 61-file project, 439 readlinks against six distinct directories, every one
+    // of them failing; the same project eight directories deeper cost 943 --
+    // linear in files x depth, against a handful of distinct answers.
+    //
+    // So resolve the parent through this same memo and append the last
+    // component.  The prefix is then walked once per directory rather than once
+    // per file, and a second file in a directory costs a single lookup.
     static std::mutex cache_mutex;
     static std::unordered_map<std::string, std::string> cache;
 
@@ -227,7 +364,52 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     }
 
     std::error_code ec;
-    auto result = std::filesystem::weakly_canonical(path, ec);
+    std::filesystem::path result;
+
+    // POSIX only, and the reason is the shortcut's correctness argument rather
+    // than any call it makes: appending a name to an already-canonical parent
+    // is the canonical spelling of the child *provided a symlink is the only
+    // thing canonical() would have rewritten*.  On Windows it is not -- that
+    // function also expands 8.3 short names (the RUNNER~1 -> runneradmin case
+    // this comment block already had in mind) and settles case, and a component
+    // needing either is not a symlink, so the leaf check below says "nothing to
+    // resolve" and the short spelling survives.  Two paths to one file then
+    // normalize differently, which is the single thing this function exists to
+    // prevent; it cost the CI's Windows job two tests, one of them the
+    // symlinked-directory case in test_references.cpp.
+    //
+    // Windows therefore keeps the full walk.  The cost this avoids is a
+    // per-component metadata round trip on a shared/HPC filesystem, which is
+    // not where that build runs.  A Windows fast path would need
+    // GetLongPathNameW and a Windows machine to prove it on.
+#ifndef _WIN32
+    // The last component still has to be resolved itself -- a symlinked source
+    // file is a real thing, and collapsing it is the point of this function --
+    // but that is one lstat rather than one call per component.  "." and ".."
+    // address the parent rather than naming a component, so they fall through
+    // to the full walk, which already handles them.
+    const auto parent = path.parent_path();
+    const auto filename = path.filename();
+    if (!parent.empty() && parent != path && !filename.empty() && filename != "." &&
+        filename != "..") {
+        const auto candidate = normalize_filesystem_path(parent) / filename;
+        std::error_code link_ec;
+        // Not a symlink (or not there at all) is the overwhelmingly common case,
+        // and the answer is then the parent's canonical spelling plus this name.
+        (void)std::filesystem::read_symlink(candidate, link_ec);
+        if (link_ec)
+            return cache_normalized(cache_mutex, cache, std::move(key),
+                                    candidate.lexically_normal());
+        // A symlink at the leaf: hand it to the full walk.  It re-resolves the
+        // prefix, which is wasted, but it is correct and it is rare.
+        result = std::filesystem::weakly_canonical(candidate, ec);
+        if (!ec)
+            return cache_normalized(cache_mutex, cache, std::move(key),
+                                    result.lexically_normal());
+    }
+#endif
+
+    result = std::filesystem::weakly_canonical(path, ec);
     if (!ec) {
         result = result.lexically_normal();
     } else {

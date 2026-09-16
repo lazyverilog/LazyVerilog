@@ -1,6 +1,7 @@
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
+#include <fstream>
 
 TEST_CASE("path utils: POSIX file URI decoding is unchanged", "[path][uri]") {
     CHECK(path_from_file_uri("file:///tmp/lazyverilog/top.sv") ==
@@ -105,4 +106,64 @@ TEST_CASE("utf16_col_to_byte_offset inverts utf16_length", "[string_utils][utf16
     SECTION("a column past the end clamps to the end of the line") {
         CHECK(utf16_col_to_byte_offset("abc", 0, 99) == 3);
     }
+}
+
+TEST_CASE("normalize_filesystem_path resolves through a memoized parent", "[path]") {
+    // The prefix is walked once per directory rather than once per file, which
+    // is what stops a project of N files at depth D costing N*D metadata calls
+    // against D distinct answers (measured: 439 readlinks for 61 files, 943 for
+    // the same files eight directories deeper).  What must not change is the
+    // answer: the last component is still resolved on its own, because a
+    // symlinked source file is the case this function exists to collapse.
+    const auto root = std::filesystem::temp_directory_path() / "lazyverilog-normalize-parent";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root / "real", ec);
+    REQUIRE_FALSE(ec);
+    { std::ofstream out(root / "real" / "actual.sv"); out << "module m; endmodule\n"; }
+
+    const auto real = std::filesystem::canonical(root / "real" / "actual.sv");
+
+    CHECK(normalize_filesystem_path(root / "real" / "actual.sv") == real);
+    // A "." component addresses the parent rather than naming one.
+    CHECK(normalize_filesystem_path(root / "real" / "." / "actual.sv") == real);
+    // A file that does not exist keeps its name, appended to a resolved parent.
+    CHECK(normalize_filesystem_path(root / "real" / "missing.sv") ==
+          real.parent_path() / "missing.sv");
+
+    // Symlinks need privileges on Windows, so their absence is not a failure.
+    std::error_code link_ec;
+    std::filesystem::create_symlink(root / "real" / "actual.sv", root / "aliased.sv", link_ec);
+    if (!link_ec)
+        CHECK(normalize_filesystem_path(root / "aliased.sv") == real);
+
+    std::filesystem::create_directory_symlink(root / "real", root / "linkdir", link_ec);
+    if (!link_ec)
+        CHECK(normalize_filesystem_path(root / "linkdir" / "actual.sv") == real);
+
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("read_file_text_optional survives a path that is not a regular file", "[path]") {
+    // A filelist entry naming a directory is a typo, and the background compiler
+    // reads filelist entries on its own thread.  libstdc++ opens a directory
+    // successfully and reports LLONG_MAX as its size, so sizing a buffer from
+    // that seek throws bad_alloc where nothing catches it -- which is what this
+    // did, through reserve(), before the read path was rewritten.
+    const auto directory = std::filesystem::temp_directory_path();
+    const auto text = read_file_text_optional(directory);
+    // Empty or absent both mean "nothing to parse"; crashing does not.
+    CHECK((!text || text->empty()));
+
+    const auto missing = std::filesystem::temp_directory_path() / "lazyverilog-no-such-file.sv";
+    std::error_code ec;
+    std::filesystem::remove(missing, ec);
+    CHECK_FALSE(read_file_text_optional(missing).has_value());
+
+    const auto empty = std::filesystem::temp_directory_path() / "lazyverilog-empty.sv";
+    { std::ofstream out(empty); }
+    const auto empty_text = read_file_text_optional(empty);
+    REQUIRE(empty_text.has_value());
+    CHECK(empty_text->empty());
+    std::filesystem::remove(empty, ec);
 }
