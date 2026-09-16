@@ -156,10 +156,14 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   config-stale.  The preload's include-resolution memo is keyed on the including
   project's digest as well as the spelling, or the first project to resolve
   `uvm_macros.svh` answers for every project that spells it the same way.
+- **Every per-document request is answered from that file's config**, via
+  `config_for(uri)` — formatting, lint, AutoFF, AutoWire, AutoArg, the RTL tree, and
+  the two capability switches.  Do not reach for `config_` in a handler that has a
+  URI; `config_` is the session's eager-indexing config, not the file's.
 - Two things stay session-wide, and are not per-file questions: **which** files to
   index (one index covers every open project, so the filelist is the union), and
-  **semantic compilation**, which builds a single slang `Compilation` and therefore
-  has one preprocessor for all of it.
+  **semantic compilation** (`[compilation]`), which builds a single slang
+  `Compilation` and therefore has one preprocessor for all of it.
 - Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
   so a session-wide set cannot pass them — each project's source only yields a module
   under its own define, or resolves a same-spelled header through its own `+incdir+`.
