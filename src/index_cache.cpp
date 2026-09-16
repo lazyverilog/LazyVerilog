@@ -828,6 +828,13 @@ IndexCache::Digest IndexCache::config_digest(const std::vector<std::string>& def
     return digest_bytes(joined);
 }
 
+std::string IndexCache::Digest::hex() const {
+    std::array<char, 33> text{};
+    std::snprintf(text.data(), text.size(), "%016llx%016llx",
+                  static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+    return std::string(text.data());
+}
+
 fs::path IndexCache::directory_for(const fs::path& project_root) {
     return project_root / ".cache" / "lazyverilog" / "index";
 }

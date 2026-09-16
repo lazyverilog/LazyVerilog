@@ -1,0 +1,122 @@
+#pragma once
+
+#include "index_cache.hpp"
+#include "project_root.hpp"
+
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+/// Everything a parse of one file needs from its project's configuration.
+///
+/// This is clangd's `tooling::CompileCommand`, reduced to what SystemVerilog
+/// actually varies: preprocessor defines and the include search path.  Like a
+/// compile command it belongs to a *file*, not to the session -- two files open
+/// at once can be in different projects, and `+incdir+` entries that make one of
+/// them parse are meaningless for the other.
+struct ParseInputs {
+    /// `[design].define`, as written.
+    std::vector<std::string> defines;
+    /// `+incdir+` entries as configured, normalized but not globbed.  Kept
+    /// because the semantic-compilation snapshot passes them on verbatim.
+    std::vector<std::string> include_dirs;
+    /// The same entries globbed to directories that exist, once, rather than on
+    /// every SourceManager.  With a few hundred include directories this
+    /// dominated the edit path, and on a shared filesystem each stat is a round
+    /// trip.  See resolve_include_dirs() in analyzer.cpp.
+    std::vector<std::filesystem::path> include_dir_paths;
+    /// Digest of the two lists above, which is what a shard is keyed on: they
+    /// change what a parse of an unchanged file *means*.  Per project, because
+    /// a shard written for one project's defines must not be served to another.
+    IndexCache::Digest config_digest;
+};
+
+/// Answers "how is this file parsed", per file.
+///
+/// The analog of clangd's `GlobalCompilationDatabase::getCompileCommand(File)`,
+/// including its fallback: a file that belongs to no known project is parsed
+/// with the default inputs rather than refused.
+///
+/// One indexer consults this per file; there is deliberately no second Analyzer
+/// per project.  That is clangd's shape too -- one `BackgroundIndex`, commands
+/// looked up per file -- and it is what keeps a second project costing a map
+/// entry instead of another set of worker threads and another source manager.
+///
+/// Immutable once built.  Callers hold a `shared_ptr<const ProjectParseInputs>`
+/// across a whole parse while a config reload installs a replacement, so there
+/// is no window where a parse reads half of one project's inputs and half of
+/// another's.
+class ProjectParseInputs {
+public:
+    /// @p resolver decides which project a path belongs to.  Null resolves
+    /// everything to the defaults, which is what the CLI tools and most tests
+    /// want: they are given one project outright.
+    explicit ProjectParseInputs(std::shared_ptr<const ProjectRootResolver> resolver = nullptr);
+
+    /// Deep copy.  The entries are held by unique_ptr so that for_path() can
+    /// hand out a reference that stays valid while the map grows, which means
+    /// the implicit copy is deleted -- and copying is exactly how a new table
+    /// is built before being published in place of the old one.
+    ProjectParseInputs(const ProjectParseInputs& other);
+    ProjectParseInputs& operator=(const ProjectParseInputs&) = delete;
+
+    /// Inputs used for a file in no registered project.
+    ///
+    /// Also what `Analyzer::set_defines()` / `set_include_dirs()` write, and
+    /// what a single-project session uses for everything -- so the behaviour
+    /// with one project is exactly what it was before this existed.
+    void set_defaults(ParseInputs inputs);
+
+    /// Point lookups at @p resolver.  Set on a copy before the copy is
+    /// published, which is how the Analyzer swaps inputs without a worker ever
+    /// seeing a half-built table.
+    void set_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
+
+    /// Register @p inputs for files under @p root.
+    void set_for_root(const std::filesystem::path& root, ParseInputs inputs);
+
+    /// The inputs @p path is parsed with.  Never null, and stable for the
+    /// lifetime of this object.
+    const ParseInputs& for_path(const std::filesystem::path& path) const;
+    /// Convenience for the many call sites that hold a URI.
+    const ParseInputs& for_uri(std::string_view uri) const;
+
+    /// The defaults, for the whole-project paths that cannot be per file --
+    /// today that is the semantic compilation snapshot, which builds one slang
+    /// Compilation out of every file and so can only have one set of defines.
+    const ParseInputs& defaults() const { return defaults_; }
+
+    /// Every registered root's inputs plus the defaults, for callers that need
+    /// the union rather than one file's answer.
+    std::vector<const ParseInputs*> all() const;
+
+private:
+    std::shared_ptr<const ProjectRootResolver> resolver_;
+    ParseInputs defaults_;
+    /// Stable addresses: for_path() hands out a reference held across a parse.
+    std::unordered_map<std::string, std::unique_ptr<ParseInputs>> by_root_;
+};
+
+/// Resolve configured include-directory patterns to existing directories, once.
+///
+/// The parse path used to hand these to SourceManager::addUserDirectories(),
+/// which globs the pattern and then runs weakly_canonical() over every match —
+/// a stat per path component, per directory.  A SourceManager is built per
+/// parse, so that ran again on every keystroke and once per project file during
+/// indexing: with a few hundred include directories it dominated the edit path,
+/// and on a shared/network filesystem each of those stats is a round trip.
+///
+/// Resolving here and passing the result as
+/// PreprocessorOptions::additionalIncludePaths keeps the same search order —
+/// slang tries the including file's own directory first, then these — with no
+/// filesystem work left on the edit path.
+std::vector<std::filesystem::path>
+resolve_include_dirs(const std::vector<std::string>& dirs);
+
+/// Glob `+incdir+` entries to the directories that exist and compute the
+/// digest, producing the inputs a project parses with.
+ParseInputs make_parse_inputs(const std::vector<std::string>& defines,
+                              const std::vector<std::string>& include_dirs);

@@ -1,3 +1,4 @@
+#include "analyzer.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
 #include "string_utils.hpp"
@@ -6,6 +7,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -349,4 +351,134 @@ TEST_CASE("the project cache is gitignored and the fallback is not",
                 CHECK_FALSE(std::filesystem::exists(fallback / ".gitignore"));
         }
     }
+}
+
+// ── Per-file parse inputs ────────────────────────────────────────────────────
+//
+// The point of ProjectParseInputs: one Analyzer, but each file preprocessed
+// with its own project's defines and include directories -- clangd's
+// per-file compile command, not a session-wide set.
+//
+// Every test here is built so that a session-wide set CANNOT pass it: each
+// project's source only produces a module when *its* define is set, so a single
+// merged define list would leave one of the two missing.
+
+namespace {
+
+/// Module names the project index holds, across every shard.
+std::set<std::string> indexed_module_names(const Analyzer& analyzer) {
+    std::set<std::string> names;
+    auto snapshot = analyzer.project_index_snapshot();
+    if (!snapshot)
+        return names;
+    for (const auto& [name, ref] : snapshot->module_by_name)
+        names.insert(name);
+    return names;
+}
+
+} // namespace
+
+TEST_CASE("two projects parse under their own defines", "[project-root][parse-inputs]") {
+    TempTree tree("inputs-defines");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv",
+                        "`ifdef CHIP_A\nmodule m_only_in_a; endmodule\n`endif\n");
+    auto b = tree.write("chip_b/rtl/b.sv",
+                        "`ifdef CHIP_B\nmodule m_only_in_b; endmodule\n`endif\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(resolver);
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_a", {"CHIP_A"}, {});
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_b", {"CHIP_B"}, {});
+    // No defaults: whatever these files parse with has to have come from their
+    // own project's entry.
+    analyzer.set_project_config({}, {}, {a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto names = indexed_module_names(analyzer);
+    CHECK(names.contains("m_only_in_a"));
+    CHECK(names.contains("m_only_in_b"));
+}
+
+TEST_CASE("a define from one project does not leak into another",
+          "[project-root][parse-inputs]") {
+    // The other half: CHIP_A must NOT be set while parsing chip_b's file.  A
+    // merged list would define both and index the guarded module anyway.
+    TempTree tree("inputs-isolation");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module m_plain_a; endmodule\n");
+    // Guarded by the *other* project's define, and by its own.  Serving chip_b
+    // the wrong entry shows up as m_leaked appearing and m_plain_b vanishing;
+    // merging every project's defines shows up as m_leaked appearing alongside
+    // it.  Neither can be mistaken for a pass.
+    auto b = tree.write("chip_b/rtl/b.sv",
+                        "`ifdef CHIP_A\nmodule m_leaked; endmodule\n`endif\n"
+                        "`ifdef CHIP_B\nmodule m_plain_b; endmodule\n`endif\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(resolver);
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_a", {"CHIP_A"}, {});
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_b", {"CHIP_B"}, {});
+    analyzer.set_project_config({}, {}, {a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto names = indexed_module_names(analyzer);
+    CHECK(names.contains("m_plain_a"));
+    CHECK(names.contains("m_plain_b"));
+    CHECK_FALSE(names.contains("m_leaked"));
+}
+
+TEST_CASE("each project searches its own include directories",
+          "[project-root][parse-inputs]") {
+    // Both files include "shared.svh" by the same spelling, resolving to
+    // different headers through different +incdir+ entries.  This is also what
+    // the preload's include-resolution memo has to be keyed on: keyed by
+    // spelling alone, whichever project resolved first would answer for both.
+    TempTree tree("inputs-incdir");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    tree.write("chip_a/inc/shared.svh", "module m_header_a; endmodule\n");
+    tree.write("chip_b/inc/shared.svh", "module m_header_b; endmodule\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "`include \"shared.svh\"\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "`include \"shared.svh\"\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(resolver);
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_a", {},
+                                       {(tree.root / "chip_a" / "inc").string()});
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_b", {},
+                                       {(tree.root / "chip_b" / "inc").string()});
+    analyzer.set_project_config({}, {}, {a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto names = indexed_module_names(analyzer);
+    CHECK(names.contains("m_header_a"));
+    CHECK(names.contains("m_header_b"));
+}
+
+TEST_CASE("a file in no registered project uses the defaults",
+          "[project-root][parse-inputs]") {
+    // clangd's fallback command.  Answering "no inputs" for an unconfigured
+    // file would make it fail to preprocess rather than merely parse without a
+    // project's defines.
+    TempTree tree("inputs-fallback");
+    auto loose = tree.write("loose/rtl/x.sv",
+                            "`ifdef FROM_DEFAULTS\nmodule m_fallback; endmodule\n`endif\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(resolver);
+    analyzer.set_project_config({"FROM_DEFAULTS"}, {}, {loose.string()});
+    analyzer.wait_for_background_index_idle();
+
+    CHECK(indexed_module_names(analyzer).contains("m_fallback"));
 }

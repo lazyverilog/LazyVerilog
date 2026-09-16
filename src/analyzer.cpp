@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "parse_inputs.hpp"
 #include "lsp_position.hpp"
 #include "cpu_budget.hpp"
 #include "dynamic_file_index.hpp"
@@ -103,38 +104,9 @@ static void cache_document_end_position(DocumentState& state) {
     state.end_character = saturating_lsp_int(col);
 }
 
-/// Resolve configured include-directory patterns to existing directories, once.
-///
-/// The parse path used to hand these to SourceManager::addUserDirectories(),
-/// which globs the pattern and then runs weakly_canonical() over every match —
-/// a stat per path component, per directory.  A SourceManager is built per
-/// parse, so that ran again on every keystroke and once per project file during
-/// indexing: with a few hundred include directories it dominated the edit path,
-/// and on a shared/network filesystem each of those stats is a round trip.
-///
-/// Resolving here and passing the result as
-/// PreprocessorOptions::additionalIncludePaths keeps the same search order —
-/// slang tries the including file's own directory first, then these — with no
-/// filesystem work left on the edit path.
-static std::vector<std::filesystem::path>
-resolve_include_dirs(const std::vector<std::string>& dirs) {
-    std::vector<std::filesystem::path> resolved;
-    resolved.reserve(dirs.size());
-    for (const auto& dir : dirs) {
-        if (dir.empty())
-            continue;
-        slang::SmallVector<std::filesystem::path> matches;
-        std::error_code ec;
-        // The same glob slang applied, so wildcard include paths keep working.
-        // A pattern matching nothing is dropped and the error ignored, as
-        // before: completion stays best-effort when the user has a stale config
-        // path, and missing include diagnostics still surface from the parse.
-        slang::svGlob({}, dir, slang::GlobMode::Directories, matches,
-                      /*expandEnvVars=*/false, ec);
-        resolved.insert(resolved.end(), matches.begin(), matches.end());
-    }
-    return resolved;
-}
+// resolve_include_dirs() moved to parse_inputs.cpp: the globbed directories are
+// now part of a project's ParseInputs, computed once per project rather than
+// once per analyzer.
 
 static void collect_parse_diagnostics(DocumentState& state, const std::string& fallback_uri) {
     if (!state.tree)
@@ -954,8 +926,12 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        defines = defines_;
-        include_dirs = include_dir_paths_;
+        // This file's project, not the session's.  A buffer open from another
+        // project is preprocessed with that project's defines and include
+        // directories, which is the whole point of looking them up per file.
+        const auto& inputs = parse_inputs_->for_path(path);
+        defines = inputs.defines;
+        include_dirs = inputs.include_dir_paths;
         // What this buffer included last time is the candidate set for header
         // seeding below.  On didOpen there is no previous snapshot, so the first
         // parse reads from disk and every keystroke after it does not.
@@ -1322,15 +1298,16 @@ std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_
     const auto start = Clock::now();
 
     std::vector<std::string> paths;
-    std::vector<std::string> defines;
-    std::vector<std::filesystem::path> include_dirs;
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     std::vector<OpenTextOverlay> open_overlays;
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> live_by_path;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         paths = extra_files_;
-        defines = defines_;
-        include_dirs = include_dir_paths_;
+        // The whole table, not one project's entries: `paths` is the merged
+        // filelist and its files can be rooted in different projects.  Copying
+        // a shared_ptr is what makes taking the lookup out of the loop free.
+        parse_inputs = parse_inputs_;
 
         open_overlays.reserve(docs_.size());
         live_by_path.reserve(docs_.size());
@@ -1366,8 +1343,11 @@ std::vector<std::shared_ptr<const DocumentState>> Analyzer::project_file_states_
         // executeCommand response is built.  This deliberately does not update
         // extra_cache_ or publish a ProjectIndexSnapshot; :LintAll is a manual
         // diagnostics command, not a hidden reindex operation.
-        auto state = make_file_state_with_options(normalized_path, defines, include_dirs,
-                                                  open_overlays, true);
+        // This file's project decides how it preprocesses.  :LintAll walks the
+        // merged filelist, which in a multi-project session spans them.
+        const auto& inputs = parse_inputs->for_path(normalized_path);
+        auto state = make_file_state_with_options(normalized_path, inputs.defines,
+                                                  inputs.include_dir_paths, open_overlays, true);
         if (state)
             states.push_back(std::move(state));
     }
@@ -6144,9 +6124,55 @@ void Analyzer::set_project_index_publish_debounce_ms(int debounce_ms) {
     background_publish_debounce_ms_ = std::max(0, debounce_ms);
 }
 
+/// Replace the default inputs, keeping every registered project's.
+///
+/// The two legacy setters below write the defaults rather than a project,
+/// because that is what they mean: a caller that hands the analyzer bare
+/// defines has one project in mind and no way to name it.  Rebuilt rather than
+/// mutated so that a worker holding the old pointer keeps a consistent view.
+void Analyzer::replace_default_parse_inputs_locked(ParseInputs inputs) {
+    auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
+    next->set_defaults(std::move(inputs));
+    parse_inputs_ = std::move(next);
+}
+
+void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
+    next->set_resolver(std::move(resolver));
+    parse_inputs_ = std::move(next);
+}
+
+void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
+                                         const std::vector<std::string>& defines,
+                                         const std::vector<std::string>& include_dirs) {
+    // Globbed and digested before the lock, like set_project_config(): this
+    // walks the filesystem once per project.
+    auto inputs = make_parse_inputs(defines, include_dirs);
+
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
+    next->set_for_root(root, std::move(inputs));
+    parse_inputs_ = std::move(next);
+
+    // A newly learned project changes how its files preprocess, so anything
+    // parsed with the defaults before now has to be parsed again.  Same
+    // treatment the legacy setters give a define change, and for the same
+    // reason: a cached snapshot built under different inputs is wrong, not
+    // stale.
+    extra_cache_.clear();
+    invalidate_extra_snapshots_locked();
+    clear_project_index_snapshot_locked();
+    if (!extra_files_.empty())
+        schedule_background_reindex_locked();
+}
+
 void Analyzer::set_defines(const std::vector<std::string>& defines) {
     std::lock_guard<std::mutex> lock(map_mutex_);
-    defines_ = defines;
+    auto inputs = parse_inputs_->defaults();
+    inputs.defines = defines;
+    inputs.config_digest = IndexCache::config_digest(inputs.defines, inputs.include_dir_paths);
+    replace_default_parse_inputs_locked(std::move(inputs));
     // Invalidate extra-file cache so reopened files pick up the new defines.
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
@@ -6156,16 +6182,9 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
 }
 
 void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
-    std::vector<std::string> normalized_include_dirs;
-    normalized_include_dirs.reserve(include_dirs.size());
-    for (const auto& dir : include_dirs)
-        normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
-
-    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
-
     std::lock_guard<std::mutex> lock(map_mutex_);
-    include_dirs_ = std::move(normalized_include_dirs);
-    include_dir_paths_ = std::move(resolved_include_dirs);
+    auto inputs = make_parse_inputs(parse_inputs_->defaults().defines, include_dirs);
+    replace_default_parse_inputs_locked(std::move(inputs));
 
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
@@ -6282,17 +6301,14 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::string& filelist_path,
                                   std::shared_ptr<IndexCacheStorage> cache_storage,
                                   const std::vector<uintmax_t>& extra_file_sizes) {
-    std::vector<std::string> normalized_include_dirs;
-    normalized_include_dirs.reserve(include_dirs.size());
-    for (const auto& dir : include_dirs)
-        normalized_include_dirs.push_back(normalize_filesystem_path(dir).string());
-
     std::vector<std::string> normalized_extra_files;
     normalized_extra_files.reserve(extra_files.size());
     for (const auto& path : extra_files)
         normalized_extra_files.push_back(normalize_filesystem_path(path).string());
 
-    auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
+    // Globbed and digested before the lock: both walk the filesystem, and
+    // map_mutex_ is the lock every request handler contends for.
+    auto default_inputs = make_parse_inputs(defines, include_dirs);
 
     // The storage opens each project's directory lazily, on the first file that
     // lands in it, and does that work outside map_mutex_ -- the lock every
@@ -6300,7 +6316,6 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // write is a round trip on the shared filesystems this cache is aimed at,
     // and initialize and every config reload would otherwise hold the lock
     // across it.
-    auto config_digest = IndexCache::config_digest(defines, resolved_include_dirs);
     auto extra_files_by_size =
         order_by_descending_size(normalized_extra_files, extra_file_sizes);
 
@@ -6311,9 +6326,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // +incdir+ entries and preprocessor defines).  Clearing and scheduling once
     // avoids creating redundant background generations that cannot commit but
     // can still burn CPU / shared-filesystem bandwidth while they parse.
-    defines_ = defines;
-    include_dirs_ = std::move(normalized_include_dirs);
-    include_dir_paths_ = std::move(resolved_include_dirs);
+    replace_default_parse_inputs_locked(std::move(default_inputs));
 
     filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_extra_files);
@@ -6323,11 +6336,10 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     for (const auto& path : extra_files_)
         extra_file_set_.insert(path);
 
-    // Installed before the burst is scheduled so the preload gate finds them
-    // ready.  The digest covers defines and include directories together: both
-    // change what a parse of an unchanged file means, and a shard keyed on only
-    // one of them would be served after the other moved.
-    index_cache_config_digest_ = config_digest;
+    // Installed before the burst is scheduled so the preload gate finds it
+    // ready.  Each project's digest covers its defines and include directories
+    // together: both change what a parse of an unchanged file means, and a
+    // shard keyed on only one of them would be served after the other moved.
     index_cache_storage_ = std::move(cache_storage);
 
     extra_cache_.clear();
@@ -6579,16 +6591,21 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
                                     const std::string& extra_dependency_uri,
                                     bool stands_alone) const {
     std::shared_ptr<IndexCacheStorage> storage;
-    IndexCache::Digest config_digest;
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (!index_cache_storage_)
             return;
         storage = index_cache_storage_;
-        config_digest = index_cache_config_digest_;
+        parse_inputs = parse_inputs_;
         generation = background_generation_;
     }
+
+    // The digest this shard is keyed on is this file's project's, not the
+    // session's.  Keying every shard on one digest would make a second project
+    // invalidate the first one's shards on every launch.
+    const auto config_digest = parse_inputs->for_uri(uri).config_digest;
 
     // Resolved outside the lock: this file's project decides the directory, and
     // finding it stats directories.
@@ -6633,19 +6650,18 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
 
 void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::shared_ptr<IndexCacheStorage> storage;
-    IndexCache::Digest config_digest;
-    std::vector<std::filesystem::path> include_dirs;
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     std::vector<std::string> files;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (!index_cache_storage_ || generation != background_generation_)
             return;
         storage = index_cache_storage_;
-        config_digest = index_cache_config_digest_;
-        // Copied out with the rest of the burst's inputs: re-running a header
-        // search below needs the same directories, in the same order, that a
-        // parse of these files would use.
-        include_dirs = include_dir_paths_;
+        // Per file from here on.  The burst can span projects, and both the
+        // config digest a shard is keyed on and the include directories a
+        // header search walks belong to the file being checked, not to the
+        // burst.
+        parse_inputs = parse_inputs_;
         files.assign(background_pending_files_.begin(), background_pending_files_.end());
     }
 
@@ -6735,9 +6751,18 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
                 return local;
         }
 
-        return memoized(incdir_resolution, recorded.spelling, [&] {
+        // The including file's project decides the search path, so the memo has
+        // to be keyed on it as well as the spelling.  Keyed on the spelling
+        // alone, the first project to resolve `uvm_macros.svh` would answer for
+        // every other project that spells it the same way and searches
+        // somewhere else entirely.
+        const auto& including_inputs = parse_inputs->for_uri(recorded.from_uri);
+        auto incdir_key = including_inputs.config_digest.hex();
+        incdir_key += '\n';
+        incdir_key += recorded.spelling;
+        return memoized(incdir_resolution, incdir_key, [&] {
             std::string resolved;
-            for (const auto& directory : include_dirs) {
+            for (const auto& directory : including_inputs.include_dir_paths) {
                 resolved = resolved_uri_if_file(directory / spelling);
                 if (!resolved.empty())
                     break;
@@ -6753,7 +6778,10 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     // to a directory earlier in the search order, changes no file the key
     // hashes.
     const auto still_valid = [&](const std::string& uri, const IndexCache::Key& key) {
-        if (key.config != config_digest)
+        // This file's project's digest.  A burst can span projects, and keying
+        // every shard on one of them would make every launch discard the other
+        // project's shards as config-stale.
+        if (!(key.config == parse_inputs->for_uri(uri).config_digest))
             return false;
         const auto content = digest_of(uri);
         if (!content || !(*content == key.content))
@@ -7245,8 +7273,14 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     CompilationSnapshot snapshot;
-    snapshot.defines = defines_;
-    snapshot.include_dirs = include_dirs_;
+    // Semantic compilation is the one thing that cannot be per file: it builds a
+    // single slang Compilation out of every source, so there is one preprocessor
+    // for all of them.  The defaults are used, which for a single-project
+    // session is exactly the project's own config; across projects it is the
+    // merged set the server accumulated.  clangd has no analog to diverge from
+    // here -- it compiles one TU at a time, each with its own command.
+    snapshot.defines = parse_inputs_->defaults().defines;
+    snapshot.include_dirs = parse_inputs_->defaults().include_dirs;
 
     std::unordered_set<std::string> seen_uris;
     std::unordered_set<std::string> seen_paths;
@@ -7711,12 +7745,11 @@ void Analyzer::schedule_background_project_publish_locked() const {
 }
 
 void Analyzer::background_index_loop() const {
-    // Hold the parse config across files instead of copying both vectors under
-    // map_mutex_ once per filelist entry.  Every writer of defines_ /
-    // include_dirs_ bumps the background generation before any later work can
-    // be queued, so a matching generation means the copy is still current.
-    std::vector<std::string> defines;
-    std::vector<std::filesystem::path> include_dirs;
+    // Hold the parse-input table across files instead of copying vectors under
+    // map_mutex_ once per filelist entry.  Every writer of it bumps the
+    // background generation before any later work can be queued, so a matching
+    // generation means the pointer is still current.
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     uint64_t config_generation = std::numeric_limits<uint64_t>::max();
 
     while (!background_stop_.load()) {
@@ -7832,8 +7865,12 @@ void Analyzer::background_index_loop() const {
             uri = uri_from_path(path);
             generation = background_generation_;
             if (config_generation != generation) {
-                defines = defines_;
-                include_dirs = include_dir_paths_;
+                // One pointer copy per generation instead of two vector copies,
+                // and the per-file lookup below costs a resolved-directory hash
+                // hit.  Copying each file's vectors under map_mutex_ would put
+                // the lock every request handler contends for in the indexer's
+                // inner loop.
+                parse_inputs = parse_inputs_;
                 config_generation = generation;
             }
             open_overlays.reserve(docs_.size());
@@ -7913,8 +7950,10 @@ void Analyzer::background_index_loop() const {
                 }
             }
 
-            auto built_headers = build_header_shards(headers_to_build, *reparsed_live_doc, defines,
-                                                     include_dirs, open_overlays,
+            const auto& inputs = parse_inputs->for_path(path_string);
+            auto built_headers = build_header_shards(headers_to_build, *reparsed_live_doc,
+                                                     inputs.defines,
+                                                     inputs.include_dir_paths, open_overlays,
                                                      background_header_texts_, generation);
             {
                 std::lock_guard<std::mutex> lock(map_mutex_);
@@ -7939,7 +7978,9 @@ void Analyzer::background_index_loop() const {
             continue;
         }
 
-        auto state = make_file_state_with_options(path_string, defines, include_dirs,
+        const auto& inputs = parse_inputs->for_path(path_string);
+        auto state = make_file_state_with_options(path_string, inputs.defines,
+                                                  inputs.include_dir_paths,
                                                   open_overlays, false,
                                                   &background_header_texts_, generation,
                                                   /*collect_diagnostics=*/false,
@@ -8016,7 +8057,8 @@ void Analyzer::background_index_loop() const {
         // file's own shard is built outside it.  This worker stays counted as
         // active until they are committed, so the publish below cannot fire on a
         // project index that is still missing header shards.
-        auto built_headers = build_header_shards(headers_to_build, *state, defines, include_dirs,
+        auto built_headers = build_header_shards(headers_to_build, *state, inputs.defines,
+                                                 inputs.include_dir_paths,
                                                  open_overlays, background_header_texts_,
                                                  generation, state.get());
         // Again, for the headers build_header_shards() parsed on their own.

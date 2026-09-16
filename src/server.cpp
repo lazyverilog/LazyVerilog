@@ -491,6 +491,11 @@ struct LazyVerilogServer::Impl {
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
+    // One resolver decides all three of a file's answers: which config it is
+    // served with, which defines and include directories it parses under, and
+    // which directory its shards live in.  Handing the same one to the analyzer
+    // means a file's project is worked out by one walk, cached once.
+    analyzer_.set_project_root_resolver(root_resolver_);
     // Mirrors read by the handlers that run on the worker pool; see the
     // declarations.  Refreshed everywhere config_ is.
     analyzer_.set_project_index_publish_callback([this] {
@@ -661,17 +666,19 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     if (!discovered_roots_.insert(key).second)
         return false;
 
-    // The filelist, defines and include directories of every project seen so
-    // far, merged.  There is one Analyzer with one set of parse inputs, so a
-    // second project cannot get its own -- and replacing the first project's
-    // inputs with the second's would unindex the files the user was just
-    // navigating.  Merging keeps both navigable, which is the behaviour a
-    // monorepo wants anyway.
+    // The merged lists serve two jobs that genuinely are session-wide:
     //
-    // The honest limit: `[design].define` is a flat list with no notion of
-    // which project it came from, so two projects that define the same macro
-    // differently get whichever value merged in first.  Include directories and
-    // filelists compose; defines do not.
+    //   * `project_files_` is *which* files to index.  One index covers every
+    //     open project, so this has to be the union -- replacing it with the
+    //     newest project's would unindex the files the user was just
+    //     navigating.
+    //   * the merged defines and include directories become the analyzer's
+    //     *default* parse inputs, used for a file under no known project and by
+    //     semantic compilation, which builds one slang Compilation and so can
+    //     only have one preprocessor.
+    //
+    // How each file actually parses is registered per root just below, and does
+    // not come from here.
     auto config = load_config(info->source_root);
     auto vcode = load_vcode(info->source_root, config);
 
@@ -695,6 +702,13 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
         project_files_.push_back(vcode.files[i]);
         project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
     }
+
+    // How files under this root preprocess.  This is the per-file half, and it
+    // does not merge: a file under this root is parsed with exactly this
+    // project's defines and include directories, whatever any other project
+    // configures.
+    analyzer_.set_parse_inputs_for_root(info->source_root, config.design.define,
+                                        vcode.include_dirs);
 
     std::cerr << "[lazyverilog] discovered project " << key << " from an opened file ("
               << vcode.files.size() << " files)\n";
@@ -1048,8 +1062,12 @@ void LazyVerilogServer::register_handlers() {
                     // Only if the config really is here.  Recording a root that
                     // holds no lazyverilog.toml would suppress the discovery of
                     // the real one above it.
-                    if (auto info = root_resolver_->project_info(root_))
+                    if (auto info = root_resolver_->project_info(root_)) {
                         discovered_roots_.insert(info->source_root.string());
+                        analyzer_.set_parse_inputs_for_root(info->source_root,
+                                                            config_.design.define,
+                                                            vcode.include_dirs);
+                    }
                 }
 
                 analyzer_.set_project_config(project_defines_, project_include_dirs_,
