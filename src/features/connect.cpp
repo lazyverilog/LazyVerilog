@@ -1,6 +1,7 @@
 #include "connect.hpp"
 #include "../syntax_index_shared.hpp"
 #include "../dynamic_file_index.hpp"
+#include "../string_utils.hpp"
 
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -489,36 +490,39 @@ static std::optional<NamedPortConn> connection_for(const InstanceEntry& inst,
     return std::nullopt;
 }
 
-static std::pair<int, int> offset_to_pos(const std::string& text, size_t off) {
+// ── the LSP column boundary ───────────────────────────────────────────────────
+//
+// Both directions go through string_utils.hpp rather than counting bytes here.
+// `Position.character` is a count of UTF-16 code units (or of bytes, when the
+// client negotiated `positionEncoding: utf-8`), and every column Connect
+// consumes -- ModuleEntry::col, header_semi_col, port_list_close_col -- is
+// already recorded in that unit by token_pos_line1_col0().  Counting bytes
+// against them agrees only while a line stays ASCII: one CJK comment inside a
+// port list is enough to slice the module header at the wrong offset and write
+// the mangled result back, and every column Connect *emits* lands in a TextEdit
+// range the client resolves the same way.
+//
+// clangd calls the same pair lspLength()/measureUnits(); here they are
+// lsp_column_from_byte_offset() and lsp_position_to_byte_offset(), which is what
+// the rest of this server already routes through.
+
+/// Byte offset -> (0-based line, LSP column).
+static std::pair<int, int> offset_to_pos(std::string_view text, size_t off) {
     off = std::min(off, text.size());
-    int line = 0, col = 0;
+    int line = 0;
+    size_t line_start = 0;
     for (size_t i = 0; i < off; ++i) {
         if (text[i] == '\n') {
             ++line;
-            col = 0;
-        } else {
-            ++col;
+            line_start = i + 1;
         }
     }
-    return {line, col};
+    return {line, lsp_column_from_byte_offset(text, line_start, off)};
 }
 
-static size_t offset_from_position(const std::string& text, int line, int col) {
-    line = std::max(line, 0);
-    col = std::max(col, 0);
-
-    size_t offset = 0;
-    int current_line = 0;
-    while (offset < text.size() && current_line < line) {
-        if (text[offset] == '\n')
-            ++current_line;
-        ++offset;
-    }
-
-    size_t line_end = offset;
-    while (line_end < text.size() && text[line_end] != '\n')
-        ++line_end;
-    return std::min(offset + static_cast<size_t>(col), line_end);
+/// (0-based line, LSP column) -> byte offset, clamped to the end of that line.
+static size_t offset_from_position(std::string_view text, int line, int col) {
+    return lsp_position_to_byte_offset(text, std::max(line, 0), std::max(col, 0));
 }
 
 static bool syntax_fragment_edge_is_wordlike(char c) {
@@ -757,9 +761,17 @@ static std::optional<TextEdit> declaration_delete_edit(const FileView& file,
         if (decl.name != signal_name || decl.declarator_count != 1)
             continue;
 
-        auto lines = split_lines(file_text(file));
-        if (decl.start_line >= 0 && decl.start_line < static_cast<int>(lines.size())) {
-            const auto prefix = lines[decl.start_line].substr(0, std::min<size_t>(decl.start_col, lines[decl.start_line].size()));
+        // Whether anything but whitespace precedes the declaration on its line,
+        // read out of the text by byte offset.  start_col is an LSP column, so
+        // slicing the line with it directly would cut in the wrong place on any
+        // line carrying non-ASCII -- and would need the whole file split into
+        // owned lines to do it.
+        const std::string& text = file_text(file);
+        if (decl.start_line >= 0) {
+            const size_t line_start = lsp_line_start_offset(text, decl.start_line);
+            const size_t decl_start =
+                offset_from_position(text, decl.start_line, decl.start_col);
+            const auto prefix = text.substr(line_start, decl_start - line_start);
             if (trim(prefix).empty() && decl.end_line == decl.start_line) {
                 return TextEdit{file.uri, decl.start_line, 0, decl.start_line + 1, 0, ""};
             }
