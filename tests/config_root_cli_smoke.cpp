@@ -219,6 +219,20 @@ int main(int argc, char** argv) {
                "a file below the config inherits [folding].enable = false from it");
     }
 
+    // The same file, with no rootUri at all -- the shape the Neovim plugin now
+    // sends.  Nothing but the opened file's own path says which project this
+    // is, which is the point: the server walks up from the file and finds
+    // folding_off/lazyverilog.toml on its own.
+    {
+        const auto out =
+            folds_for_uri(server_bin, "",
+                          path_to_uri(fixtures / "folding_off" / "rtl" / "core" /
+                                      "fold_probe.sv"));
+        expect(contains(out, R"("id":2)"), "a rootless fold request is answered");
+        expect(!contains(out, R"("startLine")"),
+               "the config is found from the opened file when no root was sent");
+    }
+
     // And the same request against a root that leaves folding on must produce
     // some, or the check above would pass against a server that never folds.
     {
