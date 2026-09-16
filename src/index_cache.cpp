@@ -853,6 +853,67 @@ std::optional<IndexCache> IndexCache::open(const fs::path& project_root) {
     return IndexCache(std::move(directory));
 }
 
+std::optional<IndexCache> IndexCache::open_fallback() {
+    auto base = user_cache_directory();
+    if (!base)
+        return std::nullopt;
+
+    auto directory = *base / "lazyverilog" / "index";
+    std::error_code ec;
+    fs::create_directories(directory, ec);
+    if (ec || !fs::is_directory(directory, ec))
+        return std::nullopt;
+
+    // No .gitignore here, unlike open(): this directory is the user's own cache
+    // and is not inside anyone's repository.  Writing one would be litter in a
+    // place that exists precisely so we do not litter.
+    return IndexCache(std::move(directory));
+}
+
+IndexCacheStorage::IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver)
+    : resolver_(std::move(resolver)) {}
+
+const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
+    const auto path = path_from_file_uri(std::string(uri));
+
+    // Resolved outside the lock.  The walk stats directories, which on a shared
+    // filesystem is a round trip, and every worker indexing a file in the same
+    // tree would otherwise queue behind whichever one is waiting.  The resolver
+    // has its own cache and its own lock.
+    std::string key = kFallbackKey;
+    std::optional<ProjectInfo> info;
+    if (resolver_) {
+        info = resolver_->project_info(path);
+        if (info)
+            key = info->source_root.string();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = caches_.find(key);
+    if (it == caches_.end()) {
+        // Opening creates a directory and may write a .gitignore, which is
+        // filesystem work done under the lock.  It happens once per project,
+        // not once per file, and the alternative -- opening outside the lock --
+        // has two workers create the same directory and one of them discard a
+        // cache the other is already handing out.
+        auto opened = std::make_unique<std::optional<IndexCache>>(
+            info ? IndexCache::open(info->source_root) : IndexCache::open_fallback());
+        it = caches_.emplace(std::move(key), std::move(opened)).first;
+    }
+    return it->second->has_value() ? &it->second->value() : nullptr;
+}
+
+std::vector<const IndexCache*> IndexCacheStorage::opened() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<const IndexCache*> result;
+    result.reserve(caches_.size());
+    for (const auto& [key, cache] : caches_) {
+        if (cache->has_value())
+            result.push_back(&cache->value());
+    }
+    return result;
+}
+
 fs::path IndexCache::shard_path(std::string_view uri) const {
     // Basename for a human reading the directory, path hash for uniqueness:
     // two files with the same name in different directories are the normal

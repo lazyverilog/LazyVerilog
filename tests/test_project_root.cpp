@@ -1,8 +1,11 @@
+#include "index_cache.hpp"
 #include "project_root.hpp"
+#include "string_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -233,4 +236,117 @@ TEST_CASE("the user cache directory follows the platform convention",
         CHECK(*dir == fs::path(home) / ".cache");
     }
 #endif
+}
+
+// ── IndexCacheStorage ────────────────────────────────────────────────────────
+//
+// The point of the storage manager is that ONE index serves files from several
+// projects, each writing shards beside its own lazyverilog.toml.  These tests
+// assert where a shard actually lands, because that is the whole user-visible
+// behaviour: "a .cache directory appeared somewhere I did not expect" is how
+// the old editor-decided root was noticed in the first place.
+
+TEST_CASE("a shard lands beside its own project's config", "[project-root][storage]") {
+    TempTree tree("storage-basic");
+    tree.write("lazyverilog.toml", "[design]\n");
+    auto source = tree.write("rtl/alu.sv", "module alu; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    IndexCacheStorage storage(resolver);
+
+    const IndexCache* cache = storage.for_uri(uri_from_path(source));
+    REQUIRE(cache != nullptr);
+    CHECK(cache->directory() == tree.root / ".cache" / "lazyverilog" / "index");
+}
+
+TEST_CASE("files from two projects get two cache directories",
+          "[project-root][storage]") {
+    TempTree tree("storage-multi");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a; endmodule\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "module b; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    IndexCacheStorage storage(resolver);
+
+    const IndexCache* cache_a = storage.for_uri(uri_from_path(a));
+    const IndexCache* cache_b = storage.for_uri(uri_from_path(b));
+
+    REQUIRE(cache_a != nullptr);
+    REQUIRE(cache_b != nullptr);
+    CHECK(cache_a->directory() == tree.root / "chip_a" / ".cache" / "lazyverilog" / "index");
+    CHECK(cache_b->directory() == tree.root / "chip_b" / ".cache" / "lazyverilog" / "index");
+    CHECK(storage.opened().size() == 2);
+}
+
+TEST_CASE("two files in one project share one cache object",
+          "[project-root][storage]") {
+    // Not just the same directory -- the same object.  A cache opened per file
+    // would create the directory and stat the .gitignore once per indexed file,
+    // which on a shared filesystem is the cost this manager exists to avoid.
+    TempTree tree("storage-share");
+    tree.write("lazyverilog.toml", "[design]\n");
+    auto a = tree.write("rtl/a.sv", "module a; endmodule\n");
+    auto b = tree.write("rtl/sub/b.sv", "module b; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    IndexCacheStorage storage(resolver);
+
+    CHECK(storage.for_uri(uri_from_path(a)) == storage.for_uri(uri_from_path(b)));
+    CHECK(storage.opened().size() == 1);
+}
+
+TEST_CASE("a file in no project falls back to the user cache directory",
+          "[project-root][storage]") {
+    TempTree tree("storage-fallback");
+    auto source = tree.write("rtl/alu.sv", "module alu; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    IndexCacheStorage storage(resolver);
+
+    const IndexCache* cache = storage.for_uri(uri_from_path(source));
+
+    auto base = user_cache_directory();
+    if (!base) {
+        // No HOME (or LOCALAPPDATA): running uncached is the documented answer.
+        CHECK(cache == nullptr);
+        return;
+    }
+
+    REQUIRE(cache != nullptr);
+    CHECK(cache->directory() == *base / "lazyverilog" / "index");
+    // The thing this replaces: nothing was written next to the opened file.
+    CHECK_FALSE(std::filesystem::exists(tree.root / ".cache"));
+    CHECK_FALSE(std::filesystem::exists(tree.root / "rtl" / ".cache"));
+}
+
+TEST_CASE("the project cache is gitignored and the fallback is not",
+          "[project-root][storage]") {
+    // Inside a repo the directory would otherwise show up in git status for
+    // everyone who runs the server; the user's own cache directory is in no
+    // repository and a .gitignore there is litter.
+    TempTree tree("storage-gitignore");
+    tree.write("lazyverilog.toml", "[design]\n");
+    auto source = tree.write("rtl/alu.sv", "module alu; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    IndexCacheStorage storage(resolver);
+
+    const IndexCache* cache = storage.for_uri(uri_from_path(source));
+    REQUIRE(cache != nullptr);
+    CHECK(std::filesystem::is_regular_file(cache->directory() / ".gitignore"));
+
+    if (auto base = user_cache_directory()) {
+        auto fallback = *base / "lazyverilog" / "index";
+        std::error_code ec;
+        const bool existed_before = std::filesystem::exists(fallback, ec);
+        if (!existed_before) {
+            TempTree orphan_tree("storage-gitignore-orphan");
+            auto orphan = orphan_tree.write("a.sv", "module a; endmodule\n");
+            IndexCacheStorage fallback_storage(std::make_shared<ProjectRootResolver>());
+            if (fallback_storage.for_uri(uri_from_path(orphan)) != nullptr)
+                CHECK_FALSE(std::filesystem::exists(fallback / ".gitignore"));
+        }
+    }
 }
