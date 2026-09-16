@@ -8,6 +8,14 @@
 
 struct VcodeResult {
     std::vector<std::string> files;
+    /// Byte size of each entry in `files`, in the same order, as seen while the
+    /// filelist was read.  Zero for a path that could not be stat'd -- which is
+    /// the same set the loader warns about.
+    ///
+    /// Carried out of the filelist pass so the background index queue can be
+    /// ordered largest-first without a second metadata call per file.  It is a
+    /// scheduling hint, not a fact anything depends on staying current.
+    std::vector<uintmax_t> file_sizes;
     std::vector<std::string> include_dirs;
 };
 
