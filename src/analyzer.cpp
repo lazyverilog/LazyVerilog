@@ -6280,7 +6280,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
                                   const std::string& filelist_path,
-                                  const std::string& project_root,
+                                  std::shared_ptr<IndexCacheStorage> cache_storage,
                                   const std::vector<uintmax_t>& extra_file_sizes) {
     std::vector<std::string> normalized_include_dirs;
     normalized_include_dirs.reserve(include_dirs.size());
@@ -6294,13 +6294,13 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
 
     auto resolved_include_dirs = resolve_include_dirs(normalized_include_dirs);
 
-    // Opened before the lock.  create_directories() plus a .gitignore write is
-    // filesystem work, and on the shared filesystems this cache is aimed at it
-    // is a round trip -- map_mutex_ is the lock every request handler contends
-    // for, and initialize and every config reload would otherwise hold it
-    // across that.
+    // The storage opens each project's directory lazily, on the first file that
+    // lands in it, and does that work outside map_mutex_ -- the lock every
+    // request handler contends for.  create_directories() plus a .gitignore
+    // write is a round trip on the shared filesystems this cache is aimed at,
+    // and initialize and every config reload would otherwise hold the lock
+    // across it.
     auto config_digest = IndexCache::config_digest(defines, resolved_include_dirs);
-    auto cache = project_root.empty() ? std::nullopt : IndexCache::open(project_root);
     auto extra_files_by_size =
         order_by_descending_size(normalized_extra_files, extra_file_sizes);
 
@@ -6328,7 +6328,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // change what a parse of an unchanged file means, and a shard keyed on only
     // one of them would be served after the other moved.
     index_cache_config_digest_ = config_digest;
-    index_cache_ = std::move(cache);
+    index_cache_storage_ = std::move(cache_storage);
 
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
@@ -6340,19 +6340,27 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
 
 void Analyzer::prune_cache_once_per_generation(
     uint64_t generation, const std::unordered_set<std::string>& live_uris) const {
-    std::optional<IndexCache> cache;
+    std::shared_ptr<IndexCacheStorage> storage;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        if (!index_cache_ || generation != background_generation_ ||
+        if (!index_cache_storage_ || generation != background_generation_ ||
             index_cache_pruned_generation_ == generation)
             return;
         index_cache_pruned_generation_ = generation;
-        cache = index_cache_;
+        storage = index_cache_storage_;
     }
     // On the writer thread, which already runs at the lowest priority this
     // process asks for, and after a shard has been written -- so it never sits
     // between a parse and the launch that wants it.  One stat per shard.
-    cache->prune_missing_sources(live_uris);
+    //
+    // Every directory this burst wrote into, not just one: with the storage
+    // choosing per file, a project whose filelist reaches into a sibling has
+    // shards in both, and sweeping only the first would let the other grow
+    // without bound.  live_uris covers the whole burst, so a shard is kept by
+    // any directory's sweep on the same grounds -- its source file still being
+    // there.
+    for (const IndexCache* cache : storage->opened())
+        cache->prune_missing_sources(live_uris);
 }
 
 void Analyzer::reserve_shard_writes(size_t count) const {
@@ -6570,17 +6578,23 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
                                     const std::vector<IncludeResolution>& include_resolutions,
                                     const std::string& extra_dependency_uri,
                                     bool stands_alone) const {
-    std::optional<IndexCache> cache;
+    std::shared_ptr<IndexCacheStorage> storage;
     IndexCache::Digest config_digest;
     uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        if (!index_cache_)
+        if (!index_cache_storage_)
             return;
-        cache = index_cache_;
+        storage = index_cache_storage_;
         config_digest = index_cache_config_digest_;
         generation = background_generation_;
     }
+
+    // Resolved outside the lock: this file's project decides the directory, and
+    // finding it stats directories.
+    const IndexCache* cache = storage->for_uri(uri);
+    if (cache == nullptr)
+        return;
 
     // Digests come from what the burst's parses read, never from a fresh read
     // of the file.  A shard keyed on bytes other than the ones it was built
@@ -6618,15 +6632,15 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
 }
 
 void Analyzer::preload_cached_shards(uint64_t generation) const {
-    std::optional<IndexCache> cache;
+    std::shared_ptr<IndexCacheStorage> storage;
     IndexCache::Digest config_digest;
     std::vector<std::filesystem::path> include_dirs;
     std::vector<std::string> files;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        if (!index_cache_ || generation != background_generation_)
+        if (!index_cache_storage_ || generation != background_generation_)
             return;
-        cache = index_cache_;
+        storage = index_cache_storage_;
         config_digest = index_cache_config_digest_;
         // Copied out with the rest of the burst's inputs: re-running a header
         // search below needs the same directories, in the same order, that a
@@ -6792,7 +6806,10 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     const auto check_one = [&](size_t index) {
         const auto& path = files[index];
         const auto  uri  = uri_from_path(path);
-        auto        loaded = cache->load(uri);
+        const IndexCache* cache = storage->for_uri(uri);
+        if (cache == nullptr)
+            return;
+        auto loaded = cache->load(uri);
         if (!loaded || !still_valid(uri, loaded->key))
             return;
 
@@ -6820,7 +6837,14 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
             // waiting for the other -- the same trade cached_file_digest()
             // makes -- and the insert below keeps whichever arrives first, so
             // every includer still ends up pointing at one shared index.
-            auto header = cache->load(dependency);
+            // A header's shard lives beside *its* project's config, which need
+            // not be the includer's: a shared verification header included from
+            // two designs is one file in one project, and looking for its shard
+            // under the includer's root would miss it from one side and write a
+            // second copy from the other.
+            const IndexCache* header_cache = storage->for_uri(dependency);
+            auto header = header_cache ? header_cache->load(dependency)
+                                       : std::optional<IndexCache::Loaded>{};
             const bool usable = header && still_valid(dependency, header->key);
 
             std::lock_guard<std::mutex> header_lock(header_mutex);
@@ -7762,7 +7786,8 @@ void Analyzer::background_index_loop() const {
             // files are unchanged and installs their shards; the rest wait,
             // because a worker that starts parsing a file the preload was about
             // to satisfy has already spent what the cache exists to save.
-            if (index_cache_ && background_preload_generation_ != background_generation_) {
+            if (index_cache_storage_ &&
+                background_preload_generation_ != background_generation_) {
                 if (background_preload_running_) {
                     background_cv_.wait(lock, [&] {
                         return background_stop_.load() || !background_preload_running_ ||

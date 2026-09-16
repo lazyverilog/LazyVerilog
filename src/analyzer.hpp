@@ -547,15 +547,18 @@ class Analyzer {
     /// schedule multiple full-project background reindex generations for a
     /// single user-visible config change.  This batched setter clears the old
     /// project cache once and schedules at most one asynchronous reindex.
-    /// @param project_root  directory holding lazyverilog.toml.  The on-disk
-    ///        shard cache lives under it; leaving it empty runs uncached, which
-    ///        is what a server with no project root should do.
+    /// @param cache_storage  decides which directory each file's shards live
+    ///        in.  Null runs uncached, which is what a server with no project
+    ///        should do.  It is a storage rather than a single root because a
+    ///        project's files are not all under one: a filelist can name
+    ///        sources from a sibling project, and each belongs beside its own
+    ///        lazyverilog.toml.
     /// @param extra_file_sizes  see set_extra_files(); empty when unknown.
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
                             const std::string& filelist_path = {},
-                            const std::string& project_root = {},
+                            std::shared_ptr<IndexCacheStorage> cache_storage = nullptr,
                             const std::vector<uintmax_t>& extra_file_sizes = {});
 
     /// Block until all currently queued project-index work is published.
@@ -826,7 +829,10 @@ class Analyzer {
     /// Cache for this project, and the config digest every shard is keyed on.
     /// Empty when no project root is known or the directory cannot be written,
     /// which is a normal read-only-checkout condition and simply runs uncached.
-    mutable std::optional<IndexCache> index_cache_;
+    /// Where each file's shards go.  Shared with the server, which resolves the
+    /// same roots to answer config lookups, and held by shared_ptr because a
+    /// queued shard write outlives the config reload that replaced it.
+    mutable std::shared_ptr<IndexCacheStorage> index_cache_storage_;
     mutable IndexCache::Digest index_cache_config_digest_;
     /// Memoized content digests for the current generation, shared by the
     /// preload and the store path.

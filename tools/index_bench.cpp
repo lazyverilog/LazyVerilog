@@ -13,6 +13,7 @@
 // to measure the parse itself, or tools/startup_bench.py, which clears the
 // cache per run unless asked for --warm.
 #include "analyzer.hpp"
+#include "index_cache.hpp"
 #include "config.hpp"
 #include "filelist.hpp"
 #include "perf_trace.hpp"
@@ -75,7 +76,10 @@ int main(int argc, char** argv) {
         analyzer.set_project_index_publish_debounce_ms(0);
         const auto start = std::chrono::steady_clock::now();
         analyzer.set_project_config(config.design.define, vcode.include_dirs, vcode.files,
-                                    resolve_vcode_path(root, config), cache_root,
+                                    resolve_vcode_path(root, config),
+                                    cache_root.empty()
+                                        ? nullptr
+                                        : IndexCacheStorage::for_root(cache_root),
                                     vcode.file_sizes);
         analyzer.wait_for_background_index_idle();
         const auto snapshot = analyzer.project_index_snapshot();

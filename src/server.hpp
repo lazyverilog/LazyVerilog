@@ -3,6 +3,8 @@
 #include "config.hpp"
 #include "cancelled_requests.hpp"
 #include "edit_watermark.hpp"
+#include "index_cache.hpp"
+#include "project_root.hpp"
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -49,11 +51,23 @@ class LazyVerilogServer {
     void configure_background_compiler();
     void schedule_background_compilation();
 
-    /// Project root handed to the analyzer's shard cache, or empty when
-    /// [index].cache is off -- an empty root is what makes it run uncached.
-    std::string index_cache_root() const {
-        return config_.index.cache ? root_.string() : std::string{};
+    /// Storage handed to the analyzer, or null when [index].cache is off --
+    /// a null storage is what makes it run uncached.
+    ///
+    /// Not a root: the server no longer has one root to give.  Each file's
+    /// shards go beside its own lazyverilog.toml, resolved by
+    /// `root_resolver_`, and a file with no config above it goes to the user's
+    /// cache directory instead of littering a tree it was never part of.
+    std::shared_ptr<IndexCacheStorage> index_cache_storage() const {
+        return config_.index.cache ? std::make_shared<IndexCacheStorage>(root_resolver_)
+                                   : nullptr;
     }
+
+    /// Decides which project any file belongs to, and therefore which config it
+    /// is served with and where its shards live.  Shared with the storage the
+    /// analyzer holds, so both answer from one cache of one walk.
+    std::shared_ptr<ProjectRootResolver> root_resolver_ =
+        std::make_shared<ProjectRootResolver>();
 
     std::filesystem::path root_;
     std::string config_diagnostic_uri_;

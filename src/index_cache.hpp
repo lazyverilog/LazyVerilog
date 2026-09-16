@@ -195,6 +195,16 @@ public:
     /// resolves the same files for config lookups.
     explicit IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver);
 
+    /// Storage that puts every file's shards under @p project_root, whatever
+    /// the file's own ancestors hold.
+    ///
+    /// For callers that already know the project because they were told it:
+    /// `index-bench --cache-root`, and tests that build a tree without writing
+    /// a config into it.  Unlike ProjectRootResolver::set_forced_root(), no
+    /// marker file is required — the caller naming a directory outright is the
+    /// authority here, not a search.
+    static std::shared_ptr<IndexCacheStorage> for_root(std::filesystem::path project_root);
+
     /// Cache @p uri's shard belongs in, or nullptr when none could be opened.
     ///
     /// The returned cache is owned by this object and stays valid for its
@@ -212,6 +222,8 @@ private:
     static constexpr const char* kFallbackKey = "<fallback>";
 
     std::shared_ptr<const ProjectRootResolver> resolver_;
+    /// Set by for_root(): every file answers with this root and no walk runs.
+    std::optional<std::filesystem::path> fixed_root_;
     mutable std::mutex mutex_;
     /// Stable addresses: a worker holds the pointer across a parse, and
     /// rehashing a map of values would move what it holds.  nullopt records a
