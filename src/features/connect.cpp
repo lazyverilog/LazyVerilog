@@ -37,16 +37,36 @@ struct DeclInfo {
     size_t declarator_count{0};
 };
 
+/// One file's structural view for the duration of a single Connect request.
+///
+/// Nothing here is owned that something else already owns for long enough.  An
+/// open buffer's text and index belong to its immutable DocumentState, which
+/// `state` keeps alive; a closed project file's shard belongs to the analyzer's
+/// cache, which `index_owner` keeps alive.  Copying either instead -- which is
+/// what this struct did -- duplicated the whole project index on every Connect
+/// request, and a shard carries every reference occurrence in its file.
 struct FileView {
     std::string uri;
     std::string path;
-    // Text is present immediately for open buffers because it can include
-    // unsaved edits.  For closed project files it starts empty and is filled
-    // lazily only when Connect must compute a TextEdit in that exact file.
-    // This avoids reading every .f entry on ConnectInfo/preview/apply requests.
-    mutable std::string text;
-    mutable bool text_loaded{false};
-    SyntaxIndex index;
+    // Text for a closed project file, read lazily and only when Connect must
+    // compute a TextEdit in that exact file.  This avoids reading every .f
+    // entry on ConnectInfo/preview/apply requests.  Open buffers do not use it:
+    // their text can include unsaved edits and is borrowed below.
+    mutable std::string lazy_text;
+    mutable bool lazy_text_loaded{false};
+    // The open buffer's text, owned by `state`.  Null for closed files.
+    const std::string* buffer_text{nullptr};
+
+    // The index this view answers from, borrowed.  For an open buffer it is the
+    // structural index cached on `state`; for a closed file it is the shard
+    // `index_owner` holds.  Mirrors ExtraFileInfo::index_ref().
+    std::shared_ptr<const SyntaxIndex> index_owner;
+    const SyntaxIndex* index_ptr{nullptr};
+    const SyntaxIndex& index_ref() const {
+        static const SyntaxIndex empty{};
+        return index_ptr ? *index_ptr : empty;
+    }
+
     // Non-null only for open/current buffers.  Per project architecture, these
     // live SyntaxTree snapshots are authoritative for edit-local facts such as
     // declarations in unsaved text.  Closed/filelist files keep only SyntaxIndex.
@@ -151,11 +171,26 @@ static std::string read_file_text_best_effort(const std::string& path) {
 }
 
 static const std::string& file_text(const FileView& file) {
-    if (!file.text_loaded) {
-        file.text = read_file_text_best_effort(file.path);
-        file.text_loaded = true;
+    if (file.buffer_text)
+        return *file.buffer_text;
+    if (!file.lazy_text_loaded) {
+        file.lazy_text = read_file_text_best_effort(file.path);
+        file.lazy_text_loaded = true;
     }
-    return file.text;
+    return file.lazy_text;
+}
+
+/// A view onto an open buffer.  The structural index and the text both live on
+/// the snapshot, which the view holds, so neither is copied.
+static FileView open_buffer_view(std::string uri, std::string path,
+                                 std::shared_ptr<const DocumentState> state) {
+    FileView file;
+    file.uri = std::move(uri);
+    file.path = std::move(path);
+    file.buffer_text = &state->text;
+    file.index_ptr = &get_structural_index(*state);
+    file.state = std::move(state);
+    return file;
 }
 
 static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::string& uri) {
@@ -169,12 +204,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{.uri = state_uri,
-                                 .path = {},
-                                 .text = state->text,
-                                 .text_loaded = true,
-                                 .index = get_structural_index(*state),
-                                 .state = state});
+        files.push_back(open_buffer_view(state_uri, {}, state));
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
@@ -186,31 +216,23 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
         if (!seen.insert(extra.uri).second)
             continue;
         if (extra.state) {
-            files.push_back(FileView{.uri = extra.uri,
-                                     .path = extra.path,
-                                     .text = extra.state->text,
-                                     .text_loaded = true,
-                                     .index = get_structural_index(*extra.state),
-                                     .state = extra.state});
+            files.push_back(open_buffer_view(extra.uri, extra.path, extra.state));
         } else {
-            files.push_back(FileView{.uri = extra.uri,
-                                     .path = extra.path,
-                                     .text = {},
-                                     .text_loaded = false,
-                                     .index = extra.index_ref(),
-                                     .state = nullptr});
+            FileView file;
+            file.uri = extra.uri;
+            file.path = extra.path;
+            // The shard, not a copy of it.  Holding the shared_ptr keeps it
+            // alive independently of the snapshot vector this loop walks.
+            file.index_owner = extra.index;
+            file.index_ptr = file.index_owner.get();
+            files.push_back(std::move(file));
         }
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{.uri = uri,
-                                     .path = {},
-                                     .text = state->text,
-                                     .text_loaded = true,
-                                     .index = get_structural_index(*state),
-                                     .state = state});
+            files.push_back(open_buffer_view(uri, {}, state));
     }
     return files;
 }
@@ -218,12 +240,12 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
 static const ModuleEntry* find_module(const std::vector<FileView>& files, const std::string& name,
                                       const FileView** file_out = nullptr) {
     for (const auto& file : files) {
-        auto it = file.index.module_by_name.find(name);
-        if (it == file.index.module_by_name.end())
+        auto it = file.index_ref().module_by_name.find(name);
+        if (it == file.index_ref().module_by_name.end())
             continue;
         if (file_out)
             *file_out = &file;
-        return &file.index.modules[it->second];
+        return &file.index_ref().modules[it->second];
     }
     return nullptr;
 }
@@ -236,7 +258,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     std::unordered_set<std::string> instantiated_modules;
 
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             by_parent_module[inst.parent_module].push_back({&file, &inst});
             instantiated_modules.insert(inst.module_name);
         }
@@ -245,7 +267,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     struct Root { std::string path; std::string module; };
     std::vector<Root> frontier;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!instantiated_modules.contains(module.name))
                 frontier.push_back({module.name, module.name});
         }
@@ -254,7 +276,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     // seed all modules so ConnectInfo still has useful instance choices.
     if (frontier.empty()) {
         for (const auto& file : files)
-            for (const auto& module : file.index.modules)
+            for (const auto& module : file.index_ref().modules)
                 frontier.push_back({module.name, module.name});
     }
 
@@ -288,13 +310,13 @@ static std::vector<std::pair<const FileView*, const ModuleEntry*>>
 find_hierarchy_roots(const std::vector<FileView>& files) {
     std::unordered_set<std::string> instantiated_modules;
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances)
+        for (const auto& inst : file.index_ref().instances)
             instantiated_modules.insert(inst.module_name);
     }
 
     std::vector<std::pair<const FileView*, const ModuleEntry*>> roots;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!instantiated_modules.contains(module.name))
                 roots.push_back({&file, &module});
         }
@@ -305,7 +327,7 @@ find_hierarchy_roots(const std::vector<FileView>& files) {
     // expandable seed so the UI can still browse something useful.
     if (roots.empty()) {
         for (const auto& file : files)
-            for (const auto& module : file.index.modules)
+            for (const auto& module : file.index_ref().modules)
                 roots.push_back({&file, &module});
     }
     return roots;
@@ -320,7 +342,7 @@ struct DesignLookup {
 static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
     DesignLookup lookup;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             // First definition wins, matching find_module().  Open buffers are
             // collected before filelist shards, so unsaved current text remains
             // authoritative when a file also appears in the project filelist.
@@ -376,7 +398,7 @@ static std::optional<std::vector<ResolvedInst>> resolve_instance_route(
         // This avoids building `top.*` paths for unrelated branches.
         const FileView* inst_file = module_file_it->second;
         const InstanceEntry* inst_entry = nullptr;
-        for (const auto& inst : inst_file->index.instances) {
+        for (const auto& inst : inst_file->index_ref().instances) {
             if (inst.parent_module == parent_module && inst.instance_name == parts[i]) {
                 inst_entry = &inst;
                 break;
@@ -456,7 +478,7 @@ static std::vector<ResolvedInst> hierarchy_children_for_path(const std::vector<F
 
     const FileView* inst_file = module_file_it->second;
     std::vector<ResolvedInst> children;
-    for (const auto& inst : inst_file->index.instances) {
+    for (const auto& inst : inst_file->index_ref().instances) {
         if (inst.parent_module != parent_module)
             continue;
         const std::string child_path = normalized_parent_path + "." + inst.instance_name;
@@ -753,7 +775,7 @@ static bool declared_signal(const FileView& file, const std::string& module_name
 
     // Closed/project files are represented by SyntaxIndex.  This is also a
     // conservative fallback if an open buffer temporarily lacks a SyntaxTree.
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         if (value.name == name &&
             (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
             return true;
@@ -768,7 +790,7 @@ static int wire_insert_line(const FileView& file, const std::string& module_name
     if (last_decl_line >= 0)
         return last_decl_line + 1;
 
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         // SyntaxIndex.values also contains ports and parameter-port-list
         // entries.  Those are not valid anchors for inserting an internal
         // bridge wire: with an ANSI header they can be physically inside the
@@ -784,9 +806,9 @@ static int wire_insert_line(const FileView& file, const std::string& module_name
 
     // No existing declarations in this module. Insert immediately after this
     // module's header semicolon using the AST/SyntaxIndex-derived edit range.
-    auto mod_it = file.index.module_by_name.find(module_name);
-    if (mod_it != file.index.module_by_name.end()) {
-        const auto& module = file.index.modules[mod_it->second];
+    auto mod_it = file.index_ref().module_by_name.find(module_name);
+    if (mod_it != file.index_ref().module_by_name.end()) {
+        const auto& module = file.index_ref().modules[mod_it->second];
         if (module.header_semi_line >= 0)
             return module.header_semi_line + 1;
     }
@@ -802,7 +824,7 @@ static std::string signal_type_in_file(const FileView& file, const std::string& 
         if (decl.name == sig)
             return decl.type;
     }
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         if (value.name == sig &&
             (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
             return value.type;
@@ -1076,10 +1098,10 @@ static std::vector<TextEdit> add_module_ports(const FileView& file, const std::s
                                               const std::vector<ModulePortAddition>& ports) {
     if (ports.empty())
         return {};
-    auto mod_it = file.index.module_by_name.find(module_name);
-    if (mod_it == file.index.module_by_name.end())
+    auto mod_it = file.index_ref().module_by_name.find(module_name);
+    if (mod_it == file.index_ref().module_by_name.end())
         return {};
-    const auto& module = file.index.modules[mod_it->second];
+    const auto& module = file.index_ref().modules[mod_it->second];
     if (module.header_semi_line < 0 || module.header_semi_col < 0)
         return {};
 
@@ -1540,13 +1562,13 @@ find_current_file_instance(const std::vector<FileView>& files, const std::string
     for (const auto& file : files) {
         if (file.uri != uri)
             continue;
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             if (inst.instance_name == inst_name)
                 return std::make_pair(&file, &inst);
         }
     }
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             if (inst.instance_name == inst_name)
                 return std::make_pair(&file, &inst);
         }
@@ -1565,7 +1587,7 @@ std::string connect_info_json(const Analyzer& analyzer, const std::string& uri,
     std::string out = "{\"modules\":{";
     bool first_mod = true;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!first_mod)
                 out += ",";
             first_mod = false;
@@ -1716,7 +1738,7 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
         self_conn[c.port_name] = c;
 
     std::multimap<std::string, std::tuple<std::string, std::string, std::string, std::string>> others;
-    for (const auto& other : file.index.instances) {
+    for (const auto& other : file.index_ref().instances) {
         if (other.instance_name == inst.instance_name || other.parent_module != inst.parent_module)
             continue;
         const auto* omod = find_module(files, other.module_name);
