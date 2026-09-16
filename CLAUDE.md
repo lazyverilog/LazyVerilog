@@ -140,10 +140,29 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   one notification.
 - `initialize` still indexes eagerly when a client does send `rootUri` — a warm first
   go-to-definition is worth keeping — but nothing per file depends on it.  `didOpen`
-  discovers projects too (`discover_project_for()`), and **merges** their parse inputs:
-  there is one `Analyzer` with one set, so a second project cannot have its own.
-  Include directories and filelists compose; `[design].define` does not, and two
-  projects defining the same macro differently get whichever value merged in first.
+  discovers projects too (`discover_project_for()`).
+- **Defines and include directories are per file**, looked up through
+  `ProjectParseInputs` (`src/parse_inputs.cpp`) — clangd's
+  `GlobalCompilationDatabase::getCompileCommand(File)`, with the same fallback for a
+  file under no known project.  There is still **one** `Analyzer`: clangd keeps one
+  `BackgroundIndex` too and looks commands up per file, which is what makes a second
+  project cost a map entry instead of another set of worker threads and another
+  source manager.
+- Every parse path asks for the file it is about to parse — `make_state()`, the
+  background indexer, `:LintAll`'s synchronous walk, the shard preload.  Do not
+  reintroduce a flat `defines_` member; that is what this replaced.
+- The shard config digest lives in `ParseInputs` for the same reason: one digest
+  across projects would make each launch discard the other project's shards as
+  config-stale.  The preload's include-resolution memo is keyed on the including
+  project's digest as well as the spelling, or the first project to resolve
+  `uvm_macros.svh` answers for every project that spells it the same way.
+- Two things stay session-wide, and are not per-file questions: **which** files to
+  index (one index covers every open project, so the filelist is the union), and
+  **semantic compilation**, which builds a single slang `Compilation` and therefore
+  has one preprocessor for all of it.
+- Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
+  so a session-wide set cannot pass them — each project's source only yields a module
+  under its own define, or resolves a same-spelled header through its own `+incdir+`.
 - Guarded by `./build/lazyverilog-tests "[project-root]"` and
   `ctest --test-dir build -R config-root-cli-smoke`.
 

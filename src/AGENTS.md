@@ -48,6 +48,8 @@ C++ source for the lazyverilog LSP server. Split into server core (root of this 
 ### Common Patterns
 - JSON-RPC over stdin/stdout
 - Config reloaded on every `workspace/didChangeConfiguration`
+- Parse inputs (defines, `+incdir+`): per file, via `ProjectParseInputs`.  There is
+  one `Analyzer`; do not add a flat `defines_` member back.
 - Config search: walk up from the opened file to the nearest `lazyverilog.toml`
   (`ProjectRootResolver`).  `rootUri` is only an eager-indexing hint; nothing per file
   depends on it, and the Neovim plugin no longer sends one.

@@ -271,8 +271,14 @@ if (auto PI = GetProjectInfo(File)) {
 }
 ```
 
-Keeping the *storage* per file rather than the *indexer* is what makes serving
-several projects affordable: a second project costs a directory, not another set
+The same shape applies to how each file is *parsed*.  `ProjectParseInputs`
+(`src/parse_inputs.cpp`) answers "which defines and include directories does this
+file use", which is clangd's `getCompileCommand(File)` — one index, commands
+looked up per file, and a fallback for a file under no known project rather than
+a refusal.
+
+Keeping the *storage* and the *inputs* per file rather than the *indexer* is what
+makes serving several projects affordable: a second project costs a directory, not another set
 of worker threads, another source manager and another copy of the project index.
 
 Two consequences worth stating outright:
