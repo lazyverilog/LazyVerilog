@@ -48,6 +48,8 @@ public:
         uint64_t hi{0};
         constexpr bool operator==(const Digest&) const = default;
         constexpr bool empty() const { return lo == 0 && hi == 0; }
+        /// Both halves as hex, for use as a map key.
+        std::string hex() const;
     };
 
     /// What a stored shard was built from.  A shard is usable only when every
