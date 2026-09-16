@@ -263,7 +263,13 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
             }
 
             lsInlayHint coverage;
-            coverage.position = lsPosition(inst.start_line, (int)lines[inst.start_line].size());
+            // The end of the line in LSP columns, not bytes.  Position.character
+            // counts UTF-16 code units (or bytes, when the client negotiated
+            // positionEncoding: utf-8), so a line carrying any non-ASCII text --
+            // an instantiation with a CJK trailing comment, say -- put this hint
+            // past the end of the line it belongs to.
+            coverage.position =
+                lsPosition(inst.start_line, lsp_column_width(lines[inst.start_line]));
             coverage.label =
                 std::to_string(connected_count) + "/" + std::to_string(port_map.size()) + " ports";
             coverage.kind = optional<lsInlayHintKind>(lsInlayHintKind::Parameter);
