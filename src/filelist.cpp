@@ -148,17 +148,36 @@ void warn_missing(const std::filesystem::path& path, const std::filesystem::path
               << filelist.string() << ") not found on disk\n";
 }
 
-void add_file(VcodeLoader& loader, std::string path) {
-    if (loader.seen_files.insert(path).second)
-        loader.result.files.push_back(std::move(path));
+void add_file(VcodeLoader& loader, std::string path, uintmax_t size) {
+    if (!loader.seen_files.insert(path).second)
+        return;
+    loader.result.files.push_back(std::move(path));
+    loader.result.file_sizes.push_back(size);
 }
 
+/// Record @p path as a project source, warning if it is not on disk.
+///
+/// One metadata call, and only for a path not already recorded.  file_size()
+/// answers both questions this needs -- an error means the file is missing or
+/// unreadable, which is what the warning is for, and otherwise the size is what
+/// the background index queue is ordered by.  Asking exists() here and
+/// file_size() again later was two passes over every entry for one fact each,
+/// and asking before the dedup charged a filelist that names a file twice (or
+/// reaches it through two `-f` includes) once per mention: 51 metadata calls for
+/// a list of 50 duplicates of one file.
+///
+/// The size is a scheduling hint read microseconds before the queue is filled,
+/// so nothing depends on it still being current.
 void add_file_checked(VcodeLoader& loader, const std::filesystem::path& path,
                       const std::filesystem::path& filelist) {
+    auto key = path.string();
+    if (loader.seen_files.contains(key))
+        return;
     std::error_code ec;
-    if (!std::filesystem::exists(path, ec))
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec)
         warn_missing(path, filelist);
-    add_file(loader, path.string());
+    add_file(loader, std::move(key), ec ? 0 : size);
 }
 
 void add_include_dir(VcodeLoader& loader, std::string dir) {

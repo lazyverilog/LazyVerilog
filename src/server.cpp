@@ -1026,7 +1026,7 @@ void LazyVerilogServer::register_handlers() {
                 auto vcode = load_vcode(root_, config_);
                 analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                              vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root());
+                                             index_cache_root(), vcode.file_sizes);
                 configure_background_compiler();
                 schedule_background_compilation();
             };
@@ -1212,7 +1212,7 @@ void LazyVerilogServer::register_handlers() {
                 { auto vcode = load_vcode(root_, config_);
                   analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                                vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root()); }
+                                               index_cache_root(), vcode.file_sizes); }
                 configure_background_compiler();
                 schedule_background_compilation();
                 sync_folding_registration();
