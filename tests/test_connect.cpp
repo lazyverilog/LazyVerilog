@@ -475,3 +475,58 @@ endmodule
     CHECK(edit.find(".new_out(w)") != std::string::npos);
     CHECK(edit.find(".new_in(w)") != std::string::npos);
 }
+
+TEST_CASE("connect: header edits survive a non-ASCII comment in the port list",
+          "[connect]") {
+    // Every column Connect reads out of the index -- ModuleEntry::col,
+    // header_semi_col, port_list_close_col -- is an LSP column, and LSP counts
+    // UTF-16 code units rather than bytes.  Slicing the module header with them
+    // as if they were byte offsets agrees only while the header stays ASCII;
+    // one multi-byte character inside the port list is enough to cut in the
+    // wrong place and write the mangled header back.
+    //
+    // The comment sits on the header line itself, ahead of the `)` and the `;`
+    // whose columns get converted -- that is what makes the two units disagree
+    // for this edit.  Its bytes are written as escapes so this file stays ASCII
+    // for compilers that do not default to UTF-8 source encoding.
+    const std::string wide = "\xed\x81\xb4\xeb\x9f\xad"; // two 3-byte characters
+    const std::string source = "\n"
+                               "module leaf(input logic i, output logic o);\n"
+                               "endmodule\n"
+                               "module mid (input logic clk, /* " + wide +
+                               " */ output logic done);\n"
+                               "    leaf u_leaf (\n"
+                               "        .i(),\n"
+                               "        .o()\n"
+                               "    );\n"
+                               "endmodule\n"
+                               "module top;\n"
+                               "    mid u_src (.clk(), .done());\n"
+                               "    mid u_dst (.clk(), .done());\n"
+                               "endmodule\n";
+
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/connect_non_ascii_header.sv";
+    analyzer.open(uri, source);
+
+    // Routing through boundary ports that do not exist yet forces `mid`'s whole
+    // header to be regenerated, which is the slice that used to go wrong.
+    const auto edit = connect_apply_edit_json(analyzer, uri,
+                                              "top.u_src.u_leaf", "o",
+                                              "top.u_dst.u_leaf", "i",
+                                              "w",
+                                              {"new_out"}, {"new_in"});
+
+    // The comment is carried through the regenerated header intact: not cut
+    // short, not duplicated, and still attached to the port it documents.
+    CHECK(edit.find("new_out") != std::string::npos);
+    CHECK(edit.find("new_in") != std::string::npos);
+    // The original port list survives verbatim, comment bytes included.
+    CHECK(edit.find("input logic clk, /* " + wide + " */ output logic done") !=
+          std::string::npos);
+    // Exactly one copy of the comment: a short slice used to leave the tail
+    // behind in the untouched text as well as in the replacement.
+    const auto first = edit.find(wide);
+    REQUIRE(first != std::string::npos);
+    CHECK(edit.find(wide, first + wide.size()) == std::string::npos);
+}
