@@ -86,3 +86,44 @@ TEST_CASE("request pool: shutdown is idempotent", "[request_pool]") {
     pool.shutdown(); // and the destructor makes a third
     REQUIRE(ran.load() == 1);
 }
+
+TEST_CASE("request pool: shutdown stops accepting before it drains", "[request_pool]") {
+    // shutdown() used to drain *before* setting stop_, so submit() went on
+    // accepting for the whole drain.  A caller still offering work faster than
+    // the pool retires it -- the reader thread, on a teardown that has not
+    // stopped the transport first -- kept the queue non-empty and the call never
+    // returned.
+    //
+    // The observable contract is the ordering, not the hang: once shutdown() has
+    // begun, submit() must refuse.  Asserting on the refusal keeps this test
+    // bounded, so a regression fails here instead of timing the suite out.
+    constexpr int kMaxSubmissions = 150;
+    RequestPool pool(1);
+    std::atomic<int> accepted{0};
+    std::atomic<int> refused{0};
+
+    // One worker and tasks twice as long as the gap between submissions, so the
+    // queue is never observed empty while the submitter runs -- the condition
+    // the old ordering waited for and could not get -- while staying bounded.
+    std::thread submitter([&] {
+        for (int i = 0; i < kMaxSubmissions; ++i) {
+            if (!pool.submit([] { std::this_thread::sleep_for(2ms); })) {
+                ++refused;
+                return;
+            }
+            ++accepted;
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+
+    std::this_thread::sleep_for(40ms); // let a backlog build
+    pool.shutdown();
+    submitter.join();
+
+    // The submitter was still going when shutdown() started, and was turned
+    // away.  Reaching the cap instead means it was accepted throughout the
+    // drain, which is the ordering this guards against.
+    CHECK(refused.load() == 1);
+    CHECK(accepted.load() > 0);
+    CHECK(accepted.load() < kMaxSubmissions);
+}
