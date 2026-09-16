@@ -199,6 +199,17 @@ private:
     std::unordered_map<std::string, size_t> string_ids_;
 };
 
+/// Cap on what a length field may reserve before a single element of the run has
+/// been read back successfully.
+///
+/// Checking a count against the bytes remaining bounds it by the file, not by
+/// the allocation: an element is many bytes wide, so a corrupt count can still
+/// ask for sizeof(element) times the shard up front -- 248x for a run of
+/// ValueEntry.  Growing from a cap instead is amortised, reaches a real shard's
+/// size in a few reallocations, and is unmeasurable next to the parse the cache
+/// exists to skip.
+constexpr uint32_t kMaxPrereserve = 1024;
+
 /// Every read is bounds-checked and sets a sticky failure flag rather than
 /// throwing.  A corrupt or truncated shard has to degrade to a cache miss, and
 /// the alternative — trusting a length field read out of a file that may be
@@ -243,12 +254,19 @@ public:
     /// Read a count, then that many elements.  The count is checked against the
     /// bytes remaining before anything is reserved: a element is at least one
     /// byte, so a count larger than what is left cannot be honest.
+    ///
+    /// That bounds the count by the file, not the allocation: an element is many
+    /// bytes wide, so a corrupt count can still ask for sizeof(T) times the
+    /// shard up front -- 248x for a ValueEntry run.  Reserve in bounded steps
+    /// instead.  A real shard reaches its size in a few growths, which is
+    /// amortised and unmeasurable next to the parse it replaces, and a corrupt
+    /// one fails on its first element either way.
     template <typename T, typename F> std::vector<T> seq(F&& read_one) {
         std::vector<T> items;
         const auto count = u32();
         if (failed_ || count > remaining())
             return (failed_ = true, items);
-        items.reserve(count);
+        items.reserve(std::min(count, kMaxPrereserve));
         for (uint32_t i = 0; i < count && !failed_; ++i)
             items.push_back(read_one());
         return items;
@@ -265,7 +283,7 @@ public:
         const auto count = tr.u32();
         if (tr.failed_ || count > tr.remaining())
             return false;
-        strings_.reserve(count);
+        strings_.reserve(std::min(count, kMaxPrereserve));
         for (uint32_t i = 0; i < count; ++i) {
             const auto size = tr.u32();
             if (tr.failed_ || size > tr.remaining())
@@ -647,7 +665,7 @@ bool read_scoped_map(Reader& r, size_t bound, std::unordered_map<std::string, si
     const auto count = r.u32();
     if (r.failed() || count > r.remaining())
         return false;
-    out.reserve(count);
+    out.reserve(std::min(count, kMaxPrereserve));
     for (uint32_t i = 0; i < count; ++i) {
         const auto key = r.str();
         const auto index = r.u32();
@@ -1109,7 +1127,7 @@ std::optional<IndexCache::Loaded> deserialize_index_shard(std::string_view bytes
         const auto count = r.u32();
         if (r.failed() || count > r.remaining())
             return false;
-        out.reserve(count);
+        out.reserve(std::min(count, kMaxPrereserve));
         for (uint32_t i = 0; i < count; ++i)
             out.insert(std::string(r.str()));
         return !r.failed();
