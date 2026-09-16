@@ -27,10 +27,18 @@ Notable difference from older examples:
   config loader for compatibility, but new configs should use
   `align_adaptive`.
 
+## Project roots and the index cache
+
+LazyVerilog finds `lazyverilog.toml` by walking up from each file you open to the
+nearest one — the editor does not choose it. Index shards are written beside that
+config, in `.cache/lazyverilog/index`, with a `.gitignore` written for you; a file
+with no config above it uses your user cache directory instead. `[index].cache =
+false` turns the cache off. See the "Index cache" section of the README.
+
 ## Developer
 
 - [Build and tests](dev/test.md)
 - [Design filelist cache](dev/files.md)
-- [Indexing philosophy](dev/indexing.md)
+- [Indexing philosophy](dev/indexing.md) — including project-root resolution and shard storage
 - [Startup performance](dev/startup-perf.md)
 - [Edit-path performance](dev/edit-perf.md)

@@ -93,38 +93,76 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
-- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request,
-  and turning the capability off is what stops the client asking at all — measured 0
-  requests against 4-6 over five keystrokes in headless Neovim.  Both are read from
-  `<root>/lazyverilog.toml`, which is why `initialize` has to find the real one.
-- **Advertise a capability statically or register it dynamically, never both.**
-  Neovim's `client:supports_method()` answers from `server_capabilities` whenever
-  that field is present, so a later `client/unregisterCapability` changes nothing and
-  the client keeps requesting for the rest of the session — measured: unregister
-  accepted (`dynamic_capabilities:get()` → nil) while
-  `server_capabilities.inlayHintProvider` stayed `true` and requests kept coming.  So
-  when the client advertises `dynamicRegistration` for one of these, `initialize`
-  **omits** the provider field and the `initialized` handler registers instead.
-- `sync_dynamic_registration()` sends `client/registerCapability` /
-  `client/unregisterCapability` on `didChangeConfiguration`, so an edit to either
-  option takes effect mid-session with no restart — measured both directions, 4 → 0
-  and 0 → 4.  Neovim 0.12.5 opts in for `inlayHint` but **not** for `foldingRange`
-  (`dynamicRegistration = false`), so a `[folding].enable` edit there still needs a
-  restart, and the server logs that rather than sending a request the client may
-  ignore.  Registration ids are fixed (`kFoldingRegistrationId`,
-  `kInlayHintRegistrationId`) because the unregister has to name what the register used.
-- A registration carries a `documentSelector` of `systemverilog`/`verilog`.  A buffer
-  whose filetype is unset matches nothing, which looks exactly like a broken server —
-  check the filetype before the server when hints do not appear.
-- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins both the
-  static replies and the withheld-when-dynamic case.  Editor-side switches for both
+- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request.
+  **Neither turns the capability off any more.**  `foldingRangeProvider` and
+  `inlayHintProvider` are advertised as literal `true`, the way clangd advertises
+  them, and the options are answered in the handlers by returning nothing.
+  Capabilities are exchanged before any file is open, and the root is resolved per
+  file, so there is no single config at `initialize` to answer from.
+- The cost of that is measured and real: turning a capability off is what stopped the
+  client asking at all — 0 requests against 4-6 over five keystrokes in headless
+  Neovim.  A disabled feature now pays a round trip per keystroke that returns
+  nothing.  clangd has no folding option at all for this reason (`Config.h` has
+  `InlayHints.Enabled` and nothing for folding); `[folding].enable` is kept because
+  it is what users already configure.  If per-keystroke cost becomes the problem
+  again, the answer is a cheaper handler, not a withheld capability.
+- The whole dynamic-registration path for these two is **gone**:
+  `sync_dynamic_registration()`, the `dynamicRegistration` probe in `initialize`, and
+  the fixed registration ids.  Do not reintroduce it to "save" the requests above
+  without first re-reading why it was removed — a client that is told statically
+  ignores a later unregister (Neovim's `client:supports_method()` answers from
+  `server_capabilities` whenever that field is present), so the two mechanisms cannot
+  coexist, and the static one is what a per-file config needs.
+- A buffer whose filetype is unset gets no LSP features at all, which looks exactly
+  like a broken server — check the filetype before the server when hints do not appear.
+- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins that both
+  providers are advertised unconditionally (config off, dynamic-registration client,
+  and no `rootUri` at all), and that the handler still declines — including for a file
+  two directories below the config that governs it.  Editor-side switches for both
   features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
 - Details and prior measured rounds: `docs/dev/edit-perf.md`.
 
+### Project Roots
+- **The server decides which project a file belongs to, not the editor.**
+  `ProjectRootResolver` (`src/project_root.cpp`) walks up from each file to the
+  nearest `lazyverilog.toml`, which is clangd's
+  `DirectoryBasedGlobalCompilationDatabase::lookupCDB` with a different marker.
+  Per directory, with misses cached as deliberately as hits: a file five directories
+  deep stats five directories per lookup and most of that walk is misses, repeated by
+  every open buffer and every indexed file.
+- **Not finding a config is an answer (`nullopt`), never a guess at the file's own
+  directory.**  That guess is what used to put a `.cache/` next to whatever file was
+  opened — including in `/tmp`.
+- The Neovim plugin sends **no `root_dir`** and has no `root_markers`.  It cannot get
+  this right: `vim.fs.root` resolves its marker list by *marker order, not proximity*,
+  so `.git` at the top of a monorepo outranked the `lazyverilog.toml` beside the file
+  and the config was never read.  A `root_markers` passed to `setup()` is ignored with
+  one notification.
+- `initialize` still indexes eagerly when a client does send `rootUri` — a warm first
+  go-to-definition is worth keeping — but nothing per file depends on it.  `didOpen`
+  discovers projects too (`discover_project_for()`), and **merges** their parse inputs:
+  there is one `Analyzer` with one set, so a second project cannot have its own.
+  Include directories and filelists compose; `[design].define` does not, and two
+  projects defining the same macro differently get whichever value merged in first.
+- Guarded by `./build/lazyverilog-tests "[project-root]"` and
+  `ctest --test-dir build -R config-root-cli-smoke`.
+
 ### Index Shard Cache
-- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
-  turns it off.  Keyed on **content digests** of the file, its `include`s, and the
-  defines/incdirs — never mtime, which is unusable on a shared filesystem.
+- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`, where
+  `project_root` is **that file's own** — resolved as above, not a session-wide root.
+  `IndexCacheStorage` picks the directory per file, which is clangd's
+  `DiskBackedIndexStorageManager`; keeping the *storage* per file rather than the
+  *indexer* is what makes several projects cheap.
+- A file in no project falls back to `user_cache_directory()/lazyverilog/index`
+  (`$XDG_CACHE_HOME` or `~/.cache` on Unix, `~/Library/Caches` on macOS,
+  `%LOCALAPPDATA%` on Windows — the same convention as LLVM's
+  `llvm::sys::path::cache_directory()`).  No `.gitignore` is written there; that
+  directory is in no repository.
+- An `include`d header's shard lives beside **its** project's config, not the
+  includer's.  A verification header shared by two designs is one file in one project.
+- `[index].cache` turns it off.  Keyed on **content digests** of the file, its
+  `include`s, and the defines/incdirs — never mtime, which is unusable on a shared
+  filesystem.
 - A digest answers "did what I read change".  It cannot answer "would I read the same
   file", so the key also records **how each `include` resolved**, unresolved ones
   included: creating a header that satisfies an `include` for the first time, or
@@ -140,7 +178,8 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   Renaming shards (`shard_path()`) needs a bump too, or the old names are stranded.
 - The sweep (`IndexCache::prune_missing_sources()`, queued by the preload onto the
   writer thread) removes shards whose source file is gone and shards of any other
-  format version.  Files without our magic are left alone.
+  format version, and runs over **every** directory the burst wrote into.  Files
+  without our magic are left alone.
 - Benchmark all three halves: `tools/startup_bench.py` clears the shard cache before
   each run (**cold**), `--warm` keeps it, `--no-cache` turns the cache off entirely.
   Report them separately — a change can improve warm and wreck cold.

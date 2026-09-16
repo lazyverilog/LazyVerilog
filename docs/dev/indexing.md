@@ -258,6 +258,38 @@ Shards are written to `<project_root>/.cache/lazyverilog/index` and reloaded on
 the next launch, the way clangd's background index uses
 `<project_root>/.cache/clangd/index`.  `[index].cache = false` turns it off.
 
+`project_root` is resolved **per file**, by `ProjectRootResolver` walking up to
+the nearest `lazyverilog.toml`, and the directory is chosen per file by
+`IndexCacheStorage` — clangd's `DiskBackedIndexStorageManager`, whose whole body
+is this:
+
+```cpp
+llvm::SmallString<128> StorageDir(FallbackDir);
+if (auto PI = GetProjectInfo(File)) {
+  StorageDir = PI->SourceRoot;
+  llvm::sys::path::append(StorageDir, ".cache", "clangd", "index");
+}
+```
+
+Keeping the *storage* per file rather than the *indexer* is what makes serving
+several projects affordable: a second project costs a directory, not another set
+of worker threads, another source manager and another copy of the project index.
+
+Two consequences worth stating outright:
+
+- a filelist that reaches into a sibling project writes that project's shards
+  under *its* root, so the sweep runs over every directory a burst touched;
+- an `include`d header's shard lives beside the header's own config.  A
+  verification header shared by two designs is one file in one project, and
+  looking for it under each includer's root would miss it from one side and
+  write a second copy from the other.
+
+A file with no `lazyverilog.toml` above it has no project, and that is an answer
+rather than a reason to guess: `IndexCache::open_fallback()` puts its shards in
+`user_cache_directory()/lazyverilog/index`, following the same convention as
+LLVM's `llvm::sys::path::cache_directory()`.  Guessing the file's own directory
+instead is what used to create `.cache/` beside whatever file was opened.
+
 A shard is reused only when everything it was built from still holds:
 
 - the file's own contents;
