@@ -144,8 +144,6 @@ DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterScoped, ScopedRegistrationParams,
 // The ids both sides use to refer to these registrations.  Fixed rather than
 // generated: there is only ever one of each per session, and the unregister has
 // to name the same string the register used.
-constexpr const char* kFoldingRegistrationId   = "lazyverilog-folding-range";
-constexpr const char* kInlayHintRegistrationId = "lazyverilog-inlay-hint";
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -495,8 +493,6 @@ LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     config_ = load_config(root_);
     // Mirrors read by the handlers that run on the worker pool; see the
     // declarations.  Refreshed everywhere config_ is.
-    folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-    inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
 
@@ -625,72 +621,40 @@ void LazyVerilogServer::run() {
     }
 }
 
-void LazyVerilogServer::sync_dynamic_registration(const char* method,
-                                                  const char* registration_id,
-                                                  const char* config_key, bool want,
-                                                  bool client_supports, bool& advertised) {
-    if (!impl_ || want == advertised)
-        return;
-
-    // Capabilities are normally exchanged once, so a client that did not opt in
-    // keeps whatever initialize advertised.  Neovim answers
-    // `foldingRange.dynamicRegistration = false` (but `inlayHint` true), so say
-    // what happened rather than send a request it is entitled to ignore.
-    if (!client_supports) {
-        std::cerr << "[lazyverilog] " << config_key << " changed to "
-                  << (want ? "true" : "false")
-                  << ", but this client does not support dynamic registration for " << method
-                  << " -- restart the server for it to take effect\n";
-        return;
+std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri) const {
+    // The file decides, not the session.  Two buffers open at once can belong
+    // to different projects, and before this each was served whichever config
+    // the editor's guessed root happened to name.
+    std::string key;
+    if (root_resolver_) {
+        if (auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri))))
+            key = info->source_root.string();
     }
 
-    std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
-    try {
-        if (want) {
-            auto req = impl_->remote_endpoint.createRequest<Req_ClientRegisterScoped::request>();
-            ScopedRegistration reg;
-            reg.id     = registration_id;
-            reg.method = method;
-            DocumentFilter sv, v;
-            sv.language = std::string("systemverilog");
-            v.language  = std::string("verilog");
-            reg.registerOptions.documentSelector = DocumentSelector{sv, v};
-            req.params.registrations.push_back(std::move(reg));
-            (void)impl_->remote_endpoint.send(req);
-        } else {
-            auto req =
-                impl_->remote_endpoint.createRequest<Req_ClientUnregisterCapability::request>();
-            Unregistration unreg;
-            unreg.id     = registration_id;
-            unreg.method = method;
-            req.params.unregisterations.push_back(std::move(unreg));
-            (void)impl_->remote_endpoint.send(req);
-        }
-        advertised = want;
-    } catch (const std::exception& e) {
-        std::cerr << "[lazyverilog] " << method << " registration error: " << e.what() << "\n";
+    {
+        std::lock_guard<std::mutex> lock(config_cache_mutex_);
+        if (auto it = config_cache_.find(key); it != config_cache_.end())
+            return it->second;
     }
+
+    // Parsed outside the lock: reading and validating TOML is filesystem work,
+    // and a burst of didOpens in one project would otherwise serialize on it.
+    // Two threads reaching the same root both parse, and whichever insert lands
+    // first is the config both of them get -- the same trade the resolver and
+    // the digest memo make, for the same reason.
+    auto loaded = std::make_shared<const Config>(
+        key.empty() ? Config{} : load_config(std::filesystem::path(key)));
+
+    std::lock_guard<std::mutex> lock(config_cache_mutex_);
+    auto [it, inserted] = config_cache_.emplace(std::move(key), std::move(loaded));
+    return it->second;
 }
 
-void LazyVerilogServer::sync_folding_registration() {
-    sync_dynamic_registration("textDocument/foldingRange", kFoldingRegistrationId,
-                              "[folding].enable", config_.folding.enable,
-                              folding_dynamic_registration_, folding_advertised_);
-}
-
-void LazyVerilogServer::sync_inlay_hint_registration() {
-    const bool was_advertised = inlay_hint_advertised_;
-    sync_dynamic_registration("textDocument/inlayHint", kInlayHintRegistrationId,
-                              "[inlay_hint].enable", config_.inlay_hint.enable,
-                              inlay_hint_dynamic_registration_, inlay_hint_advertised_);
-
-    // Registering tells the client it may ask; it does not make it ask.  Neovim
-    // re-requests hints on the next didChange, which for a file nobody is
-    // typing in never comes -- so prompt it.  Must be outside the lock
-    // sync_dynamic_registration() holds: request_inlay_hint_refresh() takes the
-    // same one.
-    if (!was_advertised && inlay_hint_advertised_)
-        request_inlay_hint_refresh();
+void LazyVerilogServer::invalidate_config_cache() {
+    if (root_resolver_)
+        root_resolver_->invalidate();
+    std::lock_guard<std::mutex> lock(config_cache_mutex_);
+    config_cache_.clear();
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
@@ -908,17 +872,6 @@ void LazyVerilogServer::register_handlers() {
             caps.positionEncoding =
                 std::string(position_encoding_name(negotiated_position_encoding()));
 
-            // Whether a later [folding].enable / [inlay_hint].enable edit can
-            // reach this client at all.  Neovim answers false for foldingRange
-            // and true for inlayHint; VS Code's client answers true for both.
-            if (const auto& td = req.params.capabilities.textDocument) {
-                if (td->foldingRange && td->foldingRange->dynamicRegistration)
-                    folding_dynamic_registration_ =
-                        *td->foldingRange->dynamicRegistration;
-                if (td->inlayHint && td->inlayHint->dynamicRegistration)
-                    inlay_hint_dynamic_registration_ = *td->inlayHint->dynamicRegistration;
-            }
-
             // Text document sync: incremental + open/close notifications
             lsTextDocumentSyncOptions sync_opts;
             sync_opts.openClose = true;
@@ -1016,9 +969,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
-
+                        
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
@@ -1043,35 +994,34 @@ void LazyVerilogServer::register_handlers() {
                 initialize_workspace_root(root_);
             }
 
-            // Inlay hints
-            // A client that takes dynamic registration gets the capability that
-            // way and not here.  Advertising it statically as well is what makes
-            // a later client/unregisterCapability useless: Neovim's
-            // supports_method() falls back to the static capability and goes on
-            // requesting hints, which is exactly the bug this avoids.  The
-            // registration is sent from the `initialized` handler below.
-            if (inlay_hint_dynamic_registration_) {
-                inlay_hint_advertised_ = false;
-            } else {
-                caps.inlayHintProvider =
-                    std::make_pair(optional<bool>(config_.inlay_hint.enable),
-                                   optional<InlayHintOptions>{});
-                inlay_hint_advertised_ = config_.inlay_hint.enable;
-            }
-
-            // Folding range.  Neovim re-requests the whole file's folds from
-            // every didChange, so `[folding].enable = false` is the switch that
-            // stops the client asking at all.  Same rule as inlay hints above:
-            // a client that takes dynamic registration must not also be told
-            // statically, or the static answer is the one it keeps believing.
-            if (folding_dynamic_registration_) {
-                folding_advertised_ = false;
-            } else {
-                caps.foldingRangeProvider =
-                    std::make_pair(optional<bool>(config_.folding.enable),
-                                   optional<FoldingRangeOptions>{});
-                folding_advertised_ = config_.folding.enable;
-            }
+            // Inlay hints and folding ranges are advertised unconditionally,
+            // the way clangd does it:
+            //
+            //     {"foldingRangeProvider", true},
+            //     {"inlayHintProvider", true},
+            //
+            // `[inlay_hint].enable` and `[folding].enable` are answered in the
+            // handlers instead, by returning nothing.  This is clangd's
+            // `InlayHints.Enabled`, whose comment is exactly that -- "if false,
+            // inlay hints are completely disabled" -- while the capability
+            // stays true.  (clangd has no folding option at all; this one is
+            // kept because it is what users already configure.)
+            //
+            // Capabilities are exchanged once, before any file is open, so they
+            // cannot depend on config: with the root resolved per file there is
+            // no single `[folding].enable` at initialize to answer from.  What
+            // the config decides is the reply, which is per file and always
+            // current.
+            //
+            // The cost is real and was measured: turning a capability off is
+            // what stops the client asking at all -- 0 requests against 4-6
+            // over five keystrokes in headless Neovim -- and that lever is
+            // gone.  A disabled feature now costs a round trip per keystroke
+            // that returns nothing.  See docs/dev/edit-perf.md.
+            caps.inlayHintProvider =
+                std::make_pair(optional<bool>(true), optional<InlayHintOptions>{});
+            caps.foldingRangeProvider =
+                std::make_pair(optional<bool>(true), optional<FoldingRangeOptions>{});
 
             // Execute command — server-side commands
             lsExecuteCommandOptions exec_opts;
@@ -1123,12 +1073,6 @@ void LazyVerilogServer::register_handlers() {
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
         }
-
-        // Either capability may have been left out of the initialize reply for
-        // a client that takes dynamic registration, so make those first
-        // registrations now.
-        sync_folding_registration();
-        sync_inlay_hint_registration();
     });
 
     // ── shutdown ──────────────────────────────────────────────────────────────
@@ -1168,18 +1112,23 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler(
         [&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
             try {
-                // Prefer the explicit config path supplied by our Neovim
-                // client.  This avoids stale formatter options when Neovim and
-                // the server disagree about the workspace root:
+                // The payload names the config that changed.  It used to also
+                // *move* the server's root -- the client and the server each
+                // had a guess at which project was open, and configFile was how
+                // a disagreement got repaired.  Neither guesses now: every file
+                // resolves its own config, so the only thing this path has to
+                // do is forget what it had cached.
                 //
-                //   client root: /repo              (because .git was found)
-                //   config file: /repo/rtl/lazyverilog.toml
-                //   server root: /repo              (from initialize rootUri)
-                //
-                // If we ignored configFile, reload would keep reading
-                // /repo/lazyverilog.toml (or defaults) forever.  The payload is
-                // only a hint for selecting the root; load_config() still reads
-                // and validates lazyverilog.toml from disk.
+                // Both the resolver and the per-root configs are dropped, not
+                // just the named file's: creating a lazyverilog.toml changes
+                // which project *other* files belong to, and nothing in a
+                // cached answer records that it was reached by not finding
+                // this one.
+                invalidate_config_cache();
+
+                // The project-parse inputs below are still session-wide, so
+                // they reload from the root this config sits in when it names
+                // one.  See the note in initialize about what is still shared.
                 {
                     std::string config_file = did_change_config_file(note.params.settings);
                     if (!config_file.empty()) {
@@ -1188,9 +1137,8 @@ void LazyVerilogServer::register_handlers() {
                         std::filesystem::path config_path(config_file);
                         if (config_path.is_relative())
                             config_path = root_ / config_path;
-                        if (config_path.filename() == "lazyverilog.toml") {
+                        if (config_path.filename() == "lazyverilog.toml")
                             root_ = config_path.parent_path();
-                        }
                     }
                 }
 
@@ -1201,9 +1149,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
-
+                        
                 std::cerr << "[lazyverilog] reloaded config from "
                           << (root_ / "lazyverilog.toml").string() << "\n";
                 if (!warn.empty())
@@ -1215,8 +1161,6 @@ void LazyVerilogServer::register_handlers() {
                                                index_cache_storage(), vcode.file_sizes); }
                 configure_background_compiler();
                 schedule_background_compilation();
-                sync_folding_registration();
-                sync_inlay_hint_registration();
             } catch (const std::exception& e) {
                 std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }
@@ -1487,14 +1431,13 @@ void LazyVerilogServer::register_handlers() {
             // no fold boundary -- and the last request of a burst is never
             // superseded, so the buffer always settles on folds for its real
             // text.
-            // `[folding].enable = false` decides this too, not only what
-            // `initialize` advertises.  Neovim answers
-            // `foldingRange.dynamicRegistration = false`, so a config reload
-            // cannot unregister the capability there and the client keeps
-            // asking for the rest of the session -- at which point computing
-            // whole-file folds nobody wants is the most expensive thing on the
-            // edit path.  `inlayHint` has always checked its own flag here.
-            if (!folding_enabled_.load(std::memory_order_relaxed))
+            // `[folding].enable = false` is answered here and nowhere else:
+            // foldingRangeProvider is advertised unconditionally, so this is
+            // the only thing standing between a disabled feature and a
+            // whole-file fold computation on every keystroke.  Read from the
+            // file's own config, because two open buffers can disagree about
+            // it.
+            if (!config_for(uri)->folding.enable)
                 return rsp;
 
             if (edit_watermark_.superseded(uri)) {
@@ -1571,9 +1514,9 @@ void LazyVerilogServer::register_handlers() {
         td_inlayHint::response rsp;
         rsp.id = req.id;
         try {
-            if (!inlay_hint_enabled_.load(std::memory_order_relaxed))
-                return rsp;
             const auto& uri = req.params.textDocument.uri.raw_uri_;
+            if (!config_for(uri)->inlay_hint.enable)
+                return rsp;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
                                              req.params.range.end.line);
         } catch (const std::exception& e) {
