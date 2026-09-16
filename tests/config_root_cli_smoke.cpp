@@ -82,13 +82,13 @@ std::string initialize_with_root(const fs::path& server_bin, const std::string& 
 /// asking for the rest of the session.  Computing whole-file folds nobody wants
 /// is the most expensive thing on the edit path, so "turned off" has to mean
 /// the handler declines too.
-std::string folds_for_root(const fs::path& server_bin, const std::string& root_uri) {
+std::string folds_for_uri(const fs::path& server_bin, const std::string& root_uri,
+                          const std::string& doc_uri) {
     static int counter = 0;
     const fs::path input = fs::temp_directory_path() /
                            ("lazyverilog-config-folds-" +
                             std::to_string(cli_process::current_process_id()) + "-" +
                             std::to_string(counter++) + ".jsonrpc");
-    const std::string doc_uri = root_uri + "/fold_probe.sv";
     {
         std::ofstream out(input, std::ios::binary);
         out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
@@ -112,6 +112,16 @@ std::string folds_for_root(const fs::path& server_bin, const std::string& root_u
     // stdout checks below passed anyway.
     expect(result.exit_code == 0, "the server exits cleanly after a deferred fold request");
     return result.stdout_text;
+}
+
+std::string folds_for_root(const fs::path& server_bin, const std::string& root_uri) {
+    return folds_for_uri(server_bin, root_uri, root_uri + "/fold_probe.sv");
+}
+
+/// Like folds_for_root(), but the buffer sits two directories below the root,
+/// where there is no lazyverilog.toml of its own.
+std::string folds_for_nested_file(const fs::path& server_bin, const std::string& root_uri) {
+    return folds_for_uri(server_bin, root_uri, root_uri + "/rtl/core/fold_probe.sv");
 }
 
 bool contains(const std::string& haystack, const std::string& needle) {
@@ -148,60 +158,45 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // The supported layout: the config sits in the root the client sent, and a
-    // setting turned off in it reaches the capability reply.
+    // Both providers are advertised unconditionally, whatever the config says
+    // and whatever the client offers to register dynamically.  This is clangd's
+    // contract -- `{"foldingRangeProvider", true}` and `{"inlayHintProvider",
+    // true}` are literals there, and no config file influences them -- and it
+    // is forced here by the root moving into the server: capabilities are
+    // exchanged before any file is open, so there is no one config to answer
+    // from any more.
+    //
+    // What the config decides is the reply, checked further down.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
-        expect(contains(out, R"("inlayHintProvider":false)"),
-               "hints disabled by the config in the workspace root");
-    }
-
-    // The same layout against a config that turns the setting on.  Without this
-    // a server that always answered `false` would pass the case above, and a
-    // server that ignored the file entirely would pass the case below.
-    {
-        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"));
         expect(contains(out, R"("inlayHintProvider":true)"),
-               "hints enabled by the config in the workspace root");
+               "inlayHintProvider is advertised even where the config turns hints off");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised even where the config turns hints off");
     }
-
-    // The client's root is two directories below the config, so by the contract
-    // there is no config: the reply must come from built-in defaults, where
-    // inlay hints are on.  An upward walk would find `enable = false` above and
-    // answer `false` here.
-    {
-        const auto out = initialize_with_root(
-            server_bin, path_to_uri(fixtures / "hints_off" / "rtl" / "core"));
-        expect(contains(out, R"("inlayHintProvider":true)"),
-               "no config in the workspace root, so defaults -- not the one above it");
-    }
-
-    // `[folding].enable` reaches the wire the same way.  Neovim re-requests the
-    // whole file's folds from every didChange and answers `dynamicRegistration
-    // = false` for foldingRange, so this reply is the only chance to stop it
-    // asking -- there is no second one later in the session.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "folding_off"));
-        expect(contains(out, R"("foldingRangeProvider":false)"),
-               "folding disabled by the config in the workspace root");
-    }
-    {
-        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("foldingRangeProvider":true)"),
-               "folding on by default when the config does not mention it");
+               "foldingRangeProvider is advertised even where the config turns folding off");
     }
-
-    // A client that takes dynamic registration must NOT also be told statically.
-    // Neovim's supports_method() answers from the static capability when one is
-    // there, so advertising both makes a later client/unregisterCapability do
-    // nothing and the client keeps requesting for the rest of the session.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"),
                                               /*dynamic_registration=*/true);
-        expect(!contains(out, R"("inlayHintProvider")"),
-               "inlayHintProvider withheld from a client that registers dynamically");
-        expect(!contains(out, R"("foldingRangeProvider")"),
-               "foldingRangeProvider withheld from a client that registers dynamically");
+        expect(contains(out, R"("inlayHintProvider":true)"),
+               "inlayHintProvider is advertised to a client that registers dynamically");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised to a client that registers dynamically");
+    }
+
+    // A client that sends no root at all still gets the same reply.  This is
+    // the shape the Neovim plugin now sends -- it stopped choosing a root_dir,
+    // because choosing one is what it was getting wrong.
+    {
+        const auto out = initialize_with_root(server_bin, "");
+        expect(contains(out, R"("inlayHintProvider":true)"),
+               "inlayHintProvider is advertised to a client that sends no root");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised to a client that sends no root");
     }
 
     // The switch has to reach the handler, not only the capability reply.
@@ -211,6 +206,19 @@ int main(int argc, char** argv) {
         expect(!contains(out, R"("startLine")"),
                "no folds are computed when [folding].enable is false");
     }
+    // The config that governs a file is the nearest one above the *file*, not
+    // one the client named.  This probe sits two directories below
+    // folding_off/lazyverilog.toml with no config of its own, and under the old
+    // contract -- `<root>/lazyverilog.toml` and nothing else -- it was served
+    // defaults, so folds came back.
+    {
+        const auto out = folds_for_nested_file(server_bin,
+                                               path_to_uri(fixtures / "folding_off"));
+        expect(contains(out, R"("id":2)"), "a nested fold request is answered");
+        expect(!contains(out, R"("startLine")"),
+               "a file below the config inherits [folding].enable = false from it");
+    }
+
     // And the same request against a root that leaves folding on must produce
     // some, or the check above would pass against a server that never folds.
     {

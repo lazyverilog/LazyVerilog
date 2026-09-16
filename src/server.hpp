@@ -69,40 +69,32 @@ class LazyVerilogServer {
     std::shared_ptr<ProjectRootResolver> root_resolver_ =
         std::make_shared<ProjectRootResolver>();
 
+    /// The config governing @p uri: the nearest lazyverilog.toml above it, or
+    /// built-in defaults when there is none.
+    ///
+    /// Never null, and immutable once returned -- a handler running on the
+    /// worker pool holds it across its whole reply while a didChangeConfiguration
+    /// replaces the cache entry underneath.  This is why it is a
+    /// shared_ptr<const Config> and not a reference into a map.
+    ///
+    /// Cached per root, because inlay hints and folding ranges are answered at
+    /// keystroke rate and parsing TOML there would be absurd.
+    std::shared_ptr<const Config> config_for(std::string_view uri) const;
+
+    /// Drop the per-root config cache and the resolver's decisions.  Called
+    /// when a lazyverilog.toml is saved: which file it governs is the
+    /// resolver's answer, and the answer can now be different.
+    void invalidate_config_cache();
+
+    mutable std::mutex config_cache_mutex_;
+    /// Keyed by project root; the empty key is "no project", served defaults.
+    mutable std::unordered_map<std::string, std::shared_ptr<const Config>> config_cache_;
+
     std::filesystem::path root_;
     std::string config_diagnostic_uri_;
     Config config_;
 
-    /// `[folding].enable` and `[inlay_hint].enable`, mirrored out of config_.
-    ///
-    /// Both are read by handlers that run on the worker pool, while a
-    /// didChangeConfiguration may be replacing config_ on the dispatch thread.
-    /// Mirroring the two flags keeps that off the whole config's lifetime.
-    std::atomic<bool> folding_enabled_{true};
-    std::atomic<bool> inlay_hint_enabled_{true};
 
-    /// What the initialize reply said for each per-keystroke capability, and
-    /// whether the client will let us revise it.  Capabilities are normally
-    /// exchanged once, so without dynamic registration a later config edit
-    /// cannot reach the client and only takes effect on restart.  Neovim opts
-    /// in for `inlayHint` but not for `foldingRange`.
-    bool folding_advertised_{true};
-    bool folding_dynamic_registration_{false};
-    bool inlay_hint_advertised_{true};
-    bool inlay_hint_dynamic_registration_{false};
-
-    /// Send client/registerCapability or client/unregisterCapability so
-    /// @p method matches @p want.  No-op when @p advertised already says so, or
-    /// when @p client_supports is false -- then it only logs, naming
-    /// @p config_key.
-    void sync_dynamic_registration(const char* method, const char* registration_id,
-                                   const char* config_key, bool want, bool client_supports,
-                                   bool& advertised);
-
-    /// Bring textDocument/foldingRange and textDocument/inlayHint into line with
-    /// `[folding].enable` and `[inlay_hint].enable` after a config reload.
-    void sync_folding_registration();
-    void sync_inlay_hint_registration();
     Analyzer analyzer_;
     std::unique_ptr<BackgroundCompiler> background_compiler_;
     // Last observed textDocument version per open URI.  The server does not
