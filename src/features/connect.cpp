@@ -1,6 +1,7 @@
 #include "connect.hpp"
 #include "../syntax_index_shared.hpp"
 #include "../dynamic_file_index.hpp"
+#include "../string_utils.hpp"
 
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -22,20 +23,63 @@
 
 namespace {
 
+/// One module-item declaration, as an edit-ready source range.
+///
+/// Declared here rather than beside the visitor that fills it because FileView
+/// caches these per module for the life of a request; see `decls_by_module`.
+struct DeclInfo {
+    std::string name;
+    std::string type;
+    int start_line{0};
+    int start_col{0};
+    int end_line{0};
+    int end_col{0};
+    size_t declarator_count{0};
+};
+
+/// One file's structural view for the duration of a single Connect request.
+///
+/// Nothing here is owned that something else already owns for long enough.  An
+/// open buffer's text and index belong to its immutable DocumentState, which
+/// `state` keeps alive; a closed project file's shard belongs to the analyzer's
+/// cache, which `index_owner` keeps alive.  Copying either instead -- which is
+/// what this struct did -- duplicated the whole project index on every Connect
+/// request, and a shard carries every reference occurrence in its file.
 struct FileView {
     std::string uri;
     std::string path;
-    // Text is present immediately for open buffers because it can include
-    // unsaved edits.  For closed project files it starts empty and is filled
-    // lazily only when Connect must compute a TextEdit in that exact file.
-    // This avoids reading every .f entry on ConnectInfo/preview/apply requests.
-    mutable std::string text;
-    mutable bool text_loaded{false};
-    SyntaxIndex index;
+    // Text for a closed project file, read lazily and only when Connect must
+    // compute a TextEdit in that exact file.  This avoids reading every .f
+    // entry on ConnectInfo/preview/apply requests.  Open buffers do not use it:
+    // their text can include unsaved edits and is borrowed below.
+    mutable std::string lazy_text;
+    mutable bool lazy_text_loaded{false};
+    // The open buffer's text, owned by `state`.  Null for closed files.
+    const std::string* buffer_text{nullptr};
+
+    // The index this view answers from, borrowed.  For an open buffer it is the
+    // structural index cached on `state`; for a closed file it is the shard
+    // `index_owner` holds.  Mirrors ExtraFileInfo::index_ref().
+    std::shared_ptr<const SyntaxIndex> index_owner;
+    const SyntaxIndex* index_ptr{nullptr};
+    const SyntaxIndex& index_ref() const {
+        static const SyntaxIndex empty{};
+        return index_ptr ? *index_ptr : empty;
+    }
+
     // Non-null only for open/current buffers.  Per project architecture, these
     // live SyntaxTree snapshots are authoritative for edit-local facts such as
     // declarations in unsaved text.  Closed/filelist files keep only SyntaxIndex.
     std::shared_ptr<const DocumentState> state;
+    // AST-derived declarations, per module, filled on first use.
+    //
+    // Deriving them walks this file's whole SyntaxTree, and a single connect
+    // edit asks for the same module's declarations from four places --
+    // declared_signal(), wire_insert_line(), signal_type_in_file() and
+    // declaration_delete_edit() -- each of which reads one field and throws the
+    // rest away.  A FileView lives exactly as long as one request, so caching
+    // here needs no invalidation, the same way `text` above does not.
+    mutable std::unordered_map<std::string, std::vector<DeclInfo>> decls_by_module;
 };
 
 struct ResolvedInst {
@@ -127,11 +171,26 @@ static std::string read_file_text_best_effort(const std::string& path) {
 }
 
 static const std::string& file_text(const FileView& file) {
-    if (!file.text_loaded) {
-        file.text = read_file_text_best_effort(file.path);
-        file.text_loaded = true;
+    if (file.buffer_text)
+        return *file.buffer_text;
+    if (!file.lazy_text_loaded) {
+        file.lazy_text = read_file_text_best_effort(file.path);
+        file.lazy_text_loaded = true;
     }
-    return file.text;
+    return file.lazy_text;
+}
+
+/// A view onto an open buffer.  The structural index and the text both live on
+/// the snapshot, which the view holds, so neither is copied.
+static FileView open_buffer_view(std::string uri, std::string path,
+                                 std::shared_ptr<const DocumentState> state) {
+    FileView file;
+    file.uri = std::move(uri);
+    file.path = std::move(path);
+    file.buffer_text = &state->text;
+    file.index_ptr = &get_structural_index(*state);
+    file.state = std::move(state);
+    return file;
 }
 
 static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::string& uri) {
@@ -145,12 +204,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
                                 const std::shared_ptr<const DocumentState>& state) {
         if (!state || !seen.insert(state_uri).second)
             return;
-        files.push_back(FileView{.uri = state_uri,
-                                 .path = {},
-                                 .text = state->text,
-                                 .text_loaded = true,
-                                 .index = get_structural_index(*state),
-                                 .state = state});
+        files.push_back(open_buffer_view(state_uri, {}, state));
     });
 
     // Filelist entries fill in library modules / sibling modules. If an extra
@@ -162,31 +216,23 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
         if (!seen.insert(extra.uri).second)
             continue;
         if (extra.state) {
-            files.push_back(FileView{.uri = extra.uri,
-                                     .path = extra.path,
-                                     .text = extra.state->text,
-                                     .text_loaded = true,
-                                     .index = get_structural_index(*extra.state),
-                                     .state = extra.state});
+            files.push_back(open_buffer_view(extra.uri, extra.path, extra.state));
         } else {
-            files.push_back(FileView{.uri = extra.uri,
-                                     .path = extra.path,
-                                     .text = {},
-                                     .text_loaded = false,
-                                     .index = extra.index_ref(),
-                                     .state = nullptr});
+            FileView file;
+            file.uri = extra.uri;
+            file.path = extra.path;
+            // The shard, not a copy of it.  Holding the shared_ptr keeps it
+            // alive independently of the snapshot vector this loop walks.
+            file.index_owner = extra.index;
+            file.index_ptr = file.index_owner.get();
+            files.push_back(std::move(file));
         }
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
     if (!seen.contains(uri)) {
         if (auto state = analyzer.get_state(uri))
-            files.push_back(FileView{.uri = uri,
-                                     .path = {},
-                                     .text = state->text,
-                                     .text_loaded = true,
-                                     .index = get_structural_index(*state),
-                                     .state = state});
+            files.push_back(open_buffer_view(uri, {}, state));
     }
     return files;
 }
@@ -194,12 +240,12 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
 static const ModuleEntry* find_module(const std::vector<FileView>& files, const std::string& name,
                                       const FileView** file_out = nullptr) {
     for (const auto& file : files) {
-        auto it = file.index.module_by_name.find(name);
-        if (it == file.index.module_by_name.end())
+        auto it = file.index_ref().module_by_name.find(name);
+        if (it == file.index_ref().module_by_name.end())
             continue;
         if (file_out)
             *file_out = &file;
-        return &file.index.modules[it->second];
+        return &file.index_ref().modules[it->second];
     }
     return nullptr;
 }
@@ -212,7 +258,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     std::unordered_set<std::string> instantiated_modules;
 
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             by_parent_module[inst.parent_module].push_back({&file, &inst});
             instantiated_modules.insert(inst.module_name);
         }
@@ -221,7 +267,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     struct Root { std::string path; std::string module; };
     std::vector<Root> frontier;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!instantiated_modules.contains(module.name))
                 frontier.push_back({module.name, module.name});
         }
@@ -230,7 +276,7 @@ build_hierarchy(const std::vector<FileView>& files) {
     // seed all modules so ConnectInfo still has useful instance choices.
     if (frontier.empty()) {
         for (const auto& file : files)
-            for (const auto& module : file.index.modules)
+            for (const auto& module : file.index_ref().modules)
                 frontier.push_back({module.name, module.name});
     }
 
@@ -264,13 +310,13 @@ static std::vector<std::pair<const FileView*, const ModuleEntry*>>
 find_hierarchy_roots(const std::vector<FileView>& files) {
     std::unordered_set<std::string> instantiated_modules;
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances)
+        for (const auto& inst : file.index_ref().instances)
             instantiated_modules.insert(inst.module_name);
     }
 
     std::vector<std::pair<const FileView*, const ModuleEntry*>> roots;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!instantiated_modules.contains(module.name))
                 roots.push_back({&file, &module});
         }
@@ -281,7 +327,7 @@ find_hierarchy_roots(const std::vector<FileView>& files) {
     // expandable seed so the UI can still browse something useful.
     if (roots.empty()) {
         for (const auto& file : files)
-            for (const auto& module : file.index.modules)
+            for (const auto& module : file.index_ref().modules)
                 roots.push_back({&file, &module});
     }
     return roots;
@@ -296,7 +342,7 @@ struct DesignLookup {
 static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
     DesignLookup lookup;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             // First definition wins, matching find_module().  Open buffers are
             // collected before filelist shards, so unsaved current text remains
             // authoritative when a file also appears in the project filelist.
@@ -352,7 +398,7 @@ static std::optional<std::vector<ResolvedInst>> resolve_instance_route(
         // This avoids building `top.*` paths for unrelated branches.
         const FileView* inst_file = module_file_it->second;
         const InstanceEntry* inst_entry = nullptr;
-        for (const auto& inst : inst_file->index.instances) {
+        for (const auto& inst : inst_file->index_ref().instances) {
             if (inst.parent_module == parent_module && inst.instance_name == parts[i]) {
                 inst_entry = &inst;
                 break;
@@ -432,7 +478,7 @@ static std::vector<ResolvedInst> hierarchy_children_for_path(const std::vector<F
 
     const FileView* inst_file = module_file_it->second;
     std::vector<ResolvedInst> children;
-    for (const auto& inst : inst_file->index.instances) {
+    for (const auto& inst : inst_file->index_ref().instances) {
         if (inst.parent_module != parent_module)
             continue;
         const std::string child_path = normalized_parent_path + "." + inst.instance_name;
@@ -489,37 +535,60 @@ static std::optional<NamedPortConn> connection_for(const InstanceEntry& inst,
     return std::nullopt;
 }
 
-static std::pair<int, int> offset_to_pos(const std::string& text, size_t off) {
-    off = std::min(off, text.size());
-    int line = 0, col = 0;
-    for (size_t i = 0; i < off; ++i) {
-        if (text[i] == '\n') {
-            ++line;
-            col = 0;
-        } else {
-            ++col;
+// ── the LSP column boundary ───────────────────────────────────────────────────
+//
+// Both directions go through string_utils.hpp rather than counting bytes here.
+// `Position.character` is a count of UTF-16 code units (or of bytes, when the
+// client negotiated `positionEncoding: utf-8`), and every column Connect
+// consumes -- ModuleEntry::col, header_semi_col, port_list_close_col -- is
+// already recorded in that unit by token_pos_line1_col0().  Counting bytes
+// against them agrees only while a line stays ASCII: one CJK comment inside a
+// port list is enough to slice the module header at the wrong offset and write
+// the mangled result back, and every column Connect *emits* lands in a TextEdit
+// range the client resolves the same way.
+//
+// clangd calls the same pair lspLength()/measureUnits(); here they are
+// lsp_column_from_byte_offset() and lsp_position_to_byte_offset(), which is what
+// the rest of this server already routes through.
+
+/// (0-based line, LSP column) -> byte offset, clamped to the end of that line.
+static size_t offset_from_position(std::string_view text, int line, int col) {
+    return lsp_position_to_byte_offset(text, std::max(line, 0), std::max(col, 0));
+}
+
+/// Byte offset -> (0-based line, LSP column), for one buffer, with the line
+/// starts found once.
+///
+/// Walking to a byte offset from the start of the text is O(offset), so asking
+/// for N positions in a file of M bytes costs O(N x M).  A declaration walk over
+/// a generated register block is exactly that shape -- thousands of positions in
+/// one large file -- and it is why this table exists rather than a rescan per
+/// call.  folding_range.cpp's LineTable is the same idea for the same reason.
+class LinePositions {
+  public:
+    LinePositions() = default;
+    explicit LinePositions(std::string_view text) : text_(text) {
+        starts_.push_back(0);
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == '\n')
+                starts_.push_back(i + 1);
         }
     }
-    return {line, col};
-}
 
-static size_t offset_from_position(const std::string& text, int line, int col) {
-    line = std::max(line, 0);
-    col = std::max(col, 0);
-
-    size_t offset = 0;
-    int current_line = 0;
-    while (offset < text.size() && current_line < line) {
-        if (text[offset] == '\n')
-            ++current_line;
-        ++offset;
+    std::pair<int, int> position_of(size_t offset) const {
+        if (starts_.empty())
+            return {0, 0};
+        offset = std::min(offset, text_.size());
+        const auto after = std::upper_bound(starts_.begin(), starts_.end(), offset);
+        const size_t line = static_cast<size_t>(after - starts_.begin()) - 1;
+        return {static_cast<int>(line),
+                lsp_column_from_byte_offset(text_, starts_[line], offset)};
     }
 
-    size_t line_end = offset;
-    while (line_end < text.size() && text[line_end] != '\n')
-        ++line_end;
-    return std::min(offset + static_cast<size_t>(col), line_end);
-}
+  private:
+    std::string_view text_;
+    std::vector<size_t> starts_;
+};
 
 static bool syntax_fragment_edge_is_wordlike(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
@@ -587,38 +656,40 @@ static std::string type_from_net_declaration(const slang::syntax::NetDeclaration
     return append_declarator_dimensions(std::move(type), declarator);
 }
 
-static std::pair<int, int> range_end_pos(const slang::SourceManager& sm,
-                                         slang::SourceRange range) {
-    if (!range.end().valid())
-        return {0, 0};
-    return offset_to_pos(std::string(sm.getSourceText(range.end().buffer())), range.end().offset());
-}
-
-struct DeclInfo {
-    std::string name;
-    std::string type;
-    int start_line{0};
-    int start_col{0};
-    int end_line{0};
-    int end_col{0};
-    size_t declarator_count{0};
-};
-
 struct ModuleDeclVisitor : public slang::syntax::SyntaxVisitor<ModuleDeclVisitor> {
     const slang::SourceManager& sm;
     std::string target_module;
     std::vector<DeclInfo> decls;
+    // Line tables for the buffers this walk has touched, keyed by buffer id.
+    // A module normally lives in one buffer; an `include`d one adds a second.
+    std::unordered_map<uint32_t, LinePositions> lines_by_buffer;
 
     ModuleDeclVisitor(const slang::SourceManager& sm, std::string target_module)
         : sm(sm), target_module(std::move(target_module)) {}
+
+    /// The line table for @p buffer, built on first use.
+    ///
+    /// getSourceText() hands back a view into the SourceManager, which outlives
+    /// this walk.  Copying it into a std::string -- which is what the call sites
+    /// below used to do, once per declaration and twice per call -- duplicated
+    /// the whole file for every declaration in it.
+    const LinePositions& lines_for(slang::BufferID buffer) {
+        const auto key = buffer.getId();
+        const auto it = lines_by_buffer.find(key);
+        if (it != lines_by_buffer.end())
+            return it->second;
+        return lines_by_buffer.emplace(key, LinePositions(sm.getSourceText(buffer)))
+            .first->second;
+    }
 
     void add_decl_at_range_start(const slang::parsing::Token& name_token, const std::string& type,
                                  slang::SourceRange range, size_t count) {
         if (!range.start().valid() || range.start().buffer() != range.end().buffer())
             return;
-        auto [start_line, start_col] = offset_to_pos(
-            std::string(sm.getSourceText(range.start().buffer())), range.start().offset());
-        auto [end_line, end_col] = range_end_pos(sm, range);
+        const auto& lines = lines_for(range.start().buffer());
+        auto [start_line, start_col] = lines.position_of(range.start().offset());
+        auto [end_line, end_col] =
+            range.end().valid() ? lines.position_of(range.end().offset()) : std::pair<int, int>{0, 0};
         decls.push_back(DeclInfo{.name = token_text(name_token),
                                  .type = type,
                                  .start_line = start_line,
@@ -670,13 +741,24 @@ struct ModuleDeclVisitor : public slang::syntax::SyntaxVisitor<ModuleDeclVisitor
     }
 };
 
-static std::vector<DeclInfo> ast_declarations_for_module(const FileView& file,
-                                                         const std::string& module_name) {
-    if (!file.state || !file.state->tree)
-        return {};
-    ModuleDeclVisitor visitor(file.state->tree->sourceManager(), module_name);
-    file.state->tree->root().visit(visitor);
-    return std::move(visitor.decls);
+/// @p module_name's module-item declarations, derived from this file's live AST.
+///
+/// Returned by reference and cached on the FileView: deriving them walks the
+/// whole SyntaxTree, and one connect edit asks four times over for the same
+/// module.  See FileView::decls_by_module.
+static const std::vector<DeclInfo>& ast_declarations_for_module(const FileView& file,
+                                                                const std::string& module_name) {
+    const auto cached = file.decls_by_module.find(module_name);
+    if (cached != file.decls_by_module.end())
+        return cached->second;
+
+    std::vector<DeclInfo> decls;
+    if (file.state && file.state->tree) {
+        ModuleDeclVisitor visitor(file.state->tree->sourceManager(), module_name);
+        file.state->tree->root().visit(visitor);
+        decls = std::move(visitor.decls);
+    }
+    return file.decls_by_module.emplace(module_name, std::move(decls)).first->second;
 }
 
 static bool declared_signal(const FileView& file, const std::string& module_name,
@@ -693,7 +775,7 @@ static bool declared_signal(const FileView& file, const std::string& module_name
 
     // Closed/project files are represented by SyntaxIndex.  This is also a
     // conservative fallback if an open buffer temporarily lacks a SyntaxTree.
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         if (value.name == name &&
             (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
             return true;
@@ -708,7 +790,7 @@ static int wire_insert_line(const FileView& file, const std::string& module_name
     if (last_decl_line >= 0)
         return last_decl_line + 1;
 
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         // SyntaxIndex.values also contains ports and parameter-port-list
         // entries.  Those are not valid anchors for inserting an internal
         // bridge wire: with an ANSI header they can be physically inside the
@@ -724,9 +806,9 @@ static int wire_insert_line(const FileView& file, const std::string& module_name
 
     // No existing declarations in this module. Insert immediately after this
     // module's header semicolon using the AST/SyntaxIndex-derived edit range.
-    auto mod_it = file.index.module_by_name.find(module_name);
-    if (mod_it != file.index.module_by_name.end()) {
-        const auto& module = file.index.modules[mod_it->second];
+    auto mod_it = file.index_ref().module_by_name.find(module_name);
+    if (mod_it != file.index_ref().module_by_name.end()) {
+        const auto& module = file.index_ref().modules[mod_it->second];
         if (module.header_semi_line >= 0)
             return module.header_semi_line + 1;
     }
@@ -742,7 +824,7 @@ static std::string signal_type_in_file(const FileView& file, const std::string& 
         if (decl.name == sig)
             return decl.type;
     }
-    for (const auto& value : file.index.values) {
+    for (const auto& value : file.index_ref().values) {
         if (value.name == sig &&
             (module_name.empty() || value.parent_scope.empty() || value.parent_scope == module_name))
             return value.type;
@@ -757,9 +839,17 @@ static std::optional<TextEdit> declaration_delete_edit(const FileView& file,
         if (decl.name != signal_name || decl.declarator_count != 1)
             continue;
 
-        auto lines = split_lines(file_text(file));
-        if (decl.start_line >= 0 && decl.start_line < static_cast<int>(lines.size())) {
-            const auto prefix = lines[decl.start_line].substr(0, std::min<size_t>(decl.start_col, lines[decl.start_line].size()));
+        // Whether anything but whitespace precedes the declaration on its line,
+        // read out of the text by byte offset.  start_col is an LSP column, so
+        // slicing the line with it directly would cut in the wrong place on any
+        // line carrying non-ASCII -- and would need the whole file split into
+        // owned lines to do it.
+        const std::string& text = file_text(file);
+        if (decl.start_line >= 0) {
+            const size_t line_start = lsp_line_start_offset(text, decl.start_line);
+            const size_t decl_start =
+                offset_from_position(text, decl.start_line, decl.start_col);
+            const auto prefix = text.substr(line_start, decl_start - line_start);
             if (trim(prefix).empty() && decl.end_line == decl.start_line) {
                 return TextEdit{file.uri, decl.start_line, 0, decl.start_line + 1, 0, ""};
             }
@@ -1008,10 +1098,10 @@ static std::vector<TextEdit> add_module_ports(const FileView& file, const std::s
                                               const std::vector<ModulePortAddition>& ports) {
     if (ports.empty())
         return {};
-    auto mod_it = file.index.module_by_name.find(module_name);
-    if (mod_it == file.index.module_by_name.end())
+    auto mod_it = file.index_ref().module_by_name.find(module_name);
+    if (mod_it == file.index_ref().module_by_name.end())
         return {};
-    const auto& module = file.index.modules[mod_it->second];
+    const auto& module = file.index_ref().modules[mod_it->second];
     if (module.header_semi_line < 0 || module.header_semi_col < 0)
         return {};
 
@@ -1232,15 +1322,34 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     // `top.u_a.u_leaf` is just a step-by-step walk through indexed instances:
     // root module -> child instance -> child module -> ... .
     auto source_route = resolve_instance_route(lookup, source_path, r.error);
-    if (!source_route)
+    if (!source_route || source_route->empty())
         return r;
     auto dest_route = resolve_instance_route(lookup, dest_path, r.error);
-    if (!dest_route)
+    if (!dest_route || dest_route->empty())
         return r;
     auto hierarchy = route_hierarchy_map(*source_route, *dest_route);
 
-    const auto& src = hierarchy.at(source_path);
-    const auto& dst = hierarchy.at(dest_path);
+    // From here on the routes' own spelling is the path, not the caller's.
+    //
+    // resolve_instance_route() splits on '.' and drops empty segments, so
+    // `top..u_src` and `top.u_src.` both resolve -- to a route whose path is
+    // `top.u_src`.  Everything downstream keys on that spelling: the hierarchy
+    // map, the common-ancestor walk, and the step lists.  Carrying the caller's
+    // text instead made a client typo miss every one of them, starting with a
+    // map lookup that threw std::out_of_range and left the request answered with
+    // a bare null instead of the error shape every other failure here returns.
+    const std::string& source_key = source_route->back().path;
+    const std::string& dest_key = dest_route->back().path;
+
+    const auto src_it = hierarchy.find(source_key);
+    const auto dst_it = hierarchy.find(dest_key);
+    if (src_it == hierarchy.end() || dst_it == hierarchy.end()) {
+        r.error = "instance '" + (src_it == hierarchy.end() ? source_path : dest_path) +
+                  "' not found";
+        return r;
+    }
+    const auto& src = src_it->second;
+    const auto& dst = dst_it->second;
     auto sp = port_on_module(files, src.module_name, source_port);
     auto dp = port_on_module(files, dst.module_name, dest_port);
     if (sp && sp->direction != "output") {
@@ -1265,13 +1374,14 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
 
     if (sp && dp && decl_type_for_port(*sp) != decl_type_for_port(*dp))
         r.warnings.push_back("type mismatch: source port '" + decl_type_for_port(*sp) + "' vs dest port '" + decl_type_for_port(*dp) + "' — using source type");
-    const std::string lca = lca_path(source_path, dest_path);
+    const std::string lca = lca_path(source_key, dest_key);
     if (lca.empty()) { r.error = "no common ancestor found"; return r; }
     const auto root_mod = lca.substr(lca.find_last_of('.') == std::string::npos ? 0 : lca.find_last_of('.') + 1);
-    r.lca_module = hierarchy.contains(lca) ? hierarchy.at(lca).module_name : root_mod;
+    const auto lca_it = hierarchy.find(lca);
+    r.lca_module = lca_it != hierarchy.end() ? lca_it->second.module_name : root_mod;
 
-    auto source_steps = path_pairs_to_lca(source_path, lca);
-    auto dest_steps = path_pairs_to_lca(dest_path, lca);
+    auto source_steps = path_pairs_to_lca(source_key, lca);
+    auto dest_steps = path_pairs_to_lca(dest_key, lca);
     const size_t needed_source_ports = source_steps.empty() ? 0 : source_steps.size() - 1;
     const size_t needed_dest_ports = dest_steps.empty() ? 0 : dest_steps.size() - 1;
     if (source_boundary_ports.size() < needed_source_ports) {
@@ -1291,19 +1401,29 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     // LCA bridge wire from those boundary ports rather than from the leaf cell
     // pin.  In the demo case `inv.o` is 1 bit, but `memory.o_data` is the real
     // exported bus that should determine the top-level bridge declaration.
+    const auto boundary_child = [&](const std::vector<std::string>& steps) -> const ResolvedInst* {
+        if (steps.empty())
+            return nullptr;
+        const auto it = hierarchy.find(steps.front());
+        return it == hierarchy.end() ? nullptr : &it->second;
+    };
     if (!source_boundary_ports.empty()) {
-        const auto& child = hierarchy.at(source_steps.front());
-        if (auto bp = port_on_module(files, child.parent_module, source_boundary_ports.front())) {
-            const auto typ = signal_decl_type_for_port(*bp);
-            if (!typ.empty())
-                r.wire_type = typ;
+        if (const auto* child = boundary_child(source_steps)) {
+            if (auto bp = port_on_module(files, child->parent_module,
+                                         source_boundary_ports.front())) {
+                const auto typ = signal_decl_type_for_port(*bp);
+                if (!typ.empty())
+                    r.wire_type = typ;
+            }
         }
     } else if (!dest_boundary_ports.empty()) {
-        const auto& child = hierarchy.at(dest_steps.front());
-        if (auto bp = port_on_module(files, child.parent_module, dest_boundary_ports.front())) {
-            const auto typ = signal_decl_type_for_port(*bp);
-            if (!typ.empty())
-                r.wire_type = typ;
+        if (const auto* child = boundary_child(dest_steps)) {
+            if (auto bp = port_on_module(files, child->parent_module,
+                                         dest_boundary_ports.front())) {
+                const auto typ = signal_decl_type_for_port(*bp);
+                if (!typ.empty())
+                    r.wire_type = typ;
+            }
         }
     }
 
@@ -1472,13 +1592,13 @@ find_current_file_instance(const std::vector<FileView>& files, const std::string
     for (const auto& file : files) {
         if (file.uri != uri)
             continue;
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             if (inst.instance_name == inst_name)
                 return std::make_pair(&file, &inst);
         }
     }
     for (const auto& file : files) {
-        for (const auto& inst : file.index.instances) {
+        for (const auto& inst : file.index_ref().instances) {
             if (inst.instance_name == inst_name)
                 return std::make_pair(&file, &inst);
         }
@@ -1497,7 +1617,7 @@ std::string connect_info_json(const Analyzer& analyzer, const std::string& uri,
     std::string out = "{\"modules\":{";
     bool first_mod = true;
     for (const auto& file : files) {
-        for (const auto& module : file.index.modules) {
+        for (const auto& module : file.index_ref().modules) {
             if (!first_mod)
                 out += ",";
             first_mod = false;
@@ -1648,7 +1768,7 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
         self_conn[c.port_name] = c;
 
     std::multimap<std::string, std::tuple<std::string, std::string, std::string, std::string>> others;
-    for (const auto& other : file.index.instances) {
+    for (const auto& other : file.index_ref().instances) {
         if (other.instance_name == inst.instance_name || other.parent_module != inst.parent_module)
             continue;
         const auto* omod = find_module(files, other.module_name);

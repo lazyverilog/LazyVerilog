@@ -191,11 +191,7 @@ std::vector<FoldToken> lex_fold_tokens(std::string_view src) {
     const auto off_re = svfmt::cached_format_marker_regex(opts.format_off_comment_pattern);
     const auto on_re  = svfmt::cached_format_marker_regex(opts.format_on_comment_pattern);
 
-    slang::SourceManager  sm;
-    slang::BumpAllocator  alloc;
-    slang::Diagnostics    diagnostics;
-    auto                  buffer = sm.assignText(src);
-    slang::parsing::Lexer lexer(buffer, alloc, diagnostics, sm);
+    SourceTextLexer lexer(src);
 
     size_t frozen_end = 0;     // one-past a directive line or `define body
     bool   disabled   = false; // inside a format-off region

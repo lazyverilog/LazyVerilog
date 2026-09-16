@@ -1,8 +1,13 @@
 #include "analyzer.hpp"
 #include "features/connect.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
 
 TEST_CASE("connect: reports modules, ports, and hierarchical instances", "[connect]") {
     Analyzer analyzer;
@@ -474,4 +479,175 @@ endmodule
     CHECK(edit.find("output logic new_out") != std::string::npos);
     CHECK(edit.find(".new_out(w)") != std::string::npos);
     CHECK(edit.find(".new_in(w)") != std::string::npos);
+}
+
+TEST_CASE("connect: header edits survive a non-ASCII comment in the port list",
+          "[connect]") {
+    // Every column Connect reads out of the index -- ModuleEntry::col,
+    // header_semi_col, port_list_close_col -- is an LSP column, and LSP counts
+    // UTF-16 code units rather than bytes.  Slicing the module header with them
+    // as if they were byte offsets agrees only while the header stays ASCII;
+    // one multi-byte character inside the port list is enough to cut in the
+    // wrong place and write the mangled header back.
+    //
+    // The comment sits on the header line itself, ahead of the `)` and the `;`
+    // whose columns get converted -- that is what makes the two units disagree
+    // for this edit.  Its bytes are written as escapes so this file stays ASCII
+    // for compilers that do not default to UTF-8 source encoding.
+    const std::string wide = "\xed\x81\xb4\xeb\x9f\xad"; // two 3-byte characters
+    const std::string source = "\n"
+                               "module leaf(input logic i, output logic o);\n"
+                               "endmodule\n"
+                               "module mid (input logic clk, /* " + wide +
+                               " */ output logic done);\n"
+                               "    leaf u_leaf (\n"
+                               "        .i(),\n"
+                               "        .o()\n"
+                               "    );\n"
+                               "endmodule\n"
+                               "module top;\n"
+                               "    mid u_src (.clk(), .done());\n"
+                               "    mid u_dst (.clk(), .done());\n"
+                               "endmodule\n";
+
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/connect_non_ascii_header.sv";
+    analyzer.open(uri, source);
+
+    // Routing through boundary ports that do not exist yet forces `mid`'s whole
+    // header to be regenerated, which is the slice that used to go wrong.
+    const auto edit = connect_apply_edit_json(analyzer, uri,
+                                              "top.u_src.u_leaf", "o",
+                                              "top.u_dst.u_leaf", "i",
+                                              "w",
+                                              {"new_out"}, {"new_in"});
+
+    // The comment is carried through the regenerated header intact: not cut
+    // short, not duplicated, and still attached to the port it documents.
+    CHECK(edit.find("new_out") != std::string::npos);
+    CHECK(edit.find("new_in") != std::string::npos);
+    // The original port list survives verbatim, comment bytes included.
+    CHECK(edit.find("input logic clk, /* " + wide + " */ output logic done") !=
+          std::string::npos);
+    // Exactly one copy of the comment: a short slice used to leave the tail
+    // behind in the untouched text as well as in the replacement.
+    const auto first = edit.find(wide);
+    REQUIRE(first != std::string::npos);
+    CHECK(edit.find(wide, first + wide.size()) == std::string::npos);
+}
+
+// ── Declaration-walk cost model ──────────────────────────────────────────────
+//
+// Preparing a connect edit derives the edited module's declarations from the
+// live AST.  That walk visits each declaration once, which is fine; what must
+// not happen is per-declaration work proportional to the *file*, because the
+// two grow together and the product is quadratic.
+//
+// Two ways in used to do exactly that: each declaration copied the whole source
+// buffer into a std::string to find its line and column (twice, once per end of
+// the range), and the line itself was found by counting newlines from byte zero.
+// On a 111 KB module with 4000 declarations one preview took 862 ms.
+//
+// Guarded as a ratio between two structurally identical modules at different
+// sizes, never an absolute budget: the quadratic term shows up as a ratio far
+// above the size ratio, and that survives a shared CI runner where a millisecond
+// threshold would not.
+namespace {
+
+std::string filler_module_source(int declarations) {
+    std::string text = "\nmodule leaf(input logic i, output logic o);\nendmodule\n"
+                       "module src_m(output logic y);\nendmodule\n"
+                       "module top;\n";
+    for (int i = 0; i < declarations; ++i)
+        text += "    logic [31:0] filler_" + std::to_string(i) + ";\n";
+    text += "    leaf u_leaf (.i(), .o());\n"
+            "    src_m u_src (.y());\n"
+            "endmodule\n";
+    return text;
+}
+
+/// Fastest wall time of one connect preview over a module with @p declarations
+/// declarations.  The minimum, not the median, for the reason the shared-header
+/// guard takes it: the cost being measured is extra work, which raises the
+/// floor, and everything a loaded runner adds only ever makes a sample slower.
+double fastest_preview_ms(int declarations, int runs) {
+    Analyzer analyzer;
+    const std::string uri =
+        "file:///tmp/connect_scaling_" + std::to_string(declarations) + ".sv";
+    analyzer.open(uri, filler_module_source(declarations));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(runs));
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto preview = connect_apply_preview_json(
+            analyzer, uri, "top.u_src", "y", "top.u_leaf", "i",
+            "w_" + std::to_string(i));
+        const auto elapsed =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+        REQUIRE(preview.find("\"error\"") == std::string::npos);
+        samples.push_back(elapsed);
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples.front();
+}
+
+} // namespace
+
+TEST_CASE("connect: preview cost is linear in declaration count", "[connect][scaling]") {
+    constexpr int kSmall = 250;
+    constexpr int kLarge = 1000; // 4x the declarations, and ~4x the file
+    constexpr int kRuns = 7;
+
+    (void)fastest_preview_ms(kSmall, 2); // warm the allocator
+
+    const double small_ms = fastest_preview_ms(kSmall, kRuns);
+    const double large_ms = fastest_preview_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+
+    std::cout << "\n[connect scaling] decls " << kSmall << " -> " << kLarge << ": " << small_ms
+              << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // Linear in the 4x input is ~4.  The quadratic form this guards against was
+    // ~16.  8 leaves room for a loaded runner without letting the product term
+    // back in.
+    CHECK(ratio < 8.0);
+}
+
+TEST_CASE("connect: a hierarchy path with stray dots resolves like its canonical spelling",
+          "[connect]") {
+    // resolve_instance_route() splits on '.' and drops empty segments, so these
+    // spellings all name the same instance.  build_connect() used to keep the
+    // caller's text and look the hierarchy map up with it, which missed, threw
+    // std::out_of_range, and left the command answered with a bare null -- no
+    // edits and no error to show the user.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/connect_stray_dots.sv";
+    analyzer.open(uri, R"(
+module producer(output logic [7:0] data);
+endmodule
+module consumer(input logic [7:0] data);
+endmodule
+module top;
+    producer u_prod (.data());
+    consumer u_cons (.data());
+endmodule
+)");
+
+    const auto canonical = connect_apply_edit_json(analyzer, uri, "top.u_prod", "data",
+                                                   "top.u_cons", "data", "data_w");
+    REQUIRE(canonical.find(".data(data_w)") != std::string::npos);
+
+    for (const auto* spelling : {"top..u_prod", "top.u_prod."}) {
+        const auto edit = connect_apply_edit_json(analyzer, uri, spelling, "data",
+                                                  "top.u_cons", "data", "data_w");
+        INFO("source path spelled " << spelling);
+        CHECK(edit == canonical);
+    }
+
+    // A path that names nothing still reports why, rather than throwing.
+    const auto missing = connect_apply_edit_json(analyzer, uri, "top.u_nope", "data",
+                                                 "top.u_cons", "data", "data_w");
+    CHECK(missing.find("not found") != std::string::npos);
 }

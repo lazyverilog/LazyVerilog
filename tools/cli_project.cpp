@@ -28,7 +28,8 @@ CliProject resolve_cli_project(const std::filesystem::path& start,
 void index_cli_project(Analyzer& analyzer, const CliProject& project) {
     auto vcode = load_vcode(project.root, project.config);
     analyzer.set_project_config(project.config.design.define, vcode.include_dirs, vcode.files,
-                                resolve_vcode_path(project.root, project.config));
+                                resolve_vcode_path(project.root, project.config), {},
+                                vcode.file_sizes);
 }
 
 void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project,

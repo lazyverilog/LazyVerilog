@@ -6201,23 +6201,35 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
 /// A path that cannot be stat'd sorts last: it is about to fail to parse, and
 /// guessing a size for it would put that failure at the front of the queue.
 /// Ties keep filelist order, so the queue is the same on every launch.
-std::vector<std::string> order_by_descending_size(const std::vector<std::string>& paths) {
+/// @param known_sizes  sizes already learned for @p paths, in the same order, or
+///        empty when the caller has none.  The filelist loader stats every entry
+///        it records anyway, so handing those numbers over saves a second pass
+///        over the whole project; callers that pass an explicit path list (tests,
+///        tools) leave it empty and the stats happen here as before.
+std::vector<std::string> order_by_descending_size(const std::vector<std::string>& paths,
+                                                  const std::vector<uintmax_t>& known_sizes) {
     if (paths.size() < 3)
         return paths;
+
+    const bool have_sizes = known_sizes.size() == paths.size();
 
     // One worker drains the queue in whatever order it is given and finishes at
     // the same time either way, so the stats buy nothing there -- and the first
     // entry, which is the only slot with a job to do, keeps its place with or
     // without this.  That is the single-core slice a batch scheduler hands out,
     // which is also where a stat is least affordable: nothing else is running to
-    // overlap it with.
-    if (available_cpu_count() <= 1)
+    // overlap it with.  Sizes already in hand cost nothing, so they still sort.
+    if (!have_sizes && available_cpu_count() <= 1)
         return paths;
 
     std::vector<std::pair<uintmax_t, size_t>> keyed;
     keyed.reserve(paths.size() - 1);
     // The first entry keeps its place; see below.
     for (size_t i = 1; i < paths.size(); ++i) {
+        if (have_sizes) {
+            keyed.emplace_back(known_sizes[i], i);
+            continue;
+        }
         std::error_code ec;
         const auto size = std::filesystem::file_size(paths[i], ec);
         keyed.emplace_back(ec ? 0 : size, i);
@@ -6234,13 +6246,16 @@ std::vector<std::string> order_by_descending_size(const std::vector<std::string>
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
-                               const std::string& filelist_path) {
+                               const std::string& filelist_path,
+                               const std::vector<uintmax_t>& file_sizes) {
     std::vector<std::string> normalized_paths;
     normalized_paths.reserve(paths.size());
     for (const auto& path : paths)
         normalized_paths.push_back(normalize_filesystem_path(path).string());
 
-    auto by_size = order_by_descending_size(normalized_paths);
+    // Normalization is 1:1 and order-preserving, so sizes learned for `paths`
+    // still line up with the normalized spellings.
+    auto by_size = order_by_descending_size(normalized_paths, file_sizes);
 
     std::lock_guard<std::mutex> lock(map_mutex_);
     filelist_path_ = filelist_path;
@@ -6265,7 +6280,8 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
                                   const std::string& filelist_path,
-                                  const std::string& project_root) {
+                                  const std::string& project_root,
+                                  const std::vector<uintmax_t>& extra_file_sizes) {
     std::vector<std::string> normalized_include_dirs;
     normalized_include_dirs.reserve(include_dirs.size());
     for (const auto& dir : include_dirs)
@@ -6285,7 +6301,8 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // across that.
     auto config_digest = IndexCache::config_digest(defines, resolved_include_dirs);
     auto cache = project_root.empty() ? std::nullopt : IndexCache::open(project_root);
-    auto extra_files_by_size = order_by_descending_size(normalized_extra_files);
+    auto extra_files_by_size =
+        order_by_descending_size(normalized_extra_files, extra_file_sizes);
 
     std::lock_guard<std::mutex> lock(map_mutex_);
 

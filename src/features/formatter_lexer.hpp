@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../slang_source_manager.hpp"
 #include "formatter_token.hpp"
 #include <algorithm>
 #include <iostream>
@@ -81,11 +82,7 @@ public:
           format_on_re_(cached_format_marker_regex(opts.format_on_comment_pattern)) {}
 
     TokenStream collect() {
-        slang::SourceManager sm;
-        slang::BumpAllocator alloc;
-        slang::Diagnostics diagnostics;
-        auto buffer = sm.assignText(source_);
-        slang::parsing::Lexer lexer(buffer, alloc, diagnostics, sm);
+        SourceTextLexer lexer(source_);
 
         while (true) {
             slang::parsing::Token token = lexer.lex();

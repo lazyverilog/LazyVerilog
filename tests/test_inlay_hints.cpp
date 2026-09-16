@@ -417,3 +417,30 @@ TEST_CASE("inlay hints: a document that was never opened answers nothing", "[inl
     CHECK(analyzer.get_parsed_state("file:///tmp/inlay_absent.sv") == nullptr);
     CHECK(provide_inlay_hints(analyzer, "file:///tmp/inlay_absent.sv", 0, 20).empty());
 }
+
+TEST_CASE("inlay hints: the coverage hint sits at the line's end in LSP columns", "[inlay]") {
+    // Position.character counts UTF-16 code units, not bytes, so the end of a
+    // line carrying non-ASCII text is not its byte length.  A trailing comment
+    // on the instantiation line used to push this hint past the end of the line
+    // it annotates.  The bytes are written as escapes so this file stays ASCII
+    // for compilers that do not default to UTF-8 source encoding.
+    const std::string wide = "\xed\x81\xb4\xeb\x9f\xad"; // two 3-byte characters
+    const std::string source = "module child(input logic a);\n"
+                               "endmodule\n"
+                               "module top;\n"
+                               "    child u_child ( // " + wide + "\n"
+                               "        .a(sig_a)\n"
+                               "    );\n"
+                               "endmodule\n";
+
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/inlay_wide_comment.sv";
+    analyzer.open(uri, source);
+
+    const auto hints = provide_inlay_hints(analyzer, uri, 0, 20);
+    REQUIRE(!hints.empty());
+    CHECK(hints[0].label == "1/1 ports");
+    CHECK(hints[0].position.line == 3);
+    // "    child u_child ( // " is 23 columns, plus the two characters.
+    CHECK(hints[0].position.character == 25);
+}

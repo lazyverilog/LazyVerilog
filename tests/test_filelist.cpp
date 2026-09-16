@@ -230,3 +230,35 @@ TEST_CASE("filelist: repeated source and incdir entries are deduplicated",
     REQUIRE(result.include_dirs.size() == 1);
     CHECK(result.include_dirs[0] == norm(root / "inc"));
 }
+
+TEST_CASE("filelist: each recorded source carries the size read while it was recorded",
+          "[filelist]") {
+    // The loader stats every entry it records, to warn about one that is not on
+    // disk.  Keeping that number is what lets the background index queue sort
+    // largest-first without a second metadata pass over the whole project, so
+    // the two vectors have to stay aligned -- including across dedup, which
+    // drops an entry from both.
+    const auto root = make_temp_dir("lv_filelist_sizes");
+    write_text(root / "small.sv", "module s; endmodule\n");
+    write_text(root / "big.sv", std::string(4096, '\n'));
+    write_text(root / "top.vc",
+               "small.sv\n"
+               "big.sv\n"
+               "small.sv\n"   // duplicate: recorded once, stat'd once
+               "missing.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.files.size() == 3);
+    REQUIRE(result.file_sizes.size() == result.files.size());
+    CHECK(result.files[0] == norm(root / "small.sv"));
+    CHECK(result.files[1] == norm(root / "big.sv"));
+    CHECK(result.files[2] == norm(root / "missing.sv"));
+
+    CHECK(result.file_sizes[0] == fs::file_size(root / "small.sv"));
+    CHECK(result.file_sizes[1] == fs::file_size(root / "big.sv"));
+    // A path that cannot be stat'd sorts last rather than guessing a size.
+    CHECK(result.file_sizes[2] == 0);
+}

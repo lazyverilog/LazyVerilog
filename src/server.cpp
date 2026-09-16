@@ -1026,7 +1026,7 @@ void LazyVerilogServer::register_handlers() {
                 auto vcode = load_vcode(root_, config_);
                 analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                              vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root());
+                                             index_cache_root(), vcode.file_sizes);
                 configure_background_compiler();
                 schedule_background_compilation();
             };
@@ -1212,7 +1212,7 @@ void LazyVerilogServer::register_handlers() {
                 { auto vcode = load_vcode(root_, config_);
                   analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
                                                vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root()); }
+                                               index_cache_root(), vcode.file_sizes); }
                 configure_background_compiler();
                 schedule_background_compilation();
                 sync_folding_registration();
@@ -1264,6 +1264,10 @@ void LazyVerilogServer::register_handlers() {
             // the workspace root; opening a file cannot move it.
             analyzer_.enqueue_parse(td.uri.raw_uri_, td.text);
             document_versions_[td.uri.raw_uri_] = td.version;
+            {
+                std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
+                folding_result_live_uris_.insert(td.uri.raw_uri_);
+            }
             analyzer_.clear_semantic_diagnostics(td.uri.raw_uri_);
             schedule_background_compilation();
         } catch (const std::exception& e) {
@@ -1312,6 +1316,7 @@ void LazyVerilogServer::register_handlers() {
             edit_watermark_.forget(uri);
             {
                 std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
+                folding_result_live_uris_.erase(uri);
                 last_folding_result_.erase(uri);
             }
             clear_published_diagnostics_for_owner(uri);
@@ -1512,8 +1517,13 @@ void LazyVerilogServer::register_handlers() {
             if (!folds)
                 return rsp;
             {
+                // Only for a buffer still open.  This handler runs on the
+                // request pool, so didClose can have taken the entry back on the
+                // dispatch thread while this fold was being computed; writing
+                // unconditionally re-added it, with nothing left to remove it.
                 std::lock_guard<std::mutex> lock(last_folding_result_mutex_);
-                last_folding_result_[uri] = folds;
+                if (folding_result_live_uris_.contains(uri))
+                    last_folding_result_[uri] = folds;
             }
             rsp.result = *folds;
         } catch (const std::exception& e) {
