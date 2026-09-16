@@ -23,6 +23,20 @@
 
 namespace {
 
+/// One module-item declaration, as an edit-ready source range.
+///
+/// Declared here rather than beside the visitor that fills it because FileView
+/// caches these per module for the life of a request; see `decls_by_module`.
+struct DeclInfo {
+    std::string name;
+    std::string type;
+    int start_line{0};
+    int start_col{0};
+    int end_line{0};
+    int end_col{0};
+    size_t declarator_count{0};
+};
+
 struct FileView {
     std::string uri;
     std::string path;
@@ -37,6 +51,15 @@ struct FileView {
     // live SyntaxTree snapshots are authoritative for edit-local facts such as
     // declarations in unsaved text.  Closed/filelist files keep only SyntaxIndex.
     std::shared_ptr<const DocumentState> state;
+    // AST-derived declarations, per module, filled on first use.
+    //
+    // Deriving them walks this file's whole SyntaxTree, and a single connect
+    // edit asks for the same module's declarations from four places --
+    // declared_signal(), wire_insert_line(), signal_type_in_file() and
+    // declaration_delete_edit() -- each of which reads one field and throws the
+    // rest away.  A FileView lives exactly as long as one request, so caching
+    // here needs no invalidation, the same way `text` above does not.
+    mutable std::unordered_map<std::string, std::vector<DeclInfo>> decls_by_module;
 };
 
 struct ResolvedInst {
@@ -506,24 +529,44 @@ static std::optional<NamedPortConn> connection_for(const InstanceEntry& inst,
 // lsp_column_from_byte_offset() and lsp_position_to_byte_offset(), which is what
 // the rest of this server already routes through.
 
-/// Byte offset -> (0-based line, LSP column).
-static std::pair<int, int> offset_to_pos(std::string_view text, size_t off) {
-    off = std::min(off, text.size());
-    int line = 0;
-    size_t line_start = 0;
-    for (size_t i = 0; i < off; ++i) {
-        if (text[i] == '\n') {
-            ++line;
-            line_start = i + 1;
-        }
-    }
-    return {line, lsp_column_from_byte_offset(text, line_start, off)};
-}
-
 /// (0-based line, LSP column) -> byte offset, clamped to the end of that line.
 static size_t offset_from_position(std::string_view text, int line, int col) {
     return lsp_position_to_byte_offset(text, std::max(line, 0), std::max(col, 0));
 }
+
+/// Byte offset -> (0-based line, LSP column), for one buffer, with the line
+/// starts found once.
+///
+/// Walking to a byte offset from the start of the text is O(offset), so asking
+/// for N positions in a file of M bytes costs O(N x M).  A declaration walk over
+/// a generated register block is exactly that shape -- thousands of positions in
+/// one large file -- and it is why this table exists rather than a rescan per
+/// call.  folding_range.cpp's LineTable is the same idea for the same reason.
+class LinePositions {
+  public:
+    LinePositions() = default;
+    explicit LinePositions(std::string_view text) : text_(text) {
+        starts_.push_back(0);
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == '\n')
+                starts_.push_back(i + 1);
+        }
+    }
+
+    std::pair<int, int> position_of(size_t offset) const {
+        if (starts_.empty())
+            return {0, 0};
+        offset = std::min(offset, text_.size());
+        const auto after = std::upper_bound(starts_.begin(), starts_.end(), offset);
+        const size_t line = static_cast<size_t>(after - starts_.begin()) - 1;
+        return {static_cast<int>(line),
+                lsp_column_from_byte_offset(text_, starts_[line], offset)};
+    }
+
+  private:
+    std::string_view text_;
+    std::vector<size_t> starts_;
+};
 
 static bool syntax_fragment_edge_is_wordlike(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
@@ -591,38 +634,40 @@ static std::string type_from_net_declaration(const slang::syntax::NetDeclaration
     return append_declarator_dimensions(std::move(type), declarator);
 }
 
-static std::pair<int, int> range_end_pos(const slang::SourceManager& sm,
-                                         slang::SourceRange range) {
-    if (!range.end().valid())
-        return {0, 0};
-    return offset_to_pos(std::string(sm.getSourceText(range.end().buffer())), range.end().offset());
-}
-
-struct DeclInfo {
-    std::string name;
-    std::string type;
-    int start_line{0};
-    int start_col{0};
-    int end_line{0};
-    int end_col{0};
-    size_t declarator_count{0};
-};
-
 struct ModuleDeclVisitor : public slang::syntax::SyntaxVisitor<ModuleDeclVisitor> {
     const slang::SourceManager& sm;
     std::string target_module;
     std::vector<DeclInfo> decls;
+    // Line tables for the buffers this walk has touched, keyed by buffer id.
+    // A module normally lives in one buffer; an `include`d one adds a second.
+    std::unordered_map<uint32_t, LinePositions> lines_by_buffer;
 
     ModuleDeclVisitor(const slang::SourceManager& sm, std::string target_module)
         : sm(sm), target_module(std::move(target_module)) {}
+
+    /// The line table for @p buffer, built on first use.
+    ///
+    /// getSourceText() hands back a view into the SourceManager, which outlives
+    /// this walk.  Copying it into a std::string -- which is what the call sites
+    /// below used to do, once per declaration and twice per call -- duplicated
+    /// the whole file for every declaration in it.
+    const LinePositions& lines_for(slang::BufferID buffer) {
+        const auto key = buffer.getId();
+        const auto it = lines_by_buffer.find(key);
+        if (it != lines_by_buffer.end())
+            return it->second;
+        return lines_by_buffer.emplace(key, LinePositions(sm.getSourceText(buffer)))
+            .first->second;
+    }
 
     void add_decl_at_range_start(const slang::parsing::Token& name_token, const std::string& type,
                                  slang::SourceRange range, size_t count) {
         if (!range.start().valid() || range.start().buffer() != range.end().buffer())
             return;
-        auto [start_line, start_col] = offset_to_pos(
-            std::string(sm.getSourceText(range.start().buffer())), range.start().offset());
-        auto [end_line, end_col] = range_end_pos(sm, range);
+        const auto& lines = lines_for(range.start().buffer());
+        auto [start_line, start_col] = lines.position_of(range.start().offset());
+        auto [end_line, end_col] =
+            range.end().valid() ? lines.position_of(range.end().offset()) : std::pair<int, int>{0, 0};
         decls.push_back(DeclInfo{.name = token_text(name_token),
                                  .type = type,
                                  .start_line = start_line,
@@ -674,13 +719,24 @@ struct ModuleDeclVisitor : public slang::syntax::SyntaxVisitor<ModuleDeclVisitor
     }
 };
 
-static std::vector<DeclInfo> ast_declarations_for_module(const FileView& file,
-                                                         const std::string& module_name) {
-    if (!file.state || !file.state->tree)
-        return {};
-    ModuleDeclVisitor visitor(file.state->tree->sourceManager(), module_name);
-    file.state->tree->root().visit(visitor);
-    return std::move(visitor.decls);
+/// @p module_name's module-item declarations, derived from this file's live AST.
+///
+/// Returned by reference and cached on the FileView: deriving them walks the
+/// whole SyntaxTree, and one connect edit asks four times over for the same
+/// module.  See FileView::decls_by_module.
+static const std::vector<DeclInfo>& ast_declarations_for_module(const FileView& file,
+                                                                const std::string& module_name) {
+    const auto cached = file.decls_by_module.find(module_name);
+    if (cached != file.decls_by_module.end())
+        return cached->second;
+
+    std::vector<DeclInfo> decls;
+    if (file.state && file.state->tree) {
+        ModuleDeclVisitor visitor(file.state->tree->sourceManager(), module_name);
+        file.state->tree->root().visit(visitor);
+        decls = std::move(visitor.decls);
+    }
+    return file.decls_by_module.emplace(module_name, std::move(decls)).first->second;
 }
 
 static bool declared_signal(const FileView& file, const std::string& module_name,

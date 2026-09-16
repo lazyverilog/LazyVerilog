@@ -1,8 +1,13 @@
 #include "analyzer.hpp"
 #include "features/connect.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
 
 TEST_CASE("connect: reports modules, ports, and hierarchical instances", "[connect]") {
     Analyzer analyzer;
@@ -529,4 +534,83 @@ TEST_CASE("connect: header edits survive a non-ASCII comment in the port list",
     const auto first = edit.find(wide);
     REQUIRE(first != std::string::npos);
     CHECK(edit.find(wide, first + wide.size()) == std::string::npos);
+}
+
+// ── Declaration-walk cost model ──────────────────────────────────────────────
+//
+// Preparing a connect edit derives the edited module's declarations from the
+// live AST.  That walk visits each declaration once, which is fine; what must
+// not happen is per-declaration work proportional to the *file*, because the
+// two grow together and the product is quadratic.
+//
+// Two ways in used to do exactly that: each declaration copied the whole source
+// buffer into a std::string to find its line and column (twice, once per end of
+// the range), and the line itself was found by counting newlines from byte zero.
+// On a 111 KB module with 4000 declarations one preview took 862 ms.
+//
+// Guarded as a ratio between two structurally identical modules at different
+// sizes, never an absolute budget: the quadratic term shows up as a ratio far
+// above the size ratio, and that survives a shared CI runner where a millisecond
+// threshold would not.
+namespace {
+
+std::string filler_module_source(int declarations) {
+    std::string text = "\nmodule leaf(input logic i, output logic o);\nendmodule\n"
+                       "module src_m(output logic y);\nendmodule\n"
+                       "module top;\n";
+    for (int i = 0; i < declarations; ++i)
+        text += "    logic [31:0] filler_" + std::to_string(i) + ";\n";
+    text += "    leaf u_leaf (.i(), .o());\n"
+            "    src_m u_src (.y());\n"
+            "endmodule\n";
+    return text;
+}
+
+/// Fastest wall time of one connect preview over a module with @p declarations
+/// declarations.  The minimum, not the median, for the reason the shared-header
+/// guard takes it: the cost being measured is extra work, which raises the
+/// floor, and everything a loaded runner adds only ever makes a sample slower.
+double fastest_preview_ms(int declarations, int runs) {
+    Analyzer analyzer;
+    const std::string uri =
+        "file:///tmp/connect_scaling_" + std::to_string(declarations) + ".sv";
+    analyzer.open(uri, filler_module_source(declarations));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(runs));
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto preview = connect_apply_preview_json(
+            analyzer, uri, "top.u_src", "y", "top.u_leaf", "i",
+            "w_" + std::to_string(i));
+        const auto elapsed =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+        REQUIRE(preview.find("\"error\"") == std::string::npos);
+        samples.push_back(elapsed);
+    }
+    std::sort(samples.begin(), samples.end());
+    return samples.front();
+}
+
+} // namespace
+
+TEST_CASE("connect: preview cost is linear in declaration count", "[connect][scaling]") {
+    constexpr int kSmall = 250;
+    constexpr int kLarge = 1000; // 4x the declarations, and ~4x the file
+    constexpr int kRuns = 7;
+
+    (void)fastest_preview_ms(kSmall, 2); // warm the allocator
+
+    const double small_ms = fastest_preview_ms(kSmall, kRuns);
+    const double large_ms = fastest_preview_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+
+    std::cout << "\n[connect scaling] decls " << kSmall << " -> " << kLarge << ": " << small_ms
+              << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // Linear in the 4x input is ~4.  The quadratic form this guards against was
+    // ~16.  8 leaves room for a loaded runner without letting the product term
+    // back in.
+    CHECK(ratio < 8.0);
 }
