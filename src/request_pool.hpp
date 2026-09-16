@@ -44,20 +44,35 @@ public:
         return true;
     }
 
-    /// Answer everything already accepted, then stop the workers and join
-    /// them.  Idempotent.
+    /// Stop accepting work, answer everything already accepted, then join the
+    /// workers.  Idempotent.
     ///
     /// It drains rather than abandons, because every task here is a reply a
     /// client is waiting for.  Waiting is safe: the methods deferred to this
     /// pool are pure computations over an immutable snapshot, so they finish on
     /// their own and wait on nothing the caller still owes them.
+    ///
+    /// Closing the door first is what bounds that wait.  Draining before
+    /// setting `stop_` left submit() accepting the whole time, so a client still
+    /// sending requests could keep the queue non-empty and this call would never
+    /// return.  The normal exit path stops the transport before reaching here,
+    /// but the teardown this also covers -- a test harness, or stdin closing
+    /// under a client that never sends `exit` -- does not.  Nothing is dropped:
+    /// submit() answers false once stopped, and its caller runs the task itself.
     void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        // Before waiting, not after: a worker parked on an empty queue has to be
+        // woken to see `stop_`, and a worker parked while the queue is *not*
+        // empty -- possible when an earlier notify_one() was consumed by a
+        // worker that then finished -- has to be woken to drain it.
+        cv_.notify_all();
         {
             std::unique_lock<std::mutex> lock(mutex_);
             idle_cv_.wait(lock, [this] { return queue_.empty() && running_ == 0; });
-            stop_ = true;
         }
-        cv_.notify_all();
         for (auto& worker : workers_)
             if (worker.joinable())
                 worker.join();
