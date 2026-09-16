@@ -14,13 +14,22 @@
 namespace {
 
 
-/// Every module this request can resolve an instance against, by name.
+/// The modules this request can resolve an instance against, by name.
 ///
 /// Entries are borrowed, not copied.  A ModuleEntry carries the module's whole
 /// port list, each port a handful of std::strings, so copying one per module in
 /// the design cost the request a deep copy of every port in the project -- once
 /// per keystroke, since Neovim asks for hints on every didChange.  The owners
 /// are kept alive alongside the pointers instead.
+///
+/// Only the names the edited file actually instantiates are resolved.  A file
+/// instantiates a handful of module types; a project declares tens of thousands,
+/// and populating the map from the whole project made the request scale with the
+/// design rather than with the buffer -- measured 1.5 ms -> 2.9 ms per keystroke
+/// going from 51 to 4001 project modules, on a file with no instances at all,
+/// while foldingRange over the same two projects stayed flat.  The project
+/// snapshot already indexes modules by name, so asking it for the few names that
+/// matter is a hash lookup each instead of a rebuild of the whole table.
 struct ModuleMap {
     std::unordered_map<std::string, const ModuleEntry*> by_name;
     // What the pointers point into.  The project snapshot is immutable once
@@ -31,21 +40,18 @@ struct ModuleMap {
     std::vector<std::shared_ptr<const DocumentState>> open_documents;
 };
 
-static void overlay_modules(ModuleMap& modules, const SyntaxIndex& index) {
-    for (const auto& module : index.modules)
-        modules.by_name[module.name] = &module;
-}
-
-static ModuleMap build_module_map(const Analyzer& analyzer) {
+/// Resolve @p wanted against the open buffers and then the project snapshot.
+///
+/// Open buffers win, and are applied first for that reason: they carry unsaved
+/// edits, so a module declared in a buffer must shadow the shard published for
+/// the same name.  Populating project-first and overlaying the buffers on top
+/// gave the same precedence by overwriting, which is only affordable when the
+/// project half is cheap.
+static ModuleMap build_module_map(const Analyzer& analyzer,
+                                  const std::unordered_set<std::string>& wanted) {
     ModuleMap modules;
-
-    modules.project = analyzer.project_index_snapshot();
-    if (modules.project) {
-        for (const auto& [name, ref] : modules.project->module_by_name) {
-            if (ref.shard && ref.module_index < ref.shard->modules.size())
-                modules.by_name[name] = &ref.shard->modules[ref.module_index];
-        }
-    }
+    if (wanted.empty())
+        return modules;
 
     analyzer.for_each_state(
         [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {
@@ -62,12 +68,39 @@ static ModuleMap build_module_map(const Analyzer& analyzer) {
             const auto& usable = state->tree ? state : state->previous_parsed;
             if (!usable || !usable->tree)
                 return;
+            const auto& index = get_structural_index(*usable);
+            bool borrowed = false;
+            for (const auto& module : index.modules) {
+                if (!wanted.contains(module.name))
+                    continue;
+                modules.by_name[module.name] = &module;
+                borrowed = true;
+            }
             // The structural index lives on the snapshot, so the snapshot has
-            // to outlive the pointers taken from it.
-            modules.open_documents.push_back(usable);
-            overlay_modules(modules, get_structural_index(*usable));
+            // to outlive the pointers taken from it -- but only when one was
+            // actually taken.
+            if (borrowed)
+                modules.open_documents.push_back(usable);
         });
 
+    auto project = analyzer.project_index_snapshot();
+    if (!project)
+        return modules;
+    bool borrowed = false;
+    for (const auto& name : wanted) {
+        if (modules.by_name.contains(name))
+            continue; // an open buffer already answered for this name
+        const auto it = project->module_by_name.find(name);
+        if (it == project->module_by_name.end())
+            continue;
+        const auto& ref = it->second;
+        if (!ref.shard || ref.module_index >= ref.shard->modules.size())
+            continue;
+        modules.by_name[name] = &ref.shard->modules[ref.module_index];
+        borrowed = true;
+    }
+    if (borrowed)
+        modules.project = std::move(project);
     return modules;
 }
 
@@ -142,12 +175,22 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
     if (!state || !state->tree)
         return {};
 
-    const auto lines = split_lines_view(state->text);
     // By reference: get_structural_index() hands back the index cached on the
     // snapshot, and binding it to a value copied every declaration, instance
     // and reference occurrence in the file on every request.
     const auto& current_index = get_structural_index(*state);
-    const auto modules = build_module_map(analyzer);
+    // Every hint this request can emit hangs off an instance, so a file with
+    // none has nothing to answer and nothing to look anything up for.  Leaf RTL
+    // is mostly this shape, and it is asked on every keystroke like the rest.
+    if (current_index.instances.empty())
+        return {};
+
+    std::unordered_set<std::string> instantiated;
+    for (const auto& inst : current_index.instances)
+        instantiated.insert(inst.module_name);
+
+    const auto lines = split_lines_view(state->text);
+    const auto modules = build_module_map(analyzer, instantiated);
     PortMapCache port_maps;
     std::vector<lsInlayHint> hints;
 
