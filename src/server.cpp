@@ -650,11 +650,74 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     return it->second;
 }
 
+bool LazyVerilogServer::discover_project_for(std::string_view uri) {
+    if (!root_resolver_)
+        return false;
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    if (!info)
+        return false;
+
+    const auto key = info->source_root.string();
+    if (!discovered_roots_.insert(key).second)
+        return false;
+
+    // The filelist, defines and include directories of every project seen so
+    // far, merged.  There is one Analyzer with one set of parse inputs, so a
+    // second project cannot get its own -- and replacing the first project's
+    // inputs with the second's would unindex the files the user was just
+    // navigating.  Merging keeps both navigable, which is the behaviour a
+    // monorepo wants anyway.
+    //
+    // The honest limit: `[design].define` is a flat list with no notion of
+    // which project it came from, so two projects that define the same macro
+    // differently get whichever value merged in first.  Include directories and
+    // filelists compose; defines do not.
+    auto config = load_config(info->source_root);
+    auto vcode = load_vcode(info->source_root, config);
+
+    const auto append_new = [](std::vector<std::string>& into,
+                               const std::vector<std::string>& from) {
+        for (const auto& value : from) {
+            if (std::find(into.begin(), into.end(), value) == into.end())
+                into.push_back(value);
+        }
+    };
+    append_new(project_defines_, config.design.define);
+    append_new(project_include_dirs_, vcode.include_dirs);
+
+    // Files carry a parallel size vector used to order the index burst largest
+    // first, so the two have to stay in step -- appending to one without the
+    // other silently reorders somebody else's burst.
+    for (size_t i = 0; i < vcode.files.size(); ++i) {
+        if (std::find(project_files_.begin(), project_files_.end(), vcode.files[i]) !=
+            project_files_.end())
+            continue;
+        project_files_.push_back(vcode.files[i]);
+        project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
+    }
+
+    std::cerr << "[lazyverilog] discovered project " << key << " from an opened file ("
+              << vcode.files.size() << " files)\n";
+
+    analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
+                                 resolve_vcode_path(info->source_root, config),
+                                 index_cache_storage(), project_file_sizes_);
+    configure_background_compiler();
+    schedule_background_compilation();
+    return true;
+}
+
 void LazyVerilogServer::invalidate_config_cache() {
     if (root_resolver_)
         root_resolver_->invalidate();
-    std::lock_guard<std::mutex> lock(config_cache_mutex_);
-    config_cache_.clear();
+    {
+        std::lock_guard<std::mutex> lock(config_cache_mutex_);
+        config_cache_.clear();
+    }
+    // A saved config can have changed the filelist, so the projects folded in
+    // from it have to be foldable again.  The accumulated inputs are kept:
+    // dropping them would unindex every other project until each was reopened.
+    discovered_roots_.clear();
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
@@ -955,15 +1018,12 @@ void LazyVerilogServer::register_handlers() {
                 if (!std::filesystem::exists(p))
                     return;
 
-                // lazyverilog.toml is read from the workspace root and nowhere
-                // else -- no upward search from here, and none from didOpen.
-                // The capability reply below is built from this config and is
-                // never revised, so a config found after initialize could not
-                // take inlay hints back off anyway; a single fixed location is
-                // the only one that can be honoured at the time it is needed.
-                // A project whose config sits elsewhere gets defaults, and the
-                // client can still point at one explicitly with the configFile
-                // payload of didChangeConfiguration.
+                // A client that still sends a root gets its project indexed
+                // before any file is opened, which is worth keeping: it is the
+                // difference between a warm first go-to-definition and one that
+                // waits for a burst to start.  It is no longer the only way a
+                // project is found, though -- didOpen discovers them too -- and
+                // it no longer decides anything per file.
                 root_ = p;
 
                 std::string warn;
@@ -975,9 +1035,26 @@ void LazyVerilogServer::register_handlers() {
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
 
                 auto vcode = load_vcode(root_, config_);
-                analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
-                                             vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_storage(), vcode.file_sizes);
+
+                // Seed the accumulators discover_project_for() appends to, and
+                // record the root as seen.  Without this the first didOpen in
+                // this same project would load its filelist a second time and
+                // schedule a redundant full reindex.
+                project_defines_     = config_.design.define;
+                project_include_dirs_ = vcode.include_dirs;
+                project_files_       = vcode.files;
+                project_file_sizes_  = vcode.file_sizes;
+                if (root_resolver_) {
+                    // Only if the config really is here.  Recording a root that
+                    // holds no lazyverilog.toml would suppress the discovery of
+                    // the real one above it.
+                    if (auto info = root_resolver_->project_info(root_))
+                        discovered_roots_.insert(info->source_root.string());
+                }
+
+                analyzer_.set_project_config(project_defines_, project_include_dirs_,
+                                             project_files_, resolve_vcode_path(root_, config_),
+                                             index_cache_storage(), project_file_sizes_);
                 configure_background_compiler();
                 schedule_background_compilation();
             };
@@ -1204,8 +1281,11 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
-            // No config search here.  The config was resolved at initialize from
-            // the workspace root; opening a file cannot move it.
+            // Opening a file is how a project is found now.  The client no
+            // longer names one -- the Neovim plugin stopped sending root_dir --
+            // so without this a session started outside a project would index
+            // whatever the server's working directory happened to hold.
+            discover_project_for(td.uri.raw_uri_);
             analyzer_.enqueue_parse(td.uri.raw_uri_, td.text);
             document_versions_[td.uri.raw_uri_] = td.version;
             {

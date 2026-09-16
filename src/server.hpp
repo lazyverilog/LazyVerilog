@@ -86,6 +86,28 @@ class LazyVerilogServer {
     /// resolver's answer, and the answer can now be different.
     void invalidate_config_cache();
 
+    /// Fold @p uri's project into the analyzer's parse inputs, if it has one
+    /// this session has not seen.
+    ///
+    /// clangd discovers a project the same way -- from a file, not from the
+    /// client -- and broadcasts it so the background index picks up its files.
+    /// Here the discovery has to *merge*, because there is one Analyzer with
+    /// one set of parse inputs, not one per project.  Returns whether anything
+    /// changed.
+    bool discover_project_for(std::string_view uri);
+
+    /// Project roots already folded in by discover_project_for(), so a burst of
+    /// didOpens in one project reloads its filelist once rather than per file.
+    /// The empty entry stands for "no project", which is discovered once and
+    /// then never again.
+    std::unordered_set<std::string> discovered_roots_;
+    /// Parse inputs accumulated across every discovered project, so that
+    /// reloading one does not drop another's.
+    std::vector<std::string> project_defines_;
+    std::vector<std::string> project_include_dirs_;
+    std::vector<std::string> project_files_;
+    std::vector<uintmax_t> project_file_sizes_;
+
     mutable std::mutex config_cache_mutex_;
     /// Keyed by project root; the empty key is "no project", served defaults.
     mutable std::unordered_map<std::string, std::shared_ptr<const Config>> config_cache_;
