@@ -1,5 +1,6 @@
 #pragma once
 
+#include "slang_source_manager.hpp"
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
 #include <filesystem>
@@ -28,17 +29,6 @@ class SyntaxTree;
 /// Convert a SourceManager file name to a URI.  slang may already store a URI
 /// for in-memory buffers; real file paths are normalised through uri_from_path().
 std::string uri_from_file_name(std::string_view file_name);
-
-/// Create a SourceManager configured the way every lazyverilog parse wants it.
-///
-/// slang otherwise runs weakly_canonical() on each candidate path it probes
-/// while resolving an `include, and a miss walks the whole directory prefix
-/// with canonical().  With N include directories that is N canonicalisations
-/// per include per parsed file, which on a shared/HPC filesystem turns project
-/// indexing into a metadata-call storm.  Disabling proximate paths keeps the
-/// probe down to the failed open itself; buffer paths stay absolute and are
-/// canonicalised once by uri_from_source_buffer().
-std::unique_ptr<slang::SourceManager> make_lsp_source_manager();
 
 /// Convert a SourceManager buffer to a URI using its absolute full path,
 /// returning an empty string for invalid or non-file-backed buffers.
