@@ -735,7 +735,12 @@ void LazyVerilogServer::invalidate_config_cache() {
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
-    if (!config_.inlay_hint.enable || !impl_)
+    // No `[inlay_hint].enable` guard: there is no one config to read it from,
+    // and asking the client to re-request costs a round trip that the handler
+    // answers with nothing when the file's own project has hints off.  Guarding
+    // on any single project's setting would suppress the refresh for every
+    // other project's files.
+    if (!impl_)
         return;
 
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
@@ -763,6 +768,9 @@ void LazyVerilogServer::configure_background_compiler() {
 }
 
 void LazyVerilogServer::schedule_background_compilation() {
+    // Semantic compilation is session-wide by construction: one slang
+    // Compilation over every source, so one set of options.  See
+    // compilation_snapshot() in analyzer.cpp.
     if (!background_compiler_ || !config_.compilation.background_compilation)
         return;
     background_compiler_->schedule();
@@ -823,10 +831,11 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // synchronously parse, copy, or merge the full design filelist on
             // every edit.
             std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-            if (config_.lint.instance.stale_instance_diagnostic)
+            const auto file_config = config_for(uri);
+            if (file_config->lint.instance.stale_instance_diagnostic)
                 project_lint_index = analyzer_.project_index_snapshot();
 
-            auto lint_diags = run_lint(*state, config_.lint, project_lint_index.get());
+            auto lint_diags = run_lint(*state, file_config->lint, project_lint_index.get());
             for (auto diag : lint_diags)
                 add_diag(std::move(diag));
         }
@@ -1376,8 +1385,13 @@ void LazyVerilogServer::register_handlers() {
             auto state = analyzer_.get_state(uri);
             if (state) {
                 std::string text = state->text;
-                FormatOptions save_format = config_.format;
-                if (config_.autoarg.autoarg_on_save && state->tree) {
+                // This file's project's formatter options.  Two buffers open at
+                // once can be in projects that disagree about indent_size, and
+                // formatting one with the other's config is a diff nobody asked
+                // for.
+                const auto file_config = config_for(uri);
+                FormatOptions save_format = file_config->format;
+                if (file_config->autoarg.autoarg_on_save && state->tree) {
                     auto results = autoarg_all_modules(*state);
                     // apply back-to-front so earlier offsets stay valid
                     std::sort(results.begin(), results.end(),
@@ -1394,7 +1408,8 @@ void LazyVerilogServer::register_handlers() {
                         // source.  Formatting each fragment first is wasted work on save because
                         // the full pass immediately reformats the same text again.
                         std::string replacement =
-                            line_prefix + format_autoarg(result, config_.autoarg, save_format);
+                            line_prefix +
+                            format_autoarg(result, file_config->autoarg, save_format);
                         if (!save_format.enable_format_on_save)
                             replacement = format_emit_text(replacement, save_format);
                         size_t end = lsp_offset(text, result.end_line, result.end_col);
@@ -1426,7 +1441,8 @@ void LazyVerilogServer::register_handlers() {
             if (state) {
                 // Format the full document so the formatter has surrounding context, but return
                 // an edit restricted to the requested range.
-                std::string formatted = format_source(state->text, config_.format);
+                std::string formatted =
+                    format_source(state->text, config_for(uri)->format);
                 auto edit = range_format_edit(state->text, formatted, req.params.range);
                 if (edit.newText != slice_lsp_range(state->text, edit.range))
                     rsp.result.push_back(std::move(edit));
@@ -1734,9 +1750,10 @@ void LazyVerilogServer::register_handlers() {
                 // or mutating the persistent project index.  Cross-file rules
                 // still consult the current published ProjectIndexSnapshot; the
                 // command does not perform hidden reindexing as a side effect.
+                // Built once if *any* project asks for it.  The snapshot is
+                // project-wide and shared; the per-file decision below is which
+                // rules run, not which index they consult.
                 std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-                if (config_.lint.instance.stale_instance_diagnostic)
-                    project_lint_index = analyzer_.project_index_snapshot();
 
                 auto add_diag = [&](const std::string& fallback_uri, ParseDiagInfo diag) {
                     const std::string target_uri = diag.uri.empty() ? fallback_uri : diag.uri;
@@ -1754,7 +1771,15 @@ void LazyVerilogServer::register_handlers() {
                     for (auto diag : state->parse_diagnostics)
                         add_diag(uri, std::move(diag));
 
-                    auto lint_diags = run_lint(*state, config_.lint,
+                    // :LintAll walks the merged filelist, which in a
+                    // multi-project session spans projects that can disagree
+                    // about which rules are enabled and at what severity.
+                    const auto file_config = config_for(uri);
+                    if (file_config->lint.instance.stale_instance_diagnostic &&
+                        !project_lint_index)
+                        project_lint_index = analyzer_.project_index_snapshot();
+
+                    auto lint_diags = run_lint(*state, file_config->lint,
                                                project_lint_index.get());
                     for (auto diag : lint_diags)
                         add_diag(uri, std::move(diag));
@@ -1901,7 +1926,8 @@ void LazyVerilogServer::register_handlers() {
                 std::string mode = get_string(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    std::string formatted = format_source(state->text, config_.format);
+                    std::string formatted =
+                    format_source(state->text, config_for(uri)->format);
                     optional<lsTextEdit> edit;
                     if (mode == "range") {
                         int start_line = get_int(2);
@@ -1922,7 +1948,8 @@ void LazyVerilogServer::register_handlers() {
                 int ff_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = preview_autoff(*state, ff_line, config_.autoff.register_pattern);
+                    auto result =
+                        preview_autoff(*state, ff_line, config_for(uri)->autoff.register_pattern);
                     preview_ff_result(result);
                 }
             } else if (cmd == "lazyverilog.autoffApply") {
@@ -1930,32 +1957,46 @@ void LazyVerilogServer::register_handlers() {
                 int ff_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = autoff(*state, ff_line, config_.autoff.register_pattern);
+                    auto result =
+                        autoff(*state, ff_line, config_for(uri)->autoff.register_pattern);
                     apply_ff_edits(result, uri, state->text);
                 }
             } else if (cmd == "lazyverilog.autoffAllPreview") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = preview_autoff_all(*state, config_.autoff.register_pattern);
+                    auto result =
+                        preview_autoff_all(*state, config_for(uri)->autoff.register_pattern);
                     preview_ff_result(result);
                 }
             } else if (cmd == "lazyverilog.autoffAllApply") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = autoff_all(*state, config_.autoff.register_pattern);
+                    auto result = autoff_all(*state, config_for(uri)->autoff.register_pattern);
                     apply_ff_edits(result, uri, state->text);
                 }
             } else if (cmd == "lazyverilog.rtlTree") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
+                    {
+                        const auto file_config = config_for(uri);
+                        rsp.result.SetJsonString(
+                            rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                          file_config->rtltree.show_instance_name),
+                            lsp::Any::kObjectType);
+                    }
                 }
             } else if (cmd == "lazyverilog.rtlTreeReverse") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
+                    {
+                        const auto file_config = config_for(uri);
+                        rsp.result.SetJsonString(
+                            rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                          file_config->rtltree.show_instance_name),
+                            lsp::Any::kObjectType);
+                    }
                 }
             } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);
@@ -1968,8 +2009,9 @@ void LazyVerilogServer::register_handlers() {
                         opened ? std::span<const OpenIndexShard>(*opened)
                                : std::span<const OpenIndexShard>{};
                     if (cmd == "lazyverilog.autowirepreview") {
-                        auto preview = autowire_preview(*state, opened_shards, project.get(),
-                                                        config_.autowire, target_line);
+                        auto preview =
+                            autowire_preview(*state, opened_shards, project.get(),
+                                             config_for(uri)->autowire, target_line);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
                         for (size_t i = 0; i < preview.size(); ++i) {
@@ -1993,7 +2035,7 @@ void LazyVerilogServer::register_handlers() {
                     } else {
                         const std::string new_source =
                             autowire_apply(*state, opened_shards, project.get(),
-                                           config_.autowire, target_line);
+                                           config_for(uri)->autowire, target_line);
                         if (new_source != state->text) {
                             // Find insertion point: first line that differs old→new.
                             const auto old_sv = split_lines_view(state->text);

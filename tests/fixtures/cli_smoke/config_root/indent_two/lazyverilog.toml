@@ -1,0 +1,8 @@
+# Half of the per-file formatter-config probe in tests/config_root_cli_smoke.cpp.
+# Paired with ../indent_eight, which differs only in indent_size: one session
+# formats a file from each, and a session-wide config cannot answer both.
+[format]
+# textDocument/formatting only rewrites when this is on; without it the
+# handler returns no edits and the probe cannot tell the two projects apart.
+enable_format_on_save = true
+indent_size = 2
