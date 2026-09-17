@@ -223,6 +223,40 @@ std::string path_to_uri(const fs::path& p) {
     return "file://" + p.generic_string();
 }
 
+/// The file watchers the server asks the client to install.
+///
+/// ProjectRootResolver's freshness windows say outright that they are a
+/// backstop and that "the client's watcher fires invalidate()" when a config
+/// appears or moves -- but the registration only ever listed source
+/// extensions, so no client was ever asked to report a lazyverilog.toml and
+/// nothing ever fired.  A config written by a git checkout, a branch switch or
+/// a terminal reached the server only once one of its buffers was saved from
+/// an editor that sends didChangeConfiguration.
+///
+/// The registration is a request the server sends on `initialized`, so it is on
+/// stdout and needs no timing assumption.  What the server *does* with a
+/// reported config -- invalidate_config_cache() then reload_all_projects() --
+/// is the same pair didChangeConfiguration takes, which
+/// lint_all_after_config_save() below already covers.
+std::string registered_file_watchers(const fs::path& server_bin) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-watchers-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"capabilities":{"textDocument":{}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after registering watchers");
+    return result.stdout_text;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -320,6 +354,15 @@ int main(int argc, char** argv) {
         expect(contains(out, R"("id":2)"), "a rootless fold request is answered");
         expect(!contains(out, R"("startLine")"),
                "the config is found from the opened file when no root was sent");
+    }
+
+    // The client is asked to report the config file, not only source files.
+    {
+        const auto out = registered_file_watchers(server_bin);
+        expect(contains(out, R"(**/lazyverilog.toml)"),
+               "the file watcher registration covers lazyverilog.toml");
+        expect(contains(out, R"(**/*.sv)"),
+               "the file watcher registration still covers source files");
     }
 
     // Formatter options are per file too, not only the two capability switches.
