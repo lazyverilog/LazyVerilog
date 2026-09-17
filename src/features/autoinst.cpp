@@ -144,16 +144,17 @@ static std::vector<std::string> ports_for_module_in_syntax_index(const SyntaxInd
 }
 
 static std::vector<std::string> ports_for_module_in_project_snapshot(
-    const ProjectIndexSnapshot& snapshot, const std::string& module_type) {
-    const auto module_it = snapshot.module_by_name.find(module_type);
-    if (module_it == snapshot.module_by_name.end() || !module_it->second.shard)
+    const ProjectIndexSnapshot& snapshot, const std::string& module_type,
+    std::string_view from_path) {
+    const auto* ref = snapshot.find_module(module_type, from_path);
+    if (!ref || !ref->shard)
         return {};
 
-    const auto& shard = *module_it->second.shard;
-    if (module_it->second.module_index >= shard.modules.size())
+    const auto& shard = *ref->shard;
+    if (ref->module_index >= shard.modules.size())
         return {};
 
-    const auto& mod_entry = shard.modules[module_it->second.module_index];
+    const auto& mod_entry = shard.modules[ref->module_index];
     std::vector<std::string> port_names;
     port_names.reserve(mod_entry.ports.size());
     for (const auto& p : mod_entry.ports) {
@@ -231,7 +232,8 @@ static std::optional<AutoinstResult> autoinst_impl_layers(
         if (port_names.empty() && !opened_shards.empty())
             port_names = ports_for_module_in_open_shards(opened_shards, module_type);
         if (port_names.empty() && project_index)
-            port_names = ports_for_module_in_project_snapshot(*project_index, module_type);
+            port_names = ports_for_module_in_project_snapshot(*project_index, module_type,
+                                                             state.normalized_path);
 
         if (port_names.empty())
             return std::nullopt;

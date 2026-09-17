@@ -1,6 +1,7 @@
 #pragma once
 #include "document_state.hpp"
 #include "index_cache.hpp"
+#include "parse_inputs.hpp"
 #include "syntax_index.hpp"
 #include <atomic>
 #include <chrono>
@@ -547,16 +548,48 @@ class Analyzer {
     /// schedule multiple full-project background reindex generations for a
     /// single user-visible config change.  This batched setter clears the old
     /// project cache once and schedules at most one asynchronous reindex.
-    /// @param project_root  directory holding lazyverilog.toml.  The on-disk
-    ///        shard cache lives under it; leaving it empty runs uncached, which
-    ///        is what a server with no project root should do.
+    /// @param cache_storage  decides which directory each file's shards live
+    ///        in.  Null runs uncached, which is what a server with no project
+    ///        should do.  It is a storage rather than a single root because a
+    ///        project's files are not all under one: a filelist can name
+    ///        sources from a sibling project, and each belongs beside its own
+    ///        lazyverilog.toml.
     /// @param extra_file_sizes  see set_extra_files(); empty when unknown.
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
                             const std::string& filelist_path = {},
-                            const std::string& project_root = {},
+                            std::shared_ptr<IndexCacheStorage> cache_storage = nullptr,
                             const std::vector<uintmax_t>& extra_file_sizes = {});
+
+    /// Point per-file parse-input lookups at @p resolver.
+    ///
+    /// Without one every file is parsed with the defaults, which is what a
+    /// single-project session and every CLI tool want.  The LSP server hands
+    /// over the same resolver its shard storage uses, so a file's config, its
+    /// parse inputs and its shard directory are all decided by one walk.
+    void set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
+
+    /// Whether a setter schedules a background reindex itself, or leaves it to
+    /// the set_project_config() the caller is about to make.
+    ///
+    /// Deferring matters because the generation scheduled here would parse the
+    /// *previous* filelist: it is superseded before it can commit, but the
+    /// workers already dispatched keep parsing, and on a large design that is
+    /// a full reindex of CPU and shared-filesystem bandwidth spent for nothing.
+    /// Registering N projects and then applying once costs N+1 generations
+    /// instead of 1.
+    enum class Reindex { Now, Deferred };
+
+    /// Register how files under @p root are preprocessed.
+    ///
+    /// This is clangd's compilation database learning a project: one indexer,
+    /// commands looked up per file.  Files under no registered root keep using
+    /// the inputs from set_project_config().
+    void set_parse_inputs_for_root(const std::filesystem::path& root,
+                                   const std::vector<std::string>& defines,
+                                   const std::vector<std::string>& include_dirs,
+                                   Reindex reindex = Reindex::Now);
 
     /// Block until all currently queued project-index work is published.
     ///
@@ -735,12 +768,21 @@ class Analyzer {
 
     mutable std::mutex map_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
-    std::vector<std::string> defines_;
-    std::vector<std::string> include_dirs_;
-    // include_dirs_ globbed to the directories that exist, once, when the
-    // config is set.  Parses hand this to slang as additional include paths
-    // instead of rebuilding it per SourceManager; see resolve_include_dirs().
-    std::vector<std::filesystem::path> include_dir_paths_;
+    /// Install @p inputs as the defaults, keeping every registered project's.
+    /// Requires map_mutex_.
+    void replace_default_parse_inputs_locked(ParseInputs inputs);
+
+    /// How each file is parsed, looked up per file.
+    ///
+    /// This replaced flat defines_/include_dirs_ members for the reason clangd
+    /// keeps compile commands in a database rather than on the server: two
+    /// files open at once can be in different projects, and one project's
+    /// `+incdir+` entries are meaningless for the other.  Immutable and held by
+    /// shared_ptr, so a worker can hold one across a whole parse while a config
+    /// reload installs a replacement -- there is no window in which a parse
+    /// reads half of one project's inputs and half of another's.
+    std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
+        std::make_shared<const ProjectParseInputs>();
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
@@ -826,8 +868,12 @@ class Analyzer {
     /// Cache for this project, and the config digest every shard is keyed on.
     /// Empty when no project root is known or the directory cannot be written,
     /// which is a normal read-only-checkout condition and simply runs uncached.
-    mutable std::optional<IndexCache> index_cache_;
-    mutable IndexCache::Digest index_cache_config_digest_;
+    /// Where each file's shards go.  Shared with the server, which resolves the
+    /// same roots to answer config lookups, and held by shared_ptr because a
+    /// queued shard write outlives the config reload that replaced it.
+    mutable std::shared_ptr<IndexCacheStorage> index_cache_storage_;
+    // The shard config digest moved into ParseInputs: it is per project, like
+    // the defines and include directories it is computed from.
     /// Memoized content digests for the current generation, shared by the
     /// preload and the store path.
     ///

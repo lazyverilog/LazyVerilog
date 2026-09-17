@@ -93,38 +93,155 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
-- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request,
-  and turning the capability off is what stops the client asking at all — measured 0
-  requests against 4-6 over five keystrokes in headless Neovim.  Both are read from
-  `<root>/lazyverilog.toml`, which is why `initialize` has to find the real one.
-- **Advertise a capability statically or register it dynamically, never both.**
-  Neovim's `client:supports_method()` answers from `server_capabilities` whenever
-  that field is present, so a later `client/unregisterCapability` changes nothing and
-  the client keeps requesting for the rest of the session — measured: unregister
-  accepted (`dynamic_capabilities:get()` → nil) while
-  `server_capabilities.inlayHintProvider` stayed `true` and requests kept coming.  So
-  when the client advertises `dynamicRegistration` for one of these, `initialize`
-  **omits** the provider field and the `initialized` handler registers instead.
-- `sync_dynamic_registration()` sends `client/registerCapability` /
-  `client/unregisterCapability` on `didChangeConfiguration`, so an edit to either
-  option takes effect mid-session with no restart — measured both directions, 4 → 0
-  and 0 → 4.  Neovim 0.12.5 opts in for `inlayHint` but **not** for `foldingRange`
-  (`dynamicRegistration = false`), so a `[folding].enable` edit there still needs a
-  restart, and the server logs that rather than sending a request the client may
-  ignore.  Registration ids are fixed (`kFoldingRegistrationId`,
-  `kInlayHintRegistrationId`) because the unregister has to name what the register used.
-- A registration carries a `documentSelector` of `systemverilog`/`verilog`.  A buffer
-  whose filetype is unset matches nothing, which looks exactly like a broken server —
-  check the filetype before the server when hints do not appear.
-- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins both the
-  static replies and the withheld-when-dynamic case.  Editor-side switches for both
+- `[inlay_hint].enable` and `[folding].enable` each drive one per-keystroke request.
+  **Neither turns the capability off any more.**  `foldingRangeProvider` and
+  `inlayHintProvider` are advertised as literal `true`, the way clangd advertises
+  them, and the options are answered in the handlers by returning nothing.
+  Capabilities are exchanged before any file is open, and the root is resolved per
+  file, so there is no single config at `initialize` to answer from.
+- The cost of that is measured and real: turning a capability off is what stopped the
+  client asking at all — 0 requests against 4-6 over five keystrokes in headless
+  Neovim.  A disabled feature now pays a round trip per keystroke that returns
+  nothing.  clangd has no folding option at all for this reason (`Config.h` has
+  `InlayHints.Enabled` and nothing for folding); `[folding].enable` is kept because
+  it is what users already configure.  If per-keystroke cost becomes the problem
+  again, the answer is a cheaper handler, not a withheld capability.
+- The whole dynamic-registration path for these two is **gone**:
+  `sync_dynamic_registration()`, the `dynamicRegistration` probe in `initialize`, and
+  the fixed registration ids.  Do not reintroduce it to "save" the requests above
+  without first re-reading why it was removed — a client that is told statically
+  ignores a later unregister (Neovim's `client:supports_method()` answers from
+  `server_capabilities` whenever that field is present), so the two mechanisms cannot
+  coexist, and the static one is what a per-file config needs.
+- A buffer whose filetype is unset gets no LSP features at all, which looks exactly
+  like a broken server — check the filetype before the server when hints do not appear.
+- Guarded by `ctest --test-dir build -R config-root-cli-smoke`, which pins that both
+  providers are advertised unconditionally (config off, dynamic-registration client,
+  and no `rootUri` at all), and that the handler still declines — including for a file
+  two directories below the config that governs it.  Editor-side switches for both
   features live in `lua/lazyverilog/config.lua` (`folding`, `inlay_hints`).
 - Details and prior measured rounds: `docs/dev/edit-perf.md`.
 
+### Project Roots
+- **The server decides which project a file belongs to, not the editor.**
+  `ProjectRootResolver` (`src/project_root.cpp`) walks up from each file to the
+  nearest `lazyverilog.toml`, which is clangd's
+  `DirectoryBasedGlobalCompilationDatabase::lookupCDB` with a different marker.
+  Per directory, with misses cached as deliberately as hits: a file five directories
+  deep stats five directories per lookup and most of that walk is misses, repeated by
+  every open buffer and every indexed file.
+- **Not finding a config is an answer (`nullopt`), never a guess at the file's own
+  directory.**  That guess is what used to put a `.cache/` next to whatever file was
+  opened — including in `/tmp`.
+- The Neovim plugin sends **no `root_dir`** and has no `root_markers`.  It cannot get
+  this right: `vim.fs.root` resolves its marker list by *marker order, not proximity*,
+  so `.git` at the top of a monorepo outranked the `lazyverilog.toml` beside the file
+  and the config was never read.  A `root_markers` passed to `setup()` is ignored with
+  one notification.
+- `initialize` still indexes eagerly when a client does send `rootUri` — a warm first
+  go-to-definition is worth keeping — but nothing per file depends on it.  `didOpen`
+  discovers projects too (`discover_project_for()`).
+- **Defines and include directories are per file**, looked up through
+  `ProjectParseInputs` (`src/parse_inputs.cpp`) — clangd's
+  `GlobalCompilationDatabase::getCompileCommand(File)`, with the same fallback for a
+  file under no known project.  There is still **one** `Analyzer`: clangd keeps one
+  `BackgroundIndex` too and looks commands up per file, which is what makes a second
+  project cost a map entry instead of another set of worker threads and another
+  source manager.
+- Every parse path asks for the file it is about to parse — `make_state()`, the
+  background indexer, `:LintAll`'s synchronous walk, the shard preload.  Do not
+  reintroduce a flat `defines_` member; that is what this replaced.
+- The shard config digest lives in `ParseInputs` for the same reason: one digest
+  across projects would make each launch discard the other project's shards as
+  config-stale.  The preload's include-resolution memo is keyed on the including
+  project's digest as well as the spelling, or the first project to resolve
+  `uvm_macros.svh` answers for every project that spells it the same way.
+- **Every per-document request is answered from that file's config**, via
+  `config_for(uri)` — formatting, lint, AutoFF, AutoWire, AutoArg, the RTL tree, and
+  the two capability switches.  Do not reach for `config_` in a handler that has a
+  URI; `config_` is the session's eager-indexing config, not the file's.
+- Two things stay session-wide, and are not per-file questions: **which** files to
+  index (one index covers every open project, so the filelist is the union), and
+  **semantic compilation** (`[compilation]`), which builds a single slang
+  `Compilation` and therefore has one preprocessor for all of it.
+- Folding several projects is one analyzer transaction: `fold_project_root()` accumulates
+  and passes `Analyzer::Reindex::Deferred`, and `apply_project_inputs()` is what schedules
+  the burst.  Registering a project *and* scheduling there costs N+1 full reindex
+  generations for N projects, each parsing the filelist as it stood before that project
+  joined it -- superseded before they can commit, but not before their workers have spent
+  the CPU.
+- `reload_all_projects()` folds in a **deterministic order** (the session root, then the
+  discovered roots, then the open buffers' roots, the last two sorted).  Fold order decides
+  the order of the merged defines and `+incdir+` entries, which are the analyzer's
+  *defaults* -- their digest keys every shard of a file under no project, and their order
+  is the header search order.  Iterating a hash container there would invalidate a
+  different arbitrary subset of those shards on each save.
+- Because the index is a union, **a name two projects both declare is disambiguated
+  at the lookup, not by splitting the index** — `ProjectIndexSnapshot::find_module()`
+  takes the asking file's path and ranks the candidates by path proximity.  clangd
+  does the same thing (`FuzzyFindRequest::ProximityPaths`, scored by the directory-tree
+  edit distance in `FileDistance.h`); its `LookupRequest` is a set of `SymbolID` and
+  carries no path filter at all, and `mergeSymbol()` collapses two same-ID symbols
+  into one without ever asking which project they came from.
+- It **ranks, it does not filter**, and that distinction is the whole design.  A filter
+  returns nothing when the asking file is in no project, or when the module lives in
+  shared IP outside either root — both routine in hardware, where a `common_ip/` with
+  no `lazyverilog.toml` is normal.  A filter would also mean paying the union's memory
+  and indexing cost while getting split-index behaviour, which is the one thing the
+  union exists to avoid.
+- Only names with more than one declaration cost anything: `module_duplicates` holds
+  those alone, so a project of thousands of uniquely-named modules does not allocate a
+  vector per name to say "there is exactly one of these".  `ProjectIndexModuleRef`
+  stores a `shard_slot`, not a path string, for the same reason — resolve it with
+  `module_path()`.
+- Ties keep first-indexed order, so the answer is stable across requests.  Like clangd
+  we ignore semantic roots (`FileDistance.h` says so outright), so two files equally
+  far from the asker are not distinguishable and the first one wins.
+- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
+  through AutoInst: the two projects' modules differ in their ports, so the ports that
+  come back name which project answered.
+- **A saved config rebuilds every known project, not just the one that changed**
+  (`reload_all_projects()`).  Reloading only the saved config replaced the merged
+  filelist with that project's own, which unindexed every other open project until
+  one of its buffers was opened again.  The rebuild also re-folds the open buffers,
+  because a `lazyverilog.toml` created just now makes a project no recorded root
+  names and the buffer that now belongs to it sent its `didOpen` long ago.
+  `fold_project_root()` accumulates and `apply_project_inputs()` applies, so folding
+  several projects still schedules one reindex generation.
+- Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
+  so a session-wide set cannot pass them — each project's source only yields a module
+  under its own define, or resolves a same-spelled header through its own `+incdir+`.
+- Guarded by `./build/lazyverilog-tests "[project-root]"` and
+  `ctest --test-dir build -R config-root-cli-smoke`.
+
 ### Index Shard Cache
-- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`; `[index].cache`
-  turns it off.  Keyed on **content digests** of the file, its `include`s, and the
-  defines/incdirs — never mtime, which is unusable on a shared filesystem.
+- Per-file shards persist in `<project_root>/.cache/lazyverilog/index`, where
+  `project_root` is **that file's own** — resolved as above, not a session-wide root.
+  `IndexCacheStorage` picks the directory per file, which is clangd's
+  `DiskBackedIndexStorageManager`; keeping the *storage* per file rather than the
+  *indexer* is what makes several projects cheap.
+- A file in no project falls back to `user_cache_directory()/lazyverilog/index`
+  (`$XDG_CACHE_HOME` or `~/.cache` on Unix, `~/Library/Caches` on macOS,
+  `%LOCALAPPDATA%` on Windows — the same convention as LLVM's
+  `llvm::sys::path::cache_directory()`).  No `.gitignore` is written there; that
+  directory is in no repository.
+- An `include`d header's shard lives beside **its** project's config, not the
+  includer's.  A verification header shared by two designs is one file in one project.
+- **There is no switch.**  `[index].cache` is gone -- the config key, the struct, and the
+  parse -- and `index_cache_storage()` always builds a storage.  clangd has no such option
+  either.  What it used to protect, a project that must have nothing written into it, is
+  answered by *where* shards go: a file under no project caches outside the tree, and a
+  directory that cannot be created runs uncached on its own.  Making it per project first
+  showed why it should not exist: gated on the server's `config_` the switch depended on
+  which directory the server was launched from (with no `rootUri` that config is whatever
+  sits above the working directory), and per project it was a second answer to a question
+  the shard *location* already answers.  A `[index]` table left in a config is ignored
+  like any other unknown key -- the loader reports unknown keys nowhere, and this is not
+  the place to start.  `index-bench --cache off` stays, for `startup_bench.py
+  --no-cache`; it is a bench knob, not a setting.
+- Keyed on **content digests** of the file, its
+  `include`s, and the defines/incdirs — never mtime, which is unusable on a shared
+  filesystem.
 - A digest answers "did what I read change".  It cannot answer "would I read the same
   file", so the key also records **how each `include` resolved**, unresolved ones
   included: creating a header that satisfies an `include` for the first time, or
@@ -140,7 +257,8 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   Renaming shards (`shard_path()`) needs a bump too, or the old names are stranded.
 - The sweep (`IndexCache::prune_missing_sources()`, queued by the preload onto the
   writer thread) removes shards whose source file is gone and shards of any other
-  format version.  Files without our magic are left alone.
+  format version, and runs over **every** directory the burst wrote into.  Files
+  without our magic are left alone.
 - Benchmark all three halves: `tools/startup_bench.py` clears the shard cache before
   each run (**cold**), `--warm` keeps it, `--no-cache` turns the cache off entirely.
   Report them separately — a change can improve warm and wreck cold.

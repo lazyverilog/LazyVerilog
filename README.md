@@ -343,21 +343,21 @@ Then install it from VS Code:
 Create `lazyverilog.toml` in the project root.  At minimum, point `design.vcode` to a filelist so
 LazyVerilog can index modules, packages, ports, and cross-file references.
 
-> **The file must sit exactly at the root your editor opens the project with.**
-> LazyVerilog reads `<root>/lazyverilog.toml` and does not search for it — not upward from the
-> root, and not upward from the file you open.  If it is anywhere else, the server starts with
-> built-in defaults and never reports an error, because from its point of view the project simply
-> has no config.
+> **Put it anywhere above your RTL.**  The server walks up from each file you open to the
+> nearest `lazyverilog.toml` — the same way `clangd` finds `compile_commands.json` — so a
+> config at the repository top governs everything under it, and a config in a subdirectory
+> governs that subdirectory instead.  The **nearest one wins**.
 >
-> The root is the one your LSP client sends in `initialize`, so make sure the two agree.  In
-> Neovim, `vim.fs.root` resolves its marker list **by marker order, not by proximity** — with
-> `{ ".git", "lazyverilog.toml" }` a `.git` higher in the tree wins over a nearer config — so keep
-> `lazyverilog.toml` beside `.git` at the top of the repository.  A monorepo with several RTL
-> projects needs either a config at the top or one client root per project.
+> Your editor does not choose this.  The Neovim plugin sends no root at all, and
+> `root_markers` is gone: `vim.fs.root` resolves markers **by list order, not proximity**, so
+> `.git` at the top of a monorepo used to outrank the `lazyverilog.toml` sitting beside your
+> file, and that config was silently never read.
 >
-> Capabilities are exchanged once at `initialize` and never revised, which is why this is strict:
-> a config discovered afterwards could not switch a feature back off, and the client would keep
-> requesting it for the rest of the session.
+> A monorepo with several RTL projects can therefore give each one its own
+> `lazyverilog.toml`, and one editor session serves them all.
+>
+> If there is no `lazyverilog.toml` anywhere above a file, it gets built-in defaults and its
+> index cache goes to your user cache directory rather than into the tree.
 
 For full configuration, refer to [`lazyverilog.toml`](lazyverilog.toml) — complete example configuration.
 
@@ -407,7 +407,7 @@ path/to/rtl3.sv
 
 Open a Verilog/SystemVerilog RTL file:
 
-Server reads `lazyverilog.toml` from the project root — see step 1; it does not search for it.
+Server finds `lazyverilog.toml` by walking up from each opened file — see step 1.
 
 ```bash
 nvim path/to/rtl.sv
@@ -564,7 +564,7 @@ Editors resolve the `lazyverilog-lsp` server in this order:
 
 ## ⚙️ Configuration
 
-LazyVerilog reads `lazyverilog.toml` from your project root, and only from there — see [Usage step 1](#1-add-a-project-config-to-your-rtl-project-root) for what the root means and why the location is fixed. Opening a subdirectory as the project root gives you built-in defaults, not the config above it.
+LazyVerilog finds `lazyverilog.toml` by walking up from each file you open to the nearest one — see [Usage step 1](#1-add-a-project-config-to-your-rtl-project-root). Opening a subdirectory no longer hides the config above it.
 
 The config controls design inputs, semantic compilation, lint rules, formatter policy, RTL tree display, inlay hints, and automation helpers.
 
@@ -585,6 +585,37 @@ enable = true
 ```
 
 </details>
+
+### Index cache
+
+LazyVerilog keeps a per-file index on disk so the second launch does not reparse a project
+that has not changed — the same idea as `clangd`'s background index.
+
+Shards go **beside the `lazyverilog.toml` that governs each file**:
+
+```
+your-project/
+├── lazyverilog.toml
+├── rtl/alu.sv
+└── .cache/lazyverilog/index/        ← created here
+    ├── .gitignore                   ← written for you; nothing to add to your repo
+    └── alu.sv.<hash>.idx
+```
+
+A file with no `lazyverilog.toml` above it does **not** get a `.cache/` next to it. Its shards
+go to your user cache directory instead — `$XDG_CACHE_HOME/lazyverilog/index` (usually
+`~/.cache/lazyverilog/index`), `~/Library/Caches/lazyverilog/index` on macOS, or
+`%LOCALAPPDATA%\lazyverilog\index` on Windows.
+
+Reuse is decided by **content**, not timestamps, so it stays correct across `git checkout`,
+`rsync` and shared filesystems where mtime cannot be trusted. Deleting the directory is always
+safe: the next launch is just slower.
+
+There is no switch for it, the same way `clangd` has none for its background index. A project
+that must have nothing written into it is answered by *where* the shards go rather than by
+turning them off: if the directory cannot be created — a read-only checkout — the server simply
+runs uncached, and a file with no `lazyverilog.toml` above it never gets a `.cache/` in the
+first place.
 
 ## 📚 Documents
 

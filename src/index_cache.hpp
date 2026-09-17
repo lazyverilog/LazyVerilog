@@ -1,13 +1,17 @@
 #pragma once
 
 #include "include_resolution.hpp"
+#include "project_root.hpp"
 #include "syntax_index.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -44,6 +48,8 @@ public:
         uint64_t hi{0};
         constexpr bool operator==(const Digest&) const = default;
         constexpr bool empty() const { return lo == 0 && hi == 0; }
+        /// Both halves as hex, for use as a map key.
+        std::string hex() const;
     };
 
     /// What a stored shard was built from.  A shard is usable only when every
@@ -109,6 +115,17 @@ public:
     /// condition, not a failure, and the server runs uncached.
     static std::optional<IndexCache> open(const std::filesystem::path& project_root);
 
+    /// Open the cache for files that belong to no project, under the user's own
+    /// cache directory (`user_cache_directory()/lazyverilog/index`).
+    ///
+    /// clangd's fallback, and for its reason: a file with no config above it
+    /// still deserves a warm second launch, but writing `.cache/` beside
+    /// whatever file was opened litters directories the user never pointed at —
+    /// and on a one-file-in-/tmp session, somewhere they will never look for it
+    /// again.  No `.gitignore` is written here: nothing in the user's cache
+    /// directory is inside a repository.
+    static std::optional<IndexCache> open_fallback();
+
     /// Directory shards live in: `<project_root>/.cache/lazyverilog/index`.
     /// Mirrors clangd's `<project_root>/.cache/clangd/index`, including the
     /// `.gitignore` written beside them.
@@ -154,6 +171,68 @@ private:
     std::filesystem::path shard_path(std::string_view uri) const;
 
     std::filesystem::path directory_;
+};
+
+/// Picks the shard directory for each file, so one index can serve files from
+/// several projects at once.
+///
+/// This is clangd's `DiskBackedIndexStorageManager`: one background index, but
+/// storage chosen per file from that file's own project —
+///
+///     llvm::SmallString<128> StorageDir(FallbackDir);
+///     if (auto PI = GetProjectInfo(File)) {
+///       StorageDir = PI->SourceRoot;
+///       llvm::sys::path::append(StorageDir, ".cache", "clangd", "index");
+///     }
+///
+/// Keeping the *storage* per file rather than the *indexer* is what makes
+/// multi-project support cheap: a second project adds a directory, not another
+/// set of worker threads, another source manager and another copy of the
+/// project index.
+///
+/// Thread-safe.  Index workers resolve and store shards concurrently.
+class IndexCacheStorage {
+public:
+    /// @p resolver decides each file's project.  Shared because the server
+    /// resolves the same files for config lookups.
+    explicit IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver);
+
+    /// Storage that puts every file's shards under @p project_root, whatever
+    /// the file's own ancestors hold.
+    ///
+    /// For callers that already know the project because they were told it:
+    /// `index-bench --cache-root`, and tests that build a tree without writing
+    /// a config into it.  Unlike ProjectRootResolver::set_forced_root(), no
+    /// marker file is required — the caller naming a directory outright is the
+    /// authority here, not a search.
+    static std::shared_ptr<IndexCacheStorage> for_root(std::filesystem::path project_root);
+
+    /// Cache @p uri's shard belongs in, or nullptr when none could be opened.
+    ///
+    /// The returned cache is owned by this object and stays valid for its
+    /// lifetime: entries are added, never replaced or removed, so a pointer
+    /// handed to a worker cannot dangle under it.
+    const IndexCache* for_uri(std::string_view uri) const;
+
+    /// Every cache opened so far.  The sweep runs over each of them, and a test
+    /// that wants to know where a shard landed asks here.
+    std::vector<const IndexCache*> opened() const;
+
+private:
+    /// Key for the fallback cache, which no project root can collide with:
+    /// project roots are absolute paths and this is not one.
+    static constexpr const char* kFallbackKey = "<fallback>";
+
+    std::shared_ptr<const ProjectRootResolver> resolver_;
+    /// Set by for_root(): every file answers with this root and no walk runs.
+    std::optional<std::filesystem::path> fixed_root_;
+    mutable std::mutex mutex_;
+    /// Stable addresses: a worker holds the pointer across a parse, and
+    /// rehashing a map of values would move what it holds.  nullopt records a
+    /// directory that could not be created, so a read-only project is not
+    /// retried once per file.
+    mutable std::unordered_map<std::string, std::unique_ptr<std::optional<IndexCache>>>
+        caches_;
 };
 
 /// Serialize / deserialize without touching the filesystem.  Exposed for tests,

@@ -82,13 +82,13 @@ std::string initialize_with_root(const fs::path& server_bin, const std::string& 
 /// asking for the rest of the session.  Computing whole-file folds nobody wants
 /// is the most expensive thing on the edit path, so "turned off" has to mean
 /// the handler declines too.
-std::string folds_for_root(const fs::path& server_bin, const std::string& root_uri) {
+std::string folds_for_uri(const fs::path& server_bin, const std::string& root_uri,
+                          const std::string& doc_uri) {
     static int counter = 0;
     const fs::path input = fs::temp_directory_path() /
                            ("lazyverilog-config-folds-" +
                             std::to_string(cli_process::current_process_id()) + "-" +
                             std::to_string(counter++) + ".jsonrpc");
-    const std::string doc_uri = root_uri + "/fold_probe.sv";
     {
         std::ofstream out(input, std::ios::binary);
         out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
@@ -111,6 +111,105 @@ std::string folds_for_root(const fs::path& server_bin, const std::string& root_u
     // going quiet, which is how it stayed invisible on one runner while the
     // stdout checks below passed anyway.
     expect(result.exit_code == 0, "the server exits cleanly after a deferred fold request");
+    return result.stdout_text;
+}
+
+std::string folds_for_root(const fs::path& server_bin, const std::string& root_uri) {
+    return folds_for_uri(server_bin, root_uri, root_uri + "/fold_probe.sv");
+}
+
+/// Like folds_for_root(), but the buffer sits two directories below the root,
+/// where there is no lazyverilog.toml of its own.
+std::string folds_for_nested_file(const fs::path& server_bin, const std::string& root_uri) {
+    return folds_for_uri(server_bin, root_uri, root_uri + "/rtl/core/fold_probe.sv");
+}
+
+/// Open two buffers from two different projects in ONE session and format both.
+/// Returns the server's stdout.
+///
+/// No rootUri is sent, so nothing but each file's own path says which project it
+/// belongs to.  A session-wide formatter config cannot answer both correctly,
+/// which is the point.
+std::string format_two_projects(const fs::path& server_bin, const std::string& uri_a,
+                                const std::string& uri_b) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-format-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    // Indented one level inside the module, so indent_size is what decides the
+    // leading whitespace of the middle line.
+    const std::string text = R"(module m;\nlogic x;\nendmodule\n)";
+    const std::string options =
+        R"({"tabSize":4,"insertSpaces":true})";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"capabilities":{"textDocument":{}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        for (const auto& uri : {uri_a, uri_b}) {
+            out << frame(
+                R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                R"("uri":")" + uri +
+                R"(","languageId":"systemverilog","version":1,"text":")" + text + R"("}}})");
+        }
+        out << frame(R"({"jsonrpc":"2.0","id":2,"method":"textDocument/formatting",)"
+                     R"("params":{"textDocument":{"uri":")" + uri_a +
+                     R"("},"options":)" + options + R"(}})");
+        out << frame(R"({"jsonrpc":"2.0","id":3,"method":"textDocument/formatting",)"
+                     R"("params":{"textDocument":{"uri":")" + uri_b +
+                     R"("},"options":)" + options + R"(}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after two formatting requests");
+    return result.stdout_text;
+}
+
+/// Open a buffer from each of two projects, save one project's config, then ask
+/// for a project-wide lint.  Returns the server's stdout.
+///
+/// `lazyverilog.lintAll` walks the merged filelist synchronously, so what comes
+/// back names every file the server currently believes is in the session -- no
+/// waiting on the background indexer, and no timing assumption.
+///
+/// Saving a config used to *replace* that filelist with the saved project's
+/// own, which unindexed every other open project until one of its buffers was
+/// opened again.  Both projects' files have a syntax error, so both must be
+/// named here; a server that dropped one reports only the other.
+std::string lint_all_after_config_save(const fs::path& server_bin, const std::string& uri_a,
+                                       const std::string& uri_b,
+                                       const std::string& config_b_uri) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-lintall-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    {
+        std::ofstream out(input, std::ios::binary);
+        // No rootUri: both projects are found only by walking up from the files
+        // that get opened, which is what the Neovim plugin now does.
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"capabilities":{"textDocument":{}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        for (const auto& uri : {uri_a, uri_b}) {
+            out << frame(
+                R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                R"("uri":")" + uri +
+                R"(","languageId":"systemverilog","version":1,)"
+                R"("text":"module t;\nendmodule\n"}}})");
+        }
+        out << frame(R"({"jsonrpc":"2.0","method":"workspace/didChangeConfiguration",)"
+                     R"("params":{"settings":{"lazyverilog":{"configFile":")" +
+                     config_b_uri + R"("}}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand",)"
+                     R"("params":{"command":"lazyverilog.lintAll","arguments":[]}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after a project-wide lint");
     return result.stdout_text;
 }
 
@@ -148,60 +247,45 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // The supported layout: the config sits in the root the client sent, and a
-    // setting turned off in it reaches the capability reply.
+    // Both providers are advertised unconditionally, whatever the config says
+    // and whatever the client offers to register dynamically.  This is clangd's
+    // contract -- `{"foldingRangeProvider", true}` and `{"inlayHintProvider",
+    // true}` are literals there, and no config file influences them -- and it
+    // is forced here by the root moving into the server: capabilities are
+    // exchanged before any file is open, so there is no one config to answer
+    // from any more.
+    //
+    // What the config decides is the reply, checked further down.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
-        expect(contains(out, R"("inlayHintProvider":false)"),
-               "hints disabled by the config in the workspace root");
-    }
-
-    // The same layout against a config that turns the setting on.  Without this
-    // a server that always answered `false` would pass the case above, and a
-    // server that ignored the file entirely would pass the case below.
-    {
-        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"));
         expect(contains(out, R"("inlayHintProvider":true)"),
-               "hints enabled by the config in the workspace root");
+               "inlayHintProvider is advertised even where the config turns hints off");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised even where the config turns hints off");
     }
-
-    // The client's root is two directories below the config, so by the contract
-    // there is no config: the reply must come from built-in defaults, where
-    // inlay hints are on.  An upward walk would find `enable = false` above and
-    // answer `false` here.
-    {
-        const auto out = initialize_with_root(
-            server_bin, path_to_uri(fixtures / "hints_off" / "rtl" / "core"));
-        expect(contains(out, R"("inlayHintProvider":true)"),
-               "no config in the workspace root, so defaults -- not the one above it");
-    }
-
-    // `[folding].enable` reaches the wire the same way.  Neovim re-requests the
-    // whole file's folds from every didChange and answers `dynamicRegistration
-    // = false` for foldingRange, so this reply is the only chance to stop it
-    // asking -- there is no second one later in the session.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "folding_off"));
-        expect(contains(out, R"("foldingRangeProvider":false)"),
-               "folding disabled by the config in the workspace root");
-    }
-    {
-        const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("foldingRangeProvider":true)"),
-               "folding on by default when the config does not mention it");
+               "foldingRangeProvider is advertised even where the config turns folding off");
     }
-
-    // A client that takes dynamic registration must NOT also be told statically.
-    // Neovim's supports_method() answers from the static capability when one is
-    // there, so advertising both makes a later client/unregisterCapability do
-    // nothing and the client keeps requesting for the rest of the session.
     {
         const auto out = initialize_with_root(server_bin, path_to_uri(fixtures / "hints_on"),
                                               /*dynamic_registration=*/true);
-        expect(!contains(out, R"("inlayHintProvider")"),
-               "inlayHintProvider withheld from a client that registers dynamically");
-        expect(!contains(out, R"("foldingRangeProvider")"),
-               "foldingRangeProvider withheld from a client that registers dynamically");
+        expect(contains(out, R"("inlayHintProvider":true)"),
+               "inlayHintProvider is advertised to a client that registers dynamically");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised to a client that registers dynamically");
+    }
+
+    // A client that sends no root at all still gets the same reply.  This is
+    // the shape the Neovim plugin now sends -- it stopped choosing a root_dir,
+    // because choosing one is what it was getting wrong.
+    {
+        const auto out = initialize_with_root(server_bin, "");
+        expect(contains(out, R"("inlayHintProvider":true)"),
+               "inlayHintProvider is advertised to a client that sends no root");
+        expect(contains(out, R"("foldingRangeProvider":true)"),
+               "foldingRangeProvider is advertised to a client that sends no root");
     }
 
     // The switch has to reach the handler, not only the capability reply.
@@ -211,11 +295,104 @@ int main(int argc, char** argv) {
         expect(!contains(out, R"("startLine")"),
                "no folds are computed when [folding].enable is false");
     }
+    // The config that governs a file is the nearest one above the *file*, not
+    // one the client named.  This probe sits two directories below
+    // folding_off/lazyverilog.toml with no config of its own, and under the old
+    // contract -- `<root>/lazyverilog.toml` and nothing else -- it was served
+    // defaults, so folds came back.
+    {
+        const auto out = folds_for_nested_file(server_bin,
+                                               path_to_uri(fixtures / "folding_off"));
+        expect(contains(out, R"("id":2)"), "a nested fold request is answered");
+        expect(!contains(out, R"("startLine")"),
+               "a file below the config inherits [folding].enable = false from it");
+    }
+
+    // The same file, with no rootUri at all -- the shape the Neovim plugin now
+    // sends.  Nothing but the opened file's own path says which project this
+    // is, which is the point: the server walks up from the file and finds
+    // folding_off/lazyverilog.toml on its own.
+    {
+        const auto out =
+            folds_for_uri(server_bin, "",
+                          path_to_uri(fixtures / "folding_off" / "rtl" / "core" /
+                                      "fold_probe.sv"));
+        expect(contains(out, R"("id":2)"), "a rootless fold request is answered");
+        expect(!contains(out, R"("startLine")"),
+               "the config is found from the opened file when no root was sent");
+    }
+
+    // Formatter options are per file too, not only the two capability switches.
+    // One session, two buffers, two projects that disagree about indent_size --
+    // and no rootUri, so the only thing that can tell them apart is each file's
+    // own path.  A session-wide config gives both files the same indent, which
+    // fails whichever project it picked.
+    {
+        const auto out = format_two_projects(
+            server_bin, path_to_uri(fixtures / "indent_two" / "m.sv"),
+            path_to_uri(fixtures / "indent_eight" / "m.sv"));
+        expect(contains(out, R"(\n  logic x;)"),
+               "the 2-space project's file is formatted with its own indent_size");
+        expect(contains(out, R"(\n        logic x;)"),
+               "the 8-space project's file is formatted with its own indent_size");
+    }
+
     // And the same request against a root that leaves folding on must produce
     // some, or the check above would pass against a server that never folds.
     {
         const auto out = folds_for_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("startLine")"), "folds are computed when folding is on");
+    }
+
+    // Saving one project's config must not unindex the others.  Built here
+    // rather than checked in, because a filelist has to name absolute paths.
+    {
+        const fs::path work =
+            fs::temp_directory_path() /
+            ("lazyverilog-config-root-multi-" + std::to_string(cli_process::current_process_id()));
+        fs::remove_all(work);
+
+        const auto make_project = [&](const std::string& name) {
+            const fs::path root = work / name;
+            fs::create_directories(root / "rtl");
+            // Missing `endmodule`, so this file always produces a parse
+            // diagnostic.  lintAll reports parse diagnostics for every file in
+            // the merged filelist regardless of any [lint] setting, which makes
+            // "is this project still indexed" answerable without depending on
+            // which rules a config happens to enable.
+            {
+                std::ofstream sv(root / "rtl" / ("dep_" + name + ".sv"));
+                sv << "module dep_" << name << ";\n";
+            }
+            {
+                std::ofstream flist(root / (name + ".f"));
+                flist << (root / "rtl" / ("dep_" + name + ".sv")).generic_string() << "\n";
+            }
+            {
+                std::ofstream toml(root / "lazyverilog.toml");
+                toml << "[design]\nvcode = \"" << name << ".f\"\n";
+            }
+            {
+                std::ofstream sv(root / "rtl" / "top.sv");
+                sv << "module top_" << name << ";\nendmodule\n";
+            }
+            return root;
+        };
+
+        const fs::path root_a = make_project("a");
+        const fs::path root_b = make_project("b");
+
+        const auto out = lint_all_after_config_save(
+            server_bin, path_to_uri(root_a / "rtl" / "top.sv"),
+            path_to_uri(root_b / "rtl" / "top.sv"),
+            path_to_uri(root_b / "lazyverilog.toml"));
+
+        expect(contains(out, "dep_b.sv"),
+               "the saved project's filelist is still linted after the save");
+        expect(contains(out, "dep_a.sv"),
+               "the other open project's filelist survives a save in the first");
+
+        fs::remove_all(work);
     }
 
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run

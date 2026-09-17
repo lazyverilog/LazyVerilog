@@ -1,0 +1,6 @@
+# See ../indent_two.
+[format]
+# textDocument/formatting only rewrites when this is on; without it the
+# handler returns no edits and the probe cannot tell the two projects apart.
+enable_format_on_save = true
+indent_size = 8

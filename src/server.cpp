@@ -144,8 +144,6 @@ DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterScoped, ScopedRegistrationParams,
 // The ids both sides use to refer to these registrations.  Fixed rather than
 // generated: there is only ever one of each per session, and the unregister has
 // to name the same string the register used.
-constexpr const char* kFoldingRegistrationId   = "lazyverilog-folding-range";
-constexpr const char* kInlayHintRegistrationId = "lazyverilog-inlay-hint";
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -493,10 +491,13 @@ struct LazyVerilogServer::Impl {
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
     root_ = std::filesystem::current_path();
     config_ = load_config(root_);
+    // One resolver decides all three of a file's answers: which config it is
+    // served with, which defines and include directories it parses under, and
+    // which directory its shards live in.  Handing the same one to the analyzer
+    // means a file's project is worked out by one walk, cached once.
+    analyzer_.set_project_root_resolver(root_resolver_);
     // Mirrors read by the handlers that run on the worker pool; see the
     // declarations.  Refreshed everywhere config_ is.
-    folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-    inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
 
@@ -625,76 +626,204 @@ void LazyVerilogServer::run() {
     }
 }
 
-void LazyVerilogServer::sync_dynamic_registration(const char* method,
-                                                  const char* registration_id,
-                                                  const char* config_key, bool want,
-                                                  bool client_supports, bool& advertised) {
-    if (!impl_ || want == advertised)
-        return;
+std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri) const {
+    // The file decides, not the session.  Two buffers open at once can belong
+    // to different projects, and before this each was served whichever config
+    // the editor's guessed root happened to name.
+    if (!root_resolver_)
+        return config_for_root({});
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    return config_for_root(info ? info->source_root : std::filesystem::path{});
+}
 
-    // Capabilities are normally exchanged once, so a client that did not opt in
-    // keeps whatever initialize advertised.  Neovim answers
-    // `foldingRange.dynamicRegistration = false` (but `inlayHint` true), so say
-    // what happened rather than send a request it is entitled to ignore.
-    if (!client_supports) {
-        std::cerr << "[lazyverilog] " << config_key << " changed to "
-                  << (want ? "true" : "false")
-                  << ", but this client does not support dynamic registration for " << method
-                  << " -- restart the server for it to take effect\n";
-        return;
+std::shared_ptr<const Config>
+LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) const {
+    std::string key = source_root.string();
+
+    {
+        std::lock_guard<std::mutex> lock(config_cache_mutex_);
+        if (auto it = config_cache_.find(key); it != config_cache_.end())
+            return it->second;
     }
 
-    std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
-    try {
-        if (want) {
-            auto req = impl_->remote_endpoint.createRequest<Req_ClientRegisterScoped::request>();
-            ScopedRegistration reg;
-            reg.id     = registration_id;
-            reg.method = method;
-            DocumentFilter sv, v;
-            sv.language = std::string("systemverilog");
-            v.language  = std::string("verilog");
-            reg.registerOptions.documentSelector = DocumentSelector{sv, v};
-            req.params.registrations.push_back(std::move(reg));
-            (void)impl_->remote_endpoint.send(req);
-        } else {
-            auto req =
-                impl_->remote_endpoint.createRequest<Req_ClientUnregisterCapability::request>();
-            Unregistration unreg;
-            unreg.id     = registration_id;
-            unreg.method = method;
-            req.params.unregisterations.push_back(std::move(unreg));
-            (void)impl_->remote_endpoint.send(req);
+    // Parsed outside the lock: reading and validating TOML is filesystem work,
+    // and a burst of didOpens in one project would otherwise serialize on it.
+    // Two threads reaching the same root both parse, and whichever insert lands
+    // first is the config both of them get -- the same trade the resolver and
+    // the digest memo make, for the same reason.
+    auto loaded = std::make_shared<const Config>(
+        key.empty() ? Config{} : load_config(source_root));
+
+    std::lock_guard<std::mutex> lock(config_cache_mutex_);
+    auto [it, inserted] = config_cache_.emplace(std::move(key), std::move(loaded));
+    return it->second;
+}
+
+bool LazyVerilogServer::discover_project_for(std::string_view uri) {
+    if (!root_resolver_)
+        return false;
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    if (!info)
+        return false;
+    if (!fold_project_root(info->source_root))
+        return false;
+    apply_project_inputs();
+    return true;
+}
+
+bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_root) {
+    const auto key = source_root.string();
+    if (!discovered_roots_.insert(key).second)
+        return false;
+    if (!std::filesystem::is_regular_file(source_root / ProjectRootResolver::kMarker)) {
+        // Deleted since it was discovered.  Recorded as seen either way, so a
+        // rebuild does not try it again on every open file.
+        return false;
+    }
+
+    // The merged lists serve two jobs that genuinely are session-wide:
+    //
+    //   * `project_files_` is *which* files to index.  One index covers every
+    //     open project, so this has to be the union -- replacing it with the
+    //     newest project's would unindex the files the user was just
+    //     navigating.
+    //   * the merged defines and include directories become the analyzer's
+    //     *default* parse inputs, used for a file under no known project and by
+    //     semantic compilation, which builds one slang Compilation and so can
+    //     only have one preprocessor.
+    //
+    // How each file actually parses is registered per root just below, and does
+    // not come from here.
+    auto config = load_config(source_root);
+    auto vcode = load_vcode(source_root, config);
+
+    const auto append_new = [](std::vector<std::string>& into,
+                               const std::vector<std::string>& from) {
+        for (const auto& value : from) {
+            if (std::find(into.begin(), into.end(), value) == into.end())
+                into.push_back(value);
         }
-        advertised = want;
-    } catch (const std::exception& e) {
-        std::cerr << "[lazyverilog] " << method << " registration error: " << e.what() << "\n";
+    };
+    append_new(project_defines_, config.design.define);
+    append_new(project_include_dirs_, vcode.include_dirs);
+
+    // Files carry a parallel size vector used to order the index burst largest
+    // first, so the two have to stay in step -- appending to one without the
+    // other silently reorders somebody else's burst.
+    //
+    // Deduplicated through a set, not a linear scan of what is already there:
+    // a filelist is thousands of entries on a real design, and scanning the
+    // accumulated list per candidate makes discovering one project quadratic in
+    // its own size -- paid on the didOpen that discovers it, which is now the
+    // ordinary path for a client that sends no rootUri.
+    std::unordered_set<std::string> known(project_files_.begin(), project_files_.end());
+    for (size_t i = 0; i < vcode.files.size(); ++i) {
+        if (!known.insert(vcode.files[i]).second)
+            continue;
+        project_files_.push_back(vcode.files[i]);
+        project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
     }
+
+    // How files under this root preprocess.  This is the per-file half, and it
+    // does not merge: a file under this root is parsed with exactly this
+    // project's defines and include directories, whatever any other project
+    // configures.
+    //
+    // Deferred, not because the burst is unwanted but because apply_project_inputs()
+    // is the one that starts it.  Every caller folds and then applies, and a
+    // generation scheduled here would parse the filelist as it stood *before*
+    // this project joined it -- superseded before it could commit, but not
+    // before its workers had spent a full reindex.
+    analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs,
+                                        Analyzer::Reindex::Deferred);
+
+    // The filelist path of whichever project was folded last.  It only selects
+    // where a relative vcode path is resolved from, and every project that has
+    // one has already had its files folded in above.
+    project_vcode_path_ = resolve_vcode_path(source_root, config);
+
+    std::cerr << "[lazyverilog] project " << key << " (" << vcode.files.size() << " files)\n";
+    return true;
 }
 
-void LazyVerilogServer::sync_folding_registration() {
-    sync_dynamic_registration("textDocument/foldingRange", kFoldingRegistrationId,
-                              "[folding].enable", config_.folding.enable,
-                              folding_dynamic_registration_, folding_advertised_);
+void LazyVerilogServer::apply_project_inputs() {
+    analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
+                                 project_vcode_path_, index_cache_storage(),
+                                 project_file_sizes_);
+    configure_background_compiler();
+    schedule_background_compilation();
 }
 
-void LazyVerilogServer::sync_inlay_hint_registration() {
-    const bool was_advertised = inlay_hint_advertised_;
-    sync_dynamic_registration("textDocument/inlayHint", kInlayHintRegistrationId,
-                              "[inlay_hint].enable", config_.inlay_hint.enable,
-                              inlay_hint_dynamic_registration_, inlay_hint_advertised_);
+void LazyVerilogServer::reload_all_projects() {
+    // Everything is re-derived, so the accumulators start empty.  Replacing
+    // them with only the saved config's project is what this replaced: it
+    // dropped every other open project's files from the index until one of its
+    // buffers was opened again.
+    const auto previously_known = discovered_roots_;
+    discovered_roots_.clear();
+    project_defines_.clear();
+    project_include_dirs_.clear();
+    project_files_.clear();
+    project_file_sizes_.clear();
+    project_vcode_path_.clear();
 
-    // Registering tells the client it may ask; it does not make it ask.  Neovim
-    // re-requests hints on the next didChange, which for a file nobody is
-    // typing in never comes -- so prompt it.  Must be outside the lock
-    // sync_dynamic_registration() holds: request_inlay_hint_refresh() takes the
-    // same one.
-    if (!was_advertised && inlay_hint_advertised_)
-        request_inlay_hint_refresh();
+    // The session root first, so it keeps deciding `config_` and the eager
+    // half, then every root discovered since.
+    if (root_resolver_ && !root_.empty()) {
+        if (auto info = root_resolver_->project_info(root_))
+            fold_project_root(info->source_root);
+    }
+    for (const auto& root : previously_known)
+        fold_project_root(std::filesystem::path(root));
+
+    // And the open buffers, last.  A lazyverilog.toml created just now makes a
+    // project that no root in either set above names, and the buffer that now
+    // belongs to it has long since sent its didOpen.
+    //
+    // Collected and sorted before folding, rather than folded as they are
+    // visited: the open documents come out of a hash map, and fold order
+    // decides the order of the merged defines and `+incdir+` entries.  Those
+    // are the analyzer's *defaults*, whose digest keys every shard belonging to
+    // a file under no project -- so an arbitrary order would invalidate a
+    // different arbitrary subset of them on each save, and would let a header
+    // searched for through the defaults resolve differently from one reload to
+    // the next.  `previously_known` is ordered for the same reason.
+    if (root_resolver_) {
+        std::set<std::string> open_roots;
+        analyzer_.for_each_state([&](const std::string& open_uri,
+                                     const std::shared_ptr<const DocumentState>& doc) {
+            if (!doc)
+                return;
+            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri)))
+                open_roots.insert(info->source_root.string());
+        });
+        for (const auto& root : open_roots)
+            fold_project_root(std::filesystem::path(root));
+    }
+
+    apply_project_inputs();
+}
+
+void LazyVerilogServer::invalidate_config_cache() {
+    if (root_resolver_)
+        root_resolver_->invalidate();
+    {
+        std::lock_guard<std::mutex> lock(config_cache_mutex_);
+        config_cache_.clear();
+    }
+    // Which projects are known is not cleared here: reload_all_projects() owns
+    // that, and it re-derives the accumulated inputs at the same time.  Clearing
+    // it here instead left the analyzer holding a filelist no longer backed by
+    // any recorded root.
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
-    if (!config_.inlay_hint.enable || !impl_)
+    // No `[inlay_hint].enable` guard: there is no one config to read it from,
+    // and asking the client to re-request costs a round trip that the handler
+    // answers with nothing when the file's own project has hints off.  Guarding
+    // on any single project's setting would suppress the refresh for every
+    // other project's files.
+    if (!impl_)
         return;
 
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
@@ -722,6 +851,9 @@ void LazyVerilogServer::configure_background_compiler() {
 }
 
 void LazyVerilogServer::schedule_background_compilation() {
+    // Semantic compilation is session-wide by construction: one slang
+    // Compilation over every source, so one set of options.  See
+    // compilation_snapshot() in analyzer.cpp.
     if (!background_compiler_ || !config_.compilation.background_compilation)
         return;
     background_compiler_->schedule();
@@ -782,10 +914,11 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // synchronously parse, copy, or merge the full design filelist on
             // every edit.
             std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-            if (config_.lint.instance.stale_instance_diagnostic)
+            const auto file_config = config_for(uri);
+            if (file_config->lint.instance.stale_instance_diagnostic)
                 project_lint_index = analyzer_.project_index_snapshot();
 
-            auto lint_diags = run_lint(*state, config_.lint, project_lint_index.get());
+            auto lint_diags = run_lint(*state, file_config->lint, project_lint_index.get());
             for (auto diag : lint_diags)
                 add_diag(std::move(diag));
         }
@@ -908,17 +1041,6 @@ void LazyVerilogServer::register_handlers() {
             caps.positionEncoding =
                 std::string(position_encoding_name(negotiated_position_encoding()));
 
-            // Whether a later [folding].enable / [inlay_hint].enable edit can
-            // reach this client at all.  Neovim answers false for foldingRange
-            // and true for inlayHint; VS Code's client answers true for both.
-            if (const auto& td = req.params.capabilities.textDocument) {
-                if (td->foldingRange && td->foldingRange->dynamicRegistration)
-                    folding_dynamic_registration_ =
-                        *td->foldingRange->dynamicRegistration;
-                if (td->inlayHint && td->inlayHint->dynamicRegistration)
-                    inlay_hint_dynamic_registration_ = *td->inlayHint->dynamicRegistration;
-            }
-
             // Text document sync: incremental + open/close notifications
             lsTextDocumentSyncOptions sync_opts;
             sync_opts.openClose = true;
@@ -1002,33 +1124,50 @@ void LazyVerilogServer::register_handlers() {
                 if (!std::filesystem::exists(p))
                     return;
 
-                // lazyverilog.toml is read from the workspace root and nowhere
-                // else -- no upward search from here, and none from didOpen.
-                // The capability reply below is built from this config and is
-                // never revised, so a config found after initialize could not
-                // take inlay hints back off anyway; a single fixed location is
-                // the only one that can be honoured at the time it is needed.
-                // A project whose config sits elsewhere gets defaults, and the
-                // client can still point at one explicitly with the configFile
-                // payload of didChangeConfiguration.
+                // A client that still sends a root gets its project indexed
+                // before any file is opened, which is worth keeping: it is the
+                // difference between a warm first go-to-definition and one that
+                // waits for a burst to start.  It is no longer the only way a
+                // project is found, though -- didOpen discovers them too -- and
+                // it no longer decides anything per file.
                 root_ = p;
 
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
 
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
 
                 auto vcode = load_vcode(root_, config_);
-                analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
-                                             vcode.files, resolve_vcode_path(root_, config_),
-                                             index_cache_root(), vcode.file_sizes);
-                configure_background_compiler();
-                schedule_background_compilation();
+
+                // Seed the accumulators through the same fold every later
+                // project goes through, so the eager root and a discovered one
+                // cannot drift apart.  Folding also records the root as seen:
+                // without that the first didOpen in this same project would
+                // load its filelist a second time and schedule a redundant
+                // full reindex.
+                //
+                // Only if the config really is here.  Recording a root that
+                // holds no lazyverilog.toml would suppress the discovery of the
+                // real one above it.
+                if (root_resolver_) {
+                    if (auto info = root_resolver_->project_info(root_))
+                        fold_project_root(info->source_root);
+                }
+                if (project_files_.empty()) {
+                    // rootUri names a directory with no config above it.  There
+                    // is still a filelist to index -- load_vcode() found one --
+                    // and no root to attribute it to.
+                    project_defines_      = config_.design.define;
+                    project_include_dirs_ = vcode.include_dirs;
+                    project_files_        = vcode.files;
+                    project_file_sizes_   = vcode.file_sizes;
+                    project_vcode_path_   = resolve_vcode_path(root_, config_);
+                }
+
+                apply_project_inputs();
             };
 
             if (req.params.rootUri && !req.params.rootUri->raw_uri_.empty()) {
@@ -1043,35 +1182,34 @@ void LazyVerilogServer::register_handlers() {
                 initialize_workspace_root(root_);
             }
 
-            // Inlay hints
-            // A client that takes dynamic registration gets the capability that
-            // way and not here.  Advertising it statically as well is what makes
-            // a later client/unregisterCapability useless: Neovim's
-            // supports_method() falls back to the static capability and goes on
-            // requesting hints, which is exactly the bug this avoids.  The
-            // registration is sent from the `initialized` handler below.
-            if (inlay_hint_dynamic_registration_) {
-                inlay_hint_advertised_ = false;
-            } else {
-                caps.inlayHintProvider =
-                    std::make_pair(optional<bool>(config_.inlay_hint.enable),
-                                   optional<InlayHintOptions>{});
-                inlay_hint_advertised_ = config_.inlay_hint.enable;
-            }
-
-            // Folding range.  Neovim re-requests the whole file's folds from
-            // every didChange, so `[folding].enable = false` is the switch that
-            // stops the client asking at all.  Same rule as inlay hints above:
-            // a client that takes dynamic registration must not also be told
-            // statically, or the static answer is the one it keeps believing.
-            if (folding_dynamic_registration_) {
-                folding_advertised_ = false;
-            } else {
-                caps.foldingRangeProvider =
-                    std::make_pair(optional<bool>(config_.folding.enable),
-                                   optional<FoldingRangeOptions>{});
-                folding_advertised_ = config_.folding.enable;
-            }
+            // Inlay hints and folding ranges are advertised unconditionally,
+            // the way clangd does it:
+            //
+            //     {"foldingRangeProvider", true},
+            //     {"inlayHintProvider", true},
+            //
+            // `[inlay_hint].enable` and `[folding].enable` are answered in the
+            // handlers instead, by returning nothing.  This is clangd's
+            // `InlayHints.Enabled`, whose comment is exactly that -- "if false,
+            // inlay hints are completely disabled" -- while the capability
+            // stays true.  (clangd has no folding option at all; this one is
+            // kept because it is what users already configure.)
+            //
+            // Capabilities are exchanged once, before any file is open, so they
+            // cannot depend on config: with the root resolved per file there is
+            // no single `[folding].enable` at initialize to answer from.  What
+            // the config decides is the reply, which is per file and always
+            // current.
+            //
+            // The cost is real and was measured: turning a capability off is
+            // what stops the client asking at all -- 0 requests against 4-6
+            // over five keystrokes in headless Neovim -- and that lever is
+            // gone.  A disabled feature now costs a round trip per keystroke
+            // that returns nothing.  See docs/dev/edit-perf.md.
+            caps.inlayHintProvider =
+                std::make_pair(optional<bool>(true), optional<InlayHintOptions>{});
+            caps.foldingRangeProvider =
+                std::make_pair(optional<bool>(true), optional<FoldingRangeOptions>{});
 
             // Execute command — server-side commands
             lsExecuteCommandOptions exec_opts;
@@ -1123,12 +1261,6 @@ void LazyVerilogServer::register_handlers() {
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
         }
-
-        // Either capability may have been left out of the initialize reply for
-        // a client that takes dynamic registration, so make those first
-        // registrations now.
-        sync_folding_registration();
-        sync_inlay_hint_registration();
     });
 
     // ── shutdown ──────────────────────────────────────────────────────────────
@@ -1168,18 +1300,23 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler(
         [&, show_warning](const Notify_WorkspaceDidChangeConfiguration::notify& note) {
             try {
-                // Prefer the explicit config path supplied by our Neovim
-                // client.  This avoids stale formatter options when Neovim and
-                // the server disagree about the workspace root:
+                // The payload names the config that changed.  It used to also
+                // *move* the server's root -- the client and the server each
+                // had a guess at which project was open, and configFile was how
+                // a disagreement got repaired.  Neither guesses now: every file
+                // resolves its own config, so the only thing this path has to
+                // do is forget what it had cached.
                 //
-                //   client root: /repo              (because .git was found)
-                //   config file: /repo/rtl/lazyverilog.toml
-                //   server root: /repo              (from initialize rootUri)
-                //
-                // If we ignored configFile, reload would keep reading
-                // /repo/lazyverilog.toml (or defaults) forever.  The payload is
-                // only a hint for selecting the root; load_config() still reads
-                // and validates lazyverilog.toml from disk.
+                // Both the resolver and the per-root configs are dropped, not
+                // just the named file's: creating a lazyverilog.toml changes
+                // which project *other* files belong to, and nothing in a
+                // cached answer records that it was reached by not finding
+                // this one.
+                invalidate_config_cache();
+
+                // The project-parse inputs below are still session-wide, so
+                // they reload from the root this config sits in when it names
+                // one.  See the note in initialize about what is still shared.
                 {
                     std::string config_file = did_change_config_file(note.params.settings);
                     if (!config_file.empty()) {
@@ -1188,35 +1325,28 @@ void LazyVerilogServer::register_handlers() {
                         std::filesystem::path config_path(config_file);
                         if (config_path.is_relative())
                             config_path = root_ / config_path;
-                        if (config_path.filename() == "lazyverilog.toml") {
+                        if (config_path.filename() == "lazyverilog.toml")
                             root_ = config_path.parent_path();
-                        }
                     }
                 }
 
                 // Re-read config from disk on every configuration-change
-                // notification.  Apply project-parse inputs with one analyzer
-                // transaction so a single config change schedules at most one
-                // full-project background reindex generation.
+                // notification.  `config_` stays the session's: it is what the
+                // eager half and semantic compilation read.
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                folding_enabled_.store(config_.folding.enable, std::memory_order_relaxed);
-                inlay_hint_enabled_.store(config_.inlay_hint.enable, std::memory_order_relaxed);
 
                 std::cerr << "[lazyverilog] reloaded config from "
                           << (root_ / "lazyverilog.toml").string() << "\n";
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                { auto vcode = load_vcode(root_, config_);
-                  analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
-                                               vcode.files, resolve_vcode_path(root_, config_),
-                                               index_cache_root(), vcode.file_sizes); }
-                configure_background_compiler();
-                schedule_background_compilation();
-                sync_folding_registration();
-                sync_inlay_hint_registration();
+
+                // Every known project, not just the one that was saved, and in
+                // one analyzer transaction so a single save schedules at most
+                // one full-project reindex generation.
+                reload_all_projects();
             } catch (const std::exception& e) {
                 std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }
@@ -1260,8 +1390,11 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const Notify_TextDocumentDidOpen::notify& note) {
         try {
             const auto& td = note.params.textDocument;
-            // No config search here.  The config was resolved at initialize from
-            // the workspace root; opening a file cannot move it.
+            // Opening a file is how a project is found now.  The client no
+            // longer names one -- the Neovim plugin stopped sending root_dir --
+            // so without this a session started outside a project would index
+            // whatever the server's working directory happened to hold.
+            discover_project_for(td.uri.raw_uri_);
             analyzer_.enqueue_parse(td.uri.raw_uri_, td.text);
             document_versions_[td.uri.raw_uri_] = td.version;
             {
@@ -1334,8 +1467,13 @@ void LazyVerilogServer::register_handlers() {
             auto state = analyzer_.get_state(uri);
             if (state) {
                 std::string text = state->text;
-                FormatOptions save_format = config_.format;
-                if (config_.autoarg.autoarg_on_save && state->tree) {
+                // This file's project's formatter options.  Two buffers open at
+                // once can be in projects that disagree about indent_size, and
+                // formatting one with the other's config is a diff nobody asked
+                // for.
+                const auto file_config = config_for(uri);
+                FormatOptions save_format = file_config->format;
+                if (file_config->autoarg.autoarg_on_save && state->tree) {
                     auto results = autoarg_all_modules(*state);
                     // apply back-to-front so earlier offsets stay valid
                     std::sort(results.begin(), results.end(),
@@ -1352,7 +1490,8 @@ void LazyVerilogServer::register_handlers() {
                         // source.  Formatting each fragment first is wasted work on save because
                         // the full pass immediately reformats the same text again.
                         std::string replacement =
-                            line_prefix + format_autoarg(result, config_.autoarg, save_format);
+                            line_prefix +
+                            format_autoarg(result, file_config->autoarg, save_format);
                         if (!save_format.enable_format_on_save)
                             replacement = format_emit_text(replacement, save_format);
                         size_t end = lsp_offset(text, result.end_line, result.end_col);
@@ -1384,7 +1523,8 @@ void LazyVerilogServer::register_handlers() {
             if (state) {
                 // Format the full document so the formatter has surrounding context, but return
                 // an edit restricted to the requested range.
-                std::string formatted = format_source(state->text, config_.format);
+                std::string formatted =
+                    format_source(state->text, config_for(uri)->format);
                 auto edit = range_format_edit(state->text, formatted, req.params.range);
                 if (edit.newText != slice_lsp_range(state->text, edit.range))
                     rsp.result.push_back(std::move(edit));
@@ -1487,14 +1627,13 @@ void LazyVerilogServer::register_handlers() {
             // no fold boundary -- and the last request of a burst is never
             // superseded, so the buffer always settles on folds for its real
             // text.
-            // `[folding].enable = false` decides this too, not only what
-            // `initialize` advertises.  Neovim answers
-            // `foldingRange.dynamicRegistration = false`, so a config reload
-            // cannot unregister the capability there and the client keeps
-            // asking for the rest of the session -- at which point computing
-            // whole-file folds nobody wants is the most expensive thing on the
-            // edit path.  `inlayHint` has always checked its own flag here.
-            if (!folding_enabled_.load(std::memory_order_relaxed))
+            // `[folding].enable = false` is answered here and nowhere else:
+            // foldingRangeProvider is advertised unconditionally, so this is
+            // the only thing standing between a disabled feature and a
+            // whole-file fold computation on every keystroke.  Read from the
+            // file's own config, because two open buffers can disagree about
+            // it.
+            if (!config_for(uri)->folding.enable)
                 return rsp;
 
             if (edit_watermark_.superseded(uri)) {
@@ -1571,9 +1710,9 @@ void LazyVerilogServer::register_handlers() {
         td_inlayHint::response rsp;
         rsp.id = req.id;
         try {
-            if (!inlay_hint_enabled_.load(std::memory_order_relaxed))
-                return rsp;
             const auto& uri = req.params.textDocument.uri.raw_uri_;
+            if (!config_for(uri)->inlay_hint.enable)
+                return rsp;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
                                              req.params.range.end.line);
         } catch (const std::exception& e) {
@@ -1693,9 +1832,10 @@ void LazyVerilogServer::register_handlers() {
                 // or mutating the persistent project index.  Cross-file rules
                 // still consult the current published ProjectIndexSnapshot; the
                 // command does not perform hidden reindexing as a side effect.
+                // Built once if *any* project asks for it.  The snapshot is
+                // project-wide and shared; the per-file decision below is which
+                // rules run, not which index they consult.
                 std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-                if (config_.lint.instance.stale_instance_diagnostic)
-                    project_lint_index = analyzer_.project_index_snapshot();
 
                 auto add_diag = [&](const std::string& fallback_uri, ParseDiagInfo diag) {
                     const std::string target_uri = diag.uri.empty() ? fallback_uri : diag.uri;
@@ -1713,7 +1853,15 @@ void LazyVerilogServer::register_handlers() {
                     for (auto diag : state->parse_diagnostics)
                         add_diag(uri, std::move(diag));
 
-                    auto lint_diags = run_lint(*state, config_.lint,
+                    // :LintAll walks the merged filelist, which in a
+                    // multi-project session spans projects that can disagree
+                    // about which rules are enabled and at what severity.
+                    const auto file_config = config_for(uri);
+                    if (file_config->lint.instance.stale_instance_diagnostic &&
+                        !project_lint_index)
+                        project_lint_index = analyzer_.project_index_snapshot();
+
+                    auto lint_diags = run_lint(*state, file_config->lint,
                                                project_lint_index.get());
                     for (auto diag : lint_diags)
                         add_diag(uri, std::move(diag));
@@ -1860,7 +2008,8 @@ void LazyVerilogServer::register_handlers() {
                 std::string mode = get_string(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    std::string formatted = format_source(state->text, config_.format);
+                    std::string formatted =
+                        format_source(state->text, config_for(uri)->format);
                     optional<lsTextEdit> edit;
                     if (mode == "range") {
                         int start_line = get_int(2);
@@ -1881,7 +2030,8 @@ void LazyVerilogServer::register_handlers() {
                 int ff_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = preview_autoff(*state, ff_line, config_.autoff.register_pattern);
+                    auto result =
+                        preview_autoff(*state, ff_line, config_for(uri)->autoff.register_pattern);
                     preview_ff_result(result);
                 }
             } else if (cmd == "lazyverilog.autoffApply") {
@@ -1889,32 +2039,42 @@ void LazyVerilogServer::register_handlers() {
                 int ff_line = get_int(1);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = autoff(*state, ff_line, config_.autoff.register_pattern);
+                    auto result =
+                        autoff(*state, ff_line, config_for(uri)->autoff.register_pattern);
                     apply_ff_edits(result, uri, state->text);
                 }
             } else if (cmd == "lazyverilog.autoffAllPreview") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = preview_autoff_all(*state, config_.autoff.register_pattern);
+                    auto result =
+                        preview_autoff_all(*state, config_for(uri)->autoff.register_pattern);
                     preview_ff_result(result);
                 }
             } else if (cmd == "lazyverilog.autoffAllApply") {
                 std::string uri = get_string(0);
                 auto state = analyzer_.get_state(uri);
                 if (state) {
-                    auto result = autoff_all(*state, config_.autoff.register_pattern);
+                    auto result = autoff_all(*state, config_for(uri)->autoff.register_pattern);
                     apply_ff_edits(result, uri, state->text);
                 }
             } else if (cmd == "lazyverilog.rtlTree") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
+                    const auto file_config = config_for(uri);
+                    rsp.result.SetJsonString(
+                        rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                      file_config->rtltree.show_instance_name),
+                        lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.rtlTreeReverse") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
-                    rsp.result.SetJsonString(rtl_tree_json(*tree, config_.rtltree.show_file, config_.rtltree.show_instance_name), lsp::Any::kObjectType);
+                    const auto file_config = config_for(uri);
+                    rsp.result.SetJsonString(
+                        rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                      file_config->rtltree.show_instance_name),
+                        lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);
@@ -1927,8 +2087,9 @@ void LazyVerilogServer::register_handlers() {
                         opened ? std::span<const OpenIndexShard>(*opened)
                                : std::span<const OpenIndexShard>{};
                     if (cmd == "lazyverilog.autowirepreview") {
-                        auto preview = autowire_preview(*state, opened_shards, project.get(),
-                                                        config_.autowire, target_line);
+                        auto preview =
+                            autowire_preview(*state, opened_shards, project.get(),
+                                             config_for(uri)->autowire, target_line);
                         // Return preview lines as JSON array of strings
                         std::string json = "[";
                         for (size_t i = 0; i < preview.size(); ++i) {
@@ -1952,7 +2113,7 @@ void LazyVerilogServer::register_handlers() {
                     } else {
                         const std::string new_source =
                             autowire_apply(*state, opened_shards, project.get(),
-                                           config_.autowire, target_line);
+                                           config_for(uri)->autowire, target_line);
                         if (new_source != state->text) {
                             // Find insertion point: first line that differs old→new.
                             const auto old_sv = split_lines_view(state->text);

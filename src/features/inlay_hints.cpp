@@ -48,7 +48,8 @@ struct ModuleMap {
 /// gave the same precedence by overwriting, which is only affordable when the
 /// project half is cheap.
 static ModuleMap build_module_map(const Analyzer& analyzer,
-                                  const std::unordered_set<std::string>& wanted) {
+                                  const std::unordered_set<std::string>& wanted,
+                                  std::string_view from_path) {
     ModuleMap modules;
     if (wanted.empty())
         return modules;
@@ -90,10 +91,10 @@ static ModuleMap build_module_map(const Analyzer& analyzer,
     for (const auto& name : wanted) {
         if (modules.by_name.contains(name))
             continue; // an open buffer already answered for this name
-        const auto it = project->module_by_name.find(name);
-        if (it == project->module_by_name.end())
+        const auto* found = project->find_module(name, from_path);
+        if (!found)
             continue;
-        const auto& ref = it->second;
+        const auto& ref = *found;
         if (!ref.shard || ref.module_index >= ref.shard->modules.size())
             continue;
         modules.by_name[name] = &ref.shard->modules[ref.module_index];
@@ -190,7 +191,7 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
         instantiated.insert(inst.module_name);
 
     const auto lines = split_lines_view(state->text);
-    const auto modules = build_module_map(analyzer, instantiated);
+    const auto modules = build_module_map(analyzer, instantiated, state->normalized_path);
     PortMapCache port_maps;
     std::vector<lsInlayHint> hints;
 
