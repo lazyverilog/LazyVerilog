@@ -27,7 +27,17 @@ class CancelledRequests {
 public:
     /// Note a `$/cancelRequest` if that is what @p raw_message is.
     void observe(std::string_view raw_message) {
-        if (raw_message.find("$/cancelRequest") == std::string_view::npos)
+        if (raw_message.find(kMethod) == std::string_view::npos)
+            return;
+        // The substring is a filter, not the test.  It matches anywhere in the
+        // message, including inside the document text a didChange carries, and
+        // the scan below then looked for an `"id"` after `"params"` without
+        // ever checking what the method was -- so a buffer holding both that
+        // string and a quoted `"id"` could have an unrelated request's id
+        // recorded as cancelled, and that request answered with
+        // RequestCancelled instead of a result.  EditWatermark::observe() does
+        // this correctly for its own method; this is the same check.
+        if (!method_is_cancel(raw_message))
             return;
         auto id = id_from_cancel(raw_message);
         if (id.empty())
@@ -59,6 +69,29 @@ public:
 
 private:
     static constexpr size_t kMaxTracked = 4096;
+    static constexpr std::string_view kMethod = "$/cancelRequest";
+
+    /// Whether the message's `"method"` member *is* the cancel method.
+    ///
+    /// Still a scan rather than a JSON parse, for the reason the whole class is
+    /// one: this runs on the thread that reads messages and the shape is fixed
+    /// by the protocol.
+    static bool method_is_cancel(std::string_view message) {
+        const auto key = message.find("\"method\"");
+        if (key == std::string_view::npos)
+            return false;
+        auto at = message.find(':', key + 8);
+        if (at == std::string_view::npos)
+            return false;
+        ++at;
+        while (at < message.size() && (message[at] == ' ' || message[at] == '\t'))
+            ++at;
+        if (at >= message.size() || message[at] != '"')
+            return false;
+        ++at;
+        return message.compare(at, kMethod.size(), kMethod) == 0 &&
+               at + kMethod.size() < message.size() && message[at + kMethod.size()] == '"';
+    }
 
     /// The `id` member of a `$/cancelRequest`'s params, as a key.
     ///

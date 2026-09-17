@@ -339,6 +339,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_shared_header_scaling.cpp
     tests/test_index_cache.cpp
     tests/test_project_root.cpp
+    tests/test_cancelled_requests.cpp
     tests/test_edit_watermark.cpp
     tests/test_request_pool.cpp
     tests/test_formatter.cpp
