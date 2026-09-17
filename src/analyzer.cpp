@@ -685,7 +685,14 @@ make_file_state_with_options(const std::filesystem::path& path,
     ppo.predefines = defines;
     ppo.additionalIncludePaths = include_dirs;
     slang::Bag bag;
-    bag.set(ppo);
+    // Moved in, not copied.  `Bag::set` takes its argument by const reference
+    // when it can, and stores it in a `std::any` by value -- so binding an
+    // lvalue here made a second copy of PreprocessorOptions, which carries the
+    // whole `+incdir+` list and the define list.  A design with a few hundred
+    // include directories therefore paid two vector copies per parse: per
+    // keystroke on the edit path, and per file during an indexing burst.
+    // Nothing reads `ppo` afterwards.
+    bag.set(std::move(ppo));
 
     auto tree_or_error = slang::syntax::SyntaxTree::fromFile(norm.string(), *sm, bag);
     if (!tree_or_error)
@@ -1044,7 +1051,14 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     ppo.predefines = defines;
     ppo.additionalIncludePaths = std::move(include_dirs);
     slang::Bag bag;
-    bag.set(ppo);
+    // Moved in, not copied.  `Bag::set` takes its argument by const reference
+    // when it can, and stores it in a `std::any` by value -- so binding an
+    // lvalue here made a second copy of PreprocessorOptions, which carries the
+    // whole `+incdir+` list and the define list.  A design with a few hundred
+    // include directories therefore paid two vector copies per parse: per
+    // keystroke on the edit path, and per file during an indexing burst.
+    // Nothing reads `ppo` afterwards.
+    bag.set(std::move(ppo));
     // Pass the normalized path, not the raw one path_from_file_uri() produced:
     // this SourceManager has disableProximatePaths set, so it resolves a
     // relative `include against this path verbatim, with no canonicalization
