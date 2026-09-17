@@ -1475,3 +1475,73 @@ TEST_CASE("project index: an edit's include fanout does not scale with the proje
               << " ms, ratio " << ratio << "\n";
     CHECK(ratio < 1.4);
 }
+
+TEST_CASE("project index: an unrelated edit does not rebuild the project snapshots",
+          "[index][scaling]") {
+    // The two ExtraFile/ExtraIndex snapshots summarize the shards.  Only the
+    // ExtraFileInfo one consults docs_ at all -- it attaches the live state to
+    // a project file that happens to be open -- and only for files it holds a
+    // shard for.  Both were dropped on every open, change, parse commit and
+    // close, whatever the buffer was.
+    //
+    // Each rebuild copies a path and a URI per project file under map_mutex_,
+    // so the first hover, go-to-definition, RTL-tree or workspace-symbol
+    // request after any keystroke anywhere paid 2N string copies while holding
+    // the lock every request handler and index worker contends for -- for a
+    // buffer the snapshots do not mention.
+    //
+    // A ratio against a structurally identical project eight times the size,
+    // minimum of several runs.  Measured over 100 edits plus the two snapshot
+    // reads a request handler makes:
+    //
+    //     before   200 -> 2.36 ms, 1600 -> 17.09 ms   (ratio 7.23)
+    //     after    200 -> 0.81 ms, 1600 ->  0.82 ms   (ratio 1.01)
+    //
+    // which at 1600 shards is 171 us per keystroke against 8.
+    namespace fs = std::filesystem;
+    const auto cost_for = [](int count) {
+        const auto dir =
+            fs::temp_directory_path() / ("lazyverilog_snapshot_scaling_" + std::to_string(count));
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < count; ++i) {
+            const auto path = dir / ("m" + std::to_string(i) + ".sv");
+            std::ofstream out(path);
+            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
+            paths.push_back(path.string());
+        }
+
+        Analyzer analyzer;
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_extra_files(paths);
+        analyzer.wait_for_background_index_idle();
+
+        // Not a filelist entry: nothing the snapshots mention.
+        const std::string uri = "file:///tmp/lazyverilog_snapshot_edit.sv";
+        analyzer.open(uri, "module edit;\nendmodule\n");
+
+        double best = std::numeric_limits<double>::max();
+        for (int run = 0; run < 7; ++run) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 100; ++i) {
+                analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
+                // What a request handler does next.
+                (void)analyzer.extra_index_snapshot_ptr();
+                (void)analyzer.extra_file_snapshot_ptr();
+            }
+            best = std::min(best, std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count());
+        }
+        fs::remove_all(dir);
+        return best;
+    };
+
+    const double small = cost_for(200);
+    const double large = cost_for(1600);
+    const double ratio = large / small;
+    std::cerr << "[scaling] unrelated edit + snapshot: 200 -> " << small << " ms, 1600 -> " << large
+              << " ms, ratio " << ratio << "\n";
+    CHECK(ratio < 1.6);
+}

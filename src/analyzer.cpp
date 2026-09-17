@@ -1086,7 +1086,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         listed_extra_file = extra_file_set_.contains(path_string);
         parse_committed_cv_.notify_all();
     }
@@ -1111,7 +1111,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         listed_extra_file = extra_file_set_.contains(path_string);
         parse_committed_cv_.notify_all();
 
@@ -1164,7 +1164,7 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
         docs_[uri] = state;
         latest_version_[uri] = version;
         semantic_diagnostics_.erase(uri);
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
     }
     {
         std::lock_guard<std::mutex> lock(parse_mutex_);
@@ -1308,7 +1308,7 @@ void Analyzer::parse_worker_loop() {
             auto it = latest_version_.find(job.uri);
             if (it != latest_version_.end() && it->second == job.version) {
                 docs_[job.uri] = state;
-                invalidate_extra_snapshots_locked();
+                invalidate_open_file_snapshot_locked(job.uri);
                 listed_extra = extra_file_set_.contains(state->normalized_path);
 
                 committed = true;
@@ -1357,7 +1357,7 @@ void Analyzer::close(const std::string& uri) {
         docs_.erase(uri);
         latest_version_.erase(uri);
         semantic_diagnostics_.erase(uri);
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         // A closed document never gets its parse, so release anyone waiting on
         // one instead of making them sit out the timeout.
         parse_committed_cv_.notify_all();
@@ -7334,13 +7334,31 @@ void Analyzer::wait_for_background_index_idle() const {
 }
 
 void Analyzer::invalidate_extra_snapshots_locked() const {
-    // Both snapshot vectors summarize extra_cache_.  The ExtraFileInfo variant
-    // also records which project files are currently open by consulting docs_,
-    // so document open/change/close paths must invalidate these caches too.
-    // This helper is intentionally tiny and must only be called while
+    // For a change to the *shards*: both snapshots summarize extra_cache_ and
+    // background_header_shards_, so both go.  Must only be called while
     // map_mutex_ is held by the mutating path.
     extra_file_snapshot_cache_.reset();
     extra_index_snapshot_cache_.reset();
+}
+
+void Analyzer::invalidate_open_file_snapshot_locked(const std::string& uri) const {
+    // For a change to docs_, which is a much narrower thing.
+    //
+    // Only the ExtraFileInfo snapshot consults docs_ at all -- it attaches the
+    // live state to a project file that happens to be open -- and it only
+    // mentions files it holds a shard for.  Editing any other buffer changes
+    // neither snapshot, and the ExtraIndexInfo one never depends on docs_ under
+    // any circumstances.
+    //
+    // Dropping both on every open, change, parse commit and close is what this
+    // replaces.  Each rebuild copies a path and a URI per project file, under
+    // map_mutex_, so the first hover, go-to-definition, RTL-tree or
+    // workspace-symbol request after any keystroke anywhere paid 2N string
+    // copies while holding the lock every request handler and index worker
+    // contends for -- for a buffer the snapshots do not mention.
+    if (!extra_cache_.contains(uri) && !background_header_shards_.contains(uri))
+        return;
+    extra_file_snapshot_cache_.reset();
 }
 
 std::shared_ptr<const std::vector<ExtraFileInfo>>
@@ -8202,7 +8220,7 @@ void Analyzer::background_index_loop() const {
                     if (const auto doc = docs_.find(uri);
                         doc != docs_.end() && doc->second == live_doc) {
                         docs_[uri] = reparsed_live_doc;
-                        invalidate_extra_snapshots_locked();
+                        invalidate_open_file_snapshot_locked(uri);
                         if (extra_file_set_.contains(path_string)) {
                             put_extra_cache_locked(
                                 uri, ExtraFileCacheEntry{

@@ -754,6 +754,9 @@ class Analyzer {
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
     void invalidate_extra_snapshots_locked() const;
+    /// Narrower counterpart for a change to docs_ rather than to the shards.
+    /// Requires map_mutex_.
+    void invalidate_open_file_snapshot_locked(const std::string& uri) const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
     /// Install, drop or empty an `extra_cache_` entry, keeping
