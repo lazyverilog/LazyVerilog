@@ -1199,25 +1199,28 @@ TEST_CASE("a project with compilation off stays quiet next to one with it on",
     CHECK(all_messages.find("undeclared_in_b") == std::string::npos);
 }
 
-TEST_CASE("a buffer under no project still gets semantic diagnostics",
+TEST_CASE("a buffer under no project joins no compilation group",
           "[project-root][module-proximity]") {
-    // Shared IP in a `common_ip/` with no `lazyverilog.toml` is routine, and so
-    // is opening one: it is the same case that makes `by_path_proximity()` rank
-    // instead of filter, and that `file_can_mean_target()` never rejects.
+    // Not an oversight -- it is what that file's config says.  `config_for()`
+    // resolves a file with no `lazyverilog.toml` above it to `Config{}`, and
+    // `[compilation].background_compilation` defaults to false, so
+    // `publish_diagnostics()` never publishes semantic diagnostics for such a
+    // buffer.  Compiling it anyway is work whose result is always discarded.
     //
-    // Grouping semantic compilation by project silently dropped it.  The file
-    // matches no project, so it joined no group, and a buffer that used to
-    // report diagnostics reported nothing -- with no message saying why, and
-    // only when some *other* project happened to be registered.
-    TempTree tree("no-project-buffer-compiles");
+    // Measured against the real server before this guard was written: with an
+    // orphan group in place, `common_ip/shared.sv` was compiled and its
+    // diagnostic never appeared in a single `publishDiagnostics` notification,
+    // while the project beside it published its own.  A user who wants these
+    // adds a `lazyverilog.toml` to the shared tree, which is the same opt-in
+    // every other per-project setting takes.
+    //
+    // This asserts the grouping directly rather than through the compiler: a
+    // compiler-level check passes whether or not the publish gate would ever
+    // let the result out, which is exactly how the wasted work went unnoticed.
+    TempTree tree("no-project-buffer-forms-no-group");
     tree.write("chip_a/lazyverilog.toml", "[design]\n");
-    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\n"
-                                           "    logic [1:0] w;\n"
-                                           "    assign w = undeclared_in_a;\n"
-                                           "endmodule\n");
-    // No config above this one, and no filelist names it.
-    auto ip = tree.write("common_ip/shared.sv", "module shared_ip;\n"
-                                                "endmodule\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\nendmodule\n");
+    auto ip = tree.write("common_ip/shared.sv", "module shared_ip;\nendmodule\n");
 
     Analyzer analyzer;
     analyzer.set_project_index_publish_debounce_ms(0);
@@ -1226,43 +1229,48 @@ TEST_CASE("a buffer under no project still gets semantic diagnostics",
     analyzer.set_project_compilation_inputs({
         {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
     });
-    // Instantiating a module no compilation can see is the other half of this:
-    // the buffer is compiled alone, so `a_top` is unresolved, and LintMode means
-    // that is not a diagnostic.  Were it one, restoring these diagnostics would
-    // just trade silence for a false positive.
-    analyzer.open(uri_from_path(ip), "module shared_ip;\n"
-                                     "    a_top u_a ();\n"
-                                     "    logic [1:0] w;\n"
-                                     "    assign w = undeclared_in_ip;\n"
-                                     "endmodule\n");
+    analyzer.open(uri_from_path(ip), "module shared_ip;\nendmodule\n");
     analyzer.wait_for_background_index_idle();
 
-    const std::string all_messages = semantic_messages(analyzer);
-    INFO(all_messages);
-    // The project beside it is unaffected.
-    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
-    // And the orphan buffer is checked.
-    CHECK(all_messages.find("undeclared_in_ip") != std::string::npos);
-    // Without inventing an error about the design it cannot see.
-    CHECK(all_messages.find("a_top") == std::string::npos);
+    const auto snapshot = analyzer.compilation_snapshot();
+    const auto ip_path = normalize_filesystem_path(ip).string();
+    const auto a_path = normalize_filesystem_path(a).string();
+
+    bool ip_grouped = false;
+    bool a_grouped = false;
+    for (const auto& group : snapshot.groups) {
+        for (const auto& file : group.files) {
+            if (file.path == ip_path)
+                ip_grouped = true;
+            if (file.path == a_path)
+                a_grouped = true;
+        }
+    }
+    // The project that asked for compilation still gets it...
+    CHECK(a_grouped);
+    // ...and the buffer whose config never asked does not.
+    CHECK_FALSE(ip_grouped);
+    // The snapshot still carries it, because the index and the ungrouped
+    // fallback both need every open buffer; only the grouping leaves it out.
+    CHECK(std::any_of(snapshot.files.begin(), snapshot.files.end(),
+                      [&](const CompilationSourceFile& f) { return f.path == ip_path; }));
 }
 
-TEST_CASE("the no-project group does not undo a project's compilation switch",
+TEST_CASE("an unlisted buffer respects its own project's compilation switch",
           "[project-root][module-proximity]") {
-    // The orphan group is for files with no project at all.  A buffer whose
-    // project turned `background_compilation` off has a project, and that
-    // project said no -- sweeping it up here would answer a question that was
-    // already answered, and the per-project switch would do nothing for any
-    // file the filelist does not name.
-    TempTree tree("no-project-group-respects-switch");
+    // The other half of the rule above: a buffer *does* have a project, that
+    // project's filelist just does not name it yet -- a file created a moment
+    // ago, or opened before being added to the `.f`.  It joins its project's
+    // group, so the project's switch is what decides, not the fact that the
+    // filelist is out of date.
+    TempTree tree("unlisted-buffer-respects-switch");
     tree.write("chip_a/lazyverilog.toml", "[design]\n");
     tree.write("chip_b/lazyverilog.toml", "[design]\n");
     auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\n"
                                            "    logic [1:0] w;\n"
                                            "    assign w = undeclared_in_a;\n"
                                            "endmodule\n");
-    auto b = tree.write("chip_b/rtl/b.sv", "module b_top;\n"
-                                           "endmodule\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "module b_top;\nendmodule\n");
 
     Analyzer analyzer;
     analyzer.set_project_index_publish_debounce_ms(0);
@@ -1272,8 +1280,6 @@ TEST_CASE("the no-project group does not undo a project's compilation switch",
         {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
         {.root = tree.root / "chip_b", .files = {}, .background_compilation = false},
     });
-    // Open, in chip_b, and named by no filelist -- exactly the shape the orphan
-    // group collects, except that it has a project.
     analyzer.open(uri_from_path(b), "module b_top;\n"
                                     "    logic [1:0] w;\n"
                                     "    assign w = undeclared_in_b;\n"
