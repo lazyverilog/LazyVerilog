@@ -190,6 +190,16 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - A session with **no registered project** — a CLI tool, a test, a client that sent no
   `rootUri` — has no groups and falls back to one merged `Compilation`, exactly as
   before.  That fallback is the reason the source libraries below still matter.
+- An open buffer under **no** `lazyverilog.toml` that no filelist names gets a group of
+  its own, against the merged defaults.  Grouping by project silently dropped it — it
+  matches no project, so it joined no group — and a buffer that used to report
+  diagnostics reported nothing, only when some *other* project happened to be
+  registered.  Alone rather than folded into each project, because which namespace it
+  belongs to is exactly what nothing knows; compiling it by itself leaves the modules it
+  instantiates unresolved, and `LintMode` reports no diagnostic for an unresolved
+  instantiation, so nothing is invented about the design around it.  A buffer whose
+  project turned `background_compilation` off is **not** swept up here: it has a project
+  and that project said no, and both directions are guarded.
 - On that fallback path each project gets its own `slang::SourceLibrary`
   (`background_compiler.cpp`).  Without one, two projects that both declare `fifo` are a
   redefinition to slang: it said so and kept one, and the other project's semantic
