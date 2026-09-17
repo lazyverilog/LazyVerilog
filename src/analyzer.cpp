@@ -7756,19 +7756,14 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     //
     // An open buffer joins the group of the project it is in, so unsaved text
     // reaches the compilation that cares about it.  A buffer under no project
-    // is not put into any of them -- there is no filelist that says which
-    // design it belongs to, and guessing would put it in every one -- but it is
-    // not dropped either; it gets a group of its own at the end.
+    // joins nothing: there is no filelist that says which design it belongs to,
+    // and guessing would put it in every one.
     if (!project_compilation_inputs_.empty()) {
         std::unordered_map<std::string, CompilationSourceFile> open_by_path;
         for (const auto& file : snapshot.files) {
             if (file.text)
                 open_by_path.emplace(file.path, file);
         }
-
-        // Every path some project took, so the orphan group below can tell an
-        // unowned buffer from one that is already being compiled somewhere.
-        std::unordered_set<std::string> grouped_paths;
 
         for (const auto& project : project_compilation_inputs_) {
             if (!project.background_compilation)
@@ -7819,59 +7814,8 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
             for (const auto* file : unlisted)
                 group.files.push_back(*file);
 
-            for (const auto& file : group.files)
-                grouped_paths.insert(file.path);
-
             if (!group.files.empty())
                 snapshot.groups.push_back(std::move(group));
-        }
-
-        // Every open buffer that no group took, compiled together against the
-        // merged defaults.
-        //
-        // These are the files under no `lazyverilog.toml` at all -- shared IP in
-        // a `common_ip/` beside the projects, a scratch file in /tmp -- that no
-        // project's filelist names either.  Before groups existed they were
-        // compiled along with everything else and reported their diagnostics
-        // like any other buffer; grouping by project silently stopped that,
-        // because a file with no project matches no group.  Losing diagnostics
-        // entirely is a worse answer than compiling against defines that may not
-        // be the ones a design would use.
-        //
-        // Alone rather than folded into each project: which project's namespace
-        // such a file belongs to is exactly what nothing here knows, and adding
-        // it to all of them would inject one buffer's modules into every open
-        // design.  Compiling it by itself leaves the modules it instantiates
-        // unresolved, which costs nothing -- `CompilationFlags::LintMode` is set
-        // and slang reports no diagnostic for an unresolved instantiation, so
-        // the file is checked without inventing errors about the design around
-        // it.
-        //
-        // A buffer whose project has `background_compilation` off is *not* here:
-        // it has a project, and that project said no.  Only an empty root
-        // qualifies, or the switch would be undone by this fallback.
-        CompilationGroup orphans;
-        std::vector<const CompilationSourceFile*> unowned;
-        for (const auto& [path_string, file] : open_by_path) {
-            if (grouped_paths.contains(path_string))
-                continue;
-            if (!parse_inputs_->project_root_for(path_string).empty())
-                continue;
-            unowned.push_back(&file);
-        }
-        // Sorted for the same reason the per-project leftovers are: docs_ is a
-        // hash map, and the order files enter a Compilation decides ties.
-        std::sort(unowned.begin(), unowned.end(),
-                  [](const CompilationSourceFile* a, const CompilationSourceFile* b) {
-                      return a->path < b->path;
-                  });
-        for (const auto* file : unowned)
-            orphans.files.push_back(*file);
-
-        if (!orphans.files.empty()) {
-            orphans.defines = snapshot.defines;
-            orphans.include_dirs = snapshot.include_dirs;
-            snapshot.groups.push_back(std::move(orphans));
         }
     }
 

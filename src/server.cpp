@@ -2000,7 +2000,15 @@ void LazyVerilogServer::register_handlers() {
                     for (auto diag : lint_diags)
                         add_diag(uri, std::move(diag));
 
-                    if (config_.compilation.background_compilation) {
+                    // This file's config, for the same reason the lint rules
+                    // above use it: `[compilation]` is per project, so the
+                    // session's answer is the wrong one for every file that is
+                    // not in the session's own project -- including a file
+                    // under no project at all, whose `Config{}` leaves
+                    // `background_compilation` at its default of false.  This
+                    // read stayed on `config_` when the rest went per project,
+                    // two lines below one that had already moved.
+                    if (file_config->compilation.background_compilation) {
                         auto semantic_diags = analyzer_.semantic_diagnostics(uri);
                         for (auto diag : semantic_diags)
                             add_diag(uri, std::move(diag));

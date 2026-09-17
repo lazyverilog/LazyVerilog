@@ -184,22 +184,26 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   projects' defines.
 - **`[compilation]` is per project, like `[lint]`.**  A project with it off contributes
   no group, and `publish_diagnostics()` gates on `config_for(uri)` so its buffers stay
-  quiet while the project open beside it compiles.  What stays session-level is the
+  quiet while the project open beside it compiles.  `:LintAll` gates on `config_for(uri)`
+  too — it walked the merged filelist deciding lint per file and semantic diagnostics
+  from the session, two lines apart.  What stays session-level is the
   *worker*: `background_compilation_debounce_ms` and `log_timing` are one timer and one
   log stream, and `any_project_compiles()` starts it when anybody wants it.
 - A session with **no registered project** — a CLI tool, a test, a client that sent no
   `rootUri` — has no groups and falls back to one merged `Compilation`, exactly as
   before.  That fallback is the reason the source libraries below still matter.
-- An open buffer under **no** `lazyverilog.toml` that no filelist names gets a group of
-  its own, against the merged defaults.  Grouping by project silently dropped it — it
-  matches no project, so it joined no group — and a buffer that used to report
-  diagnostics reported nothing, only when some *other* project happened to be
-  registered.  Alone rather than folded into each project, because which namespace it
-  belongs to is exactly what nothing knows; compiling it by itself leaves the modules it
-  instantiates unresolved, and `LintMode` reports no diagnostic for an unresolved
-  instantiation, so nothing is invented about the design around it.  A buffer whose
-  project turned `background_compilation` off is **not** swept up here: it has a project
-  and that project said no, and both directions are guarded.
+- An open buffer under **no** `lazyverilog.toml` joins no group, and that is its config
+  speaking, not an oversight.  `config_for()` resolves such a file to `Config{}` and
+  `[compilation].background_compilation` defaults to **false**, so
+  `publish_diagnostics()` would discard whatever a compilation produced for it.  Giving
+  those buffers a group of their own was tried and reverted: measured against the real
+  server, the file was compiled and not one `publishDiagnostics` notification carried
+  its diagnostic, while the project beside it published its own.  Opting shared IP in
+  means putting a `lazyverilog.toml` in the shared tree, the same opt-in every other
+  per-project setting takes.  Guarded by "a buffer under no project joins no compilation
+  group", which asserts the **grouping** and not the compiler's output — a
+  compiler-level check passes whether or not the publish gate would ever let the result
+  out, which is exactly how the wasted work went unnoticed.
 - On that fallback path each project gets its own `slang::SourceLibrary`
   (`background_compiler.cpp`).  Without one, two projects that both declare `fifo` are a
   redefinition to slang: it said so and kept one, and the other project's semantic
