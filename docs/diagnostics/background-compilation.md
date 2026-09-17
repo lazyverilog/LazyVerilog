@@ -7,11 +7,30 @@ LazyVerilog has two diagnostic paths:
 2. **Background semantic compilation** is optional and runs only when
    `[compilation].background_compilation = true`.
 
-The background compiler builds a fresh Slang semantic compilation from:
+The background compiler builds **one fresh Slang compilation per open project**,
+each from that project's own:
 
-- files listed by `[design].vcode`
-- open editor buffers, using their unsaved in-memory text
-- `[design].define` preprocessor defines
+- files listed by its `[design].vcode`
+- open editor buffers under its root, using their unsaved in-memory text
+- its `[design].define` preprocessor defines and `+incdir+` entries
+
+A Slang compilation has one preprocessor and one flat module namespace, so it can
+only ever belong to one project: compiling every open project together gave one
+elaboration two projects' `fifo` and handed one project's defines to the other's
+parse.  The set of files a `.f` names is the scope SystemVerilog binds an
+instantiation over, so that is what each compilation is built from.
+
+`[compilation]` is read **per project**, the same way `[lint]` is.  A project with
+`background_compilation = false` contributes no compilation and shows no semantic
+diagnostics in its buffers, even while a project open beside it has it on.  What
+stays session-level is the worker itself — `background_compilation_debounce_ms`
+and `log_timing` are one timer and one log stream.
+
+Projects compile one after another rather than in parallel: peak memory is the
+binding resource, so N projects cost N times the wall clock and one project's
+memory.  A file two projects both list is compiled once for each; identical
+diagnostics are collapsed, and genuinely different ones are kept, because shared
+IP does mean different things under two projects' defines.
 
 Semantic diagnostics are cached by URI and merged into `publishDiagnostics` for
 open documents after compilation finishes.

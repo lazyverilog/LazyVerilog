@@ -82,6 +82,12 @@ const ParseInputs& ProjectParseInputs::for_path(const fs::path& path) const {
     return defaults_;
 }
 
+const ParseInputs& ProjectParseInputs::for_root(const fs::path& root) const {
+    if (auto it = by_root_.find(root.string()); it != by_root_.end())
+        return *it->second;
+    return defaults_;
+}
+
 fs::path ProjectParseInputs::project_root_for(const fs::path& path) const {
     if (!resolver_)
         return {};

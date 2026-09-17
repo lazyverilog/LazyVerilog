@@ -49,6 +49,8 @@ class LazyVerilogServer {
     void clear_published_diagnostics_for_owner(const std::string& owner_uri);
     void publish_config_diagnostic(const ConfigWarning* warning);
     void request_inlay_hint_refresh();
+    /// Whether any open project asks for semantic compilation.
+    bool any_project_compiles() const;
     void configure_background_compiler();
     void schedule_background_compilation();
 
@@ -152,6 +154,17 @@ class LazyVerilogServer {
     std::vector<std::string> project_include_dirs_;
     std::vector<std::string> project_files_;
     std::vector<uintmax_t> project_file_sizes_;
+    /// Each project's *own* filelist and its `[compilation]` answer, kept
+    /// alongside the union above rather than folded into it.
+    ///
+    /// The union is the right unit for indexing -- a name only one project
+    /// declares should still be reachable from the other -- but it is the wrong
+    /// one for semantic compilation, which builds a slang Compilation with one
+    /// preprocessor and one flat module namespace.  What a `.f` names is the set
+    /// of files an instantiation binds over, so it is what a Compilation should
+    /// be built from.  Appended in fold order, which reload_all_projects() keeps
+    /// deterministic.
+    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     /// Every filelist read while folding the projects above, `-f` chains
     /// included, as normalized absolute paths.  What
     /// workspace/didChangeWatchedFiles compares a reported `.f` against.

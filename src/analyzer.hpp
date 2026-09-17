@@ -381,10 +381,42 @@ struct CompilationSourceFile {
     std::shared_ptr<const std::string> text;
 };
 
+/// One project's share of a semantic compilation, as the server registers it.
+///
+/// `files` is that project's own filelist, not the union.  Which declaration an
+/// instantiation binds to is decided by the set of files being compiled, and
+/// that set is what a `.f` names -- so grouping by filelist is not an
+/// approximation of the semantic answer, it *is* the scope SystemVerilog binds
+/// over.  The union deliberately stays the unit for *indexing*, where a name
+/// only one project declares should still be reachable from the other.
+struct ProjectCompilationInputs {
+    std::filesystem::path root;
+    std::vector<std::string> files;
+    /// That project's `[compilation].background_compilation`.  A project with it
+    /// off contributes no compilation at all, even while another has it on.
+    bool background_compilation{false};
+};
+
+/// One slang Compilation's worth of input.
+struct CompilationGroup {
+    /// The project this compiles, or empty for the ungrouped fallback.
+    std::string root;
+    std::vector<CompilationSourceFile> files;
+    /// This project's own, not the merged defaults.  One Compilation has one
+    /// preprocessor, which is exactly why it has to be one project's.
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+};
+
 struct CompilationSnapshot {
     std::vector<CompilationSourceFile> files;
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
+    /// What actually gets compiled: one entry per project whose config asks for
+    /// it.  Empty means no project registered any -- a CLI tool, a test, or a
+    /// client that sent no rootUri -- and then `files` above is compiled as one
+    /// group against the merged defaults, which is what this did before.
+    std::vector<CompilationGroup> groups;
     std::vector<std::string> open_uris;
     std::unordered_map<std::string, uint64_t> uri_versions;
     /// Which project each of `files` belongs to, answered by the compiler
@@ -572,6 +604,19 @@ class Analyzer {
     /// over the same resolver its shard storage uses, so a file's config, its
     /// parse inputs and its shard directory are all decided by one walk.
     void set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
+
+    /// Register which files each project compiles, and whether it wants to.
+    ///
+    /// Semantic compilation is the one place the union is wrong: it builds a
+    /// slang Compilation, and a Compilation has one preprocessor and one flat
+    /// module namespace, so compiling every project's files together gave two
+    /// projects' `fifo`s to one elaboration and one project's `define` to the
+    /// other's parse.  One Compilation per project is what a `.f` already
+    /// describes.
+    ///
+    /// Passing an empty list restores the single merged compilation, which is
+    /// what a CLI tool or a test with no registered project gets.
+    void set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs);
 
     /// Whether a setter schedules a background reindex itself, or leaves it to
     /// the set_project_config() the caller is about to make.
@@ -831,6 +876,8 @@ class Analyzer {
     /// shared_ptr, so a worker can hold one across a whole parse while a config
     /// reload installs a replacement -- there is no window in which a parse
     /// reads half of one project's inputs and half of another's.
+    /// Guarded by map_mutex_, read by compilation_snapshot().
+    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
     // Normalized absolute lexical filesystem paths.  Writers normalize before
