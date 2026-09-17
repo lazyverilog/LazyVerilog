@@ -1349,3 +1349,68 @@ TEST_CASE("syntax_index: a type spelled as an object-like macro resolves to the 
     // base type name to resolve, and port/signal text is used to generate code.
     CHECK(type_of("bus").find("`WIDTH") != std::string::npos);
 }
+
+TEST_CASE("project index: the published shard order does not depend on hash order", "[index]") {
+    // `module_by_name` keeps the first declaration it meets, and find_module()
+    // breaks a proximity tie the same way -- both on the promise that "first"
+    // means something fixed.  The snapshot was built by walking two
+    // unordered_maps, so "first" meant whichever bucket order the last rehash
+    // produced.  SystemVerilog's module namespace is flat and global, so two
+    // projects open in one session routinely both declare `fifo`, and the
+    // winner could change on any republish -- one per indexing burst, one per
+    // edit of a listed file -- with nothing in the tree having changed.
+    //
+    // Asserted as the invariant rather than by trying to catch a flip: headers
+    // first, then files, each by path.  Eight files make an ascending bucket
+    // order vanishingly unlikely to happen by accident.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_index_order";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    write_file(dir / "shared.svh", "`define ORDER_W 4\n");
+    std::vector<std::string> paths;
+    for (char name = 'a'; name <= 'h'; ++name) {
+        const auto path = dir / (std::string(1, name) + "_mod.sv");
+        write_file(path, "`include \"shared.svh\"\nmodule m_" + std::string(1, name) +
+                             ";\n    logic [`ORDER_W-1:0] sig;\nendmodule\n");
+        paths.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(snapshot->shards.size() > 2);
+
+    const auto header_uri = uri_from_path((dir / "shared.svh").string());
+    bool seen_file = false;
+    std::string previous;
+    for (const auto& shard : snapshot->shards) {
+        const bool is_header = shard.uri == header_uri;
+        if (is_header) {
+            // Headers lead: an includer's copy of a header's declarations can
+            // be a burst behind, so a consumer scanning in order has to meet
+            // the header's own shard first.
+            CHECK(!seen_file);
+        } else if (!seen_file) {
+            seen_file = true;
+            previous.clear();
+        }
+        CHECK(previous <= shard.path);
+        previous = shard.path;
+    }
+    CHECK(seen_file);
+
+    fs::remove_all(dir);
+}
