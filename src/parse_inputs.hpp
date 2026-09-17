@@ -84,6 +84,18 @@ public:
     /// Convenience for the many call sites that hold a URI.
     const ParseInputs& for_uri(std::string_view uri) const;
 
+    /// Which project @p path belongs to, or an empty path when it belongs to
+    /// none.
+    ///
+    /// The same walk, and the same per-directory cache, that decides the file's
+    /// config and its shard directory -- deliberately, because a third notion
+    /// of "which project is this file in" is how the features came to disagree
+    /// about it in the first place.  Unlike for_path() this does not require the
+    /// root to have registered parse inputs: a file's project is a fact about
+    /// the file, and a caller asking whether two files are in the same one is
+    /// not asking how either of them parses.
+    std::filesystem::path project_root_for(const std::filesystem::path& path) const;
+
     /// The defaults, for the whole-project paths that cannot be per file --
     /// today that is the semantic compilation snapshot, which builds one slang
     /// Compilation out of every file and so can only have one set of defines.

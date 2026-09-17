@@ -1,6 +1,8 @@
 #include "analyzer.hpp"
+#include "background_compiler.hpp"
 #include "features/autoinst.hpp"
 #include "features/connect.hpp"
+#include "features/rename.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
 #include "string_utils.hpp"
@@ -8,8 +10,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <filesystem>
 #include <fstream>
@@ -667,13 +672,15 @@ TEST_CASE("autoinst instantiates its own project's module",
 // answers both with the same project, so whichever of the two files it happens
 // to pick, one direction fails.
 //
-// find_references() is not among them, and cannot be: its target resolution is
-// ranked with the rest, but the occurrence search that follows is keyed on
-// `module::<name>` -- a SymbolID with no project in it -- so both projects'
-// `fifo` declarations are one symbol to it and every direction reports both.
-// Making that identity project-aware is a shard-format change and a different
-// question from which declaration a lookup resolves to; a test here would pin
-// the merged behaviour rather than guard this rule.
+// find_references() takes the rule from the other end.  Its SymbolID really is
+// `module::<name>` with no project in it -- the shard indexer is syntactic and
+// cannot know which file declares the `fifo` a use site means -- so ranking
+// cannot help the occurrence search that follows.  What decides there is the
+// *file* an occurrence was written in: an occurrence in a project that is
+// neither the declaration's nor the asking file's cannot mean this declaration.
+// Both escapes are load-bearing, and both are asserted below: a file under no
+// project is never rejected, and the asking file's own project is always
+// admitted.
 
 namespace {
 
@@ -712,6 +719,11 @@ struct TwoProjectTree {
 
     void index(Analyzer& analyzer) const {
         analyzer.set_project_index_publish_debounce_ms(0);
+        // The server hands the analyzer one resolver for every per-file
+        // question (server.cpp).  Without it a file has no project here, and
+        // the rule that a file under no project is never rejected would make
+        // the reference cases below pass for the wrong reason.
+        analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
         analyzer.set_extra_files({a.string(), b.string()});
         analyzer.wait_for_background_index_idle();
     }
@@ -911,4 +923,193 @@ TEST_CASE("project root: the File hint answers exactly as the stat would", "[pro
           nested);
     CHECK(resolver.project_info(nested, ProjectRootResolver::PathKind::File)->source_root ==
           tree.root);
+}
+
+TEST_CASE("references stay inside the asking file's project",
+          "[project-root][module-proximity]") {
+    // Both projects declare `fifo` and both instantiate it.  The occurrence
+    // search is keyed on `module::fifo`, which is one SymbolID for both, so
+    // before the file an occurrence was written in was consulted this reported
+    // all four -- including the *other* project's `module fifo` declaration.
+    TwoProjectTree fixture("dup-references");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    const auto reference_uris = [&](const std::string& project) {
+        const std::string uri = fixture.open_top(analyzer, project);
+        std::set<std::string> uris;
+        for (const auto& ref : analyzer.find_references(uri, 1, 6, true))
+            uris.insert(ref.uri);
+        return uris;
+    };
+
+    const auto from_b = reference_uris("chip_b");
+    CHECK(from_b.contains(uri_from_path(fixture.b)));
+    CHECK_FALSE(from_b.contains(uri_from_path(fixture.a)));
+
+    const auto from_a = reference_uris("chip_a");
+    CHECK(from_a.contains(uri_from_path(fixture.a)));
+    CHECK_FALSE(from_a.contains(uri_from_path(fixture.b)));
+}
+
+TEST_CASE("rename does not rewrite the other project's declaration",
+          "[project-root][module-proximity]") {
+    // The consequence of the case above, and the reason it is worth a guard of
+    // its own: over-reporting a reference is noise, but renaming through it
+    // edits a file in a project the user never opened the buffer for.
+    TwoProjectTree fixture("dup-rename");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    const std::string uri = fixture.open_top(analyzer, "chip_b");
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(1, 6); // cursor on `fifo`
+    params.newName = "fifo_v2";
+
+    auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    CHECK(edit.changes->contains(uri_from_path(fixture.b)));
+    CHECK_FALSE(edit.changes->contains(uri_from_path(fixture.a)));
+}
+
+TEST_CASE("references to shared IP reach every project that uses it",
+          "[project-root][module-proximity]") {
+    // The case a project *filter* would break, and the reason the rule rejects
+    // only what it can prove.  One `fifo`, outside every root -- a `common_ip/`
+    // with no lazyverilog.toml is routine in hardware -- used by two projects.
+    // Renaming it from either side has to edit both, or the other project stops
+    // compiling.
+    TempTree tree("shared-ip-references");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto ip = tree.write("common_ip/fifo.sv", "module fifo (input logic i_clk);\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({ip.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto open_top = [&](const std::string& project) {
+        const std::string uri = uri_from_path(tree.root / (project + "/rtl/top.sv"));
+        analyzer.open(uri, "module top;\n    fifo u_fifo ();\nendmodule\n");
+        return uri;
+    };
+    const std::string uri_b = open_top("chip_b");
+    const std::string uri_a = open_top("chip_a");
+
+    std::set<std::string> uris;
+    for (const auto& ref : analyzer.find_references(uri_b, 1, 4, true))
+        uris.insert(ref.uri);
+
+    CHECK(uris.contains(uri_from_path(ip)));
+    CHECK(uris.contains(uri_b));
+    // The whole point: asked from chip_b, a use in chip_a is still a use.
+    CHECK(uris.contains(uri_a));
+}
+
+TEST_CASE("references from a project that borrows another's module keep the asking file",
+          "[project-root][module-proximity]") {
+    // Declaration in chip_a, asked from chip_b: three projects' worth of
+    // answers, none of them provably wrong.  Admitting the asking file's own
+    // project is what stops this returning results that omit the very file the
+    // cursor is in.
+    TempTree tree("borrowed-module-references");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto owned = tree.write("chip_a/rtl/fifo.sv", "module fifo (input logic i_clk);\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({owned.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri_b = uri_from_path(tree.root / "chip_b/rtl/top.sv");
+    analyzer.open(uri_b, "module top;\n    fifo u_fifo ();\nendmodule\n");
+
+    std::set<std::string> uris;
+    for (const auto& ref : analyzer.find_references(uri_b, 1, 4, true))
+        uris.insert(ref.uri);
+
+    CHECK(uris.contains(uri_from_path(owned)));
+    CHECK(uris.contains(uri_b));
+}
+
+TEST_CASE("semantic compilation keeps two projects' same-named modules apart",
+          "[project-root][module-proximity]") {
+    // Background compilation is one slang Compilation over every open project's
+    // files -- it has a single preprocessor, so it cannot be split per project
+    // -- and SystemVerilog's module namespace is flat.  Two projects that both
+    // declare `fifo` were therefore a redefinition to slang, which said so and
+    // kept one of them.
+    //
+    // The undeclared identifier is the other half of the guard, and the reason
+    // every library here is marked default.  It is reported only from inside a
+    // module that was really elaborated, and slang never auto-instantiates a
+    // definition sitting in a library -- so assigning libraries the obvious way
+    // silences the redefinition by elaborating nothing at all, and this notices.
+    TempTree tree("dup-compilation");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto fifo_a = tree.write("chip_a/rtl/fifo.sv", "module fifo;\n"
+                                                   "    logic [1:0] w;\n"
+                                                   "    assign w = undeclared_in_a;\n"
+                                                   "endmodule\n");
+    auto fifo_b = tree.write("chip_b/rtl/fifo.sv", "module fifo;\n"
+                                                   "    logic [1:0] w;\n"
+                                                   "    assign w = undeclared_in_b;\n"
+                                                   "endmodule\n");
+    // Each project's own top, so `fifo` is instantiated rather than picked as a
+    // top-level module itself.  Two same-named tops would collide as instance
+    // names under $root, which is a different problem and not one libraries
+    // answer.
+    auto top_a = tree.write("chip_a/rtl/top_a.sv", "module top_a;\n    fifo u_fifo ();\nendmodule\n");
+    auto top_b = tree.write("chip_b/rtl/top_b.sv", "module top_b;\n    fifo u_fifo ();\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files(
+        {fifo_a.string(), fifo_b.string(), top_a.string(), top_b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::optional<BackgroundCompileResult> result;
+    BackgroundCompiler compiler([&] { return analyzer.compilation_snapshot(); },
+                                [&](BackgroundCompileResult compiled) {
+                                    std::lock_guard<std::mutex> lock(mutex);
+                                    result = std::move(compiled);
+                                    cv.notify_all();
+                                });
+
+    BackgroundCompilerConfig config;
+    config.enabled = true;
+    config.thread_count = 1;
+    config.debounce_ms = 0;
+    compiler.configure(config);
+    compiler.schedule();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        REQUIRE(cv.wait_for(lock, std::chrono::seconds(60),
+                            [&] { return result.has_value(); }));
+    }
+    compiler.stop();
+
+    std::string all_messages;
+    for (const auto& [uri, diags] : result->diagnostics_by_uri) {
+        for (const auto& diag : diags)
+            all_messages += uri + ": " + diag.message + "\n";
+    }
+    INFO(all_messages);
+
+    // Neither `fifo` is a redefinition of the other -- they are in different
+    // libraries now, which SystemVerilog allows.
+    CHECK(all_messages.find("edefinition of 'fifo'") == std::string::npos);
+    CHECK(all_messages.find("duplicate definition of 'fifo'") == std::string::npos);
+    // And the design still elaborates, so the diagnostics the user actually
+    // wants did not go with it.
+    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
 }

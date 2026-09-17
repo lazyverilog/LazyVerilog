@@ -164,6 +164,30 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   index (one index covers every open project, so the filelist is the union), and
   **semantic compilation** (`[compilation]`), which builds a single slang
   `Compilation` and therefore has one preprocessor for all of it.
+- Because that compilation is one `Compilation` over every project, **each project gets
+  its own `slang::SourceLibrary`** (`background_compiler.cpp`).  Without one, two
+  projects that both declare `fifo` are a redefinition to slang: it said so and kept
+  one, and the other project's semantic diagnostics vanished with it.  A name declared
+  in two libraries is legal and kept in priority order; only a duplicate *within* one
+  library is reported (`Compilation::insertDefinition`).  This is SystemVerilog's own
+  answer to the question C++ answers with linkage.
+- Every one of those libraries is marked `isDefault`, which is not the flag's usual
+  sense and is the whole reason this works.  slang never auto-instantiates a definition
+  that sits in a library — "Library definitions are never automatically instantiated in
+  any capacity" — so naming a library the obvious way silences the redefinition by
+  elaborating *nothing at all*.  The `[module-proximity]` compilation case asserts a
+  diagnostic from inside a module body for exactly this reason; flipping `isDefault` to
+  false is what it catches.
+- Priority follows **sorted root order**, not the order files arrive in: the snapshot's
+  open buffers come out of a hash map, and priority is what decides which definition a
+  lookup takes.  Below two projects no library is assigned at all, so a single-project
+  session is unchanged.
+- Libraries make the duplicate legal; they do **not** make binding per project.  Without
+  a `config` block slang resolves a name through a global priority list and then
+  `defList.front()` (`Compilation::tryGetDefinition`), so both projects' tops still bind
+  to the higher-priority `fifo`.  Per-instantiator preference (`overrideLib =
+  &parentDef->sourceLibrary`) only fires under `resolveConfigRule`.  Fixing that means
+  synthesizing a config per project, or one `Compilation` per project.
 - Folding several projects is one analyzer transaction: `fold_project_root()` accumulates
   and passes `Analyzer::Reindex::Deferred`, and `apply_project_inputs()` is what schedules
   the burst.  Registering a project *and* scheduling there costs N+1 full reindex
@@ -218,18 +242,39 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   the lookup that decides what counts as an answer; `collect_files()` orders the vector
   every Connect consumer already reads in order.  Nine hand-written copies of that loop
   is how the defect came to be in nine places at once.
-- **`find_references()` is a known exception.**  Its target resolution is ranked with
-  the rest, but the occurrence search that follows keys on `module::<name>` — a
-  `SymbolID` with no project in it — so two projects' `fifo` declarations are one symbol
-  and references/rename report both.  Making that identity project-aware is a shard
-  format change (`kFormatVersion`), and it has to keep reporting both for shared IP that
-  really is used by two projects.
+- **`find_references()` takes the rule from the other end, because ranking cannot
+  express it.**  A `SymbolID` really is `module::<name>` with no project in it: the
+  shard indexer is syntactic and single-file, so when it walks `fifo u_fifo ();` it
+  cannot know which file declares that `fifo` — that binding is what the union snapshot
+  decides at request time.  Two projects' `fifo`s are therefore one symbol to the
+  occurrence scan, and rename rewrote *both* declarations.  Go-to-definition needs one
+  answer and can rank; references needs a set, so what decides is the **file an
+  occurrence was written in**: `file_can_mean_target()` rejects a file only when its
+  project, the declaration's and the asking file's are all known and the first is
+  neither of the other two.
+- Both escapes there are load-bearing, and both are guarded.  A file under **no**
+  project is never rejected — shared IP outside every root is routine, and this is the
+  same reason `by_path_proximity()` ranks instead of filtering.  The **asking file's own
+  project** is always admitted, or clicking in the project that borrows another's module
+  returns results that omit the file under the cursor.  Per file, not per occurrence: a
+  shard that cannot see the declaration is skipped whole, and a path-prefix test in
+  front means a single-project session never consults the resolver at all.  Keyed per
+  file rather than per directory it cost 1.3 µs each on an 800-file project — a 3.4×
+  regression on a change that is supposed to be *removing* work.
+- Do not put the project in the `SymbolID`.  It is a session-dependent fact —
+  opening a split changes which projects share a file, while the file's bytes do not —
+  and shards are content-addressed, so it would either be stale on disk or re-key every
+  shared file on every project open.  clangd file-qualifies a USR only for
+  non-externally-visible declarations (`ShouldGenerateLocation`), i.e. by something
+  **intrinsic** to the declaration, and it can do that because it indexes after sema
+  with the binding already resolved.  Its `RefsRequest` carries no path filter at all.
 - Guarded by `./build/lazyverilog-tests "[module-proximity]"`, end to end through
-  AutoInst, go-to-definition, hover and Connect.  Each case asserts **both** directions,
-  because a first-match implementation answers both with the same project and would
-  otherwise pass for whichever file it happened to pick.  Aiming the guard at AutoInst
-  alone — the one feature that already called `find_module()` — is why four features
-  without the rule went unnoticed.
+  AutoInst, go-to-definition, hover, Connect, references, rename and semantic
+  compilation.  Each case asserts **both** directions, because a first-match
+  implementation answers both with the same project and would otherwise pass for
+  whichever file it happened to pick.  Aiming the guard at AutoInst alone — the one
+  feature that already called `find_module()` — is why four features without the rule
+  went unnoticed.
 - **A saved config rebuilds every known project, not just the one that changed**
   (`reload_all_projects()`).  Reloading only the saved config replaced the merged
   filelist with that project's own, which unindexed every other open project until
