@@ -82,7 +82,8 @@ bool ProjectRootResolver::directory_has_marker(const fs::path& directory) const 
     return found;
 }
 
-std::optional<ProjectInfo> ProjectRootResolver::project_info(const fs::path& file) const {
+std::optional<ProjectInfo> ProjectRootResolver::project_info(const fs::path& file,
+                                                             PathKind kind) const {
     fs::path forced;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -104,8 +105,17 @@ std::optional<ProjectInfo> ProjectRootResolver::project_info(const fs::path& fil
         return std::nullopt;
 
     auto absolute = normalize_filesystem_path(file);
-    std::error_code ec;
-    fs::path dir = fs::is_directory(absolute, ec) && !ec ? absolute : absolute.parent_path();
+    // Only when the caller does not already know.  The directory cache below
+    // cannot answer this -- it is keyed on directories and the question is
+    // about the path itself -- so it is an uncached stat on a path that is
+    // resolved once per request and once per parse.
+    fs::path dir;
+    if (kind == PathKind::File) {
+        dir = absolute.parent_path();
+    } else {
+        std::error_code ec;
+        dir = fs::is_directory(absolute, ec) && !ec ? absolute : absolute.parent_path();
+    }
 
     // Walk to the filesystem root.  parent_path() of a root path is itself,
     // which is the loop's only stop condition -- `dir.empty()` never becomes

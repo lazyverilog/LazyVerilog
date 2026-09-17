@@ -370,13 +370,38 @@ static std::optional<std::vector<ParamInfo>> module_params_from_snapshot(
     return module_params_from_module(it->second.shard->modules[it->second.module_index]);
 }
 
-static std::optional<std::vector<ParamInfo>> find_module_params(const Analyzer& analyzer,
+
+
+/// The cross-file layers, gathered once per request.
+///
+/// Each of these used to be fetched inside whichever helper needed it, and a
+/// single request reaches two or three of them: the method lookup and the
+/// package-subroutine lookup both run when the first misses, and the module
+/// parameter fallback runs after both.  `opened_file_index_shards()` builds a
+/// fresh vector every call -- a state pointer and a URI copy per open buffer,
+/// behind map_mutex_ -- so the merge was rebuilt two or three times to answer
+/// one keystroke's worth of signature help, which fires on every '(' and ','.
+///
+/// src/AGENTS.md states the rule directly: other-open-buffer dynamic indexes
+/// are request-path data, and handlers must not rebuild the same
+/// all-open-buffer merge for every request.
+struct CrossFileLayers {
+    std::shared_ptr<const std::vector<OpenIndexShard>> opened;
+    std::shared_ptr<const ProjectIndexSnapshot> project;
+
+    static CrossFileLayers gather(const Analyzer& analyzer, const std::string& current_uri) {
+        return CrossFileLayers{analyzer.opened_file_index_shards(current_uri),
+                               analyzer.project_index_snapshot()};
+    }
+};
+
+static std::optional<std::vector<ParamInfo>> find_module_params(const CrossFileLayers& layers,
                                                                 const SyntaxTree& current_tree,
                                                                 const std::string& name) {
     if (auto found = module_params_from_tree(current_tree, name))
         return found;
-    if (auto project = analyzer.project_index_snapshot())
-        return module_params_from_snapshot(*project, name);
+    if (layers.project)
+        return module_params_from_snapshot(*layers.project, name);
     return std::nullopt;
 }
 
@@ -548,18 +573,17 @@ static void collect_subroutine_from_shard(const SyntaxIndex& index, const std::s
     }
 }
 
-static std::optional<SubroutineInfo> find_subroutine_outside_document(const Analyzer& analyzer,
-                                                                      const std::string& uri,
-                                                                      const std::string& name) {
+static std::optional<SubroutineInfo> find_subroutine_outside_document(
+    const CrossFileLayers& layers, const std::string& name) {
     std::optional<SubroutineInfo> result;
     bool ambiguous = false;
-    if (auto opened = analyzer.opened_file_index_shards(uri)) {
-        for (const auto& shard : *opened) {
+    if (layers.opened) {
+        for (const auto& shard : *layers.opened) {
             if (shard.index)
                 collect_subroutine_from_shard(*shard.index, name, result, ambiguous);
         }
     }
-    if (auto project = analyzer.project_index_snapshot()) {
+    if (const auto& project = layers.project) {
         for (const auto& shard : project->shards) {
             if (shard.index)
                 collect_subroutine_from_shard(*shard.index, name, result, ambiguous);
@@ -635,19 +659,18 @@ static std::optional<SubroutineInfo> subroutine_at_index_declaration(const Synta
     return std::nullopt;
 }
 
-static std::optional<SubroutineInfo> find_method_outside_document(const Analyzer& analyzer,
-                                                                  const std::string& current_uri,
+static std::optional<SubroutineInfo> find_method_outside_document(const CrossFileLayers& layers,
                                                                   const std::string& uri, int line,
                                                                   int col) {
-    if (auto opened = analyzer.opened_file_index_shards(current_uri)) {
-        for (const auto& shard : *opened) {
+    if (layers.opened) {
+        for (const auto& shard : *layers.opened) {
             if (!shard.index)
                 continue;
             if (auto found = method_at_index_declaration(*shard.index, shard.uri, uri, line, col))
                 return found;
         }
     }
-    if (auto project = analyzer.project_index_snapshot()) {
+    if (const auto& project = layers.project) {
         // The declaring file's own shard holds it in the ordinary case; a
         // header's declarations live in the header's shard, which another
         // shard's file table still points at.
@@ -671,10 +694,9 @@ static std::optional<SubroutineInfo> find_method_outside_document(const Analyzer
 /// package/module subroutine rather than a class method.  The declaring shard is
 /// tried first so only one shard is scanned in the ordinary case.
 static std::optional<SubroutineInfo> find_subroutine_at_declaration_outside_document(
-    const Analyzer& analyzer, const std::string& current_uri, const std::string& uri, int line,
-    int col) {
-    if (auto opened = analyzer.opened_file_index_shards(current_uri)) {
-        for (const auto& shard : *opened) {
+    const CrossFileLayers& layers, const std::string& uri, int line, int col) {
+    if (layers.opened) {
+        for (const auto& shard : *layers.opened) {
             if (!shard.index)
                 continue;
             if (auto found =
@@ -682,7 +704,7 @@ static std::optional<SubroutineInfo> find_subroutine_at_declaration_outside_docu
                 return found;
         }
     }
-    if (auto project = analyzer.project_index_snapshot()) {
+    if (const auto& project = layers.project) {
         for (const auto& shard : project->shards) {
             if (!shard.index || shard.uri != uri)
                 continue;
@@ -753,7 +775,11 @@ static lsSignatureHelp make_help(const std::string& label, const std::vector<std
 
 std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
                                                       const lsTextDocumentPositionParams& params) {
-    auto state = analyzer.get_state(params.textDocument.uri.raw_uri_);
+    // Signature help fires on '(' and ',' -- from the same notification that
+    // started the reparse -- so `get_state()` is a text-only placeholder
+    // exactly when the user is typing the argument list this exists to
+    // describe.  See Analyzer::symbol_at().
+    auto state = analyzer.get_parsed_state(params.textDocument.uri.raw_uri_);
     if (!state || !state->tree)
         return std::nullopt;
 
@@ -779,8 +805,11 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
     if (!ctx)
         return std::nullopt;
 
+    // Once, here, rather than inside each helper below; see CrossFileLayers.
+    const auto layers = CrossFileLayers::gather(analyzer, params.textDocument.uri.raw_uri_);
+
     if (ctx->is_module_param) {
-        auto params_info = find_module_params(analyzer, *state->tree, ctx->name);
+        auto params_info = find_module_params(layers, *state->tree, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;
@@ -824,14 +853,14 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
                 if (auto other = analyzer.get_state(def->uri); other && other->tree)
                     subroutine = subroutine_at_declaration(*other->tree, def->line, def->col);
                 if (!subroutine)
-                    subroutine = find_method_outside_document(
-                        analyzer, params.textDocument.uri.raw_uri_, def->uri, def->line, def->col);
+                    subroutine =
+                        find_method_outside_document(layers, def->uri, def->line, def->col);
                 // `pkg::f(...)` where the package lives in a closed file: not a
                 // class method, so MethodEntry has nothing, but the shard's
                 // ValueEntry carries the formals.
                 if (!subroutine)
                     subroutine = find_subroutine_at_declaration_outside_document(
-                        analyzer, params.textDocument.uri.raw_uri_, def->uri, def->line, def->col);
+                        layers, def->uri, def->line, def->col);
             }
         }
         if (!subroutine)
@@ -843,12 +872,11 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
         // to look.  Hover and go-to-definition already resolve these; signature
         // help asking the same shards keeps the three consistent.
         if (!subroutine)
-            subroutine = find_subroutine_outside_document(
-                analyzer, params.textDocument.uri.raw_uri_, ctx->name);
+            subroutine = find_subroutine_outside_document(layers, ctx->name);
     }
 
     if (!subroutine) {
-        auto params_info = find_module_params(analyzer, *state->tree, ctx->name);
+        auto params_info = find_module_params(layers, *state->tree, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;

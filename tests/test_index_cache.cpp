@@ -589,7 +589,7 @@ class CacheProject {
         if (include_dirs.empty())
             include_dirs.push_back(root().string());
         analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_project_config(defines, include_dirs, paths, {},
+        analyzer.set_project_config(defines, include_dirs, paths,
                                     IndexCacheStorage::for_root(root()));
         analyzer.wait_for_background_index_idle();
         // Shard writes are deliberately off the indexing path, so a test that
@@ -1241,6 +1241,61 @@ TEST_CASE("index cache: shards from a previous format version are collected", "[
     project.index(analyzer, {"a.sv"});
     CHECK(project.shard_files() == 1);
     CHECK(!std::filesystem::exists(stale));
+}
+
+TEST_CASE("index cache: an incremental burst does not sweep the shard directory",
+          "[index-cache]") {
+    // The sweep reads the head of every shard in the directory and stats its
+    // source.  That is affordable once per full reindex, where the burst has
+    // walked every configured file and so knows which shards are referenced.
+    //
+    // An incremental burst does not.  Editing a shared header re-queues the
+    // files that `include it and bumps the generation -- on every keystroke --
+    // and the preload that follows carries those one or two paths and nothing
+    // else.  Sweeping against that "live" set opened and stat'ed every other
+    // shard in the project to decide what to do with it: measured at 302 shard
+    // opens per keystroke on a 301-shard project and 802 on an 801-shard one,
+    // on the indexing worker itself when the CPU slice leaves no room for the
+    // writer thread.
+    //
+    // Which shards those are is arbitrary, too -- the re-queued includer is
+    // whichever one the shard map happens to yield first -- so the set the
+    // sweep was told is live had no relation to the set that is.
+    //
+    // Asserted through the one thing a sweep and a non-sweep disagree about: an
+    // orphaned shard belonging to a file outside the edited header's fan-out
+    // survives the incremental burst, and the next full reindex collects it.
+    // That is the cost of the trade, stated outright -- disk space until the
+    // next reindex, never a shard that is served, because validating one hashes
+    // a file that is not there.
+    CacheProject project("analyzer-prune-incremental");
+    project.write("defs.svh", "`define W 8\n");
+    project.write("a.sv", "`include \"defs.svh\"\nmodule a;\n  logic [`W-1:0] sig_a;\nendmodule\n");
+    // Deliberately not an includer: it must not be what the header's fan-out
+    // re-queues, or it lands in the sweep's live set and proves nothing.
+    project.write("b.sv", "module b;\n  logic [7:0] sig_b;\nendmodule\n");
+
+    Analyzer analyzer;
+    project.index(analyzer, {"a.sv", "b.sv"});
+    const auto after_full = project.shard_files();
+    REQUIRE(after_full == 3); // a, b, and the header's own shard
+
+    // Gone from disk, so its shard is exactly what a sweep collects.
+    std::filesystem::remove(project.root() / "b.sv");
+
+    // An edit to the header, which is what fans out to its includers.
+    const auto header_uri = uri_from_path((project.root() / "defs.svh").string());
+    analyzer.open(header_uri, "`define W 8\n");
+    analyzer.change(header_uri, "`define W 16\n");
+    analyzer.wait_for_background_index_idle();
+    analyzer.wait_for_index_cache_writes_idle();
+
+    CHECK(project.shard_files() == after_full);
+
+    // The next burst that carries the whole filelist collects it.
+    Analyzer reindexed;
+    project.index(reindexed, {"a.sv"});
+    CHECK(project.shard_files() < after_full);
 }
 
 TEST_CASE("index cache: a file not written by this cache is left alone", "[index-cache]") {

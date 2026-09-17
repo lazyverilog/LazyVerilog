@@ -632,7 +632,8 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     // the editor's guessed root happened to name.
     if (!root_resolver_)
         return config_for_root({});
-    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
+                                             ProjectRootResolver::PathKind::File);
     return config_for_root(info ? info->source_root : std::filesystem::path{});
 }
 
@@ -662,7 +663,8 @@ LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) con
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     if (!root_resolver_)
         return false;
-    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
+                                             ProjectRootResolver::PathKind::File);
     if (!info)
         return false;
     if (!fold_project_root(info->source_root))
@@ -737,10 +739,16 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs,
                                         Analyzer::Reindex::Deferred);
 
-    // The filelist path of whichever project was folded last.  It only selects
-    // where a relative vcode path is resolved from, and every project that has
-    // one has already had its files folded in above.
-    project_vcode_path_ = resolve_vcode_path(source_root, config);
+    // Every filelist this project actually read, `-f` chain included.  The
+    // client is asked to watch `.f` and `.vf`, and without this there was
+    // nothing to compare a reported one against, so the report was dropped and
+    // the project went on indexing the list as it stood at launch.
+    //
+    // This replaces a `project_vcode_path_` that recorded the filelist of
+    // whichever project was folded last and was handed to the analyzer as
+    // `filelist_path`, where it was stored in a member nothing ever read.  One
+    // project's path could not answer this question anyway.
+    project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
 
     std::cerr << "[lazyverilog] project " << key << " (" << vcode.files.size() << " files)\n";
     return true;
@@ -748,8 +756,7 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
 
 void LazyVerilogServer::apply_project_inputs() {
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
-                                 project_vcode_path_, index_cache_storage(),
-                                 project_file_sizes_);
+                                 index_cache_storage_, project_file_sizes_);
     configure_background_compiler();
     schedule_background_compilation();
 }
@@ -765,7 +772,7 @@ void LazyVerilogServer::reload_all_projects() {
     project_include_dirs_.clear();
     project_files_.clear();
     project_file_sizes_.clear();
-    project_vcode_path_.clear();
+    project_filelists_.clear();
 
     // The session root first, so it keeps deciding `config_` and the eager
     // half, then every root discovered since.
@@ -794,7 +801,8 @@ void LazyVerilogServer::reload_all_projects() {
                                      const std::shared_ptr<const DocumentState>& doc) {
             if (!doc)
                 return;
-            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri)))
+            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri),
+                                                        ProjectRootResolver::PathKind::File))
                 open_roots.insert(info->source_root.string());
         });
         for (const auto& root : open_roots)
@@ -1132,15 +1140,25 @@ void LazyVerilogServer::register_handlers() {
                 // it no longer decides anything per file.
                 root_ = p;
 
+                // Which project the client's root is *in*, which is not always
+                // the directory it named: an editor launched in a subdirectory
+                // sends that subdirectory.  `config_` is read from there, and
+                // it decides `[compilation]` -- the one table that genuinely is
+                // session-wide -- so reading it from the spelling rather than
+                // from the project meant a background_compilation set in the
+                // config above was silently ignored.
+                std::optional<ProjectInfo> info;
+                if (root_resolver_)
+                    info = root_resolver_->project_info(root_);
+                const auto config_root = info ? info->source_root : root_;
+
                 std::string warn;
                 ConfigWarning warning_detail;
-                config_ = load_config(root_, &warn, &warning_detail);
+                config_ = load_config(config_root, &warn, &warning_detail);
 
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-
-                auto vcode = load_vcode(root_, config_);
 
                 // Seed the accumulators through the same fold every later
                 // project goes through, so the eager root and a discovered one
@@ -1152,19 +1170,26 @@ void LazyVerilogServer::register_handlers() {
                 // Only if the config really is here.  Recording a root that
                 // holds no lazyverilog.toml would suppress the discovery of the
                 // real one above it.
-                if (root_resolver_) {
-                    if (auto info = root_resolver_->project_info(root_))
-                        fold_project_root(info->source_root);
-                }
+                if (info)
+                    fold_project_root(info->source_root);
+
                 if (project_files_.empty()) {
                     // rootUri names a directory with no config above it.  There
-                    // is still a filelist to index -- load_vcode() found one --
-                    // and no root to attribute it to.
+                    // may still be a filelist to index, and no root to
+                    // attribute it to.
+                    //
+                    // Read only here.  fold_project_root() above reads the
+                    // filelist of the project it folds, so loading one
+                    // unconditionally parsed every `-f` in the tree twice on
+                    // every launch and stat'ed every entry twice with it --
+                    // load_vcode() takes one metadata call per file to order
+                    // the index queue.
+                    auto vcode            = load_vcode(root_, config_);
                     project_defines_      = config_.design.define;
                     project_include_dirs_ = vcode.include_dirs;
-                    project_files_        = vcode.files;
-                    project_file_sizes_   = vcode.file_sizes;
-                    project_vcode_path_   = resolve_vcode_path(root_, config_);
+                    project_files_        = std::move(vcode.files);
+                    project_file_sizes_   = std::move(vcode.file_sizes);
+                    project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
                 }
 
                 apply_project_inputs();
@@ -1256,6 +1281,16 @@ void LazyVerilogServer::register_handlers() {
             // ever report a change for.
             for (const auto ext : kWatchedSourceExtensions)
                 reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
+            // The config itself.  ProjectRootResolver's freshness windows say
+            // they are a backstop and that "the client's watcher fires
+            // invalidate()" for a config that appears or moves -- but no
+            // watcher asked for one, so nothing ever did.  A lazyverilog.toml
+            // written by a git checkout, a branch switch or a terminal reached
+            // the server only once one of its buffers was saved from an editor
+            // that sends didChangeConfiguration, and until then every file
+            // under it kept the config it was resolved with.
+            reg.registerOptions.watchers.push_back(
+                {"**/" + std::string(ProjectRootResolver::kMarker)});
             req.params.registrations = {std::move(reg)};
             (void)impl_->remote_endpoint.send(req);
         } catch (const std::exception& e) {
@@ -1360,14 +1395,46 @@ void LazyVerilogServer::register_handlers() {
             changed_uris.reserve(note.params.changes.size());
             deleted_uris.reserve(note.params.changes.size());
 
+            bool config_changed = false;
             for (const auto& change : note.params.changes) {
                 const auto& uri = change.uri.raw_uri_;
                 if (uri.empty())
                     continue;
+                // A config is not a source file: it decides which project every
+                // *other* file belongs to, so it cannot be handled by the
+                // per-file refresh below.  Creating one makes a project no
+                // recorded root names, and deleting one hands its files back to
+                // whatever is above.
+                const auto path = path_from_file_uri(uri);
+                if (std::filesystem::path(path).filename() == ProjectRootResolver::kMarker) {
+                    config_changed = true;
+                    continue;
+                }
+                // A filelist is not a source file either: it decides *which*
+                // files the project has.  `.f` and `.vf` are in the watcher
+                // globs, so the client has always reported these -- there was
+                // simply nothing that knew which paths were filelists, so the
+                // report fell through to the per-file refresh, which looked the
+                // path up as a project source, found nothing, and dropped it.
+                // A filelist rewritten by a branch switch or a generator was
+                // invisible for the rest of the session.
+                if (project_filelists_.contains(normalize_filesystem_path(path).string())) {
+                    config_changed = true;
+                    continue;
+                }
                 if (change.type == lsFileChangeType::Deleted)
                     deleted_uris.push_back(uri);
                 else
                     changed_uris.push_back(uri);
+            }
+
+            if (config_changed) {
+                // The same two steps didChangeConfiguration takes, and for the
+                // same reason: which file a config governs is the resolver's
+                // answer and the answer can now be different, and every known
+                // project is rebuilt rather than only the one that changed.
+                invalidate_config_cache();
+                reload_all_projects();
             }
 
             // Event-driven project-shard refresh.  This deliberately avoids
@@ -1473,8 +1540,38 @@ void LazyVerilogServer::register_handlers() {
                 // for.
                 const auto file_config = config_for(uri);
                 FormatOptions save_format = file_config->format;
-                if (file_config->autoarg.autoarg_on_save && state->tree) {
-                    auto results = autoarg_all_modules(*state);
+                // AutoArg needs a tree for *this* text, and format-on-save
+                // arrives from BufWritePre -- right behind the didChange that
+                // carried the last keystroke -- so `state` is routinely the
+                // text-only placeholder and `state->tree` is null.  Testing it
+                // there made AutoArg-on-save run or not run depending on
+                // whether the parse had landed, which the user experiences as
+                // it working intermittently.
+                //
+                // So wait for the parse, and check that what came back is a
+                // parse of the text being formatted.  It is not enough that it
+                // has a tree: get_parsed_state() falls back to the snapshot one
+                // keystroke old when the wait times out, and generating a port
+                // list from that would place edits at offsets this text does
+                // not have.  Formatting itself needs no tree and still runs on
+                // the current text either way, which is what happened before.
+                //
+                // A much longer wait than a keystroke-rate request takes.  The
+                // default 150 ms is sized for hover and signature help, where
+                // the user is typing and a late answer is worse than a slightly
+                // stale one; this is a save, the user is not typing, and the
+                // client is blocking on the reply anyway.  150 ms is also less
+                // than a 12k-line file's parse, which is exactly the size where
+                // AutoArg-on-save was dropping out.  Still bounded, so a file
+                // that never parses costs one formatting pass without AutoArg
+                // rather than the dispatch thread.
+                const auto parsed =
+                    analyzer_.get_parsed_state(uri, std::chrono::seconds(2));
+                const DocumentState* ast =
+                    parsed && parsed->tree && parsed->text == state->text ? parsed.get()
+                                                                          : nullptr;
+                if (file_config->autoarg.autoarg_on_save && ast) {
+                    auto results = autoarg_all_modules(*ast);
                     // apply back-to-front so earlier offsets stay valid
                     std::sort(results.begin(), results.end(),
                               [](const AutoargResult& a, const AutoargResult& b) {

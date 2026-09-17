@@ -64,15 +64,27 @@ class LazyVerilogServer {
     /// background index is, and the reason there used to be one -- a project
     /// that must not have a directory written into it -- is answered by where
     /// the shards go, not by whether they are written.
-    std::shared_ptr<IndexCacheStorage> index_cache_storage() const {
-        return std::make_shared<IndexCacheStorage>(root_resolver_);
-    }
-
     /// Decides which project any file belongs to, and therefore which config it
     /// is served with and where its shards live.  Shared with the storage the
     /// analyzer holds, so both answer from one cache of one walk.
     std::shared_ptr<ProjectRootResolver> root_resolver_ =
         std::make_shared<ProjectRootResolver>();
+
+    /// One storage for the session, not one per call.
+    ///
+    /// This used to be an accessor that built a fresh `IndexCacheStorage` on
+    /// every invocation, and `apply_project_inputs()` calls it on initialize,
+    /// on every didOpen that discovers a project, and on every config reload.
+    /// Each new instance started with an empty per-root cache, so the next file
+    /// to land in a project re-ran `IndexCache::open()` for it --
+    /// `create_directories`, `is_directory`, and an `exists` for the
+    /// `.gitignore` -- for a directory that was opened moments earlier.
+    ///
+    /// Nothing wanted that.  The storage's only input is the resolver, which
+    /// lives as long as the server, and its entries are keyed on the resolved
+    /// root, so a project that appears or moves simply adds one.
+    std::shared_ptr<IndexCacheStorage> index_cache_storage_ =
+        std::make_shared<IndexCacheStorage>(root_resolver_);
 
     /// The config governing @p uri: the nearest lazyverilog.toml above it, or
     /// built-in defaults when there is none.
@@ -140,15 +152,10 @@ class LazyVerilogServer {
     std::vector<std::string> project_include_dirs_;
     std::vector<std::string> project_files_;
     std::vector<uintmax_t> project_file_sizes_;
-    /// Where a relative filelist path is resolved from, set by the last project
-    /// folded in.  Only projects that configure one are affected by it.
-    ///
-    /// A string, because that is what produces it (resolve_vcode_path) and what
-    /// consumes it (Analyzer::set_project_config).  Holding a filesystem::path
-    /// in between only compiled on POSIX: path::string_type is std::string
-    /// there, so the implicit conversion existed, and on Windows it is
-    /// std::wstring and there is none.
-    std::string project_vcode_path_;
+    /// Every filelist read while folding the projects above, `-f` chains
+    /// included, as normalized absolute paths.  What
+    /// workspace/didChangeWatchedFiles compares a reported `.f` against.
+    std::set<std::string> project_filelists_;
 
     mutable std::mutex config_cache_mutex_;
     /// Keyed by project root; the empty key is "no project", served defaults.
