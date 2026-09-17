@@ -5053,7 +5053,8 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     return result;
 }
 
-std::optional<Location>Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
+std::optional<Location>
+Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
                               std::span<const ExtraFileInfo> extra_files,
                               const std::string* skip_extra_uri) const {
     if (!state.tree)
@@ -5082,6 +5083,38 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
     // about which project a name belongs to.
     const auto ranked = by_path_proximity(extra_files, std::string_view(state.normalized_path));
 
+    // The two shapes every recovery below is written in.  They are here because
+    // the order is the part that has to be right, and a scan that spells its own
+    // loop is a scan that can be written without the order -- which is how the
+    // defect above came to be in nine places at once, and how two of them came
+    // to be byte-identical copies of each other.
+    //
+    // `probe` decides what counts as an answer; the search is not its business.
+    // Both stop at the first candidate that answers, which is what makes the
+    // ordering the whole disambiguation.
+    const auto nearest_shard_answer = [&](auto&& probe) {
+        decltype(probe(std::declval<const ExtraFileInfo&>())) found{};
+        for (const auto* extra : ranked) {
+            if (skip_extra(extra))
+                continue;
+            if ((found = probe(*extra)))
+                break;
+        }
+        return found;
+    };
+
+    // Macros and subroutine arguments are preprocessor- and body-level facts
+    // that the compact shards do not carry, so these answer from live syntax
+    // trees and therefore see open buffers only.
+    const auto nearest_open_buffer_answer = [&](auto&& probe) {
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            using Result = decltype(probe(*extra.state->tree, extra.uri));
+            if (!extra.state || !extra.state->tree)
+                return Result{};
+            return probe(*extra.state->tree, extra.uri);
+        });
+    };
+
     auto target = definition_target_at(*state.tree, uri, line, col);
 
     if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
@@ -5092,59 +5125,34 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
 
         if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
             return loc;
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra->state || !extra->state->tree)
-                continue;
-            if (auto loc = find_macro_definition(*extra->state->tree, extra->uri, ident->text))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_macro_definition(tree, tree_uri, ident->text);
+            });
     }
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto loc = find_macro_definition(*state.tree, uri, target.name))
             return loc;
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra->state || !extra->state->tree)
-                continue;
-            if (auto loc = find_macro_definition(*extra->state->tree, extra->uri, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_macro_definition(tree, tree_uri, target.name);
+            });
     }
 
-    if (target.kind == DefinitionTargetKind::NamedPort) {
+    // One branch for both.  `.name(...)` at an instantiation is spelled the same
+    // way whether it connects a port or overrides a parameter, and either way
+    // the declaration it resolves to lives in the instantiated module's header,
+    // which find_port_definition() covers.  These were two identical copies.
+    if (target.kind == DefinitionTargetKind::NamedPort ||
+        target.kind == DefinitionTargetKind::NamedParameter) {
         if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
                                                     target.name))
             return loc;
-
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc =
-                    find_port_definition(extra->index_ref(), extra->uri, target.module_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
-    }
-
-    if (target.kind == DefinitionTargetKind::NamedParameter) {
-        if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
-                                                    target.name))
-            return loc;
-
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc =
-                    find_port_definition(extra->index_ref(), extra->uri, target.module_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            return find_port_definition(extra.index_ref(), extra.uri, target.module_name,
+                                        target.name);
+        });
     }
 
     if (target.kind == DefinitionTargetKind::NamedArgument) {
@@ -5152,28 +5160,19 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
                                                            target.name))
             return loc;
 
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra->state || !extra->state->tree)
-                continue;
-            if (auto loc = find_subroutine_argument_definition(*extra->state->tree, extra->uri,
-                                                               target.subroutine_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_subroutine_argument_definition(tree, tree_uri,
+                                                           target.subroutine_name, target.name);
+            });
     }
 
     if (target.kind == DefinitionTargetKind::Instance) {
         if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
             return loc;
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc = find_module_definition(extra->index_ref(), extra->uri, target.module_name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            return find_module_definition(extra.index_ref(), extra.uri, target.module_name);
+        });
     }
 
     const int use_line_one_based = line + 1;
@@ -5199,13 +5198,11 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
         if (!target.qualifier_scope.empty()) {
             auto aliased =
                 scoped_typedef_base_type(current_index, target.qualifier_scope, qualifier);
-            for (const auto* extra : ranked) {
-                if (aliased)
-                    break;
-                if (skip_extra(extra))
-                    continue;
-                aliased =
-                    scoped_typedef_base_type(extra->index_ref(), target.qualifier_scope, qualifier);
+            if (!aliased) {
+                aliased = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope,
+                                                    qualifier);
+                });
             }
             if (aliased)
                 qualifier = *aliased;
@@ -5213,13 +5210,10 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
 
         if (auto loc = find_package_member(current_index, uri, qualifier, target.name))
             return loc;
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc = find_package_member(extra->index_ref(), extra->uri, qualifier,
-                                                target.name))
-                return loc;
-        }
+        if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                return find_package_member(extra.index_ref(), extra.uri, qualifier, target.name);
+            }))
+            return loc;
 
         // The qualifier may name a class rather than a package: `my_item::type_id`,
         // `my_class::static_method`.  Resolve inside that class only — this is
@@ -5306,13 +5300,9 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
             while (type && visited.insert(*type).second) {
                 auto next = typedef_alias_target(current_index, *type);
                 if (!next) {
-                    for (const auto* extra : ranked) {
-                        if (skip_extra(extra))
-                            continue;
-                        next = typedef_alias_target(extra->index_ref(), *type);
-                        if (next)
-                            break;
-                    }
+                    next = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                        return typedef_alias_target(extra.index_ref(), *type);
+                    });
                 }
                 if (!next)
                     break;
@@ -5352,13 +5342,11 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
-            for (const auto* extra : ranked) {
-                if (skip_extra(extra))
-                    continue;
-                if (auto loc = find_typedef_field_definition(extra->index_ref(), extra->uri,
-                                                             *class_type, target.name))
-                    return loc;
-            }
+            if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return find_typedef_field_definition(extra.index_ref(), extra.uri, *class_type,
+                                                         target.name);
+                }))
+                return loc;
         }
 
         // Interface ports.  `AXI_BUS.Slave bus;` then `bus.aw_valid` — the
@@ -5383,13 +5371,11 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
             if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
                                                             target.name))
                 return loc;
-            for (const auto* extra : ranked) {
-                if (skip_extra(extra))
-                    continue;
-                if (auto loc = find_interface_member_definition(extra->index_ref(), extra->uri,
-                                                                interface_name, target.name))
-                    return loc;
-            }
+            if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return find_interface_member_definition(extra.index_ref(), extra.uri,
+                                                            interface_name, target.name);
+                }))
+                return loc;
         }
 
         // `gen_stall_mem.rf_rd_a_hz` — the receiver is a generate block label,
@@ -5480,16 +5466,12 @@ std::optional<Location>Analyzer::definition_of_state(const DocumentState& state,
             return loc;
     }
 
-    for (const auto* extra : ranked) {
-        if (skip_extra(extra))
-            continue;
-        if (auto loc = find_generic_definition_from_index(extra->index_ref(), extra->uri, target.name,
-                                                          target.scope_module, target.scope_package,
-                                                          visible_imports, use_line_one_based))
-            return loc;
-    }
-
-    return std::nullopt;}
+    return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+        return find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
+                                                  target.scope_module, target.scope_package,
+                                                  visible_imports, use_line_one_based);
+    });
+}
 
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
                                                 bool include_declaration) const {
