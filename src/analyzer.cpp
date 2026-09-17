@@ -6109,12 +6109,93 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         };
 
     std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         open_states.reserve(docs_.size());
         for (const auto& [state_uri, state] : docs_)
             open_states.emplace_back(state_uri, state);
+        // A pointer copy, resolved outside the lock.  project_root_for() walks
+        // up to the nearest config and stats directories on the way, which is a
+        // round trip per level on a shared filesystem; every other parse-input
+        // lookup takes the pointer under the lock for the same reason.
+        parse_inputs = parse_inputs_;
     }
+
+    // Which project a file belongs to, memoized by *directory* for the length of
+    // this request.
+    //
+    // Answered by the resolver that already decides the file's config and its
+    // shard directory, never by a second walk: a third notion of "which project
+    // is this file in" is how the features came to disagree about it before.
+    //
+    // Keyed on the containing directory because that is the question the
+    // resolver actually answers -- it caches per directory, and a project's
+    // files come in directories of tens or hundreds.  Keyed per file this cost
+    // 1.3us each on an 800-file project, which is a linear term next to a scan
+    // this is supposed to be cutting work out of.
+    // The key is owned rather than a view into the caller's path: one string per
+    // distinct directory is nothing next to the scan, and a view would tie the
+    // memo's correctness to every caller having passed a string that outlives
+    // the request.
+    std::unordered_map<std::string, std::string> project_root_by_dir;
+    const auto project_of = [&](const std::string& path) {
+        const auto slash = path.find_last_of("/\\");
+        const std::string dir = slash == std::string::npos ? std::string{} : path.substr(0, slash);
+        if (auto it = project_root_by_dir.find(dir); it != project_root_by_dir.end())
+            return it->second;
+        std::string root;
+        if (parse_inputs)
+            root = parse_inputs->project_root_for(std::filesystem::path(path)).string();
+        project_root_by_dir.emplace(dir, root);
+        return root;
+    };
+
+    const std::string declaration_path =
+        normalize_filesystem_path(path_from_file_uri(target_def->uri)).string();
+    const std::string declaration_project = project_of(declaration_path);
+    const std::string asking_project = project_of(state->normalized_path);
+
+    // Whether an occurrence *written in* @p path can mean the declaration we
+    // resolved.
+    //
+    // A SymbolID is `module::fifo` with no project in it, because the shard
+    // indexer is syntactic and cannot know which file declares the `fifo` a use
+    // site means -- that binding is what the union snapshot decides at request
+    // time.  So two projects that both declare `fifo` share one SymbolID, and
+    // the scans below would report, and rename would rewrite, the other
+    // project's declaration.
+    //
+    // This rejects only what it can prove: all three projects known, and the
+    // occurrence's is neither the declaration's nor the asking file's.  Both
+    // escapes matter.  A file under no project -- shared IP outside every root,
+    // routine in hardware -- is never rejected, so a union index keeps answering
+    // where a split one would go silent.  And the asking file's own project is
+    // always admitted, or clicking in the project that *borrows* a module would
+    // return results that omit the file under the cursor.
+    //
+    // Per file, not per occurrence: the answer is the same for every reference
+    // in a shard, so a shard that cannot see the declaration is skipped whole.
+    //
+    // The prefix test in front is not an optimization detail: in a single-project
+    // session every file is under the one root, so it answers without consulting
+    // the resolver at all and this whole rule costs two string compares per file.
+    // It can only ever *admit*, which is the safe direction -- a nested project
+    // inside one of these roots is admitted by its parent's prefix rather than
+    // rejected on its own account, the same answer this gave before the rule
+    // existed.
+    const auto under = [](const std::string& path, const std::string& root) {
+        return path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+               (path[root.size()] == '/' || path[root.size()] == '\\');
+    };
+    const auto file_can_mean_target = [&](const std::string& path) {
+        if (declaration_project.empty() || asking_project.empty())
+            return true;
+        if (under(path, declaration_project) || under(path, asking_project))
+            return true;
+        const std::string project = project_of(path);
+        return project.empty() || project == declaration_project || project == asking_project;
+    };
 
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> open_state_by_uri;
     std::unordered_set<std::string> open_uris;
@@ -6175,7 +6256,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (!state || !state->tree)
             continue;
 
-        if (target_symbol_id) {
+        // The SymbolID scan only.  visit_tree() below resolves every candidate
+        // token through definition_of_state() and keeps it only when it lands on
+        // this very declaration, so it already answers per project and needs no
+        // help deciding.
+        if (target_symbol_id && file_can_mean_target(state->normalized_path)) {
             // For owner-qualified symbols (module / port / parameter), use the
             // same compact occurrence representation for open files that closed
             // project files use.  This is important for cross-file open buffers:
@@ -6205,20 +6290,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
-            if ((target_info.kind == DefinitionTargetKind::ClassMember &&
-                 target_symbol_debug.starts_with("class_method::")) ||
-                target_symbol_debug.starts_with("class_field::"))
-                // A class field is written both bare inside the class body and
-                // as `handle.field` elsewhere.  Only the first form carries the
-                // scoped `class_field::` identity in a shard: the second is
-                // indexed as an unresolved name, because the shard cannot type
-                // the receiver.  Verifying candidate tokens against the
-                // declaration recovers those uses without widening the
-                // SymbolID match to every same-named symbol in the project.
-                visit_tree(*state->tree, state_uri, resolve_snapshot);
-        } else {
-            visit_tree(*state->tree, state_uri, resolve_snapshot);
         }
+
+        if (!target_symbol_id ||
+            (target_info.kind == DefinitionTargetKind::ClassMember &&
+             target_symbol_debug.starts_with("class_method::")) ||
+            target_symbol_debug.starts_with("class_field::"))
+            // A class field is written both bare inside the class body and as
+            // `handle.field` elsewhere.  Only the first form carries the scoped
+            // `class_field::` identity in a shard: the second is indexed as an
+            // unresolved name, because the shard cannot type the receiver.
+            // Verifying candidate tokens against the declaration recovers those
+            // uses without widening the SymbolID match to every same-named
+            // symbol in the project.
+            visit_tree(*state->tree, state_uri, resolve_snapshot);
     }
 
     // Closed project files are represented by compact reference-occurrence
@@ -6228,6 +6313,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             continue;
         if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
             !import_bridge_name_id && !scoped_member_alias_id)
+            continue;
+        // Whole shard, before its references are scanned at all: every
+        // occurrence in it was written in the same file and gets the same
+        // answer.
+        if (!file_can_mean_target(extra.path))
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -7607,6 +7697,9 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // here -- it compiles one TU at a time, each with its own command.
     snapshot.defines = parse_inputs_->defaults().defines;
     snapshot.include_dirs = parse_inputs_->defaults().include_dirs;
+    // Which project each file belongs to is resolved by the compiler, off this
+    // lock; see CompilationSnapshot::parse_inputs.
+    snapshot.parse_inputs = parse_inputs_;
 
     std::unordered_set<std::string> seen_uris;
     std::unordered_set<std::string> seen_paths;

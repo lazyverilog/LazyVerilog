@@ -318,7 +318,77 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     bag.set(std::move(preprocessor_options));
     bag.set(std::move(compilation_options));
 
+    // One slang source library per project.
+    //
+    // This is a single Compilation over every open project's files -- semantic
+    // compilation cannot be per file, because it has one preprocessor for all
+    // of it -- and SystemVerilog's module namespace is flat and global.  Two
+    // projects that both declare `fifo` are therefore a redefinition to slang:
+    // it says so and keeps one of them, and the other project's semantic
+    // diagnostics disappear along with its definition -- measured, not feared;
+    // see the `[module-proximity]` compilation case.
+    //
+    // Libraries are the language's own answer, and slang implements it: a name
+    // declared in two libraries is legal and kept in priority order, and only a
+    // duplicate *within* one library is reported (Compilation::createDefinition).
+    //
+    // `isDefault` is set on every one of them, which is not the flag's usual
+    // sense and is load-bearing.  slang skips library definitions when it picks
+    // what to elaborate -- "Library definitions are never automatically
+    // instantiated in any capacity" -- so naming a library without this would
+    // leave a multi-project session with no top-level modules and therefore no
+    // semantic diagnostics at all, which is a far worse answer than the warning
+    // this removes.
+    //
+    // Priority follows sorted root order, not the order files arrive in: the
+    // snapshot's open buffers come out of a hash map, and priority is what
+    // decides which definition a lookup takes, so seeding it from iteration
+    // order would let one session disagree with the next about which `fifo` a
+    // diagnostic is about.
+    //
+    // Below two projects nothing is assigned at all.  A lone project's files go
+    // into slang's own default library exactly as they did before, so the
+    // overwhelmingly common session is bit-for-bit unchanged.
+    //
+    // Declared *before* the Compilation, and that order is load-bearing: locals
+    // are destroyed in reverse, and the Compilation holds pointers into these
+    // for its whole life, its destructor included.
+    std::unordered_map<std::string, const slang::SourceLibrary*> library_by_path;
+    std::vector<std::unique_ptr<slang::SourceLibrary>> libraries;
+    if (snapshot.parse_inputs) {
+        std::unordered_map<std::string, std::string> root_by_path;
+        std::vector<std::string> roots;
+        for (const auto& file : snapshot.files) {
+            auto root = snapshot.parse_inputs->project_root_for(file.path).string();
+            if (root.empty())
+                continue;
+            if (std::find(roots.begin(), roots.end(), root) == roots.end())
+                roots.push_back(root);
+            // Keyed the way the parse loop below spells the same file, so a
+            // path that arrives unnormalized cannot silently miss its library.
+            root_by_path.emplace(normalize_filesystem_path(file.path).string(), std::move(root));
+        }
+
+        if (roots.size() > 1) {
+            std::sort(roots.begin(), roots.end());
+            std::unordered_map<std::string, const slang::SourceLibrary*> library_by_root;
+            libraries.reserve(roots.size());
+            for (size_t i = 0; i < roots.size(); ++i) {
+                auto library =
+                    std::make_unique<slang::SourceLibrary>(std::string(roots[i]),
+                                                           static_cast<int>(i));
+                library->isDefault = true;
+                library_by_root.emplace(roots[i], library.get());
+                libraries.push_back(std::move(library));
+            }
+            for (const auto& [path, root] : root_by_path)
+                library_by_path.emplace(path, library_by_root.at(root));
+        }
+    }
+
+
     slang::ast::Compilation compilation(bag);
+
     std::string first_uri;
     std::unordered_set<std::string> assigned_paths;
     size_t scanned_buffer_count = 0;
@@ -351,9 +421,11 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
             first_uri = file.uri;
 
         try {
-            auto tree = slang::syntax::SyntaxTree::fromText(std::string_view(text), *source_manager,
-                                                            std::string_view(file.uri),
-                                                            std::string_view(file.path), bag);
+            const auto library_it = library_by_path.find(normalized_path);
+            auto tree = slang::syntax::SyntaxTree::fromText(
+                std::string_view(text), *source_manager, std::string_view(file.uri),
+                std::string_view(file.path), bag,
+                library_it == library_by_path.end() ? nullptr : library_it->second);
             compilation.addSyntaxTree(std::move(tree));
             add_new_assigned_paths();
         } catch (const std::exception& e) {

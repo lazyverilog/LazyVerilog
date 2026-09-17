@@ -387,6 +387,16 @@ struct CompilationSnapshot {
     std::vector<std::string> include_dirs;
     std::vector<std::string> open_uris;
     std::unordered_map<std::string, uint64_t> uri_versions;
+    /// Which project each of `files` belongs to, answered by the compiler
+    /// rather than here.
+    ///
+    /// A pointer copy, deliberately: the snapshot is built under map_mutex_ and
+    /// resolving a project walks up to the nearest config, statting each
+    /// directory on the way.  Doing that per file inside the critical section
+    /// would put a filesystem walk per filelist entry on the lock every request
+    /// handler contends for.  The compiler runs on its own thread with nothing
+    /// waiting on it, and ProjectParseInputs is immutable once published.
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
 };
 
 struct RtlTreeNode {
