@@ -366,6 +366,18 @@ TEST_CASE("the project cache is gitignored and the fallback is not",
 
 namespace {
 
+/// The spelling the index stores for @p path.
+///
+/// A shard's path is normalized -- weakly_canonical, native separators -- and a
+/// path built by appending "chip_a/rtl/fifo.sv" is not: on Windows those
+/// forward slashes survive into the spelling, while the analyzer's copy has
+/// backslashes.  Comparing the raw spelling passed on POSIX, where the two
+/// happen to agree, and failed on Windows for a reason that has nothing to do
+/// with what is being tested.
+std::string indexed_path(const fs::path& path) {
+    return normalize_filesystem_path(path).string();
+}
+
 /// Module names the project index holds, across every shard.
 std::set<std::string> indexed_module_names(const Analyzer& analyzer) {
     std::set<std::string> names;
@@ -534,12 +546,14 @@ TEST_CASE("a name two projects declare resolves toward the asking file",
     auto snapshot = analyzer.project_index_snapshot();
     REQUIRE(snapshot);
 
-    const auto* from_a = snapshot->find_module("fifo", (tree.root / "chip_a/rtl/top.sv").string());
-    const auto* from_b = snapshot->find_module("fifo", (tree.root / "chip_b/rtl/top.sv").string());
+    // Normalized, because that is what a real caller passes: every feature
+    // hands find_module() the querying document's normalized_path.
+    const auto* from_a = snapshot->find_module("fifo", indexed_path(tree.root / "chip_a/rtl/top.sv"));
+    const auto* from_b = snapshot->find_module("fifo", indexed_path(tree.root / "chip_b/rtl/top.sv"));
     REQUIRE(from_a);
     REQUIRE(from_b);
-    CHECK(snapshot->module_path(*from_a) == a.string());
-    CHECK(snapshot->module_path(*from_b) == b.string());
+    CHECK(snapshot->module_path(*from_a) == indexed_path(a));
+    CHECK(snapshot->module_path(*from_b) == indexed_path(b));
 }
 
 TEST_CASE("a module only the other project declares is still found",
@@ -564,14 +578,14 @@ TEST_CASE("a module only the other project declares is still found",
     auto snapshot = analyzer.project_index_snapshot();
     REQUIRE(snapshot);
 
-    const std::string asking = (tree.root / "chip_a/rtl/top.sv").string();
+    const std::string asking = indexed_path(tree.root / "chip_a/rtl/top.sv");
     const auto* crossed = snapshot->find_module("only_in_b", asking);
     REQUIRE(crossed);
-    CHECK(snapshot->module_path(*crossed) == only_b.string());
+    CHECK(snapshot->module_path(*crossed) == indexed_path(only_b));
 
     const auto* ip = snapshot->find_module("sync_2ff", asking);
     REQUIRE(ip);
-    CHECK(snapshot->module_path(*ip) == shared.string());
+    CHECK(snapshot->module_path(*ip) == indexed_path(shared));
 
     CHECK(snapshot->find_module("no_such_module", asking) == nullptr);
 }
