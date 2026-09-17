@@ -737,10 +737,16 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs,
                                         Analyzer::Reindex::Deferred);
 
-    // The filelist path of whichever project was folded last.  It only selects
-    // where a relative vcode path is resolved from, and every project that has
-    // one has already had its files folded in above.
-    project_vcode_path_ = resolve_vcode_path(source_root, config);
+    // Every filelist this project actually read, `-f` chain included.  The
+    // client is asked to watch `.f` and `.vf`, and without this there was
+    // nothing to compare a reported one against, so the report was dropped and
+    // the project went on indexing the list as it stood at launch.
+    //
+    // This replaces a `project_vcode_path_` that recorded the filelist of
+    // whichever project was folded last and was handed to the analyzer as
+    // `filelist_path`, where it was stored in a member nothing ever read.  One
+    // project's path could not answer this question anyway.
+    project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
 
     std::cerr << "[lazyverilog] project " << key << " (" << vcode.files.size() << " files)\n";
     return true;
@@ -748,8 +754,7 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
 
 void LazyVerilogServer::apply_project_inputs() {
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
-                                 project_vcode_path_, index_cache_storage(),
-                                 project_file_sizes_);
+                                 index_cache_storage(), project_file_sizes_);
     configure_background_compiler();
     schedule_background_compilation();
 }
@@ -765,7 +770,7 @@ void LazyVerilogServer::reload_all_projects() {
     project_include_dirs_.clear();
     project_files_.clear();
     project_file_sizes_.clear();
-    project_vcode_path_.clear();
+    project_filelists_.clear();
 
     // The session root first, so it keeps deciding `config_` and the eager
     // half, then every root discovered since.
@@ -1181,7 +1186,7 @@ void LazyVerilogServer::register_handlers() {
                     project_include_dirs_ = vcode.include_dirs;
                     project_files_        = std::move(vcode.files);
                     project_file_sizes_   = std::move(vcode.file_sizes);
-                    project_vcode_path_   = resolve_vcode_path(root_, config_);
+                    project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
                 }
 
                 apply_project_inputs();
@@ -1397,8 +1402,20 @@ void LazyVerilogServer::register_handlers() {
                 // per-file refresh below.  Creating one makes a project no
                 // recorded root names, and deleting one hands its files back to
                 // whatever is above.
-                if (std::filesystem::path(path_from_file_uri(uri)).filename() ==
-                    ProjectRootResolver::kMarker) {
+                const auto path = path_from_file_uri(uri);
+                if (std::filesystem::path(path).filename() == ProjectRootResolver::kMarker) {
+                    config_changed = true;
+                    continue;
+                }
+                // A filelist is not a source file either: it decides *which*
+                // files the project has.  `.f` and `.vf` are in the watcher
+                // globs, so the client has always reported these -- there was
+                // simply nothing that knew which paths were filelists, so the
+                // report fell through to the per-file refresh, which looked the
+                // path up as a project source, found nothing, and dropped it.
+                // A filelist rewritten by a branch switch or a generator was
+                // invisible for the rest of the session.
+                if (project_filelists_.contains(normalize_filesystem_path(path).string())) {
                     config_changed = true;
                     continue;
                 }
