@@ -6278,7 +6278,7 @@ void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
     // reason: a cached snapshot built under different inputs is wrong, not
     // stale.  Invalidating is cheap and is done either way; only the burst it
     // would start is what a batching caller defers.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (reindex == Reindex::Now && !extra_files_.empty())
@@ -6292,7 +6292,7 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     inputs.config_digest = IndexCache::config_digest(inputs.defines, inputs.include_dir_paths);
     replace_default_parse_inputs_locked(std::move(inputs));
     // Invalidate extra-file cache so reopened files pick up the new defines.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (!extra_files_.empty())
@@ -6307,7 +6307,7 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
     // UVM include directory would not be visible until the next source edit.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (!extra_files_.empty())
@@ -6402,7 +6402,7 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     extra_file_set_.reserve(extra_files_.size());
     for (const auto& path : extra_files_)
         extra_file_set_.insert(path);
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
 
@@ -6460,7 +6460,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // shard keyed on only one of them would be served after the other moved.
     index_cache_storage_ = std::move(cache_storage);
 
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
 
@@ -7174,11 +7174,11 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         // parse path: never let a cached shard replace one.
         if (const auto doc = docs_.find(hit.uri); doc != docs_.end() && doc->second)
             continue;
-        extra_cache_[hit.uri] = ExtraFileCacheEntry{
-            .path = hit.path,
-            .uri = hit.uri,
-            .index = hit.index,
-        };
+        put_extra_cache_locked(hit.uri, ExtraFileCacheEntry{
+                                             .path = hit.path,
+                                             .uri = hit.uri,
+                                             .index = hit.index,
+                                         });
         for (auto& [header_uri, header_index, stands_alone] : hit.headers) {
             // Claimed as well as committed.  The claim is what stops a worker
             // that parses some other includer from rebuilding a header this
@@ -7258,7 +7258,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     for (const auto& path : deleted_paths) {
         if (path.empty() || !extra_file_set_.contains(path))
             continue;
-        extra_cache_.erase(uri_from_path(path));
+        erase_extra_cache_locked(uri_from_path(path));
         invalidate_extra_snapshots_locked();
         removed_deleted_file = true;
     }
@@ -7294,15 +7294,18 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
 
         // Nothing queues a header directly.  Re-queue the files that `include`
         // it instead; the first one to commit re-claims the header and rebuilds
-        // its shard from that file's fresh tree.
-        for (const auto& [entry_uri, entry] : extra_cache_) {
-            if (!entry.index)
-                continue;
-            const auto& deps = entry.index->include_dependencies;
-            if (std::find(deps.begin(), deps.end(), header_uri) == deps.end())
-                continue;
-            queue_background_file_locked(entry.path, /*front=*/true);
-            queued_changed_file = true;
+        // its shard from that file's fresh tree.  By lookup rather than by
+        // walking every shard's dependency list, which cost a full pass over
+        // the project per changed header.
+        const auto includers = extra_cache_includers_.find(header_uri);
+        if (includers != extra_cache_includers_.end()) {
+            for (const auto& includer_uri : includers->second) {
+                const auto entry = extra_cache_.find(includer_uri);
+                if (entry == extra_cache_.end())
+                    continue;
+                queue_background_file_locked(entry->second.path, /*front=*/true);
+                queued_changed_file = true;
+            }
         }
     }
 
@@ -7865,19 +7868,36 @@ bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {
     // in place until the new one commits, so the project index never has a gap.
     background_header_claims_.erase(uri);
     standalone_header_uris_.erase(uri);
-    for (const auto& [extra_uri, entry] : extra_cache_) {
-        // Test the shard's dependency list in place.  Offering a
-        // `std::vector<std::string>{}` fallback made the conditional expression
-        // a prvalue, so every shard's list was deep-copied on every edit, under
-        // map_mutex_.
-        if (docs_.contains(extra_uri) || !entry.index)
-            continue;
-        const auto& deps = entry.index->include_dependencies;
-        if (std::find(deps.begin(), deps.end(), uri) == deps.end())
-            continue;
-        queue_background_file_locked(entry.path, /*front=*/true);
-        queued = true;
-        break;
+
+    // Straight to the shards that include this file.  This used to walk every
+    // shard in the project and compare against each one's dependency list, on
+    // *every* didChange and under the lock every request handler and index
+    // worker contends for -- so an ordinary .sv file, which nothing includes,
+    // paid a full scan per keystroke to be told so.  extra_cache_includers_ is
+    // maintained alongside extra_cache_ and answers the same question by
+    // lookup.
+    const auto includers = extra_cache_includers_.find(uri);
+    if (includers != extra_cache_includers_.end()) {
+        // The smallest path among them, not whichever the set yields first.
+        // Only one closed includer is re-queued, and which one decides which
+        // shard carries this header's declarations afterwards -- so leaving it
+        // to hash order makes the project index differ between two runs over an
+        // identical tree.  One pass over the includers of this one header, not
+        // over the project.
+        const ExtraFileCacheEntry* chosen = nullptr;
+        for (const auto& includer_uri : includers->second) {
+            if (docs_.contains(includer_uri))
+                continue;
+            const auto entry = extra_cache_.find(includer_uri);
+            if (entry == extra_cache_.end())
+                continue;
+            if (!chosen || entry->second.path < chosen->path)
+                chosen = &entry->second;
+        }
+        if (chosen) {
+            queue_background_file_locked(chosen->path, /*front=*/true);
+            queued = true;
+        }
     }
     return queued;
 }
@@ -8184,11 +8204,13 @@ void Analyzer::background_index_loop() const {
                         docs_[uri] = reparsed_live_doc;
                         invalidate_extra_snapshots_locked();
                         if (extra_file_set_.contains(path_string)) {
-                            extra_cache_[uri] = ExtraFileCacheEntry{
-                                .path = path_string,
-                                .uri = uri,
-                                .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
-                            };
+                            put_extra_cache_locked(
+                                uri, ExtraFileCacheEntry{
+                                         .path = path_string,
+                                         .uri = uri,
+                                         .index = std::make_shared<SyntaxIndex>(
+                                             std::move(live_index)),
+                                     });
                             invalidate_extra_snapshots_locked();
                             schedule_background_project_publish_locked();
                         }
@@ -8286,11 +8308,11 @@ void Analyzer::background_index_loop() const {
                 return doc != docs_.end() && doc->second;
             }();
             if (!opened_mid_parse) {
-                extra_cache_[uri] = ExtraFileCacheEntry{
-                    .path = path_string,
-                    .uri = uri,
-                    .index = committed_index,
-                };
+                put_extra_cache_locked(uri, ExtraFileCacheEntry{
+                                                .path = path_string,
+                                                .uri = uri,
+                                                .index = committed_index,
+                                            });
                 invalidate_extra_snapshots_locked();
                 shard_to_cache = std::move(committed_index);
             }
@@ -8517,6 +8539,37 @@ void Analyzer::clear_project_index_snapshot_locked() const {
     project_index_snapshot_cache_.reset();
 }
 
+void Analyzer::put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const {
+    erase_extra_cache_locked(uri);
+    if (entry.index) {
+        for (const auto& dependency : entry.index->include_dependencies)
+            extra_cache_includers_[dependency].insert(uri);
+    }
+    extra_cache_[uri] = std::move(entry);
+}
+
+void Analyzer::erase_extra_cache_locked(const std::string& uri) const {
+    const auto it = extra_cache_.find(uri);
+    if (it == extra_cache_.end())
+        return;
+    if (it->second.index) {
+        for (const auto& dependency : it->second.index->include_dependencies) {
+            const auto includers = extra_cache_includers_.find(dependency);
+            if (includers == extra_cache_includers_.end())
+                continue;
+            includers->second.erase(uri);
+            if (includers->second.empty())
+                extra_cache_includers_.erase(includers);
+        }
+    }
+    extra_cache_.erase(it);
+}
+
+void Analyzer::clear_extra_cache_locked() const {
+    extra_cache_.clear();
+    extra_cache_includers_.clear();
+}
+
 void Analyzer::update_extra_cache_for_live_state_locked(
     std::shared_ptr<const DocumentState> state, SyntaxIndex index) {
     if (!state)
@@ -8531,11 +8584,11 @@ void Analyzer::update_extra_cache_for_live_state_locked(
     if (!extra_file_set_.contains(path_string))
         return;
 
-    extra_cache_[uri] = ExtraFileCacheEntry{
-        .path = path_string,
-        .uri = uri,
-        .index = std::make_shared<SyntaxIndex>(std::move(index)),
-    };
+    put_extra_cache_locked(uri, ExtraFileCacheEntry{
+                                    .path = path_string,
+                                    .uri = uri,
+                                    .index = std::make_shared<SyntaxIndex>(std::move(index)),
+                                });
     invalidate_extra_snapshots_locked();
 
     // The per-file shard changed, so the published merged project snapshot is

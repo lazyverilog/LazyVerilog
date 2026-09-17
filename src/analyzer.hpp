@@ -756,6 +756,14 @@ class Analyzer {
     void invalidate_extra_snapshots_locked() const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
+    /// Install, drop or empty an `extra_cache_` entry, keeping
+    /// `extra_cache_includers_` in step.  The map is the only reason these
+    /// exist; nothing else may touch `extra_cache_` directly.  Require
+    /// map_mutex_.
+    void put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const;
+    void erase_extra_cache_locked(const std::string& uri) const;
+    void clear_extra_cache_locked() const;
+
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state,
                                                   SyntaxIndex index);
 
@@ -808,6 +816,22 @@ class Analyzer {
     // didOpen/didChange critical section from scanning large filelists.
     mutable std::unordered_set<std::string> extra_file_set_;
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> extra_cache_;
+    /// Which shards `include a given file: header URI -> the URIs of the
+    /// entries of `extra_cache_` that list it.
+    ///
+    /// Answering "does anything include this file" used to be a walk of every
+    /// shard in the project, comparing against each one's dependency list.
+    /// That ran on *every* didChange, from queue_include_dependents_locked(),
+    /// under the lock every request handler and index worker contends for --
+    /// and for an ordinary .sv file, which nothing includes, it ran to
+    /// completion and found nothing every time.  It ran again per changed
+    /// header in refresh_changed_extra_files().
+    ///
+    /// Only entries that `include something appear, so a design of plain
+    /// sources costs nothing to keep, and maintaining it is one pass over a
+    /// dependency list the caller already holds.
+    mutable std::unordered_map<std::string, std::unordered_set<std::string>>
+        extra_cache_includers_;
     mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_cache_;
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
