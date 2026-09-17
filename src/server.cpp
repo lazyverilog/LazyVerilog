@@ -726,6 +726,16 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
         project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
     }
 
+    // This project's own list, *before* that dedup rather than after it.  A file
+    // two projects share belongs to both compilations -- dropping it from the
+    // second because the first got there first would leave that project unable
+    // to resolve a module its filelist names.
+    project_compilation_inputs_.push_back(ProjectCompilationInputs{
+        .root = source_root,
+        .files = vcode.files,
+        .background_compilation = config.compilation.background_compilation,
+    });
+
     // How files under this root preprocess.  This is the per-file half, and it
     // does not merge: a file under this root is parsed with exactly this
     // project's defines and include directories, whatever any other project
@@ -757,6 +767,7 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
 void LazyVerilogServer::apply_project_inputs() {
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
                                  index_cache_storage_, project_file_sizes_);
+    analyzer_.set_project_compilation_inputs(project_compilation_inputs_);
     configure_background_compiler();
     schedule_background_compilation();
 }
@@ -772,6 +783,7 @@ void LazyVerilogServer::reload_all_projects() {
     project_include_dirs_.clear();
     project_files_.clear();
     project_file_sizes_.clear();
+    project_compilation_inputs_.clear();
     project_filelists_.clear();
 
     // The session root first, so it keeps deciding `config_` and the eager
@@ -844,25 +856,44 @@ void LazyVerilogServer::request_inlay_hint_refresh() {
     }
 }
 
+bool LazyVerilogServer::any_project_compiles() const {
+    // `[compilation]` is per project like every other per-file answer, but the
+    // *worker* is one: it is a debounce timer and a thread, not a policy.  So it
+    // runs when anybody wants it and each project's switch is honoured where the
+    // work actually happens -- the group it contributes, and the publish for its
+    // own buffers.
+    if (config_.compilation.background_compilation)
+        return true;
+    return std::any_of(project_compilation_inputs_.begin(), project_compilation_inputs_.end(),
+                       [](const ProjectCompilationInputs& project) {
+                           return project.background_compilation;
+                       });
+}
+
 void LazyVerilogServer::configure_background_compiler() {
     if (!background_compiler_)
         return;
 
+    const bool enabled = any_project_compiles();
     background_compiler_->configure(BackgroundCompilerConfig{
-        .enabled = config_.compilation.background_compilation,
+        .enabled = enabled,
+        // Session-level on purpose: one timer and one log stream, and a project
+        // cannot have its own copy of either.  The session config is what a
+        // client with a rootUri set, and the defaults otherwise.
         .debounce_ms = config_.compilation.background_compilation_debounce_ms,
         .log_timing = config_.compilation.log_timing,
     });
 
-    if (!config_.compilation.background_compilation)
+    if (!enabled)
         analyzer_.clear_all_semantic_diagnostics();
 }
 
 void LazyVerilogServer::schedule_background_compilation() {
-    // Semantic compilation is session-wide by construction: one slang
-    // Compilation over every source, so one set of options.  See
-    // compilation_snapshot() in analyzer.cpp.
-    if (!background_compiler_ || !config_.compilation.background_compilation)
+    // One Compilation per project, each over that project's own filelist and
+    // its own defines -- see compilation_snapshot() in analyzer.cpp.  A run is
+    // scheduled when any project wants one; which projects it actually compiles
+    // is decided there.
+    if (!background_compiler_ || !any_project_compiles())
         return;
     background_compiler_->schedule();
 }
@@ -903,6 +934,10 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
     try {
         auto state = analyzer_.get_state(uri);
+        // This file's config, not the session's -- every answer below is a
+        // per-document question, and `config_` is the session's eager-indexing
+        // config.
+        const auto file_config = config_for(uri);
         std::unordered_map<std::string, std::vector<ParseDiagInfo>> diags_by_uri;
         diags_by_uri[uri];
         if (state) {
@@ -922,7 +957,6 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // synchronously parse, copy, or merge the full design filelist on
             // every edit.
             std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-            const auto file_config = config_for(uri);
             if (file_config->lint.instance.stale_instance_diagnostic)
                 project_lint_index = analyzer_.project_index_snapshot();
 
@@ -931,7 +965,10 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
                 add_diag(std::move(diag));
         }
 
-        if (config_.compilation.background_compilation) {
+        // This file's project, not the session's: a project with
+        // `[compilation]` off shows no semantic diagnostics in its buffers even
+        // while the project open beside it is compiling.
+        if (file_config->compilation.background_compilation) {
             auto semantic_diags = analyzer_.semantic_diagnostics(uri);
             auto& target = diags_by_uri[uri];
             target.insert(target.end(), semantic_diags.begin(), semantic_diags.end());

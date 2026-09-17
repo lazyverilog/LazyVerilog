@@ -160,34 +160,57 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   `config_for(uri)` — formatting, lint, AutoFF, AutoWire, AutoArg, the RTL tree, and
   the two capability switches.  Do not reach for `config_` in a handler that has a
   URI; `config_` is the session's eager-indexing config, not the file's.
-- Two things stay session-wide, and are not per-file questions: **which** files to
-  index (one index covers every open project, so the filelist is the union), and
-  **semantic compilation** (`[compilation]`), which builds a single slang
-  `Compilation` and therefore has one preprocessor for all of it.
-- Because that compilation is one `Compilation` over every project, **each project gets
-  its own `slang::SourceLibrary`** (`background_compiler.cpp`).  Without one, two
-  projects that both declare `fifo` are a redefinition to slang: it said so and kept
-  one, and the other project's semantic diagnostics vanished with it.  A name declared
-  in two libraries is legal and kept in priority order; only a duplicate *within* one
-  library is reported (`Compilation::insertDefinition`).  This is SystemVerilog's own
-  answer to the question C++ answers with linkage.
+- **Only one thing stays session-wide**: *which* files to index.  One index covers
+  every open project, so the filelist is the union — a name only one project declares
+  should still be reachable from the other.
+- **Semantic compilation is not that thing.**  `[compilation]` builds one slang
+  `Compilation` per **project**, each over that project's own filelist and its own
+  defines and `+incdir+` (`ProjectCompilationInputs` → `CompilationSnapshot::groups` →
+  `BackgroundCompiler::compile_group()`).  A `Compilation` has one preprocessor and one
+  flat module namespace, so compiling the union handed one elaboration two projects'
+  `fifo` and one project's `define` to the other project's parse.
+- The grouping is **by filelist, not by walking up to a root**.  Which declaration
+  `fifo u_fifo ();` binds to is decided by the set of files being compiled, and a `.f`
+  *is* that set, so this is the scope SystemVerilog binds over rather than an
+  approximation of it.  That is also why `fold_project_root()` records each project's
+  list **before** the union's dedup: a file two projects share belongs to both
+  compilations, and dropping it from the second would leave that project unable to
+  resolve a module its own filelist names.
+- Groups compile **sequentially**, one worker.  Peak memory is the binding resource, so
+  N projects cost N times the wall clock and one project's memory, never N times the
+  memory.  A file in two filelists is compiled twice and can report the same diagnostic
+  twice; `dedup_parse_diagnostics()` collapses the identical ones and keeps genuinely
+  different ones, because shared IP really does mean different things under two
+  projects' defines.
+- **`[compilation]` is per project, like `[lint]`.**  A project with it off contributes
+  no group, and `publish_diagnostics()` gates on `config_for(uri)` so its buffers stay
+  quiet while the project open beside it compiles.  What stays session-level is the
+  *worker*: `background_compilation_debounce_ms` and `log_timing` are one timer and one
+  log stream, and `any_project_compiles()` starts it when anybody wants it.
+- A session with **no registered project** — a CLI tool, a test, a client that sent no
+  `rootUri` — has no groups and falls back to one merged `Compilation`, exactly as
+  before.  That fallback is the reason the source libraries below still matter.
+- On that fallback path each project gets its own `slang::SourceLibrary`
+  (`background_compiler.cpp`).  Without one, two projects that both declare `fifo` are a
+  redefinition to slang: it said so and kept one, and the other project's semantic
+  diagnostics vanished with it.  A name declared in two libraries is legal and kept in
+  priority order; only a duplicate *within* one library is reported
+  (`Compilation::insertDefinition`).  This is SystemVerilog's own answer to the question
+  C++ answers with linkage.
 - Every one of those libraries is marked `isDefault`, which is not the flag's usual
-  sense and is the whole reason this works.  slang never auto-instantiates a definition
+  sense and is the whole reason it works.  slang never auto-instantiates a definition
   that sits in a library — "Library definitions are never automatically instantiated in
   any capacity" — so naming a library the obvious way silences the redefinition by
   elaborating *nothing at all*.  The `[module-proximity]` compilation case asserts a
   diagnostic from inside a module body for exactly this reason; flipping `isDefault` to
-  false is what it catches.
-- Priority follows **sorted root order**, not the order files arrive in: the snapshot's
-  open buffers come out of a hash map, and priority is what decides which definition a
-  lookup takes.  Below two projects no library is assigned at all, so a single-project
-  session is unchanged.
-- Libraries make the duplicate legal; they do **not** make binding per project.  Without
-  a `config` block slang resolves a name through a global priority list and then
-  `defList.front()` (`Compilation::tryGetDefinition`), so both projects' tops still bind
-  to the higher-priority `fifo`.  Per-instantiator preference (`overrideLib =
-  &parentDef->sourceLibrary`) only fires under `resolveConfigRule`.  Fixing that means
-  synthesizing a config per project, or one `Compilation` per project.
+  false is what it catches.  Priority follows **sorted root order**, not the order files
+  arrive in, because the snapshot's open buffers come out of a hash map.
+- Libraries make a duplicate legal; they do **not** make binding per project.  Without a
+  `config` block slang resolves a name through a global priority list and then
+  `defList.front()` (`Compilation::tryGetDefinition`); per-instantiator preference
+  (`overrideLib = &parentDef->sourceLibrary`) only fires under `resolveConfigRule`.
+  Per-project `Compilation`s are what actually answer that, which is why they are the
+  real fix and the libraries are the fallback's safety net.
 - Folding several projects is one analyzer transaction: `fold_project_root()` accumulates
   and passes `Analyzer::Reindex::Deferred`, and `apply_project_inputs()` is what schedules
   the burst.  Registering a project *and* scheduling there costs N+1 full reindex

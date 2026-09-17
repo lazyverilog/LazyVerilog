@@ -71,6 +71,9 @@ class BackgroundCompiler {
     void worker_loop(std::shared_ptr<WorkerSlot> slot);
     std::vector<std::thread> collect_exited_workers_locked();
     BackgroundCompileResult compile(uint64_t generation, CompilationSnapshot snapshot) const;
+    void compile_group(const CompilationGroup& group,
+                       const std::shared_ptr<const ProjectParseInputs>& parse_inputs,
+                       BackgroundCompileResult& result) const;
 
     SnapshotCallback snapshot_callback_;
     ResultCallback result_callback_;

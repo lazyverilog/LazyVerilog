@@ -740,6 +740,42 @@ struct TwoProjectTree {
     }
 };
 
+/// Run one background semantic compilation and flatten what it reported.
+///
+/// Every diagnostic as "<uri>: <message>", which is what these cases actually
+/// assert on: which project's module was elaborated, and under whose defines.
+std::string semantic_messages(Analyzer& analyzer) {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::optional<BackgroundCompileResult> result;
+    BackgroundCompiler compiler([&] { return analyzer.compilation_snapshot(); },
+                                [&](BackgroundCompileResult compiled) {
+                                    std::lock_guard<std::mutex> lock(mutex);
+                                    result = std::move(compiled);
+                                    cv.notify_all();
+                                });
+
+    BackgroundCompilerConfig config;
+    config.enabled = true;
+    config.thread_count = 1;
+    config.debounce_ms = 0;
+    compiler.configure(config);
+    compiler.schedule();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds(60), [&] { return result.has_value(); }))
+            return "<background compilation did not finish>";
+    }
+    compiler.stop();
+
+    std::string messages;
+    for (const auto& [uri, diags] : result->diagnostics_by_uri) {
+        for (const auto& diag : diags)
+            messages += uri + ": " + diag.message + "\n";
+    }
+    return messages;
+}
+
 } // namespace
 
 TEST_CASE("go to definition lands in the asking file's project",
@@ -1075,34 +1111,7 @@ TEST_CASE("semantic compilation keeps two projects' same-named modules apart",
         {fifo_a.string(), fifo_b.string(), top_a.string(), top_b.string()});
     analyzer.wait_for_background_index_idle();
 
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::optional<BackgroundCompileResult> result;
-    BackgroundCompiler compiler([&] { return analyzer.compilation_snapshot(); },
-                                [&](BackgroundCompileResult compiled) {
-                                    std::lock_guard<std::mutex> lock(mutex);
-                                    result = std::move(compiled);
-                                    cv.notify_all();
-                                });
-
-    BackgroundCompilerConfig config;
-    config.enabled = true;
-    config.thread_count = 1;
-    config.debounce_ms = 0;
-    compiler.configure(config);
-    compiler.schedule();
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        REQUIRE(cv.wait_for(lock, std::chrono::seconds(60),
-                            [&] { return result.has_value(); }));
-    }
-    compiler.stop();
-
-    std::string all_messages;
-    for (const auto& [uri, diags] : result->diagnostics_by_uri) {
-        for (const auto& diag : diags)
-            all_messages += uri + ": " + diag.message + "\n";
-    }
+    const std::string all_messages = semantic_messages(analyzer);
     INFO(all_messages);
 
     // Neither `fifo` is a redefinition of the other -- they are in different
@@ -1112,4 +1121,80 @@ TEST_CASE("semantic compilation keeps two projects' same-named modules apart",
     // And the design still elaborates, so the diagnostics the user actually
     // wants did not go with it.
     CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
+}
+
+TEST_CASE("each project compiles under its own defines", "[project-root][module-proximity]") {
+    // Semantic compilation used to be one slang Compilation over the union, and
+    // a Compilation has one preprocessor -- so it could only ever be handed the
+    // *merged* defines.  Each module here is visible only under its own
+    // project's define, so a merged compilation either sees both (if the merge
+    // is what it gets) or neither.  With no defaults registered at all, the only
+    // way both diagnostics appear is if each project was compiled with its own.
+    TempTree tree("per-project-compilation-defines");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "`ifdef CHIP_A\n"
+                                           "module a_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_a;\n"
+                                           "endmodule\n"
+                                           "`endif\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "`ifdef CHIP_B\n"
+                                           "module b_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_b;\n"
+                                           "endmodule\n"
+                                           "`endif\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_a", {"CHIP_A"}, {});
+    analyzer.set_parse_inputs_for_root(tree.root / "chip_b", {"CHIP_B"}, {});
+    // No defaults: a define that reaches either file has to have come from that
+    // file's own project entry.
+    analyzer.set_project_config({}, {}, {a.string(), b.string()});
+    analyzer.set_project_compilation_inputs({
+        {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
+        {.root = tree.root / "chip_b", .files = {b.string()}, .background_compilation = true},
+    });
+    analyzer.wait_for_background_index_idle();
+
+    const std::string all_messages = semantic_messages(analyzer);
+    INFO(all_messages);
+    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
+    CHECK(all_messages.find("undeclared_in_b") != std::string::npos);
+}
+
+TEST_CASE("a project with compilation off stays quiet next to one with it on",
+          "[project-root][module-proximity]") {
+    // The direct analog of `[lint]`, which has been per file since config_for()
+    // existed.  `[compilation]` was read from the session config, so one
+    // project's switch decided for every project open beside it.
+    TempTree tree("per-project-compilation-switch");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_a;\n"
+                                           "endmodule\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "module b_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_b;\n"
+                                           "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {a.string(), b.string()});
+    analyzer.set_project_compilation_inputs({
+        {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
+        {.root = tree.root / "chip_b", .files = {b.string()}, .background_compilation = false},
+    });
+    analyzer.wait_for_background_index_idle();
+
+    const std::string all_messages = semantic_messages(analyzer);
+    INFO(all_messages);
+    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
+    CHECK(all_messages.find("undeclared_in_b") == std::string::npos);
 }

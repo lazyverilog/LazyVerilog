@@ -84,6 +84,16 @@ public:
     /// Convenience for the many call sites that hold a URI.
     const ParseInputs& for_uri(std::string_view uri) const;
 
+    /// The inputs registered for @p root itself, or the defaults if none is.
+    ///
+    /// for_path() answers "how does this file parse" and walks up to find the
+    /// project; this answers "how does this project parse" for a caller that
+    /// already holds the root.  Semantic compilation needs that form: it builds
+    /// one preprocessor for a whole project, and asking through one of its files
+    /// would take the wrong answer for a `.f` that names a sibling project's
+    /// source.
+    const ParseInputs& for_root(const std::filesystem::path& root) const;
+
     /// Which project @p path belongs to, or an empty path when it belongs to
     /// none.
     ///
@@ -96,9 +106,10 @@ public:
     /// not asking how either of them parses.
     std::filesystem::path project_root_for(const std::filesystem::path& path) const;
 
-    /// The defaults, for the whole-project paths that cannot be per file --
-    /// today that is the semantic compilation snapshot, which builds one slang
-    /// Compilation out of every file and so can only have one set of defines.
+    /// The merged inputs, for a caller that has no project to ask about -- a file
+    /// under none, and the semantic compilation fallback taken when no project
+    /// has registered what it compiles.  A project that has is served by
+    /// for_root() instead.
     const ParseInputs& defaults() const { return defaults_; }
 
     /// Every registered root's inputs plus the defaults, for callers that need

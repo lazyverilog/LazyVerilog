@@ -6390,6 +6390,11 @@ void Analyzer::replace_default_parse_inputs_locked(ParseInputs inputs) {
     parse_inputs_ = std::move(next);
 }
 
+void Analyzer::set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    project_compilation_inputs_ = std::move(inputs);
+}
+
 void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver) {
     std::lock_guard<std::mutex> lock(map_mutex_);
     auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
@@ -7689,12 +7694,12 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     CompilationSnapshot snapshot;
-    // Semantic compilation is the one thing that cannot be per file: it builds a
-    // single slang Compilation out of every source, so there is one preprocessor
-    // for all of them.  The defaults are used, which for a single-project
-    // session is exactly the project's own config; across projects it is the
-    // merged set the server accumulated.  clangd has no analog to diverge from
-    // here -- it compiles one TU at a time, each with its own command.
+    // The merged defaults, for the ungrouped fallback alone -- a CLI tool, a
+    // test, or a client that sent no rootUri, where no project registered what
+    // it compiles.  A real session compiles one group per project against that
+    // project's own inputs (see the grouping at the end of this function), which
+    // is what a Compilation needs: it has one preprocessor, so the one set of
+    // defines it gets had better be one project's rather than everyone's.
     snapshot.defines = parse_inputs_->defaults().defines;
     snapshot.include_dirs = parse_inputs_->defaults().include_dirs;
     // Which project each file belongs to is resolved by the compiler, off this
@@ -7739,6 +7744,79 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         });
         seen_uris.insert(uri);
         seen_paths.insert(path_string);
+    }
+
+    // One group per project that asked for semantic compilation.
+    //
+    // Which declaration `fifo u_fifo ();` binds to is decided by the set of
+    // files being compiled, and a `.f` is exactly that set -- so this is not an
+    // approximation of what elaboration would say, it is the scope the language
+    // binds over.  Compiling the union instead gave one elaboration two `fifo`s
+    // and gave one project's `define` to the other project's parse.
+    //
+    // An open buffer joins the group of the project it is in, so unsaved text
+    // reaches the compilation that cares about it.  A buffer under no project
+    // joins nothing: there is no filelist that says which design it belongs to,
+    // and guessing would put it in every one.
+    if (!project_compilation_inputs_.empty()) {
+        std::unordered_map<std::string, CompilationSourceFile> open_by_path;
+        for (const auto& file : snapshot.files) {
+            if (file.text)
+                open_by_path.emplace(file.path, file);
+        }
+
+        for (const auto& project : project_compilation_inputs_) {
+            if (!project.background_compilation)
+                continue;
+
+            const auto& inputs = parse_inputs_->for_root(project.root);
+            CompilationGroup group;
+            group.root = project.root.string();
+            group.defines = inputs.defines;
+            group.include_dirs = inputs.include_dirs;
+
+            std::unordered_set<std::string> in_group;
+            group.files.reserve(project.files.size());
+            for (const auto& path_string : project.files) {
+                if (!in_group.insert(path_string).second)
+                    continue;
+                // The open buffer's entry when there is one, so the compilation
+                // reads the text the user is looking at rather than the file on
+                // disk.
+                if (const auto it = open_by_path.find(path_string); it != open_by_path.end()) {
+                    group.files.push_back(it->second);
+                    continue;
+                }
+                group.files.push_back(CompilationSourceFile{
+                    .uri = uri_from_path(path_string),
+                    .path = path_string,
+                    .text = nullptr,
+                });
+            }
+
+            // Open buffers this project's filelist does not name -- a file just
+            // created, or one the user opened before adding it to the `.f`.
+            // Sorted, because docs_ is a hash map and the order files enter a
+            // Compilation decides which definition wins a tie: taking bucket
+            // order would let one run disagree with the next.
+            std::vector<const CompilationSourceFile*> unlisted;
+            for (const auto& [path_string, file] : open_by_path) {
+                if (in_group.contains(path_string))
+                    continue;
+                if (parse_inputs_->project_root_for(path_string) != project.root)
+                    continue;
+                unlisted.push_back(&file);
+            }
+            std::sort(unlisted.begin(), unlisted.end(),
+                      [](const CompilationSourceFile* a, const CompilationSourceFile* b) {
+                          return a->path < b->path;
+                      });
+            for (const auto* file : unlisted)
+                group.files.push_back(*file);
+
+            if (!group.files.empty())
+                snapshot.groups.push_back(std::move(group));
+        }
     }
 
     return snapshot;
