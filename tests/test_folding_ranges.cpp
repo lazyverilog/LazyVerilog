@@ -1241,23 +1241,34 @@ static std::string folding_scaling_source(int stages) {
 /// A fresh `Analyzer` and a run-unique URI are what keep every sample a real
 /// computation.  `Analyzer::open()` parses synchronously and returns before the
 /// timed region starts, so it is not charged to the measurement.
+/// One timed foldingRange over @p source, on a fresh Analyzer.
+///
+/// Split out of fastest_folding_ms() so a caller can interleave two sizes
+/// without rebuilding either source between samples; @p tag only keeps the URIs
+/// distinct.
+static double folding_ms_once(const std::string& source, const std::string& tag,
+                              size_t& folds_out) {
+    Analyzer          analyzer;
+    const std::string uri = "file:///fold_scaling_" + tag + ".sv";
+    analyzer.open(uri, source);
+
+    const auto start = std::chrono::steady_clock::now();
+    auto       folds = provide_folding_range(analyzer, make_params(uri));
+    const auto ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    folds_out = folds.size();
+    return ms;
+}
+
 static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
     const std::string source = folding_scaling_source(stages);
 
     std::vector<double> samples;
     samples.reserve((size_t)runs);
     for (int i = 0; i < runs; ++i) {
-        Analyzer          analyzer;
-        const std::string uri = "file:///fold_scaling_" + std::to_string(stages) + "_" +
-                                std::to_string(i) + ".sv";
-        analyzer.open(uri, source);
-
-        const auto start = std::chrono::steady_clock::now();
-        auto       folds = provide_folding_range(analyzer, make_params(uri));
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
-        folds_out = folds.size();
+        samples.push_back(folding_ms_once(
+            source, std::to_string(stages) + "_" + std::to_string(i), folds_out));
     }
     std::sort(samples.begin(), samples.end());
     return samples.front();
@@ -1308,20 +1319,59 @@ TEST_CASE("foldingRange: cost stays linear at large fold counts", "[folding][sca
     // per side: at ~80 ms a sample this is still well under a second, and the
     // cost being guarded raises the floor, so the minimum is the honest statistic.
     constexpr int kStages = 1920;
-    constexpr int kRuns   = 2;
+    // Five rounds per side, not two.
+    //
+    // The statistic is the minimum, because the cost being guarded raises the
+    // floor and everything a shared runner adds only ever makes a sample
+    // slower.  A minimum over two samples is a poor estimate of that floor,
+    // though, and the large side is both the more expensive half and the one
+    // with more room to be slow -- so one unlucky pair there was enough to fail
+    // a guard the code passes with 40% to spare.  That is what happened on the
+    // darwin-x64 job, which is the only one that runs its tests translated:
+    // macos-15 runners are arm64 and the job builds x86_64, so the binary goes
+    // through Rosetta.  It reported 49.68 ms and 151.45 ms, ratio 3.048, while
+    // the same commit passed the same job in another run.
+    //
+    // More samples cost less than they look: the sources are now built once
+    // rather than once per call, which is most of what the old two rounds
+    // spent.
+    constexpr int kRuns = 5;
 
     size_t small_folds = 0;
     size_t large_folds = 0;
 
-    const double small_ms = fastest_folding_ms(kStages, kRuns, small_folds);
-    const double large_ms = fastest_folding_ms(kStages * 2, kRuns, large_folds);
+    const std::string small_source = folding_scaling_source(kStages);
+    const std::string large_source = folding_scaling_source(kStages * 2);
+
+    // Alternated, not one side then the other.  Timed in sequence, a runner
+    // that slows part way through lands entirely on one half and the ratio
+    // stops describing the code.  Interleaved, whatever it does hits both.
+    std::vector<double> small_samples;
+    std::vector<double> large_samples;
+    for (int round = 0; round < kRuns; ++round) {
+        const auto tag = std::to_string(round);
+        small_samples.push_back(folding_ms_once(small_source, "lin_s" + tag, small_folds));
+        large_samples.push_back(folding_ms_once(large_source, "lin_l" + tag, large_folds));
+    }
+
+    const double small_ms = *std::min_element(small_samples.begin(), small_samples.end());
+    const double large_ms = *std::min_element(large_samples.begin(), large_samples.end());
 
     REQUIRE(small_folds > 20000);
     CHECK(large_folds - 1 == (small_folds - 1) * 2);
 
     const double ratio = large_ms / small_ms;
+    // Every sample, not just the two that decide the ratio: a failure here is
+    // usually about the spread, and one number cannot show it.
     std::cout << "\n[folding scaling, large] folds=" << small_folds << " ms=" << small_ms
-              << "  folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio << "\n";
+              << "  folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio
+              << "\n  small:";
+    for (double sample : small_samples)
+        std::cout << " " << sample;
+    std::cout << "\n  large:";
+    for (double sample : large_samples)
+        std::cout << " " << sample;
+    std::cout << "\n";
 
     // Measured 1.7-1.8 once the partner pass stopped scanning the whole fold
     // list; the version this replaced measures 5.86 and fails.
