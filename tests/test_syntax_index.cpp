@@ -1,6 +1,7 @@
 #include "analyzer.hpp"
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
+#include <iostream>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1413,4 +1414,64 @@ TEST_CASE("project index: the published shard order does not depend on hash orde
     CHECK(seen_file);
 
     fs::remove_all(dir);
+}
+
+TEST_CASE("project index: an edit's include fanout does not scale with the project",
+          "[index][scaling]") {
+    // didChange asks "does anything `include this file", and for an ordinary
+    // .sv file the answer is no.  Answering it used to walk every shard in the
+    // project and compare the edited URI against each one's dependency list --
+    // under map_mutex_, the lock every request handler and index worker
+    // contends for, on every keystroke.  Measured at ~6.5 ns per shard per
+    // keystroke, which is ~30 us at 5000 files and ~130 us at 20000, for a
+    // question whose answer is always "no".
+    //
+    // A ratio against a structurally identical project eight times the size,
+    // minimum of several runs -- an absolute budget would not survive a shared
+    // runner.  Before the reverse map: 0.86 ms at 200 shards against 1.25 ms at
+    // 800, a ratio of 1.45 over a 4x size change.  After: 0.76 and 0.78, 1.03.
+    namespace fs = std::filesystem;
+    const auto cost_for = [](int count) {
+        const auto dir =
+            fs::temp_directory_path() / ("lazyverilog_fanout_scaling_" + std::to_string(count));
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < count; ++i) {
+            const auto path = dir / ("m" + std::to_string(i) + ".sv");
+            std::ofstream out(path);
+            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
+            paths.push_back(path.string());
+        }
+
+        Analyzer analyzer;
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_extra_files(paths);
+        analyzer.wait_for_background_index_idle();
+
+        // Not a filelist entry and included by nothing, so every keystroke on
+        // it is the "answer is no" case.  Tiny, so the parse does not drown out
+        // what is being measured.
+        const std::string uri = "file:///tmp/lazyverilog_fanout_edit.sv";
+        analyzer.open(uri, "module edit;\nendmodule\n");
+
+        double best = std::numeric_limits<double>::max();
+        for (int run = 0; run < 7; ++run) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 100; ++i)
+                analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
+            best = std::min(best, std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count());
+        }
+        fs::remove_all(dir);
+        return best;
+    };
+
+    const double small = cost_for(200);
+    const double large = cost_for(1600);
+    const double ratio = large / small;
+    std::cerr << "[scaling] edit fanout: 200 -> " << small << " ms, 1600 -> " << large
+              << " ms, ratio " << ratio << "\n";
+    CHECK(ratio < 1.4);
 }
