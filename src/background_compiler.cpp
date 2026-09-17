@@ -312,8 +312,11 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     compilation_options.errorLimit = error_limit_.load(std::memory_order_relaxed);
 
     slang::Bag bag;
-    bag.set(preprocessor_options);
-    bag.set(compilation_options);
+    // Moved, not copied: `Bag::set` stores by value into a `std::any`, and
+    // PreprocessorOptions carries the whole `+incdir+` list.  Neither is read
+    // again after this.
+    bag.set(std::move(preprocessor_options));
+    bag.set(std::move(compilation_options));
 
     slang::ast::Compilation compilation(bag);
     std::string first_uri;
