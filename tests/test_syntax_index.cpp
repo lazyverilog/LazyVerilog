@@ -1558,3 +1558,47 @@ TEST_CASE("project index: an unrelated edit does not rebuild the project snapsho
               << large_ms << " ms, ratio " << ratio << "\n";
     CHECK(ratio < 1.6);
 }
+
+TEST_CASE("project index: the extra-file snapshots are ordered too", "[index]") {
+    // The same defect as the published snapshot, in the two vectors request
+    // handlers read directly.  connect.cpp's find_module() takes the first
+    // shard whose module table holds the name, and definition and hover run
+    // by-name lookups over the same order -- so it was decided by whichever
+    // bucket order the last rehash of extra_cache_ produced, and could change
+    // on any republish with nothing in the tree having changed.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_extra_snapshot_order";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    std::vector<std::string> paths;
+    for (char name = 'a'; name <= 'h'; ++name) {
+        const auto path = dir / (std::string(1, name) + "_mod.sv");
+        std::ofstream out(path);
+        out << "module m_" << name << ";\n  logic [7:0] sig;\nendmodule\n";
+        paths.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+
+    const auto files = analyzer.extra_file_snapshot_ptr();
+    REQUIRE(files);
+    REQUIRE(files->size() == paths.size());
+    CHECK(std::is_sorted(files->begin(), files->end(),
+                         [](const ExtraFileInfo& a, const ExtraFileInfo& b) {
+                             return a.path < b.path;
+                         }));
+
+    const auto indexes = analyzer.extra_index_snapshot_ptr();
+    REQUIRE(indexes);
+    REQUIRE(indexes->size() == paths.size());
+    CHECK(std::is_sorted(indexes->begin(), indexes->end(),
+                         [](const ExtraIndexInfo& a, const ExtraIndexInfo& b) {
+                             return a.path < b.path;
+                         }));
+
+    fs::remove_all(dir);
+}

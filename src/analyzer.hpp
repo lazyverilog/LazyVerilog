@@ -746,6 +746,17 @@ class Analyzer {
                               bool stands_alone = false) const;
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
+    /// The entries of a shard map in a fixed order.
+    ///
+    /// Both shard maps are unordered, and every consumer of the snapshots built
+    /// from them resolves a name by taking the first match -- so without this
+    /// the answer was decided by whichever bucket order the last rehash
+    /// produced, and could change on any republish.  Path is the one key that
+    /// is unique per shard, already held, and the same from one launch to the
+    /// next.  Pointers, so nothing is copied.
+    static std::vector<const ExtraFileCacheEntry*>
+    sorted_by_path(const std::unordered_map<std::string, ExtraFileCacheEntry>& entries);
+
     void invalidate_extra_snapshots_locked() const;
     /// Narrower counterpart for a change to docs_ rather than to the shards.
     /// Requires map_mutex_.
