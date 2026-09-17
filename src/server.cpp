@@ -1132,15 +1132,25 @@ void LazyVerilogServer::register_handlers() {
                 // it no longer decides anything per file.
                 root_ = p;
 
+                // Which project the client's root is *in*, which is not always
+                // the directory it named: an editor launched in a subdirectory
+                // sends that subdirectory.  `config_` is read from there, and
+                // it decides `[compilation]` -- the one table that genuinely is
+                // session-wide -- so reading it from the spelling rather than
+                // from the project meant a background_compilation set in the
+                // config above was silently ignored.
+                std::optional<ProjectInfo> info;
+                if (root_resolver_)
+                    info = root_resolver_->project_info(root_);
+                const auto config_root = info ? info->source_root : root_;
+
                 std::string warn;
                 ConfigWarning warning_detail;
-                config_ = load_config(root_, &warn, &warning_detail);
+                config_ = load_config(config_root, &warn, &warning_detail);
 
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-
-                auto vcode = load_vcode(root_, config_);
 
                 // Seed the accumulators through the same fold every later
                 // project goes through, so the eager root and a discovered one
@@ -1152,18 +1162,25 @@ void LazyVerilogServer::register_handlers() {
                 // Only if the config really is here.  Recording a root that
                 // holds no lazyverilog.toml would suppress the discovery of the
                 // real one above it.
-                if (root_resolver_) {
-                    if (auto info = root_resolver_->project_info(root_))
-                        fold_project_root(info->source_root);
-                }
+                if (info)
+                    fold_project_root(info->source_root);
+
                 if (project_files_.empty()) {
                     // rootUri names a directory with no config above it.  There
-                    // is still a filelist to index -- load_vcode() found one --
-                    // and no root to attribute it to.
+                    // may still be a filelist to index, and no root to
+                    // attribute it to.
+                    //
+                    // Read only here.  fold_project_root() above reads the
+                    // filelist of the project it folds, so loading one
+                    // unconditionally parsed every `-f` in the tree twice on
+                    // every launch and stat'ed every entry twice with it --
+                    // load_vcode() takes one metadata call per file to order
+                    // the index queue.
+                    auto vcode            = load_vcode(root_, config_);
                     project_defines_      = config_.design.define;
                     project_include_dirs_ = vcode.include_dirs;
-                    project_files_        = vcode.files;
-                    project_file_sizes_   = vcode.file_sizes;
+                    project_files_        = std::move(vcode.files);
+                    project_file_sizes_   = std::move(vcode.file_sizes);
                     project_vcode_path_   = resolve_vcode_path(root_, config_);
                 }
 
