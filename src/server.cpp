@@ -1273,6 +1273,16 @@ void LazyVerilogServer::register_handlers() {
             // ever report a change for.
             for (const auto ext : kWatchedSourceExtensions)
                 reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
+            // The config itself.  ProjectRootResolver's freshness windows say
+            // they are a backstop and that "the client's watcher fires
+            // invalidate()" for a config that appears or moves -- but no
+            // watcher asked for one, so nothing ever did.  A lazyverilog.toml
+            // written by a git checkout, a branch switch or a terminal reached
+            // the server only once one of its buffers was saved from an editor
+            // that sends didChangeConfiguration, and until then every file
+            // under it kept the config it was resolved with.
+            reg.registerOptions.watchers.push_back(
+                {"**/" + std::string(ProjectRootResolver::kMarker)});
             req.params.registrations = {std::move(reg)};
             (void)impl_->remote_endpoint.send(req);
         } catch (const std::exception& e) {
@@ -1377,14 +1387,34 @@ void LazyVerilogServer::register_handlers() {
             changed_uris.reserve(note.params.changes.size());
             deleted_uris.reserve(note.params.changes.size());
 
+            bool config_changed = false;
             for (const auto& change : note.params.changes) {
                 const auto& uri = change.uri.raw_uri_;
                 if (uri.empty())
                     continue;
+                // A config is not a source file: it decides which project every
+                // *other* file belongs to, so it cannot be handled by the
+                // per-file refresh below.  Creating one makes a project no
+                // recorded root names, and deleting one hands its files back to
+                // whatever is above.
+                if (std::filesystem::path(path_from_file_uri(uri)).filename() ==
+                    ProjectRootResolver::kMarker) {
+                    config_changed = true;
+                    continue;
+                }
                 if (change.type == lsFileChangeType::Deleted)
                     deleted_uris.push_back(uri);
                 else
                     changed_uris.push_back(uri);
+            }
+
+            if (config_changed) {
+                // The same two steps didChangeConfiguration takes, and for the
+                // same reason: which file a config governs is the resolver's
+                // answer and the answer can now be different, and every known
+                // project is rebuilt rather than only the one that changed.
+                invalidate_config_cache();
+                reload_all_projects();
             }
 
             // Event-driven project-shard refresh.  This deliberately avoids
