@@ -644,6 +644,24 @@ class Analyzer {
     /// philosophy: current file uses AST, project files use index.
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
 
+    /// The same shards, ordered nearest-first against @p from_path.
+    ///
+    /// This is the order every by-name scan over the project has to run in --
+    /// see by_path_proximity() -- and it is memoized because computing it is
+    /// linear in the filelist while the thing it depends on is not: the
+    /// snapshot is immutable and shared until the next publish, and a person
+    /// asks several questions about the same buffer before either changes.
+    /// Ordering per request instead measured 129us on 1500 files and 455us on
+    /// 5000, against a go-to-definition that otherwise answers in single-digit
+    /// microseconds.
+    ///
+    /// Holding @p files keeps the pointers valid and makes its address a sound
+    /// cache key; without that a freed snapshot could be replaced by a new one
+    /// at the same address and this would hand back pointers into it.
+    std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+    ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                       std::string_view from_path) const;
+
     /// Return the last background-published project-wide shard snapshot.
     ///
     /// This is the Option-B project index: publishing records immutable per-file
@@ -707,9 +725,15 @@ class Analyzer {
   private:
     std::shared_ptr<DocumentState> make_state(const std::string& uri,
                                               const std::string& text) const;
+    /// @p ranked is the candidate files **in the order they should be tried**.
+    /// Every search below takes the first that can answer, so that order is
+    /// what decides which project a name resolves into; the caller owns it
+    /// (ranked_extra_files()) because it owns the request.  Passing an empty
+    /// span restricts the search to the current document, which is what
+    /// find_references() wants.
     std::optional<Location>
     definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                        std::span<const ExtraFileInfo> extra_files,
+                        std::span<const ExtraFileInfo* const> ranked,
                         const std::string* skip_extra_uri = nullptr) const;
 
     struct ExtraFileCacheEntry {
@@ -776,6 +800,14 @@ class Analyzer {
 
     mutable std::mutex map_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
+
+    // One entry, because requests arrive about one buffer at a time.  Its own
+    // mutex: this is read on every definition/hover, and map_mutex_ is what the
+    // index workers hold.
+    mutable std::mutex ranked_extra_mutex_;
+    mutable std::shared_ptr<const std::vector<ExtraFileInfo>> ranked_extra_source_;
+    mutable std::string ranked_extra_from_;
+    mutable std::shared_ptr<const std::vector<const ExtraFileInfo*>> ranked_extra_cache_;
     /// Install @p inputs as the defaults, keeping every registered project's.
     /// Requires map_mutex_.
     void replace_default_parse_inputs_locked(ParseInputs inputs);
