@@ -5053,16 +5053,34 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     return result;
 }
 
-std::optional<Location>
-Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
+std::optional<Location>Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
                               std::span<const ExtraFileInfo> extra_files,
                               const std::string* skip_extra_uri) const {
     if (!state.tree)
         return std::nullopt;
 
-    auto skip_extra = [&](const ExtraFileInfo& extra) {
-        return skip_extra_uri && extra.uri == *skip_extra_uri;
+    auto skip_extra = [&](const ExtraFileInfo* extra) {
+        return skip_extra_uri && extra->uri == *skip_extra_uri;
     };
+
+    // Nearest-first, and that ordering is the whole cross-project answer.
+    //
+    // Every by-name search below takes the first candidate that can answer it.
+    // SystemVerilog's module and package namespaces are flat and global while
+    // this index is a union across every open project, so "the first candidate"
+    // decided which project a name resolved into -- and the candidates arrive
+    // sorted by path, which meant the alphabetically-first project won every
+    // tie regardless of which file was asking.  Two projects open in one editor
+    // session both declaring `fifo` is routine, and go-to-definition on the one
+    // in `chip_b` landed in `chip_a`.
+    //
+    // Ranking the candidates once, here, fixes every scan below at the same
+    // time and leaves each of them written as the first-match scan it already
+    // was.  This is the rule AutoInst, AutoWire, inlay hints, lint and the RTL
+    // tree already went through ProjectIndexSnapshot::find_module() to get;
+    // they share its scoring function, so the features can no longer disagree
+    // about which project a name belongs to.
+    const auto ranked = by_path_proximity(extra_files, std::string_view(state.normalized_path));
 
     auto target = definition_target_at(*state.tree, uri, line, col);
 
@@ -5074,12 +5092,12 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
         if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
             return loc;
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
-            if (!extra.state || !extra.state->tree)
+            if (!extra->state || !extra->state->tree)
                 continue;
-            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, ident->text))
+            if (auto loc = find_macro_definition(*extra->state->tree, extra->uri, ident->text))
                 return loc;
         }
         return std::nullopt;
@@ -5088,12 +5106,12 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto loc = find_macro_definition(*state.tree, uri, target.name))
             return loc;
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
-            if (!extra.state || !extra.state->tree)
+            if (!extra->state || !extra->state->tree)
                 continue;
-            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, target.name))
+            if (auto loc = find_macro_definition(*extra->state->tree, extra->uri, target.name))
                 return loc;
         }
         return std::nullopt;
@@ -5104,11 +5122,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                     target.name))
             return loc;
 
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
             if (auto loc =
-                    find_port_definition(extra.index_ref(), extra.uri, target.module_name, target.name))
+                    find_port_definition(extra->index_ref(), extra->uri, target.module_name, target.name))
                 return loc;
         }
         return std::nullopt;
@@ -5119,11 +5137,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                     target.name))
             return loc;
 
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
             if (auto loc =
-                    find_port_definition(extra.index_ref(), extra.uri, target.module_name, target.name))
+                    find_port_definition(extra->index_ref(), extra->uri, target.module_name, target.name))
                 return loc;
         }
         return std::nullopt;
@@ -5134,12 +5152,12 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                            target.name))
             return loc;
 
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
-            if (!extra.state || !extra.state->tree)
+            if (!extra->state || !extra->state->tree)
                 continue;
-            if (auto loc = find_subroutine_argument_definition(*extra.state->tree, extra.uri,
+            if (auto loc = find_subroutine_argument_definition(*extra->state->tree, extra->uri,
                                                                target.subroutine_name, target.name))
                 return loc;
         }
@@ -5149,10 +5167,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     if (target.kind == DefinitionTargetKind::Instance) {
         if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
             return loc;
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
-            if (auto loc = find_module_definition(extra.index_ref(), extra.uri, target.module_name))
+            if (auto loc = find_module_definition(extra->index_ref(), extra->uri, target.module_name))
                 return loc;
         }
         return std::nullopt;
@@ -5164,11 +5182,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // Every shard a class hierarchy could be spread across, current file first.
     auto class_lookup_shards = [&] {
         std::vector<ClassLookupShard> shards;
-        shards.reserve(extra_files.size() + 1);
+        shards.reserve(ranked.size() + 1);
         shards.push_back(ClassLookupShard{&current_index, &uri});
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (!skip_extra(extra))
-                shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+                shards.push_back(ClassLookupShard{&extra->index_ref(), &extra->uri});
         }
         return shards;
     };
@@ -5181,13 +5199,13 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (!target.qualifier_scope.empty()) {
             auto aliased =
                 scoped_typedef_base_type(current_index, target.qualifier_scope, qualifier);
-            for (const auto& extra : extra_files) {
+            for (const auto* extra : ranked) {
                 if (aliased)
                     break;
                 if (skip_extra(extra))
                     continue;
                 aliased =
-                    scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope, qualifier);
+                    scoped_typedef_base_type(extra->index_ref(), target.qualifier_scope, qualifier);
             }
             if (aliased)
                 qualifier = *aliased;
@@ -5195,10 +5213,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
         if (auto loc = find_package_member(current_index, uri, qualifier, target.name))
             return loc;
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (skip_extra(extra))
                 continue;
-            if (auto loc = find_package_member(extra.index_ref(), extra.uri, qualifier,
+            if (auto loc = find_package_member(extra->index_ref(), extra->uri, qualifier,
                                                 target.name))
                 return loc;
         }
@@ -5288,10 +5306,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             while (type && visited.insert(*type).second) {
                 auto next = typedef_alias_target(current_index, *type);
                 if (!next) {
-                    for (const auto& extra : extra_files) {
+                    for (const auto* extra : ranked) {
                         if (skip_extra(extra))
                             continue;
-                        next = typedef_alias_target(extra.index_ref(), *type);
+                        next = typedef_alias_target(extra->index_ref(), *type);
                         if (next)
                             break;
                     }
@@ -5334,10 +5352,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
-            for (const auto& extra : extra_files) {
+            for (const auto* extra : ranked) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
+                if (auto loc = find_typedef_field_definition(extra->index_ref(), extra->uri,
                                                              *class_type, target.name))
                     return loc;
             }
@@ -5365,10 +5383,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
                                                             target.name))
                 return loc;
-            for (const auto& extra : extra_files) {
+            for (const auto* extra : ranked) {
                 if (skip_extra(extra))
                     continue;
-                if (auto loc = find_interface_member_definition(extra.index_ref(), extra.uri,
+                if (auto loc = find_interface_member_definition(extra->index_ref(), extra->uri,
                                                                 interface_name, target.name))
                     return loc;
             }
@@ -5462,17 +5480,16 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
     }
 
-    for (const auto& extra : extra_files) {
+    for (const auto* extra : ranked) {
         if (skip_extra(extra))
             continue;
-        if (auto loc = find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
+        if (auto loc = find_generic_definition_from_index(extra->index_ref(), extra->uri, target.name,
                                                           target.scope_module, target.scope_package,
                                                           visible_imports, use_line_one_based))
             return loc;
     }
 
-    return std::nullopt;
-}
+    return std::nullopt;}
 
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
                                                 bool include_declaration) const {
