@@ -2275,3 +2275,66 @@ endmodule
     CHECK(loc->line == 2);
     CHECK(loc->col == 18);
 }
+
+// The window between a didChange and the parse it starts.
+//
+// Neovim -- and nvim-cmp with it -- issues hover, go-to-definition and
+// signature help from the same notification that carried the edit, so the
+// snapshot these requests find is the text-only placeholder enqueue_parse()
+// installed and `tree` is null.  Giving up there answered *every* request made
+// while the user types with nothing, and the client renders that: measured
+// against a live server on an unchanged file and position, 5 of 5 hovers came
+// back null when issued alongside the didChange and 5 of 5 were correct when
+// issued after the parse had landed.
+//
+// The parse worker is held with set_parse_paused() so the window is a state the
+// test enters rather than one it races the worker for -- the same reason the
+// folding tests do it.  Pausing also forces the *fallback* half of
+// get_parsed_state(): its wait times out and the answer comes from the snapshot
+// one keystroke old, which is the path worth pinning.  With the worker running,
+// the wait returns the current parse and the answer is simply correct.
+TEST_CASE("definition: an edit in flight still resolves", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_reparse.sv";
+    analyzer.open(uri, kDefinitionFixture);
+
+    const auto settled = analyzer.definition_of(uri, 8, 11);
+    REQUIRE(settled.has_value());
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, kDefinitionFixture + std::string("\n// edit\n"));
+
+    auto placeholder = analyzer.get_state(uri);
+    REQUIRE(placeholder != nullptr);
+    REQUIRE(placeholder->tree == nullptr); // really in the window
+
+    const auto in_flight = analyzer.definition_of(uri, 8, 11);
+    CHECK(in_flight.has_value());
+    if (in_flight)
+        CHECK(in_flight->line == settled->line);
+
+    analyzer.set_parse_paused(false);
+}
+
+TEST_CASE("definition: hover during an edit in flight still answers", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/hover_reparse.sv";
+    analyzer.open(uri, kDefinitionFixture);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(8, 11);
+
+    REQUIRE(provide_hover(analyzer, params).has_value());
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, kDefinitionFixture + std::string("\n// edit\n"));
+
+    auto placeholder = analyzer.get_state(uri);
+    REQUIRE(placeholder != nullptr);
+    REQUIRE(placeholder->tree == nullptr);
+
+    CHECK(provide_hover(analyzer, params).has_value());
+
+    analyzer.set_parse_paused(false);
+}

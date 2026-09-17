@@ -4470,7 +4470,19 @@ static std::string declaration_type_from_source_line(const std::string& path, in
 }
 
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
-    auto state = get_state(uri);
+    // The last snapshot that parsed, not simply the last one.  The editor
+    // issues this request from the same notification that started the reparse,
+    // so `get_state()` hands back a text-only placeholder and giving up there
+    // answers *every* request made while the user types with nothing -- which
+    // the client renders.  Measured on an unchanged file and position: 5 of 5
+    // hovers null when issued alongside the didChange, 5 of 5 correct when
+    // issued after the parse landed.
+    //
+    // get_parsed_state() waits for the reparse first, so the ordinary answer is
+    // the current one; only a file that parses slower than the wait falls back
+    // to the snapshot one keystroke old, which is what the user was looking at
+    // a moment ago.  Same trade, and the same call, as inlay hints.
+    auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
 
@@ -4925,7 +4937,19 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
     const auto start = Clock::now();
-    auto state = get_state(uri);
+    // The last snapshot that parsed, not simply the last one.  The editor
+    // issues this request from the same notification that started the reparse,
+    // so `get_state()` hands back a text-only placeholder and giving up there
+    // answers *every* request made while the user types with nothing -- which
+    // the client renders.  Measured on an unchanged file and position: 5 of 5
+    // hovers null when issued alongside the didChange, 5 of 5 correct when
+    // issued after the parse landed.
+    //
+    // get_parsed_state() waits for the reparse first, so the ordinary answer is
+    // the current one; only a file that parses slower than the wait falls back
+    // to the snapshot one keystroke old, which is what the user was looking at
+    // a moment ago.  Same trade, and the same call, as inlay hints.
+    auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
 
