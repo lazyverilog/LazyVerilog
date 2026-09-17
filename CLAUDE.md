@@ -203,9 +203,33 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   shard while an includer's copy of them can be a burst behind.  Like clangd we ignore
   semantic roots (`FileDistance.h` says so outright), so two files equally far from the
   asker are not distinguishable and path order decides.
-- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
-  through AutoInst: the two projects' modules differ in their ports, so the ports that
-  come back name which project answered.
+- **The rule is the candidate order, not a lookup only some features call.**  A
+  feature that answers from the prebuilt by-name table calls `find_module()`; one that
+  scans the project's shards by name and takes the first that answers — go-to-definition,
+  hover, Connect — instead orders its candidates with `by_path_proximity()`, which shares
+  `find_module()`'s scoring function.  Both are "nearest to the asking file wins", and
+  keeping them on one scoring function is what stops the features disagreeing about which
+  project a name belongs to.  They did: ranking lived only in `find_module()`, so
+  go-to-definition on an instance in one project landed in the other, and renaming the
+  directories moved the answer.
+- A first-match scan over an *ordered* candidate list is the intended shape — do not
+  teach each scan to rank.  `definition_of_state()` orders once and its recoveries are
+  written as `nearest_shard_answer()` / `nearest_open_buffer_answer()`, which take only
+  the lookup that decides what counts as an answer; `collect_files()` orders the vector
+  every Connect consumer already reads in order.  Nine hand-written copies of that loop
+  is how the defect came to be in nine places at once.
+- **`find_references()` is a known exception.**  Its target resolution is ranked with
+  the rest, but the occurrence search that follows keys on `module::<name>` — a
+  `SymbolID` with no project in it — so two projects' `fifo` declarations are one symbol
+  and references/rename report both.  Making that identity project-aware is a shard
+  format change (`kFormatVersion`), and it has to keep reporting both for shared IP that
+  really is used by two projects.
+- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, end to end through
+  AutoInst, go-to-definition, hover and Connect.  Each case asserts **both** directions,
+  because a first-match implementation answers both with the same project and would
+  otherwise pass for whichever file it happened to pick.  Aiming the guard at AutoInst
+  alone — the one feature that already called `find_module()` — is why four features
+  without the rule went unnoticed.
 - **A saved config rebuilds every known project, not just the one that changed**
   (`reload_all_projects()`).  Reloading only the saved config replaced the merged
   filelist with that project's own, which unindexed every other open project until
