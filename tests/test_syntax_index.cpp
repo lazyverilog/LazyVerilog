@@ -1416,6 +1416,82 @@ TEST_CASE("project index: the published shard order does not depend on hash orde
     fs::remove_all(dir);
 }
 
+namespace {
+
+/// A throwaway project of @p count trivial modules, indexed and ready to time.
+///
+/// Held by unique_ptr because Analyzer is neither movable nor copyable, and
+/// both halves of a scaling comparison have to exist at once -- see the
+/// interleaving note in the guards below.
+struct SizedProject {
+    std::filesystem::path dir;
+    std::unique_ptr<Analyzer> analyzer;
+
+    SizedProject(const std::string& tag, int count) {
+        namespace fs = std::filesystem;
+        dir = fs::temp_directory_path() / (tag + "_" + std::to_string(count));
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < count; ++i) {
+            const auto path = dir / ("m" + std::to_string(i) + ".sv");
+            std::ofstream out(path);
+            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
+            paths.push_back(path.string());
+        }
+        analyzer = std::make_unique<Analyzer>();
+        analyzer->set_project_index_publish_debounce_ms(0);
+        analyzer->set_extra_files(paths);
+        analyzer->wait_for_background_index_idle();
+    }
+    ~SizedProject() {
+        analyzer.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+/// Time @p body over both projects alternately, returning each one's fastest
+/// round.
+///
+/// Alternating matters more than the number of rounds.  Timing one project to
+/// completion and then the other lets a runner that goes busy part way through
+/// land entirely on one half, which turns a ratio into a measurement of the
+/// machine -- observed as a one-in-several-runs failure when the two were timed
+/// in sequence.  Interleaved, whatever the runner does slows both.
+template <typename Body>
+std::pair<double, double> interleaved_best(SizedProject& small, SizedProject& large, Body&& body) {
+    const auto one = [&](SizedProject& project) {
+        const auto start = std::chrono::steady_clock::now();
+        body(*project.analyzer);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    double small_best = std::numeric_limits<double>::max();
+    double large_best = std::numeric_limits<double>::max();
+    for (int round = 0; round < 7; ++round) {
+        small_best = std::min(small_best, one(small));
+        large_best = std::min(large_best, one(large));
+    }
+    return {small_best, large_best};
+}
+
+/// A buffer that is not a filelist entry and that nothing `include`s, edited a
+/// hundred times.  Every keystroke on it is the "nothing depends on me" case.
+void edit_unrelated_buffer(Analyzer& analyzer, bool read_snapshots) {
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    for (int i = 0; i < 100; ++i) {
+        analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
+        if (read_snapshots) {
+            // What a request handler does next.
+            (void)analyzer.extra_index_snapshot_ptr();
+            (void)analyzer.extra_file_snapshot_ptr();
+        }
+    }
+}
+
+} // namespace
+
 TEST_CASE("project index: an edit's include fanout does not scale with the project",
           "[index][scaling]") {
     // didChange asks "does anything `include this file", and for an ordinary
@@ -1427,51 +1503,21 @@ TEST_CASE("project index: an edit's include fanout does not scale with the proje
     // question whose answer is always "no".
     //
     // A ratio against a structurally identical project eight times the size,
-    // minimum of several runs -- an absolute budget would not survive a shared
-    // runner.  Before the reverse map: 0.86 ms at 200 shards against 1.25 ms at
-    // 800, a ratio of 1.45 over a 4x size change.  After: 0.76 and 0.78, 1.03.
-    namespace fs = std::filesystem;
-    const auto cost_for = [](int count) {
-        const auto dir =
-            fs::temp_directory_path() / ("lazyverilog_fanout_scaling_" + std::to_string(count));
-        fs::remove_all(dir);
-        fs::create_directories(dir);
-        std::vector<std::string> paths;
-        for (int i = 0; i < count; ++i) {
-            const auto path = dir / ("m" + std::to_string(i) + ".sv");
-            std::ofstream out(path);
-            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
-            paths.push_back(path.string());
-        }
+    // fastest of several interleaved rounds -- an absolute budget would not
+    // survive a shared runner.  Before the reverse map: 0.86 ms at 200 shards
+    // against 1.25 ms at 800, a ratio of 1.45 over a 4x size change.  After:
+    // 0.76 and 0.78, 1.03.
+    SizedProject small("lazyverilog_fanout_scaling", 200);
+    SizedProject large("lazyverilog_fanout_scaling", 1600);
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    small.analyzer->open(uri, "module edit;\nendmodule\n");
+    large.analyzer->open(uri, "module edit;\nendmodule\n");
 
-        Analyzer analyzer;
-        analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_extra_files(paths);
-        analyzer.wait_for_background_index_idle();
+    const auto [small_ms, large_ms] = interleaved_best(
+        small, large, [](Analyzer& a) { edit_unrelated_buffer(a, /*read_snapshots=*/false); });
 
-        // Not a filelist entry and included by nothing, so every keystroke on
-        // it is the "answer is no" case.  Tiny, so the parse does not drown out
-        // what is being measured.
-        const std::string uri = "file:///tmp/lazyverilog_fanout_edit.sv";
-        analyzer.open(uri, "module edit;\nendmodule\n");
-
-        double best = std::numeric_limits<double>::max();
-        for (int run = 0; run < 7; ++run) {
-            const auto start = std::chrono::steady_clock::now();
-            for (int i = 0; i < 100; ++i)
-                analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
-            best = std::min(best, std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - start)
-                                      .count());
-        }
-        fs::remove_all(dir);
-        return best;
-    };
-
-    const double small = cost_for(200);
-    const double large = cost_for(1600);
-    const double ratio = large / small;
-    std::cerr << "[scaling] edit fanout: 200 -> " << small << " ms, 1600 -> " << large
+    const double ratio = large_ms / small_ms;
+    std::cerr << "[scaling] edit fanout: 200 -> " << small_ms << " ms, 1600 -> " << large_ms
               << " ms, ratio " << ratio << "\n";
     CHECK(ratio < 1.4);
 }
@@ -1491,57 +1537,24 @@ TEST_CASE("project index: an unrelated edit does not rebuild the project snapsho
     // buffer the snapshots do not mention.
     //
     // A ratio against a structurally identical project eight times the size,
-    // minimum of several runs.  Measured over 100 edits plus the two snapshot
-    // reads a request handler makes:
+    // fastest of several interleaved rounds.  Measured over 100 edits plus the
+    // two snapshot reads a request handler makes:
     //
     //     before   200 -> 2.36 ms, 1600 -> 17.09 ms   (ratio 7.23)
     //     after    200 -> 0.81 ms, 1600 ->  0.82 ms   (ratio 1.01)
     //
     // which at 1600 shards is 171 us per keystroke against 8.
-    namespace fs = std::filesystem;
-    const auto cost_for = [](int count) {
-        const auto dir =
-            fs::temp_directory_path() / ("lazyverilog_snapshot_scaling_" + std::to_string(count));
-        fs::remove_all(dir);
-        fs::create_directories(dir);
-        std::vector<std::string> paths;
-        for (int i = 0; i < count; ++i) {
-            const auto path = dir / ("m" + std::to_string(i) + ".sv");
-            std::ofstream out(path);
-            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
-            paths.push_back(path.string());
-        }
+    SizedProject small("lazyverilog_snapshot_scaling", 200);
+    SizedProject large("lazyverilog_snapshot_scaling", 1600);
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    small.analyzer->open(uri, "module edit;\nendmodule\n");
+    large.analyzer->open(uri, "module edit;\nendmodule\n");
 
-        Analyzer analyzer;
-        analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_extra_files(paths);
-        analyzer.wait_for_background_index_idle();
+    const auto [small_ms, large_ms] = interleaved_best(
+        small, large, [](Analyzer& a) { edit_unrelated_buffer(a, /*read_snapshots=*/true); });
 
-        // Not a filelist entry: nothing the snapshots mention.
-        const std::string uri = "file:///tmp/lazyverilog_snapshot_edit.sv";
-        analyzer.open(uri, "module edit;\nendmodule\n");
-
-        double best = std::numeric_limits<double>::max();
-        for (int run = 0; run < 7; ++run) {
-            const auto start = std::chrono::steady_clock::now();
-            for (int i = 0; i < 100; ++i) {
-                analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
-                // What a request handler does next.
-                (void)analyzer.extra_index_snapshot_ptr();
-                (void)analyzer.extra_file_snapshot_ptr();
-            }
-            best = std::min(best, std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - start)
-                                      .count());
-        }
-        fs::remove_all(dir);
-        return best;
-    };
-
-    const double small = cost_for(200);
-    const double large = cost_for(1600);
-    const double ratio = large / small;
-    std::cerr << "[scaling] unrelated edit + snapshot: 200 -> " << small << " ms, 1600 -> " << large
-              << " ms, ratio " << ratio << "\n";
+    const double ratio = large_ms / small_ms;
+    std::cerr << "[scaling] unrelated edit + snapshot: 200 -> " << small_ms << " ms, 1600 -> "
+              << large_ms << " ms, ratio " << ratio << "\n";
     CHECK(ratio < 1.6);
 }
