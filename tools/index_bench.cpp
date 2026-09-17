@@ -6,7 +6,7 @@
 // <project-root> must contain lazyverilog.toml.  Set LAZYVERILOG_TRACE_PERF=1
 // for per-file timings.
 //
-// The on-disk shard cache is on unless [index].cache says otherwise or --cache
+// The on-disk shard cache is on unless --cache
 // off is passed, and it persists between runs -- so with it on, only the first
 // run of a *fresh* cache is a cold start and every run after it is warm.  The
 // repeat loop here does not clear anything between iterations; use --cache off
@@ -32,9 +32,10 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
-    // --cache overrides [index].cache; absent, the config decides.  A bench that
-    // ignored the config wrote a .cache directory into a project that had
-    // asked, in that project's own config, for it not to be.
+    // --cache off measures the parse with nothing written or read, which is what
+    // startup_bench.py's --no-cache asks for.  A bench knob only: the server has
+    // no such switch, and caching is on there the way clangd's background index
+    // is.
     std::optional<bool> cache_override;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
@@ -62,7 +63,7 @@ int main(int argc, char** argv) {
     if (!warn.empty())
         std::cerr << "[config] " << warn << "\n";
     auto vcode = load_vcode(root, config);
-    const bool cache_enabled = cache_override.value_or(config.index.cache);
+    const bool cache_enabled = cache_override.value_or(true);
     // Empty root is what runs the analyzer uncached, the same way server.cpp
     // spells it.
     const std::string cache_root = cache_enabled ? root.string() : std::string{};

@@ -256,7 +256,9 @@ client is not asked to watch is one the cache refuses to hold.
 
 Shards are written to `<project_root>/.cache/lazyverilog/index` and reloaded on
 the next launch, the way clangd's background index uses
-`<project_root>/.cache/clangd/index`.  `[index].cache = false` turns it off.
+`<project_root>/.cache/clangd/index`.  There is no switch for it, as there is none
+in clangd: a directory that cannot be created runs uncached, and a file under no
+project caches outside the tree rather than in it.
 
 `project_root` is resolved **per file**, by `ProjectRootResolver` walking up to
 the nearest `lazyverilog.toml`, and the directory is chosen per file by

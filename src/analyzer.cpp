@@ -6619,8 +6619,8 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
     }
 
     // Resolved outside the lock: this file's project decides the directory, and
-    // finding it stats directories.  First, so a project whose `[index].cache`
-    // is off costs one cached lookup and nothing else.
+    // finding it stats directories.  First, so a file whose directory could not
+    // be created costs one cached lookup and nothing else.
     const IndexCache* cache = storage->for_uri(uri);
     if (cache == nullptr)
         return;

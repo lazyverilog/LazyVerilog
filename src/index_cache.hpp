@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -194,21 +193,9 @@ private:
 /// Thread-safe.  Index workers resolve and store shards concurrently.
 class IndexCacheStorage {
 public:
-    /// Whether a project may have shards written into it, asked once per
-    /// project root (empty for "no project", which is the user's own cache
-    /// directory).
-    ///
-    /// This is `[index].cache`, and it is per project for the same reason every
-    /// other setting is: with the root resolved per file there is no session
-    /// config to read it from, and a project that says `cache = false` because
-    /// nothing may be written into it means exactly that -- whichever directory
-    /// the editor happened to be launched from.  Null enables every project.
-    using CachePolicy = std::function<bool(const std::filesystem::path& source_root)>;
-
     /// @p resolver decides each file's project.  Shared because the server
     /// resolves the same files for config lookups.
-    explicit IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver,
-                               CachePolicy cache_enabled = {});
+    explicit IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver);
 
     /// Storage that puts every file's shards under @p project_root, whatever
     /// the file's own ancestors hold.
@@ -237,9 +224,6 @@ private:
     static constexpr const char* kFallbackKey = "<fallback>";
 
     std::shared_ptr<const ProjectRootResolver> resolver_;
-    /// Asked once per root; the nullopt it can produce is remembered like any
-    /// other "no cache here", so a disabled project is not re-asked per file.
-    CachePolicy cache_enabled_;
     /// Set by for_root(): every file answers with this root and no walk runs.
     std::optional<std::filesystem::path> fixed_root_;
     mutable std::mutex mutex_;
