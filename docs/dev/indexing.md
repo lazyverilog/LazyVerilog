@@ -256,7 +256,47 @@ client is not asked to watch is one the cache refuses to hold.
 
 Shards are written to `<project_root>/.cache/lazyverilog/index` and reloaded on
 the next launch, the way clangd's background index uses
-`<project_root>/.cache/clangd/index`.  `[index].cache = false` turns it off.
+`<project_root>/.cache/clangd/index`.  There is no switch for it, as there is none
+in clangd: a directory that cannot be created runs uncached, and a file under no
+project caches outside the tree rather than in it.
+
+`project_root` is resolved **per file**, by `ProjectRootResolver` walking up to
+the nearest `lazyverilog.toml`, and the directory is chosen per file by
+`IndexCacheStorage` — clangd's `DiskBackedIndexStorageManager`, whose whole body
+is this:
+
+```cpp
+llvm::SmallString<128> StorageDir(FallbackDir);
+if (auto PI = GetProjectInfo(File)) {
+  StorageDir = PI->SourceRoot;
+  llvm::sys::path::append(StorageDir, ".cache", "clangd", "index");
+}
+```
+
+The same shape applies to how each file is *parsed*.  `ProjectParseInputs`
+(`src/parse_inputs.cpp`) answers "which defines and include directories does this
+file use", which is clangd's `getCompileCommand(File)` — one index, commands
+looked up per file, and a fallback for a file under no known project rather than
+a refusal.
+
+Keeping the *storage* and the *inputs* per file rather than the *indexer* is what
+makes serving several projects affordable: a second project costs a directory, not another set
+of worker threads, another source manager and another copy of the project index.
+
+Two consequences worth stating outright:
+
+- a filelist that reaches into a sibling project writes that project's shards
+  under *its* root, so the sweep runs over every directory a burst touched;
+- an `include`d header's shard lives beside the header's own config.  A
+  verification header shared by two designs is one file in one project, and
+  looking for it under each includer's root would miss it from one side and
+  write a second copy from the other.
+
+A file with no `lazyverilog.toml` above it has no project, and that is an answer
+rather than a reason to guess: `IndexCache::open_fallback()` puts its shards in
+`user_cache_directory()/lazyverilog/index`, following the same convention as
+LLVM's `llvm::sys::path::cache_directory()`.  Guessing the file's own directory
+instead is what used to create `.cache/` beside whatever file was opened.
 
 A shard is reused only when everything it was built from still holds:
 
@@ -341,6 +381,49 @@ index therefore does not copy every symbol/reference from every file into one
 flat index.  Feature paths should use `Analyzer::project_index_snapshot()` and
 either consult its global lookups or iterate the relevant shard references rather
 than materializing a compatibility merge.
+
+### Two projects, one index: duplicate module names
+
+The snapshot is a **union across every open project**.  That is deliberate: the
+index is one object because clangd's `BackgroundIndex` is one object, and
+splitting it per project is what would make the file you were just reading
+disappear the moment you open a second project.
+
+SystemVerilog has no namespaces, though, so the union has a cost C++ mostly
+avoids.  Two designs open at once both declaring `fifo` is ordinary, not a
+corner case, and two checkouts of the same repo collide on every name.
+
+The disambiguation therefore happens at the **lookup**, not the storage:
+
+```cpp
+const auto* ref = snapshot->find_module(name, state.normalized_path);
+```
+
+`module_by_name` still holds one declaration per name.  Names with more than one
+also appear in `module_duplicates`, and `find_module()` picks among those by path
+proximity to the asking file — the same signal as clangd's
+`FuzzyFindRequest::ProximityPaths`, which `FileDistance.h` defines as an edit
+distance up and down the directory tree.  Comparison is by whole path component,
+so a sibling checkout (`chipA_old/`) scores no closer than an unrelated project.
+
+**It ranks; it never filters.**  A module with a single declaration resolves from
+anywhere, so go-to-definition still crosses into another project, and still
+reaches shared IP sitting under no `lazyverilog.toml` at all — the `common_ip/`
+case, which is normal in hardware and which a filter would break outright.  A
+filter would also mean paying the union's memory and indexing cost while
+behaving like a split index.
+
+Limitations, both shared with clangd:
+
+- When **no** candidate is near the asking file (say `common_ip/` and
+  `vendor_ip/` both declare `sync_2ff` and your project declares neither), the
+  tie is not broken and first-indexed order decides.  `FileDistance.h` notes the
+  same gap — "often there are semantic roots whose children are almost
+  unrelated… we ignore this."
+- Proximity is a heuristic about paths, not a statement about which filelist a
+  file belongs to.
+
+Guarded by `./build/lazyverilog-tests "[module-proximity]"`.
 
 ## Project-index refresh notifications
 

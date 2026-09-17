@@ -1801,3 +1801,72 @@ void SyntaxIndex::merge(const SyntaxIndex& other) {
             include_dependencies.push_back(uri);
     }
 }
+
+size_t shared_path_prefix_components(std::string_view a, std::string_view b) {
+    const auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+    size_t shared = 0;
+    size_t i = 0;
+    size_t j = 0;
+    while (true) {
+        while (i < a.size() && is_sep(a[i]))
+            ++i;
+        while (j < b.size() && is_sep(b[j]))
+            ++j;
+        if (i >= a.size() || j >= b.size())
+            break;
+
+        size_t ai = i;
+        size_t bj = j;
+        while (ai < a.size() && !is_sep(a[ai]))
+            ++ai;
+        while (bj < b.size() && !is_sep(b[bj]))
+            ++bj;
+
+        // Compare whole components, never raw prefixes: "chipA_old" must not
+        // count as sharing a component with "chipA", which is exactly the kind
+        // of sibling checkout this tie-break exists to tell apart.
+        if (a.substr(i, ai - i) != b.substr(j, bj - j))
+            break;
+
+        ++shared;
+        i = ai;
+        j = bj;
+    }
+    return shared;
+}
+
+const std::string& ProjectIndexSnapshot::module_path(const ProjectIndexModuleRef& ref) const {
+    static const std::string kNone;
+    return ref.shard_slot < shards.size() ? shards[ref.shard_slot].path : kNone;
+}
+
+const ProjectIndexModuleRef* ProjectIndexSnapshot::find_module(const std::string& name,
+                                                               std::string_view from_path) const {
+    const auto it = module_by_name.find(name);
+    if (it == module_by_name.end())
+        return nullptr;
+
+    // One declaration is the overwhelmingly common case, and it is also the
+    // only case a caller with no path in hand can be answered for.
+    if (from_path.empty() || module_duplicates.empty())
+        return &it->second;
+
+    const auto dup = module_duplicates.find(name);
+    if (dup == module_duplicates.end() || dup->second.empty())
+        return &it->second;
+
+    const ProjectIndexModuleRef* best = nullptr;
+    size_t best_shared = 0;
+    for (const auto& candidate : dup->second) {
+        if (!candidate.shard)
+            continue;
+        const size_t shared = shared_path_prefix_components(from_path, module_path(candidate));
+        // Strictly greater, so an equally distant candidate loses to the one
+        // indexed before it and the answer stays stable across requests.
+        if (!best || shared > best_shared) {
+            best = &candidate;
+            best_shared = shared;
+        }
+    }
+    return best ? best : &it->second;
+}

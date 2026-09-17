@@ -589,7 +589,8 @@ class CacheProject {
         if (include_dirs.empty())
             include_dirs.push_back(root().string());
         analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_project_config(defines, include_dirs, paths, {}, root().string());
+        analyzer.set_project_config(defines, include_dirs, paths, {},
+                                    IndexCacheStorage::for_root(root()));
         analyzer.wait_for_background_index_idle();
         // Shard writes are deliberately off the indexing path, so a test that
         // asserts on what the *next* launch sees has to wait for them.  The
@@ -797,23 +798,6 @@ TEST_CASE("index cache: no project root means no cache and no directory", "[inde
 
     CHECK(snapshot_values(analyzer.project_index_snapshot()).count("uncached") == 1);
     CHECK(!std::filesystem::exists(IndexCache::directory_for(project.root())));
-}
-
-TEST_CASE("index cache: [index].cache defaults on and can be turned off", "[index-cache]") {
-    // The server decides by handing the analyzer an empty project root, so what
-    // this pins is the config plumbing: the default, and that `false` reaches
-    // it.  The uncached behaviour itself is covered above.
-    CHECK(Config{}.index.cache);
-
-    TempDir dir("config");
-    {
-        std::ofstream out(dir.path() / "lazyverilog.toml", std::ios::binary);
-        out << "[index]\ncache = false\n";
-    }
-    std::string warning;
-    const auto config = load_config(dir.path(), &warning);
-    CHECK(warning.empty());
-    CHECK(!config.index.cache);
 }
 
 TEST_CASE("header text cache: a projected header keeps the digest of the real one",

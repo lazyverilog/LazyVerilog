@@ -10,22 +10,15 @@ local RELEASE_BASE_URL = "https://github.com/lazyverilog/LazyVerilog/releases/do
 -- lazyverilog.toml change notification
 -- ---------------------------------------------------------------------------
 
--- One filesystem watcher per LSP root.  Neovim may attach the same LazyVerilog
--- client to many buffers in the same project, so the watcher must be keyed by
--- root directory rather than by buffer.  The watcher only sends an LSP
--- notification; the server owns the actual config reload and project reindex.
-local config_watchers = {}
-
--- Debounce table keyed by root directory.  A single write often produces
--- several fs events (temporary file rename, chmod, content write, mtime update),
--- and BufWritePost can fire near the fs event as well.  Coalescing avoids
--- asking the server to reload the same lazyverilog.toml repeatedly.
-local config_reload_pending = {}
-
-local function _join_path(...)
-	local parts = { ... }
-	return table.concat(parts, "/")
-end
+-- The server decides which lazyverilog.toml governs a file, by walking up from
+-- the file itself.  Neovim does not, and must not: with no root_dir there is
+-- nothing to key a watcher on any more, and guessing one is exactly what this
+-- change removes.
+--
+-- What is left is the precise half.  BufWritePost tells us the exact config the
+-- user just saved, and the server works out which projects that affects.  A
+-- config edited outside Neovim is picked up by the server's own freshness
+-- window instead of by a watcher here.
 
 local function _normalize_path(path)
 	if vim.fs and vim.fs.normalize then
@@ -34,42 +27,10 @@ local function _normalize_path(path)
 	return vim.fn.fnamemodify(path, ":p")
 end
 
-local function _path_is_at_or_under(path, root)
-	path = path and _normalize_path(path)
-	root = root and _normalize_path(root)
-	if not path or path == "" or not root or root == "" then
-		return false
-	end
-	if path == root then
-		return true
-	end
-	return path:sub(1, #root + 1) == (root .. "/")
-end
-
-local function _client_root(client)
-	if not client then
-		return nil
-	end
-	local root = client.root_dir
-		or (client.config and client.config.root_dir)
-		or (client.workspace_folders
-			and client.workspace_folders[1]
-			and client.workspace_folders[1].name)
-	if not root or root == "" then
-		return nil
-	end
-	return _normalize_path(root)
-end
-
 local function _send_config_changed_to_client(client, changed_path, reason)
-	-- Keep the LSP payload shape in one place so both notification sources use
-	-- the exact same server contract:
-	--
-	--   * BufWritePost: explicit user save, sent immediately.
-	--   * fs_event: external/noisy change source, sent through debounce.
-	--
-	-- The server reloads from disk; configFile only selects the correct
-	-- lazyverilog.toml root when the LSP root and config root differ.
+	-- configFile names the exact file that changed.  The server does not read it
+	-- as "the project root is now here" -- it resolves that per file -- only as
+	-- "this config is stale".
 	client:notify("workspace/didChangeConfiguration", {
 		settings = {
 			lazyverilog = {
@@ -78,67 +39,6 @@ local function _send_config_changed_to_client(client, changed_path, reason)
 			},
 		},
 	})
-end
-
-local function _notify_config_changed(root, changed_path, reason)
-	root = root and _normalize_path(root)
-	if not root or root == "" then
-		return
-	end
-
-	if config_reload_pending[root] then
-		return
-	end
-	config_reload_pending[root] = true
-
-	vim.defer_fn(function()
-		config_reload_pending[root] = nil
-
-		local clients = vim.lsp.get_clients({ name = "lazyverilog" })
-		for _, client in ipairs(clients) do
-			if _client_root(client) == root then
-				_send_config_changed_to_client(client, changed_path, reason)
-			end
-		end
-	end, 150)
-end
-
-local function _start_config_watcher_for_root(root)
-	root = root and _normalize_path(root)
-	if not root or root == "" or config_watchers[root] then
-		return
-	end
-
-	local config_path = _join_path(root, "lazyverilog.toml")
-	if vim.fn.filereadable(config_path) ~= 1 then
-		-- No file exists yet.  BufWritePost below still covers the common case
-		-- where the user creates lazyverilog.toml inside Neovim.  Avoid watching
-		-- the whole root directory here: large shared/HPC project directories can
-		-- be noisy, and root-directory watchers are less portable than file
-		-- watchers.
-		return
-	end
-
-	local watcher = vim.uv.new_fs_event()
-	if not watcher then
-		return
-	end
-
-	local ok = watcher:start(config_path, {}, function(err, _filename, _events)
-		if err then
-			return
-		end
-		vim.schedule(function()
-			_notify_config_changed(root, config_path, "lazyverilog.toml changed")
-		end)
-	end)
-
-	if not ok then
-		watcher:close()
-		return
-	end
-
-	config_watchers[root] = watcher
 end
 
 -- ---------------------------------------------------------------------------
@@ -565,19 +465,6 @@ local function validate_cmd(cmd)
 end
 
 -- ---------------------------------------------------------------------------
--- Root detection
--- ---------------------------------------------------------------------------
-
-local function find_root(bufnr, markers)
-	local path = vim.api.nvim_buf_get_name(bufnr)
-	if path == "" then
-		return vim.fn.getcwd()
-	end
-	local dir = vim.fn.fnamemodify(path, ":h")
-	return vim.fs.root(dir, markers) or dir
-end
-
--- ---------------------------------------------------------------------------
 -- LSP start
 -- ---------------------------------------------------------------------------
 
@@ -674,13 +561,11 @@ local function start_lsp(cfg, cmd, bufnr)
 	end
 
 	bufnr                = bufnr or vim.api.nvim_get_current_buf()
-	local root           = find_root(bufnr, cfg.root_markers)
 
 	-- Wrap user on_attach with our defaults
 	local user_on_attach = cfg.on_attach
 	local function combined_on_attach(client, buf)
 		_default_on_attach(cfg, client, buf)
-		_start_config_watcher_for_root(_client_root(client))
 		if user_on_attach then
 			user_on_attach(client, buf)
 		end
@@ -690,7 +575,15 @@ local function start_lsp(cfg, cmd, bufnr)
 		name         = "lazyverilog",
 		cmd          = cmd,
 		cmd_env      = cfg.cmd_env,
-		root_dir     = root,
+		-- No root_dir on purpose.  It is what the server used to be told its
+		-- project was, and Neovim's answer was a guess from a marker list
+		-- resolved by marker order rather than proximity -- a .git at the top of
+		-- a monorepo outranking the lazyverilog.toml next to the file.  The
+		-- server now walks up from each file itself.
+		--
+		-- Leaving it nil also means one client for every SystemVerilog buffer in
+		-- the session rather than one per guessed root, which is what lets a
+		-- single server serve files from several projects at once.
 		filetypes    = cfg.filetypes,
 		capabilities = cfg.capabilities,
 		on_attach    = combined_on_attach,
@@ -750,24 +643,14 @@ function M.start(cfg, bufnr)
 	end
 end
 
---- Notify active LazyVerilog clients that a lazyverilog.toml file changed.
+--- Tell the server that a lazyverilog.toml was saved.
 ---
---- This is used by the plugin-level BufWritePost fallback in addition to the
---- libuv file watcher above.  It notifies clients whose detected root contains
---- the changed config file:
----
----   /proj/lazyverilog.toml       -> clients rooted at /proj
----   /proj/sub/lazyverilog.toml   -> clients rooted at /proj or /proj/sub
----
---- This is intentionally broader than exact `<root>/lazyverilog.toml` matching.
---- Neovim may root the LSP at a repository marker such as `.git`, while the
---- server discovers a nested lazyverilog.toml from an opened SystemVerilog
---- file.  If we kept exact matching, BufWritePost for that nested TOML would
---- silently drop the notification and formatter options would stay stale.
----
---- The notification carries the exact configFile path, so the server can switch
---- to that TOML's parent before reloading.  We still avoid unrelated workspaces
---- by requiring the changed TOML to live under the client's root.
+--- Every LazyVerilog client is notified, with no attempt to work out which one
+--- the file belongs to.  That filtering used to live here, along with a
+--- single-client recovery path for when it guessed wrong -- both of them
+--- consequences of the editor owning the root.  The server resolves a config
+--- to the projects it governs by walking the tree it is actually in, so the
+--- only thing worth sending is which file changed.
 function M.notify_config_changed_for_path(path, reason)
 	if not path or path == "" then
 		return
@@ -777,45 +660,8 @@ function M.notify_config_changed_for_path(path, reason)
 		return
 	end
 
-	local clients = vim.lsp.get_clients({ name = "lazyverilog" })
-	local sent = false
-	for _, client in ipairs(clients) do
-		local root = _client_root(client)
-		if root and _path_is_at_or_under(changed_path, root) then
-			_start_config_watcher_for_root(root)
-			-- BufWritePost is a precise save event from Neovim, not a noisy
-			-- filesystem event.  Send it immediately and do not consult the
-			-- debounce table used by libuv watchers; otherwise a stale/replaced
-			-- file watcher or a burst of fs events can suppress a later explicit
-			-- save and make the second config edit appear not to reload.
-			_send_config_changed_to_client(
-				client,
-				changed_path,
-				reason or "lazyverilog.toml saved"
-			)
-			sent = true
-		end
-	end
-
-	if not sent and #clients == 1 then
-		-- Recovery path for the common single-workspace case.  Some root
-		-- combinations are hard to predict:
-		--
-		--   * user starts Neovim outside the repository,
-		--   * the server later discovers lazyverilog.toml from didOpen,
-		--   * client.root_dir remains the old start/root marker,
-		--   * or path normalization differs across symlinks / mounted dirs.
-		--
-		-- Dropping the notification is worse than sending one explicit reload:
-		-- the payload contains the exact configFile, and the server uses that
-		-- path to select the TOML root before reloading.  Keep this fallback to
-		-- one active LazyVerilog client so unrelated multi-workspace sessions do
-		-- not get redirected accidentally.
-		_send_config_changed_to_client(
-			clients[1],
-			changed_path,
-			reason or "lazyverilog.toml saved"
-		)
+	for _, client in ipairs(vim.lsp.get_clients({ name = "lazyverilog" })) do
+		_send_config_changed_to_client(client, changed_path, reason or "lazyverilog.toml saved")
 	end
 end
 

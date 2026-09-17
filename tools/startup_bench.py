@@ -135,7 +135,8 @@ def main() -> int:
                              "mixture.")
     parser.add_argument("--no-cache", action="store_true",
                         help="run with the shard cache disabled entirely, measuring the "
-                             "parse with nothing written or read.  Overrides [index].cache.")
+                             "parse with nothing written or read.  A bench-only knob: "
+                             "the server always caches.")
     parser.add_argument("--label", default="", help="tag printed with the results")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args()

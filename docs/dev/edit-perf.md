@@ -200,6 +200,24 @@ exchanged once at `initialize`.  It no longer is.
 
 ## Round 3: revising a capability mid-session
 
+**This is history.**  Both providers are now advertised as literal `true` and the
+options are answered in the handlers by returning nothing — clangd's contract,
+and forced here by the root moving into the server: capabilities are exchanged
+before any file is open, so with a per-file root there is no single
+`[folding].enable` to answer from.  `sync_dynamic_registration()` and the
+`dynamicRegistration` probe are gone.
+
+What was measured still stands and is the cost now being paid: withholding a
+capability is what stopped Neovim asking at all — 0 requests against 4-6 over
+five keystrokes — so a disabled feature pays a round trip per keystroke that
+returns nothing.  clangd has no folding option at all (`Config.h` carries
+`InlayHints.Enabled` and nothing for folding).  If this cost matters again, the
+answer is a cheaper handler, not a withheld capability; the two mechanisms
+cannot coexist, because a client told statically ignores a later unregister.
+
+The original finding, kept because the reasoning is still what rules out
+reintroducing dynamic registration:
+
 `sync_dynamic_registration()` sends `client/registerCapability` or
 `client/unregisterCapability` when `didChangeConfiguration` reloads a config whose
 `enable` flag has flipped, so an edit takes effect without a restart.  Measured in
