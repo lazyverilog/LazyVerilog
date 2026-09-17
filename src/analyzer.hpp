@@ -898,6 +898,14 @@ class Analyzer {
     mutable uint64_t index_cache_digest_generation_{std::numeric_limits<uint64_t>::max()};
     mutable std::unordered_map<std::string, std::optional<IndexCache::Digest>>
         index_cache_digests_;
+    /// Point the digest memo at @p generation, clearing it, if @p generation is
+    /// newer than the one it holds.  True when it was adopted (and so emptied).
+    ///
+    /// Forward only.  The background generation counts up and never down, and a
+    /// caller behind it is a worker whose parse has already been superseded;
+    /// letting it re-tag the memo backwards made the current burst's digests
+    /// disappear.  Requires index_cache_digest_mutex_.
+    bool adopt_digest_generation_locked(uint64_t generation) const;
     std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
                                                          uint64_t generation) const;
     /// Digests of the bytes the burst's parses actually read, as opposed to

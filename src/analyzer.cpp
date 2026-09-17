@@ -6544,15 +6544,17 @@ std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string
                                                                uint64_t generation) const {
     {
         std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
-        if (index_cache_digest_generation_ != generation) {
-            index_cache_digests_.clear();
-            index_cache_parsed_digests_.clear();
-            index_cache_digest_generation_ = generation;
+        if (adopt_digest_generation_locked(generation)) {
+            // Nothing to serve yet: this generation's memo starts empty.
         }
-        else if (const auto it = index_cache_digests_.find(uri);
-                 it != index_cache_digests_.end()) {
-            return it->second;
+        else if (index_cache_digest_generation_ == generation) {
+            if (const auto it = index_cache_digests_.find(uri);
+                it != index_cache_digests_.end())
+                return it->second;
         }
+        // Otherwise this caller is behind the memo's generation.  Its answer is
+        // still wanted -- it is about a file on disk, which no generation
+        // changes -- but it must not be written into a newer burst's memo.
     }
 
     // Read and hash with the memo unlocked: two workers racing on the same file
@@ -6565,14 +6567,46 @@ std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string
     return digest;
 }
 
+bool Analyzer::adopt_digest_generation_locked(uint64_t generation) const {
+    // The background generation only ever counts up, so the memo's must too.
+    //
+    // This used to be `!=`, which let a *stale* caller reset it backwards.  A
+    // worker still parsing a file when the generation moved on reaches
+    // remember_parsed_digests() before the check that would discard its result
+    // -- the parse is the slow part, and editing an `include`d header bumps the
+    // generation on every keystroke -- so the two callers took turns clearing
+    // each other's memo and re-tagging it with their own generation.
+    //
+    // The cost was silent.  A cleared memo makes parsed_file_digest() answer
+    // nullopt for a file whose digest was just recorded, and
+    // store_shard_in_cache() reads that as "this burst never read the file in
+    // full" and writes no shard at all -- so the burst indexes the project and
+    // caches none of it, and the next launch is cold with nothing anywhere
+    // saying why.  It also puts back the O(files x header) hashing the memo
+    // exists to remove.
+    constexpr auto kNoGeneration = std::numeric_limits<uint64_t>::max();
+    if (index_cache_digest_generation_ == generation)
+        return false;
+    if (index_cache_digest_generation_ != kNoGeneration &&
+        generation < index_cache_digest_generation_)
+        return false; // stale caller; leave the newer burst's memo alone
+    index_cache_digests_.clear();
+    index_cache_parsed_digests_.clear();
+    index_cache_digest_generation_ = generation;
+    return true;
+}
+
 void Analyzer::remember_parsed_digests(const DocumentState& state, uint64_t generation) const {
     if (state.parsed_digests.empty() && state.parsed_texts.empty())
         return;
     std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
+    adopt_digest_generation_locked(generation);
     if (index_cache_digest_generation_ != generation) {
-        index_cache_digests_.clear();
-        index_cache_parsed_digests_.clear();
-        index_cache_digest_generation_ = generation;
+        // This parse belongs to a burst that has already been superseded -- its
+        // caller reaches here before the generation check that discards its
+        // shard.  What it read is not what the current burst reads, so it has
+        // nothing to contribute and must not clear what the current one has.
+        return;
     }
     // First parse of a file wins.  Every parse in a burst reads the same bytes
     // -- that is what the header projection guarantees -- so a later one has
