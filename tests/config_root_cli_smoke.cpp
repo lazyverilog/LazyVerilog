@@ -167,6 +167,52 @@ std::string format_two_projects(const fs::path& server_bin, const std::string& u
     return result.stdout_text;
 }
 
+/// Open a buffer from each of two projects, save one project's config, then ask
+/// for a project-wide lint.  Returns the server's stdout.
+///
+/// `lazyverilog.lintAll` walks the merged filelist synchronously, so what comes
+/// back names every file the server currently believes is in the session -- no
+/// waiting on the background indexer, and no timing assumption.
+///
+/// Saving a config used to *replace* that filelist with the saved project's
+/// own, which unindexed every other open project until one of its buffers was
+/// opened again.  Both projects' files have a syntax error, so both must be
+/// named here; a server that dropped one reports only the other.
+std::string lint_all_after_config_save(const fs::path& server_bin, const std::string& uri_a,
+                                       const std::string& uri_b,
+                                       const std::string& config_b_uri) {
+    static int counter = 0;
+    const fs::path input = fs::temp_directory_path() /
+                           ("lazyverilog-config-lintall-" +
+                            std::to_string(cli_process::current_process_id()) + "-" +
+                            std::to_string(counter++) + ".jsonrpc");
+    {
+        std::ofstream out(input, std::ios::binary);
+        // No rootUri: both projects are found only by walking up from the files
+        // that get opened, which is what the Neovim plugin now does.
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"capabilities":{"textDocument":{}}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        for (const auto& uri : {uri_a, uri_b}) {
+            out << frame(
+                R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                R"("uri":")" + uri +
+                R"(","languageId":"systemverilog","version":1,)"
+                R"("text":"module t;\nendmodule\n"}}})");
+        }
+        out << frame(R"({"jsonrpc":"2.0","method":"workspace/didChangeConfiguration",)"
+                     R"("params":{"settings":{"lazyverilog":{"configFile":")" +
+                     config_b_uri + R"("}}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":2,"method":"workspace/executeCommand",)"
+                     R"("params":{"command":"lazyverilog.lintAll","arguments":[]}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after a project-wide lint");
+    return result.stdout_text;
+}
+
 bool contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
 }
@@ -296,6 +342,57 @@ int main(int argc, char** argv) {
     {
         const auto out = folds_for_root(server_bin, path_to_uri(fixtures / "hints_off"));
         expect(contains(out, R"("startLine")"), "folds are computed when folding is on");
+    }
+
+    // Saving one project's config must not unindex the others.  Built here
+    // rather than checked in, because a filelist has to name absolute paths.
+    {
+        const fs::path work =
+            fs::temp_directory_path() /
+            ("lazyverilog-config-root-multi-" + std::to_string(cli_process::current_process_id()));
+        fs::remove_all(work);
+
+        const auto make_project = [&](const std::string& name) {
+            const fs::path root = work / name;
+            fs::create_directories(root / "rtl");
+            // Missing `endmodule`, so this file always produces a parse
+            // diagnostic.  lintAll reports parse diagnostics for every file in
+            // the merged filelist regardless of any [lint] setting, which makes
+            // "is this project still indexed" answerable without depending on
+            // which rules a config happens to enable.
+            {
+                std::ofstream sv(root / "rtl" / ("dep_" + name + ".sv"));
+                sv << "module dep_" << name << ";\n";
+            }
+            {
+                std::ofstream flist(root / (name + ".f"));
+                flist << (root / "rtl" / ("dep_" + name + ".sv")).generic_string() << "\n";
+            }
+            {
+                std::ofstream toml(root / "lazyverilog.toml");
+                toml << "[design]\nvcode = \"" << name << ".f\"\n";
+            }
+            {
+                std::ofstream sv(root / "rtl" / "top.sv");
+                sv << "module top_" << name << ";\nendmodule\n";
+            }
+            return root;
+        };
+
+        const fs::path root_a = make_project("a");
+        const fs::path root_b = make_project("b");
+
+        const auto out = lint_all_after_config_save(
+            server_bin, path_to_uri(root_a / "rtl" / "top.sv"),
+            path_to_uri(root_b / "rtl" / "top.sv"),
+            path_to_uri(root_b / "lazyverilog.toml"));
+
+        expect(contains(out, "dep_b.sv"),
+               "the saved project's filelist is still linted after the save");
+        expect(contains(out, "dep_a.sv"),
+               "the other open project's filelist survives a save in the first");
+
+        fs::remove_all(work);
     }
 
     std::cerr << "config-root-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run

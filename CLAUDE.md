@@ -188,6 +188,14 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
   through AutoInst: the two projects' modules differ in their ports, so the ports that
   come back name which project answered.
+- **A saved config rebuilds every known project, not just the one that changed**
+  (`reload_all_projects()`).  Reloading only the saved config replaced the merged
+  filelist with that project's own, which unindexed every other open project until
+  one of its buffers was opened again.  The rebuild also re-folds the open buffers,
+  because a `lazyverilog.toml` created just now makes a project no recorded root
+  names and the buffer that now belongs to it sent its `didOpen` long ago.
+  `fold_project_root()` accumulates and `apply_project_inputs()` applies, so folding
+  several projects still schedules one reindex generation.
 - Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
   so a session-wide set cannot pass them — each project's source only yields a module
   under its own define, or resolves a same-spelled header through its own `+incdir+`.

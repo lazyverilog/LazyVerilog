@@ -96,6 +96,24 @@ class LazyVerilogServer {
     /// changed.
     bool discover_project_for(std::string_view uri);
 
+    /// Fold one project's config and filelist into the session accumulators,
+    /// and register how its files preprocess.  Does not apply them to the
+    /// analyzer: callers batch that, so folding several projects schedules one
+    /// reindex generation rather than one each.  False when @p source_root was
+    /// already known or holds no config.
+    bool fold_project_root(const std::filesystem::path& source_root);
+
+    /// Push the accumulated project inputs into the analyzer and restart
+    /// background compilation.  The one place that transaction happens.
+    void apply_project_inputs();
+
+    /// Rebuild every known project from disk after a config was saved.
+    ///
+    /// Reloading only the config that changed is not enough: it can add or
+    /// remove filelist entries, and a newly created lazyverilog.toml changes
+    /// which project files *under* it belong to, including files already open.
+    void reload_all_projects();
+
     /// Project roots already folded in by discover_project_for(), so a burst of
     /// didOpens in one project reloads its filelist once rather than per file.
     /// The empty entry stands for "no project", which is discovered once and
@@ -107,6 +125,9 @@ class LazyVerilogServer {
     std::vector<std::string> project_include_dirs_;
     std::vector<std::string> project_files_;
     std::vector<uintmax_t> project_file_sizes_;
+    /// Where a relative filelist path is resolved from, set by the last project
+    /// folded in.  Only projects that configure one are affected by it.
+    std::filesystem::path project_vcode_path_;
 
     mutable std::mutex config_cache_mutex_;
     /// Keyed by project root; the empty key is "no project", served defaults.

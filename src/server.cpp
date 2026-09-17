@@ -661,10 +661,21 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
     if (!info)
         return false;
+    if (!fold_project_root(info->source_root))
+        return false;
+    apply_project_inputs();
+    return true;
+}
 
-    const auto key = info->source_root.string();
+bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_root) {
+    const auto key = source_root.string();
     if (!discovered_roots_.insert(key).second)
         return false;
+    if (!std::filesystem::is_regular_file(source_root / ProjectRootResolver::kMarker)) {
+        // Deleted since it was discovered.  Recorded as seen either way, so a
+        // rebuild does not try it again on every open file.
+        return false;
+    }
 
     // The merged lists serve two jobs that genuinely are session-wide:
     //
@@ -679,8 +690,8 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     //
     // How each file actually parses is registered per root just below, and does
     // not come from here.
-    auto config = load_config(info->source_root);
-    auto vcode = load_vcode(info->source_root, config);
+    auto config = load_config(source_root);
+    auto vcode = load_vcode(source_root, config);
 
     const auto append_new = [](std::vector<std::string>& into,
                                const std::vector<std::string>& from) {
@@ -695,9 +706,15 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     // Files carry a parallel size vector used to order the index burst largest
     // first, so the two have to stay in step -- appending to one without the
     // other silently reorders somebody else's burst.
+    //
+    // Deduplicated through a set, not a linear scan of what is already there:
+    // a filelist is thousands of entries on a real design, and scanning the
+    // accumulated list per candidate makes discovering one project quadratic in
+    // its own size -- paid on the didOpen that discovers it, which is now the
+    // ordinary path for a client that sends no rootUri.
+    std::unordered_set<std::string> known(project_files_.begin(), project_files_.end());
     for (size_t i = 0; i < vcode.files.size(); ++i) {
-        if (std::find(project_files_.begin(), project_files_.end(), vcode.files[i]) !=
-            project_files_.end())
+        if (!known.insert(vcode.files[i]).second)
             continue;
         project_files_.push_back(vcode.files[i]);
         project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
@@ -707,18 +724,61 @@ bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     // does not merge: a file under this root is parsed with exactly this
     // project's defines and include directories, whatever any other project
     // configures.
-    analyzer_.set_parse_inputs_for_root(info->source_root, config.design.define,
-                                        vcode.include_dirs);
+    analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs);
 
-    std::cerr << "[lazyverilog] discovered project " << key << " from an opened file ("
-              << vcode.files.size() << " files)\n";
+    // The filelist path of whichever project was folded last.  It only selects
+    // where a relative vcode path is resolved from, and every project that has
+    // one has already had its files folded in above.
+    project_vcode_path_ = resolve_vcode_path(source_root, config);
 
+    std::cerr << "[lazyverilog] project " << key << " (" << vcode.files.size() << " files)\n";
+    return true;
+}
+
+void LazyVerilogServer::apply_project_inputs() {
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
-                                 resolve_vcode_path(info->source_root, config),
-                                 index_cache_storage(), project_file_sizes_);
+                                 project_vcode_path_, index_cache_storage(),
+                                 project_file_sizes_);
     configure_background_compiler();
     schedule_background_compilation();
-    return true;
+}
+
+void LazyVerilogServer::reload_all_projects() {
+    // Everything is re-derived, so the accumulators start empty.  Replacing
+    // them with only the saved config's project is what this replaced: it
+    // dropped every other open project's files from the index until one of its
+    // buffers was opened again.
+    const auto previously_known = discovered_roots_;
+    discovered_roots_.clear();
+    project_defines_.clear();
+    project_include_dirs_.clear();
+    project_files_.clear();
+    project_file_sizes_.clear();
+    project_vcode_path_.clear();
+
+    // The session root first, so it keeps deciding `config_` and the eager
+    // half, then every root discovered since.
+    if (root_resolver_ && !root_.empty()) {
+        if (auto info = root_resolver_->project_info(root_))
+            fold_project_root(info->source_root);
+    }
+    for (const auto& root : previously_known)
+        fold_project_root(std::filesystem::path(root));
+
+    // And the open buffers, last.  A lazyverilog.toml created just now makes a
+    // project that no root in either set above names, and the buffer that now
+    // belongs to it has long since sent its didOpen.
+    if (root_resolver_) {
+        analyzer_.for_each_state([&](const std::string& open_uri,
+                                     const std::shared_ptr<const DocumentState>& doc) {
+            if (!doc)
+                return;
+            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri)))
+                fold_project_root(info->source_root);
+        });
+    }
+
+    apply_project_inputs();
 }
 
 void LazyVerilogServer::invalidate_config_cache() {
@@ -728,10 +788,10 @@ void LazyVerilogServer::invalidate_config_cache() {
         std::lock_guard<std::mutex> lock(config_cache_mutex_);
         config_cache_.clear();
     }
-    // A saved config can have changed the filelist, so the projects folded in
-    // from it have to be foldable again.  The accumulated inputs are kept:
-    // dropping them would unindex every other project until each was reopened.
-    discovered_roots_.clear();
+    // Which projects are known is not cleared here: reload_all_projects() owns
+    // that, and it re-derives the accumulated inputs at the same time.  Clearing
+    // it here instead left the analyzer holding a filelist no longer backed by
+    // any recorded root.
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
@@ -1059,31 +1119,32 @@ void LazyVerilogServer::register_handlers() {
 
                 auto vcode = load_vcode(root_, config_);
 
-                // Seed the accumulators discover_project_for() appends to, and
-                // record the root as seen.  Without this the first didOpen in
-                // this same project would load its filelist a second time and
-                // schedule a redundant full reindex.
-                project_defines_     = config_.design.define;
-                project_include_dirs_ = vcode.include_dirs;
-                project_files_       = vcode.files;
-                project_file_sizes_  = vcode.file_sizes;
+                // Seed the accumulators through the same fold every later
+                // project goes through, so the eager root and a discovered one
+                // cannot drift apart.  Folding also records the root as seen:
+                // without that the first didOpen in this same project would
+                // load its filelist a second time and schedule a redundant
+                // full reindex.
+                //
+                // Only if the config really is here.  Recording a root that
+                // holds no lazyverilog.toml would suppress the discovery of the
+                // real one above it.
                 if (root_resolver_) {
-                    // Only if the config really is here.  Recording a root that
-                    // holds no lazyverilog.toml would suppress the discovery of
-                    // the real one above it.
-                    if (auto info = root_resolver_->project_info(root_)) {
-                        discovered_roots_.insert(info->source_root.string());
-                        analyzer_.set_parse_inputs_for_root(info->source_root,
-                                                            config_.design.define,
-                                                            vcode.include_dirs);
-                    }
+                    if (auto info = root_resolver_->project_info(root_))
+                        fold_project_root(info->source_root);
+                }
+                if (project_files_.empty()) {
+                    // rootUri names a directory with no config above it.  There
+                    // is still a filelist to index -- load_vcode() found one --
+                    // and no root to attribute it to.
+                    project_defines_      = config_.design.define;
+                    project_include_dirs_ = vcode.include_dirs;
+                    project_files_        = vcode.files;
+                    project_file_sizes_   = vcode.file_sizes;
+                    project_vcode_path_   = resolve_vcode_path(root_, config_);
                 }
 
-                analyzer_.set_project_config(project_defines_, project_include_dirs_,
-                                             project_files_, resolve_vcode_path(root_, config_),
-                                             index_cache_storage(), project_file_sizes_);
-                configure_background_compiler();
-                schedule_background_compilation();
+                apply_project_inputs();
             };
 
             if (req.params.rootUri && !req.params.rootUri->raw_uri_.empty()) {
@@ -1247,24 +1308,22 @@ void LazyVerilogServer::register_handlers() {
                 }
 
                 // Re-read config from disk on every configuration-change
-                // notification.  Apply project-parse inputs with one analyzer
-                // transaction so a single config change schedules at most one
-                // full-project background reindex generation.
+                // notification.  `config_` stays the session's: it is what the
+                // eager half and semantic compilation read.
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                        
+
                 std::cerr << "[lazyverilog] reloaded config from "
                           << (root_ / "lazyverilog.toml").string() << "\n";
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
-                { auto vcode = load_vcode(root_, config_);
-                  analyzer_.set_project_config(config_.design.define, vcode.include_dirs,
-                                               vcode.files, resolve_vcode_path(root_, config_),
-                                               index_cache_storage(), vcode.file_sizes); }
-                configure_background_compiler();
-                schedule_background_compilation();
+
+                // Every known project, not just the one that was saved, and in
+                // one analyzer transaction so a single save schedules at most
+                // one full-project reindex generation.
+                reload_all_projects();
             } catch (const std::exception& e) {
                 std::cerr << "[lazyverilog] didChangeConfiguration error: " << e.what() << "\n";
             }
