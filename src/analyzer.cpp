@@ -5473,6 +5473,26 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     });
 }
 
+/// Whether a target of this kind can be recovered from the compact shards.
+///
+/// These are the kinds whose declaration a closed project file can hold and
+/// whose lookup the shards actually carry, so references/rename started from a
+/// use site can find their target without walking a closed file's AST.  Named
+/// as a set rather than spelled as a condition on each recovery, because the
+/// recoveries are now one loop and it decides whether that loop runs at all.
+static bool target_kind_recoverable_from_shards(DefinitionTargetKind kind) {
+    switch (kind) {
+    case DefinitionTargetKind::Instance:
+    case DefinitionTargetKind::NamedPort:
+    case DefinitionTargetKind::NamedParameter:
+    case DefinitionTargetKind::PackageMember:
+    case DefinitionTargetKind::Generic:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
                                                 bool include_declaration) const {
     auto target = identifier_at(uri, line, col);
@@ -5495,42 +5515,47 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
                                          : DefinitionTarget{};
     auto target_def = definition_of_state(*state, uri, line, col, extra_files);
-    if (!target_def && target_info.kind == DefinitionTargetKind::Instance) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_module_definition(extra.index_ref(), extra.uri,
-                                                     target_info.module_name)))
-                break;
-        }
-    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedPort) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
-                                                   target_info.module_name, target_info.name)))
-                break;
-        }
-    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedParameter) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
-                                                   target_info.module_name, target_info.name)))
-                break;
-        }
-    } else if (!target_def && (target_info.kind == DefinitionTargetKind::Generic ||
-                               target_info.kind == DefinitionTargetKind::PackageMember)) {
-        // A name only a closed project file can explain — typically a package
-        // member reached through an import, either bare or `pkg::`-qualified.
-        // definition_of_state() above ran without extra files by design, so it
-        // could not leave the open buffers.  Recover the declaration from the
-        // compact shards rather than walking closed-file ASTs; without this,
-        // references/rename started *from the use site* return nothing at all.
+    if (!target_def && target_kind_recoverable_from_shards(target_info.kind)) {
+        // A name only a closed project file can explain -- an instantiated
+        // module, a port or parameter on one, or a package member reached
+        // through an import.  The definition_of_state() call above deliberately
+        // ran with no extra files, so it could not leave the open buffers; each
+        // of these used to recover with its own copy of one loop, two of them
+        // byte-identical, and every copy took whichever shard came first.
+        //
+        // Nearest-first, for the reason definition_of_state() is: the module
+        // namespace is flat and global across a union index, so with two
+        // projects open the first shard that could answer was the one from the
+        // alphabetically first project rather than the asking file's own.
+        // References started from a use site in one project would resolve their
+        // target into the other and then report that module's occurrences.
         const auto visible_imports =
-            state->tree ? get_dynamic_index(*state).imports : std::vector<ImportEntry>{};
-        for (const auto& extra : *extra_idx) {
-            if (target_info.kind == DefinitionTargetKind::PackageMember) {
-                target_def = find_package_member(extra.index_ref(), extra.uri,
+            (target_info.kind == DefinitionTargetKind::Generic && state->tree)
+                ? get_dynamic_index(*state).imports
+                : std::vector<ImportEntry>{};
+        for (const auto* extra : by_path_proximity(std::span<const ExtraIndexInfo>(*extra_idx),
+                                                   std::string_view(state->normalized_path))) {
+            switch (target_info.kind) {
+            case DefinitionTargetKind::Instance:
+                target_def = find_module_definition(extra->index_ref(), extra->uri,
+                                                    target_info.module_name);
+                break;
+            case DefinitionTargetKind::NamedPort:
+            case DefinitionTargetKind::NamedParameter:
+                target_def = find_port_definition(extra->index_ref(), extra->uri,
+                                                  target_info.module_name, target_info.name);
+                break;
+            case DefinitionTargetKind::PackageMember:
+                target_def = find_package_member(extra->index_ref(), extra->uri,
                                                  target_info.package_qualifier, target_info.name);
-            } else {
+                break;
+            case DefinitionTargetKind::Generic:
                 target_def = find_generic_definition_from_index(
-                    extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                    extra->index_ref(), extra->uri, target_info.name, target_info.scope_module,
                     target_info.scope_package, visible_imports, line + 1);
+                break;
+            default:
+                break; // guarded by target_kind_recoverable_from_shards()
             }
             if (target_def)
                 break;
