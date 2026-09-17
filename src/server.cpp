@@ -632,7 +632,8 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     // the editor's guessed root happened to name.
     if (!root_resolver_)
         return config_for_root({});
-    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
+                                             ProjectRootResolver::PathKind::File);
     return config_for_root(info ? info->source_root : std::filesystem::path{});
 }
 
@@ -662,7 +663,8 @@ LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) con
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     if (!root_resolver_)
         return false;
-    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
+                                             ProjectRootResolver::PathKind::File);
     if (!info)
         return false;
     if (!fold_project_root(info->source_root))
@@ -799,7 +801,8 @@ void LazyVerilogServer::reload_all_projects() {
                                      const std::shared_ptr<const DocumentState>& doc) {
             if (!doc)
                 return;
-            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri)))
+            if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri),
+                                                        ProjectRootResolver::PathKind::File))
                 open_roots.insert(info->source_root.string());
         });
         for (const auto& root : open_roots)

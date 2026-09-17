@@ -897,7 +897,8 @@ const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
         info = ProjectInfo{*fixed_root_};
         key = fixed_root_->string();
     } else if (resolver_) {
-        info = resolver_->project_info(path_from_file_uri(std::string(uri)));
+        info = resolver_->project_info(path_from_file_uri(std::string(uri)),
+                                      ProjectRootResolver::PathKind::File);
         if (info)
             key = info->source_root.string();
     }
