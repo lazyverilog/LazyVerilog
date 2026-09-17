@@ -69,7 +69,7 @@ void ProjectParseInputs::set_for_root(const fs::path& root, ParseInputs inputs) 
 
 const ParseInputs& ProjectParseInputs::for_path(const fs::path& path) const {
     if (resolver_ && !by_root_.empty()) {
-        if (auto info = resolver_->project_info(path)) {
+        if (auto info = resolver_->project_info(path, ProjectRootResolver::PathKind::File)) {
             auto it = by_root_.find(info->source_root.string());
             if (it != by_root_.end())
                 return *it->second;

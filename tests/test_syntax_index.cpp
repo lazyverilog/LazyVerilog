@@ -1,6 +1,7 @@
 #include "analyzer.hpp"
 #include "string_utils.hpp"
 #include "syntax_index.hpp"
+#include <iostream>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -908,6 +909,28 @@ TEST_CASE("project index: shared header text is indexed once per including file"
     REQUIRE(reparsed->shards.size() == 3);
     CHECK(shared_width(*reparsed) == "32");
 
+    // The header's *own* shard, which is where its declarations live and what
+    // a feature resolving a header symbol is told to consult.  Asking any
+    // shard, as shared_width() does, does not pin this: an includer reparsed
+    // through the open-buffer overlay carries the new value too, so the check
+    // above passes even when the header's shard is describing what was last
+    // saved.  It was -- the header reaches build_header_shards() through
+    // SyntaxTree::fromFile(), and preload_open_text_overlays() skips the
+    // overlay for the path being parsed, so the one buffer whose unsaved text
+    // this shard is about was the one buffer it could not see.
+    auto header_shard = std::find_if(reparsed->shards.begin(), reparsed->shards.end(),
+                                     [&](const ProjectIndexSnapshot::Shard& shard) {
+                                         return shard.uri == header_uri;
+                                     });
+    REQUIRE(header_shard != reparsed->shards.end());
+    REQUIRE(header_shard->index);
+    std::string from_header_shard;
+    for (const auto& value : header_shard->index->values) {
+        if (value.name == "SHARED_W")
+            from_header_shard = value.default_value;
+    }
+    CHECK(from_header_shard == "32");
+
     fs::remove_all(dir);
 }
 
@@ -1326,4 +1349,256 @@ TEST_CASE("syntax_index: a type spelled as an object-like macro resolves to the 
     // A macro standing for a dimension keeps the user's spelling: there is no
     // base type name to resolve, and port/signal text is used to generate code.
     CHECK(type_of("bus").find("`WIDTH") != std::string::npos);
+}
+
+TEST_CASE("project index: the published shard order does not depend on hash order", "[index]") {
+    // `module_by_name` keeps the first declaration it meets, and find_module()
+    // breaks a proximity tie the same way -- both on the promise that "first"
+    // means something fixed.  The snapshot was built by walking two
+    // unordered_maps, so "first" meant whichever bucket order the last rehash
+    // produced.  SystemVerilog's module namespace is flat and global, so two
+    // projects open in one session routinely both declare `fifo`, and the
+    // winner could change on any republish -- one per indexing burst, one per
+    // edit of a listed file -- with nothing in the tree having changed.
+    //
+    // Asserted as the invariant rather than by trying to catch a flip: headers
+    // first, then files, each by path.  Eight files make an ascending bucket
+    // order vanishingly unlikely to happen by accident.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_index_order";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    auto write_file = [](const fs::path& path, const std::string& text) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    };
+
+    write_file(dir / "shared.svh", "`define ORDER_W 4\n");
+    std::vector<std::string> paths;
+    for (char name = 'a'; name <= 'h'; ++name) {
+        const auto path = dir / (std::string(1, name) + "_mod.sv");
+        write_file(path, "`include \"shared.svh\"\nmodule m_" + std::string(1, name) +
+                             ";\n    logic [`ORDER_W-1:0] sig;\nendmodule\n");
+        paths.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+    REQUIRE(snapshot->shards.size() > 2);
+
+    const auto header_uri = uri_from_path((dir / "shared.svh").string());
+    bool seen_file = false;
+    std::string previous;
+    for (const auto& shard : snapshot->shards) {
+        const bool is_header = shard.uri == header_uri;
+        if (is_header) {
+            // Headers lead: an includer's copy of a header's declarations can
+            // be a burst behind, so a consumer scanning in order has to meet
+            // the header's own shard first.
+            CHECK(!seen_file);
+        } else if (!seen_file) {
+            seen_file = true;
+            previous.clear();
+        }
+        CHECK(previous <= shard.path);
+        previous = shard.path;
+    }
+    CHECK(seen_file);
+
+    fs::remove_all(dir);
+}
+
+namespace {
+
+/// A throwaway project of @p count trivial modules, indexed and ready to time.
+///
+/// Held by unique_ptr because Analyzer is neither movable nor copyable, and
+/// both halves of a scaling comparison have to exist at once -- see the
+/// interleaving note in the guards below.
+struct SizedProject {
+    std::filesystem::path dir;
+    std::unique_ptr<Analyzer> analyzer;
+
+    SizedProject(const std::string& tag, int count) {
+        namespace fs = std::filesystem;
+        dir = fs::temp_directory_path() / (tag + "_" + std::to_string(count));
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < count; ++i) {
+            const auto path = dir / ("m" + std::to_string(i) + ".sv");
+            std::ofstream out(path);
+            out << "module m" << i << ";\n  logic [7:0] sig;\nendmodule\n";
+            paths.push_back(path.string());
+        }
+        analyzer = std::make_unique<Analyzer>();
+        analyzer->set_project_index_publish_debounce_ms(0);
+        analyzer->set_extra_files(paths);
+        analyzer->wait_for_background_index_idle();
+    }
+    ~SizedProject() {
+        analyzer.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+/// Time @p body over both projects alternately, returning each one's fastest
+/// round.
+///
+/// Alternating matters more than the number of rounds.  Timing one project to
+/// completion and then the other lets a runner that goes busy part way through
+/// land entirely on one half, which turns a ratio into a measurement of the
+/// machine -- observed as a one-in-several-runs failure when the two were timed
+/// in sequence.  Interleaved, whatever the runner does slows both.
+template <typename Body>
+std::pair<double, double> interleaved_best(SizedProject& small, SizedProject& large, Body&& body) {
+    const auto one = [&](SizedProject& project) {
+        const auto start = std::chrono::steady_clock::now();
+        body(*project.analyzer);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    double small_best = std::numeric_limits<double>::max();
+    double large_best = std::numeric_limits<double>::max();
+    for (int round = 0; round < 7; ++round) {
+        small_best = std::min(small_best, one(small));
+        large_best = std::min(large_best, one(large));
+    }
+    return {small_best, large_best};
+}
+
+/// A buffer that is not a filelist entry and that nothing `include`s, edited a
+/// hundred times.  Every keystroke on it is the "nothing depends on me" case.
+void edit_unrelated_buffer(Analyzer& analyzer, bool read_snapshots) {
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    for (int i = 0; i < 100; ++i) {
+        analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
+        if (read_snapshots) {
+            // What a request handler does next.
+            (void)analyzer.extra_index_snapshot_ptr();
+            (void)analyzer.extra_file_snapshot_ptr();
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("project index: an edit's include fanout does not scale with the project",
+          "[index][scaling]") {
+    // didChange asks "does anything `include this file", and for an ordinary
+    // .sv file the answer is no.  Answering it used to walk every shard in the
+    // project and compare the edited URI against each one's dependency list --
+    // under map_mutex_, the lock every request handler and index worker
+    // contends for, on every keystroke.  Measured at ~6.5 ns per shard per
+    // keystroke, which is ~30 us at 5000 files and ~130 us at 20000, for a
+    // question whose answer is always "no".
+    //
+    // A ratio against a structurally identical project eight times the size,
+    // fastest of several interleaved rounds -- an absolute budget would not
+    // survive a shared runner.  Before the reverse map: 0.86 ms at 200 shards
+    // against 1.25 ms at 800, a ratio of 1.45 over a 4x size change.  After:
+    // 0.76 and 0.78, 1.03.
+    SizedProject small("lazyverilog_fanout_scaling", 200);
+    SizedProject large("lazyverilog_fanout_scaling", 1600);
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    small.analyzer->open(uri, "module edit;\nendmodule\n");
+    large.analyzer->open(uri, "module edit;\nendmodule\n");
+
+    const auto [small_ms, large_ms] = interleaved_best(
+        small, large, [](Analyzer& a) { edit_unrelated_buffer(a, /*read_snapshots=*/false); });
+
+    const double ratio = large_ms / small_ms;
+    std::cerr << "[scaling] edit fanout: 200 -> " << small_ms << " ms, 1600 -> " << large_ms
+              << " ms, ratio " << ratio << "\n";
+    CHECK(ratio < 1.4);
+}
+
+TEST_CASE("project index: an unrelated edit does not rebuild the project snapshots",
+          "[index][scaling]") {
+    // The two ExtraFile/ExtraIndex snapshots summarize the shards.  Only the
+    // ExtraFileInfo one consults docs_ at all -- it attaches the live state to
+    // a project file that happens to be open -- and only for files it holds a
+    // shard for.  Both were dropped on every open, change, parse commit and
+    // close, whatever the buffer was.
+    //
+    // Each rebuild copies a path and a URI per project file under map_mutex_,
+    // so the first hover, go-to-definition, RTL-tree or workspace-symbol
+    // request after any keystroke anywhere paid 2N string copies while holding
+    // the lock every request handler and index worker contends for -- for a
+    // buffer the snapshots do not mention.
+    //
+    // A ratio against a structurally identical project eight times the size,
+    // fastest of several interleaved rounds.  Measured over 100 edits plus the
+    // two snapshot reads a request handler makes:
+    //
+    //     before   200 -> 2.36 ms, 1600 -> 17.09 ms   (ratio 7.23)
+    //     after    200 -> 0.81 ms, 1600 ->  0.82 ms   (ratio 1.01)
+    //
+    // which at 1600 shards is 171 us per keystroke against 8.
+    SizedProject small("lazyverilog_snapshot_scaling", 200);
+    SizedProject large("lazyverilog_snapshot_scaling", 1600);
+    const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
+    small.analyzer->open(uri, "module edit;\nendmodule\n");
+    large.analyzer->open(uri, "module edit;\nendmodule\n");
+
+    const auto [small_ms, large_ms] = interleaved_best(
+        small, large, [](Analyzer& a) { edit_unrelated_buffer(a, /*read_snapshots=*/true); });
+
+    const double ratio = large_ms / small_ms;
+    std::cerr << "[scaling] unrelated edit + snapshot: 200 -> " << small_ms << " ms, 1600 -> "
+              << large_ms << " ms, ratio " << ratio << "\n";
+    CHECK(ratio < 1.6);
+}
+
+TEST_CASE("project index: the extra-file snapshots are ordered too", "[index]") {
+    // The same defect as the published snapshot, in the two vectors request
+    // handlers read directly.  connect.cpp's find_module() takes the first
+    // shard whose module table holds the name, and definition and hover run
+    // by-name lookups over the same order -- so it was decided by whichever
+    // bucket order the last rehash of extra_cache_ produced, and could change
+    // on any republish with nothing in the tree having changed.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_extra_snapshot_order";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    std::vector<std::string> paths;
+    for (char name = 'a'; name <= 'h'; ++name) {
+        const auto path = dir / (std::string(1, name) + "_mod.sv");
+        std::ofstream out(path);
+        out << "module m_" << name << ";\n  logic [7:0] sig;\nendmodule\n";
+        paths.push_back(path.string());
+    }
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+
+    const auto files = analyzer.extra_file_snapshot_ptr();
+    REQUIRE(files);
+    REQUIRE(files->size() == paths.size());
+    CHECK(std::is_sorted(files->begin(), files->end(),
+                         [](const ExtraFileInfo& a, const ExtraFileInfo& b) {
+                             return a.path < b.path;
+                         }));
+
+    const auto indexes = analyzer.extra_index_snapshot_ptr();
+    REQUIRE(indexes);
+    REQUIRE(indexes->size() == paths.size());
+    CHECK(std::is_sorted(indexes->begin(), indexes->end(),
+                         [](const ExtraIndexInfo& a, const ExtraIndexInfo& b) {
+                             return a.path < b.path;
+                         }));
+
+    fs::remove_all(dir);
 }

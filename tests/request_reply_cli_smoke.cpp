@@ -114,6 +114,81 @@ int cancelled_request_errors(const fs::path& server_bin, const fs::path& work) {
     return cancelled;
 }
 
+
+/// AutoArg-on-save must not depend on whether the parse has landed.
+///
+/// Format-on-save arrives from BufWritePre, right behind the didChange that
+/// carried the last keystroke, so the snapshot the handler finds is routinely
+/// the text-only placeholder `enqueue_parse()` installed.  Testing `state->tree`
+/// there made AutoArg run or not run depending on that race, which a user
+/// experiences as the feature working intermittently.
+///
+/// Driven over stdio with the whole session buffered, so the formatting request
+/// is dispatched immediately behind the didChange -- the window itself.  The
+/// document is padded so the parse cannot finish inside the microseconds the
+/// dispatch thread needs to reach the next message; without the padding this
+/// would pass on a fast machine whatever the server did.
+///
+/// Returns whether the reply carries the generated port list.
+bool autoarg_on_save_after_edit(const fs::path& server_bin, const fs::path& work) {
+    const fs::path project = work / "autoarg";
+    fs::create_directories(project);
+    {
+        std::ofstream toml(project / "lazyverilog.toml");
+        toml << "[design]\nvcode = \"lv.f\"\n"
+             << "[autoarg]\nautoarg_on_save = true\n"
+             << "[format]\nenable_format_on_save = true\n";
+        std::ofstream flist(project / "lv.f");
+    }
+
+    // A non-ANSI header with an empty port list is what AutoArg fills in.
+    std::string body = R"(module aa ();\n  input logic i_clk;\n  output logic o_q;\n)";
+    for (int i = 0; i < 4000; ++i)
+        body += R"(  always_comb begin\n    x = )" + std::to_string(i) + R"(;\n  end\n)";
+    body += R"(endmodule\n)";
+
+    const std::string root_uri = "file://" + (project / "").generic_string();
+    const std::string doc_uri  = "file://" + (project / "aa.sv").generic_string();
+    {
+        std::ofstream sv(project / "aa.sv");
+        sv << "module aa ();\n";
+    }
+
+    const fs::path input = project / "autoarg.jsonrpc";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"rootUri":")" + root_uri + R"(","capabilities":{}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                     R"("uri":")" + doc_uri + R"(","languageId":"systemverilog","version":1,"text":")" +
+                     body + R"("}}})");
+        // The keystroke, then the save.  Nothing between them.
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didChange","params":{)"
+                     R"("textDocument":{"uri":")" + doc_uri + R"(","version":2},)"
+                     R"("contentChanges":[{"range":{"start":{"line":0,"character":0},)"
+                     R"("end":{"line":0,"character":0}},"text":"// edit\n"}]}})");
+        out << frame(R"({"jsonrpc":"2.0","id":40,"method":"textDocument/formatting","params":{)"
+                     R"("textDocument":{"uri":")" + doc_uri + R"("},)"
+                     R"("options":{"tabSize":4,"insertSpaces":true}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    expect(result.exit_code == 0, "the server exits cleanly after a format-on-save");
+
+    const auto at = result.stdout_text.find(R"("id":40)");
+    if (at == std::string::npos)
+        return false;
+    // The port *list*, not merely the names: both appear in the body's own
+    // `input`/`output` declarations whether AutoArg ran or not, so checking for
+    // them alone passes on a reply that only reformatted the file.  What only
+    // AutoArg produces is a filled header -- `module aa(` followed by the names
+    // -- in place of the empty `module aa();` the source has.
+    const auto reply = result.stdout_text.substr(at, 400);
+    return !contains(reply, "module aa();") && contains(reply, "i_clk,");
+}
+
 struct Case {
     int         id;
     std::string method;
@@ -209,6 +284,11 @@ int main(int argc, char** argv) {
     // A withdrawn request is answered with RequestCancelled rather than run.
     expect(cancelled_request_errors(server_bin, work) > 0,
            "a cancelled request comes back as RequestCancelled");
+
+    // A save that lands while the last keystroke is still parsing still runs
+    // AutoArg.
+    expect(autoarg_on_save_after_edit(server_bin, work),
+           "autoarg_on_save fills the port list for a save behind an edit");
 
     fs::remove_all(work);
 

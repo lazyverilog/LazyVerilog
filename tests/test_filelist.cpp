@@ -3,6 +3,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -261,4 +262,33 @@ TEST_CASE("filelist: each recorded source carries the size read while it was rec
     CHECK(result.file_sizes[1] == fs::file_size(root / "big.sv"));
     // A path that cannot be stat'd sorts last rather than guessing a size.
     CHECK(result.file_sizes[2] == 0);
+}
+
+TEST_CASE("filelist: every filelist read is reported, -f chain included", "[filelist]") {
+    // `.f` and `.vf` are in the watcher globs the server registers, so a client
+    // has always reported a filelist edited by a branch switch or a generator.
+    // Nothing knew which paths were filelists, though, so the report fell
+    // through to the per-file shard refresh, which looked the path up as a
+    // project source, found nothing, and dropped it -- and the project went on
+    // indexing the list as it stood at launch for the rest of the session.
+    //
+    // The whole chain, not just the one the config names: a `-f` include is
+    // just as capable of gaining or losing a source file.
+    const auto root = make_temp_dir("lv_filelist_reported");
+    write_text(root / "top.vc",
+               "rtl/top.sv\n"
+               "-f lists/child.vc\n");
+    write_text(root / "lists/child.vc", "child.sv\n");
+
+    Config cfg;
+    cfg.design.vcode = "top.vc";
+    const auto result = load_vcode(root, cfg);
+
+    REQUIRE(result.filelists.size() == 2);
+    // Sorted, so two launches over one tree report them in one order.
+    CHECK(std::is_sorted(result.filelists.begin(), result.filelists.end()));
+    CHECK(std::find(result.filelists.begin(), result.filelists.end(), norm(root / "top.vc")) !=
+          result.filelists.end());
+    CHECK(std::find(result.filelists.begin(), result.filelists.end(),
+                    norm(root / "lists" / "child.vc")) != result.filelists.end());
 }

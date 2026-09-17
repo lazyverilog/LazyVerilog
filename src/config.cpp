@@ -1,4 +1,6 @@
 #include "config.hpp"
+
+#include "string_utils.hpp"
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -196,9 +198,16 @@ static std::vector<std::string> validate_config(const Config& cfg) {
 }
 
 std::filesystem::path find_config_root(const std::filesystem::path& start) {
-    auto dir = std::filesystem::is_directory(start) ? start : start.parent_path();
+    // error_code overloads throughout.  The throwing ones raise on a directory
+    // that cannot be stat'ed -- a permission error part way up the walk, a
+    // filesystem that is briefly unavailable -- and this runs from the CLI
+    // tools, where that surfaced as an unhandled filesystem_error rather than
+    // as "no config found", which is the answer the walk already has for a
+    // directory that holds nothing.
+    std::error_code ec;
+    auto dir = std::filesystem::is_directory(start, ec) && !ec ? start : start.parent_path();
     while (true) {
-        if (std::filesystem::exists(dir / "lazyverilog.toml"))
+        if (std::filesystem::exists(dir / "lazyverilog.toml", ec) && !ec)
             return dir;
         auto parent = dir.parent_path();
         if (parent == dir)
@@ -216,12 +225,18 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
     if (warning_detail)
         *warning_detail = {};
     auto toml_path = root / "lazyverilog.toml";
-    if (!std::filesystem::exists(toml_path)) {
+    // Read once, rather than exists() and then parse_file() opening it again.
+    // The stat answered nothing the read does not -- an unreadable file has to
+    // fall back to defaults either way -- and it opened a window where the
+    // config could be written between the two, which is exactly the moment a
+    // config reload runs.  load_config() is also called per project root on
+    // every reload and on every config-cache miss.
+    const auto toml_text = read_file_text_optional(toml_path);
+    if (!toml_text)
         return cfg;
-    }
     std::vector<std::string> value_errors;
     try {
-        auto tbl = toml::parse_file(toml_path.string());
+        auto tbl = toml::parse(*toml_text, toml_path.string());
 
         auto expect_table = [&](const toml::table* parent, const char* key,
                                 const std::string& path) {

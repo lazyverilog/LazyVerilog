@@ -480,3 +480,46 @@ use_named_arguments = "yes"
     CHECK(cfg.autofunc.indent_size == 4);
     CHECK(cfg.autofunc.use_named_arguments == true);
 }
+
+TEST_CASE("config: a malformed file reports its line and column", "[config]") {
+    // load_config() reads the file itself now instead of handing the path to
+    // toml::parse_file() after a separate exists() -- the stat answered nothing
+    // the read does not, and it opened a window where the file could be written
+    // between the two, which is exactly the moment a config reload runs.
+    //
+    // What must survive that is the diagnostic: the position comes from the
+    // parser's view of the text, and the path is carried alongside it.
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_config_parse_error";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir / "lazyverilog.toml");
+        out << "[design]\nvcode = \n";
+    }
+
+    std::string warning;
+    ConfigWarning detail;
+    load_config(dir, &warning, &detail);
+
+    CHECK(warning.find("parse error") != std::string::npos);
+    CHECK(warning.find("line 2") != std::string::npos);
+    CHECK(detail.path == dir / "lazyverilog.toml");
+    CHECK(detail.line == 2);
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("config: a directory with no config is not an error", "[config]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_config_absent";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    std::string warning = "stale";
+    ConfigWarning detail;
+    const auto cfg = load_config(dir, &warning, &detail);
+
+    CHECK(warning.empty());
+    CHECK(cfg.design.vcode.empty());
+
+    std::filesystem::remove_all(dir);
+}

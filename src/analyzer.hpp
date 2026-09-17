@@ -525,18 +525,12 @@ class Analyzer {
     /// entries parsed from the same filelist are handled separately via
     /// set_include_dirs(); they are include search paths, not source files.
     ///
-    /// @param filelist_path  Resolved absolute path to the .f file itself (may be empty).
-    ///                       Stored as configuration provenance for reload / diagnostics paths.
-    ///                       Request handlers deliberately do not poll or stat this file on
-    ///                       shared filesystems; freshness is driven by explicit config reloads
-    ///                       and watched-file notifications.
     /// @param file_sizes  byte size of each entry of @p paths, in the same
     ///        order, when the caller already knows them -- the filelist loader
     ///        stats every entry it records, so handing those numbers over spares
     ///        the background queue a second metadata pass over the project.
     ///        Empty means "not known"; the sizes are then read here as before.
     void set_extra_files(const std::vector<std::string>& paths,
-                         const std::string& filelist_path = {},
                          const std::vector<uintmax_t>& file_sizes = {});
 
     /// Apply all project-parse inputs from one loaded configuration in a single
@@ -558,7 +552,6 @@ class Analyzer {
     void set_project_config(const std::vector<std::string>& defines,
                             const std::vector<std::string>& include_dirs,
                             const std::vector<std::string>& extra_files,
-                            const std::string& filelist_path = {},
                             std::shared_ptr<IndexCacheStorage> cache_storage = nullptr,
                             const std::vector<uintmax_t>& extra_file_sizes = {});
 
@@ -753,18 +746,33 @@ class Analyzer {
                               bool stands_alone = false) const;
     std::function<void()> publish_project_index_snapshot_locked() const;
     void clear_project_index_snapshot_locked() const;
+    /// The entries of a shard map in a fixed order.
+    ///
+    /// Both shard maps are unordered, and every consumer of the snapshots built
+    /// from them resolves a name by taking the first match -- so without this
+    /// the answer was decided by whichever bucket order the last rehash
+    /// produced, and could change on any republish.  Path is the one key that
+    /// is unique per shard, already held, and the same from one launch to the
+    /// next.  Pointers, so nothing is copied.
+    static std::vector<const ExtraFileCacheEntry*>
+    sorted_by_path(const std::unordered_map<std::string, ExtraFileCacheEntry>& entries);
+
     void invalidate_extra_snapshots_locked() const;
+    /// Narrower counterpart for a change to docs_ rather than to the shards.
+    /// Requires map_mutex_.
+    void invalidate_open_file_snapshot_locked(const std::string& uri) const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     std::shared_ptr<const std::vector<ExtraIndexInfo>> build_extra_index_snapshot_locked() const;
+    /// Install, drop or empty an `extra_cache_` entry, keeping
+    /// `extra_cache_includers_` in step.  The map is the only reason these
+    /// exist; nothing else may touch `extra_cache_` directly.  Require
+    /// map_mutex_.
+    void put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const;
+    void erase_extra_cache_locked(const std::string& uri) const;
+    void clear_extra_cache_locked() const;
+
     void update_extra_cache_for_live_state_locked(std::shared_ptr<const DocumentState> state,
                                                   SyntaxIndex index);
-
-    // Resolved .f filelist path.  We intentionally do not poll this file's
-    // mtime on LSP requests: HPC projects usually do not edit filelists while
-    // the editor is alive, and even one metadata operation per request is still
-    // unwanted noise on shared filesystems.  Configuration reloads call
-    // set_extra_files() explicitly when the filelist should be re-read.
-    mutable std::string filelist_path_;
 
     mutable std::mutex map_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
@@ -808,6 +816,22 @@ class Analyzer {
     // didOpen/didChange critical section from scanning large filelists.
     mutable std::unordered_set<std::string> extra_file_set_;
     mutable std::unordered_map<std::string, ExtraFileCacheEntry> extra_cache_;
+    /// Which shards `include a given file: header URI -> the URIs of the
+    /// entries of `extra_cache_` that list it.
+    ///
+    /// Answering "does anything include this file" used to be a walk of every
+    /// shard in the project, comparing against each one's dependency list.
+    /// That ran on *every* didChange, from queue_include_dependents_locked(),
+    /// under the lock every request handler and index worker contends for --
+    /// and for an ordinary .sv file, which nothing includes, it ran to
+    /// completion and found nothing every time.  It ran again per changed
+    /// header in refresh_changed_extra_files().
+    ///
+    /// Only entries that `include something appear, so a design of plain
+    /// sources costs nothing to keep, and maintaining it is one pass over a
+    /// dependency list the caller already holds.
+    mutable std::unordered_map<std::string, std::unordered_set<std::string>>
+        extra_cache_includers_;
     mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_cache_;
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
@@ -865,6 +889,17 @@ class Analyzer {
     // include directories change what every shard's key hashes to.
     mutable uint64_t background_preload_generation_{std::numeric_limits<uint64_t>::max()};
     mutable bool background_preload_running_{false};
+    // The generation of the last burst that queued the *whole* filelist.
+    //
+    // Only such a burst can say which shards are live: its preload walks every
+    // configured file, so a shard the sweep does not see named is genuinely
+    // unreferenced.  An incremental burst -- the one or two includers an edited
+    // header re-queues -- knows about those files and nothing else, so its
+    // "live" set is two entries out of thousands and a sweep run against it
+    // reads and stats every other shard in the directory to prove it should
+    // keep them.  That is one full directory sweep per keystroke on a shared
+    // header; see preload_cached_shards().
+    mutable uint64_t background_full_reindex_generation_{std::numeric_limits<uint64_t>::max()};
     /// Cache for this project, and the config digest every shard is keyed on.
     /// Empty when no project root is known or the directory cannot be written,
     /// which is a normal read-only-checkout condition and simply runs uncached.
@@ -887,6 +922,14 @@ class Analyzer {
     mutable uint64_t index_cache_digest_generation_{std::numeric_limits<uint64_t>::max()};
     mutable std::unordered_map<std::string, std::optional<IndexCache::Digest>>
         index_cache_digests_;
+    /// Point the digest memo at @p generation, clearing it, if @p generation is
+    /// newer than the one it holds.  True when it was adopted (and so emptied).
+    ///
+    /// Forward only.  The background generation counts up and never down, and a
+    /// caller behind it is a worker whose parse has already been superseded;
+    /// letting it re-tag the memo backwards made the current burst's digests
+    /// disappear.  Requires index_cache_digest_mutex_.
+    bool adopt_digest_generation_locked(uint64_t generation) const;
     std::optional<IndexCache::Digest> cached_file_digest(const std::string& uri,
                                                          uint64_t generation) const;
     /// Digests of the bytes the burst's parses actually read, as opposed to

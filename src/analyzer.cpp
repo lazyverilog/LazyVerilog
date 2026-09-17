@@ -637,6 +637,15 @@ struct BuiltHeaderShard {
     /// authoritative record of its declarations — the condition for serving an
     /// includer its directives alone.  See standalone_header_uris_.
     bool stands_alone{false};
+    /// Built from an editor buffer's unsaved text rather than from the file.
+    ///
+    /// Such a shard must never be written to the on-disk cache.  A shard is
+    /// keyed on a digest of the bytes the parse read, and the digest recorded
+    /// for this header in this burst is the *disk* one -- some includer read it
+    /// from disk before the buffer was opened.  Writing this index under that
+    /// key is a hit that is wrong on every future launch, which is the one
+    /// failure mode the cache has no way to detect.
+    bool from_open_buffer{false};
 };
 
 static std::vector<BuiltHeaderShard>
@@ -676,7 +685,14 @@ make_file_state_with_options(const std::filesystem::path& path,
     ppo.predefines = defines;
     ppo.additionalIncludePaths = include_dirs;
     slang::Bag bag;
-    bag.set(ppo);
+    // Moved in, not copied.  `Bag::set` takes its argument by const reference
+    // when it can, and stores it in a `std::any` by value -- so binding an
+    // lvalue here made a second copy of PreprocessorOptions, which carries the
+    // whole `+incdir+` list and the define list.  A design with a few hundred
+    // include directories therefore paid two vector copies per parse: per
+    // keystroke on the edit path, and per file during an indexing burst.
+    // Nothing reads `ppo` afterwards.
+    bag.set(std::move(ppo));
 
     auto tree_or_error = slang::syntax::SyntaxTree::fromFile(norm.string(), *sm, bag);
     if (!tree_or_error)
@@ -761,6 +777,64 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
         // its modules and ports, scoped to its module, and none of the
         // header's own declarations when the `include sits at file scope.
         std::shared_ptr<SyntaxIndex> header_index;
+
+        // A header that is itself an open buffer is served from that buffer,
+        // not from the file.  make_file_state_with_options() reaches the header
+        // through SyntaxTree::fromFile(), and preload_open_text_overlays()
+        // deliberately skips the overlay for the path being parsed -- so the
+        // one file whose unsaved text matters most here was the one file that
+        // could not supply it, and the header's own shard went on describing
+        // what was last saved.  Every includer reparsed in the same burst sees
+        // the new text through the overlay, so the index ends up holding both
+        // answers at once and which one a lookup finds depends on the order it
+        // walks the shards in.
+        const DocumentState* open_header = nullptr;
+        for (const auto& overlay : open_overlays) {
+            if (!overlay.state || !overlay.state->tree)
+                continue;
+            if (overlay.uri == header_uri) {
+                open_header = overlay.state.get();
+                break;
+            }
+        }
+        if (open_header) {
+            const bool buffer_stands_alone =
+                std::none_of(open_header->parse_diagnostics.begin(),
+                             open_header->parse_diagnostics.end(),
+                             [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+            if (buffer_stands_alone) {
+                // The same build the disk path does, over the buffer's own
+                // tree: make_state() parsed it as a whole file, which is what
+                // "the header on its own" means here too.
+                auto index = SyntaxIndex::build(*open_header->tree,
+                                                std::string_view(open_header->text),
+                                                IndexDepth::Declarations,
+                                                std::string_view(header_uri));
+                index.include_dependencies = open_header->include_dependencies;
+                built.push_back(BuiltHeaderShard{
+                    .uri = header_uri,
+                    .index = std::make_shared<SyntaxIndex>(std::move(index)),
+                    .stands_alone = true,
+                    .from_open_buffer = true,
+                });
+            } else {
+                // A fragment -- a port list, a class body -- has no tree of its
+                // own either way, so it is derived from the includer below.
+                // That tree already carries this buffer's unsaved text: the
+                // overlay is skipped only for the file being parsed, and here
+                // that file is the includer, not the header.
+                derived_uris.push_back(header_uri);
+                built.push_back(BuiltHeaderShard{
+                    .uri = header_uri,
+                    .stands_alone = false,
+                    .from_open_buffer = true,
+                });
+            }
+            // No projection either way: the burst's header-text cache only ever
+            // holds on-disk text, see header_cache_excluded_paths().
+            continue;
+        }
+
         auto header_state = make_file_state_with_options(
             path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
             /*retain_text=*/false, &header_texts, generation,
@@ -977,7 +1051,14 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     ppo.predefines = defines;
     ppo.additionalIncludePaths = std::move(include_dirs);
     slang::Bag bag;
-    bag.set(ppo);
+    // Moved in, not copied.  `Bag::set` takes its argument by const reference
+    // when it can, and stores it in a `std::any` by value -- so binding an
+    // lvalue here made a second copy of PreprocessorOptions, which carries the
+    // whole `+incdir+` list and the define list.  A design with a few hundred
+    // include directories therefore paid two vector copies per parse: per
+    // keystroke on the edit path, and per file during an indexing burst.
+    // Nothing reads `ppo` afterwards.
+    bag.set(std::move(ppo));
     // Pass the normalized path, not the raw one path_from_file_uri() produced:
     // this SourceManager has disableProximatePaths set, so it resolves a
     // relative `include against this path verbatim, with no canonicalization
@@ -1019,7 +1100,7 @@ void Analyzer::open(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         listed_extra_file = extra_file_set_.contains(path_string);
         parse_committed_cv_.notify_all();
     }
@@ -1044,7 +1125,7 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         docs_[uri] = state;
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         listed_extra_file = extra_file_set_.contains(path_string);
         parse_committed_cv_.notify_all();
 
@@ -1097,7 +1178,7 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
         docs_[uri] = state;
         latest_version_[uri] = version;
         semantic_diagnostics_.erase(uri);
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
     }
     {
         std::lock_guard<std::mutex> lock(parse_mutex_);
@@ -1133,6 +1214,12 @@ void Analyzer::parse_worker_loop() {
     std::unordered_set<std::string> deferred_dependents;
 
     while (true) {
+        // A parse that throws must cost the keystroke that started it and
+        // nothing else.  This is a thread function: an escaping exception is
+        // std::terminate, which the user sees as the language server vanishing
+        // mid-edit.  RequestPool and BackgroundCompiler already treat their own
+        // work this way.
+        try {
         ParseJob job;
         bool have_job = false;
         {
@@ -1235,7 +1322,7 @@ void Analyzer::parse_worker_loop() {
             auto it = latest_version_.find(job.uri);
             if (it != latest_version_.end() && it->second == job.version) {
                 docs_[job.uri] = state;
-                invalidate_extra_snapshots_locked();
+                invalidate_open_file_snapshot_locked(job.uri);
                 listed_extra = extra_file_set_.contains(state->normalized_path);
 
                 committed = true;
@@ -1265,6 +1352,11 @@ void Analyzer::parse_worker_loop() {
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
         }
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] parse worker error: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] parse worker error\n";
+        }
     }
 }
 
@@ -1279,7 +1371,7 @@ void Analyzer::close(const std::string& uri) {
         docs_.erase(uri);
         latest_version_.erase(uri);
         semantic_diagnostics_.erase(uri);
-        invalidate_extra_snapshots_locked();
+        invalidate_open_file_snapshot_locked(uri);
         // A closed document never gets its parse, so release anyone waiting on
         // one instead of making them sit out the timeout.
         parse_committed_cv_.notify_all();
@@ -4459,7 +4551,19 @@ static std::string declaration_type_from_source_line(const std::string& path, in
 }
 
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
-    auto state = get_state(uri);
+    // The last snapshot that parsed, not simply the last one.  The editor
+    // issues this request from the same notification that started the reparse,
+    // so `get_state()` hands back a text-only placeholder and giving up there
+    // answers *every* request made while the user types with nothing -- which
+    // the client renders.  Measured on an unchanged file and position: 5 of 5
+    // hovers null when issued alongside the didChange, 5 of 5 correct when
+    // issued after the parse landed.
+    //
+    // get_parsed_state() waits for the reparse first, so the ordinary answer is
+    // the current one; only a file that parses slower than the wait falls back
+    // to the snapshot one keystroke old, which is what the user was looking at
+    // a moment ago.  Same trade, and the same call, as inlay hints.
+    auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
 
@@ -4914,7 +5018,19 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
 
 std::optional<Location> Analyzer::definition_of(const std::string& uri, int line, int col) const {
     const auto start = Clock::now();
-    auto state = get_state(uri);
+    // The last snapshot that parsed, not simply the last one.  The editor
+    // issues this request from the same notification that started the reparse,
+    // so `get_state()` hands back a text-only placeholder and giving up there
+    // answers *every* request made while the user types with nothing -- which
+    // the client renders.  Measured on an unchanged file and position: 5 of 5
+    // hovers null when issued alongside the didChange, 5 of 5 correct when
+    // issued after the parse landed.
+    //
+    // get_parsed_state() waits for the reparse first, so the ordinary answer is
+    // the current one; only a file that parses slower than the wait falls back
+    // to the snapshot one keystroke old, which is what the user was looking at
+    // a moment ago.  Same trade, and the same call, as inlay hints.
+    auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
 
@@ -6176,7 +6292,7 @@ void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
     // reason: a cached snapshot built under different inputs is wrong, not
     // stale.  Invalidating is cheap and is done either way; only the burst it
     // would start is what a batching caller defers.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (reindex == Reindex::Now && !extra_files_.empty())
@@ -6190,7 +6306,7 @@ void Analyzer::set_defines(const std::vector<std::string>& defines) {
     inputs.config_digest = IndexCache::config_digest(inputs.defines, inputs.include_dir_paths);
     replace_default_parse_inputs_locked(std::move(inputs));
     // Invalidate extra-file cache so reopened files pick up the new defines.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (!extra_files_.empty())
@@ -6205,7 +6321,7 @@ void Analyzer::set_include_dirs(const std::vector<std::string>& include_dirs) {
     // Include paths affect parsing every explicit filelist source.  Clear the
     // cache even if the filelist itself did not change, otherwise a newly added
     // UVM include directory would not be visible until the next source edit.
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
     if (!extra_files_.empty())
@@ -6281,7 +6397,6 @@ std::vector<std::string> order_by_descending_size(const std::vector<std::string>
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
-                               const std::string& filelist_path,
                                const std::vector<uintmax_t>& file_sizes) {
     std::vector<std::string> normalized_paths;
     normalized_paths.reserve(paths.size());
@@ -6293,14 +6408,13 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     auto by_size = order_by_descending_size(normalized_paths, file_sizes);
 
     std::lock_guard<std::mutex> lock(map_mutex_);
-    filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_paths);
     extra_files_by_size_ = std::move(by_size);
     extra_file_set_.clear();
     extra_file_set_.reserve(extra_files_.size());
     for (const auto& path : extra_files_)
         extra_file_set_.insert(path);
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
 
@@ -6314,7 +6428,6 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
 void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
-                                  const std::string& filelist_path,
                                   std::shared_ptr<IndexCacheStorage> cache_storage,
                                   const std::vector<uintmax_t>& extra_file_sizes) {
     std::vector<std::string> normalized_extra_files;
@@ -6344,7 +6457,6 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // can still burn CPU / shared-filesystem bandwidth while they parse.
     replace_default_parse_inputs_locked(std::move(default_inputs));
 
-    filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_extra_files);
     extra_files_by_size_ = std::move(extra_files_by_size);
     extra_file_set_.clear();
@@ -6358,7 +6470,7 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // shard keyed on only one of them would be served after the other moved.
     index_cache_storage_ = std::move(cache_storage);
 
-    extra_cache_.clear();
+    clear_extra_cache_locked();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
 
@@ -6430,13 +6542,22 @@ void Analyzer::drain_shard_writes_inline() const {
             std::lock_guard<std::mutex> lock(map_mutex_);
             current_generation = write.generation == background_generation_;
         }
-        if (current_generation) {
-            if (write.index) {
-                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                     write.extra_dependency_uri, write.stands_alone);
+        // See index_cache_writer_loop(): `index_cache_writing_` is set and
+        // something may be waiting on it, and on a one-CPU slice this runs on
+        // the indexing worker, which is a thread function too.
+        try {
+            if (current_generation) {
+                if (write.index) {
+                    store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                         write.extra_dependency_uri, write.stands_alone);
+                }
+                if (write.prune_only)
+                    prune_cache_once_per_generation(write.generation, write.live_uris);
             }
-            if (write.prune_only)
-                prune_cache_once_per_generation(write.generation, write.live_uris);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] index cache write failed\n";
         }
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
@@ -6507,11 +6628,22 @@ void Analyzer::index_cache_writer_loop() const {
             }
         }
 
-        if (write.index)
-            store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                 write.extra_dependency_uri, write.stands_alone);
-        if (write.prune_only)
-            prune_cache_once_per_generation(write.generation, write.live_uris);
+        // `index_cache_writing_` is set, and wait_for_index_cache_writes_idle()
+        // waits on it, so anything thrown here would park that caller forever --
+        // after taking the process down, since this is a thread function.  A
+        // write that fails is a cache miss next launch, which is what a cache
+        // that cannot be written has always meant.
+        try {
+            if (write.index)
+                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                     write.extra_dependency_uri, write.stands_alone);
+            if (write.prune_only)
+                prune_cache_once_per_generation(write.generation, write.live_uris);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] index cache write failed\n";
+        }
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
@@ -6544,15 +6676,17 @@ std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string
                                                                uint64_t generation) const {
     {
         std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
-        if (index_cache_digest_generation_ != generation) {
-            index_cache_digests_.clear();
-            index_cache_parsed_digests_.clear();
-            index_cache_digest_generation_ = generation;
+        if (adopt_digest_generation_locked(generation)) {
+            // Nothing to serve yet: this generation's memo starts empty.
         }
-        else if (const auto it = index_cache_digests_.find(uri);
-                 it != index_cache_digests_.end()) {
-            return it->second;
+        else if (index_cache_digest_generation_ == generation) {
+            if (const auto it = index_cache_digests_.find(uri);
+                it != index_cache_digests_.end())
+                return it->second;
         }
+        // Otherwise this caller is behind the memo's generation.  Its answer is
+        // still wanted -- it is about a file on disk, which no generation
+        // changes -- but it must not be written into a newer burst's memo.
     }
 
     // Read and hash with the memo unlocked: two workers racing on the same file
@@ -6565,14 +6699,46 @@ std::optional<IndexCache::Digest> Analyzer::cached_file_digest(const std::string
     return digest;
 }
 
+bool Analyzer::adopt_digest_generation_locked(uint64_t generation) const {
+    // The background generation only ever counts up, so the memo's must too.
+    //
+    // This used to be `!=`, which let a *stale* caller reset it backwards.  A
+    // worker still parsing a file when the generation moved on reaches
+    // remember_parsed_digests() before the check that would discard its result
+    // -- the parse is the slow part, and editing an `include`d header bumps the
+    // generation on every keystroke -- so the two callers took turns clearing
+    // each other's memo and re-tagging it with their own generation.
+    //
+    // The cost was silent.  A cleared memo makes parsed_file_digest() answer
+    // nullopt for a file whose digest was just recorded, and
+    // store_shard_in_cache() reads that as "this burst never read the file in
+    // full" and writes no shard at all -- so the burst indexes the project and
+    // caches none of it, and the next launch is cold with nothing anywhere
+    // saying why.  It also puts back the O(files x header) hashing the memo
+    // exists to remove.
+    constexpr auto kNoGeneration = std::numeric_limits<uint64_t>::max();
+    if (index_cache_digest_generation_ == generation)
+        return false;
+    if (index_cache_digest_generation_ != kNoGeneration &&
+        generation < index_cache_digest_generation_)
+        return false; // stale caller; leave the newer burst's memo alone
+    index_cache_digests_.clear();
+    index_cache_parsed_digests_.clear();
+    index_cache_digest_generation_ = generation;
+    return true;
+}
+
 void Analyzer::remember_parsed_digests(const DocumentState& state, uint64_t generation) const {
     if (state.parsed_digests.empty() && state.parsed_texts.empty())
         return;
     std::lock_guard<std::mutex> lock(index_cache_digest_mutex_);
+    adopt_digest_generation_locked(generation);
     if (index_cache_digest_generation_ != generation) {
-        index_cache_digests_.clear();
-        index_cache_parsed_digests_.clear();
-        index_cache_digest_generation_ = generation;
+        // This parse belongs to a burst that has already been superseded -- its
+        // caller reaches here before the generation check that discards its
+        // shard.  What it read is not what the current burst reads, so it has
+        // nothing to contribute and must not clear what the current one has.
+        return;
     }
     // First parse of a file wins.  Every parse in a burst reads the same bytes
     // -- that is what the header projection guarantees -- so a later one has
@@ -6669,11 +6835,13 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::shared_ptr<IndexCacheStorage> storage;
     std::shared_ptr<const ProjectParseInputs> parse_inputs;
     std::vector<std::string> files;
+    uint64_t full_reindex_generation = std::numeric_limits<uint64_t>::max();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (!index_cache_storage_ || generation != background_generation_)
             return;
         storage = index_cache_storage_;
+        full_reindex_generation = background_full_reindex_generation_;
         // Per file from here on.  The burst can span projects, and both the
         // config digest a shard is keyed on and the include directories a
         // header search walks belong to the file being checked, not to the
@@ -6929,9 +7097,29 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
                  i = next.fetch_add(1, std::memory_order_relaxed))
                 check_one(i);
         };
-        for (size_t i = 0; i + 1 < worker_count; ++i)
-            workers.emplace_back(drain);
-        drain(); // this thread takes a share too
+        // Spawning can fail -- a thread limit, a memory limit -- and the
+        // workers already running would then be destroyed joinable, which is
+        // std::terminate.  Stop asking for more and let the ones that started,
+        // plus this thread, drain the whole queue; the work is handed out per
+        // index, so any number of them finishes it.
+        for (size_t i = 0; i + 1 < worker_count; ++i) {
+            try {
+                workers.emplace_back(drain);
+            } catch (const std::system_error& e) {
+                std::cerr << "[lazyverilog] index cache preload worker: " << e.what() << "\n";
+                break;
+            }
+        }
+        // Joined whatever happens above, so a throwing check_one() cannot leave
+        // a joinable thread to destroy.
+        try {
+            drain(); // this thread takes a share too
+        } catch (...) {
+            for (auto& worker : workers)
+                if (worker.joinable())
+                    worker.join();
+            throw;
+        }
         for (auto& worker : workers)
             worker.join();
     }
@@ -6942,26 +7130,46 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         if (result)
             hits.push_back(std::move(*result));
 
-    // Queued whatever the preload found.  The sweep has to happen on the launch
-    // that reuses everything just as much as on one that rebuilds, and that
-    // launch writes no shards for it to hang off.
+    // Queued whatever the preload found, but only for a burst that queued the
+    // whole filelist.  The sweep has to happen on the launch that reuses
+    // everything just as much as on one that rebuilds, and that launch writes
+    // no shards for it to hang off -- so it cannot hang off a shard write.
     //
-    // Everything above was just proved to be on disk, so the sweep is told and
-    // skips those shards by name.  On an unchanged project that is all of them,
-    // which turns a read of every shard in the directory into a set lookup --
-    // the difference is most of a warm start on a one-CPU slice, where the
-    // sweep has no second core to run on.
-    std::unordered_set<std::string> live_uris;
-    live_uris.reserve(files.size() + header_hits.size());
-    for (const auto& path : files)
-        live_uris.insert(uri_from_path(path));
-    for (const auto& [header_uri, header_hit] : header_hits)
-        live_uris.insert(header_uri);
+    // It cannot hang off *any* burst either.  `live_uris` is only an answer to
+    // "which shards are referenced" when `files` was every configured file; an
+    // incremental burst carries the one or two includers an edited header
+    // re-queued, and a sweep told that two of a project's shards are live opens
+    // and stats every other one to decide it should keep them.  Editing a
+    // shared header bumps the generation on every keystroke (see
+    // queue_include_dependents_locked()), so that was one full sweep of the
+    // shard directory per character typed: measured at 302 shard opens per
+    // keystroke on a 301-shard project and 802 on an 801-shard one, plus a stat
+    // of each shard's source, on the indexing worker itself when the CPU slice
+    // leaves no room for the writer thread.
+    //
+    // Deferring to the next full reindex costs a deleted file's shard staying
+    // on disk until then.  It is never *served* -- validating it hashes a file
+    // that is not there -- so what it holds is disk space, which the next
+    // launch reclaims.
+    const bool sweep_is_answerable = generation == full_reindex_generation;
+    if (sweep_is_answerable) {
+        // Everything above was just proved to be on disk, so the sweep is told
+        // and skips those shards by name.  On an unchanged project that is all
+        // of them, which turns a read of every shard in the directory into a
+        // set lookup -- the difference is most of a warm start on a one-CPU
+        // slice, where the sweep has no second core to run on.
+        std::unordered_set<std::string> live_uris;
+        live_uris.reserve(files.size() + header_hits.size());
+        for (const auto& path : files)
+            live_uris.insert(uri_from_path(path));
+        for (const auto& [header_uri, header_hit] : header_hits)
+            live_uris.insert(header_uri);
 
-    reserve_shard_writes(1);
-    queue_shard_write(PendingShardWrite{.prune_only = true,
-                                        .generation = generation,
-                                        .live_uris = std::move(live_uris)});
+        reserve_shard_writes(1);
+        queue_shard_write(PendingShardWrite{.prune_only = true,
+                                            .generation = generation,
+                                            .live_uris = std::move(live_uris)});
+    }
 
     if (hits.empty())
         return;
@@ -6976,11 +7184,11 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         // parse path: never let a cached shard replace one.
         if (const auto doc = docs_.find(hit.uri); doc != docs_.end() && doc->second)
             continue;
-        extra_cache_[hit.uri] = ExtraFileCacheEntry{
-            .path = hit.path,
-            .uri = hit.uri,
-            .index = hit.index,
-        };
+        put_extra_cache_locked(hit.uri, ExtraFileCacheEntry{
+                                             .path = hit.path,
+                                             .uri = hit.uri,
+                                             .index = hit.index,
+                                         });
         for (auto& [header_uri, header_index, stands_alone] : hit.headers) {
             // Claimed as well as committed.  The claim is what stops a worker
             // that parses some other includer from rebuilding a header this
@@ -7060,7 +7268,7 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
     for (const auto& path : deleted_paths) {
         if (path.empty() || !extra_file_set_.contains(path))
             continue;
-        extra_cache_.erase(uri_from_path(path));
+        erase_extra_cache_locked(uri_from_path(path));
         invalidate_extra_snapshots_locked();
         removed_deleted_file = true;
     }
@@ -7096,15 +7304,18 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
 
         // Nothing queues a header directly.  Re-queue the files that `include`
         // it instead; the first one to commit re-claims the header and rebuilds
-        // its shard from that file's fresh tree.
-        for (const auto& [entry_uri, entry] : extra_cache_) {
-            if (!entry.index)
-                continue;
-            const auto& deps = entry.index->include_dependencies;
-            if (std::find(deps.begin(), deps.end(), header_uri) == deps.end())
-                continue;
-            queue_background_file_locked(entry.path, /*front=*/true);
-            queued_changed_file = true;
+        // its shard from that file's fresh tree.  By lookup rather than by
+        // walking every shard's dependency list, which cost a full pass over
+        // the project per changed header.
+        const auto includers = extra_cache_includers_.find(header_uri);
+        if (includers != extra_cache_includers_.end()) {
+            for (const auto& includer_uri : includers->second) {
+                const auto entry = extra_cache_.find(includer_uri);
+                if (entry == extra_cache_.end())
+                    continue;
+                queue_background_file_locked(entry->second.path, /*front=*/true);
+                queued_changed_file = true;
+            }
         }
     }
 
@@ -7132,14 +7343,45 @@ void Analyzer::wait_for_background_index_idle() const {
     });
 }
 
+std::vector<const Analyzer::ExtraFileCacheEntry*>
+Analyzer::sorted_by_path(const std::unordered_map<std::string, ExtraFileCacheEntry>& entries) {
+    std::vector<const ExtraFileCacheEntry*> sorted;
+    sorted.reserve(entries.size());
+    for (const auto& [key, entry] : entries)
+        sorted.push_back(&entry);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ExtraFileCacheEntry* a, const ExtraFileCacheEntry* b) {
+                  return a->path < b->path;
+              });
+    return sorted;
+}
+
 void Analyzer::invalidate_extra_snapshots_locked() const {
-    // Both snapshot vectors summarize extra_cache_.  The ExtraFileInfo variant
-    // also records which project files are currently open by consulting docs_,
-    // so document open/change/close paths must invalidate these caches too.
-    // This helper is intentionally tiny and must only be called while
+    // For a change to the *shards*: both snapshots summarize extra_cache_ and
+    // background_header_shards_, so both go.  Must only be called while
     // map_mutex_ is held by the mutating path.
     extra_file_snapshot_cache_.reset();
     extra_index_snapshot_cache_.reset();
+}
+
+void Analyzer::invalidate_open_file_snapshot_locked(const std::string& uri) const {
+    // For a change to docs_, which is a much narrower thing.
+    //
+    // Only the ExtraFileInfo snapshot consults docs_ at all -- it attaches the
+    // live state to a project file that happens to be open -- and it only
+    // mentions files it holds a shard for.  Editing any other buffer changes
+    // neither snapshot, and the ExtraIndexInfo one never depends on docs_ under
+    // any circumstances.
+    //
+    // Dropping both on every open, change, parse commit and close is what this
+    // replaces.  Each rebuild copies a path and a URI per project file, under
+    // map_mutex_, so the first hover, go-to-definition, RTL-tree or
+    // workspace-symbol request after any keystroke anywhere paid 2N string
+    // copies while holding the lock every request handler and index worker
+    // contends for -- for a buffer the snapshots do not mention.
+    if (!extra_cache_.contains(uri) && !background_header_shards_.contains(uri))
+        return;
+    extra_file_snapshot_cache_.reset();
 }
 
 std::shared_ptr<const std::vector<ExtraFileInfo>>
@@ -7179,13 +7421,24 @@ Analyzer::build_extra_file_snapshot_locked() const {
             .index = entry.index,
         });
     };
-    for (const auto& [key, entry] : extra_cache_)
-        append(entry);
-    for (const auto& [key, entry] : background_header_shards_) {
+    // By path within each group, because both maps are unordered.  Consumers
+    // take the first match by name -- connect.cpp's find_module(), and the
+    // by-name lookups definition and hover run over this vector -- so the
+    // answer was decided by whichever bucket order the last rehash produced and
+    // could change on any republish.  Same defect and same fix as
+    // publish_project_index_snapshot_locked().
+    //
+    // The groups keep their order: a header that is also a filelist entry is
+    // still represented by its filelist shard, and which of the two is
+    // authoritative for a header's declarations is the project index
+    // snapshot's question, not this one's.
+    for (const auto* entry : sorted_by_path(extra_cache_))
+        append(*entry);
+    for (const auto* entry : sorted_by_path(background_header_shards_)) {
         // A header that is also a filelist entry is already above; appending it
         // twice would give every by-name lookup two candidates for one file.
-        if (!extra_cache_.contains(key))
-            append(entry);
+        if (!extra_cache_.contains(entry->uri))
+            append(*entry);
     }
     return result;
 }
@@ -7201,13 +7454,14 @@ Analyzer::build_extra_index_snapshot_locked() const {
             .index = entry.index,
         });
     };
-    for (const auto& [key, entry] : extra_cache_)
-        append(entry);
+    // By path within each group; see build_extra_file_snapshot_locked().
+    for (const auto* entry : sorted_by_path(extra_cache_))
+        append(*entry);
     // A file's shard no longer carries what it `include`d, so header shards have
     // to appear here too or header declarations become invisible to every
     // feature reading this snapshot.
-    for (const auto& [key, entry] : background_header_shards_)
-        append(entry);
+    for (const auto* entry : sorted_by_path(background_header_shards_))
+        append(*entry);
     return result;
 }
 
@@ -7667,19 +7921,36 @@ bool Analyzer::queue_include_dependents_locked(const std::string& uri) const {
     // in place until the new one commits, so the project index never has a gap.
     background_header_claims_.erase(uri);
     standalone_header_uris_.erase(uri);
-    for (const auto& [extra_uri, entry] : extra_cache_) {
-        // Test the shard's dependency list in place.  Offering a
-        // `std::vector<std::string>{}` fallback made the conditional expression
-        // a prvalue, so every shard's list was deep-copied on every edit, under
-        // map_mutex_.
-        if (docs_.contains(extra_uri) || !entry.index)
-            continue;
-        const auto& deps = entry.index->include_dependencies;
-        if (std::find(deps.begin(), deps.end(), uri) == deps.end())
-            continue;
-        queue_background_file_locked(entry.path, /*front=*/true);
-        queued = true;
-        break;
+
+    // Straight to the shards that include this file.  This used to walk every
+    // shard in the project and compare against each one's dependency list, on
+    // *every* didChange and under the lock every request handler and index
+    // worker contends for -- so an ordinary .sv file, which nothing includes,
+    // paid a full scan per keystroke to be told so.  extra_cache_includers_ is
+    // maintained alongside extra_cache_ and answers the same question by
+    // lookup.
+    const auto includers = extra_cache_includers_.find(uri);
+    if (includers != extra_cache_includers_.end()) {
+        // The smallest path among them, not whichever the set yields first.
+        // Only one closed includer is re-queued, and which one decides which
+        // shard carries this header's declarations afterwards -- so leaving it
+        // to hash order makes the project index differ between two runs over an
+        // identical tree.  One pass over the includers of this one header, not
+        // over the project.
+        const ExtraFileCacheEntry* chosen = nullptr;
+        for (const auto& includer_uri : includers->second) {
+            if (docs_.contains(includer_uri))
+                continue;
+            const auto entry = extra_cache_.find(includer_uri);
+            if (entry == extra_cache_.end())
+                continue;
+            if (!chosen || entry->second.path < chosen->path)
+                chosen = &entry->second;
+        }
+        if (chosen) {
+            queue_background_file_locked(chosen->path, /*front=*/true);
+            queued = true;
+        }
     }
     return queued;
 }
@@ -7743,6 +8014,10 @@ void Analyzer::schedule_background_reindex_locked() const {
     background_header_shards_.clear();
     background_header_claims_.clear();
     standalone_header_uris_.clear();
+    // This burst carries the whole filelist, so its preload is in a position to
+    // say which shards are still referenced.  Only such a burst may sweep the
+    // shard directory; see background_full_reindex_generation_.
+    background_full_reindex_generation_ = background_generation_;
     // Largest first; see extra_files_by_size_.  Falls back to filelist order for
     // a caller that set extra_files_ without it.
     const auto& queue_order =
@@ -7778,6 +8053,8 @@ void Analyzer::background_index_loop() const {
         // Whether this worker took the burst's warmup file; see
         // background_warmup_generation_.
         bool warmup_owner = false;
+        // Whether this worker is still counted in background_index_active_.
+        bool counted_active = false;
 
         {
             std::unique_lock<std::mutex> lock(map_mutex_);
@@ -7848,7 +8125,19 @@ void Analyzer::background_index_loop() const {
                 background_preload_running_ = true;
                 const auto preload_generation = background_generation_;
                 lock.unlock();
-                preload_cached_shards(preload_generation);
+                // The gate is armed, so anything thrown out of here would leave
+                // every other worker parked on `background_preload_running_`
+                // forever -- and, on the way, take the process down: this is a
+                // thread function with nothing above it to catch.  A preload
+                // that fails is a cache miss, which is the behaviour this
+                // server had before the cache existed.
+                try {
+                    preload_cached_shards(preload_generation);
+                } catch (const std::exception& e) {
+                    std::cerr << "[lazyverilog] index cache preload failed: " << e.what() << "\n";
+                } catch (...) {
+                    std::cerr << "[lazyverilog] index cache preload failed\n";
+                }
                 lock.lock();
                 background_preload_running_ = false;
                 background_preload_generation_ = preload_generation;
@@ -7877,6 +8166,7 @@ void Analyzer::background_index_loop() const {
             // file rather than be swallowed as a duplicate.
             background_pending_set_.erase(path_string);
             ++background_index_active_;
+            counted_active = true;
             const auto path = normalize_filesystem_path(path_string);
             path_string = path.string();
             uri = uri_from_path(path);
@@ -7918,6 +8208,17 @@ void Analyzer::background_index_loop() const {
         // map_mutex_ held.  Recording this worker's own generation rather than
         // the current one is deliberate: if the generation moved on while this
         // file was parsing, the gate stays armed for the new burst.
+        // Give the active-file count back, at most once.  Paired with the
+        // warmup release above rather than folded into it: the shard-write
+        // reservation below has to be countable *before* the decrement's wake,
+        // so the two do not always happen at the same point.
+        const auto release_active_locked = [&] {
+            if (!counted_active)
+                return;
+            counted_active = false;
+            --background_index_active_;
+        };
+
         const auto release_warmup_locked = [&] {
             if (!warmup_owner)
                 return;
@@ -7926,6 +8227,19 @@ void Analyzer::background_index_loop() const {
             background_warmup_generation_ = generation;
         };
 
+        // Everything from here on parses.  slang can throw, an allocation for a
+        // generated register block can throw, and a filesystem that goes away
+        // under the shard cache can throw -- and this is a thread function, so
+        // anything that escapes is std::terminate with no diagnostic, taking
+        // the editor's whole language server with it.  One file that cannot be
+        // indexed must cost that file and nothing else, the way RequestPool
+        // and BackgroundCompiler already treat their own work.
+        //
+        // The two releases below are idempotent, so the handler can run them
+        // without knowing how far the body got.  Skipping them is what would
+        // wedge the pool: the warmup gate would stay armed and the active count
+        // would never reach zero, so no worker wakes and no index is published.
+        try {
         if (live_doc) {
             // The queued path may represent an indirect include dependency
             // refresh, not a direct edit to this open document.  Reparse the
@@ -7941,13 +8255,15 @@ void Analyzer::background_index_loop() const {
                     if (const auto doc = docs_.find(uri);
                         doc != docs_.end() && doc->second == live_doc) {
                         docs_[uri] = reparsed_live_doc;
-                        invalidate_extra_snapshots_locked();
+                        invalidate_open_file_snapshot_locked(uri);
                         if (extra_file_set_.contains(path_string)) {
-                            extra_cache_[uri] = ExtraFileCacheEntry{
-                                .path = path_string,
-                                .uri = uri,
-                                .index = std::make_shared<SyntaxIndex>(std::move(live_index)),
-                            };
+                            put_extra_cache_locked(
+                                uri, ExtraFileCacheEntry{
+                                         .path = path_string,
+                                         .uri = uri,
+                                         .index = std::make_shared<SyntaxIndex>(
+                                             std::move(live_index)),
+                                     });
                             invalidate_extra_snapshots_locked();
                             schedule_background_project_publish_locked();
                         }
@@ -7987,7 +8303,7 @@ void Analyzer::background_index_loop() const {
                     invalidate_extra_snapshots_locked();
                 }
                 release_warmup_locked();
-                --background_index_active_;
+                release_active_locked();
                 if (background_pending_files_.empty() && background_index_active_ == 0)
                     schedule_background_project_publish_locked();
                 background_cv_.notify_all();
@@ -8005,7 +8321,7 @@ void Analyzer::background_index_loop() const {
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             release_warmup_locked();
-            --background_index_active_;
+            release_active_locked();
             background_cv_.notify_all();
             continue;
         }
@@ -8031,7 +8347,7 @@ void Analyzer::background_index_loop() const {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
                 release_warmup_locked();
-                --background_index_active_;
+                release_active_locked();
                 background_cv_.notify_all();
                 continue;
             }
@@ -8045,11 +8361,11 @@ void Analyzer::background_index_loop() const {
                 return doc != docs_.end() && doc->second;
             }();
             if (!opened_mid_parse) {
-                extra_cache_[uri] = ExtraFileCacheEntry{
-                    .path = path_string,
-                    .uri = uri,
-                    .index = committed_index,
-                };
+                put_extra_cache_locked(uri, ExtraFileCacheEntry{
+                                                .path = path_string,
+                                                .uri = uri,
+                                                .index = committed_index,
+                                            });
                 invalidate_extra_snapshots_locked();
                 shard_to_cache = std::move(committed_index);
             }
@@ -8087,7 +8403,15 @@ void Analyzer::background_index_loop() const {
                 for (auto& header : built_headers) {
                     if (header.stands_alone)
                         standalone_header_uris_.insert(header.uri);
-                    headers_to_cache.emplace_back(header.uri, header.index, header.stands_alone);
+                    // Never a shard built from unsaved text; see
+                    // BuiltHeaderShard::from_open_buffer.  It still goes into
+                    // the in-memory index below -- that is the point of it --
+                    // but the on-disk cache keys shards on a digest of the
+                    // bytes a parse read, and the digest this burst holds for
+                    // this header is the one some includer took off disk.
+                    if (!header.from_open_buffer)
+                        headers_to_cache.emplace_back(header.uri, header.index,
+                                                      header.stands_alone);
                     background_header_shards_[header.uri] = ExtraFileCacheEntry{
                         .path = path_from_file_uri(header.uri),
                         .uri = header.uri,
@@ -8123,7 +8447,7 @@ void Analyzer::background_index_loop() const {
             // applies consistently to disk-backed reindex and live edit paths.
             // With several workers draining the queue, "drained" also requires
             // that no sibling worker is still parsing a file.
-            --background_index_active_;
+            release_active_locked();
             if (background_pending_files_.empty() && background_index_active_ == 0)
                 schedule_background_project_publish_locked();
             background_cv_.notify_all();
@@ -8155,6 +8479,21 @@ void Analyzer::background_index_loop() const {
                 .stands_alone = stands_alone,
                 .generation = generation,
             });
+        }
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] background index of " << path_string
+                      << " failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] background index of " << path_string << " failed\n";
+        }
+
+        if (counted_active || warmup_owner) {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            release_warmup_locked();
+            release_active_locked();
+            if (background_pending_files_.empty() && background_index_active_ == 0)
+                schedule_background_project_publish_locked();
+            background_cv_.notify_all();
         }
     }
 }
@@ -8201,10 +8540,29 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
         }
     };
 
-    for (const auto& [key, entry] : extra_cache_)
-        add_shard(entry);
-    for (const auto& [key, entry] : background_header_shards_)
-        add_shard(entry);
+    // In a fixed order, which neither map has.  Both are unordered_maps, so
+    // "first definition wins" above meant "whichever bucket order this rehash
+    // produced wins", and SystemVerilog's module namespace is flat and global
+    // -- two projects open at once routinely both declare `fifo`.
+    // find_module() breaks a proximity tie by taking the candidate recorded
+    // first and says the answer is therefore stable; it was stable only within
+    // one snapshot, and a republish (one per indexing burst, one per edit of a
+    // listed file) could pick the other one.  Go-to-definition and AutoInst
+    // would answer differently for the same cursor with nothing having changed.
+    //
+    // Headers first, then files, each by path.  Path is the one key that is
+    // unique per shard, already held, and the same from one launch to the next.
+    // Headers lead because a header's declarations belong to its own shard and
+    // an includer's copy of them can be a burst behind -- only one closed
+    // includer is re-queued when a header changes, by design -- so a consumer
+    // that scans shards in order should meet the authoritative one first.
+    // Pointers, not copies, and the sort is the only cost added: it runs once
+    // per debounced publish, against the per-module hash inserts below that
+    // were already there.
+    for (const auto* entry : sorted_by_path(background_header_shards_))
+        add_shard(*entry);
+    for (const auto* entry : sorted_by_path(extra_cache_))
+        add_shard(*entry);
 
     project_index_snapshot_cache_ = std::move(snapshot);
 
@@ -8217,6 +8575,37 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
 
 void Analyzer::clear_project_index_snapshot_locked() const {
     project_index_snapshot_cache_.reset();
+}
+
+void Analyzer::put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const {
+    erase_extra_cache_locked(uri);
+    if (entry.index) {
+        for (const auto& dependency : entry.index->include_dependencies)
+            extra_cache_includers_[dependency].insert(uri);
+    }
+    extra_cache_[uri] = std::move(entry);
+}
+
+void Analyzer::erase_extra_cache_locked(const std::string& uri) const {
+    const auto it = extra_cache_.find(uri);
+    if (it == extra_cache_.end())
+        return;
+    if (it->second.index) {
+        for (const auto& dependency : it->second.index->include_dependencies) {
+            const auto includers = extra_cache_includers_.find(dependency);
+            if (includers == extra_cache_includers_.end())
+                continue;
+            includers->second.erase(uri);
+            if (includers->second.empty())
+                extra_cache_includers_.erase(includers);
+        }
+    }
+    extra_cache_.erase(it);
+}
+
+void Analyzer::clear_extra_cache_locked() const {
+    extra_cache_.clear();
+    extra_cache_includers_.clear();
 }
 
 void Analyzer::update_extra_cache_for_live_state_locked(
@@ -8233,11 +8622,11 @@ void Analyzer::update_extra_cache_for_live_state_locked(
     if (!extra_file_set_.contains(path_string))
         return;
 
-    extra_cache_[uri] = ExtraFileCacheEntry{
-        .path = path_string,
-        .uri = uri,
-        .index = std::make_shared<SyntaxIndex>(std::move(index)),
-    };
+    put_extra_cache_locked(uri, ExtraFileCacheEntry{
+                                    .path = path_string,
+                                    .uri = uri,
+                                    .index = std::make_shared<SyntaxIndex>(std::move(index)),
+                                });
     invalidate_extra_snapshots_locked();
 
     // The per-file shard changed, so the published merged project snapshot is
