@@ -164,6 +164,18 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   index (one index covers every open project, so the filelist is the union), and
   **semantic compilation** (`[compilation]`), which builds a single slang
   `Compilation` and therefore has one preprocessor for all of it.
+- Folding several projects is one analyzer transaction: `fold_project_root()` accumulates
+  and passes `Analyzer::Reindex::Deferred`, and `apply_project_inputs()` is what schedules
+  the burst.  Registering a project *and* scheduling there costs N+1 full reindex
+  generations for N projects, each parsing the filelist as it stood before that project
+  joined it -- superseded before they can commit, but not before their workers have spent
+  the CPU.
+- `reload_all_projects()` folds in a **deterministic order** (the session root, then the
+  discovered roots, then the open buffers' roots, the last two sorted).  Fold order decides
+  the order of the merged defines and `+incdir+` entries, which are the analyzer's
+  *defaults* -- their digest keys every shard of a file under no project, and their order
+  is the header search order.  Iterating a hash container there would invalidate a
+  different arbitrary subset of those shards on each save.
 - Because the index is a union, **a name two projects both declare is disambiguated
   at the lookup, not by splitting the index** — `ProjectIndexSnapshot::find_module()`
   takes the asking file's path and ranks the candidates by path proximity.  clangd
@@ -215,7 +227,15 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   directory is in no repository.
 - An `include`d header's shard lives beside **its** project's config, not the
   includer's.  A verification header shared by two designs is one file in one project.
-- `[index].cache` turns it off.  Keyed on **content digests** of the file, its
+- `[index].cache` turns it off, **per project** like every other setting: a session can
+  hold several, and one saying nothing may be written into it must not decide for the
+  others.  `IndexCacheStorage` asks its `CachePolicy` once per root, and the server
+  answers from that root's own config.  Gating the whole storage on the server's
+  `config_` instead made the switch depend on which directory the server was launched
+  from -- with no `rootUri` that config is whatever sits above the working directory.
+  The fallback cache, for files under no project, has no project config and is the one
+  case `config_` still answers.  Guarded by `[project-root][storage]`.
+- Keyed on **content digests** of the file, its
   `include`s, and the defines/incdirs — never mtime, which is unusable on a shared
   filesystem.
 - A digest answers "did what I read change".  It cannot answer "would I read the same

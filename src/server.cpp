@@ -630,11 +630,15 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     // The file decides, not the session.  Two buffers open at once can belong
     // to different projects, and before this each was served whichever config
     // the editor's guessed root happened to name.
-    std::string key;
-    if (root_resolver_) {
-        if (auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri))))
-            key = info->source_root.string();
-    }
+    if (!root_resolver_)
+        return config_for_root({});
+    auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)));
+    return config_for_root(info ? info->source_root : std::filesystem::path{});
+}
+
+std::shared_ptr<const Config>
+LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) const {
+    std::string key = source_root.string();
 
     {
         std::lock_guard<std::mutex> lock(config_cache_mutex_);
@@ -648,11 +652,26 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     // first is the config both of them get -- the same trade the resolver and
     // the digest memo make, for the same reason.
     auto loaded = std::make_shared<const Config>(
-        key.empty() ? Config{} : load_config(std::filesystem::path(key)));
+        key.empty() ? Config{} : load_config(source_root));
 
     std::lock_guard<std::mutex> lock(config_cache_mutex_);
     auto [it, inserted] = config_cache_.emplace(std::move(key), std::move(loaded));
     return it->second;
+}
+
+std::shared_ptr<IndexCacheStorage> LazyVerilogServer::index_cache_storage() const {
+    // The fallback cache -- for files under no project at all -- has no project
+    // config to consult, so the session's is the only answer there is.
+    const bool fallback_enabled = config_.index.cache;
+    return std::make_shared<IndexCacheStorage>(
+        root_resolver_, [this, fallback_enabled](const std::filesystem::path& source_root) {
+            if (source_root.empty())
+                return fallback_enabled;
+            // Runs on an index worker.  config_for_root() is safe there: it
+            // goes through the resolver and the config cache, both of which
+            // take their own locks, and it never touches config_.
+            return config_for_root(source_root)->index.cache;
+        });
 }
 
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
@@ -724,7 +743,14 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     // does not merge: a file under this root is parsed with exactly this
     // project's defines and include directories, whatever any other project
     // configures.
-    analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs);
+    //
+    // Deferred, not because the burst is unwanted but because apply_project_inputs()
+    // is the one that starts it.  Every caller folds and then applies, and a
+    // generation scheduled here would parse the filelist as it stood *before*
+    // this project joined it -- superseded before it could commit, but not
+    // before its workers had spent a full reindex.
+    analyzer_.set_parse_inputs_for_root(source_root, config.design.define, vcode.include_dirs,
+                                        Analyzer::Reindex::Deferred);
 
     // The filelist path of whichever project was folded last.  It only selects
     // where a relative vcode path is resolved from, and every project that has
@@ -768,14 +794,26 @@ void LazyVerilogServer::reload_all_projects() {
     // And the open buffers, last.  A lazyverilog.toml created just now makes a
     // project that no root in either set above names, and the buffer that now
     // belongs to it has long since sent its didOpen.
+    //
+    // Collected and sorted before folding, rather than folded as they are
+    // visited: the open documents come out of a hash map, and fold order
+    // decides the order of the merged defines and `+incdir+` entries.  Those
+    // are the analyzer's *defaults*, whose digest keys every shard belonging to
+    // a file under no project -- so an arbitrary order would invalidate a
+    // different arbitrary subset of them on each save, and would let a header
+    // searched for through the defaults resolve differently from one reload to
+    // the next.  `previously_known` is ordered for the same reason.
     if (root_resolver_) {
+        std::set<std::string> open_roots;
         analyzer_.for_each_state([&](const std::string& open_uri,
                                      const std::shared_ptr<const DocumentState>& doc) {
             if (!doc)
                 return;
             if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri)))
-                fold_project_root(info->source_root);
+                open_roots.insert(info->source_root.string());
         });
+        for (const auto& root : open_roots)
+            fold_project_root(std::filesystem::path(root));
     }
 
     apply_project_inputs();
@@ -1112,7 +1150,7 @@ void LazyVerilogServer::register_handlers() {
                 std::string warn;
                 ConfigWarning warning_detail;
                 config_ = load_config(root_, &warn, &warning_detail);
-                        
+
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
@@ -1986,7 +2024,7 @@ void LazyVerilogServer::register_handlers() {
                 auto state = analyzer_.get_state(uri);
                 if (state) {
                     std::string formatted =
-                    format_source(state->text, config_for(uri)->format);
+                        format_source(state->text, config_for(uri)->format);
                     optional<lsTextEdit> edit;
                     if (mode == "range") {
                         int start_line = get_int(2);
@@ -2038,24 +2076,20 @@ void LazyVerilogServer::register_handlers() {
             } else if (cmd == "lazyverilog.rtlTree") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree(uri)) {
-                    {
-                        const auto file_config = config_for(uri);
-                        rsp.result.SetJsonString(
-                            rtl_tree_json(*tree, file_config->rtltree.show_file,
-                                          file_config->rtltree.show_instance_name),
-                            lsp::Any::kObjectType);
-                    }
+                    const auto file_config = config_for(uri);
+                    rsp.result.SetJsonString(
+                        rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                      file_config->rtltree.show_instance_name),
+                        lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.rtlTreeReverse") {
                 std::string uri = get_string(0);
                 if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
-                    {
-                        const auto file_config = config_for(uri);
-                        rsp.result.SetJsonString(
-                            rtl_tree_json(*tree, file_config->rtltree.show_file,
-                                          file_config->rtltree.show_instance_name),
-                            lsp::Any::kObjectType);
-                    }
+                    const auto file_config = config_for(uri);
+                    rsp.result.SetJsonString(
+                        rtl_tree_json(*tree, file_config->rtltree.show_file,
+                                      file_config->rtltree.show_instance_name),
+                        lsp::Any::kObjectType);
                 }
             } else if (cmd == "lazyverilog.autowire" || cmd == "lazyverilog.autowirepreview") {
                 std::string uri = get_string(0);

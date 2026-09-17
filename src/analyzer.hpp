@@ -570,6 +570,17 @@ class Analyzer {
     /// parse inputs and its shard directory are all decided by one walk.
     void set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
 
+    /// Whether a setter schedules a background reindex itself, or leaves it to
+    /// the set_project_config() the caller is about to make.
+    ///
+    /// Deferring matters because the generation scheduled here would parse the
+    /// *previous* filelist: it is superseded before it can commit, but the
+    /// workers already dispatched keep parsing, and on a large design that is
+    /// a full reindex of CPU and shared-filesystem bandwidth spent for nothing.
+    /// Registering N projects and then applying once costs N+1 generations
+    /// instead of 1.
+    enum class Reindex { Now, Deferred };
+
     /// Register how files under @p root are preprocessed.
     ///
     /// This is clangd's compilation database learning a project: one indexer,
@@ -577,7 +588,8 @@ class Analyzer {
     /// the inputs from set_project_config().
     void set_parse_inputs_for_root(const std::filesystem::path& root,
                                    const std::vector<std::string>& defines,
-                                   const std::vector<std::string>& include_dirs);
+                                   const std::vector<std::string>& include_dirs,
+                                   Reindex reindex = Reindex::Now);
 
     /// Block until all currently queued project-index work is published.
     ///
@@ -756,6 +768,10 @@ class Analyzer {
 
     mutable std::mutex map_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
+    /// Install @p inputs as the defaults, keeping every registered project's.
+    /// Requires map_mutex_.
+    void replace_default_parse_inputs_locked(ParseInputs inputs);
+
     /// How each file is parsed, looked up per file.
     ///
     /// This replaced flat defines_/include_dirs_ members for the reason clangd
@@ -765,10 +781,6 @@ class Analyzer {
     /// shared_ptr, so a worker can hold one across a whole parse while a config
     /// reload installs a replacement -- there is no window in which a parse
     /// reads half of one project's inputs and half of another's.
-    /// Install @p inputs as the defaults, keeping every registered project's.
-    /// Requires map_mutex_.
-    void replace_default_parse_inputs_locked(ParseInputs inputs);
-
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
     // Normalized absolute lexical filesystem paths.  Writers normalize before

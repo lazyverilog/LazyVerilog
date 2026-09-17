@@ -6159,7 +6159,8 @@ void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolv
 
 void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
                                          const std::vector<std::string>& defines,
-                                         const std::vector<std::string>& include_dirs) {
+                                         const std::vector<std::string>& include_dirs,
+                                         Reindex reindex) {
     // Globbed and digested before the lock, like set_project_config(): this
     // walks the filesystem once per project.
     auto inputs = make_parse_inputs(defines, include_dirs);
@@ -6173,11 +6174,12 @@ void Analyzer::set_parse_inputs_for_root(const std::filesystem::path& root,
     // parsed with the defaults before now has to be parsed again.  Same
     // treatment the legacy setters give a define change, and for the same
     // reason: a cached snapshot built under different inputs is wrong, not
-    // stale.
+    // stale.  Invalidating is cheap and is done either way; only the burst it
+    // would start is what a batching caller defers.
     extra_cache_.clear();
     invalidate_extra_snapshots_locked();
     clear_project_index_snapshot_locked();
-    if (!extra_files_.empty())
+    if (reindex == Reindex::Now && !extra_files_.empty())
         schedule_background_reindex_locked();
 }
 
@@ -6616,16 +6618,17 @@ void Analyzer::store_shard_in_cache(const std::string& uri, const SyntaxIndex& i
         generation = background_generation_;
     }
 
+    // Resolved outside the lock: this file's project decides the directory, and
+    // finding it stats directories.  First, so a project whose `[index].cache`
+    // is off costs one cached lookup and nothing else.
+    const IndexCache* cache = storage->for_uri(uri);
+    if (cache == nullptr)
+        return;
+
     // The digest this shard is keyed on is this file's project's, not the
     // session's.  Keying every shard on one digest would make a second project
     // invalidate the first one's shards on every launch.
     const auto config_digest = parse_inputs->for_uri(uri).config_digest;
-
-    // Resolved outside the lock: this file's project decides the directory, and
-    // finding it stats directories.
-    const IndexCache* cache = storage->for_uri(uri);
-    if (cache == nullptr)
-        return;
 
     // Digests come from what the burst's parses read, never from a fresh read
     // of the file.  A shard keyed on bytes other than the ones it was built
