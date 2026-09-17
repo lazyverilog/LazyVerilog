@@ -924,14 +924,15 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::vector<std::string> previous_dependencies;
     std::unordered_set<std::string> standalone_headers;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
-        // This file's project, not the session's.  A buffer open from another
-        // project is preprocessed with that project's defines and include
-        // directories, which is the whole point of looking them up per file.
-        const auto& inputs = parse_inputs_->for_path(path);
-        defines = inputs.defines;
-        include_dirs = inputs.include_dir_paths;
+        // A pointer copy, resolved below.  for_path() walks up to the nearest
+        // config, which stats directories: on a shared filesystem that is a
+        // round trip, and doing it here would hold the lock every request
+        // handler contends for across it, once per keystroke.  Every other
+        // parse-input lookup takes the pointer under the lock for this reason.
+        parse_inputs = parse_inputs_;
         // What this buffer included last time is the candidate set for header
         // seeding below.  On didOpen there is no previous snapshot, so the first
         // parse reads from disk and every keystroke after it does not.
@@ -955,6 +956,15 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                 .state = open_state,
             });
         }
+    }
+
+    {
+        // This file's project, not the session's.  A buffer open from another
+        // project is preprocessed with that project's defines and include
+        // directories, which is the whole point of looking them up per file.
+        const auto& inputs = parse_inputs->for_path(normalized_current_path);
+        defines = inputs.defines;
+        include_dirs = inputs.include_dir_paths;
     }
 
     auto sm = make_lsp_source_manager();
