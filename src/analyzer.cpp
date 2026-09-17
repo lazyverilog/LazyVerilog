@@ -8465,10 +8465,44 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
         }
     };
 
-    for (const auto& [key, entry] : extra_cache_)
-        add_shard(entry);
+    // In a fixed order, which neither map has.  Both are unordered_maps, so
+    // "first definition wins" above meant "whichever bucket order this rehash
+    // produced wins", and SystemVerilog's module namespace is flat and global
+    // -- two projects open at once routinely both declare `fifo`.
+    // find_module() breaks a proximity tie by taking the candidate recorded
+    // first and says the answer is therefore stable; it was stable only within
+    // one snapshot, and a republish (one per indexing burst, one per edit of a
+    // listed file) could pick the other one.  Go-to-definition and AutoInst
+    // would answer differently for the same cursor with nothing having changed.
+    //
+    // Headers first, then files, each by path.  Path is the one key that is
+    // unique per shard, already held, and the same from one launch to the next.
+    // Headers lead because a header's declarations belong to its own shard and
+    // an includer's copy of them can be a burst behind -- only one closed
+    // includer is re-queued when a header changes, by design -- so a consumer
+    // that scans shards in order should meet the authoritative one first.
+    const auto by_path = [](const ExtraFileCacheEntry* a, const ExtraFileCacheEntry* b) {
+        return a->path < b->path;
+    };
+    std::vector<const ExtraFileCacheEntry*> headers;
+    headers.reserve(background_header_shards_.size());
     for (const auto& [key, entry] : background_header_shards_)
-        add_shard(entry);
+        headers.push_back(&entry);
+    std::sort(headers.begin(), headers.end(), by_path);
+
+    std::vector<const ExtraFileCacheEntry*> files;
+    files.reserve(extra_cache_.size());
+    for (const auto& [key, entry] : extra_cache_)
+        files.push_back(&entry);
+    std::sort(files.begin(), files.end(), by_path);
+
+    // Pointers, not copies, and the sort is the only cost added: it runs once
+    // per debounced publish, against the per-module hash inserts below that
+    // were already there.
+    for (const auto* entry : headers)
+        add_shard(*entry);
+    for (const auto* entry : files)
+        add_shard(*entry);
 
     project_index_snapshot_cache_ = std::move(snapshot);
 
