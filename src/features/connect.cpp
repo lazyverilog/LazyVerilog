@@ -237,18 +237,7 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     return files;
 }
 
-static const ModuleEntry* find_module(const std::vector<FileView>& files, const std::string& name,
-                                      const FileView** file_out = nullptr) {
-    for (const auto& file : files) {
-        auto it = file.index_ref().module_by_name.find(name);
-        if (it == file.index_ref().module_by_name.end())
-            continue;
-        if (file_out)
-            *file_out = &file;
-        return &file.index_ref().modules[it->second];
-    }
-    return nullptr;
-}
+
 
 static std::unordered_map<std::string, ResolvedInst>
 build_hierarchy(const std::vector<FileView>& files) {
@@ -355,6 +344,30 @@ static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
         // parent module at each hierarchy step.
     }
     return lookup;
+}
+
+/// The module @p name names, or null.
+///
+/// Through the lookup, not by walking every FileView and asking each shard's
+/// own table.  That walk was O(files) per call on a filelist that is thousands
+/// of entries on a real design, and the call sites are not one apiece:
+/// connect_apply_preview_json() makes seven, and single_interface_json() makes
+/// one per sibling instance of the one being described.  It had already built a
+/// DesignLookup for the hierarchy walk and then scanned past it.
+///
+/// Same answer: build_design_lookup() fills first-wins in `files` order, which
+/// is what the scan returned.
+static const ModuleEntry* find_module(const DesignLookup& lookup, const std::string& name,
+                                      const FileView** file_out = nullptr) {
+    const auto it = lookup.module_by_name.find(name);
+    if (it == lookup.module_by_name.end())
+        return nullptr;
+    if (file_out) {
+        const auto file = lookup.module_file_by_name.find(name);
+        if (file != lookup.module_file_by_name.end())
+            *file_out = file->second;
+    }
+    return it->second;
 }
 
 static std::vector<std::string> split_hier_path(const std::string& path) {
@@ -503,10 +516,10 @@ static std::unordered_map<std::string, ResolvedInst> route_hierarchy_map(
     return hierarchy;
 }
 
-static std::optional<PortEntry> port_on_module(const std::vector<FileView>& files,
+static std::optional<PortEntry> port_on_module(const DesignLookup& lookup,
                                                const std::string& module_name,
                                                const std::string& port_name) {
-    if (const auto* module = find_module(files, module_name)) {
+    if (const auto* module = find_module(lookup, module_name)) {
         auto it = module->port_by_name.find(port_name);
         if (it != module->port_by_name.end())
             return module->ports[it->second];
@@ -1350,8 +1363,8 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     }
     const auto& src = src_it->second;
     const auto& dst = dst_it->second;
-    auto sp = port_on_module(files, src.module_name, source_port);
-    auto dp = port_on_module(files, dst.module_name, dest_port);
+    auto sp = port_on_module(lookup, src.module_name, source_port);
+    auto dp = port_on_module(lookup, dst.module_name, dest_port);
     if (sp && sp->direction != "output") {
         r.error = "port '" + source_port + "' is not an output port";
         return r;
@@ -1409,7 +1422,7 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     };
     if (!source_boundary_ports.empty()) {
         if (const auto* child = boundary_child(source_steps)) {
-            if (auto bp = port_on_module(files, child->parent_module,
+            if (auto bp = port_on_module(lookup, child->parent_module,
                                          source_boundary_ports.front())) {
                 const auto typ = signal_decl_type_for_port(*bp);
                 if (!typ.empty())
@@ -1418,7 +1431,7 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
         }
     } else if (!dest_boundary_ports.empty()) {
         if (const auto* child = boundary_child(dest_steps)) {
-            if (auto bp = port_on_module(files, child->parent_module,
+            if (auto bp = port_on_module(lookup, child->parent_module,
                                          dest_boundary_ports.front())) {
                 const auto typ = signal_decl_type_for_port(*bp);
                 if (!typ.empty())
@@ -1494,7 +1507,7 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     auto add_boundary_port = [&](const ResolvedInst& child_inst, const std::string& direction,
                                  const std::string& port_name) {
         const FileView* module_file = nullptr;
-        const auto* module = find_module(files, child_inst.parent_module, &module_file);
+        const auto* module = find_module(lookup, child_inst.parent_module, &module_file);
         if (!module_file)
             return;
         if (module && module->port_by_name.contains(port_name))
@@ -1507,7 +1520,7 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     auto add_leaf_port = [&](const ResolvedInst& leaf_inst, const std::string& leaf_module,
                              const std::string& direction, const std::string& port_name) {
         const FileView* module_file = nullptr;
-        const auto* module = find_module(files, leaf_module, &module_file);
+        const auto* module = find_module(lookup, leaf_module, &module_file);
         if (!module_file)
             return;
         if (module && module->port_by_name.contains(port_name))
@@ -1562,7 +1575,7 @@ static ConnectBuildResult build_connect(const Analyzer& analyzer, const std::str
     }
 
     const FileView* lca_file = nullptr;
-    find_module(files, r.lca_module, &lca_file);
+    find_module(lookup, r.lca_module, &lca_file);
     if (lca_file) {
         if (auto edit = add_wire_decl(*lca_file, r.lca_module, wire_name, r.wire_type)) {
             r.preview.push_back(PreviewEdit{basename_from_uri(lca_file->uri), edit->sl + 1,
@@ -1714,14 +1727,15 @@ std::string connect_apply_edit_json(const Analyzer& analyzer, const std::string&
 std::string interface_json(const Analyzer& analyzer, const std::string& uri,
                            const std::string& inst1_name, const std::string& inst2_name) {
     auto files = collect_files(analyzer, uri);
+    const auto lookup = build_design_lookup(files);
     auto a = find_current_file_instance(files, uri, inst1_name);
     auto b = find_current_file_instance(files, uri, inst2_name);
     if (!a || !b)
         return error_json("instance not found");
     const auto& inst1 = *a->second;
     const auto& inst2 = *b->second;
-    const auto* mod1 = find_module(files, inst1.module_name);
-    const auto* mod2 = find_module(files, inst2.module_name);
+    const auto* mod1 = find_module(lookup, inst1.module_name);
+    const auto* mod2 = find_module(lookup, inst2.module_name);
     if (!mod1 || !mod2)
         return error_json("module not found");
 
@@ -1754,12 +1768,13 @@ std::string interface_json(const Analyzer& analyzer, const std::string& uri,
 std::string single_interface_json(const Analyzer& analyzer, const std::string& uri,
                                   const std::string& inst_name) {
     auto files = collect_files(analyzer, uri);
+    const auto lookup = build_design_lookup(files);
     auto target = find_current_file_instance(files, uri, inst_name);
     if (!target)
         return error_json("instance '" + inst_name + "' not found");
     const auto& file = *target->first;
     const auto& inst = *target->second;
-    const auto* mod = find_module(files, inst.module_name);
+    const auto* mod = find_module(lookup, inst.module_name);
     if (!mod)
         return error_json("module not found");
 
@@ -1771,7 +1786,7 @@ std::string single_interface_json(const Analyzer& analyzer, const std::string& u
     for (const auto& other : file.index_ref().instances) {
         if (other.instance_name == inst.instance_name || other.parent_module != inst.parent_module)
             continue;
-        const auto* omod = find_module(files, other.module_name);
+        const auto* omod = find_module(lookup, other.module_name);
         for (const auto& c : other.connections) {
             std::string dir, typ;
             if (omod) {
@@ -1819,6 +1834,7 @@ std::string interface_connect_edit_json(const Analyzer& analyzer, const std::str
                                         const std::string& wire_name,
                                         const std::string& wire_type) {
     auto files = collect_files(analyzer, uri);
+    const auto lookup = build_design_lookup(files);
     auto a = find_current_file_instance(files, uri, inst1_name);
     auto b = find_current_file_instance(files, uri, inst2_name);
     if (!a || !b)
@@ -1830,8 +1846,8 @@ std::string interface_connect_edit_json(const Analyzer& analyzer, const std::str
     // port rather than trusting the caller-provided type.  If port metadata is
     // unavailable, keep the caller type as a compatibility fallback.
     std::string declaration_type = wire_type;
-    const auto* mod1 = find_module(files, a->second->module_name);
-    const auto* mod2 = find_module(files, b->second->module_name);
+    const auto* mod1 = find_module(lookup, a->second->module_name);
+    const auto* mod2 = find_module(lookup, b->second->module_name);
     auto choose_output_type = [&](const ModuleEntry* module, const std::string& port_name) {
         if (!module)
             return;
