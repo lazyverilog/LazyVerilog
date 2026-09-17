@@ -2,8 +2,6 @@
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
-#include <mutex>
-#include <set>
 #include <unordered_map>
 #include <toml++/toml.hpp>
 
@@ -23,24 +21,6 @@ std::string toml_type_name(const toml::node& node) {
     case toml::node_type::none: break;
     }
     return "unknown";
-}
-
-/// Report a `[index]` table, which no longer configures anything, once per file.
-///
-/// Process-global on purpose: the point is to tell the user, and a config is
-/// re-read on every per-root lookup and every reload.  Guarded because index
-/// workers and request handlers both reach load_config().
-void warn_once_about_removed_index_table(const std::filesystem::path& toml_path) {
-    static std::mutex mutex;
-    static std::set<std::string> reported;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!reported.insert(toml_path.string()).second)
-            return;
-    }
-    std::cerr << "[lazyverilog] " << toml_path.string()
-              << ": [index] is no longer a setting; the index cache is always on and shards"
-                 " go beside each file's own lazyverilog.toml\n";
 }
 
 void push_type_error(std::vector<std::string>& errors, const std::string& path,
@@ -278,19 +258,6 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
             append_string_array(d, "define", "[design].define", cfg.design.define,
                                 value_errors);
         }
-
-        // [index] was `cache = <bool>`, and there is no longer anything to
-        // decide: the shard cache is always on, and a project with no config
-        // above it caches outside the tree rather than in it, so the one thing
-        // turning it off used to protect against cannot happen.  Said once
-        // rather than ignored silently -- a key that looks like it still works
-        // is worse than one that is plainly gone.
-        //
-        // Once per config file, not once per load: a config is re-read by every
-        // per-root lookup and by every reload, and a line repeated on each of
-        // those reads like noise rather than news.
-        if (tbl["index"].as_table())
-            warn_once_about_removed_index_table(toml_path);
 
         // [compilation]
         if (auto p = tbl["compilation"].as_table()) {

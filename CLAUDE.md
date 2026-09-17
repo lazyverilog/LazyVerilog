@@ -235,9 +235,10 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   showed why it should not exist: gated on the server's `config_` the switch depended on
   which directory the server was launched from (with no `rootUri` that config is whatever
   sits above the working directory), and per project it was a second answer to a question
-  the shard *location* already answers.  A `[index]` table still in a config is reported
-  once on stderr, not silently ignored.  `index-bench --cache off` stays, for
-  `startup_bench.py --no-cache`; it is a bench knob, not a setting.
+  the shard *location* already answers.  A `[index]` table left in a config is ignored
+  like any other unknown key -- the loader reports unknown keys nowhere, and this is not
+  the place to start.  `index-bench --cache off` stays, for `startup_bench.py
+  --no-cache`; it is a bench knob, not a setting.
 - Keyed on **content digests** of the file, its
   `include`s, and the defines/incdirs — never mtime, which is unusable on a shared
   filesystem.
