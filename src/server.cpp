@@ -756,7 +756,7 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
 
 void LazyVerilogServer::apply_project_inputs() {
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
-                                 index_cache_storage(), project_file_sizes_);
+                                 index_cache_storage_, project_file_sizes_);
     configure_background_compiler();
     schedule_background_compilation();
 }
