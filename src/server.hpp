@@ -8,6 +8,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,17 +52,21 @@ class LazyVerilogServer {
     void configure_background_compiler();
     void schedule_background_compilation();
 
-    /// Storage handed to the analyzer, or null when [index].cache is off --
-    /// a null storage is what makes it run uncached.
+    /// Storage handed to the analyzer, which decides per file where its shards
+    /// go and whether they are written at all.
     ///
     /// Not a root: the server no longer has one root to give.  Each file's
     /// shards go beside its own lazyverilog.toml, resolved by
     /// `root_resolver_`, and a file with no config above it goes to the user's
     /// cache directory instead of littering a tree it was never part of.
-    std::shared_ptr<IndexCacheStorage> index_cache_storage() const {
-        return config_.index.cache ? std::make_shared<IndexCacheStorage>(root_resolver_)
-                                   : nullptr;
-    }
+    ///
+    /// `[index].cache` is read per project for the same reason, through the
+    /// policy below.  Gating the whole storage on `config_` instead made the
+    /// setting depend on which directory the server was launched from: with no
+    /// rootUri -- what the Neovim plugin now sends -- `config_` is whatever is
+    /// above the working directory, so a project that says `cache = false`
+    /// because nothing may be written into it got a `.cache/` anyway.
+    std::shared_ptr<IndexCacheStorage> index_cache_storage() const;
 
     /// Decides which project any file belongs to, and therefore which config it
     /// is served with and where its shards live.  Shared with the storage the
@@ -80,6 +85,11 @@ class LazyVerilogServer {
     /// Cached per root, because inlay hints and folding ranges are answered at
     /// keystroke rate and parsing TOML there would be absurd.
     std::shared_ptr<const Config> config_for(std::string_view uri) const;
+
+    /// The config at @p source_root, or built-in defaults for an empty path.
+    /// Shares config_for()'s cache; that is the same lookup once the file has
+    /// been resolved to a project.
+    std::shared_ptr<const Config> config_for_root(const std::filesystem::path& source_root) const;
 
     /// Drop the per-root config cache and the resolver's decisions.  Called
     /// when a lazyverilog.toml is saved: which file it governs is the
@@ -116,9 +126,14 @@ class LazyVerilogServer {
 
     /// Project roots already folded in by discover_project_for(), so a burst of
     /// didOpens in one project reloads its filelist once rather than per file.
-    /// The empty entry stands for "no project", which is discovered once and
-    /// then never again.
-    std::unordered_set<std::string> discovered_roots_;
+    ///
+    /// Ordered, not hashed: reload_all_projects() re-folds this set, and the
+    /// order it folds in decides the order of the merged defines and `+incdir+`
+    /// entries that become the analyzer's defaults.  A hash order would make
+    /// that -- and therefore the digest keying every shard of a file under no
+    /// project -- differ from one save to the next.  There are a handful of
+    /// entries, so the lookup cost is not a consideration either way.
+    std::set<std::string> discovered_roots_;
     /// Parse inputs accumulated across every discovered project, so that
     /// reloading one does not drop another's.
     std::vector<std::string> project_defines_;

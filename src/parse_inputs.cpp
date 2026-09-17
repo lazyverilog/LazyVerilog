@@ -38,10 +38,11 @@ ParseInputs make_parse_inputs(const std::vector<std::string>& defines,
         inputs.include_dirs.push_back(normalize_filesystem_path(dir).string());
 
     inputs.include_dir_paths = resolve_include_dirs(inputs.include_dirs);
-    // Digested from the normalized spellings, not the globbed result: the glob
-    // depends on which directories happen to exist right now, so keying on it
-    // would make creating an unrelated directory that matches a pattern look
-    // like a config change and throw away every shard.
+    // Over the globbed result, which is what a parse actually searches -- a
+    // `+incdir+` pattern that now matches one more directory changes what an
+    // unchanged file preprocesses to, and a shard keyed on the pattern alone
+    // would be served after that.  Unchanged from before these inputs became
+    // per project.
     inputs.config_digest = IndexCache::config_digest(inputs.defines, inputs.include_dir_paths);
     return inputs;
 }

@@ -877,8 +877,9 @@ std::optional<IndexCache> IndexCache::open_fallback() {
     return IndexCache(std::move(directory));
 }
 
-IndexCacheStorage::IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver)
-    : resolver_(std::move(resolver)) {}
+IndexCacheStorage::IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver,
+                                     CachePolicy cache_enabled)
+    : resolver_(std::move(resolver)), cache_enabled_(std::move(cache_enabled)) {}
 
 std::shared_ptr<IndexCacheStorage> IndexCacheStorage::for_root(fs::path project_root) {
     auto storage = std::make_shared<IndexCacheStorage>(nullptr);
@@ -910,8 +911,16 @@ const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
         // not once per file, and the alternative -- opening outside the lock --
         // has two workers create the same directory and one of them discard a
         // cache the other is already handing out.
+        // Asked here rather than by the server deciding to build no storage at
+        // all, because the answer belongs to the project and a session can hold
+        // several: one project turning the cache off must not take the others'
+        // with it, and must not be overruled by whichever config the server
+        // happened to load for itself.
+        const bool enabled =
+            !cache_enabled_ || cache_enabled_(info ? info->source_root : fs::path{});
         auto opened = std::make_unique<std::optional<IndexCache>>(
-            info ? IndexCache::open(info->source_root) : IndexCache::open_fallback());
+            !enabled ? std::nullopt
+                     : (info ? IndexCache::open(info->source_root) : IndexCache::open_fallback()));
         it = caches_.emplace(std::move(key), std::move(opened)).first;
     }
     return it->second->has_value() ? &it->second->value() : nullptr;

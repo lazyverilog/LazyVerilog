@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "config.hpp"
 #include "features/autoinst.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
@@ -322,6 +323,36 @@ TEST_CASE("a file in no project falls back to the user cache directory",
     // The thing this replaces: nothing was written next to the opened file.
     CHECK_FALSE(std::filesystem::exists(tree.root / ".cache"));
     CHECK_FALSE(std::filesystem::exists(tree.root / "rtl" / ".cache"));
+}
+
+TEST_CASE("a project that turns the cache off gets no shard directory",
+          "[project-root][storage]") {
+    // `[index].cache` is the project's answer, not the session's.  Gating the
+    // whole storage on the server's own config made the setting depend on which
+    // directory the server was launched from: with no rootUri -- what the
+    // Neovim plugin sends -- that config is whatever sits above the working
+    // directory, so a project that says `cache = false` because nothing may be
+    // written into it got a `.cache/` regardless.
+    //
+    // Both halves are asserted: one project turning it off must not turn the
+    // other's off with it, or the check below would pass against a storage that
+    // simply never caches.
+    TempTree tree("storage-cache-off");
+    tree.write("chip_a/lazyverilog.toml", "[index]\ncache = true\n");
+    tree.write("chip_b/lazyverilog.toml", "[index]\ncache = false\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a; endmodule\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "module b; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    // The policy the server installs: that project's own config.
+    IndexCacheStorage storage(resolver, [](const fs::path& source_root) {
+        return source_root.empty() ? true : load_config(source_root).index.cache;
+    });
+
+    CHECK(storage.for_uri(uri_from_path(a)) != nullptr);
+    CHECK(storage.for_uri(uri_from_path(b)) == nullptr);
+    CHECK(fs::exists(tree.root / "chip_a" / ".cache"));
+    CHECK_FALSE(fs::exists(tree.root / "chip_b" / ".cache"));
 }
 
 TEST_CASE("the project cache is gitignored and the fallback is not",
