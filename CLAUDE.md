@@ -164,6 +164,30 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   index (one index covers every open project, so the filelist is the union), and
   **semantic compilation** (`[compilation]`), which builds a single slang
   `Compilation` and therefore has one preprocessor for all of it.
+- Because the index is a union, **a name two projects both declare is disambiguated
+  at the lookup, not by splitting the index** — `ProjectIndexSnapshot::find_module()`
+  takes the asking file's path and ranks the candidates by path proximity.  clangd
+  does the same thing (`FuzzyFindRequest::ProximityPaths`, scored by the directory-tree
+  edit distance in `FileDistance.h`); its `LookupRequest` is a set of `SymbolID` and
+  carries no path filter at all, and `mergeSymbol()` collapses two same-ID symbols
+  into one without ever asking which project they came from.
+- It **ranks, it does not filter**, and that distinction is the whole design.  A filter
+  returns nothing when the asking file is in no project, or when the module lives in
+  shared IP outside either root — both routine in hardware, where a `common_ip/` with
+  no `lazyverilog.toml` is normal.  A filter would also mean paying the union's memory
+  and indexing cost while getting split-index behaviour, which is the one thing the
+  union exists to avoid.
+- Only names with more than one declaration cost anything: `module_duplicates` holds
+  those alone, so a project of thousands of uniquely-named modules does not allocate a
+  vector per name to say "there is exactly one of these".  `ProjectIndexModuleRef`
+  stores a `shard_slot`, not a path string, for the same reason — resolve it with
+  `module_path()`.
+- Ties keep first-indexed order, so the answer is stable across requests.  Like clangd
+  we ignore semantic roots (`FileDistance.h` says so outright), so two files equally
+  far from the asker are not distinguishable and the first one wins.
+- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
+  through AutoInst: the two projects' modules differ in their ports, so the ports that
+  come back name which project answered.
 - Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
   so a session-wide set cannot pass them — each project's source only yields a module
   under its own define, or resolves a same-spelled header through its own `+incdir+`.
