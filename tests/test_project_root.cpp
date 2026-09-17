@@ -1,11 +1,13 @@
 #include "analyzer.hpp"
 #include "features/autoinst.hpp"
+#include "features/connect.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
 #include "string_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <set>
@@ -650,6 +652,228 @@ TEST_CASE("autoinst instantiates its own project's module",
     const auto from_a = ports_seen_from(tree.root / "chip_a/rtl/top.sv");
     CHECK(from_a.contains("i_a_clk"));
     CHECK_FALSE(from_a.contains("i_b_clk"));
+}
+
+// ── The same rule, through the features that consume it ──────────────────────
+//
+// Ranking lived in ProjectIndexSnapshot::find_module(), and the guard above
+// exercised it through AutoInst.  Go-to-definition, hover, references and
+// Connect never called it: they scan the project's shards by name and take the
+// first that answers, over a container sorted by path, so the alphabetically
+// first project won every tie regardless of which file was asking.  AutoInst
+// was already correct, so testing AutoInst could not see it.
+//
+// Each case below asserts *both* directions.  A first-match implementation
+// answers both with the same project, so whichever of the two files it happens
+// to pick, one direction fails.
+//
+// find_references() is not among them, and cannot be: its target resolution is
+// ranked with the rest, but the occurrence search that follows is keyed on
+// `module::<name>` -- a SymbolID with no project in it -- so both projects'
+// `fifo` declarations are one symbol to it and every direction reports both.
+// Making that identity project-aware is a shard-format change and a different
+// question from which declaration a lookup resolves to; a test here would pin
+// the merged behaviour rather than guard this rule.
+
+namespace {
+
+/// Two projects that both declare `fifo`, differing in ports and doc comment so
+/// the answer names which project produced it.
+struct TwoProjectTree {
+    TempTree tree;
+    fs::path a;
+    fs::path b;
+
+    explicit TwoProjectTree(const std::string& name) : tree(name) {
+        tree.write("chip_a/lazyverilog.toml", "[design]\n");
+        tree.write("chip_b/lazyverilog.toml", "[design]\n");
+        a = tree.write("chip_a/rtl/fifo.sv",
+                       "module fifo (\n"
+                       "    input logic i_clk,\n"
+                       "    output logic o_a_full\n"
+                       ");\n"
+                       "    leaf_a u_leaf ();\n"
+                       "endmodule\n"
+                       "module leaf_a;\n"
+                       "endmodule\n");
+        // One line lower, a wider clock, its own port name and its own leaf:
+        // four independent ways for an answer to say which project produced it.
+        b = tree.write("chip_b/rtl/fifo.sv",
+                       "\n"
+                       "module fifo (\n"
+                       "    input logic [1:0] i_clk,\n"
+                       "    output logic o_b_full\n"
+                       ");\n"
+                       "    leaf_b u_leaf ();\n"
+                       "endmodule\n"
+                       "module leaf_b;\n"
+                       "endmodule\n");
+    }
+
+    void index(Analyzer& analyzer) const {
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_extra_files({a.string(), b.string()});
+        analyzer.wait_for_background_index_idle();
+    }
+
+    /// A `top` in the named project instantiating `fifo`, opened and ready.
+    std::string open_top(Analyzer& analyzer, const std::string& project) const {
+        const std::string uri = uri_from_path(tree.root / (project + "/rtl/top.sv"));
+        analyzer.open(uri, "module top;\n"
+                           "    fifo u_fifo (\n"
+                           "        .i_clk(1'b0)\n"
+                           "    );\n"
+                           "endmodule\n");
+        return uri;
+    }
+};
+
+} // namespace
+
+TEST_CASE("go to definition lands in the asking file's project",
+          "[project-root][module-proximity]") {
+    // The reported symptom: open project A, open project B in a split, go to
+    // definition on an instance in B -- and land in A.
+    TwoProjectTree fixture("dup-definition");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    const auto module_declaration_from = [&](const std::string& project) {
+        const std::string uri = fixture.open_top(analyzer, project);
+        auto loc = analyzer.definition_of(uri, 1, 6); // cursor on `fifo`
+        REQUIRE(loc.has_value());
+        return loc->uri;
+    };
+
+    CHECK(module_declaration_from("chip_b") == uri_from_path(fixture.b));
+    CHECK(module_declaration_from("chip_a") == uri_from_path(fixture.a));
+}
+
+TEST_CASE("a named port connection resolves in the asking project's module",
+          "[project-root][module-proximity]") {
+    // `.i_clk(...)` names a port both `fifo`s declare, so the port name cannot
+    // say which module answered -- only the file it was found in can.
+    TwoProjectTree fixture("dup-named-port");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    const auto port_declaration_from = [&](const std::string& project) {
+        const std::string uri = fixture.open_top(analyzer, project);
+        auto loc = analyzer.definition_of(uri, 2, 10); // cursor on `.i_clk`
+        REQUIRE(loc.has_value());
+        return loc->uri;
+    };
+
+    CHECK(port_declaration_from("chip_b") == uri_from_path(fixture.b));
+    CHECK(port_declaration_from("chip_a") == uri_from_path(fixture.a));
+}
+
+TEST_CASE("hover describes the asking file's module", "[project-root][module-proximity]") {
+    // Hover shares definition_of_state() with go-to-definition, so it had the
+    // same defect; the doc comments differ so the rendered hover names which
+    // project answered.
+    TwoProjectTree fixture("dup-hover");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    const auto hover_from = [&](const std::string& project, int line, int col) {
+        const std::string uri = fixture.open_top(analyzer, project);
+        auto info = analyzer.symbol_at(uri, line, col);
+        REQUIRE(info.has_value());
+        return *info;
+    };
+
+    // `module fifo` sits one line lower in chip_b, so the declaration position
+    // hover reports names the file it resolved through.  Hover on a module
+    // renders a bare kind, which is the same string for both.
+    CHECK(hover_from("chip_b", 1, 6).line == 1);
+    CHECK(hover_from("chip_a", 1, 6).line == 0);
+
+    // And on a port both modules declare, where the rendered type differs.
+    CHECK(hover_from("chip_b", 2, 10).detail == "logic [1:0]");
+    CHECK(hover_from("chip_a", 2, 10).detail == "logic");
+}
+
+TEST_CASE("connect resolves the asking project's module", "[project-root][module-proximity]") {
+    // Connect builds its own view of the design in collect_files(), which had
+    // neither the ranking nor a stable order -- open buffers arrived in
+    // unordered_map bucket order.  The two `fifo`s differ in one port, so the
+    // ports Connect reports name which project it resolved into.
+    TwoProjectTree fixture("dup-connect");
+    Analyzer analyzer;
+    fixture.index(analyzer);
+
+    // Expanding `top.u_fifo` resolves the instance to a module and reports what
+    // that module instantiates.  Each project's fifo holds its own leaf, so the
+    // child that comes back names which fifo Connect resolved into.  A listing
+    // of every module in the design could not tell them apart -- both are in
+    // the union index, and both are meant to be.
+    const auto leaf_under_fifo_from = [&](const std::string& project) {
+        const std::string uri = fixture.open_top(analyzer, project);
+        return connect_hierarchy_children_json(analyzer, uri, "top.u_fifo");
+    };
+
+    const auto from_b = leaf_under_fifo_from("chip_b");
+    CHECK(from_b.find("leaf_b") != std::string::npos);
+    CHECK(from_b.find("leaf_a") == std::string::npos);
+
+    const auto from_a = leaf_under_fifo_from("chip_a");
+    CHECK(from_a.find("leaf_a") != std::string::npos);
+    CHECK(from_a.find("leaf_b") == std::string::npos);
+}
+
+TEST_CASE("nearest-first ordering ranks without filtering", "[module-proximity]") {
+    // The primitive every one of the above now shares.  Three properties the
+    // scans depend on: nothing is dropped, ties keep the caller's order, and a
+    // single project -- the overwhelmingly common case -- is returned untouched.
+    struct Candidate {
+        std::string path;
+    };
+    const std::vector<Candidate> files{
+        {"/w/chip_a/rtl/fifo.sv"},
+        {"/w/chip_b/rtl/fifo.sv"},
+        {"/w/common_ip/sync.sv"},
+        {"/w/chip_b/verif/fifo.sv"},
+    };
+
+    const auto paths = [](const std::vector<const Candidate*>& ranked) {
+        std::vector<std::string> out;
+        for (const auto* c : ranked)
+            out.push_back(c->path);
+        return out;
+    };
+
+    const auto from_b =
+        paths(by_path_proximity(std::span<const Candidate>(files), "/w/chip_b/rtl/top.sv"));
+    CHECK(from_b.front() == "/w/chip_b/rtl/fifo.sv");
+    // Ranks, does not filter: shared IP in no project is still reachable.
+    CHECK(from_b.size() == files.size());
+    CHECK(std::find(from_b.begin(), from_b.end(), "/w/common_ip/sync.sv") != from_b.end());
+    // chip_b/verif is nearer than either chip_a or common_ip.
+    CHECK(std::find(from_b.begin(), from_b.end(), "/w/chip_b/verif/fifo.sv") <
+          std::find(from_b.begin(), from_b.end(), "/w/chip_a/rtl/fifo.sv"));
+    // Equally distant candidates keep the order they arrived in, so the answer
+    // is stable rather than dependent on a sort's tie-breaking.
+    CHECK(std::find(from_b.begin(), from_b.end(), "/w/chip_a/rtl/fifo.sv") <
+          std::find(from_b.begin(), from_b.end(), "/w/common_ip/sync.sv"));
+
+    // No path in hand, and one project: both return the caller's order as-is.
+    CHECK(paths(by_path_proximity(std::span<const Candidate>(files), "")) ==
+          std::vector<std::string>{"/w/chip_a/rtl/fifo.sv", "/w/chip_b/rtl/fifo.sv",
+                                   "/w/common_ip/sync.sv", "/w/chip_b/verif/fifo.sv"});
+
+    const std::vector<Candidate> one_project{{"/w/chip_a/rtl/a.sv"}, {"/w/chip_a/rtl/b.sv"}};
+    CHECK(paths(by_path_proximity(std::span<const Candidate>(one_project),
+                                  "/w/chip_a/rtl/top.sv")) ==
+          std::vector<std::string>{"/w/chip_a/rtl/a.sv", "/w/chip_a/rtl/b.sv"});
+
+    // The in-place variant moves the same elements into the same order.
+    std::vector<Candidate> owned = files;
+    order_by_path_proximity(owned, "/w/chip_b/rtl/top.sv");
+    std::vector<std::string> owned_paths;
+    for (const auto& c : owned)
+        owned_paths.push_back(c.path);
+    CHECK(owned_paths == from_b);
 }
 
 TEST_CASE("project root: the File hint answers exactly as the stat would", "[project-root]") {
