@@ -186,7 +186,11 @@ static FileView open_buffer_view(std::string uri, std::string path,
                                  std::shared_ptr<const DocumentState> state) {
     FileView file;
     file.uri = std::move(uri);
-    file.path = std::move(path);
+    // An open buffer that is not a filelist entry has no path from the caller,
+    // and the snapshot already holds its normalized one.  Leaving it empty made
+    // every open buffer unrankable -- which did not matter while `files` order
+    // was arbitrary, and is the whole answer now that it is not.
+    file.path = path.empty() ? state->normalized_path : std::move(path);
     file.buffer_text = &state->text;
     file.index_ptr = &get_structural_index(*state);
     file.state = std::move(state);
@@ -196,6 +200,9 @@ static FileView open_buffer_view(std::string uri, std::string path,
 static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::string& uri) {
     std::vector<FileView> files;
     std::unordered_set<std::string> seen;
+    // Once: get_state() takes the analyzer lock, and both the defensive push
+    // below and the ordering at the end need this same snapshot.
+    const auto asking_state = analyzer.get_state(uri);
 
     // Open buffers are authoritative: they contain unsaved edits.  Derive the
     // structural view from the live SyntaxTree on demand instead of relying on
@@ -230,10 +237,25 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     }
 
     // Be defensive for command calls that arrive before didOpen is processed.
-    if (!seen.contains(uri)) {
-        if (auto state = analyzer.get_state(uri))
-            files.push_back(open_buffer_view(uri, {}, state));
-    }
+    if (!seen.contains(uri) && asking_state)
+        files.push_back(open_buffer_view(uri, {}, asking_state));
+
+    // Nearest-first against the file this request is about.  Every consumer of
+    // this vector resolves names by taking the first view that declares them --
+    // build_design_lookup() fills its tables first-wins, build_hierarchy() and
+    // find_hierarchy_roots() walk it in order -- so this order is what decides
+    // which project a name belongs to.
+    //
+    // It was neither ranked nor stable: open buffers came first in `docs_`
+    // iteration order, which is an unordered_map's bucket order, so with two
+    // projects open Connect could resolve `fifo` into either one and change its
+    // mind on any rehash.  Same rule and same scoring function as
+    // go-to-definition and ProjectIndexSnapshot::find_module().
+    //
+    // Dedup above is by URI and already done, so an open buffer still shadows
+    // its own closed shard; ordering only decides between different files.
+    if (asking_state)
+        order_by_path_proximity(files, std::string_view(asking_state->normalized_path));
     return files;
 }
 
@@ -332,9 +354,12 @@ static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
     DesignLookup lookup;
     for (const auto& file : files) {
         for (const auto& module : file.index_ref().modules) {
-            // First definition wins, matching find_module().  Open buffers are
-            // collected before filelist shards, so unsaved current text remains
-            // authoritative when a file also appears in the project filelist.
+            // First definition wins, over a `files` that collect_files() has
+            // ordered nearest-first, which is how this agrees with
+            // ProjectIndexSnapshot::find_module() about which project a name
+            // belongs to.  A file open in the editor still shadows its own
+            // closed shard -- that dedup is by URI and happens during
+            // collection -- so unsaved current text stays authoritative.
             lookup.module_file_by_name.emplace(module.name, &file);
             lookup.module_by_name.emplace(module.name, &module);
         }
@@ -356,7 +381,9 @@ static DesignLookup build_design_lookup(const std::vector<FileView>& files) {
 /// DesignLookup for the hierarchy walk and then scanned past it.
 ///
 /// Same answer: build_design_lookup() fills first-wins in `files` order, which
-/// is what the scan returned.
+/// is what the scan returned.  That order is proximity to the requesting file,
+/// so among two projects that both declare the name this resolves into the
+/// asking file's own.
 static const ModuleEntry* find_module(const DesignLookup& lookup, const std::string& name,
                                       const FileView** file_out = nullptr) {
     const auto it = lookup.module_by_name.find(name);
