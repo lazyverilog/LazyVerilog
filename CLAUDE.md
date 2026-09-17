@@ -194,9 +194,15 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   vector per name to say "there is exactly one of these".  `ProjectIndexModuleRef`
   stores a `shard_slot`, not a path string, for the same reason — resolve it with
   `module_path()`.
-- Ties keep first-indexed order, so the answer is stable across requests.  Like clangd
-  we ignore semantic roots (`FileDistance.h` says so outright), so two files equally
-  far from the asker are not distinguishable and the first one wins.
+- Ties are broken by **path order**, which is what makes the answer stable.  Every
+  snapshot is built from two `unordered_map`s, so "the one indexed first" meant
+  "whichever bucket order the last rehash produced" and the winner could flip on any
+  republish; `Analyzer::sorted_by_path()` is the single place that order is decided,
+  for the published snapshot and for the two extra-file vectors alike.  The published
+  one puts **headers before files**, because a header's declarations belong to its own
+  shard while an includer's copy of them can be a burst behind.  Like clangd we ignore
+  semantic roots (`FileDistance.h` says so outright), so two files equally far from the
+  asker are not distinguishable and path order decides.
 - Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
   through AutoInst: the two projects' modules differ in their ports, so the ports that
   come back name which project answered.
@@ -259,6 +265,15 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   writer thread) removes shards whose source file is gone and shards of any other
   format version, and runs over **every** directory the burst wrote into.  Files
   without our magic are left alone.
+- It runs **once per full reindex**, never per burst.  Only a burst that queued the
+  whole filelist can say which shards are referenced; an incremental one carries the
+  one or two includers an edited header re-queued, and editing a header bumps the
+  generation on every keystroke -- so sweeping there read and stat'ed every other shard
+  in the project per character typed (measured: 302 shard opens per keystroke on a
+  301-shard project, 802 on an 801-shard one).  `background_full_reindex_generation_`
+  is what gates it.  The cost is that a deleted file's shard waits for the next full
+  reindex; it is never *served* in the meantime, because validating it hashes a file
+  that is not there.
 - Benchmark all three halves: `tools/startup_bench.py` clears the shard cache before
   each run (**cold**), `--warm` keeps it, `--no-cache` turns the cache off entirely.
   Report them separately — a change can improve warm and wreck cold.
