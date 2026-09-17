@@ -268,6 +268,9 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     const CurrentModulePortMap& current_modules;
     const SyntaxIndex*         project_index;
     const ProjectIndexSnapshot* project_snapshot;
+    // The file being linted, for the project snapshot's duplicate-name
+    // tie-break.  See ProjectIndexSnapshot::find_module().
+    std::string                from_path;
     SourceManager&             sm;
     std::vector<ParseDiagInfo> diags;
     bool in_always_ff_{false};
@@ -332,9 +335,10 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     LintVisitor(const LintConfig& c, const CurrentModulePortMap& current,
                 const SyntaxIndex* project, const ProjectIndexSnapshot* snapshot,
-                SourceManager& s, std::string file_stem,
+                std::string from, SourceManager& s, std::string file_stem,
                 std::span<const slang::BufferID> own_buffers)
-        : cfg(c), current_modules(current), project_index(project), project_snapshot(snapshot), sm(s),
+        : cfg(c), current_modules(current), project_index(project), project_snapshot(snapshot),
+          from_path(std::move(from)), sm(s),
           file_stem_(std::move(file_stem)), own_buffers_(own_buffers) {
         if (cfg.naming.enable) {
             module_re_      = compile_re(cfg.naming.module_pattern);
@@ -457,11 +461,10 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     const ModuleEntry* find_project_module_entry(std::string_view module_name) const {
         const std::string key(module_name);
         if (project_snapshot) {
-            const auto it = project_snapshot->module_by_name.find(key);
-            if (it == project_snapshot->module_by_name.end() || !it->second.shard ||
-                it->second.module_index >= it->second.shard->modules.size())
+            const auto* ref = project_snapshot->find_module(key, from_path);
+            if (!ref || !ref->shard || ref->module_index >= ref->shard->modules.size())
                 return nullptr;
-            return &it->second.shard->modules[it->second.module_index];
+            return &ref->shard->modules[ref->module_index];
         }
         if (!project_index)
             return nullptr;
@@ -811,7 +814,8 @@ static std::vector<ParseDiagInfo> run_lint_impl(const DocumentState& state, cons
         state.tree->root().visit(collector);
         current_modules = std::move(collector.modules);
     }
-    LintVisitor v(config, current_modules, project_index, project_snapshot, sm,
+    LintVisitor v(config, current_modules, project_index, project_snapshot,
+                  state.normalized_path, sm,
                   file_stem_from_uri(state.uri), state.tree->getSourceBufferIds());
     state.tree->root().visit(v);
     v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {

@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "features/autoinst.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
 #include "string_utils.hpp"
@@ -481,4 +482,158 @@ TEST_CASE("a file in no registered project uses the defaults",
     analyzer.wait_for_background_index_idle();
 
     CHECK(indexed_module_names(analyzer).contains("m_fallback"));
+}
+
+// ── Duplicate module names across projects ───────────────────────────────────
+//
+// SystemVerilog has no namespaces.  Two projects open in one editor session
+// routinely both declare `fifo`, and the index is deliberately a union across
+// them -- splitting it is what would make the buffer you were just reading
+// disappear when you open a second project.  So the disambiguation happens at
+// the lookup, and it ranks rather than filters: see
+// ProjectIndexSnapshot::find_module().
+//
+// Every test below is built so the pre-existing "first declaration wins"
+// behaviour CANNOT pass it: whichever of the two files won that race, one of
+// the two directions asserted here would get the other project's answer.
+
+TEST_CASE("path proximity counts whole components", "[module-proximity]") {
+    // A sibling checkout is the case this exists to tell apart, and it is
+    // exactly the case a raw string prefix gets wrong.
+    // "w" alone: chipA_old is a different component, not a longer chipA.
+    CHECK(shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipA_old/rtl/fifo.sv") == 1);
+    // "w", "chipA", "rtl"; the file names differ.
+    CHECK(shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipA/rtl/fifo.sv") == 3);
+    CHECK(shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipB/rtl/fifo.sv") == 1);
+    // A sibling checkout scores no better than an unrelated sibling project,
+    // which is the point: neither is the project that asked.
+    CHECK(shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipA_old/rtl/fifo.sv") ==
+          shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipB/rtl/fifo.sv"));
+    // Deeper inside the same project still beats a sibling project.
+    CHECK(shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipA/verif/fifo.sv") >
+          shared_path_prefix_components("/w/chipA/rtl/top.sv", "/w/chipB/rtl/fifo.sv"));
+    // Either separator, so a Windows path and a POSIX one score alike.
+    CHECK(shared_path_prefix_components("C:\\w\\chipA\\top.sv", "C:/w/chipA/fifo.sv") == 3);
+    CHECK(shared_path_prefix_components("/w/a.sv", "/x/b.sv") == 0);
+    CHECK(shared_path_prefix_components("", "/w/a.sv") == 0);
+}
+
+TEST_CASE("a name two projects declare resolves toward the asking file",
+          "[project-root][module-proximity]") {
+    TempTree tree("dup-modules");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/fifo.sv", "module fifo; endmodule\n");
+    auto b = tree.write("chip_b/rtl/fifo.sv", "module fifo; endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+
+    const auto* from_a = snapshot->find_module("fifo", (tree.root / "chip_a/rtl/top.sv").string());
+    const auto* from_b = snapshot->find_module("fifo", (tree.root / "chip_b/rtl/top.sv").string());
+    REQUIRE(from_a);
+    REQUIRE(from_b);
+    CHECK(snapshot->module_path(*from_a) == a.string());
+    CHECK(snapshot->module_path(*from_b) == b.string());
+}
+
+TEST_CASE("a module only the other project declares is still found",
+          "[project-root][module-proximity]") {
+    // The tie-break ranks, it does not filter.  A name with one declaration
+    // anywhere resolves from anywhere -- which is what a filter would break,
+    // and what shared IP outside either project root depends on.
+    TempTree tree("dup-crossproject");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/fifo.sv", "module fifo; endmodule\n");
+    auto b = tree.write("chip_b/rtl/fifo.sv", "module fifo; endmodule\n");
+    auto only_b = tree.write("chip_b/rtl/only_b.sv", "module only_in_b; endmodule\n");
+    // No lazyverilog.toml above it: shared IP in no project at all.
+    auto shared = tree.write("common_ip/sync.sv", "module sync_2ff; endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({a.string(), b.string(), only_b.string(), shared.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+
+    const std::string asking = (tree.root / "chip_a/rtl/top.sv").string();
+    const auto* crossed = snapshot->find_module("only_in_b", asking);
+    REQUIRE(crossed);
+    CHECK(snapshot->module_path(*crossed) == only_b.string());
+
+    const auto* ip = snapshot->find_module("sync_2ff", asking);
+    REQUIRE(ip);
+    CHECK(snapshot->module_path(*ip) == shared.string());
+
+    CHECK(snapshot->find_module("no_such_module", asking) == nullptr);
+}
+
+TEST_CASE("a caller with no path in hand still gets an answer",
+          "[project-root][module-proximity]") {
+    TempTree tree("dup-nopath");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/fifo.sv", "module fifo; endmodule\n");
+    auto b = tree.write("chip_b/rtl/fifo.sv", "module fifo; endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot);
+
+    // Opting out takes the first-indexed declaration rather than nothing, and
+    // gives the same one every time it is asked.
+    const auto* first = snapshot->find_module("fifo", {});
+    REQUIRE(first);
+    CHECK(snapshot->module_path(*snapshot->find_module("fifo", {})) ==
+          snapshot->module_path(*first));
+}
+
+TEST_CASE("autoinst instantiates its own project's module",
+          "[project-root][module-proximity]") {
+    // End to end through a feature: the two `fifo`s differ in their ports, so
+    // the ports that come back name which project answered.
+    TempTree tree("dup-autoinst");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/fifo.sv",
+                        "module fifo(input logic i_a_clk, output logic o_a_full); endmodule\n");
+    auto b = tree.write("chip_b/rtl/fifo.sv",
+                        "module fifo(input logic i_b_clk, output logic o_b_full); endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string top = "module top;\n    fifo u_fifo ();\nendmodule\n";
+    const auto ports_seen_from = [&](const fs::path& top_path) {
+        const std::string uri = uri_from_path(top_path);
+        analyzer.open(uri, top);
+        auto state = analyzer.get_state(uri);
+        REQUIRE(state);
+        auto result = autoinst_impl(*state, 1, 9, nullptr,
+                                    analyzer.project_index_snapshot().get());
+        REQUIRE(result.has_value());
+        return std::set<std::string>(result->port_names.begin(), result->port_names.end());
+    };
+
+    const auto from_b = ports_seen_from(tree.root / "chip_b/rtl/top.sv");
+    CHECK(from_b.contains("i_b_clk"));
+    CHECK_FALSE(from_b.contains("i_a_clk"));
+
+    const auto from_a = ports_seen_from(tree.root / "chip_a/rtl/top.sv");
+    CHECK(from_a.contains("i_a_clk"));
+    CHECK_FALSE(from_a.contains("i_b_clk"));
 }

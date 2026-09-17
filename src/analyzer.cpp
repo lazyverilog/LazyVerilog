@@ -4774,6 +4774,10 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
     });
     auto project = project_index_snapshot();
 
+    // Which file is asking.  A name two projects both declare is resolved
+    // toward this one; see ProjectIndexSnapshot::find_module().
+    const std::string& from_path = state.normalized_path;
+
     const auto find_module = [&](const std::string& name) -> std::optional<HierarchyModule> {
         for (const auto& [state_uri, doc] : open_states) {
             const auto& index = get_structural_index(*doc);
@@ -4782,18 +4786,18 @@ std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& s
                 return HierarchyModule{&index, state_uri, &index.modules[it->second]};
         }
         if (project) {
-            const auto it = project->module_by_name.find(name);
-            if (it != project->module_by_name.end() && it->second.shard) {
-                const auto& index = *it->second.shard;
+            const auto* ref = project->find_module(name, from_path);
+            if (ref && ref->shard) {
+                const auto& index = *ref->shard;
                 // The shard's URI is the file it was built from; entries carry
                 // their own file_id for `include`d declarations.
                 std::string shard_uri;
                 for (const auto& shard : project->shards)
-                    if (shard.index == it->second.shard) {
+                    if (shard.index == ref->shard) {
                         shard_uri = shard.uri;
                         break;
                     }
-                return HierarchyModule{&index, shard_uri, &index.modules[it->second.module_index]};
+                return HierarchyModule{&index, shard_uri, &index.modules[ref->module_index]};
             }
         }
         return std::nullopt;
@@ -8153,20 +8157,34 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
         if (!entry.index)
             return;
 
+        const size_t shard_slot = snapshot->shards.size();
         snapshot->shards.push_back(ProjectIndexSnapshot::Shard{
             .path = entry.path,
             .uri = entry.uri,
             .index = entry.index,
         });
 
-        // Lightweight global module lookup.  Keep first definition wins to
-        // preserve the historical merge behavior for duplicate module names.
+        // Lightweight global module lookup.  First definition still wins here,
+        // but it is no longer the whole answer: a name declared in more than
+        // one file also records its other declarations, and the lookup picks
+        // among them per querying file.  See
+        // ProjectIndexSnapshot::find_module().
         for (size_t i = 0; i < entry.index->modules.size(); ++i) {
             const auto& module = entry.index->modules[i];
-            snapshot->module_by_name.try_emplace(module.name, ProjectIndexModuleRef{
+            ProjectIndexModuleRef ref{
                 .shard = entry.index,
                 .module_index = i,
-            });
+                .shard_slot = shard_slot,
+            };
+            const auto [slot, inserted] = snapshot->module_by_name.try_emplace(module.name, ref);
+            if (inserted)
+                continue;
+            if (snapshot->module_path(slot->second) == entry.path)
+                continue; // the same file reached through both shard maps
+            auto& candidates = snapshot->module_duplicates[module.name];
+            if (candidates.empty())
+                candidates.push_back(slot->second);
+            candidates.push_back(std::move(ref));
         }
     };
 

@@ -380,6 +380,49 @@ flat index.  Feature paths should use `Analyzer::project_index_snapshot()` and
 either consult its global lookups or iterate the relevant shard references rather
 than materializing a compatibility merge.
 
+### Two projects, one index: duplicate module names
+
+The snapshot is a **union across every open project**.  That is deliberate: the
+index is one object because clangd's `BackgroundIndex` is one object, and
+splitting it per project is what would make the file you were just reading
+disappear the moment you open a second project.
+
+SystemVerilog has no namespaces, though, so the union has a cost C++ mostly
+avoids.  Two designs open at once both declaring `fifo` is ordinary, not a
+corner case, and two checkouts of the same repo collide on every name.
+
+The disambiguation therefore happens at the **lookup**, not the storage:
+
+```cpp
+const auto* ref = snapshot->find_module(name, state.normalized_path);
+```
+
+`module_by_name` still holds one declaration per name.  Names with more than one
+also appear in `module_duplicates`, and `find_module()` picks among those by path
+proximity to the asking file — the same signal as clangd's
+`FuzzyFindRequest::ProximityPaths`, which `FileDistance.h` defines as an edit
+distance up and down the directory tree.  Comparison is by whole path component,
+so a sibling checkout (`chipA_old/`) scores no closer than an unrelated project.
+
+**It ranks; it never filters.**  A module with a single declaration resolves from
+anywhere, so go-to-definition still crosses into another project, and still
+reaches shared IP sitting under no `lazyverilog.toml` at all — the `common_ip/`
+case, which is normal in hardware and which a filter would break outright.  A
+filter would also mean paying the union's memory and indexing cost while
+behaving like a split index.
+
+Limitations, both shared with clangd:
+
+- When **no** candidate is near the asking file (say `common_ip/` and
+  `vendor_ip/` both declare `sync_2ff` and your project declares neither), the
+  tie is not broken and first-indexed order decides.  `FileDistance.h` notes the
+  same gap — "often there are semantic roots whose children are almost
+  unrelated… we ignore this."
+- Proximity is a heuristic about paths, not a statement about which filelist a
+  file belongs to.
+
+Guarded by `./build/lazyverilog-tests "[module-proximity]"`.
+
 ## Project-index refresh notifications
 
 Features that depend on definitions from filelist/project files may produce partial

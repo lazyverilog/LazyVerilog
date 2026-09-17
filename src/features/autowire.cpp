@@ -229,14 +229,15 @@ static std::optional<PortEntry> project_port(const SyntaxIndex& syntax_index,
 
 static std::optional<PortEntry> project_port(const ProjectIndexSnapshot& snapshot,
                                              const std::string& module_name,
-                                             const std::string& port_name) {
-    const auto module_it = snapshot.module_by_name.find(module_name);
-    if (module_it == snapshot.module_by_name.end() || !module_it->second.shard)
+                                             const std::string& port_name,
+                                             std::string_view from_path) {
+    const auto* ref = snapshot.find_module(module_name, from_path);
+    if (!ref || !ref->shard)
         return std::nullopt;
-    const auto& shard = *module_it->second.shard;
-    if (module_it->second.module_index >= shard.modules.size())
+    const auto& shard = *ref->shard;
+    if (ref->module_index >= shard.modules.size())
         return std::nullopt;
-    const auto& module = shard.modules[module_it->second.module_index];
+    const auto& module = shard.modules[ref->module_index];
     const auto port_it = module.port_by_name.find(port_name);
     if (port_it == module.port_by_name.end() || port_it->second >= module.ports.size())
         return std::nullopt;
@@ -427,7 +428,8 @@ static std::vector<InstSignal> collect_inst_signals(const DocumentState& state,
             if (!port && !opened_shards.empty())
                 port = project_port(opened_shards, module_name, port_name);
             if (!port && project_index)
-                port = project_port(*project_index, module_name, port_name);
+                port = project_port(*project_index, module_name, port_name,
+                                    state.normalized_path);
 
             if (port) {
                 direction = port->direction;

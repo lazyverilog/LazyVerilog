@@ -448,6 +448,13 @@ struct SyntaxIndex {
 struct ProjectIndexModuleRef {
     std::shared_ptr<const SyntaxIndex> shard;
     size_t module_index{0};
+    /// Index into ProjectIndexSnapshot::shards of the file this declaration was
+    /// found in, for the duplicate-name tie-break; resolve it with
+    /// ProjectIndexSnapshot::module_path().  A slot rather than the path itself
+    /// because every module in a file would otherwise copy the same string, and
+    /// a per-declaration allocation on the publish path is what shows up in
+    /// maxRSS on a large project.
+    size_t shard_slot{0};
 };
 
 struct ProjectIndexSnapshot {
@@ -459,4 +466,37 @@ struct ProjectIndexSnapshot {
 
     std::vector<Shard> shards;
     std::unordered_map<std::string, ProjectIndexModuleRef> module_by_name;
+
+    /// Every declaration of a name that more than one file declares, the one in
+    /// module_by_name included.  Empty for the overwhelming majority of names,
+    /// which is why it is a second map rather than a vector in the first: a
+    /// project of thousands of modules would otherwise pay a heap allocation
+    /// per name to express "there is exactly one of these".
+    std::unordered_map<std::string, std::vector<ProjectIndexModuleRef>> module_duplicates;
+
+    /// The declaration of @p name that best answers for @p from_path, or null.
+    ///
+    /// SystemVerilog has no namespaces: the module name space is flat and
+    /// global, so two projects open in one editor session routinely both
+    /// declare `fifo`.  The index is deliberately a union across projects --
+    /// splitting it is what would make the buffer you were just reading
+    /// disappear when you open a second project -- so the disambiguation
+    /// happens here, at the lookup, and it *ranks* rather than filters: a name
+    /// only this project declares still resolves into the other one.
+    ///
+    /// The ranking is path proximity, which is clangd's `ProximityPaths`
+    /// (FileDistance.h: "an edit-distance, where edits go up or down the
+    /// directory tree").  Like clangd we take no account of semantic roots, so
+    /// a tie between two files equally far away keeps the order they were
+    /// indexed in.  Passing an empty @p from_path opts out and takes that
+    /// first-indexed declaration.
+    const ProjectIndexModuleRef* find_module(const std::string& name,
+                                             std::string_view from_path = {}) const;
+
+    /// The file @p ref was declared in, or an empty string if its slot is stale.
+    const std::string& module_path(const ProjectIndexModuleRef& ref) const;
 };
+
+/// How many leading path components @p a and @p b agree on.  Accepts either
+/// separator so a Windows path and a POSIX one score the same way.
+size_t shared_path_prefix_components(std::string_view a, std::string_view b);
