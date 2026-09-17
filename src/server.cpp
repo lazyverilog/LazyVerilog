@@ -1473,8 +1473,38 @@ void LazyVerilogServer::register_handlers() {
                 // for.
                 const auto file_config = config_for(uri);
                 FormatOptions save_format = file_config->format;
-                if (file_config->autoarg.autoarg_on_save && state->tree) {
-                    auto results = autoarg_all_modules(*state);
+                // AutoArg needs a tree for *this* text, and format-on-save
+                // arrives from BufWritePre -- right behind the didChange that
+                // carried the last keystroke -- so `state` is routinely the
+                // text-only placeholder and `state->tree` is null.  Testing it
+                // there made AutoArg-on-save run or not run depending on
+                // whether the parse had landed, which the user experiences as
+                // it working intermittently.
+                //
+                // So wait for the parse, and check that what came back is a
+                // parse of the text being formatted.  It is not enough that it
+                // has a tree: get_parsed_state() falls back to the snapshot one
+                // keystroke old when the wait times out, and generating a port
+                // list from that would place edits at offsets this text does
+                // not have.  Formatting itself needs no tree and still runs on
+                // the current text either way, which is what happened before.
+                //
+                // A much longer wait than a keystroke-rate request takes.  The
+                // default 150 ms is sized for hover and signature help, where
+                // the user is typing and a late answer is worse than a slightly
+                // stale one; this is a save, the user is not typing, and the
+                // client is blocking on the reply anyway.  150 ms is also less
+                // than a 12k-line file's parse, which is exactly the size where
+                // AutoArg-on-save was dropping out.  Still bounded, so a file
+                // that never parses costs one formatting pass without AutoArg
+                // rather than the dispatch thread.
+                const auto parsed =
+                    analyzer_.get_parsed_state(uri, std::chrono::seconds(2));
+                const DocumentState* ast =
+                    parsed && parsed->tree && parsed->text == state->text ? parsed.get()
+                                                                          : nullptr;
+                if (file_config->autoarg.autoarg_on_save && ast) {
+                    auto results = autoarg_all_modules(*ast);
                     // apply back-to-front so earlier offsets stay valid
                     std::sort(results.begin(), results.end(),
                               [](const AutoargResult& a, const AutoargResult& b) {
