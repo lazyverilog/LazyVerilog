@@ -4572,17 +4572,22 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         return std::nullopt;
 
     auto target = definition_target_at(*state->tree, uri, line, col);
-    auto extra_files = extra_file_snapshot_ptr();
+    // Nearest-first, and shared with the definition_of_state() call below: a
+    // macro two projects both define is the same ambiguity a module is, and
+    // hover answering from one project while go-to-definition answers from the
+    // other is the disagreement this ordering exists to prevent.
+    auto extra_files = ranked_extra_files(extra_file_snapshot_ptr(),
+                                          std::string_view(state->normalized_path));
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto info = find_macro_info(*state->tree, uri, target.name))
             return info;
-        for (const auto& extra : *extra_files) {
-            if (extra.uri == uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri == uri)
                 continue;
-            if (!extra.state || !extra.state->tree)
+            if (!extra->state || !extra->state->tree)
                 continue;
-            if (auto info = find_macro_info(*extra.state->tree, extra.uri, target.name))
+            if (auto info = find_macro_info(*extra->state->tree, extra->uri, target.name))
                 return info;
         }
         return SymbolInfo{
@@ -4624,25 +4629,25 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             return info;
 
         if (definition->uri != uri) {
-            for (const auto& extra : *extra_files) {
-                if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
+            for (const auto* extra : *extra_files) {
+                if (extra->uri != definition->uri || !extra->state || !extra->state->tree)
                     continue;
-                if (auto info = symbol_info_from_definition(*extra.state->tree, extra.uri, name,
-                                                            *definition, &extra.index_ref()))
+                if (auto info = symbol_info_from_definition(*extra->state->tree, extra->uri, name,
+                                                            *definition, &extra->index_ref()))
                     return info;
             }
         }
 
-        for (const auto& extra : *extra_files) {
-            if (extra.uri != definition->uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri != definition->uri)
                 continue;
-            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition)) {
+            if (auto info = symbol_info_from_index(extra->index_ref(), target, *definition)) {
                 // A generate-block declaration is indexed without its type, so
                 // recover it from the declaration's own line — one line read,
                 // and only when hover would otherwise show a bare name.
                 if (info->detail.empty())
                     info->detail = declaration_type_from_source_line(
-                        extra.path, definition->line, definition->col, info->name);
+                        extra->path, definition->line, definition->col, info->name);
                 return info;
             }
             break;
@@ -4654,10 +4659,10 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // alone therefore finds nothing for such declarations and hover degrades
         // to a bare name.  Fall back to scanning the shards; the entries carry
         // their own file_id, so the location match stays exact.
-        for (const auto& extra : *extra_files) {
-            if (extra.uri == definition->uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri == definition->uri)
                 continue; // already tried above
-            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
+            if (auto info = symbol_info_from_index(extra->index_ref(), target, *definition))
                 return info;
         }
         return SymbolInfo{
@@ -5034,12 +5039,13 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     if (!state || !state->tree)
         return std::nullopt;
 
-    auto extra = extra_file_snapshot_ptr();
     // Skip the current document during extra-file iteration to avoid searching
     // it twice.  The snapshot itself is shared and immutable, so this remains
     // O(1) instead of copying and erase/removing a potentially large filelist
     // vector on every goto-definition request.
-    auto result = definition_of_state(*state, uri, line, col, *extra, &uri);
+    auto ranked = ranked_extra_files(extra_file_snapshot_ptr(),
+                                     std::string_view(state->normalized_path));
+    auto result = definition_of_state(*state, uri, line, col, *ranked, &uri);
     // Miss path only: an `include directive resolves no identifier, and every
     // successful definition keeps its current cost.
     if (!result)
@@ -5055,7 +5061,7 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
 
 std::optional<Location>
 Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                              std::span<const ExtraFileInfo> extra_files,
+                              std::span<const ExtraFileInfo* const> ranked,
                               const std::string* skip_extra_uri) const {
     if (!state.tree)
         return std::nullopt;
@@ -5064,24 +5070,26 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return skip_extra_uri && extra->uri == *skip_extra_uri;
     };
 
-    // Nearest-first, and that ordering is the whole cross-project answer.
+    // `ranked` arrives nearest-first, and that ordering is the whole
+    // cross-project answer.
     //
     // Every by-name search below takes the first candidate that can answer it.
     // SystemVerilog's module and package namespaces are flat and global while
     // this index is a union across every open project, so "the first candidate"
-    // decided which project a name resolved into -- and the candidates arrive
-    // sorted by path, which meant the alphabetically-first project won every
-    // tie regardless of which file was asking.  Two projects open in one editor
-    // session both declaring `fifo` is routine, and go-to-definition on the one
-    // in `chip_b` landed in `chip_a`.
+    // decides which project a name resolves into -- and the candidates used to
+    // arrive sorted by path, which meant the alphabetically-first project won
+    // every tie regardless of which file was asking.  Two projects open in one
+    // editor session both declaring `fifo` is routine, and go-to-definition on
+    // the one in `chip_b` landed in `chip_a`.
     //
-    // Ranking the candidates once, here, fixes every scan below at the same
-    // time and leaves each of them written as the first-match scan it already
-    // was.  This is the rule AutoInst, AutoWire, inlay hints, lint and the RTL
-    // tree already went through ProjectIndexSnapshot::find_module() to get;
-    // they share its scoring function, so the features can no longer disagree
-    // about which project a name belongs to.
-    const auto ranked = by_path_proximity(extra_files, std::string_view(state.normalized_path));
+    // The order is the caller's because it is a property of the request and
+    // costs a pass over the filelist to produce; ranked_extra_files() memoizes
+    // it per snapshot and asking file.  Having it decided once, outside, is
+    // also what lets every scan below stay the first-match scan it already was.
+    // This is the rule AutoInst, AutoWire, inlay hints, lint and the RTL tree
+    // already went through ProjectIndexSnapshot::find_module() to get; both
+    // share its scoring function, so the features can no longer disagree about
+    // which project a name belongs to.
 
     // The two shapes every recovery below is written in.  They are here because
     // the order is the part that has to be right, and a scan that spells its own
@@ -5499,7 +5507,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // References/Rename must not walk closed project-file ASTs.  Current and
     // other open files are live SyntaxTrees; closed project files require a
     // future reference-occurrence index before they can participate scalably.
-    std::vector<ExtraFileInfo> extra_files;
+    // The definition_of_state() calls below therefore pass no candidates at
+    // all, which restricts them to the current document.
     auto state = get_state(uri);
     if (!state)
         return {};
@@ -5514,7 +5523,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         return {};
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
                                          : DefinitionTarget{};
-    auto target_def = definition_of_state(*state, uri, line, col, extra_files);
+    auto target_def = definition_of_state(*state, uri, line, col, {});
     if (!target_def && target_kind_recoverable_from_shards(target_info.kind)) {
         // A name only a closed project file can explain -- an instantiated
         // module, a port or parameter on one, or a package member reached
@@ -5574,7 +5583,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // itself uses: closed project files carry only their compact index shard
         // (ExtraFileInfo::state is null for them), so this resolves through the
         // same index lookups and never walks a closed file's AST.
-        const auto extra_full = extra_file_snapshot_ptr();
+        const auto extra_full =
+            ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state->normalized_path));
         target_def = definition_of_state(*state, uri, line, col, *extra_full, &uri);
     }
     if (!target_def) {
@@ -6124,7 +6134,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (auto it = open_state_by_uri.find(candidate_uri); it != open_state_by_uri.end()) {
             if (!it->second)
                 return std::nullopt;
-            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, extra_files);
+            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, {});
         }
         return std::nullopt;
     };
@@ -7505,6 +7515,27 @@ Analyzer::extra_file_snapshot_ptr() const {
         extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
     log_perf("extra_file_snapshot_ptr files=" + std::to_string(extra_file_snapshot_cache_->size()), start);
     return extra_file_snapshot_cache_;
+}
+
+std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                             std::string_view from_path) const {
+    if (!files)
+        return std::make_shared<std::vector<const ExtraFileInfo*>>();
+
+    std::lock_guard<std::mutex> lock(ranked_extra_mutex_);
+    // Identity, not contents: the snapshot is immutable and replaced wholesale,
+    // so the same pointer means the same files in the same order.  The held
+    // reference below is what makes comparing addresses sound.
+    if (ranked_extra_cache_ && ranked_extra_source_ == files && ranked_extra_from_ == from_path)
+        return ranked_extra_cache_;
+
+    auto ranked = std::make_shared<std::vector<const ExtraFileInfo*>>(
+        by_path_proximity(std::span<const ExtraFileInfo>(*files), from_path));
+    ranked_extra_source_ = files;
+    ranked_extra_from_.assign(from_path);
+    ranked_extra_cache_ = ranked;
+    return ranked;
 }
 
 std::shared_ptr<const std::vector<ExtraIndexInfo>>
