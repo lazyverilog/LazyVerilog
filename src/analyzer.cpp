@@ -1133,6 +1133,12 @@ void Analyzer::parse_worker_loop() {
     std::unordered_set<std::string> deferred_dependents;
 
     while (true) {
+        // A parse that throws must cost the keystroke that started it and
+        // nothing else.  This is a thread function: an escaping exception is
+        // std::terminate, which the user sees as the language server vanishing
+        // mid-edit.  RequestPool and BackgroundCompiler already treat their own
+        // work this way.
+        try {
         ParseJob job;
         bool have_job = false;
         {
@@ -1264,6 +1270,11 @@ void Analyzer::parse_worker_loop() {
             deferred_dependents.insert(job.uri);
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
+        }
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] parse worker error: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] parse worker error\n";
         }
     }
 }
@@ -6430,13 +6441,22 @@ void Analyzer::drain_shard_writes_inline() const {
             std::lock_guard<std::mutex> lock(map_mutex_);
             current_generation = write.generation == background_generation_;
         }
-        if (current_generation) {
-            if (write.index) {
-                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                     write.extra_dependency_uri, write.stands_alone);
+        // See index_cache_writer_loop(): `index_cache_writing_` is set and
+        // something may be waiting on it, and on a one-CPU slice this runs on
+        // the indexing worker, which is a thread function too.
+        try {
+            if (current_generation) {
+                if (write.index) {
+                    store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                         write.extra_dependency_uri, write.stands_alone);
+                }
+                if (write.prune_only)
+                    prune_cache_once_per_generation(write.generation, write.live_uris);
             }
-            if (write.prune_only)
-                prune_cache_once_per_generation(write.generation, write.live_uris);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] index cache write failed\n";
         }
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
@@ -6507,11 +6527,22 @@ void Analyzer::index_cache_writer_loop() const {
             }
         }
 
-        if (write.index)
-            store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
-                                 write.extra_dependency_uri, write.stands_alone);
-        if (write.prune_only)
-            prune_cache_once_per_generation(write.generation, write.live_uris);
+        // `index_cache_writing_` is set, and wait_for_index_cache_writes_idle()
+        // waits on it, so anything thrown here would park that caller forever --
+        // after taking the process down, since this is a thread function.  A
+        // write that fails is a cache miss next launch, which is what a cache
+        // that cannot be written has always meant.
+        try {
+            if (write.index)
+                store_shard_in_cache(write.uri, *write.index, write.include_resolutions,
+                                     write.extra_dependency_uri, write.stands_alone);
+            if (write.prune_only)
+                prune_cache_once_per_generation(write.generation, write.live_uris);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] index cache write failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] index cache write failed\n";
+        }
 
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
@@ -6965,9 +6996,29 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
                  i = next.fetch_add(1, std::memory_order_relaxed))
                 check_one(i);
         };
-        for (size_t i = 0; i + 1 < worker_count; ++i)
-            workers.emplace_back(drain);
-        drain(); // this thread takes a share too
+        // Spawning can fail -- a thread limit, a memory limit -- and the
+        // workers already running would then be destroyed joinable, which is
+        // std::terminate.  Stop asking for more and let the ones that started,
+        // plus this thread, drain the whole queue; the work is handed out per
+        // index, so any number of them finishes it.
+        for (size_t i = 0; i + 1 < worker_count; ++i) {
+            try {
+                workers.emplace_back(drain);
+            } catch (const std::system_error& e) {
+                std::cerr << "[lazyverilog] index cache preload worker: " << e.what() << "\n";
+                break;
+            }
+        }
+        // Joined whatever happens above, so a throwing check_one() cannot leave
+        // a joinable thread to destroy.
+        try {
+            drain(); // this thread takes a share too
+        } catch (...) {
+            for (auto& worker : workers)
+                if (worker.joinable())
+                    worker.join();
+            throw;
+        }
         for (auto& worker : workers)
             worker.join();
     }
@@ -7838,6 +7889,8 @@ void Analyzer::background_index_loop() const {
         // Whether this worker took the burst's warmup file; see
         // background_warmup_generation_.
         bool warmup_owner = false;
+        // Whether this worker is still counted in background_index_active_.
+        bool counted_active = false;
 
         {
             std::unique_lock<std::mutex> lock(map_mutex_);
@@ -7908,7 +7961,19 @@ void Analyzer::background_index_loop() const {
                 background_preload_running_ = true;
                 const auto preload_generation = background_generation_;
                 lock.unlock();
-                preload_cached_shards(preload_generation);
+                // The gate is armed, so anything thrown out of here would leave
+                // every other worker parked on `background_preload_running_`
+                // forever -- and, on the way, take the process down: this is a
+                // thread function with nothing above it to catch.  A preload
+                // that fails is a cache miss, which is the behaviour this
+                // server had before the cache existed.
+                try {
+                    preload_cached_shards(preload_generation);
+                } catch (const std::exception& e) {
+                    std::cerr << "[lazyverilog] index cache preload failed: " << e.what() << "\n";
+                } catch (...) {
+                    std::cerr << "[lazyverilog] index cache preload failed\n";
+                }
                 lock.lock();
                 background_preload_running_ = false;
                 background_preload_generation_ = preload_generation;
@@ -7937,6 +8002,7 @@ void Analyzer::background_index_loop() const {
             // file rather than be swallowed as a duplicate.
             background_pending_set_.erase(path_string);
             ++background_index_active_;
+            counted_active = true;
             const auto path = normalize_filesystem_path(path_string);
             path_string = path.string();
             uri = uri_from_path(path);
@@ -7978,6 +8044,17 @@ void Analyzer::background_index_loop() const {
         // map_mutex_ held.  Recording this worker's own generation rather than
         // the current one is deliberate: if the generation moved on while this
         // file was parsing, the gate stays armed for the new burst.
+        // Give the active-file count back, at most once.  Paired with the
+        // warmup release above rather than folded into it: the shard-write
+        // reservation below has to be countable *before* the decrement's wake,
+        // so the two do not always happen at the same point.
+        const auto release_active_locked = [&] {
+            if (!counted_active)
+                return;
+            counted_active = false;
+            --background_index_active_;
+        };
+
         const auto release_warmup_locked = [&] {
             if (!warmup_owner)
                 return;
@@ -7986,6 +8063,19 @@ void Analyzer::background_index_loop() const {
             background_warmup_generation_ = generation;
         };
 
+        // Everything from here on parses.  slang can throw, an allocation for a
+        // generated register block can throw, and a filesystem that goes away
+        // under the shard cache can throw -- and this is a thread function, so
+        // anything that escapes is std::terminate with no diagnostic, taking
+        // the editor's whole language server with it.  One file that cannot be
+        // indexed must cost that file and nothing else, the way RequestPool
+        // and BackgroundCompiler already treat their own work.
+        //
+        // The two releases below are idempotent, so the handler can run them
+        // without knowing how far the body got.  Skipping them is what would
+        // wedge the pool: the warmup gate would stay armed and the active count
+        // would never reach zero, so no worker wakes and no index is published.
+        try {
         if (live_doc) {
             // The queued path may represent an indirect include dependency
             // refresh, not a direct edit to this open document.  Reparse the
@@ -8047,7 +8137,7 @@ void Analyzer::background_index_loop() const {
                     invalidate_extra_snapshots_locked();
                 }
                 release_warmup_locked();
-                --background_index_active_;
+                release_active_locked();
                 if (background_pending_files_.empty() && background_index_active_ == 0)
                     schedule_background_project_publish_locked();
                 background_cv_.notify_all();
@@ -8065,7 +8155,7 @@ void Analyzer::background_index_loop() const {
         if (background_stop_.load() || !state || !state->tree) {
             std::lock_guard<std::mutex> lock(map_mutex_);
             release_warmup_locked();
-            --background_index_active_;
+            release_active_locked();
             background_cv_.notify_all();
             continue;
         }
@@ -8091,7 +8181,7 @@ void Analyzer::background_index_loop() const {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
                 release_warmup_locked();
-                --background_index_active_;
+                release_active_locked();
                 background_cv_.notify_all();
                 continue;
             }
@@ -8183,7 +8273,7 @@ void Analyzer::background_index_loop() const {
             // applies consistently to disk-backed reindex and live edit paths.
             // With several workers draining the queue, "drained" also requires
             // that no sibling worker is still parsing a file.
-            --background_index_active_;
+            release_active_locked();
             if (background_pending_files_.empty() && background_index_active_ == 0)
                 schedule_background_project_publish_locked();
             background_cv_.notify_all();
@@ -8215,6 +8305,21 @@ void Analyzer::background_index_loop() const {
                 .stands_alone = stands_alone,
                 .generation = generation,
             });
+        }
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] background index of " << path_string
+                      << " failed: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[lazyverilog] background index of " << path_string << " failed\n";
+        }
+
+        if (counted_active || warmup_owner) {
+            std::lock_guard<std::mutex> lock(map_mutex_);
+            release_warmup_locked();
+            release_active_locked();
+            if (background_pending_files_.empty() && background_index_active_ == 0)
+                schedule_background_project_publish_locked();
+            background_cv_.notify_all();
         }
     }
 }

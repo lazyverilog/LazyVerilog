@@ -968,11 +968,19 @@ size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& 
     // leaves the shard alone.
     constexpr size_t kHeaderBytes = 3 * sizeof(uint32_t) + sizeof(uint32_t) + 4096;
 
+    // The error_code overloads throughout, including the increment.  A
+    // range-for over a directory_iterator uses the *throwing* `operator++`
+    // whatever the constructor was given, so a directory that becomes
+    // unreadable part way through -- a shared filesystem blinking, a checkout
+    // removing the tree underneath -- threw std::filesystem_error out of a
+    // thread function.  Advancing by hand keeps the whole sweep on the
+    // "report, do not throw" side its every other step is already on.
     std::error_code ec;
     size_t removed = 0;
-    for (const auto& entry : fs::directory_iterator(directory_, ec)) {
-        if (ec)
-            break;
+    fs::directory_iterator it(directory_, ec);
+    const fs::directory_iterator done;
+    for (; !ec && it != done; it.increment(ec)) {
+        const auto& entry = *it;
         if (entry.path().extension() != ".idx")
             continue;
         if (live_names.contains(entry.path().filename().string()))
