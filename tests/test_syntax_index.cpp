@@ -908,6 +908,28 @@ TEST_CASE("project index: shared header text is indexed once per including file"
     REQUIRE(reparsed->shards.size() == 3);
     CHECK(shared_width(*reparsed) == "32");
 
+    // The header's *own* shard, which is where its declarations live and what
+    // a feature resolving a header symbol is told to consult.  Asking any
+    // shard, as shared_width() does, does not pin this: an includer reparsed
+    // through the open-buffer overlay carries the new value too, so the check
+    // above passes even when the header's shard is describing what was last
+    // saved.  It was -- the header reaches build_header_shards() through
+    // SyntaxTree::fromFile(), and preload_open_text_overlays() skips the
+    // overlay for the path being parsed, so the one buffer whose unsaved text
+    // this shard is about was the one buffer it could not see.
+    auto header_shard = std::find_if(reparsed->shards.begin(), reparsed->shards.end(),
+                                     [&](const ProjectIndexSnapshot::Shard& shard) {
+                                         return shard.uri == header_uri;
+                                     });
+    REQUIRE(header_shard != reparsed->shards.end());
+    REQUIRE(header_shard->index);
+    std::string from_header_shard;
+    for (const auto& value : header_shard->index->values) {
+        if (value.name == "SHARED_W")
+            from_header_shard = value.default_value;
+    }
+    CHECK(from_header_shard == "32");
+
     fs::remove_all(dir);
 }
 

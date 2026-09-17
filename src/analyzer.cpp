@@ -637,6 +637,15 @@ struct BuiltHeaderShard {
     /// authoritative record of its declarations — the condition for serving an
     /// includer its directives alone.  See standalone_header_uris_.
     bool stands_alone{false};
+    /// Built from an editor buffer's unsaved text rather than from the file.
+    ///
+    /// Such a shard must never be written to the on-disk cache.  A shard is
+    /// keyed on a digest of the bytes the parse read, and the digest recorded
+    /// for this header in this burst is the *disk* one -- some includer read it
+    /// from disk before the buffer was opened.  Writing this index under that
+    /// key is a hit that is wrong on every future launch, which is the one
+    /// failure mode the cache has no way to detect.
+    bool from_open_buffer{false};
 };
 
 static std::vector<BuiltHeaderShard>
@@ -761,6 +770,64 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
         // its modules and ports, scoped to its module, and none of the
         // header's own declarations when the `include sits at file scope.
         std::shared_ptr<SyntaxIndex> header_index;
+
+        // A header that is itself an open buffer is served from that buffer,
+        // not from the file.  make_file_state_with_options() reaches the header
+        // through SyntaxTree::fromFile(), and preload_open_text_overlays()
+        // deliberately skips the overlay for the path being parsed -- so the
+        // one file whose unsaved text matters most here was the one file that
+        // could not supply it, and the header's own shard went on describing
+        // what was last saved.  Every includer reparsed in the same burst sees
+        // the new text through the overlay, so the index ends up holding both
+        // answers at once and which one a lookup finds depends on the order it
+        // walks the shards in.
+        const DocumentState* open_header = nullptr;
+        for (const auto& overlay : open_overlays) {
+            if (!overlay.state || !overlay.state->tree)
+                continue;
+            if (overlay.uri == header_uri) {
+                open_header = overlay.state.get();
+                break;
+            }
+        }
+        if (open_header) {
+            const bool buffer_stands_alone =
+                std::none_of(open_header->parse_diagnostics.begin(),
+                             open_header->parse_diagnostics.end(),
+                             [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+            if (buffer_stands_alone) {
+                // The same build the disk path does, over the buffer's own
+                // tree: make_state() parsed it as a whole file, which is what
+                // "the header on its own" means here too.
+                auto index = SyntaxIndex::build(*open_header->tree,
+                                                std::string_view(open_header->text),
+                                                IndexDepth::Declarations,
+                                                std::string_view(header_uri));
+                index.include_dependencies = open_header->include_dependencies;
+                built.push_back(BuiltHeaderShard{
+                    .uri = header_uri,
+                    .index = std::make_shared<SyntaxIndex>(std::move(index)),
+                    .stands_alone = true,
+                    .from_open_buffer = true,
+                });
+            } else {
+                // A fragment -- a port list, a class body -- has no tree of its
+                // own either way, so it is derived from the includer below.
+                // That tree already carries this buffer's unsaved text: the
+                // overlay is skipped only for the file being parsed, and here
+                // that file is the includer, not the header.
+                derived_uris.push_back(header_uri);
+                built.push_back(BuiltHeaderShard{
+                    .uri = header_uri,
+                    .stands_alone = false,
+                    .from_open_buffer = true,
+                });
+            }
+            // No projection either way: the burst's header-text cache only ever
+            // holds on-disk text, see header_cache_excluded_paths().
+            continue;
+        }
+
         auto header_state = make_file_state_with_options(
             path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
             /*retain_text=*/false, &header_texts, generation,
@@ -8261,7 +8328,15 @@ void Analyzer::background_index_loop() const {
                 for (auto& header : built_headers) {
                     if (header.stands_alone)
                         standalone_header_uris_.insert(header.uri);
-                    headers_to_cache.emplace_back(header.uri, header.index, header.stands_alone);
+                    // Never a shard built from unsaved text; see
+                    // BuiltHeaderShard::from_open_buffer.  It still goes into
+                    // the in-memory index below -- that is the point of it --
+                    // but the on-disk cache keys shards on a digest of the
+                    // bytes a parse read, and the digest this burst holds for
+                    // this header is the one some includer took off disk.
+                    if (!header.from_open_buffer)
+                        headers_to_cache.emplace_back(header.uri, header.index,
+                                                      header.stands_alone);
                     background_header_shards_[header.uri] = ExtraFileCacheEntry{
                         .path = path_from_file_uri(header.uri),
                         .uri = header.uri,
