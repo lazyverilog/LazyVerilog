@@ -589,7 +589,7 @@ class CacheProject {
         if (include_dirs.empty())
             include_dirs.push_back(root().string());
         analyzer.set_project_index_publish_debounce_ms(0);
-        analyzer.set_project_config(defines, include_dirs, paths, {},
+        analyzer.set_project_config(defines, include_dirs, paths,
                                     IndexCacheStorage::for_root(root()));
         analyzer.wait_for_background_index_idle();
         // Shard writes are deliberately off the indexing path, so a test that

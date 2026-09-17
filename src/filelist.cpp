@@ -328,5 +328,10 @@ VcodeResult load_vcode(const std::filesystem::path& root, const Config& config) 
 
     VcodeLoader loader;
     load_vcode_file(std::filesystem::path(resolve_vcode_path(root, config)), loader);
+    // Sorted, so two launches over one tree report them in one order; the set
+    // they come from is unordered.
+    loader.result.filelists.assign(loader.visited_filelists.begin(),
+                                   loader.visited_filelists.end());
+    std::sort(loader.result.filelists.begin(), loader.result.filelists.end());
     return std::move(loader.result);
 }

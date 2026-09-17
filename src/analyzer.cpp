@@ -6383,7 +6383,6 @@ std::vector<std::string> order_by_descending_size(const std::vector<std::string>
 }
 
 void Analyzer::set_extra_files(const std::vector<std::string>& paths,
-                               const std::string& filelist_path,
                                const std::vector<uintmax_t>& file_sizes) {
     std::vector<std::string> normalized_paths;
     normalized_paths.reserve(paths.size());
@@ -6395,7 +6394,6 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
     auto by_size = order_by_descending_size(normalized_paths, file_sizes);
 
     std::lock_guard<std::mutex> lock(map_mutex_);
-    filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_paths);
     extra_files_by_size_ = std::move(by_size);
     extra_file_set_.clear();
@@ -6416,7 +6414,6 @@ void Analyzer::set_extra_files(const std::vector<std::string>& paths,
 void Analyzer::set_project_config(const std::vector<std::string>& defines,
                                   const std::vector<std::string>& include_dirs,
                                   const std::vector<std::string>& extra_files,
-                                  const std::string& filelist_path,
                                   std::shared_ptr<IndexCacheStorage> cache_storage,
                                   const std::vector<uintmax_t>& extra_file_sizes) {
     std::vector<std::string> normalized_extra_files;
@@ -6446,7 +6443,6 @@ void Analyzer::set_project_config(const std::vector<std::string>& defines,
     // can still burn CPU / shared-filesystem bandwidth while they parse.
     replace_default_parse_inputs_locked(std::move(default_inputs));
 
-    filelist_path_ = filelist_path;
     extra_files_ = std::move(normalized_extra_files);
     extra_files_by_size_ = std::move(extra_files_by_size);
     extra_file_set_.clear();

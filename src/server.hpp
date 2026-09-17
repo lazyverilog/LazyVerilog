@@ -140,15 +140,10 @@ class LazyVerilogServer {
     std::vector<std::string> project_include_dirs_;
     std::vector<std::string> project_files_;
     std::vector<uintmax_t> project_file_sizes_;
-    /// Where a relative filelist path is resolved from, set by the last project
-    /// folded in.  Only projects that configure one are affected by it.
-    ///
-    /// A string, because that is what produces it (resolve_vcode_path) and what
-    /// consumes it (Analyzer::set_project_config).  Holding a filesystem::path
-    /// in between only compiled on POSIX: path::string_type is std::string
-    /// there, so the implicit conversion existed, and on Windows it is
-    /// std::wstring and there is none.
-    std::string project_vcode_path_;
+    /// Every filelist read while folding the projects above, `-f` chains
+    /// included, as normalized absolute paths.  What
+    /// workspace/didChangeWatchedFiles compares a reported `.f` against.
+    std::set<std::string> project_filelists_;
 
     mutable std::mutex config_cache_mutex_;
     /// Keyed by project root; the empty key is "no project", served defaults.
