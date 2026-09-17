@@ -7343,6 +7343,19 @@ void Analyzer::wait_for_background_index_idle() const {
     });
 }
 
+std::vector<const Analyzer::ExtraFileCacheEntry*>
+Analyzer::sorted_by_path(const std::unordered_map<std::string, ExtraFileCacheEntry>& entries) {
+    std::vector<const ExtraFileCacheEntry*> sorted;
+    sorted.reserve(entries.size());
+    for (const auto& [key, entry] : entries)
+        sorted.push_back(&entry);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ExtraFileCacheEntry* a, const ExtraFileCacheEntry* b) {
+                  return a->path < b->path;
+              });
+    return sorted;
+}
+
 void Analyzer::invalidate_extra_snapshots_locked() const {
     // For a change to the *shards*: both snapshots summarize extra_cache_ and
     // background_header_shards_, so both go.  Must only be called while
@@ -7408,13 +7421,24 @@ Analyzer::build_extra_file_snapshot_locked() const {
             .index = entry.index,
         });
     };
-    for (const auto& [key, entry] : extra_cache_)
-        append(entry);
-    for (const auto& [key, entry] : background_header_shards_) {
+    // By path within each group, because both maps are unordered.  Consumers
+    // take the first match by name -- connect.cpp's find_module(), and the
+    // by-name lookups definition and hover run over this vector -- so the
+    // answer was decided by whichever bucket order the last rehash produced and
+    // could change on any republish.  Same defect and same fix as
+    // publish_project_index_snapshot_locked().
+    //
+    // The groups keep their order: a header that is also a filelist entry is
+    // still represented by its filelist shard, and which of the two is
+    // authoritative for a header's declarations is the project index
+    // snapshot's question, not this one's.
+    for (const auto* entry : sorted_by_path(extra_cache_))
+        append(*entry);
+    for (const auto* entry : sorted_by_path(background_header_shards_)) {
         // A header that is also a filelist entry is already above; appending it
         // twice would give every by-name lookup two candidates for one file.
-        if (!extra_cache_.contains(key))
-            append(entry);
+        if (!extra_cache_.contains(entry->uri))
+            append(*entry);
     }
     return result;
 }
@@ -7430,13 +7454,14 @@ Analyzer::build_extra_index_snapshot_locked() const {
             .index = entry.index,
         });
     };
-    for (const auto& [key, entry] : extra_cache_)
-        append(entry);
+    // By path within each group; see build_extra_file_snapshot_locked().
+    for (const auto* entry : sorted_by_path(extra_cache_))
+        append(*entry);
     // A file's shard no longer carries what it `include`d, so header shards have
     // to appear here too or header declarations become invisible to every
     // feature reading this snapshot.
-    for (const auto& [key, entry] : background_header_shards_)
-        append(entry);
+    for (const auto* entry : sorted_by_path(background_header_shards_))
+        append(*entry);
     return result;
 }
 
@@ -8531,27 +8556,12 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
     // an includer's copy of them can be a burst behind -- only one closed
     // includer is re-queued when a header changes, by design -- so a consumer
     // that scans shards in order should meet the authoritative one first.
-    const auto by_path = [](const ExtraFileCacheEntry* a, const ExtraFileCacheEntry* b) {
-        return a->path < b->path;
-    };
-    std::vector<const ExtraFileCacheEntry*> headers;
-    headers.reserve(background_header_shards_.size());
-    for (const auto& [key, entry] : background_header_shards_)
-        headers.push_back(&entry);
-    std::sort(headers.begin(), headers.end(), by_path);
-
-    std::vector<const ExtraFileCacheEntry*> files;
-    files.reserve(extra_cache_.size());
-    for (const auto& [key, entry] : extra_cache_)
-        files.push_back(&entry);
-    std::sort(files.begin(), files.end(), by_path);
-
     // Pointers, not copies, and the sort is the only cost added: it runs once
     // per debounced publish, against the per-module hash inserts below that
     // were already there.
-    for (const auto* entry : headers)
+    for (const auto* entry : sorted_by_path(background_header_shards_))
         add_shard(*entry);
-    for (const auto* entry : files)
+    for (const auto* entry : sorted_by_path(extra_cache_))
         add_shard(*entry);
 
     project_index_snapshot_cache_ = std::move(snapshot);
