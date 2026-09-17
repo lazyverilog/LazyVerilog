@@ -753,7 +753,11 @@ static lsSignatureHelp make_help(const std::string& label, const std::vector<std
 
 std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
                                                       const lsTextDocumentPositionParams& params) {
-    auto state = analyzer.get_state(params.textDocument.uri.raw_uri_);
+    // Signature help fires on '(' and ',' -- from the same notification that
+    // started the reparse -- so `get_state()` is a text-only placeholder
+    // exactly when the user is typing the argument list this exists to
+    // describe.  See Analyzer::symbol_at().
+    auto state = analyzer.get_parsed_state(params.textDocument.uri.raw_uri_);
     if (!state || !state->tree)
         return std::nullopt;
 
