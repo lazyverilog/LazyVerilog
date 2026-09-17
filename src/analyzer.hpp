@@ -865,6 +865,17 @@ class Analyzer {
     // include directories change what every shard's key hashes to.
     mutable uint64_t background_preload_generation_{std::numeric_limits<uint64_t>::max()};
     mutable bool background_preload_running_{false};
+    // The generation of the last burst that queued the *whole* filelist.
+    //
+    // Only such a burst can say which shards are live: its preload walks every
+    // configured file, so a shard the sweep does not see named is genuinely
+    // unreferenced.  An incremental burst -- the one or two includers an edited
+    // header re-queues -- knows about those files and nothing else, so its
+    // "live" set is two entries out of thousands and a sweep run against it
+    // reads and stats every other shard in the directory to prove it should
+    // keep them.  That is one full directory sweep per keystroke on a shared
+    // header; see preload_cached_shards().
+    mutable uint64_t background_full_reindex_generation_{std::numeric_limits<uint64_t>::max()};
     /// Cache for this project, and the config digest every shard is keyed on.
     /// Empty when no project root is known or the directory cannot be written,
     /// which is a normal read-only-checkout condition and simply runs uncached.

@@ -6669,11 +6669,13 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     std::shared_ptr<IndexCacheStorage> storage;
     std::shared_ptr<const ProjectParseInputs> parse_inputs;
     std::vector<std::string> files;
+    uint64_t full_reindex_generation = std::numeric_limits<uint64_t>::max();
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         if (!index_cache_storage_ || generation != background_generation_)
             return;
         storage = index_cache_storage_;
+        full_reindex_generation = background_full_reindex_generation_;
         // Per file from here on.  The burst can span projects, and both the
         // config digest a shard is keyed on and the include directories a
         // header search walks belong to the file being checked, not to the
@@ -6942,26 +6944,46 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         if (result)
             hits.push_back(std::move(*result));
 
-    // Queued whatever the preload found.  The sweep has to happen on the launch
-    // that reuses everything just as much as on one that rebuilds, and that
-    // launch writes no shards for it to hang off.
+    // Queued whatever the preload found, but only for a burst that queued the
+    // whole filelist.  The sweep has to happen on the launch that reuses
+    // everything just as much as on one that rebuilds, and that launch writes
+    // no shards for it to hang off -- so it cannot hang off a shard write.
     //
-    // Everything above was just proved to be on disk, so the sweep is told and
-    // skips those shards by name.  On an unchanged project that is all of them,
-    // which turns a read of every shard in the directory into a set lookup --
-    // the difference is most of a warm start on a one-CPU slice, where the
-    // sweep has no second core to run on.
-    std::unordered_set<std::string> live_uris;
-    live_uris.reserve(files.size() + header_hits.size());
-    for (const auto& path : files)
-        live_uris.insert(uri_from_path(path));
-    for (const auto& [header_uri, header_hit] : header_hits)
-        live_uris.insert(header_uri);
+    // It cannot hang off *any* burst either.  `live_uris` is only an answer to
+    // "which shards are referenced" when `files` was every configured file; an
+    // incremental burst carries the one or two includers an edited header
+    // re-queued, and a sweep told that two of a project's shards are live opens
+    // and stats every other one to decide it should keep them.  Editing a
+    // shared header bumps the generation on every keystroke (see
+    // queue_include_dependents_locked()), so that was one full sweep of the
+    // shard directory per character typed: measured at 302 shard opens per
+    // keystroke on a 301-shard project and 802 on an 801-shard one, plus a stat
+    // of each shard's source, on the indexing worker itself when the CPU slice
+    // leaves no room for the writer thread.
+    //
+    // Deferring to the next full reindex costs a deleted file's shard staying
+    // on disk until then.  It is never *served* -- validating it hashes a file
+    // that is not there -- so what it holds is disk space, which the next
+    // launch reclaims.
+    const bool sweep_is_answerable = generation == full_reindex_generation;
+    if (sweep_is_answerable) {
+        // Everything above was just proved to be on disk, so the sweep is told
+        // and skips those shards by name.  On an unchanged project that is all
+        // of them, which turns a read of every shard in the directory into a
+        // set lookup -- the difference is most of a warm start on a one-CPU
+        // slice, where the sweep has no second core to run on.
+        std::unordered_set<std::string> live_uris;
+        live_uris.reserve(files.size() + header_hits.size());
+        for (const auto& path : files)
+            live_uris.insert(uri_from_path(path));
+        for (const auto& [header_uri, header_hit] : header_hits)
+            live_uris.insert(header_uri);
 
-    reserve_shard_writes(1);
-    queue_shard_write(PendingShardWrite{.prune_only = true,
-                                        .generation = generation,
-                                        .live_uris = std::move(live_uris)});
+        reserve_shard_writes(1);
+        queue_shard_write(PendingShardWrite{.prune_only = true,
+                                            .generation = generation,
+                                            .live_uris = std::move(live_uris)});
+    }
 
     if (hits.empty())
         return;
@@ -7743,6 +7765,10 @@ void Analyzer::schedule_background_reindex_locked() const {
     background_header_shards_.clear();
     background_header_claims_.clear();
     standalone_header_uris_.clear();
+    // This burst carries the whole filelist, so its preload is in a position to
+    // say which shards are still referenced.  Only such a burst may sweep the
+    // shard directory; see background_full_reindex_generation_.
+    background_full_reindex_generation_ = background_generation_;
     // Largest first; see extra_files_by_size_.  Falls back to filelist order for
     // a caller that set extra_files_ without it.
     const auto& queue_order =
