@@ -32,8 +32,8 @@ Notable difference from older examples:
 LazyVerilog finds `lazyverilog.toml` by walking up from each file you open to the
 nearest one — the editor does not choose it. Index shards are written beside that
 config, in `.cache/lazyverilog/index`, with a `.gitignore` written for you; a file
-with no config above it uses your user cache directory instead. `[index].cache =
-false` turns the cache off. See the "Index cache" section of the README.
+with no config above it uses your user cache directory instead. There is no switch
+for it. See the "Index cache" section of the README.
 
 ## Developer
 

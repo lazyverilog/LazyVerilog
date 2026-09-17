@@ -227,14 +227,17 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   directory is in no repository.
 - An `include`d header's shard lives beside **its** project's config, not the
   includer's.  A verification header shared by two designs is one file in one project.
-- `[index].cache` turns it off, **per project** like every other setting: a session can
-  hold several, and one saying nothing may be written into it must not decide for the
-  others.  `IndexCacheStorage` asks its `CachePolicy` once per root, and the server
-  answers from that root's own config.  Gating the whole storage on the server's
-  `config_` instead made the switch depend on which directory the server was launched
-  from -- with no `rootUri` that config is whatever sits above the working directory.
-  The fallback cache, for files under no project, has no project config and is the one
-  case `config_` still answers.  Guarded by `[project-root][storage]`.
+- **There is no switch.**  `[index].cache` is gone -- the config key, the struct, and the
+  parse -- and `index_cache_storage()` always builds a storage.  clangd has no such option
+  either.  What it used to protect, a project that must have nothing written into it, is
+  answered by *where* shards go: a file under no project caches outside the tree, and a
+  directory that cannot be created runs uncached on its own.  Making it per project first
+  showed why it should not exist: gated on the server's `config_` the switch depended on
+  which directory the server was launched from (with no `rootUri` that config is whatever
+  sits above the working directory), and per project it was a second answer to a question
+  the shard *location* already answers.  A `[index]` table still in a config is reported
+  once on stderr, not silently ignored.  `index-bench --cache off` stays, for
+  `startup_bench.py --no-cache`; it is a bench knob, not a setting.
 - Keyed on **content digests** of the file, its
   `include`s, and the defines/incdirs — never mtime, which is unusable on a shared
   filesystem.

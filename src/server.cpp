@@ -659,21 +659,6 @@ LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) con
     return it->second;
 }
 
-std::shared_ptr<IndexCacheStorage> LazyVerilogServer::index_cache_storage() const {
-    // The fallback cache -- for files under no project at all -- has no project
-    // config to consult, so the session's is the only answer there is.
-    const bool fallback_enabled = config_.index.cache;
-    return std::make_shared<IndexCacheStorage>(
-        root_resolver_, [this, fallback_enabled](const std::filesystem::path& source_root) {
-            if (source_root.empty())
-                return fallback_enabled;
-            // Runs on an index worker.  config_for_root() is safe there: it
-            // goes through the resolver and the config cache, both of which
-            // take their own locks, and it never touches config_.
-            return config_for_root(source_root)->index.cache;
-        });
-}
-
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     if (!root_resolver_)
         return false;

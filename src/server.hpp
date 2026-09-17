@@ -52,21 +52,21 @@ class LazyVerilogServer {
     void configure_background_compiler();
     void schedule_background_compilation();
 
-    /// Storage handed to the analyzer, which decides per file where its shards
-    /// go and whether they are written at all.
+    /// Storage handed to the analyzer, which decides per file where that file's
+    /// shards go.
     ///
     /// Not a root: the server no longer has one root to give.  Each file's
     /// shards go beside its own lazyverilog.toml, resolved by
     /// `root_resolver_`, and a file with no config above it goes to the user's
     /// cache directory instead of littering a tree it was never part of.
     ///
-    /// `[index].cache` is read per project for the same reason, through the
-    /// policy below.  Gating the whole storage on `config_` instead made the
-    /// setting depend on which directory the server was launched from: with no
-    /// rootUri -- what the Neovim plugin now sends -- `config_` is whatever is
-    /// above the working directory, so a project that says `cache = false`
-    /// because nothing may be written into it got a `.cache/` anyway.
-    std::shared_ptr<IndexCacheStorage> index_cache_storage() const;
+    /// Always built.  There is no switch: caching is on the way clangd's
+    /// background index is, and the reason there used to be one -- a project
+    /// that must not have a directory written into it -- is answered by where
+    /// the shards go, not by whether they are written.
+    std::shared_ptr<IndexCacheStorage> index_cache_storage() const {
+        return std::make_shared<IndexCacheStorage>(root_resolver_);
+    }
 
     /// Decides which project any file belongs to, and therefore which config it
     /// is served with and where its shards live.  Shared with the storage the

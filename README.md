@@ -366,9 +366,6 @@ For full configuration, refer to [`lazyverilog.toml`](lazyverilog.toml) — comp
 vcode = "path/to/vcode/file"
 define = ["VERILATOR", "MY_DEFINE"]
 
-[index]
-cache = true  # reuse per-file index shards across launches; see "Index cache" below
-
 [compilation]
 background_compilation = true   # run semantic compilation in background workers (richer diagnostics)
                                 # Caution: can be laggy on slow machines.
@@ -614,13 +611,11 @@ Reuse is decided by **content**, not timestamps, so it stays correct across `git
 `rsync` and shared filesystems where mtime cannot be trusted. Deleting the directory is always
 safe: the next launch is just slower.
 
-To turn it off entirely — for a read-only checkout, or a project that must have nothing written
-into it:
-
-```toml
-[index]
-cache = false
-```
+There is no switch for it, the same way `clangd` has none for its background index. A project
+that must have nothing written into it is answered by *where* the shards go rather than by
+turning them off: if the directory cannot be created — a read-only checkout — the server simply
+runs uncached, and a file with no `lazyverilog.toml` above it never gets a `.cache/` in the
+first place.
 
 ## 📚 Documents
 

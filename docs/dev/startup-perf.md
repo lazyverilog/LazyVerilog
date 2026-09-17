@@ -15,7 +15,7 @@ tools/startup_bench.py --cpus 0             # emulate a 1-CPU slice
 tools/startup_bench.py --cpus 0 --trace     # per-file timings, slowest first
 tools/startup_bench.py --json               # machine-readable
 tools/startup_bench.py --warm               # keep the shard cache between runs
-tools/startup_bench.py --no-cache           # shard cache off entirely
+tools/startup_bench.py --no-cache           # shard cache off entirely (bench-only)
 ```
 
 The script wraps `index-bench` and reports median index time, user/sys CPU, and
@@ -109,7 +109,8 @@ which is what makes repeated runs comparable.  Leaving it in place makes run 1
 cold and every run after it warm, and the median of that mixture is a warm number
 wearing a cold label.  Add `--warm` to measure reuse deliberately and `--no-cache`
 to measure the parse with the cache out of the picture; the mode is printed with
-the results and carried in `--json`.
+the results and carried in `--json`.  `--no-cache` is a knob on `index-bench`, not
+a setting: the server always caches.
 
 Use the same `CMAKE_BUILD_TYPE` on both sides — `Release` and `RelWithDebInfo`
 differ enough to swamp the effect being measured — and read `maxRSS` alongside

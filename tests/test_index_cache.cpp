@@ -800,23 +800,6 @@ TEST_CASE("index cache: no project root means no cache and no directory", "[inde
     CHECK(!std::filesystem::exists(IndexCache::directory_for(project.root())));
 }
 
-TEST_CASE("index cache: [index].cache defaults on and can be turned off", "[index-cache]") {
-    // The server decides by handing the analyzer an empty project root, so what
-    // this pins is the config plumbing: the default, and that `false` reaches
-    // it.  The uncached behaviour itself is covered above.
-    CHECK(Config{}.index.cache);
-
-    TempDir dir("config");
-    {
-        std::ofstream out(dir.path() / "lazyverilog.toml", std::ios::binary);
-        out << "[index]\ncache = false\n";
-    }
-    std::string warning;
-    const auto config = load_config(dir.path(), &warning);
-    CHECK(warning.empty());
-    CHECK(!config.index.cache);
-}
-
 TEST_CASE("header text cache: a projected header keeps the digest of the real one",
           "[index-cache]") {
     // Once a header's own shard exists, the burst serves the rest of its files
