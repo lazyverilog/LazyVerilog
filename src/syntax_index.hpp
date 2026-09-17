@@ -1,4 +1,7 @@
 #pragma once
+#include <algorithm>
+#include <functional>
+#include <span>
 #include <memory>
 #include <cstdint>
 #include <limits>
@@ -500,3 +503,79 @@ struct ProjectIndexSnapshot {
 /// How many leading path components @p a and @p b agree on.  Accepts either
 /// separator so a Windows path and a POSIX one score the same way.
 size_t shared_path_prefix_components(std::string_view a, std::string_view b);
+
+/// The elements of @p items, nearest-first against @p from_path.
+///
+/// Every by-name search over the project's files needs this order, because
+/// SystemVerilog's module/package namespace is flat and global while the index
+/// is a union across every open project: two projects open at once routinely
+/// both declare `fifo`, and the scans that consume this take the first match
+/// they meet.  Ordering the candidates is therefore the whole disambiguation --
+/// a scan written as "first match wins" resolves correctly once "first" means
+/// "nearest to the file that asked" instead of "first in the container".
+///
+/// This is the same rule, and the same scoring function, as
+/// `ProjectIndexSnapshot::find_module()`; that one answers from a prebuilt
+/// by-name table, this one orders a candidate sequence.  Keeping them on one
+/// scoring function is what stops go-to-definition and AutoInst disagreeing
+/// about which project a name belongs to.
+///
+/// It **ranks, it does not filter**: every element is returned, so a file under
+/// no project, or an answer that lives in shared IP outside every root, is
+/// still reachable -- it is simply met later.  Ties keep the order @p items
+/// arrived in, which callers keep sorted by path, so the answer is stable from
+/// one request to the next rather than depending on a hash container's bucket
+/// order.
+///
+/// Returns pointers into @p items, which must outlive the result.
+template <typename T>
+std::vector<const T*> by_path_proximity(std::span<const T> items, std::string_view from_path) {
+    std::vector<const T*> ranked;
+    ranked.reserve(items.size());
+    for (const auto& item : items)
+        ranked.push_back(&item);
+    if (from_path.empty() || ranked.size() < 2)
+        return ranked;
+
+    // Score once per candidate rather than once per comparison: the scoring
+    // walks two paths component-wise, and a sort would call it O(n log n)
+    // times on a filelist that is thousands of entries on a real design.
+    std::vector<size_t> score;
+    score.reserve(items.size());
+    for (const auto& item : items)
+        score.push_back(shared_path_prefix_components(from_path, item.path));
+
+    // One project open -- the overwhelmingly common case -- scores every
+    // candidate identically, and the order is already the one we would produce.
+    // Leaving early there keeps this a single linear pass with no allocation
+    // beyond the pointers the caller needs anyway.
+    if (std::adjacent_find(score.begin(), score.end(), std::not_equal_to<>()) == score.end())
+        return ranked;
+
+    std::vector<size_t> order;
+    order.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        order.push_back(i);
+    // Stable, so equally distant candidates keep the caller's path order.
+    std::stable_sort(order.begin(), order.end(),
+                     [&score](size_t a, size_t b) { return score[a] > score[b]; });
+    for (size_t i = 0; i < order.size(); ++i)
+        ranked[i] = &items[order[i]];
+    return ranked;
+}
+
+/// @copydoc by_path_proximity
+///
+/// In-place variant, for a caller that owns its candidates and hands them to
+/// consumers by reference.
+template <typename T>
+void order_by_path_proximity(std::vector<T>& items, std::string_view from_path) {
+    if (from_path.empty() || items.size() < 2)
+        return;
+    const auto ranked = by_path_proximity(std::span<const T>(items), from_path);
+    std::vector<T> reordered;
+    reordered.reserve(items.size());
+    for (const T* item : ranked)
+        reordered.push_back(std::move(items[static_cast<size_t>(item - items.data())]));
+    items = std::move(reordered);
+}
