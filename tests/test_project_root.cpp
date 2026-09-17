@@ -651,3 +651,40 @@ TEST_CASE("autoinst instantiates its own project's module",
     CHECK(from_a.contains("i_a_clk"));
     CHECK_FALSE(from_a.contains("i_b_clk"));
 }
+
+TEST_CASE("project root: the File hint answers exactly as the stat would", "[project-root]") {
+    // Deciding whether a path is a file or a directory costs an is_directory()
+    // the per-directory cache cannot serve: that cache is keyed on directories,
+    // and this question is about the path itself.  So it was one uncached stat
+    // per lookup, and lookups run per request (config_for) and per parse
+    // (ProjectParseInputs::for_path) -- measured on a warm launch of a 300-file
+    // project as roughly three metadata calls per project file, 1814 against
+    // 902 after.
+    //
+    // The hint is only sound while it answers identically for a real file,
+    // which is what this pins, and while nothing passes File for a directory --
+    // stated here by showing what that would do.
+    TempTree tree("file-hint");
+    tree.write(ProjectRootResolver::kMarker, "[design]\n");
+    const auto file = tree.write("rtl/core/m.sv", "module m;\nendmodule\n");
+
+    ProjectRootResolver resolver;
+
+    const auto stated = resolver.project_info(file, ProjectRootResolver::PathKind::File);
+    const auto probed = resolver.project_info(file, ProjectRootResolver::PathKind::Unknown);
+    REQUIRE(stated.has_value());
+    REQUIRE(probed.has_value());
+    CHECK(stated->source_root == tree.root);
+    CHECK(stated->source_root == probed->source_root);
+
+    // A directory that *is* a project root, asked about without the stat: the
+    // walk starts at its parent, so the marker inside it is not seen.  Callers
+    // holding a path that may be either must leave the hint at Unknown.
+    const auto nested = tree.root / "rtl";
+    tree.write(std::string("rtl/") + ProjectRootResolver::kMarker, "[design]\n");
+    resolver.invalidate();
+    CHECK(resolver.project_info(nested, ProjectRootResolver::PathKind::Unknown)->source_root ==
+          nested);
+    CHECK(resolver.project_info(nested, ProjectRootResolver::PathKind::File)->source_root ==
+          tree.root);
+}

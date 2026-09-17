@@ -49,14 +49,27 @@ public:
     /// restores searching.
     void set_forced_root(std::filesystem::path directory);
 
-    /// The project @p file belongs to, or nullopt when no `lazyverilog.toml`
+    /// What @p path is, when the caller already knows.
+    ///
+    /// Deciding it here costs an `is_directory()` that the per-directory cache
+    /// below cannot serve -- it is keyed on directories, and this question is
+    /// about the path itself.  So it is one uncached stat per lookup, and the
+    /// lookups are per request (`config_for`) and per parse (`for_path`).
+    /// Every hot caller holds a path it knows is a file.
+    enum class PathKind {
+        Unknown, ///< Ask the filesystem.  For a path that may name either.
+        File,    ///< Start the walk at the parent, with no stat at all.
+    };
+
+    /// The project @p path belongs to, or nullopt when no `lazyverilog.toml`
     /// exists in it or any ancestor.
     ///
     /// Callers must handle nullopt rather than substituting a root of their
     /// own: "this file is in no project" is a real answer, and the shard cache
-    /// answers it with a fallback directory outside the tree.  @p file may be
+    /// answers it with a fallback directory outside the tree.  @p path may be
     /// a file or a directory, and need not exist.
-    std::optional<ProjectInfo> project_info(const std::filesystem::path& file) const;
+    std::optional<ProjectInfo> project_info(const std::filesystem::path& path,
+                                            PathKind kind = PathKind::Unknown) const;
 
     /// Drop every cached decision.  Called when a `lazyverilog.toml` is created
     /// or deleted, where waiting out the freshness window would serve a root
