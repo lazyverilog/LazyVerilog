@@ -1198,3 +1198,90 @@ TEST_CASE("a project with compilation off stays quiet next to one with it on",
     CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
     CHECK(all_messages.find("undeclared_in_b") == std::string::npos);
 }
+
+TEST_CASE("a buffer under no project still gets semantic diagnostics",
+          "[project-root][module-proximity]") {
+    // Shared IP in a `common_ip/` with no `lazyverilog.toml` is routine, and so
+    // is opening one: it is the same case that makes `by_path_proximity()` rank
+    // instead of filter, and that `file_can_mean_target()` never rejects.
+    //
+    // Grouping semantic compilation by project silently dropped it.  The file
+    // matches no project, so it joined no group, and a buffer that used to
+    // report diagnostics reported nothing -- with no message saying why, and
+    // only when some *other* project happened to be registered.
+    TempTree tree("no-project-buffer-compiles");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_a;\n"
+                                           "endmodule\n");
+    // No config above this one, and no filelist names it.
+    auto ip = tree.write("common_ip/shared.sv", "module shared_ip;\n"
+                                                "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {a.string()});
+    analyzer.set_project_compilation_inputs({
+        {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
+    });
+    // Instantiating a module no compilation can see is the other half of this:
+    // the buffer is compiled alone, so `a_top` is unresolved, and LintMode means
+    // that is not a diagnostic.  Were it one, restoring these diagnostics would
+    // just trade silence for a false positive.
+    analyzer.open(uri_from_path(ip), "module shared_ip;\n"
+                                     "    a_top u_a ();\n"
+                                     "    logic [1:0] w;\n"
+                                     "    assign w = undeclared_in_ip;\n"
+                                     "endmodule\n");
+    analyzer.wait_for_background_index_idle();
+
+    const std::string all_messages = semantic_messages(analyzer);
+    INFO(all_messages);
+    // The project beside it is unaffected.
+    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
+    // And the orphan buffer is checked.
+    CHECK(all_messages.find("undeclared_in_ip") != std::string::npos);
+    // Without inventing an error about the design it cannot see.
+    CHECK(all_messages.find("a_top") == std::string::npos);
+}
+
+TEST_CASE("the no-project group does not undo a project's compilation switch",
+          "[project-root][module-proximity]") {
+    // The orphan group is for files with no project at all.  A buffer whose
+    // project turned `background_compilation` off has a project, and that
+    // project said no -- sweeping it up here would answer a question that was
+    // already answered, and the per-project switch would do nothing for any
+    // file the filelist does not name.
+    TempTree tree("no-project-group-respects-switch");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\n"
+                                           "    logic [1:0] w;\n"
+                                           "    assign w = undeclared_in_a;\n"
+                                           "endmodule\n");
+    auto b = tree.write("chip_b/rtl/b.sv", "module b_top;\n"
+                                           "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {a.string()});
+    analyzer.set_project_compilation_inputs({
+        {.root = tree.root / "chip_a", .files = {a.string()}, .background_compilation = true},
+        {.root = tree.root / "chip_b", .files = {}, .background_compilation = false},
+    });
+    // Open, in chip_b, and named by no filelist -- exactly the shape the orphan
+    // group collects, except that it has a project.
+    analyzer.open(uri_from_path(b), "module b_top;\n"
+                                    "    logic [1:0] w;\n"
+                                    "    assign w = undeclared_in_b;\n"
+                                    "endmodule\n");
+    analyzer.wait_for_background_index_idle();
+
+    const std::string all_messages = semantic_messages(analyzer);
+    INFO(all_messages);
+    CHECK(all_messages.find("undeclared_in_a") != std::string::npos);
+    CHECK(all_messages.find("undeclared_in_b") == std::string::npos);
+}
