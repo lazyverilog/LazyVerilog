@@ -8,18 +8,20 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
+// read_file_text_optional() opens and fstats one handle rather than resolving
+// the path twice; see the comment there.
 #ifndef _WIN32
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
-#include <optional>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <vector>
 
 inline std::string trim_copy(std::string text) {
     auto first = std::find_if_not(text.begin(), text.end(),

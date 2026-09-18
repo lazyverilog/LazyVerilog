@@ -7712,7 +7712,6 @@ Analyzer::opened_file_index_shards(const std::string& current_uri) const {
 
 CompilationSnapshot Analyzer::compilation_snapshot() const {
     CompilationSnapshot snapshot;
-    std::shared_ptr<const std::vector<ProjectCompilationInputs>> projects;
 
     // map_mutex_ covers gathering what the analyzer knows -- the open buffers,
     // the merged filelist, the versions -- and nothing after it.  The grouping
@@ -7723,7 +7722,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // request thread is waiting on this lock.
     std::unique_lock<std::mutex> lock(map_mutex_);
     snapshot.parse_inputs = parse_inputs_;
-    projects = project_compilation_inputs_;
+    const auto projects = project_compilation_inputs_;
 
     std::unordered_set<std::string> seen_uris;
     // Each file's index in snapshot.files, which is also the dedup set: the
