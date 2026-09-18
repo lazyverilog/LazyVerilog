@@ -90,6 +90,13 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   a 13k-line file (3803 ranges, 327 KiB on the wire, 42684 rows covered): ~4 ms to
   `vim.json.decode` and ~2 ms to walk.  Small next to the request itself — do not
   reach for a smaller payload before measuring that it is what hurts.
+- Fold columns are **UTF-16 code units of the line's content**, and a line's content ends
+  before its terminator — both halves of it.  `LineTable::starts` is built by scanning for
+  `'\n'`, so on a CRLF buffer the `'\r'` sat inside the line and every column came out one
+  too large, naming a position past the end of its own line.  Neovim sends
+  `lineFoldingOnly` and drops `startCharacter`/`endCharacter`, so only a client that places
+  the marker by column ever sees either this or the UTF-16 conversion beside it.  The guard
+  asserts a CRLF buffer against the LF spelling of the same source.
 - Guarded by `./build/lazyverilog-tests "[folding][scaling]"`.  Same rule as the
   startup guards: a **ratio against a structurally identical input at another
   size**, never an absolute millisecond budget.
@@ -196,6 +203,15 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   `groups` is the only answer to "what gets compiled" and `BackgroundCompiler::compile()`
   needs no branch to find it.  An empty `root` is what marks it, and that is the reason
   the source libraries below still matter.
+- **That fallback is chosen by whether any project registered what it compiles, and by
+  nothing else.**  "Nobody told us what to compile" and "everybody told us not to" are
+  different answers and the second wants no compilation at all.  Deciding on whether the
+  project loop happened to produce a group conflates them: a session whose projects all
+  have `[compilation]` off, or whose only interested project has an empty filelist and no
+  open buffer, then fell through to the fallback and compiled the union anyway — under
+  one project's defines, with `publish_diagnostics()` discarding every result.  It is
+  reachable from the session config alone, because `any_project_compiles()` starts the
+  worker when anybody wants it.  The branch is an if/else on that one question.
 - `CompilationGroup::files` holds **indices into `CompilationSnapshot::files`**, which owns
   every file once.  A file two projects' filelists both name is one entry referenced twice,
   not two copies of its URI and path — the snapshot is built under `map_mutex_`, and the
@@ -270,8 +286,17 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   for the published snapshot and for the two extra-file vectors alike.  The published
   one puts **headers before files**, because a header's declarations belong to its own
   shard while an includer's copy of them can be a burst behind.  Like clangd we ignore
-  semantic roots (`FileDistance.h` says so outright), so two files equally far from the
-  asker are not distinguishable and path order decides.
+  semantic roots (`FileDistance.h` says so outright), so two files genuinely equidistant
+  from the asker are not distinguishable and path order decides.
+- **Nearness is two numbers, not one.**  `PathProximityScore` carries the shared leading
+  prefix (more is nearer) and the candidate's own depth (fewer is nearer, at equal
+  prefix).  The prefix alone is the *up* half of clangd's edit distance and cannot see
+  how far past the meeting point a candidate then travels: against `chip/rtl/top.sv`,
+  `chip/rtl/fifo.sv` and `chip/rtl/sub/legacy/fifo.sv` share exactly `chip/rtl`, so the
+  sibling and the one three directories below it tied and arrival order decided.  The
+  depth term is consulted only on that tie, so nothing the prefix distinguishes is
+  reordered, and the two together reproduce `FileDistance`'s ordering.  Add a term here
+  and both entry points get it — that is the point of `path_proximity_score()`.
 - **The rule is the candidate order, not a lookup only some features call.**  A
   feature that answers from the prebuilt by-name table calls `find_module()`; one that
   scans the project's shards by name and takes the first that answers — go-to-definition,
@@ -331,6 +356,19 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
 - Guarded by `./build/lazyverilog-tests "[parse-inputs]"`.  Those tests are written
   so a session-wide set cannot pass them — each project's source only yields a module
   under its own define, or resolves a same-spelled header through its own `+incdir+`.
+- **`normalize_filesystem_path()` memoizes process-wide, and that memo has an owner.**
+  Its premise — a path that resolves on disk does not change spelling while the server is
+  alive — is true of a file being edited and false of a tree being rearranged: a branch
+  switch that repoints a vendor-IP symlink leaves every path under it resolving to where
+  it used to go, and two code paths reaching one file then disagree about its URI, which
+  is the one thing the function exists to prevent.  So
+  `invalidate_normalized_path_cache()` is called where the layout is in play — from
+  `invalidate_config_cache()`, beside `ProjectRootResolver::invalidate()`, and once per
+  watcher batch that reports a **created or deleted** file.  Never on a *changed* one:
+  editing a file cannot change what a path resolves to, and clearing there would make the
+  next keystroke re-walk the project.  The cap (`NormalizedPathCache::kMaxEntries`) is the
+  other half — nothing else ever releases entries, and a server left running across many
+  trees would hold every spelling it had seen.
 - Guarded by `./build/lazyverilog-tests "[project-root]"` and
   `ctest --test-dir build -R config-root-cli-smoke`.
 
@@ -371,6 +409,24 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   `DocumentState::parsed_digests`.  Hashing a `SourceManager` buffer means
   `IndexCache::digest_source_buffer()`, which drops the `'\0'` slang appends; hashing
   `getSourceText()` directly compares against `digest_file()` and never matches.
+- **Reading a file is one path lookup**, never a kind check and then an open.
+  `read_file_text_optional()` opens with `O_NONBLOCK` — which is what makes opening safe
+  before the kind is known, since a FIFO then returns instead of blocking forever — and
+  `fstat`s the handle it already holds.  Both hazards the old `is_regular_file()` guarded
+  (a directory, whose libstdc++ size is `LLONG_MAX`, and that FIFO) are still answered.
+  It sits on both halves of the warm path — every source file hashed, every shard read —
+  so the second walk was ~2 avoidable round trips per file per launch on a shared
+  filesystem.  The read asks for `st_size + 1` so an unchanged file ends on a short read;
+  draining until `read()` returns 0 instead costs a syscall per file and measured +10% on
+  a warm start, which was most of what removing the stat had bought.  Windows keeps the
+  path check, the same trade `normalize_filesystem_path()` makes.
+- **A shard's `file_id`s are checked where they are read**, by `Reader::file_id()` against
+  the file table — which is deserialized first, precisely so this is possible.  Fourteen
+  entry types carry one; three hand-written scans over the finished index covered three
+  of them, and a bad id in the other eleven became an empty URI at request time instead of
+  the cache miss it should have been.  Checking at the read also *removes* those scans,
+  one of them over `references`.  `r.u32()` into a `file_id` is now the visibly wrong
+  spelling, which is what keeps a fifteenth entry type from being added without it.
 - Adding a field to any entry in `src/syntax_index.hpp` requires updating the codec in
   `src/index_cache.cpp` and bumping `kFormatVersion`.  A `static_assert` on each struct's
   size makes forgetting a compile error rather than a shard that silently drops the field.
@@ -488,6 +544,23 @@ ctest --test-dir build                          # test gate — must pass first
     positioning. This is unavoidable for distinguishing own-line comments from
     trailing comments, and must be handled carefully so it does not create
     non-idempotent formatting behavior.
+
+### Hand-Built JSON
+- The custom `workspace/executeCommand` replies are serialized by hand and handed to the
+  transport as a finished string, so nothing downstream re-escapes them.  There is **one**
+  escaper for that, `json_quoted()` / `append_json_string()` in `src/string_utils.hpp`.
+  Do not write a second: there were two, only one escaped the C0 controls, and the same
+  byte was therefore legal JSON out of one command and a parse error out of the other.
+- RFC 8259 §7 requires every code point below U+0020 to be escaped.  Six have short forms
+  and the rest have only `\uXXXX`, so stopping at the six emits a document no conforming
+  parser will read — a vertical tab in a comment was enough to make a whole-document
+  `newText` undecodable, and `vim.json.decode` reports that as a parse error pointing
+  nowhere near the file that caused it.  Form feed *is* escaped, which is the control byte
+  legacy HDL actually uses, and is most of why this went unseen.
+- Cast to `unsigned char` before testing against 0x20.  `char` is signed on every target
+  this builds for, so a UTF-8 continuation byte is negative and a signed test escapes it,
+  corrupting text that was already valid.
+- Guarded by `./build/lazyverilog-tests "[json]"`.
 
 ## Dependencies
 
