@@ -292,14 +292,20 @@ void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
 
 /// Compile one group into @p result.
 ///
-/// @p parse_inputs is only consulted for the ungrouped fallback, where the files
-/// can span projects; a real project group is one project by construction, so it
-/// needs no source libraries to keep names apart.  An empty `group.root` is what
-/// says which of the two this is, so the guard below matches this sentence.
-void BackgroundCompiler::compile_group(const CompilationGroup& group,
-                                       const std::shared_ptr<const ProjectParseInputs>& parse_inputs,
+/// @p group references @p snapshot's files by index; the snapshot owns them.
+///
+/// The snapshot's parse inputs are only consulted for the ungrouped fallback,
+/// where the files can span projects; a real project group is one project by
+/// construction, so it needs no source libraries to keep names apart.  An empty
+/// `group.root` is what says which of the two this is.
+void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
+                                       const CompilationGroup& group,
                                        BackgroundCompileResult& result) const {
     const auto start = Clock::now();
+    const auto& parse_inputs = snapshot.parse_inputs;
+    const auto file_at = [&](uint32_t index) -> const CompilationSourceFile& {
+        return snapshot.files[index];
+    };
     auto source_manager = make_lsp_source_manager();
     for (const auto& dir : group.include_dirs) {
         if (!dir.empty())
@@ -368,10 +374,18 @@ void BackgroundCompiler::compile_group(const CompilationGroup& group,
         // Sorted, so iteration order *is* priority order: the snapshot's open
         // buffers come out of a hash map, and priority decides which definition
         // a lookup takes.
+        // One resolve per file, kept.  The set is the dedup and the priority
+        // order at once, and root_of_file remembers the answer so the
+        // assignment below does not walk the filesystem a second time for
+        // every file.
         std::set<std::string> roots;
-        for (const auto& file : group.files) {
-            if (auto root = parse_inputs->project_root_for(file.path).string(); !root.empty())
-                roots.insert(std::move(root));
+        std::vector<std::string> root_of_file;
+        root_of_file.reserve(group.files.size());
+        for (const auto index : group.files) {
+            auto root = parse_inputs->project_root_for(file_at(index).path).string();
+            if (!root.empty())
+                roots.insert(root);
+            root_of_file.push_back(std::move(root));
         }
 
         if (roots.size() > 1) {
@@ -384,14 +398,14 @@ void BackgroundCompiler::compile_group(const CompilationGroup& group,
                 library_by_root.emplace(root, library.get());
                 libraries.push_back(std::move(library));
             }
-            for (const auto& file : group.files) {
-                const auto it =
-                    library_by_root.find(parse_inputs->project_root_for(file.path).string());
+            for (size_t slot = 0; slot < group.files.size(); ++slot) {
+                const auto it = library_by_root.find(root_of_file[slot]);
                 if (it == library_by_root.end())
                     continue;
                 // Keyed the way the parse loop below spells the same file, so a
                 // path that arrives unnormalized cannot silently miss its library.
-                library_by_path.emplace(normalize_filesystem_path(file.path).string(), it->second);
+                library_by_path.emplace(
+                    normalize_filesystem_path(file_at(group.files[slot]).path).string(), it->second);
             }
         }
     }
@@ -417,7 +431,8 @@ void BackgroundCompiler::compile_group(const CompilationGroup& group,
         scanned_buffer_count = buffers.size();
     };
 
-    for (const auto& file : group.files) {
+    for (const auto index : group.files) {
+        const auto& file = file_at(index);
         const auto normalized_path = normalize_filesystem_path(file.path).string();
         if (assigned_paths.contains(normalized_path))
             continue;
@@ -491,20 +506,14 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     // Sequentially, deliberately: peak memory is the binding resource here, and
     // N projects compiled at once would multiply it.  Compiled one after the
     // other, N projects cost N times the wall clock and one project's memory.
-    for (const auto& group : snapshot.groups)
-        compile_group(group, snapshot.parse_inputs, result);
-
-    // No project registered one -- a CLI tool, a test, or a client that sent no
-    // rootUri.  Everything the analyzer knows about is compiled as one group
-    // against the merged defaults, which is what this did before groups
-    // existed, and is why the per-project source libraries below still matter.
-    const size_t compiled_file_count = snapshot.files.size();
-    if (snapshot.groups.empty()) {
-        compile_group(CompilationGroup{.root = {},
-                                       .files = std::move(snapshot.files),
-                                       .defines = std::move(snapshot.defines),
-                                       .include_dirs = std::move(snapshot.include_dirs)},
-                      snapshot.parse_inputs, result);
+    //
+    // No branch for the "no registered project" session: compilation_snapshot()
+    // emits that as a group with an empty root, so `groups` is the only answer
+    // to what gets compiled.
+    size_t compiled_file_count = 0;
+    for (const auto& group : snapshot.groups) {
+        compiled_file_count += group.files.size();
+        compile_group(snapshot, group, result);
     }
 
     // A file two projects' filelists both name is compiled once per project, so
