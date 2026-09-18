@@ -1239,7 +1239,8 @@ TEST_CASE("a buffer under no project joins no compilation group",
     bool ip_grouped = false;
     bool a_grouped = false;
     for (const auto& group : snapshot.groups) {
-        for (const auto& file : group.files) {
+        for (const auto index : group.files) {
+            const auto& file = snapshot.files[index];
             if (file.path == ip_path)
                 ip_grouped = true;
             if (file.path == a_path)
@@ -1250,8 +1251,9 @@ TEST_CASE("a buffer under no project joins no compilation group",
     CHECK(a_grouped);
     // ...and the buffer whose config never asked does not.
     CHECK_FALSE(ip_grouped);
-    // The snapshot still carries it, because the index and the ungrouped
-    // fallback both need every open buffer; only the grouping leaves it out.
+    // The snapshot still carries the buffer -- the index needs every open
+    // buffer, and `files` is what exists rather than what is compiled.  Only
+    // the grouping leaves it out.
     CHECK(std::any_of(snapshot.files.begin(), snapshot.files.end(),
                       [&](const CompilationSourceFile& f) { return f.path == ip_path; }));
 }
