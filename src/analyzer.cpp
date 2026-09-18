@@ -6405,6 +6405,36 @@ void Analyzer::replace_default_parse_inputs_locked(ParseInputs inputs) {
 }
 
 void Analyzer::set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs) {
+    // Normalized at this boundary, exactly as set_project_config() normalizes
+    // the union's filelist, and for the same reason: compilation_snapshot()
+    // looks each of these paths up in the table it builds from docs_ and
+    // extra_files_, both of which hold normalized spellings.  A filelist entry
+    // that spells the same file differently misses that lookup and is appended
+    // to the snapshot a second time, with no text, and the group then holds
+    // both entries: one Compilation is handed the bytes on disk *and* the open
+    // buffer, which is the same module declared twice.  For a listed buffer
+    // outside the project's root, where the open-buffer pass below would not
+    // have added it either, what is compiled is the disk copy alone and the
+    // unsaved edit is simply dropped.
+    //
+    // A `.f` on Windows routinely spells paths with forward slashes, which are
+    // not the separator normalization returns, so every listed buffer missed
+    // there; that is what reddened the Windows job while every other platform,
+    // where an absolute filelist path normalizes to itself, stayed green.
+    //
+    // Before the lock, because normalize_filesystem_path() walks the
+    // filesystem and map_mutex_ is the lock every request handler contends
+    // for.  The walk is memoized by spelling and set_project_config() has
+    // just resolved these same paths, so in practice this is a map lookup per
+    // entry rather than a stat chain.
+    //
+    // `root` is left as given: it arrives from ProjectRootResolver, which
+    // already normalizes, and it is the key ProjectParseInputs::by_root_ was
+    // populated under -- rewriting it here would make for_root() miss.
+    for (auto& project : inputs)
+        for (auto& file : project.files)
+            file = normalize_filesystem_path(file).string();
+
     auto shared = std::make_shared<const std::vector<ProjectCompilationInputs>>(std::move(inputs));
     std::lock_guard<std::mutex> lock(map_mutex_);
     project_compilation_inputs_ = std::move(shared);
