@@ -24,6 +24,68 @@ inline std::string trim_copy(std::string text) {
     return std::string(first, last);
 }
 
+/// Append @p text to @p out as a quoted JSON string literal.
+///
+/// The two hand-built JSON responses this server sends -- the custom
+/// `workspace/executeCommand` results, which the vendored lspcpp passes through
+/// verbatim as a pre-serialized string -- both need this, and they had a copy
+/// each.  Only one of them escaped the C0 controls, so the same byte was legal
+/// JSON out of one command and a parse error out of the other.
+///
+/// RFC 8259 section 7 requires every code point below U+0020 to be escaped.  Six
+/// of them have short forms; the rest have no spelling but `\uXXXX`, so a
+/// serializer that stops at the named six emits a document no conforming parser
+/// will read.  A single vertical tab -- a byte that reaches here from a comment
+/// in the user's own source -- was enough to make a formatting reply
+/// undecodable, and the client reports that as a parse error pointing nowhere
+/// near the file that caused it.
+///
+/// Nothing above U+007F is touched: JSON strings hold UTF-8 directly, and the
+/// document's bytes are already the encoding the transport wants.
+inline void append_json_string(std::string& out, std::string_view text) {
+    // Most SystemVerilog text needs no escaping at all.  Reserve the common-case
+    // payload plus quotes up front so a whole-document `newText` does not grow
+    // one byte at a time; escapes can exceed the estimate, but this removes
+    // nearly every reallocation for real files.
+    out.reserve(out.size() + text.size() + 2 + text.size() / 8);
+    out += '"';
+    for (char c : text) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default: {
+            // Cast before comparing: `char` is signed on every target this
+            // builds for, so a UTF-8 continuation byte is negative and a signed
+            // test would send it down the escape path and corrupt text that was
+            // already valid.
+            const auto byte = static_cast<unsigned char>(c);
+            if (byte >= 0x20) {
+                out += c;
+                break;
+            }
+            static constexpr char kHex[] = "0123456789abcdef";
+            out += "\\u00";
+            out += kHex[byte >> 4];
+            out += kHex[byte & 0xf];
+            break;
+        }
+        }
+    }
+    out += '"';
+}
+
+/// @copydoc append_json_string
+inline std::string json_quoted(std::string_view text) {
+    std::string out;
+    append_json_string(out, text);
+    return out;
+}
+
 /// Count the UTF-16 code units in a UTF-8 slice.
 ///
 /// LSP measures `Position.character` in UTF-16 code units, while every byte
