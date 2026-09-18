@@ -4550,6 +4550,48 @@ static std::string declaration_type_from_source_line(const std::string& path, in
     return prefix;
 }
 
+/// The first candidate in @p ranked that answers @p probe, skipping @p skip_uri.
+///
+/// @p ranked arrives nearest-first (see by_path_proximity()), and that ordering
+/// is the whole cross-project answer: SystemVerilog's module and package
+/// namespaces are flat and global while this index is a union across every open
+/// project, so which candidate is met first is what decides which project a name
+/// resolves into.  @p probe decides what counts as an answer; the search is not
+/// its business.
+///
+/// One function rather than a loop per caller, because the order is the part
+/// that has to be right, and a scan that spells its own loop is a scan that can
+/// be written without it -- which is how the defect came to be in nine places at
+/// once, and how two of them came to be byte-identical copies of each other.
+template <typename Probe>
+static auto first_ranked_answer(std::span<const ExtraFileInfo* const> ranked,
+                                const std::string* skip_uri, Probe&& probe) {
+    decltype(probe(std::declval<const ExtraFileInfo&>())) found{};
+    for (const auto* extra : ranked) {
+        if (skip_uri && extra->uri == *skip_uri)
+            continue;
+        if ((found = probe(*extra)))
+            break;
+    }
+    return found;
+}
+
+/// @copydoc first_ranked_answer
+///
+/// Macros and subroutine arguments are preprocessor- and body-level facts that
+/// the compact shards do not carry, so probes in this form answer from live
+/// syntax trees and therefore see open buffers only.
+template <typename Probe>
+static auto first_ranked_tree_answer(std::span<const ExtraFileInfo* const> ranked,
+                                     const std::string* skip_uri, Probe&& probe) {
+    return first_ranked_answer(ranked, skip_uri, [&](const ExtraFileInfo& extra) {
+        using Result = decltype(probe(*extra.state->tree, extra.uri));
+        if (!extra.state || !extra.state->tree)
+            return Result{};
+        return probe(*extra.state->tree, extra.uri);
+    });
+}
+
 std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, int col) const {
     // The last snapshot that parsed, not simply the last one.  The editor
     // issues this request from the same notification that started the reparse,
@@ -4576,20 +4618,17 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // macro two projects both define is the same ambiguity a module is, and
     // hover answering from one project while go-to-definition answers from the
     // other is the disagreement this ordering exists to prevent.
-    auto extra_files = ranked_extra_files(extra_file_snapshot_ptr(),
-                                          std::string_view(state->normalized_path));
+    auto extra_files = ranked_extra_files(*state);
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto info = find_macro_info(*state->tree, uri, target.name))
             return info;
-        for (const auto* extra : *extra_files) {
-            if (extra->uri == uri)
-                continue;
-            if (!extra->state || !extra->state->tree)
-                continue;
-            if (auto info = find_macro_info(*extra->state->tree, extra->uri, target.name))
-                return info;
-        }
+        if (auto info = first_ranked_tree_answer(
+                *extra_files, &uri,
+                [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                    return find_macro_info(tree, tree_uri, target.name);
+                }))
+            return info;
         return SymbolInfo{
             .name = target.name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
     }
@@ -4659,12 +4698,13 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // alone therefore finds nothing for such declarations and hover degrades
         // to a bare name.  Fall back to scanning the shards; the entries carry
         // their own file_id, so the location match stays exact.
-        for (const auto* extra : *extra_files) {
-            if (extra->uri == definition->uri)
-                continue; // already tried above
-            if (auto info = symbol_info_from_index(extra->index_ref(), target, *definition))
-                return info;
-        }
+        // Skipping the definition's own URI: already tried above.
+        if (auto info = first_ranked_answer(*extra_files, &definition->uri,
+                                            [&](const ExtraFileInfo& extra) {
+                                                return symbol_info_from_index(extra.index_ref(),
+                                                                              target, *definition);
+                                            }))
+            return info;
         return SymbolInfo{
             .name = name, .kind = "symbol", .line = definition->line, .col = definition->col};
     }
@@ -5043,8 +5083,7 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     // it twice.  The snapshot itself is shared and immutable, so this remains
     // O(1) instead of copying and erase/removing a potentially large filelist
     // vector on every goto-definition request.
-    auto ranked = ranked_extra_files(extra_file_snapshot_ptr(),
-                                     std::string_view(state->normalized_path));
+    auto ranked = ranked_extra_files(*state);
     auto result = definition_of_state(*state, uri, line, col, *ranked, &uri);
     // Miss path only: an `include directive resolves no identifier, and every
     // successful definition keeps its current cost.
@@ -5101,26 +5140,15 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // Both stop at the first candidate that answers, which is what makes the
     // ordering the whole disambiguation.
     const auto nearest_shard_answer = [&](auto&& probe) {
-        decltype(probe(std::declval<const ExtraFileInfo&>())) found{};
-        for (const auto* extra : ranked) {
-            if (skip_extra(extra))
-                continue;
-            if ((found = probe(*extra)))
-                break;
-        }
-        return found;
+        return first_ranked_answer(ranked, skip_extra_uri, std::forward<decltype(probe)>(probe));
     };
 
     // Macros and subroutine arguments are preprocessor- and body-level facts
     // that the compact shards do not carry, so these answer from live syntax
     // trees and therefore see open buffers only.
     const auto nearest_open_buffer_answer = [&](auto&& probe) {
-        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
-            using Result = decltype(probe(*extra.state->tree, extra.uri));
-            if (!extra.state || !extra.state->tree)
-                return Result{};
-            return probe(*extra.state->tree, extra.uri);
-        });
+        return first_ranked_tree_answer(ranked, skip_extra_uri,
+                                        std::forward<decltype(probe)>(probe));
     };
 
     auto target = definition_target_at(*state.tree, uri, line, col);
@@ -5583,8 +5611,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // itself uses: closed project files carry only their compact index shard
         // (ExtraFileInfo::state is null for them), so this resolves through the
         // same index lookups and never walks a closed file's AST.
-        const auto extra_full =
-            ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state->normalized_path));
+        const auto extra_full = ranked_extra_files(*state);
         target_def = definition_of_state(*state, uri, line, col, *extra_full, &uri);
     }
     if (!target_def) {
@@ -7613,6 +7640,11 @@ Analyzer::extra_file_snapshot_ptr() const {
 }
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+Analyzer::ranked_extra_files(const DocumentState& state) const {
+    return ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state.normalized_path));
+}
+
+std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
                              std::string_view from_path) const {
     if (!files)
@@ -7759,11 +7791,35 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // joins nothing: there is no filelist that says which design it belongs to,
     // and guessing would put it in every one.
     if (!project_compilation_inputs_.empty()) {
-        std::unordered_map<std::string, CompilationSourceFile> open_by_path;
+        // Every file's entry indexed by path, open buffers and closed files
+        // alike.  The two loops above already deduped by path with the open
+        // buffer winning, so there is exactly one entry per file and it is the
+        // right one -- and reusing it is what keeps the group loop from running
+        // uri_from_path() a second time for every closed file of every project,
+        // on this lock.  Views into snapshot.files, which is complete by here
+        // and not touched again.
+        std::unordered_map<std::string_view, const CompilationSourceFile*> file_by_path;
+        file_by_path.reserve(snapshot.files.size());
+        for (const auto& file : snapshot.files)
+            file_by_path.emplace(file.path, &file);
+
+        // Each open buffer's project, resolved once rather than once per project
+        // it is compared against.  Which project a buffer is in is a fact about
+        // the buffer, and the upward walk it costs is exactly the filesystem work
+        // CompilationSnapshot::parse_inputs exists to keep off this lock --
+        // paying it per (project, buffer) pair put it back.
+        //
+        // Sorted by path, because docs_ is a hash map and the order files enter
+        // a Compilation decides which definition wins a tie: taking bucket order
+        // would let one run disagree with the next.
+        std::vector<std::pair<std::filesystem::path, const CompilationSourceFile*>> open_by_root;
         for (const auto& file : snapshot.files) {
             if (file.text)
-                open_by_path.emplace(file.path, file);
+                open_by_root.emplace_back(parse_inputs_->project_root_for(file.path), &file);
         }
+        std::sort(open_by_root.begin(), open_by_root.end(), [](const auto& a, const auto& b) {
+            return a.second->path < b.second->path;
+        });
 
         for (const auto& project : project_compilation_inputs_) {
             if (!project.background_compilation)
@@ -7775,7 +7831,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
             group.defines = inputs.defines;
             group.include_dirs = inputs.include_dirs;
 
-            std::unordered_set<std::string> in_group;
+            std::unordered_set<std::string_view> in_group;
             group.files.reserve(project.files.size());
             for (const auto& path_string : project.files) {
                 if (!in_group.insert(path_string).second)
@@ -7783,8 +7839,8 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
                 // The open buffer's entry when there is one, so the compilation
                 // reads the text the user is looking at rather than the file on
                 // disk.
-                if (const auto it = open_by_path.find(path_string); it != open_by_path.end()) {
-                    group.files.push_back(it->second);
+                if (const auto it = file_by_path.find(path_string); it != file_by_path.end()) {
+                    group.files.push_back(*it->second);
                     continue;
                 }
                 group.files.push_back(CompilationSourceFile{
@@ -7796,23 +7852,11 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
 
             // Open buffers this project's filelist does not name -- a file just
             // created, or one the user opened before adding it to the `.f`.
-            // Sorted, because docs_ is a hash map and the order files enter a
-            // Compilation decides which definition wins a tie: taking bucket
-            // order would let one run disagree with the next.
-            std::vector<const CompilationSourceFile*> unlisted;
-            for (const auto& [path_string, file] : open_by_path) {
-                if (in_group.contains(path_string))
+            for (const auto& [root, file] : open_by_root) {
+                if (root != project.root || in_group.contains(file->path))
                     continue;
-                if (parse_inputs_->project_root_for(path_string) != project.root)
-                    continue;
-                unlisted.push_back(&file);
-            }
-            std::sort(unlisted.begin(), unlisted.end(),
-                      [](const CompilationSourceFile* a, const CompilationSourceFile* b) {
-                          return a->path < b->path;
-                      });
-            for (const auto* file : unlisted)
                 group.files.push_back(*file);
+            }
 
             if (!group.files.empty())
                 snapshot.groups.push_back(std::move(group));

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <slang/ast/Compilation.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/parsing/Preprocessor.h>
@@ -293,7 +294,8 @@ void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
 ///
 /// @p parse_inputs is only consulted for the ungrouped fallback, where the files
 /// can span projects; a real project group is one project by construction, so it
-/// needs no source libraries to keep names apart.
+/// needs no source libraries to keep names apart.  An empty `group.root` is what
+/// says which of the two this is, so the guard below matches this sentence.
 void BackgroundCompiler::compile_group(const CompilationGroup& group,
                                        const std::shared_ptr<const ProjectParseInputs>& parse_inputs,
                                        BackgroundCompileResult& result) const {
@@ -320,15 +322,15 @@ void BackgroundCompiler::compile_group(const CompilationGroup& group,
     bag.set(std::move(preprocessor_options));
     bag.set(std::move(compilation_options));
 
-    // One slang source library per project.
+    // One slang source library per project, on the ungrouped fallback only.
     //
-    // This is a single Compilation over every open project's files -- semantic
-    // compilation cannot be per file, because it has one preprocessor for all
-    // of it -- and SystemVerilog's module namespace is flat and global.  Two
-    // projects that both declare `fifo` are therefore a redefinition to slang:
-    // it says so and keeps one of them, and the other project's semantic
-    // diagnostics disappear along with its definition -- measured, not feared;
-    // see the `[module-proximity]` compilation case.
+    // That path is a single Compilation over every file the analyzer knows
+    // about -- semantic compilation cannot be per file, because it has one
+    // preprocessor for all of it -- and SystemVerilog's module namespace is flat
+    // and global.  Two projects that both declare `fifo` are therefore a
+    // redefinition to slang: it says so and keeps one of them, and the other
+    // project's semantic diagnostics disappear along with its definition --
+    // measured, not feared; see the `[module-proximity]` compilation case.
     //
     // Libraries are the language's own answer, and slang implements it: a name
     // declared in two libraries is legal and kept in priority order, and only a
@@ -357,37 +359,42 @@ void BackgroundCompiler::compile_group(const CompilationGroup& group,
     // for its whole life, its destructor included.
     std::unordered_map<std::string, const slang::SourceLibrary*> library_by_path;
     std::vector<std::unique_ptr<slang::SourceLibrary>> libraries;
-    if (parse_inputs) {
-        std::unordered_map<std::string, std::string> root_by_path;
-        std::vector<std::string> roots;
+    // Only the ungrouped fallback can span projects.  A group with a root is one
+    // project by construction -- that is what the grouping decided -- so asking
+    // the resolver about its files could only ever rediscover that root, at the
+    // price of an upward directory walk and a path normalization per filelist
+    // entry on every debounced compile.
+    if (parse_inputs && group.root.empty()) {
+        // Sorted, so iteration order *is* priority order: the snapshot's open
+        // buffers come out of a hash map, and priority decides which definition
+        // a lookup takes.
+        std::set<std::string> roots;
         for (const auto& file : group.files) {
-            auto root = parse_inputs->project_root_for(file.path).string();
-            if (root.empty())
-                continue;
-            if (std::find(roots.begin(), roots.end(), root) == roots.end())
-                roots.push_back(root);
-            // Keyed the way the parse loop below spells the same file, so a
-            // path that arrives unnormalized cannot silently miss its library.
-            root_by_path.emplace(normalize_filesystem_path(file.path).string(), std::move(root));
+            if (auto root = parse_inputs->project_root_for(file.path).string(); !root.empty())
+                roots.insert(std::move(root));
         }
 
         if (roots.size() > 1) {
-            std::sort(roots.begin(), roots.end());
             std::unordered_map<std::string, const slang::SourceLibrary*> library_by_root;
             libraries.reserve(roots.size());
-            for (size_t i = 0; i < roots.size(); ++i) {
-                auto library =
-                    std::make_unique<slang::SourceLibrary>(std::string(roots[i]),
-                                                           static_cast<int>(i));
+            for (const auto& root : roots) {
+                auto library = std::make_unique<slang::SourceLibrary>(
+                    std::string(root), static_cast<int>(libraries.size()));
                 library->isDefault = true;
-                library_by_root.emplace(roots[i], library.get());
+                library_by_root.emplace(root, library.get());
                 libraries.push_back(std::move(library));
             }
-            for (const auto& [path, root] : root_by_path)
-                library_by_path.emplace(path, library_by_root.at(root));
+            for (const auto& file : group.files) {
+                const auto it =
+                    library_by_root.find(parse_inputs->project_root_for(file.path).string());
+                if (it == library_by_root.end())
+                    continue;
+                // Keyed the way the parse loop below spells the same file, so a
+                // path that arrives unnormalized cannot silently miss its library.
+                library_by_path.emplace(normalize_filesystem_path(file.path).string(), it->second);
+            }
         }
     }
-
 
     slang::ast::Compilation compilation(bag);
 
@@ -491,11 +498,12 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     // rootUri.  Everything the analyzer knows about is compiled as one group
     // against the merged defaults, which is what this did before groups
     // existed, and is why the per-project source libraries below still matter.
+    const size_t compiled_file_count = snapshot.files.size();
     if (snapshot.groups.empty()) {
         compile_group(CompilationGroup{.root = {},
-                                       .files = snapshot.files,
-                                       .defines = snapshot.defines,
-                                       .include_dirs = snapshot.include_dirs},
+                                       .files = std::move(snapshot.files),
+                                       .defines = std::move(snapshot.defines),
+                                       .include_dirs = std::move(snapshot.include_dirs)},
                       snapshot.parse_inputs, result);
     }
 
@@ -503,8 +511,14 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     // an identical diagnostic can arrive twice.  Two *different* diagnostics for
     // one file are kept: shared IP really does mean different things under two
     // projects' defines, and that is worth seeing.
-    for (auto& [uri, diags] : result.diagnostics_by_uri)
-        dedup_parse_diagnostics(diags);
+    //
+    // One group cannot produce a duplicate -- its own parse loop skips a path it
+    // has already assigned -- so the single-project session and the fallback both
+    // skip a pass that rebuilds every vector and hashes every diagnostic.
+    if (snapshot.groups.size() > 1) {
+        for (auto& [uri, diags] : result.diagnostics_by_uri)
+            dedup_parse_diagnostics(diags);
+    }
 
     result.uri_versions = std::move(snapshot.uri_versions);
 
@@ -513,7 +527,7 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
         std::cerr << "[lazyverilog][compilation] semantic compilation files="
-                  << snapshot.files.size() << ": " << elapsed.count() << "ms\n";
+                  << compiled_file_count << ": " << elapsed.count() << "ms\n";
     }
 
     return result;

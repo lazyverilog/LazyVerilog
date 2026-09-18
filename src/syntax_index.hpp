@@ -552,15 +552,14 @@ std::vector<const T*> by_path_proximity(std::span<const T> items, std::string_vi
     if (std::adjacent_find(score.begin(), score.end(), std::not_equal_to<>()) == score.end())
         return ranked;
 
-    std::vector<size_t> order;
-    order.reserve(items.size());
-    for (size_t i = 0; i < items.size(); ++i)
-        order.push_back(i);
-    // Stable, so equally distant candidates keep the caller's path order.
-    std::stable_sort(order.begin(), order.end(),
-                     [&score](size_t a, size_t b) { return score[a] > score[b]; });
-    for (size_t i = 0; i < order.size(); ++i)
-        ranked[i] = &items[order[i]];
+    // Stable, so equally distant candidates keep the caller's path order.  The
+    // pointers are sorted in place against the precomputed scores, indexed by
+    // each candidate's offset -- that is what keeps the scoring one pass rather
+    // than one call per comparison.
+    std::stable_sort(ranked.begin(), ranked.end(), [&](const T* a, const T* b) {
+        return score[static_cast<size_t>(a - items.data())] >
+               score[static_cast<size_t>(b - items.data())];
+    });
     return ranked;
 }
 
@@ -573,6 +572,15 @@ void order_by_path_proximity(std::vector<T>& items, std::string_view from_path) 
     if (from_path.empty() || items.size() < 2)
         return;
     const auto ranked = by_path_proximity(std::span<const T>(items), from_path);
+    // One project open scores every candidate the same, so the ranking is the
+    // identity and the vector is already in the order we would produce.  Say so
+    // before rebuilding it: `items` is the caller's own elements -- Connect's
+    // are one FileView per open buffer *and* per project shard -- and moving all
+    // of them into a second vector to reproduce their current order is the whole
+    // cost of this call in the common session.
+    if (std::equal(ranked.begin(), ranked.end(), items.data(),
+                   [](const T* ranked_item, const T& item) { return ranked_item == &item; }))
+        return;
     std::vector<T> reordered;
     reordered.reserve(items.size());
     for (const T* item : ranked)

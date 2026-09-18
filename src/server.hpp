@@ -51,6 +51,15 @@ class LazyVerilogServer {
     void request_inlay_hint_refresh();
     /// Whether any open project asks for semantic compilation.
     bool any_project_compiles() const;
+    /// @p uri's semantic diagnostics, or none when @p config -- that file's own,
+    /// never the session's -- does not ask for compilation.
+    ///
+    /// `[compilation]` is per project, so every consumer has to gate on the
+    /// asking file's answer.  Spelled at the call sites instead, it drifted the
+    /// first time it changed: one of the two was left reading `config_` while
+    /// the other moved to the file's config, two lines apart.
+    std::vector<ParseDiagInfo> semantic_diagnostics_for(const std::string& uri,
+                                                        const Config& config) const;
     void configure_background_compiler();
     void schedule_background_compilation();
 
