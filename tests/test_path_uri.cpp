@@ -196,15 +196,39 @@ TEST_CASE("path utils: the normalization memo does not grow without bound", "[pa
     // Nothing else releases it -- the memo has no expiry, by design -- so a
     // server left running across many trees would hold every spelling it ever
     // saw.  The cap is generous enough that a real project never reaches it.
-    const auto base = std::filesystem::temp_directory_path() / "lazyverilog-memo-cap";
-    for (size_t i = 0; i < NormalizedPathCache::kMaxEntries + 64; ++i)
-        (void)normalize_filesystem_path(base / ("m" + std::to_string(i) + ".sv"));
+    //
+    // Driven through cache_normalized(), which is where the cap lives and the
+    // only thing that writes the map.  Going through normalize_filesystem_path()
+    // resolves every one of these paths for real: one lstat each on POSIX, and
+    // on Windows -- which has no fast path -- a whole weakly_canonical() walk
+    // per path.  That measured about fifteen seconds of the Windows CI job, for
+    // a property that is about the map and not about the filesystem.
+    invalidate_normalized_path_cache();
+    for (size_t i = 0; i < NormalizedPathCache::kMaxEntries + 64; ++i) {
+        const auto key = "/synthetic/m" + std::to_string(i) + ".sv";
+        (void)cache_normalized(key, std::filesystem::path(key));
+    }
 
     auto& cache = normalized_path_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    CHECK(cache.entries.size() <= NormalizedPathCache::kMaxEntries);
-    // And it is still a cache, not a disabled one.
-    CHECK(cache.entries.size() > 0);
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        CHECK(cache.entries.size() <= NormalizedPathCache::kMaxEntries);
+        // And it is still a cache, not a disabled one.
+        CHECK(cache.entries.size() > 0);
+    }
+
+    // The cap is only worth anything if normalize_filesystem_path() is in fact
+    // served by this map, so pin that too -- with one path rather than 65k.
+    invalidate_normalized_path_cache();
+    const auto resolved = normalize_filesystem_path(std::filesystem::temp_directory_path());
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        CHECK(cache.entries.size() > 0);
+    }
+    CHECK(resolved == normalize_filesystem_path(std::filesystem::temp_directory_path()));
+
+    // Leave the suite a clean memo rather than this test's synthetic entries.
+    invalidate_normalized_path_cache();
 }
 
 TEST_CASE("read_file_text_optional survives a path that is not a regular file", "[path]") {
