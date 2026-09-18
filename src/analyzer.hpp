@@ -717,6 +717,16 @@ class Analyzer {
     ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
                        std::string_view from_path) const;
 
+    /// The published snapshot, ranked against @p state's own path.
+    ///
+    /// What every request handler actually wants, spelled once: a handler that
+    /// reaches for extra_file_snapshot_ptr() directly gets filelist order, and
+    /// the scans that consume it take the first match -- which is precisely the
+    /// defect the ranking exists to fix, so the correct form should be the
+    /// shorter one to write.
+    std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+    ranked_extra_files(const DocumentState& state) const;
+
     /// Return the last background-published project-wide shard snapshot.
     ///
     /// This is the Option-B project index: publishing records immutable per-file
@@ -876,10 +886,11 @@ class Analyzer {
     /// shared_ptr, so a worker can hold one across a whole parse while a config
     /// reload installs a replacement -- there is no window in which a parse
     /// reads half of one project's inputs and half of another's.
-    /// Guarded by map_mutex_, read by compilation_snapshot().
-    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
+    /// What each project compiles, and whether it wants to.  Guarded by
+    /// map_mutex_, read by compilation_snapshot().
+    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
