@@ -236,46 +236,6 @@ static std::string format_emit_text(const std::string& text, const FormatOptions
     return formatted;
 }
 
-static std::string json_string(std::string_view text) {
-    std::string out;
-    // Most SystemVerilog text does not need escaping.  Reserve the common-case
-    // payload plus quotes up front so large formatting/workspace responses do
-    // not grow one byte at a time.  Escaped characters can exceed this estimate,
-    // but the reserve still removes nearly all reallocations for normal files.
-    out.reserve(text.size() + 2 + text.size() / 8);
-    out += "\"";
-    for (char c : text) {
-        switch (c) {
-        case '"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\b':
-            out += "\\b";
-            break;
-        case '\f':
-            out += "\\f";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += c;
-            break;
-        }
-    }
-    out += "\"";
-    return out;
-}
-
 static lsPosition document_end_position(const DocumentState& state) {
     return lsPosition(state.end_line, state.end_character);
 }
@@ -292,8 +252,8 @@ static std::string whole_document_workspace_edit_json(const std::string& uri,
                                                       const DocumentState& state,
                                                       const std::string& new_text) {
     const auto end = document_end_position(state);
-    const auto escaped_uri = json_string(uri);
-    const auto escaped_text = json_string(new_text);
+    const auto escaped_uri = json_quoted(uri);
+    const auto escaped_text = json_quoted(new_text);
     const auto end_line = std::to_string(end.line);
     const auto end_character = std::to_string(end.character);
 
@@ -378,26 +338,26 @@ static std::string did_change_config_file(lsp::Any settings_any) {
 }
 
 static std::string workspace_edit_json(const std::string& uri, const lsTextEdit& edit) {
-    return "{\"changes\":{" + json_string(uri) +
+    return "{\"changes\":{" + json_quoted(uri) +
            ":[{\"range\":{\"start\":{\"line\":" + std::to_string(edit.range.start.line) +
            ",\"character\":" + std::to_string(edit.range.start.character) +
            "},\"end\":{\"line\":" + std::to_string(edit.range.end.line) +
            ",\"character\":" + std::to_string(edit.range.end.character) +
-           "}},\"newText\":" + json_string(edit.newText) + "}]}}";
+           "}},\"newText\":" + json_quoted(edit.newText) + "}]}}";
 }
 
 static void append_rtl_tree_json(std::string& out, const RtlTreeNode& node, bool show_file,
                                  bool show_instance_name, size_t depth = 0) {
     constexpr size_t kMaxRtlTreeJsonDepth = 512;
     out += "{\"name\":";
-    out += json_string(node.name);
+    out += json_quoted(node.name);
     // Always include navigation metadata.  `rtltree.show_file` and
     // `rtltree.show_instance_name` control the rendered label in the client,
     // not whether <CR> can jump to a definition when that label is hidden.
     out += ",\"inst\":";
-    out += json_string(node.inst);
+    out += json_quoted(node.inst);
     out += ",\"file\":";
-    out += json_string(node.file);
+    out += json_quoted(node.file);
     out += ",\"line\":";
     out += std::to_string(node.line);
     out += ",\"col\":";
@@ -2018,12 +1978,12 @@ void LazyVerilogServer::register_handlers() {
                         json += ",";
                     const auto& [diag_uri, diag] = diagnostics[i];
                     json += "{";
-                    json += "\"uri\":" + json_string(diag_uri);
-                    json += ",\"file\":" + json_string(uri_to_file(diag_uri));
+                    json += "\"uri\":" + json_quoted(diag_uri);
+                    json += ",\"file\":" + json_quoted(uri_to_file(diag_uri));
                     json += ",\"line\":" + std::to_string(diag.line + 1);
                     json += ",\"col\":" + std::to_string(diag.col + 1);
-                    json += ",\"severity\":" + json_string(severity_text(diag.severity));
-                    json += ",\"message\":" + json_string(diag.message);
+                    json += ",\"severity\":" + json_quoted(severity_text(diag.severity));
+                    json += ",\"message\":" + json_quoted(diag.message);
                     json += "}";
                 }
                 json += "]";
@@ -2047,7 +2007,7 @@ void LazyVerilogServer::register_handlers() {
                 };
                 if (!result.error.empty()) {
                     comma();
-                    json += "\"error\":" + json_string(result.error);
+                    json += "\"error\":" + json_quoted(result.error);
                 }
                 if (result.warn) {
                     comma();
@@ -2064,8 +2024,8 @@ void LazyVerilogServer::register_handlers() {
                     if (i > 0)
                         json += ",";
                     json += "{";
-                    json += "\"src\":" + json_string(pair.src);
-                    json += ",\"dst\":" + json_string(pair.dst);
+                    json += "\"src\":" + json_quoted(pair.src);
+                    json += ",\"dst\":" + json_quoted(pair.dst);
                     json += ",\"missing_if\":" + std::string(pair.missing_if ? "true" : "false");
                     json += ",\"missing_else\":" + std::string(pair.missing_else ? "true" : "false");
                     json += "}";
@@ -2111,7 +2071,7 @@ void LazyVerilogServer::register_handlers() {
 
                 std::string json;
                 json += "{\"changes\":{";
-                json += json_string(uri);
+                json += json_quoted(uri);
                 json += ":[";
                 bool first = true;
                 for (const auto& edit : sorted_edits) {
@@ -2128,7 +2088,7 @@ void LazyVerilogServer::register_handlers() {
                     json += ",\"character\":";
                     json += character_str;
                     json += "}},\"newText\":";
-                    json += json_string(edit.text);
+                    json += json_quoted(edit.text);
                     json += '}';
                 }
                 json += "]}}";
