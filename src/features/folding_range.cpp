@@ -40,7 +40,15 @@ struct LineTable {
         return (int)(it - starts.begin()) - 1;
     }
 
-    // Returns {start, end} byte offsets for line (end excludes '\n').
+    // Returns {start, end} byte offsets for line (end excludes the terminator).
+    //
+    // Both halves of a CRLF terminator, not just the '\n'.  `starts` is built
+    // by scanning for '\n' alone, so on a CRLF buffer the '\r' sat inside the
+    // line and every column measured from these bounds came out one too large
+    // -- `endmodule` reported as 10 UTF-16 units instead of 9, naming a column
+    // past the end of its own line.  That is the same defect the two
+    // measurements below were rewritten to fix for non-ASCII text, and it hid
+    // for the same reason: Neovim sends `lineFoldingOnly` and drops the field.
     std::pair<size_t, size_t> bounds(int line) const {
         if (line < 0 || (size_t)line >= starts.size())
             return {text.size(), text.size()};
@@ -48,6 +56,8 @@ struct LineTable {
         size_t e = ((size_t)line + 1 < starts.size())
                        ? starts[(size_t)line + 1] - 1
                        : text.size();
+        if (e > s && text[e - 1] == '\r')
+            --e;
         return {s, e};
     }
 

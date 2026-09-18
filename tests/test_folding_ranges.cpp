@@ -1617,6 +1617,44 @@ TEST_CASE("foldingRange: character offsets are UTF-16 code units", "[folding]") 
     }
 }
 
+TEST_CASE("foldingRange: a CRLF buffer folds exactly like an LF one", "[folding]") {
+    // The line table is built by scanning for '\n', so on a CRLF buffer the
+    // '\r' sat inside the line and every column measured from it came out one
+    // too large -- the same "column past the end of its own line" the UTF-16
+    // case above fixed, from the other direction, and hidden by the same
+    // lineFoldingOnly client.
+    //
+    // Asserted against the LF spelling of the same source rather than against
+    // fixed numbers: line endings are the one thing that differs, so anything
+    // the two disagree about is this defect.
+    const std::string lf = "module m;\n"
+                           "  always_comb begin\n"
+                           "    x = 1;\n"
+                           "  end\n"
+                           "endmodule\n";
+    std::string crlf;
+    for (char c : lf) {
+        if (c == '\n')
+            crlf += '\r';
+        crlf += c;
+    }
+
+    Analyzer analyzer;
+    analyzer.open("file:///fold_lf.sv", lf);
+    analyzer.open("file:///fold_crlf.sv", crlf);
+
+    auto lf_folds   = provide_folding_range(analyzer, make_params("file:///fold_lf.sv"));
+    auto crlf_folds = provide_folding_range(analyzer, make_params("file:///fold_crlf.sv"));
+
+    REQUIRE_FALSE(lf_folds.empty());
+    CHECK(same_folds(lf_folds, crlf_folds));
+
+    // And the absolute value, so the pair cannot agree on a wrong answer.
+    const auto* module = find_fold_kind(crlf_folds, 0, 4, "region");
+    REQUIRE(module != nullptr);
+    CHECK(module->endCharacter == 9); // strlen("endmodule"), not 10
+}
+
 TEST_CASE("foldingRange: a non-BMP character counts as two UTF-16 units", "[folding]") {
     // A surrogate pair is where a UTF-16 count parts company with a character
     // count as well as with a byte count, so it pins the conversion rather than
