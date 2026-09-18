@@ -895,9 +895,21 @@ class Analyzer {
     /// reads half of one project's inputs and half of another's.
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
-    /// What each project compiles, and whether it wants to.  Guarded by
-    /// map_mutex_, read by compilation_snapshot().
-    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
+    /// What each project compiles, and whether it wants to.
+    ///
+    /// Behind a shared_ptr for the same reason `parse_inputs_` is, and to the
+    /// same end: compilation_snapshot() takes the pointer under map_mutex_ and
+    /// builds its groups after releasing it, so the upward directory walk that
+    /// decides an unlisted buffer's project happens off the lock every request
+    /// thread contends for.  Copying the vector there instead would copy every
+    /// project's whole filelist -- thousands of strings on a real design -- on
+    /// the lock, which is worse than the walk it was meant to move.
+    ///
+    /// Replaced wholesale, never mutated in place, so a reader holding the
+    /// pointer sees one consistent set of projects.
+    std::shared_ptr<const std::vector<ProjectCompilationInputs>>
+        project_compilation_inputs_ =
+            std::make_shared<const std::vector<ProjectCompilationInputs>>();
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.
