@@ -381,12 +381,54 @@ struct CompilationSourceFile {
     std::shared_ptr<const std::string> text;
 };
 
+/// One project's share of a semantic compilation, as the server registers it.
+///
+/// `files` is that project's own filelist, not the union.  Which declaration an
+/// instantiation binds to is decided by the set of files being compiled, and
+/// that set is what a `.f` names -- so grouping by filelist is not an
+/// approximation of the semantic answer, it *is* the scope SystemVerilog binds
+/// over.  The union deliberately stays the unit for *indexing*, where a name
+/// only one project declares should still be reachable from the other.
+struct ProjectCompilationInputs {
+    std::filesystem::path root;
+    std::vector<std::string> files;
+    /// That project's `[compilation].background_compilation`.  A project with it
+    /// off contributes no compilation at all, even while another has it on.
+    bool background_compilation{false};
+};
+
+/// One slang Compilation's worth of input.
+struct CompilationGroup {
+    /// The project this compiles, or empty for the ungrouped fallback.
+    std::string root;
+    std::vector<CompilationSourceFile> files;
+    /// This project's own, not the merged defaults.  One Compilation has one
+    /// preprocessor, which is exactly why it has to be one project's.
+    std::vector<std::string> defines;
+    std::vector<std::string> include_dirs;
+};
+
 struct CompilationSnapshot {
     std::vector<CompilationSourceFile> files;
     std::vector<std::string> defines;
     std::vector<std::string> include_dirs;
+    /// What actually gets compiled: one entry per project whose config asks for
+    /// it.  Empty means no project registered any -- a CLI tool, a test, or a
+    /// client that sent no rootUri -- and then `files` above is compiled as one
+    /// group against the merged defaults, which is what this did before.
+    std::vector<CompilationGroup> groups;
     std::vector<std::string> open_uris;
     std::unordered_map<std::string, uint64_t> uri_versions;
+    /// Which project each of `files` belongs to, answered by the compiler
+    /// rather than here.
+    ///
+    /// A pointer copy, deliberately: the snapshot is built under map_mutex_ and
+    /// resolving a project walks up to the nearest config, statting each
+    /// directory on the way.  Doing that per file inside the critical section
+    /// would put a filesystem walk per filelist entry on the lock every request
+    /// handler contends for.  The compiler runs on its own thread with nothing
+    /// waiting on it, and ProjectParseInputs is immutable once published.
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
 };
 
 struct RtlTreeNode {
@@ -563,6 +605,19 @@ class Analyzer {
     /// parse inputs and its shard directory are all decided by one walk.
     void set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
 
+    /// Register which files each project compiles, and whether it wants to.
+    ///
+    /// Semantic compilation is the one place the union is wrong: it builds a
+    /// slang Compilation, and a Compilation has one preprocessor and one flat
+    /// module namespace, so compiling every project's files together gave two
+    /// projects' `fifo`s to one elaboration and one project's `define` to the
+    /// other's parse.  One Compilation per project is what a `.f` already
+    /// describes.
+    ///
+    /// Passing an empty list restores the single merged compilation, which is
+    /// what a CLI tool or a test with no registered project gets.
+    void set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs);
+
     /// Whether a setter schedules a background reindex itself, or leaves it to
     /// the set_project_config() the caller is about to make.
     ///
@@ -644,6 +699,24 @@ class Analyzer {
     /// philosophy: current file uses AST, project files use index.
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
 
+    /// The same shards, ordered nearest-first against @p from_path.
+    ///
+    /// This is the order every by-name scan over the project has to run in --
+    /// see by_path_proximity() -- and it is memoized because computing it is
+    /// linear in the filelist while the thing it depends on is not: the
+    /// snapshot is immutable and shared until the next publish, and a person
+    /// asks several questions about the same buffer before either changes.
+    /// Ordering per request instead measured 129us on 1500 files and 455us on
+    /// 5000, against a go-to-definition that otherwise answers in single-digit
+    /// microseconds.
+    ///
+    /// Holding @p files keeps the pointers valid and makes its address a sound
+    /// cache key; without that a freed snapshot could be replaced by a new one
+    /// at the same address and this would hand back pointers into it.
+    std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+    ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                       std::string_view from_path) const;
+
     /// Return the last background-published project-wide shard snapshot.
     ///
     /// This is the Option-B project index: publishing records immutable per-file
@@ -707,9 +780,15 @@ class Analyzer {
   private:
     std::shared_ptr<DocumentState> make_state(const std::string& uri,
                                               const std::string& text) const;
+    /// @p ranked is the candidate files **in the order they should be tried**.
+    /// Every search below takes the first that can answer, so that order is
+    /// what decides which project a name resolves into; the caller owns it
+    /// (ranked_extra_files()) because it owns the request.  Passing an empty
+    /// span restricts the search to the current document, which is what
+    /// find_references() wants.
     std::optional<Location>
     definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                        std::span<const ExtraFileInfo> extra_files,
+                        std::span<const ExtraFileInfo* const> ranked,
                         const std::string* skip_extra_uri = nullptr) const;
 
     struct ExtraFileCacheEntry {
@@ -776,6 +855,14 @@ class Analyzer {
 
     mutable std::mutex map_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<const DocumentState>> docs_;
+
+    // One entry, because requests arrive about one buffer at a time.  Its own
+    // mutex: this is read on every definition/hover, and map_mutex_ is what the
+    // index workers hold.
+    mutable std::mutex ranked_extra_mutex_;
+    mutable std::shared_ptr<const std::vector<ExtraFileInfo>> ranked_extra_source_;
+    mutable std::string ranked_extra_from_;
+    mutable std::shared_ptr<const std::vector<const ExtraFileInfo*>> ranked_extra_cache_;
     /// Install @p inputs as the defaults, keeping every registered project's.
     /// Requires map_mutex_.
     void replace_default_parse_inputs_locked(ParseInputs inputs);
@@ -789,6 +876,8 @@ class Analyzer {
     /// shared_ptr, so a worker can hold one across a whole parse while a config
     /// reload installs a replacement -- there is no window in which a parse
     /// reads half of one project's inputs and half of another's.
+    /// Guarded by map_mutex_, read by compilation_snapshot().
+    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
     // Normalized absolute lexical filesystem paths.  Writers normalize before

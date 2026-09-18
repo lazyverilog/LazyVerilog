@@ -160,10 +160,71 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   `config_for(uri)` — formatting, lint, AutoFF, AutoWire, AutoArg, the RTL tree, and
   the two capability switches.  Do not reach for `config_` in a handler that has a
   URI; `config_` is the session's eager-indexing config, not the file's.
-- Two things stay session-wide, and are not per-file questions: **which** files to
-  index (one index covers every open project, so the filelist is the union), and
-  **semantic compilation** (`[compilation]`), which builds a single slang
-  `Compilation` and therefore has one preprocessor for all of it.
+- **Only one thing stays session-wide**: *which* files to index.  One index covers
+  every open project, so the filelist is the union — a name only one project declares
+  should still be reachable from the other.
+- **Semantic compilation is not that thing.**  `[compilation]` builds one slang
+  `Compilation` per **project**, each over that project's own filelist and its own
+  defines and `+incdir+` (`ProjectCompilationInputs` → `CompilationSnapshot::groups` →
+  `BackgroundCompiler::compile_group()`).  A `Compilation` has one preprocessor and one
+  flat module namespace, so compiling the union handed one elaboration two projects'
+  `fifo` and one project's `define` to the other project's parse.
+- The grouping is **by filelist, not by walking up to a root**.  Which declaration
+  `fifo u_fifo ();` binds to is decided by the set of files being compiled, and a `.f`
+  *is* that set, so this is the scope SystemVerilog binds over rather than an
+  approximation of it.  That is also why `fold_project_root()` records each project's
+  list **before** the union's dedup: a file two projects share belongs to both
+  compilations, and dropping it from the second would leave that project unable to
+  resolve a module its own filelist names.
+- Groups compile **sequentially**, one worker.  Peak memory is the binding resource, so
+  N projects cost N times the wall clock and one project's memory, never N times the
+  memory.  A file in two filelists is compiled twice and can report the same diagnostic
+  twice; `dedup_parse_diagnostics()` collapses the identical ones and keeps genuinely
+  different ones, because shared IP really does mean different things under two
+  projects' defines.
+- **`[compilation]` is per project, like `[lint]`.**  A project with it off contributes
+  no group, and `publish_diagnostics()` gates on `config_for(uri)` so its buffers stay
+  quiet while the project open beside it compiles.  `:LintAll` gates on `config_for(uri)`
+  too — it walked the merged filelist deciding lint per file and semantic diagnostics
+  from the session, two lines apart.  What stays session-level is the
+  *worker*: `background_compilation_debounce_ms` and `log_timing` are one timer and one
+  log stream, and `any_project_compiles()` starts it when anybody wants it.
+- A session with **no registered project** — a CLI tool, a test, a client that sent no
+  `rootUri` — has no groups and falls back to one merged `Compilation`, exactly as
+  before.  That fallback is the reason the source libraries below still matter.
+- An open buffer under **no** `lazyverilog.toml` joins no group, and that is its config
+  speaking, not an oversight.  `config_for()` resolves such a file to `Config{}` and
+  `[compilation].background_compilation` defaults to **false**, so
+  `publish_diagnostics()` would discard whatever a compilation produced for it.  Giving
+  those buffers a group of their own was tried and reverted: measured against the real
+  server, the file was compiled and not one `publishDiagnostics` notification carried
+  its diagnostic, while the project beside it published its own.  Opting shared IP in
+  means putting a `lazyverilog.toml` in the shared tree, the same opt-in every other
+  per-project setting takes.  Guarded by "a buffer under no project joins no compilation
+  group", which asserts the **grouping** and not the compiler's output — a
+  compiler-level check passes whether or not the publish gate would ever let the result
+  out, which is exactly how the wasted work went unnoticed.
+- On that fallback path each project gets its own `slang::SourceLibrary`
+  (`background_compiler.cpp`).  Without one, two projects that both declare `fifo` are a
+  redefinition to slang: it said so and kept one, and the other project's semantic
+  diagnostics vanished with it.  A name declared in two libraries is legal and kept in
+  priority order; only a duplicate *within* one library is reported
+  (`Compilation::insertDefinition`).  This is SystemVerilog's own answer to the question
+  C++ answers with linkage.
+- Every one of those libraries is marked `isDefault`, which is not the flag's usual
+  sense and is the whole reason it works.  slang never auto-instantiates a definition
+  that sits in a library — "Library definitions are never automatically instantiated in
+  any capacity" — so naming a library the obvious way silences the redefinition by
+  elaborating *nothing at all*.  The `[module-proximity]` compilation case asserts a
+  diagnostic from inside a module body for exactly this reason; flipping `isDefault` to
+  false is what it catches.  Priority follows **sorted root order**, not the order files
+  arrive in, because the snapshot's open buffers come out of a hash map.
+- Libraries make a duplicate legal; they do **not** make binding per project.  Without a
+  `config` block slang resolves a name through a global priority list and then
+  `defList.front()` (`Compilation::tryGetDefinition`); per-instantiator preference
+  (`overrideLib = &parentDef->sourceLibrary`) only fires under `resolveConfigRule`.
+  Per-project `Compilation`s are what actually answer that, which is why they are the
+  real fix and the libraries are the fallback's safety net.
 - Folding several projects is one analyzer transaction: `fold_project_root()` accumulates
   and passes `Analyzer::Reindex::Deferred`, and `apply_project_inputs()` is what schedules
   the burst.  Registering a project *and* scheduling there costs N+1 full reindex
@@ -203,9 +264,54 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   shard while an includer's copy of them can be a burst behind.  Like clangd we ignore
   semantic roots (`FileDistance.h` says so outright), so two files equally far from the
   asker are not distinguishable and path order decides.
-- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, including end to end
-  through AutoInst: the two projects' modules differ in their ports, so the ports that
-  come back name which project answered.
+- **The rule is the candidate order, not a lookup only some features call.**  A
+  feature that answers from the prebuilt by-name table calls `find_module()`; one that
+  scans the project's shards by name and takes the first that answers — go-to-definition,
+  hover, Connect — instead orders its candidates with `by_path_proximity()`, which shares
+  `find_module()`'s scoring function.  Both are "nearest to the asking file wins", and
+  keeping them on one scoring function is what stops the features disagreeing about which
+  project a name belongs to.  They did: ranking lived only in `find_module()`, so
+  go-to-definition on an instance in one project landed in the other, and renaming the
+  directories moved the answer.
+- A first-match scan over an *ordered* candidate list is the intended shape — do not
+  teach each scan to rank.  `definition_of_state()` orders once and its recoveries are
+  written as `nearest_shard_answer()` / `nearest_open_buffer_answer()`, which take only
+  the lookup that decides what counts as an answer; `collect_files()` orders the vector
+  every Connect consumer already reads in order.  Nine hand-written copies of that loop
+  is how the defect came to be in nine places at once.
+- **`find_references()` takes the rule from the other end, because ranking cannot
+  express it.**  A `SymbolID` really is `module::<name>` with no project in it: the
+  shard indexer is syntactic and single-file, so when it walks `fifo u_fifo ();` it
+  cannot know which file declares that `fifo` — that binding is what the union snapshot
+  decides at request time.  Two projects' `fifo`s are therefore one symbol to the
+  occurrence scan, and rename rewrote *both* declarations.  Go-to-definition needs one
+  answer and can rank; references needs a set, so what decides is the **file an
+  occurrence was written in**: `file_can_mean_target()` rejects a file only when its
+  project, the declaration's and the asking file's are all known and the first is
+  neither of the other two.
+- Both escapes there are load-bearing, and both are guarded.  A file under **no**
+  project is never rejected — shared IP outside every root is routine, and this is the
+  same reason `by_path_proximity()` ranks instead of filtering.  The **asking file's own
+  project** is always admitted, or clicking in the project that borrows another's module
+  returns results that omit the file under the cursor.  Per file, not per occurrence: a
+  shard that cannot see the declaration is skipped whole, and a path-prefix test in
+  front means a single-project session never consults the resolver at all.  Keyed per
+  file rather than per directory it cost 1.3 µs each on an 800-file project — a 3.4×
+  regression on a change that is supposed to be *removing* work.
+- Do not put the project in the `SymbolID`.  It is a session-dependent fact —
+  opening a split changes which projects share a file, while the file's bytes do not —
+  and shards are content-addressed, so it would either be stale on disk or re-key every
+  shared file on every project open.  clangd file-qualifies a USR only for
+  non-externally-visible declarations (`ShouldGenerateLocation`), i.e. by something
+  **intrinsic** to the declaration, and it can do that because it indexes after sema
+  with the binding already resolved.  Its `RefsRequest` carries no path filter at all.
+- Guarded by `./build/lazyverilog-tests "[module-proximity]"`, end to end through
+  AutoInst, go-to-definition, hover, Connect, references, rename and semantic
+  compilation.  Each case asserts **both** directions, because a first-match
+  implementation answers both with the same project and would otherwise pass for
+  whichever file it happened to pick.  Aiming the guard at AutoInst alone — the one
+  feature that already called `find_module()` — is why four features without the rule
+  went unnoticed.
 - **A saved config rebuilds every known project, not just the one that changed**
   (`reload_all_projects()`).  Reloading only the saved config replaced the merged
   filelist with that project's own, which unindexed every other open project until

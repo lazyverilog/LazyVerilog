@@ -57,7 +57,10 @@ C++ source for the lazyverilog LSP server. Split into server core (root of this 
   (`ProjectRootResolver`).  `rootUri` is only an eager-indexing hint; nothing per file
   depends on it, and the Neovim plugin no longer sends one.
 - Project module lookup: `ProjectIndexSnapshot::find_module(name, asking_file_path)`,
-  never `module_by_name.find()` directly.  The index is a union across open projects
+  never `module_by_name.find()` directly.  A feature that instead *scans* the project's
+  files by name orders them with `by_path_proximity()` first and keeps taking the first
+  match; same scoring function, same rule.  Do not write a by-name scan over an
+  unordered candidate list.  The index is a union across open projects
   and SystemVerilog module names are global, so the asking file is what breaks a tie.
   Pass the querying document's `normalized_path`; passing a URI silently scores every
   candidate zero and disables the tie-break.  It ranks and never filters -- a module

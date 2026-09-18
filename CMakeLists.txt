@@ -365,6 +365,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/filelist.cpp
     src/analyzer.cpp
     src/dynamic_file_index.cpp
+    src/background_compiler.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/index_cache.cpp

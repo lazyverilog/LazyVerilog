@@ -4572,17 +4572,22 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         return std::nullopt;
 
     auto target = definition_target_at(*state->tree, uri, line, col);
-    auto extra_files = extra_file_snapshot_ptr();
+    // Nearest-first, and shared with the definition_of_state() call below: a
+    // macro two projects both define is the same ambiguity a module is, and
+    // hover answering from one project while go-to-definition answers from the
+    // other is the disagreement this ordering exists to prevent.
+    auto extra_files = ranked_extra_files(extra_file_snapshot_ptr(),
+                                          std::string_view(state->normalized_path));
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto info = find_macro_info(*state->tree, uri, target.name))
             return info;
-        for (const auto& extra : *extra_files) {
-            if (extra.uri == uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri == uri)
                 continue;
-            if (!extra.state || !extra.state->tree)
+            if (!extra->state || !extra->state->tree)
                 continue;
-            if (auto info = find_macro_info(*extra.state->tree, extra.uri, target.name))
+            if (auto info = find_macro_info(*extra->state->tree, extra->uri, target.name))
                 return info;
         }
         return SymbolInfo{
@@ -4624,25 +4629,25 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
             return info;
 
         if (definition->uri != uri) {
-            for (const auto& extra : *extra_files) {
-                if (extra.uri != definition->uri || !extra.state || !extra.state->tree)
+            for (const auto* extra : *extra_files) {
+                if (extra->uri != definition->uri || !extra->state || !extra->state->tree)
                     continue;
-                if (auto info = symbol_info_from_definition(*extra.state->tree, extra.uri, name,
-                                                            *definition, &extra.index_ref()))
+                if (auto info = symbol_info_from_definition(*extra->state->tree, extra->uri, name,
+                                                            *definition, &extra->index_ref()))
                     return info;
             }
         }
 
-        for (const auto& extra : *extra_files) {
-            if (extra.uri != definition->uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri != definition->uri)
                 continue;
-            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition)) {
+            if (auto info = symbol_info_from_index(extra->index_ref(), target, *definition)) {
                 // A generate-block declaration is indexed without its type, so
                 // recover it from the declaration's own line — one line read,
                 // and only when hover would otherwise show a bare name.
                 if (info->detail.empty())
                     info->detail = declaration_type_from_source_line(
-                        extra.path, definition->line, definition->col, info->name);
+                        extra->path, definition->line, definition->col, info->name);
                 return info;
             }
             break;
@@ -4654,10 +4659,10 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // alone therefore finds nothing for such declarations and hover degrades
         // to a bare name.  Fall back to scanning the shards; the entries carry
         // their own file_id, so the location match stays exact.
-        for (const auto& extra : *extra_files) {
-            if (extra.uri == definition->uri)
+        for (const auto* extra : *extra_files) {
+            if (extra->uri == definition->uri)
                 continue; // already tried above
-            if (auto info = symbol_info_from_index(extra.index_ref(), target, *definition))
+            if (auto info = symbol_info_from_index(extra->index_ref(), target, *definition))
                 return info;
         }
         return SymbolInfo{
@@ -5034,12 +5039,13 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     if (!state || !state->tree)
         return std::nullopt;
 
-    auto extra = extra_file_snapshot_ptr();
     // Skip the current document during extra-file iteration to avoid searching
     // it twice.  The snapshot itself is shared and immutable, so this remains
     // O(1) instead of copying and erase/removing a potentially large filelist
     // vector on every goto-definition request.
-    auto result = definition_of_state(*state, uri, line, col, *extra, &uri);
+    auto ranked = ranked_extra_files(extra_file_snapshot_ptr(),
+                                     std::string_view(state->normalized_path));
+    auto result = definition_of_state(*state, uri, line, col, *ranked, &uri);
     // Miss path only: an `include directive resolves no identifier, and every
     // successful definition keeps its current cost.
     if (!result)
@@ -5055,13 +5061,66 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
 
 std::optional<Location>
 Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
-                              std::span<const ExtraFileInfo> extra_files,
+                              std::span<const ExtraFileInfo* const> ranked,
                               const std::string* skip_extra_uri) const {
     if (!state.tree)
         return std::nullopt;
 
-    auto skip_extra = [&](const ExtraFileInfo& extra) {
-        return skip_extra_uri && extra.uri == *skip_extra_uri;
+    auto skip_extra = [&](const ExtraFileInfo* extra) {
+        return skip_extra_uri && extra->uri == *skip_extra_uri;
+    };
+
+    // `ranked` arrives nearest-first, and that ordering is the whole
+    // cross-project answer.
+    //
+    // Every by-name search below takes the first candidate that can answer it.
+    // SystemVerilog's module and package namespaces are flat and global while
+    // this index is a union across every open project, so "the first candidate"
+    // decides which project a name resolves into -- and the candidates used to
+    // arrive sorted by path, which meant the alphabetically-first project won
+    // every tie regardless of which file was asking.  Two projects open in one
+    // editor session both declaring `fifo` is routine, and go-to-definition on
+    // the one in `chip_b` landed in `chip_a`.
+    //
+    // The order is the caller's because it is a property of the request and
+    // costs a pass over the filelist to produce; ranked_extra_files() memoizes
+    // it per snapshot and asking file.  Having it decided once, outside, is
+    // also what lets every scan below stay the first-match scan it already was.
+    // This is the rule AutoInst, AutoWire, inlay hints, lint and the RTL tree
+    // already went through ProjectIndexSnapshot::find_module() to get; both
+    // share its scoring function, so the features can no longer disagree about
+    // which project a name belongs to.
+
+    // The two shapes every recovery below is written in.  They are here because
+    // the order is the part that has to be right, and a scan that spells its own
+    // loop is a scan that can be written without the order -- which is how the
+    // defect above came to be in nine places at once, and how two of them came
+    // to be byte-identical copies of each other.
+    //
+    // `probe` decides what counts as an answer; the search is not its business.
+    // Both stop at the first candidate that answers, which is what makes the
+    // ordering the whole disambiguation.
+    const auto nearest_shard_answer = [&](auto&& probe) {
+        decltype(probe(std::declval<const ExtraFileInfo&>())) found{};
+        for (const auto* extra : ranked) {
+            if (skip_extra(extra))
+                continue;
+            if ((found = probe(*extra)))
+                break;
+        }
+        return found;
+    };
+
+    // Macros and subroutine arguments are preprocessor- and body-level facts
+    // that the compact shards do not carry, so these answer from live syntax
+    // trees and therefore see open buffers only.
+    const auto nearest_open_buffer_answer = [&](auto&& probe) {
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            using Result = decltype(probe(*extra.state->tree, extra.uri));
+            if (!extra.state || !extra.state->tree)
+                return Result{};
+            return probe(*extra.state->tree, extra.uri);
+        });
     };
 
     auto target = definition_target_at(*state.tree, uri, line, col);
@@ -5074,59 +5133,34 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
         if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
             return loc;
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra.state || !extra.state->tree)
-                continue;
-            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, ident->text))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_macro_definition(tree, tree_uri, ident->text);
+            });
     }
 
     if (target.kind == DefinitionTargetKind::Macro) {
         if (auto loc = find_macro_definition(*state.tree, uri, target.name))
             return loc;
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra.state || !extra.state->tree)
-                continue;
-            if (auto loc = find_macro_definition(*extra.state->tree, extra.uri, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_macro_definition(tree, tree_uri, target.name);
+            });
     }
 
-    if (target.kind == DefinitionTargetKind::NamedPort) {
+    // One branch for both.  `.name(...)` at an instantiation is spelled the same
+    // way whether it connects a port or overrides a parameter, and either way
+    // the declaration it resolves to lives in the instantiated module's header,
+    // which find_port_definition() covers.  These were two identical copies.
+    if (target.kind == DefinitionTargetKind::NamedPort ||
+        target.kind == DefinitionTargetKind::NamedParameter) {
         if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
                                                     target.name))
             return loc;
-
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc =
-                    find_port_definition(extra.index_ref(), extra.uri, target.module_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
-    }
-
-    if (target.kind == DefinitionTargetKind::NamedParameter) {
-        if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
-                                                    target.name))
-            return loc;
-
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc =
-                    find_port_definition(extra.index_ref(), extra.uri, target.module_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            return find_port_definition(extra.index_ref(), extra.uri, target.module_name,
+                                        target.name);
+        });
     }
 
     if (target.kind == DefinitionTargetKind::NamedArgument) {
@@ -5134,28 +5168,19 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                                            target.name))
             return loc;
 
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (!extra.state || !extra.state->tree)
-                continue;
-            if (auto loc = find_subroutine_argument_definition(*extra.state->tree, extra.uri,
-                                                               target.subroutine_name, target.name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_open_buffer_answer(
+            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                return find_subroutine_argument_definition(tree, tree_uri,
+                                                           target.subroutine_name, target.name);
+            });
     }
 
     if (target.kind == DefinitionTargetKind::Instance) {
         if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
             return loc;
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc = find_module_definition(extra.index_ref(), extra.uri, target.module_name))
-                return loc;
-        }
-        return std::nullopt;
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            return find_module_definition(extra.index_ref(), extra.uri, target.module_name);
+        });
     }
 
     const int use_line_one_based = line + 1;
@@ -5164,11 +5189,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // Every shard a class hierarchy could be spread across, current file first.
     auto class_lookup_shards = [&] {
         std::vector<ClassLookupShard> shards;
-        shards.reserve(extra_files.size() + 1);
+        shards.reserve(ranked.size() + 1);
         shards.push_back(ClassLookupShard{&current_index, &uri});
-        for (const auto& extra : extra_files) {
+        for (const auto* extra : ranked) {
             if (!skip_extra(extra))
-                shards.push_back(ClassLookupShard{&extra.index_ref(), &extra.uri});
+                shards.push_back(ClassLookupShard{&extra->index_ref(), &extra->uri});
         }
         return shards;
     };
@@ -5181,13 +5206,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (!target.qualifier_scope.empty()) {
             auto aliased =
                 scoped_typedef_base_type(current_index, target.qualifier_scope, qualifier);
-            for (const auto& extra : extra_files) {
-                if (aliased)
-                    break;
-                if (skip_extra(extra))
-                    continue;
-                aliased =
-                    scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope, qualifier);
+            if (!aliased) {
+                aliased = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope,
+                                                    qualifier);
+                });
             }
             if (aliased)
                 qualifier = *aliased;
@@ -5195,13 +5218,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
         if (auto loc = find_package_member(current_index, uri, qualifier, target.name))
             return loc;
-        for (const auto& extra : extra_files) {
-            if (skip_extra(extra))
-                continue;
-            if (auto loc = find_package_member(extra.index_ref(), extra.uri, qualifier,
-                                                target.name))
-                return loc;
-        }
+        if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                return find_package_member(extra.index_ref(), extra.uri, qualifier, target.name);
+            }))
+            return loc;
 
         // The qualifier may name a class rather than a package: `my_item::type_id`,
         // `my_class::static_method`.  Resolve inside that class only — this is
@@ -5288,13 +5308,9 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             while (type && visited.insert(*type).second) {
                 auto next = typedef_alias_target(current_index, *type);
                 if (!next) {
-                    for (const auto& extra : extra_files) {
-                        if (skip_extra(extra))
-                            continue;
-                        next = typedef_alias_target(extra.index_ref(), *type);
-                        if (next)
-                            break;
-                    }
+                    next = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                        return typedef_alias_target(extra.index_ref(), *type);
+                    });
                 }
                 if (!next)
                     break;
@@ -5334,13 +5350,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
                 return loc;
-            for (const auto& extra : extra_files) {
-                if (skip_extra(extra))
-                    continue;
-                if (auto loc = find_typedef_field_definition(extra.index_ref(), extra.uri,
-                                                             *class_type, target.name))
-                    return loc;
-            }
+            if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return find_typedef_field_definition(extra.index_ref(), extra.uri, *class_type,
+                                                         target.name);
+                }))
+                return loc;
         }
 
         // Interface ports.  `AXI_BUS.Slave bus;` then `bus.aw_valid` — the
@@ -5365,13 +5379,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
                                                             target.name))
                 return loc;
-            for (const auto& extra : extra_files) {
-                if (skip_extra(extra))
-                    continue;
-                if (auto loc = find_interface_member_definition(extra.index_ref(), extra.uri,
-                                                                interface_name, target.name))
-                    return loc;
-            }
+            if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
+                    return find_interface_member_definition(extra.index_ref(), extra.uri,
+                                                            interface_name, target.name);
+                }))
+                return loc;
         }
 
         // `gen_stall_mem.rf_rd_a_hz` — the receiver is a generate block label,
@@ -5462,16 +5474,31 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
     }
 
-    for (const auto& extra : extra_files) {
-        if (skip_extra(extra))
-            continue;
-        if (auto loc = find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
-                                                          target.scope_module, target.scope_package,
-                                                          visible_imports, use_line_one_based))
-            return loc;
-    }
+    return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+        return find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
+                                                  target.scope_module, target.scope_package,
+                                                  visible_imports, use_line_one_based);
+    });
+}
 
-    return std::nullopt;
+/// Whether a target of this kind can be recovered from the compact shards.
+///
+/// These are the kinds whose declaration a closed project file can hold and
+/// whose lookup the shards actually carry, so references/rename started from a
+/// use site can find their target without walking a closed file's AST.  Named
+/// as a set rather than spelled as a condition on each recovery, because the
+/// recoveries are now one loop and it decides whether that loop runs at all.
+static bool target_kind_recoverable_from_shards(DefinitionTargetKind kind) {
+    switch (kind) {
+    case DefinitionTargetKind::Instance:
+    case DefinitionTargetKind::NamedPort:
+    case DefinitionTargetKind::NamedParameter:
+    case DefinitionTargetKind::PackageMember:
+    case DefinitionTargetKind::Generic:
+        return true;
+    default:
+        return false;
+    }
 }
 
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
@@ -5480,7 +5507,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // References/Rename must not walk closed project-file ASTs.  Current and
     // other open files are live SyntaxTrees; closed project files require a
     // future reference-occurrence index before they can participate scalably.
-    std::vector<ExtraFileInfo> extra_files;
+    // The definition_of_state() calls below therefore pass no candidates at
+    // all, which restricts them to the current document.
     auto state = get_state(uri);
     if (!state)
         return {};
@@ -5495,43 +5523,48 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         return {};
     const auto target_info = state->tree ? definition_target_at(*state->tree, uri, line, col)
                                          : DefinitionTarget{};
-    auto target_def = definition_of_state(*state, uri, line, col, extra_files);
-    if (!target_def && target_info.kind == DefinitionTargetKind::Instance) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_module_definition(extra.index_ref(), extra.uri,
-                                                     target_info.module_name)))
-                break;
-        }
-    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedPort) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
-                                                   target_info.module_name, target_info.name)))
-                break;
-        }
-    } else if (!target_def && target_info.kind == DefinitionTargetKind::NamedParameter) {
-        for (const auto& extra : *extra_idx) {
-            if ((target_def = find_port_definition(extra.index_ref(), extra.uri,
-                                                   target_info.module_name, target_info.name)))
-                break;
-        }
-    } else if (!target_def && (target_info.kind == DefinitionTargetKind::Generic ||
-                               target_info.kind == DefinitionTargetKind::PackageMember)) {
-        // A name only a closed project file can explain — typically a package
-        // member reached through an import, either bare or `pkg::`-qualified.
-        // definition_of_state() above ran without extra files by design, so it
-        // could not leave the open buffers.  Recover the declaration from the
-        // compact shards rather than walking closed-file ASTs; without this,
-        // references/rename started *from the use site* return nothing at all.
+    auto target_def = definition_of_state(*state, uri, line, col, {});
+    if (!target_def && target_kind_recoverable_from_shards(target_info.kind)) {
+        // A name only a closed project file can explain -- an instantiated
+        // module, a port or parameter on one, or a package member reached
+        // through an import.  The definition_of_state() call above deliberately
+        // ran with no extra files, so it could not leave the open buffers; each
+        // of these used to recover with its own copy of one loop, two of them
+        // byte-identical, and every copy took whichever shard came first.
+        //
+        // Nearest-first, for the reason definition_of_state() is: the module
+        // namespace is flat and global across a union index, so with two
+        // projects open the first shard that could answer was the one from the
+        // alphabetically first project rather than the asking file's own.
+        // References started from a use site in one project would resolve their
+        // target into the other and then report that module's occurrences.
         const auto visible_imports =
-            state->tree ? get_dynamic_index(*state).imports : std::vector<ImportEntry>{};
-        for (const auto& extra : *extra_idx) {
-            if (target_info.kind == DefinitionTargetKind::PackageMember) {
-                target_def = find_package_member(extra.index_ref(), extra.uri,
+            (target_info.kind == DefinitionTargetKind::Generic && state->tree)
+                ? get_dynamic_index(*state).imports
+                : std::vector<ImportEntry>{};
+        for (const auto* extra : by_path_proximity(std::span<const ExtraIndexInfo>(*extra_idx),
+                                                   std::string_view(state->normalized_path))) {
+            switch (target_info.kind) {
+            case DefinitionTargetKind::Instance:
+                target_def = find_module_definition(extra->index_ref(), extra->uri,
+                                                    target_info.module_name);
+                break;
+            case DefinitionTargetKind::NamedPort:
+            case DefinitionTargetKind::NamedParameter:
+                target_def = find_port_definition(extra->index_ref(), extra->uri,
+                                                  target_info.module_name, target_info.name);
+                break;
+            case DefinitionTargetKind::PackageMember:
+                target_def = find_package_member(extra->index_ref(), extra->uri,
                                                  target_info.package_qualifier, target_info.name);
-            } else {
+                break;
+            case DefinitionTargetKind::Generic:
                 target_def = find_generic_definition_from_index(
-                    extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                    extra->index_ref(), extra->uri, target_info.name, target_info.scope_module,
                     target_info.scope_package, visible_imports, line + 1);
+                break;
+            default:
+                break; // guarded by target_kind_recoverable_from_shards()
             }
             if (target_def)
                 break;
@@ -5550,7 +5583,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // itself uses: closed project files carry only their compact index shard
         // (ExtraFileInfo::state is null for them), so this resolves through the
         // same index lookups and never walks a closed file's AST.
-        const auto extra_full = extra_file_snapshot_ptr();
+        const auto extra_full =
+            ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state->normalized_path));
         target_def = definition_of_state(*state, uri, line, col, *extra_full, &uri);
     }
     if (!target_def) {
@@ -6075,12 +6109,93 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         };
 
     std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
+    std::shared_ptr<const ProjectParseInputs> parse_inputs;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         open_states.reserve(docs_.size());
         for (const auto& [state_uri, state] : docs_)
             open_states.emplace_back(state_uri, state);
+        // A pointer copy, resolved outside the lock.  project_root_for() walks
+        // up to the nearest config and stats directories on the way, which is a
+        // round trip per level on a shared filesystem; every other parse-input
+        // lookup takes the pointer under the lock for the same reason.
+        parse_inputs = parse_inputs_;
     }
+
+    // Which project a file belongs to, memoized by *directory* for the length of
+    // this request.
+    //
+    // Answered by the resolver that already decides the file's config and its
+    // shard directory, never by a second walk: a third notion of "which project
+    // is this file in" is how the features came to disagree about it before.
+    //
+    // Keyed on the containing directory because that is the question the
+    // resolver actually answers -- it caches per directory, and a project's
+    // files come in directories of tens or hundreds.  Keyed per file this cost
+    // 1.3us each on an 800-file project, which is a linear term next to a scan
+    // this is supposed to be cutting work out of.
+    // The key is owned rather than a view into the caller's path: one string per
+    // distinct directory is nothing next to the scan, and a view would tie the
+    // memo's correctness to every caller having passed a string that outlives
+    // the request.
+    std::unordered_map<std::string, std::string> project_root_by_dir;
+    const auto project_of = [&](const std::string& path) {
+        const auto slash = path.find_last_of("/\\");
+        const std::string dir = slash == std::string::npos ? std::string{} : path.substr(0, slash);
+        if (auto it = project_root_by_dir.find(dir); it != project_root_by_dir.end())
+            return it->second;
+        std::string root;
+        if (parse_inputs)
+            root = parse_inputs->project_root_for(std::filesystem::path(path)).string();
+        project_root_by_dir.emplace(dir, root);
+        return root;
+    };
+
+    const std::string declaration_path =
+        normalize_filesystem_path(path_from_file_uri(target_def->uri)).string();
+    const std::string declaration_project = project_of(declaration_path);
+    const std::string asking_project = project_of(state->normalized_path);
+
+    // Whether an occurrence *written in* @p path can mean the declaration we
+    // resolved.
+    //
+    // A SymbolID is `module::fifo` with no project in it, because the shard
+    // indexer is syntactic and cannot know which file declares the `fifo` a use
+    // site means -- that binding is what the union snapshot decides at request
+    // time.  So two projects that both declare `fifo` share one SymbolID, and
+    // the scans below would report, and rename would rewrite, the other
+    // project's declaration.
+    //
+    // This rejects only what it can prove: all three projects known, and the
+    // occurrence's is neither the declaration's nor the asking file's.  Both
+    // escapes matter.  A file under no project -- shared IP outside every root,
+    // routine in hardware -- is never rejected, so a union index keeps answering
+    // where a split one would go silent.  And the asking file's own project is
+    // always admitted, or clicking in the project that *borrows* a module would
+    // return results that omit the file under the cursor.
+    //
+    // Per file, not per occurrence: the answer is the same for every reference
+    // in a shard, so a shard that cannot see the declaration is skipped whole.
+    //
+    // The prefix test in front is not an optimization detail: in a single-project
+    // session every file is under the one root, so it answers without consulting
+    // the resolver at all and this whole rule costs two string compares per file.
+    // It can only ever *admit*, which is the safe direction -- a nested project
+    // inside one of these roots is admitted by its parent's prefix rather than
+    // rejected on its own account, the same answer this gave before the rule
+    // existed.
+    const auto under = [](const std::string& path, const std::string& root) {
+        return path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+               (path[root.size()] == '/' || path[root.size()] == '\\');
+    };
+    const auto file_can_mean_target = [&](const std::string& path) {
+        if (declaration_project.empty() || asking_project.empty())
+            return true;
+        if (under(path, declaration_project) || under(path, asking_project))
+            return true;
+        const std::string project = project_of(path);
+        return project.empty() || project == declaration_project || project == asking_project;
+    };
 
     std::unordered_map<std::string, std::shared_ptr<const DocumentState>> open_state_by_uri;
     std::unordered_set<std::string> open_uris;
@@ -6100,7 +6215,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (auto it = open_state_by_uri.find(candidate_uri); it != open_state_by_uri.end()) {
             if (!it->second)
                 return std::nullopt;
-            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, extra_files);
+            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, {});
         }
         return std::nullopt;
     };
@@ -6141,7 +6256,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (!state || !state->tree)
             continue;
 
-        if (target_symbol_id) {
+        // The SymbolID scan only.  visit_tree() below resolves every candidate
+        // token through definition_of_state() and keeps it only when it lands on
+        // this very declaration, so it already answers per project and needs no
+        // help deciding.
+        if (target_symbol_id && file_can_mean_target(state->normalized_path)) {
             // For owner-qualified symbols (module / port / parameter), use the
             // same compact occurrence representation for open files that closed
             // project files use.  This is important for cross-file open buffers:
@@ -6171,20 +6290,20 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                 if (reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
-            if ((target_info.kind == DefinitionTargetKind::ClassMember &&
-                 target_symbol_debug.starts_with("class_method::")) ||
-                target_symbol_debug.starts_with("class_field::"))
-                // A class field is written both bare inside the class body and
-                // as `handle.field` elsewhere.  Only the first form carries the
-                // scoped `class_field::` identity in a shard: the second is
-                // indexed as an unresolved name, because the shard cannot type
-                // the receiver.  Verifying candidate tokens against the
-                // declaration recovers those uses without widening the
-                // SymbolID match to every same-named symbol in the project.
-                visit_tree(*state->tree, state_uri, resolve_snapshot);
-        } else {
-            visit_tree(*state->tree, state_uri, resolve_snapshot);
         }
+
+        if (!target_symbol_id ||
+            (target_info.kind == DefinitionTargetKind::ClassMember &&
+             target_symbol_debug.starts_with("class_method::")) ||
+            target_symbol_debug.starts_with("class_field::"))
+            // A class field is written both bare inside the class body and as
+            // `handle.field` elsewhere.  Only the first form carries the scoped
+            // `class_field::` identity in a shard: the second is indexed as an
+            // unresolved name, because the shard cannot type the receiver.
+            // Verifying candidate tokens against the declaration recovers those
+            // uses without widening the SymbolID match to every same-named
+            // symbol in the project.
+            visit_tree(*state->tree, state_uri, resolve_snapshot);
     }
 
     // Closed project files are represented by compact reference-occurrence
@@ -6194,6 +6313,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             continue;
         if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
             !import_bridge_name_id && !scoped_member_alias_id)
+            continue;
+        // Whole shard, before its references are scanned at all: every
+        // occurrence in it was written in the same file and gets the same
+        // answer.
+        if (!file_can_mean_target(extra.path))
             continue;
 
         // SyntaxIndex intentionally no longer stores SymbolID -> reference
@@ -6264,6 +6388,11 @@ void Analyzer::replace_default_parse_inputs_locked(ParseInputs inputs) {
     auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
     next->set_defaults(std::move(inputs));
     parse_inputs_ = std::move(next);
+}
+
+void Analyzer::set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    project_compilation_inputs_ = std::move(inputs);
 }
 
 void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver) {
@@ -7483,6 +7612,27 @@ Analyzer::extra_file_snapshot_ptr() const {
     return extra_file_snapshot_cache_;
 }
 
+std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                             std::string_view from_path) const {
+    if (!files)
+        return std::make_shared<std::vector<const ExtraFileInfo*>>();
+
+    std::lock_guard<std::mutex> lock(ranked_extra_mutex_);
+    // Identity, not contents: the snapshot is immutable and replaced wholesale,
+    // so the same pointer means the same files in the same order.  The held
+    // reference below is what makes comparing addresses sound.
+    if (ranked_extra_cache_ && ranked_extra_source_ == files && ranked_extra_from_ == from_path)
+        return ranked_extra_cache_;
+
+    auto ranked = std::make_shared<std::vector<const ExtraFileInfo*>>(
+        by_path_proximity(std::span<const ExtraFileInfo>(*files), from_path));
+    ranked_extra_source_ = files;
+    ranked_extra_from_.assign(from_path);
+    ranked_extra_cache_ = ranked;
+    return ranked;
+}
+
 std::shared_ptr<const std::vector<ExtraIndexInfo>>
 Analyzer::extra_index_snapshot_ptr() const {
     const auto start = Clock::now();
@@ -7544,14 +7694,17 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     CompilationSnapshot snapshot;
-    // Semantic compilation is the one thing that cannot be per file: it builds a
-    // single slang Compilation out of every source, so there is one preprocessor
-    // for all of them.  The defaults are used, which for a single-project
-    // session is exactly the project's own config; across projects it is the
-    // merged set the server accumulated.  clangd has no analog to diverge from
-    // here -- it compiles one TU at a time, each with its own command.
+    // The merged defaults, for the ungrouped fallback alone -- a CLI tool, a
+    // test, or a client that sent no rootUri, where no project registered what
+    // it compiles.  A real session compiles one group per project against that
+    // project's own inputs (see the grouping at the end of this function), which
+    // is what a Compilation needs: it has one preprocessor, so the one set of
+    // defines it gets had better be one project's rather than everyone's.
     snapshot.defines = parse_inputs_->defaults().defines;
     snapshot.include_dirs = parse_inputs_->defaults().include_dirs;
+    // Which project each file belongs to is resolved by the compiler, off this
+    // lock; see CompilationSnapshot::parse_inputs.
+    snapshot.parse_inputs = parse_inputs_;
 
     std::unordered_set<std::string> seen_uris;
     std::unordered_set<std::string> seen_paths;
@@ -7591,6 +7744,79 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         });
         seen_uris.insert(uri);
         seen_paths.insert(path_string);
+    }
+
+    // One group per project that asked for semantic compilation.
+    //
+    // Which declaration `fifo u_fifo ();` binds to is decided by the set of
+    // files being compiled, and a `.f` is exactly that set -- so this is not an
+    // approximation of what elaboration would say, it is the scope the language
+    // binds over.  Compiling the union instead gave one elaboration two `fifo`s
+    // and gave one project's `define` to the other project's parse.
+    //
+    // An open buffer joins the group of the project it is in, so unsaved text
+    // reaches the compilation that cares about it.  A buffer under no project
+    // joins nothing: there is no filelist that says which design it belongs to,
+    // and guessing would put it in every one.
+    if (!project_compilation_inputs_.empty()) {
+        std::unordered_map<std::string, CompilationSourceFile> open_by_path;
+        for (const auto& file : snapshot.files) {
+            if (file.text)
+                open_by_path.emplace(file.path, file);
+        }
+
+        for (const auto& project : project_compilation_inputs_) {
+            if (!project.background_compilation)
+                continue;
+
+            const auto& inputs = parse_inputs_->for_root(project.root);
+            CompilationGroup group;
+            group.root = project.root.string();
+            group.defines = inputs.defines;
+            group.include_dirs = inputs.include_dirs;
+
+            std::unordered_set<std::string> in_group;
+            group.files.reserve(project.files.size());
+            for (const auto& path_string : project.files) {
+                if (!in_group.insert(path_string).second)
+                    continue;
+                // The open buffer's entry when there is one, so the compilation
+                // reads the text the user is looking at rather than the file on
+                // disk.
+                if (const auto it = open_by_path.find(path_string); it != open_by_path.end()) {
+                    group.files.push_back(it->second);
+                    continue;
+                }
+                group.files.push_back(CompilationSourceFile{
+                    .uri = uri_from_path(path_string),
+                    .path = path_string,
+                    .text = nullptr,
+                });
+            }
+
+            // Open buffers this project's filelist does not name -- a file just
+            // created, or one the user opened before adding it to the `.f`.
+            // Sorted, because docs_ is a hash map and the order files enter a
+            // Compilation decides which definition wins a tie: taking bucket
+            // order would let one run disagree with the next.
+            std::vector<const CompilationSourceFile*> unlisted;
+            for (const auto& [path_string, file] : open_by_path) {
+                if (in_group.contains(path_string))
+                    continue;
+                if (parse_inputs_->project_root_for(path_string) != project.root)
+                    continue;
+                unlisted.push_back(&file);
+            }
+            std::sort(unlisted.begin(), unlisted.end(),
+                      [](const CompilationSourceFile* a, const CompilationSourceFile* b) {
+                          return a->path < b->path;
+                      });
+            for (const auto* file : unlisted)
+                group.files.push_back(*file);
+
+            if (!group.files.empty())
+                snapshot.groups.push_back(std::move(group));
+        }
     }
 
     return snapshot;
