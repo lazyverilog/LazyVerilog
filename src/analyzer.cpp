@@ -7777,6 +7777,15 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // reaches the compilation that cares about it.  A buffer under no project
     // joins nothing: there is no filelist that says which design it belongs to,
     // and guessing would put it in every one.
+    //
+    // Whether any project registered what it compiles is what picks between
+    // this and the merged fallback below, and it is the only thing that may:
+    // the two are answers to different questions, and a session where every
+    // registered project has `[compilation]` off wants neither.  Choosing on
+    // "did the loop above produce a group" instead is what let such a session
+    // fall through to the fallback and compile the union anyway -- with one
+    // project's defines over another project's files, publish_diagnostics()
+    // then dropping every result, and nothing anywhere saying it had happened.
     if (!project_compilation_inputs_.empty()) {
         // The open buffers, sorted by path.  docs_ is a hash map and the order
         // files enter a Compilation decides which definition wins a tie, so
@@ -7851,14 +7860,13 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
                 snapshot.groups.push_back(std::move(group));
         }
     }
-
     // No project registered what it compiles -- a CLI tool, a test, or a client
     // that sent no rootUri.  Everything the analyzer knows about becomes one
     // group against the merged defaults, which is what this did before groups
     // existed.  Emitted here rather than reconstructed by the compiler, so
     // `groups` is the only answer to "what gets compiled" and the consumer needs
     // no branch to find it.
-    if (snapshot.groups.empty()) {
+    else {
         CompilationGroup fallback;
         fallback.defines = parse_inputs_->defaults().defines;
         fallback.include_dirs = parse_inputs_->defaults().include_dirs;
