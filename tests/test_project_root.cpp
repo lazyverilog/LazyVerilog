@@ -1258,6 +1258,68 @@ TEST_CASE("a buffer under no project joins no compilation group",
                       [&](const CompilationSourceFile& f) { return f.path == ip_path; }));
 }
 
+TEST_CASE("a filelist entry reaches its open buffer however the `.f` spells it",
+          "[project-root][module-proximity]") {
+    // A `.f` names a file; it does not dictate a spelling.  `chip_a/./rtl/a.sv`
+    // is what a hand-written list produces when entries are pasted under a
+    // variable, and on Windows a filelist routinely uses forward slashes, which
+    // are not the separator `normalize_filesystem_path()` returns.
+    //
+    // compilation_snapshot() looks each filelist entry up in the table it
+    // builds from docs_ and extra_files_, and both of those hold *normalized*
+    // spellings.  So an entry spelled any other way used to miss, and the miss
+    // was silent: the file was appended to the snapshot a second time with no
+    // text, and the group kept both -- one Compilation handed the disk bytes
+    // and the open buffer, i.e. the same module declared twice.  A listed
+    // buffer outside the project's root, which the open-buffer pass would not
+    // have added either, lost its unsaved edit outright.
+    //
+    // This asserts the identity -- one entry, shared with the open buffer,
+    // carrying its text -- rather than a diagnostic.  The tests either side of
+    // it check `semantic_messages()` for one substring, and a duplicate only
+    // *adds* messages, so they pass against the broken grouping; that is why
+    // the Windows job showed this in exactly one place and showed it as an
+    // unrelated-looking assertion about which files a group holds.
+    TempTree tree("filelist-spelling-reaches-buffer");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    auto a = tree.write("chip_a/rtl/a.sv", "module a_top;\nendmodule\n");
+
+    // The same file, spelled the way a filelist might.
+    const auto as_listed = (tree.root / "chip_a" / "." / "rtl" / "a.sv").string();
+    const auto a_path = normalize_filesystem_path(a).string();
+    REQUIRE(as_listed != a_path);
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {as_listed});
+    analyzer.set_project_compilation_inputs({
+        {.root = tree.root / "chip_a", .files = {as_listed}, .background_compilation = true},
+    });
+    // The unsaved text differs from what is on disk, so a group that compiled
+    // the wrong entry would be compiling the wrong bytes.
+    analyzer.open(uri_from_path(a), "module a_top;\n    logic unsaved_edit;\nendmodule\n");
+    analyzer.wait_for_background_index_idle();
+
+    const auto snapshot = analyzer.compilation_snapshot();
+
+    // Owned once, under the normalized spelling, however the `.f` spelled it.
+    const auto entries = std::count_if(
+        snapshot.files.begin(), snapshot.files.end(),
+        [&](const CompilationSourceFile& f) { return f.path == a_path; });
+    CHECK(entries == 1);
+    CHECK(std::none_of(snapshot.files.begin(), snapshot.files.end(),
+                       [&](const CompilationSourceFile& f) { return f.path == as_listed; }));
+
+    // ...and the group points at that entry, with the buffer's text attached.
+    REQUIRE(snapshot.groups.size() == 1);
+    REQUIRE(snapshot.groups[0].files.size() == 1);
+    const auto& compiled = snapshot.files[snapshot.groups[0].files[0]];
+    CHECK(compiled.path == a_path);
+    REQUIRE(compiled.text != nullptr);
+    CHECK(compiled.text->find("unsaved_edit") != std::string::npos);
+}
+
 TEST_CASE("an unlisted buffer respects its own project's compilation switch",
           "[project-root][module-proximity]") {
     // The other half of the rule above: a buffer *does* have a project, that
