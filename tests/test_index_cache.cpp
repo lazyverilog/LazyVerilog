@@ -513,6 +513,85 @@ TEST_CASE("index cache: a truncated or corrupt shard is a miss, not a crash", "[
     }
 }
 
+TEST_CASE("index cache: an out-of-range file id is rejected, whichever entry holds it",
+          "[index-cache]") {
+    // A stored file_id has to address the table it was written against; an entry
+    // pointing outside it would hand the request path a URI belonging to another
+    // file, or none.  Fourteen entry types carry one, and the check used to be
+    // three hand-written scans over three of them -- so the other eleven were
+    // accepted and degraded to an empty URI at request time instead.
+    //
+    // This walks every one of them.  The point is the coverage: a fifteenth
+    // entry type added without the check should fail here rather than in a
+    // user's editor.
+    TempDir dir("file-id-range");
+    const auto file = dir.write("design.sv", kSource);
+    // Full depth, unlike the shard the background indexer stores: it is the only
+    // one that collects macros, and this test is about covering every entry kind
+    // the codec can write.  The codec does not vary with depth.
+    auto sm = make_lsp_source_manager();
+    auto tree_or_error = slang::syntax::SyntaxTree::fromFile(file.string(), *sm);
+    REQUIRE(tree_or_error);
+    auto tree = *tree_or_error;
+    REQUIRE(tree != nullptr);
+    const auto buffers = tree->getSourceBufferIds();
+    REQUIRE(!buffers.empty());
+    const auto original =
+        SyntaxIndex::build(*tree, sm->getSourceText(buffers.front()), IndexDepth::Full,
+                           uri_from_source_buffer(*sm, buffers.front()));
+    const auto out_of_range = static_cast<SourceFileID>(original.source_files.size());
+    REQUIRE(out_of_range != kInvalidSourceFileID);
+
+    // A shard whose ids are all in range round-trips, so a rejection below is
+    // the id and not the fixture.
+    REQUIRE(deserialize_index_shard(serialize_index_shard(some_key(), original)).has_value());
+
+    const auto rejects_with = [&](auto&& corrupt) {
+        auto index = original;
+        corrupt(index);
+        return !deserialize_index_shard(serialize_index_shard(some_key(), index)).has_value();
+    };
+    // Stamp every entry of one kind rather than picking one out: which
+    // declaration in the fixture ends up first is not this test's business, and
+    // a nested vector that is empty on the first outer entry is not evidence of
+    // anything.  `touched` is what keeps that from passing vacuously -- it says
+    // the fixture really did produce an entry of this kind to corrupt.
+    size_t touched = 0;
+    const auto mark = [&](auto& entry) {
+        entry.file_id = out_of_range;
+        ++touched;
+    };
+    const auto rejects_every = [&](auto&& stamp) {
+        touched = 0;
+        const bool rejected = rejects_with(stamp);
+        CHECK(touched > 0);
+        return rejected;
+    };
+
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.modules) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& m : i.modules) for (auto& e : m.ports) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& m : i.modules) for (auto& e : m.modports) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.instances) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& n : i.instances) for (auto& e : n.connections) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.classes) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& c : i.classes) for (auto& e : c.fields) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& c : i.classes) for (auto& e : c.methods) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.typedefs) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& t : i.typedefs) for (auto& e : t.enum_members) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& t : i.typedefs) for (auto& e : t.fields) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.macros) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.values) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.imports) mark(e); }));
+    CHECK(rejects_every([&](SyntaxIndex& i) { for (auto& e : i.references) mark(e); }));
+
+    // kInvalidSourceFileID is not out of range -- it is how an entry says it has
+    // no file, and rejecting it would make every such shard a permanent miss.
+    CHECK_FALSE(rejects_with([&](SyntaxIndex& i) {
+        for (auto& reference : i.references)
+            reference.file_id = kInvalidSourceFileID;
+    }));
+}
+
 TEST_CASE("index cache: digests separate what a parse depends on", "[index-cache]") {
     CHECK(IndexCache::digest_bytes("module a; endmodule") ==
           IndexCache::digest_bytes("module a; endmodule"));
