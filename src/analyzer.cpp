@@ -4563,10 +4563,10 @@ static std::string declaration_type_from_source_line(const std::string& path, in
 /// that has to be right, and a scan that spells its own loop is a scan that can
 /// be written without it -- which is how the defect came to be in nine places at
 /// once, and how two of them came to be byte-identical copies of each other.
-template <typename Probe>
-static auto first_ranked_answer(std::span<const ExtraFileInfo* const> ranked,
-                                const std::string* skip_uri, Probe&& probe) {
-    decltype(probe(std::declval<const ExtraFileInfo&>())) found{};
+template <typename Info, typename Probe>
+static auto first_ranked_answer(std::span<const Info* const> ranked, const std::string* skip_uri,
+                                Probe&& probe) {
+    decltype(probe(std::declval<const Info&>())) found{};
     for (const auto* extra : ranked) {
         if (skip_uri && extra->uri == *skip_uri)
             continue;
@@ -4584,7 +4584,7 @@ static auto first_ranked_answer(std::span<const ExtraFileInfo* const> ranked,
 template <typename Probe>
 static auto first_ranked_tree_answer(std::span<const ExtraFileInfo* const> ranked,
                                      const std::string* skip_uri, Probe&& probe) {
-    return first_ranked_answer(ranked, skip_uri, [&](const ExtraFileInfo& extra) {
+    return first_ranked_answer<ExtraFileInfo>(ranked, skip_uri, [&](const ExtraFileInfo& extra) {
         using Result = decltype(probe(*extra.state->tree, extra.uri));
         if (!extra.state || !extra.state->tree)
             return Result{};
@@ -4699,7 +4699,7 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
         // to a bare name.  Fall back to scanning the shards; the entries carry
         // their own file_id, so the location match stays exact.
         // Skipping the definition's own URI: already tried above.
-        if (auto info = first_ranked_answer(*extra_files, &definition->uri,
+        if (auto info = first_ranked_answer<ExtraFileInfo>(*extra_files, &definition->uri,
                                             [&](const ExtraFileInfo& extra) {
                                                 return symbol_info_from_index(extra.index_ref(),
                                                                               target, *definition);
@@ -5130,22 +5130,13 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // share its scoring function, so the features can no longer disagree about
     // which project a name belongs to.
 
-    // The two shapes every recovery below is written in.  They are here because
-    // the order is the part that has to be right, and a scan that spells its own
-    // loop is a scan that can be written without the order -- which is how the
-    // defect above came to be in nine places at once, and how two of them came
-    // to be byte-identical copies of each other.
-    //
-    // `probe` decides what counts as an answer; the search is not its business.
-    // Both stop at the first candidate that answers, which is what makes the
-    // ordering the whole disambiguation.
+    // The two shapes every recovery below is written in, curried onto this
+    // request's candidates and skip -- both invariant across the twelve call
+    // sites, and making each site spell them reopens the per-site freedom this
+    // closed.  The rationale lives on first_ranked_answer().
     const auto nearest_shard_answer = [&](auto&& probe) {
         return first_ranked_answer(ranked, skip_extra_uri, std::forward<decltype(probe)>(probe));
     };
-
-    // Macros and subroutine arguments are preprocessor- and body-level facts
-    // that the compact shards do not carry, so these answer from live syntax
-    // trees and therefore see open buffers only.
     const auto nearest_open_buffer_answer = [&](auto&& probe) {
         return first_ranked_tree_answer(ranked, skip_extra_uri,
                                         std::forward<decltype(probe)>(probe));
@@ -5570,33 +5561,29 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             (target_info.kind == DefinitionTargetKind::Generic && state->tree)
                 ? get_dynamic_index(*state).imports
                 : std::vector<ImportEntry>{};
-        for (const auto* extra : by_path_proximity(std::span<const ExtraIndexInfo>(*extra_idx),
-                                                   std::string_view(state->normalized_path))) {
-            switch (target_info.kind) {
-            case DefinitionTargetKind::Instance:
-                target_def = find_module_definition(extra->index_ref(), extra->uri,
-                                                    target_info.module_name);
-                break;
-            case DefinitionTargetKind::NamedPort:
-            case DefinitionTargetKind::NamedParameter:
-                target_def = find_port_definition(extra->index_ref(), extra->uri,
-                                                  target_info.module_name, target_info.name);
-                break;
-            case DefinitionTargetKind::PackageMember:
-                target_def = find_package_member(extra->index_ref(), extra->uri,
-                                                 target_info.package_qualifier, target_info.name);
-                break;
-            case DefinitionTargetKind::Generic:
-                target_def = find_generic_definition_from_index(
-                    extra->index_ref(), extra->uri, target_info.name, target_info.scope_module,
-                    target_info.scope_package, visible_imports, line + 1);
-                break;
-            default:
-                break; // guarded by target_kind_recoverable_from_shards()
-            }
-            if (target_def)
-                break;
-        }
+        const auto ranked = by_path_proximity(std::span<const ExtraIndexInfo>(*extra_idx),
+                                              std::string_view(state->normalized_path));
+        target_def = first_ranked_answer<ExtraIndexInfo>(
+            ranked, nullptr, [&](const ExtraIndexInfo& extra) -> std::optional<Location> {
+                switch (target_info.kind) {
+                case DefinitionTargetKind::Instance:
+                    return find_module_definition(extra.index_ref(), extra.uri,
+                                                  target_info.module_name);
+                case DefinitionTargetKind::NamedPort:
+                case DefinitionTargetKind::NamedParameter:
+                    return find_port_definition(extra.index_ref(), extra.uri,
+                                                target_info.module_name, target_info.name);
+                case DefinitionTargetKind::PackageMember:
+                    return find_package_member(extra.index_ref(), extra.uri,
+                                               target_info.package_qualifier, target_info.name);
+                case DefinitionTargetKind::Generic:
+                    return find_generic_definition_from_index(
+                        extra.index_ref(), extra.uri, target_info.name, target_info.scope_module,
+                        target_info.scope_package, visible_imports, line + 1);
+                default:
+                    return std::nullopt; // guarded by target_kind_recoverable_from_shards()
+                }
+            });
     } else if (!target_def && target_info.kind == DefinitionTargetKind::ClassMember) {
         // A member access whose declaring type lives in another file:
         // `handle.field`, `iface.sig`, `iface.task()`, `pkt.header`.  The
@@ -7726,33 +7713,35 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
     CompilationSnapshot snapshot;
-    // The merged defaults, for the ungrouped fallback alone -- a CLI tool, a
-    // test, or a client that sent no rootUri, where no project registered what
-    // it compiles.  A real session compiles one group per project against that
-    // project's own inputs (see the grouping at the end of this function), which
-    // is what a Compilation needs: it has one preprocessor, so the one set of
-    // defines it gets had better be one project's rather than everyone's.
-    snapshot.defines = parse_inputs_->defaults().defines;
-    snapshot.include_dirs = parse_inputs_->defaults().include_dirs;
     // Which project each file belongs to is resolved by the compiler, off this
     // lock; see CompilationSnapshot::parse_inputs.
     snapshot.parse_inputs = parse_inputs_;
 
     std::unordered_set<std::string> seen_uris;
-    std::unordered_set<std::string> seen_paths;
+    // Each file's index in snapshot.files, which is also the dedup set: the
+    // groups below reference files by index, so the table that says "have I
+    // seen this path" and the table that says "which entry is it" are one
+    // container rather than two sized to the whole filelist on this lock.
+    std::unordered_map<std::string, uint32_t> index_by_path;
+
+    const auto add_file = [&](CompilationSourceFile file) {
+        const auto index = static_cast<uint32_t>(snapshot.files.size());
+        index_by_path.emplace(file.path, index);
+        seen_uris.insert(file.uri);
+        snapshot.files.push_back(std::move(file));
+        return index;
+    };
 
     for (const auto& [uri, state] : docs_) {
         if (!state)
             continue;
 
-        snapshot.files.push_back(CompilationSourceFile{
+        add_file(CompilationSourceFile{
             .uri = uri,
             .path = state->normalized_path,
             .text = std::shared_ptr<const std::string>(state, &state->text),
         });
         snapshot.open_uris.push_back(uri);
-        seen_uris.insert(uri);
-        seen_paths.insert(state->normalized_path);
         if (const auto it = latest_version_.find(uri); it != latest_version_.end())
             snapshot.uri_versions[uri] = it->second;
     }
@@ -7765,17 +7754,15 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         // Keeping this path-to-URI conversion allocation-only prevents large
         // project snapshots from extending the analyzer critical section with
         // redundant per-file path work.
-        const auto uri = uri_from_path(path_string);
-        if (seen_uris.contains(uri) || seen_paths.contains(path_string))
+        auto uri = uri_from_path(path_string);
+        if (seen_uris.contains(uri) || index_by_path.contains(path_string))
             continue;
 
-        snapshot.files.push_back(CompilationSourceFile{
-            .uri = uri,
+        add_file(CompilationSourceFile{
+            .uri = std::move(uri),
             .path = path_string,
             .text = nullptr,
         });
-        seen_uris.insert(uri);
-        seen_paths.insert(path_string);
     }
 
     // One group per project that asked for semantic compilation.
@@ -7791,35 +7778,33 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // joins nothing: there is no filelist that says which design it belongs to,
     // and guessing would put it in every one.
     if (!project_compilation_inputs_.empty()) {
-        // Every file's entry indexed by path, open buffers and closed files
-        // alike.  The two loops above already deduped by path with the open
-        // buffer winning, so there is exactly one entry per file and it is the
-        // right one -- and reusing it is what keeps the group loop from running
-        // uri_from_path() a second time for every closed file of every project,
-        // on this lock.  Views into snapshot.files, which is complete by here
-        // and not touched again.
-        std::unordered_map<std::string_view, const CompilationSourceFile*> file_by_path;
-        file_by_path.reserve(snapshot.files.size());
-        for (const auto& file : snapshot.files)
-            file_by_path.emplace(file.path, &file);
-
-        // Each open buffer's project, resolved once rather than once per project
-        // it is compared against.  Which project a buffer is in is a fact about
-        // the buffer, and the upward walk it costs is exactly the filesystem work
-        // CompilationSnapshot::parse_inputs exists to keep off this lock --
-        // paying it per (project, buffer) pair put it back.
-        //
-        // Sorted by path, because docs_ is a hash map and the order files enter
-        // a Compilation decides which definition wins a tie: taking bucket order
-        // would let one run disagree with the next.
-        std::vector<std::pair<std::filesystem::path, const CompilationSourceFile*>> open_by_root;
-        for (const auto& file : snapshot.files) {
-            if (file.text)
-                open_by_root.emplace_back(parse_inputs_->project_root_for(file.path), &file);
+        // The open buffers, sorted by path.  docs_ is a hash map and the order
+        // files enter a Compilation decides which definition wins a tie, so
+        // taking bucket order would let one run disagree with the next.
+        std::vector<uint32_t> open_files;
+        for (uint32_t i = 0; i < snapshot.files.size(); ++i) {
+            if (snapshot.files[i].text)
+                open_files.push_back(i);
         }
-        std::sort(open_by_root.begin(), open_by_root.end(), [](const auto& a, const auto& b) {
-            return a.second->path < b.second->path;
+        std::sort(open_files.begin(), open_files.end(), [&](uint32_t a, uint32_t b) {
+            return snapshot.files[a].path < snapshot.files[b].path;
         });
+
+        // Which project each open buffer is in, resolved at most once and only
+        // when asked.  Lazily, because the question only arises for a buffer no
+        // project's filelist names: resolving every buffer up front costs an
+        // upward directory walk each for the common session where every buffer
+        // is listed and the answer is never needed -- and that walk is exactly
+        // the filesystem work CompilationSnapshot::parse_inputs exists to keep
+        // off this lock.  Once each, because it is a fact about the buffer, not
+        // about the project it is being compared against.
+        std::vector<std::optional<std::filesystem::path>> root_of_open(open_files.size());
+        const auto open_root = [&](size_t slot) -> const std::filesystem::path& {
+            if (!root_of_open[slot])
+                root_of_open[slot] =
+                    parse_inputs_->project_root_for(snapshot.files[open_files[slot]].path);
+            return *root_of_open[slot];
+        };
 
         for (const auto& project : project_compilation_inputs_) {
             if (!project.background_compilation)
@@ -7831,36 +7816,57 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
             group.defines = inputs.defines;
             group.include_dirs = inputs.include_dirs;
 
-            std::unordered_set<std::string_view> in_group;
+            std::unordered_set<uint32_t> in_group;
             group.files.reserve(project.files.size());
+            const auto add_to_group = [&](uint32_t index) {
+                if (in_group.insert(index).second)
+                    group.files.push_back(index);
+            };
+
             for (const auto& path_string : project.files) {
-                if (!in_group.insert(path_string).second)
-                    continue;
-                // The open buffer's entry when there is one, so the compilation
-                // reads the text the user is looking at rather than the file on
-                // disk.
-                if (const auto it = file_by_path.find(path_string); it != file_by_path.end()) {
-                    group.files.push_back(*it->second);
-                    continue;
-                }
-                group.files.push_back(CompilationSourceFile{
-                    .uri = uri_from_path(path_string),
-                    .path = path_string,
-                    .text = nullptr,
-                });
+                // The entry the loops above already built -- an open buffer's
+                // when there is one, so the compilation reads the text the user
+                // is looking at rather than the file on disk.  A filelist entry
+                // neither docs_ nor extra_files_ names is added to the snapshot
+                // here, so it is still owned in exactly one place.
+                const auto it = index_by_path.find(path_string);
+                add_to_group(it != index_by_path.end()
+                                 ? it->second
+                                 : add_file(CompilationSourceFile{
+                                       .uri = uri_from_path(path_string),
+                                       .path = path_string,
+                                       .text = nullptr,
+                                   }));
             }
 
             // Open buffers this project's filelist does not name -- a file just
             // created, or one the user opened before adding it to the `.f`.
-            for (const auto& [root, file] : open_by_root) {
-                if (root != project.root || in_group.contains(file->path))
+            for (size_t slot = 0; slot < open_files.size(); ++slot) {
+                if (in_group.contains(open_files[slot]) || open_root(slot) != project.root)
                     continue;
-                group.files.push_back(*file);
+                add_to_group(open_files[slot]);
             }
 
             if (!group.files.empty())
                 snapshot.groups.push_back(std::move(group));
         }
+    }
+
+    // No project registered what it compiles -- a CLI tool, a test, or a client
+    // that sent no rootUri.  Everything the analyzer knows about becomes one
+    // group against the merged defaults, which is what this did before groups
+    // existed.  Emitted here rather than reconstructed by the compiler, so
+    // `groups` is the only answer to "what gets compiled" and the consumer needs
+    // no branch to find it.
+    if (snapshot.groups.empty()) {
+        CompilationGroup fallback;
+        fallback.defines = parse_inputs_->defaults().defines;
+        fallback.include_dirs = parse_inputs_->defaults().include_dirs;
+        fallback.files.reserve(snapshot.files.size());
+        for (uint32_t i = 0; i < snapshot.files.size(); ++i)
+            fallback.files.push_back(i);
+        if (!fallback.files.empty())
+            snapshot.groups.push_back(std::move(fallback));
     }
 
     return snapshot;

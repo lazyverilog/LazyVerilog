@@ -973,15 +973,12 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
                 add_diag(std::move(diag));
         }
 
-        // This file's project, not the session's: a project with
-        // `[compilation]` off shows no semantic diagnostics in its buffers even
-        // while the project open beside it is compiling.
-        {
-            auto semantic_diags = semantic_diagnostics_for(uri, *file_config);
-            auto& target = diags_by_uri[uri];
-            target.insert(target.end(), std::make_move_iterator(semantic_diags.begin()),
-                          std::make_move_iterator(semantic_diags.end()));
-        }
+        // Gated on this file's own project, inside semantic_diagnostics_for().
+        auto semantic_diags = semantic_diagnostics_for(uri, *file_config);
+        auto& semantic_target = diags_by_uri[uri];
+        semantic_target.insert(semantic_target.end(),
+                               std::make_move_iterator(semantic_diags.begin()),
+                               std::make_move_iterator(semantic_diags.end()));
 
         auto& previously_published = diagnostic_uris_by_owner_[uri];
         for (const auto& old_uri : previously_published)
@@ -2010,11 +2007,7 @@ void LazyVerilogServer::register_handlers() {
                         add_diag(uri, std::move(diag));
 
                     // This file's config, for the same reason the lint rules
-                    // above use it: `[compilation]` is per project, so the
-                    // session's answer is the wrong one for every file that is
-                    // not in the session's own project -- including a file
-                    // under no project at all, whose `Config{}` leaves
-                    // `background_compilation` at its default of false.
+                    // above use it; semantic_diagnostics_for() holds the gate.
                     for (auto& diag : semantic_diagnostics_for(uri, *file_config))
                         add_diag(uri, std::move(diag));
                 }
