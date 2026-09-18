@@ -289,21 +289,23 @@ void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
     }
 }
 
-BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
-                                                    CompilationSnapshot snapshot) const {
+/// Compile one group into @p result.
+///
+/// @p parse_inputs is only consulted for the ungrouped fallback, where the files
+/// can span projects; a real project group is one project by construction, so it
+/// needs no source libraries to keep names apart.
+void BackgroundCompiler::compile_group(const CompilationGroup& group,
+                                       const std::shared_ptr<const ProjectParseInputs>& parse_inputs,
+                                       BackgroundCompileResult& result) const {
     const auto start = Clock::now();
-    BackgroundCompileResult result;
-    result.generation = generation;
-    result.open_uris = std::move(snapshot.open_uris);
-
     auto source_manager = make_lsp_source_manager();
-    for (const auto& dir : snapshot.include_dirs) {
+    for (const auto& dir : group.include_dirs) {
         if (!dir.empty())
             (void)source_manager->addUserDirectories(dir);
     }
 
     slang::parsing::PreprocessorOptions preprocessor_options;
-    preprocessor_options.predefines = snapshot.defines;
+    preprocessor_options.predefines = group.defines;
 
     slang::ast::CompilationOptions compilation_options;
     compilation_options.flags |= slang::ast::CompilationFlags::LintMode;
@@ -318,7 +320,77 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     bag.set(std::move(preprocessor_options));
     bag.set(std::move(compilation_options));
 
+    // One slang source library per project.
+    //
+    // This is a single Compilation over every open project's files -- semantic
+    // compilation cannot be per file, because it has one preprocessor for all
+    // of it -- and SystemVerilog's module namespace is flat and global.  Two
+    // projects that both declare `fifo` are therefore a redefinition to slang:
+    // it says so and keeps one of them, and the other project's semantic
+    // diagnostics disappear along with its definition -- measured, not feared;
+    // see the `[module-proximity]` compilation case.
+    //
+    // Libraries are the language's own answer, and slang implements it: a name
+    // declared in two libraries is legal and kept in priority order, and only a
+    // duplicate *within* one library is reported (Compilation::createDefinition).
+    //
+    // `isDefault` is set on every one of them, which is not the flag's usual
+    // sense and is load-bearing.  slang skips library definitions when it picks
+    // what to elaborate -- "Library definitions are never automatically
+    // instantiated in any capacity" -- so naming a library without this would
+    // leave a multi-project session with no top-level modules and therefore no
+    // semantic diagnostics at all, which is a far worse answer than the warning
+    // this removes.
+    //
+    // Priority follows sorted root order, not the order files arrive in: the
+    // snapshot's open buffers come out of a hash map, and priority is what
+    // decides which definition a lookup takes, so seeding it from iteration
+    // order would let one session disagree with the next about which `fifo` a
+    // diagnostic is about.
+    //
+    // Below two projects nothing is assigned at all.  A lone project's files go
+    // into slang's own default library exactly as they did before, so the
+    // overwhelmingly common session is bit-for-bit unchanged.
+    //
+    // Declared *before* the Compilation, and that order is load-bearing: locals
+    // are destroyed in reverse, and the Compilation holds pointers into these
+    // for its whole life, its destructor included.
+    std::unordered_map<std::string, const slang::SourceLibrary*> library_by_path;
+    std::vector<std::unique_ptr<slang::SourceLibrary>> libraries;
+    if (parse_inputs) {
+        std::unordered_map<std::string, std::string> root_by_path;
+        std::vector<std::string> roots;
+        for (const auto& file : group.files) {
+            auto root = parse_inputs->project_root_for(file.path).string();
+            if (root.empty())
+                continue;
+            if (std::find(roots.begin(), roots.end(), root) == roots.end())
+                roots.push_back(root);
+            // Keyed the way the parse loop below spells the same file, so a
+            // path that arrives unnormalized cannot silently miss its library.
+            root_by_path.emplace(normalize_filesystem_path(file.path).string(), std::move(root));
+        }
+
+        if (roots.size() > 1) {
+            std::sort(roots.begin(), roots.end());
+            std::unordered_map<std::string, const slang::SourceLibrary*> library_by_root;
+            libraries.reserve(roots.size());
+            for (size_t i = 0; i < roots.size(); ++i) {
+                auto library =
+                    std::make_unique<slang::SourceLibrary>(std::string(roots[i]),
+                                                           static_cast<int>(i));
+                library->isDefault = true;
+                library_by_root.emplace(roots[i], library.get());
+                libraries.push_back(std::move(library));
+            }
+            for (const auto& [path, root] : root_by_path)
+                library_by_path.emplace(path, library_by_root.at(root));
+        }
+    }
+
+
     slang::ast::Compilation compilation(bag);
+
     std::string first_uri;
     std::unordered_set<std::string> assigned_paths;
     size_t scanned_buffer_count = 0;
@@ -338,7 +410,7 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
         scanned_buffer_count = buffers.size();
     };
 
-    for (const auto& file : snapshot.files) {
+    for (const auto& file : group.files) {
         const auto normalized_path = normalize_filesystem_path(file.path).string();
         if (assigned_paths.contains(normalized_path))
             continue;
@@ -351,9 +423,11 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
             first_uri = file.uri;
 
         try {
-            auto tree = slang::syntax::SyntaxTree::fromText(std::string_view(text), *source_manager,
-                                                            std::string_view(file.uri),
-                                                            std::string_view(file.path), bag);
+            const auto library_it = library_by_path.find(normalized_path);
+            auto tree = slang::syntax::SyntaxTree::fromText(
+                std::string_view(text), *source_manager, std::string_view(file.uri),
+                std::string_view(file.path), bag,
+                library_it == library_by_path.end() ? nullptr : library_it->second);
             compilation.addSyntaxTree(std::move(tree));
             add_new_assigned_paths();
         } catch (const std::exception& e) {
@@ -380,6 +454,57 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
                 std::cerr << "[lazyverilog] semantic diagnostics failed: " << e.what() << "\n";
         }
     }
+
+    const bool group_log_timing = log_timing_.load(std::memory_order_relaxed);
+    if (group_log_timing) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
+        std::cerr << "[lazyverilog][compilation] project "
+                  << (group.root.empty() ? std::string("(none)") : group.root)
+                  << " files=" << group.files.size() << ": " << elapsed.count() << "ms\n";
+    }
+}
+
+BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
+                                                    CompilationSnapshot snapshot) const {
+    const auto start = Clock::now();
+    BackgroundCompileResult result;
+    result.generation = generation;
+    result.open_uris = std::move(snapshot.open_uris);
+
+    // One slang Compilation per project, run one at a time.
+    //
+    // A Compilation has a single preprocessor and a single flat module
+    // namespace, so compiling every open project's files together gave one
+    // elaboration two projects' `fifo` and handed one project's `define` to the
+    // other project's parse.  What decides which declaration an instantiation
+    // binds to is the set of files being compiled, and that set is what a `.f`
+    // names -- so the grouping is the language's own scope, not a heuristic.
+    //
+    // Sequentially, deliberately: peak memory is the binding resource here, and
+    // N projects compiled at once would multiply it.  Compiled one after the
+    // other, N projects cost N times the wall clock and one project's memory.
+    for (const auto& group : snapshot.groups)
+        compile_group(group, snapshot.parse_inputs, result);
+
+    // No project registered one -- a CLI tool, a test, or a client that sent no
+    // rootUri.  Everything the analyzer knows about is compiled as one group
+    // against the merged defaults, which is what this did before groups
+    // existed, and is why the per-project source libraries below still matter.
+    if (snapshot.groups.empty()) {
+        compile_group(CompilationGroup{.root = {},
+                                       .files = snapshot.files,
+                                       .defines = snapshot.defines,
+                                       .include_dirs = snapshot.include_dirs},
+                      snapshot.parse_inputs, result);
+    }
+
+    // A file two projects' filelists both name is compiled once per project, so
+    // an identical diagnostic can arrive twice.  Two *different* diagnostics for
+    // one file are kept: shared IP really does mean different things under two
+    // projects' defines, and that is worth seeing.
+    for (auto& [uri, diags] : result.diagnostics_by_uri)
+        dedup_parse_diagnostics(diags);
 
     result.uri_versions = std::move(snapshot.uri_versions);
 
