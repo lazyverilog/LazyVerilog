@@ -1184,13 +1184,22 @@ void LazyVerilogServer::register_handlers() {
                 // Only if the config really is here.  Recording a root that
                 // holds no lazyverilog.toml would suppress the discovery of the
                 // real one above it.
-                if (info)
-                    fold_project_root(info->source_root);
+                const bool folded = info && fold_project_root(info->source_root);
 
-                if (project_files_.empty()) {
+                if (!folded) {
                     // rootUri names a directory with no config above it.  There
                     // may still be a filelist to index, and no root to
                     // attribute it to.
+                    //
+                    // On "was a project folded", not on "is the filelist empty".
+                    // A project with a config and no filelist satisfies the
+                    // second, and this then overwrote everything the fold had
+                    // just accumulated -- with load_vcode() re-read against
+                    // `root_`, the client's spelling, rather than against the
+                    // project root the fold used.  An editor launched in a
+                    // subdirectory sends that subdirectory, so the two are not
+                    // the same place and the filelist resolved from the wrong
+                    // one.
                     //
                     // Read only here.  fold_project_root() above reads the
                     // filelist of the project it folds, so loading one
@@ -1203,8 +1212,8 @@ void LazyVerilogServer::register_handlers() {
                     project_include_dirs_ = vcode.include_dirs;
                     project_files_        = std::move(vcode.files);
                     project_file_sizes_   = std::move(vcode.file_sizes);
-                    // Reached only when nothing was folded, so the set is empty
-                    // and this is what keeps it in step with the assignment.
+                    // Nothing was folded, so the set is empty and this is what
+                    // keeps it in step with the assignment.
                     project_file_set_.insert(project_files_.begin(), project_files_.end());
                     project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
                 }
