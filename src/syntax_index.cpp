@@ -1835,6 +1835,22 @@ size_t shared_path_prefix_components(std::string_view a, std::string_view b) {
     return shared;
 }
 
+size_t path_component_count(std::string_view path) {
+    const auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+    size_t components = 0;
+    size_t i = 0;
+    while (i < path.size()) {
+        while (i < path.size() && is_sep(path[i]))
+            ++i;
+        if (i >= path.size())
+            break;
+        ++components;
+        while (i < path.size() && !is_sep(path[i]))
+            ++i;
+    }
+    return components;
+}
+
 const std::string& ProjectIndexSnapshot::module_path(const ProjectIndexModuleRef& ref) const {
     static const std::string kNone;
     return ref.shard_slot < shards.size() ? shards[ref.shard_slot].path : kNone;
@@ -1856,16 +1872,19 @@ const ProjectIndexModuleRef* ProjectIndexSnapshot::find_module(const std::string
         return &it->second;
 
     const ProjectIndexModuleRef* best = nullptr;
-    size_t best_shared = 0;
+    PathProximityScore best_score;
     for (const auto& candidate : dup->second) {
         if (!candidate.shard)
             continue;
-        const size_t shared = shared_path_prefix_components(from_path, module_path(candidate));
-        // Strictly greater, so an equally distant candidate loses to the one
-        // indexed before it and the answer stays stable across requests.
-        if (!best || shared > best_shared) {
+        // The same scoring function by_path_proximity() uses, so this lookup and
+        // the scans that order their own candidates cannot disagree about which
+        // project a name belongs to.
+        const auto score = path_proximity_score(from_path, module_path(candidate));
+        // Strictly nearer, so an equally near candidate loses to the one indexed
+        // before it and the answer stays stable across requests.
+        if (!best || score > best_score) {
             best = &candidate;
-            best_shared = shared;
+            best_score = score;
         }
     }
     return best ? best : &it->second;

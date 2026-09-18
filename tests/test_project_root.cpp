@@ -870,6 +870,39 @@ TEST_CASE("connect resolves the asking project's module", "[project-root][module
     CHECK(from_a.find("leaf_b") == std::string::npos);
 }
 
+TEST_CASE("nearest-first ordering sees past the shared prefix", "[module-proximity]") {
+    // find_module() answers from the prebuilt by-name table and by_path_proximity()
+    // orders a candidate sequence, and CLAUDE.md is explicit that they must stay
+    // on one scoring function or the features disagree about which project a
+    // name belongs to.  So the term added to one has to reach the other: a
+    // sibling declaration beats one three directories below the same prefix,
+    // whichever entry point is asked.
+    TempTree tree("proximity-same-prefix");
+    tree.write("chip/lazyverilog.toml", "[design]\n");
+    auto near = tree.write("chip/rtl/fifo.sv", "module fifo;\nendmodule\n");
+    auto deep = tree.write("chip/rtl/sub/legacy/fifo.sv", "module fifo;\nendmodule\n");
+    auto top = tree.write("chip/rtl/top.sv", "module top;\n  fifo u_fifo ();\nendmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {near.string(), deep.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto snapshot = analyzer.project_index_snapshot();
+    REQUIRE(snapshot != nullptr);
+    const auto* ref = snapshot->find_module("fifo", normalize_filesystem_path(top).string());
+    REQUIRE(ref != nullptr);
+    CHECK(snapshot->module_path(*ref) == normalize_filesystem_path(near).string());
+
+    // And from inside the deep directory the deep one wins, so this is ranking
+    // and not a fixed preference for shallow paths.
+    const auto* from_deep =
+        snapshot->find_module("fifo", normalize_filesystem_path(deep).string());
+    REQUIRE(from_deep != nullptr);
+    CHECK(snapshot->module_path(*from_deep) == normalize_filesystem_path(deep).string());
+}
+
 TEST_CASE("nearest-first ordering ranks without filtering", "[module-proximity]") {
     // The primitive every one of the above now shares.  Three properties the
     // scans depend on: nothing is dropped, ties keep the caller's order, and a
@@ -897,18 +930,29 @@ TEST_CASE("nearest-first ordering ranks without filtering", "[module-proximity]"
     // Ranks, does not filter: shared IP in no project is still reachable.
     CHECK(from_b.size() == files.size());
     CHECK(std::find(from_b.begin(), from_b.end(), "/w/common_ip/sync.sv") != from_b.end());
-    // chip_b/verif is nearer than either chip_a or common_ip.
-    CHECK(std::find(from_b.begin(), from_b.end(), "/w/chip_b/verif/fifo.sv") <
-          std::find(from_b.begin(), from_b.end(), "/w/chip_a/rtl/fifo.sv"));
-    // Equally distant candidates keep the order they arrived in, so the answer
-    // is stable rather than dependent on a sort's tie-breaking.
-    CHECK(std::find(from_b.begin(), from_b.end(), "/w/chip_a/rtl/fifo.sv") <
-          std::find(from_b.begin(), from_b.end(), "/w/common_ip/sync.sv"));
+    // The whole order, which is clangd's directory-tree edit distance for these
+    // four: 0 up/down to chip_b/rtl, 2 to chip_b/verif, 3 to common_ip, 4 to
+    // chip_a/rtl.
+    CHECK(from_b == std::vector<std::string>{"/w/chip_b/rtl/fifo.sv",
+                                             "/w/chip_b/verif/fifo.sv",
+                                             "/w/common_ip/sync.sv",
+                                             "/w/chip_a/rtl/fifo.sv"});
 
     // No path in hand, and one project: both return the caller's order as-is.
     CHECK(paths(by_path_proximity(std::span<const Candidate>(files), "")) ==
           std::vector<std::string>{"/w/chip_a/rtl/fifo.sv", "/w/chip_b/rtl/fifo.sv",
                                    "/w/common_ip/sync.sv", "/w/chip_b/verif/fifo.sv"});
+
+    // What the shared prefix alone cannot see: both of these share exactly
+    // `w/chip_b/rtl` with the asking file, so on that term they tie and the
+    // winner was whichever the caller's path order happened to put first.  The
+    // sibling is nearer -- one step down against three -- and saying so is the
+    // "down" half of the edit distance.
+    const std::vector<Candidate> same_prefix{{"/w/chip_b/rtl/sub/legacy/fifo.sv"},
+                                             {"/w/chip_b/rtl/fifo.sv"}};
+    CHECK(paths(by_path_proximity(std::span<const Candidate>(same_prefix),
+                                  "/w/chip_b/rtl/top.sv"))
+              .front() == "/w/chip_b/rtl/fifo.sv");
 
     const std::vector<Candidate> one_project{{"/w/chip_a/rtl/a.sv"}, {"/w/chip_a/rtl/b.sv"}};
     CHECK(paths(by_path_proximity(std::span<const Candidate>(one_project),
