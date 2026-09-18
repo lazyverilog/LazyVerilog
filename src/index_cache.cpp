@@ -676,57 +676,6 @@ bool read_scoped_map(Reader& r, size_t bound, std::unordered_map<std::string, si
     return true;
 }
 
-// Slurp a path that is expected to be an ordinary file, or give back nothing.
-//
-// `!in` does not mean "this is readable".  libstdc++ opens a directory
-// successfully and fails only in basic_filebuf::underflow, which *throws*
-// std::ios_base::failure whatever the stream's exception mask says -- so the
-// obvious ifstream + istreambuf_iterator pair terminates the process on a path
-// that is a directory, from a background thread with nothing to catch it.
-// Neither does a successful open promise the read returns: a FIFO opens, then
-// blocks forever on a writer that never comes.
-//
-// is_regular_file() answers both questions, and the catch is the backstop for a
-// path that stops being one between the check and the read.
-std::optional<std::string> read_regular_file(const fs::path& path) {
-    std::error_code ec;
-    if (!fs::is_regular_file(path, ec) || ec)
-        return std::nullopt;
-    try {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-            return std::nullopt;
-        // Sized in one read rather than assembled a character at a time.  The
-        // istreambuf_iterator pair this replaces went through the streambuf's
-        // virtual sgetc/sbumpc per byte and grew the string as it went: 1.17 ms
-        // for a 636 KiB header against 0.036 ms here, and this path reads every
-        // file in the project on a warm start to hash it, plus every shard.
-        //
-        // The size comes from seeking the handle that is already open, not from
-        // a second look at the path: file_size() would be another metadata call
-        // per file, which is the thing a shared filesystem charges for.
-        in.seekg(0, std::ios::end);
-        const auto end = in.tellg();
-        if (end < 0)
-            return std::nullopt;
-        in.seekg(0, std::ios::beg);
-        std::string bytes(static_cast<size_t>(end), '\0');
-        if (end > 0)
-            in.read(bytes.data(), end);
-        if (in.bad())
-            return std::nullopt;
-        // A file that shrank between the seek and the read is short, not broken.
-        bytes.resize(static_cast<size_t>(in.gcount()));
-        return bytes;
-    } catch (const std::exception&) {
-        return std::nullopt;
-    }
-}
-
-std::string read_whole_file(const fs::path& path) {
-    return read_regular_file(path).value_or(std::string{});
-}
-
 // A field added to any of these without a matching codec update would be
 // silently dropped from every cached shard, which surfaces as a symbol that
 // resolves before a restart and not after.  Freeze the sizes: a change here is
@@ -789,9 +738,10 @@ std::optional<IndexCache::Digest> IndexCache::digest_file(const fs::path& path) 
     // A path that is not an ordinary file has no digest, and saying so is the
     // whole answer: the caller treats nullopt as "cannot key a shard on this",
     // which is the correct outcome for a directory or a FIFO standing where a
-    // source file used to be.  See read_regular_file() for why the plain
-    // ifstream this replaced aborted the process instead.
-    const auto bytes = read_regular_file(path);
+    // source file used to be.  See read_file_text_optional() for why this
+    // cannot be a plain ifstream, and for why it costs one path lookup rather
+    // than a stat and an open.
+    const auto bytes = read_file_text_optional(path);
     if (!bytes)
         return std::nullopt;
     return digest_bytes(*bytes);
@@ -951,7 +901,7 @@ fs::path IndexCache::shard_path(std::string_view uri) const {
 }
 
 std::optional<IndexCache::Loaded> IndexCache::load(std::string_view uri) const {
-    const auto bytes = read_whole_file(shard_path(uri));
+    const auto bytes = read_file_text_or_empty(shard_path(uri));
     if (bytes.empty())
         return std::nullopt;
     return deserialize_index_shard(bytes);
@@ -988,7 +938,7 @@ size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& 
             continue;
         // Anything but an ordinary file is not a shard, and reading one would
         // throw out of basic_filebuf rather than fail the stream -- the same
-        // trap read_regular_file() exists for.
+        // trap read_file_text_optional() exists for.
         std::error_code kind_ec;
         if (!entry.is_regular_file(kind_ec) || kind_ec)
             continue;
