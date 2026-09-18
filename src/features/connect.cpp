@@ -108,30 +108,11 @@ struct PreviewEdit {
     bool warning{false};
 };
 
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char ch : s) {
-        switch (ch) {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(ch) < 0x20) {
-                char buf[7];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
-                out += buf;
-            } else {
-                out += ch;
-            }
-        }
-    }
-    return out;
-}
-
-static std::string q(const std::string& s) { return "\"" + json_escape(s) + "\""; }
+/// One allocation and one escaper, shared with the other hand-built JSON
+/// responses in server.cpp.  The copy this replaced escaped the C0 controls
+/// correctly and the other one did not, which is the whole reason there is
+/// now only one.
+static std::string q(const std::string& s) { return json_quoted(s); }
 
 static std::string basename_from_uri(const std::string& uri) {
     const auto pos = uri.find_last_of('/');

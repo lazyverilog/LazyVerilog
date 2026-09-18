@@ -329,6 +329,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_config.cpp
     tests/test_cpu_budget.cpp
     tests/test_path_uri.cpp
+    tests/test_json_string.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
     tests/test_lsp_position_encoding.cpp

@@ -3,6 +3,11 @@
 #include <filesystem>
 #include <fstream>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
 TEST_CASE("path utils: POSIX file URI decoding is unchanged", "[path][uri]") {
     CHECK(path_from_file_uri("file:///tmp/lazyverilog/top.sv") ==
           "/tmp/lazyverilog/top.sv");
@@ -144,6 +149,88 @@ TEST_CASE("normalize_filesystem_path resolves through a memoized parent", "[path
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_CASE("path utils: the normalization memo can be dropped when the tree moves", "[path]") {
+    // The memo's premise is that a path which resolves on disk does not change
+    // spelling while the server is alive.  That is true of a file being edited
+    // and false of a tree being rearranged: repointing a symlink leaves every
+    // path under it resolving to where it used to go, and two code paths
+    // reaching one file then disagree about its URI -- the one thing
+    // normalize_filesystem_path() exists to prevent.
+    const auto root = std::filesystem::temp_directory_path() / "lazyverilog-memo-invalidate";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root / "ip_v1", ec);
+    std::filesystem::create_directories(root / "ip_v2", ec);
+    { std::ofstream out(root / "ip_v1" / "fifo.sv"); out << "module fifo; endmodule\n"; }
+    { std::ofstream out(root / "ip_v2" / "fifo.sv"); out << "module fifo; endmodule\n"; }
+
+    std::error_code link_ec;
+    std::filesystem::create_directory_symlink(root / "ip_v1", root / "ip", link_ec);
+    if (link_ec) {
+        SUCCEED("symlinks unavailable here");
+    }
+    else {
+        const auto through_link = root / "ip" / "fifo.sv";
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v1" / "fifo.sv"));
+
+        // The branch switch.
+        std::filesystem::remove(root / "ip", ec);
+        std::filesystem::create_directory_symlink(root / "ip_v2", root / "ip", link_ec);
+        REQUIRE_FALSE(link_ec);
+
+        // Still the old answer: that is the memo, and it is why an invalidation
+        // hook has to exist at all.
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v1" / "fifo.sv"));
+
+        invalidate_normalized_path_cache();
+
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v2" / "fifo.sv"));
+    }
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("path utils: the normalization memo does not grow without bound", "[path]") {
+    // Nothing else releases it -- the memo has no expiry, by design -- so a
+    // server left running across many trees would hold every spelling it ever
+    // saw.  The cap is generous enough that a real project never reaches it.
+    //
+    // Driven through cache_normalized(), which is where the cap lives and the
+    // only thing that writes the map.  Going through normalize_filesystem_path()
+    // resolves every one of these paths for real: one lstat each on POSIX, and
+    // on Windows -- which has no fast path -- a whole weakly_canonical() walk
+    // per path.  That measured about fifteen seconds of the Windows CI job, for
+    // a property that is about the map and not about the filesystem.
+    invalidate_normalized_path_cache();
+    for (size_t i = 0; i < NormalizedPathCache::kMaxEntries + 64; ++i) {
+        const auto key = "/synthetic/m" + std::to_string(i) + ".sv";
+        (void)cache_normalized(key, std::filesystem::path(key));
+    }
+
+    auto& cache = normalized_path_cache();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        CHECK(cache.entries.size() <= NormalizedPathCache::kMaxEntries);
+        // And it is still a cache, not a disabled one.
+        CHECK(cache.entries.size() > 0);
+    }
+
+    // The cap is only worth anything if normalize_filesystem_path() is in fact
+    // served by this map, so pin that too -- with one path rather than 65k.
+    invalidate_normalized_path_cache();
+    const auto resolved = normalize_filesystem_path(std::filesystem::temp_directory_path());
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        CHECK(cache.entries.size() > 0);
+    }
+    CHECK(resolved == normalize_filesystem_path(std::filesystem::temp_directory_path()));
+
+    // Leave the suite a clean memo rather than this test's synthetic entries.
+    invalidate_normalized_path_cache();
+}
+
 TEST_CASE("read_file_text_optional survives a path that is not a regular file", "[path]") {
     // A filelist entry naming a directory is a typo, and the background compiler
     // reads filelist entries on its own thread.  libstdc++ opens a directory
@@ -167,3 +254,31 @@ TEST_CASE("read_file_text_optional survives a path that is not a regular file", 
     CHECK(empty_text->empty());
     std::filesystem::remove(empty, ec);
 }
+
+#ifndef _WIN32
+TEST_CASE("read_file_text_optional does not block on a FIFO", "[path]") {
+    // The other hazard the kind check exists for, and the one that decides how
+    // the file is opened: a FIFO opens successfully and then blocks forever on a
+    // writer that never comes.  A filelist naming one would hang an index worker
+    // with no diagnostic at all.
+    //
+    // Answered from the handle rather than from the path -- O_NONBLOCK returns
+    // immediately, fstat() says it is not a regular file, and the read never
+    // happens.  A separate is_regular_file() would answer the same question at
+    // the cost of resolving the path twice, which on a shared filesystem is a
+    // round trip per component of every file in the project.
+    //
+    // POSIX only: mkfifo has no Windows equivalent, and that build keeps the
+    // path check.
+    const auto fifo = std::filesystem::temp_directory_path() / "lazyverilog-fifo.sv";
+    std::error_code ec;
+    std::filesystem::remove(fifo, ec);
+    if (::mkfifo(fifo.c_str(), 0600) != 0)
+        SUCCEED("mkfifo unavailable here");
+    else {
+        // Returns rather than hangs; the test timing out is the failure mode.
+        CHECK_FALSE(read_file_text_optional(fifo).has_value());
+        std::filesystem::remove(fifo, ec);
+    }
+}
+#endif

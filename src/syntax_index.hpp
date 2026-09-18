@@ -505,6 +505,46 @@ struct ProjectIndexSnapshot {
 /// separator so a Windows path and a POSIX one score the same way.
 size_t shared_path_prefix_components(std::string_view a, std::string_view b);
 
+/// How many path components @p path has.  Same separator handling.
+size_t path_component_count(std::string_view path);
+
+/// How near one candidate is to the file that asked, higher being nearer.
+///
+/// Two numbers, because one is not enough.  The shared prefix says how much of
+/// the way down the tree the two paths travel together, and it is the primary
+/// term.  On its own it cannot see how far past that point the candidate then
+/// goes: against `rtl/top.sv`, both `rtl/fifo.sv` and `rtl/sub/legacy/fifo.sv`
+/// share exactly `rtl`, so the sibling and the one three directories below it
+/// scored the same and which won was whichever the path order happened to put
+/// first.
+///
+/// `depth` breaks that, and only that: it is consulted when the prefixes are
+/// equal, so nothing the prefix already distinguishes is reordered.  It is the
+/// "down" half of clangd's FileDistance (FileDistance.h: "an edit-distance,
+/// where edits go up or down the directory tree"); the "up" half is a property
+/// of the asking file, identical for every candidate, so it cannot order them.
+struct PathProximityScore {
+    /// Leading components shared with the asking file.  More is nearer.
+    size_t shared{0};
+    /// Components in the candidate's own path.  Fewer is nearer, at equal
+    /// `shared`.
+    size_t depth{0};
+
+    /// Nearer than.  std::greater<> reaches this, which is what lets the two
+    /// ranking entry points below sort on it directly.
+    bool operator>(const PathProximityScore& other) const {
+        return shared != other.shared ? shared > other.shared : depth < other.depth;
+    }
+    bool operator==(const PathProximityScore&) const = default;
+};
+
+/// @p candidate's nearness to @p from_path.  The one place the rule is defined.
+inline PathProximityScore path_proximity_score(std::string_view from_path,
+                                               std::string_view candidate) {
+    return {shared_path_prefix_components(from_path, candidate),
+            path_component_count(candidate)};
+}
+
 /// Each element's proximity score against @p from_path, or nullopt when the
 /// candidates are already in the order a ranking would put them in.
 ///
@@ -515,19 +555,23 @@ size_t shared_path_prefix_components(std::string_view a, std::string_view b);
 ///
 /// `is_sorted` rather than "all scores equal", because a candidate list that
 /// already happens to descend needs no sort either, and the test costs the same.
+///
+/// Scoring once per candidate rather than once per comparison matters more now
+/// that a score is two numbers: it is still one pass, and the sort compares the
+/// precomputed pairs.
 template <typename T>
-std::optional<std::vector<size_t>> path_proximity_scores(std::span<const T> items,
-                                                         std::string_view from_path) {
+std::optional<std::vector<PathProximityScore>> path_proximity_scores(std::span<const T> items,
+                                                                     std::string_view from_path) {
     if (from_path.empty() || items.size() < 2)
         return std::nullopt;
 
     // Score once per candidate rather than once per comparison: the scoring
     // walks two paths component-wise, and a sort would call it O(n log n)
     // times on a filelist that is thousands of entries on a real design.
-    std::vector<size_t> score;
+    std::vector<PathProximityScore> score;
     score.reserve(items.size());
     for (const auto& item : items)
-        score.push_back(shared_path_prefix_components(from_path, item.path));
+        score.push_back(path_proximity_score(from_path, item.path));
 
     if (std::is_sorted(score.begin(), score.end(), std::greater<>()))
         return std::nullopt;

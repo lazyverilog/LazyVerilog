@@ -14,6 +14,15 @@
 #include <unordered_map>
 #include <vector>
 
+// read_file_text_optional() opens and fstats one handle rather than resolving
+// the path twice; see the comment there.
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 inline std::string trim_copy(std::string text) {
     auto first = std::find_if_not(text.begin(), text.end(),
                                    [](unsigned char c) { return std::isspace(c); });
@@ -22,6 +31,68 @@ inline std::string trim_copy(std::string text) {
     if (first >= last)
         return {};
     return std::string(first, last);
+}
+
+/// Append @p text to @p out as a quoted JSON string literal.
+///
+/// The two hand-built JSON responses this server sends -- the custom
+/// `workspace/executeCommand` results, which the vendored lspcpp passes through
+/// verbatim as a pre-serialized string -- both need this, and they had a copy
+/// each.  Only one of them escaped the C0 controls, so the same byte was legal
+/// JSON out of one command and a parse error out of the other.
+///
+/// RFC 8259 section 7 requires every code point below U+0020 to be escaped.  Six
+/// of them have short forms; the rest have no spelling but `\uXXXX`, so a
+/// serializer that stops at the named six emits a document no conforming parser
+/// will read.  A single vertical tab -- a byte that reaches here from a comment
+/// in the user's own source -- was enough to make a formatting reply
+/// undecodable, and the client reports that as a parse error pointing nowhere
+/// near the file that caused it.
+///
+/// Nothing above U+007F is touched: JSON strings hold UTF-8 directly, and the
+/// document's bytes are already the encoding the transport wants.
+inline void append_json_string(std::string& out, std::string_view text) {
+    // Most SystemVerilog text needs no escaping at all.  Reserve the common-case
+    // payload plus quotes up front so a whole-document `newText` does not grow
+    // one byte at a time; escapes can exceed the estimate, but this removes
+    // nearly every reallocation for real files.
+    out.reserve(out.size() + text.size() + 2 + text.size() / 8);
+    out += '"';
+    for (char c : text) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default: {
+            // Cast before comparing: `char` is signed on every target this
+            // builds for, so a UTF-8 continuation byte is negative and a signed
+            // test would send it down the escape path and corrupt text that was
+            // already valid.
+            const auto byte = static_cast<unsigned char>(c);
+            if (byte >= 0x20) {
+                out += c;
+                break;
+            }
+            static constexpr char kHex[] = "0123456789abcdef";
+            out += "\\u00";
+            out += kHex[byte >> 4];
+            out += kHex[byte & 0xf];
+            break;
+        }
+        }
+    }
+    out += '"';
+}
+
+/// @copydoc append_json_string
+inline std::string json_quoted(std::string_view text) {
+    std::string out;
+    append_json_string(out, text);
+    return out;
 }
 
 /// Count the UTF-16 code units in a UTF-8 slice.
@@ -261,52 +332,115 @@ inline int lsp_column_from_byte_offset(std::string_view text, size_t line_start,
 
 
 
+/// Read a whole regular file, or nullopt when it is not one or cannot be read.
+///
+/// Two hazards decide the shape of this, and neither is hypothetical:
+///
+///   * a **directory** opens successfully under libstdc++ and reports LLONG_MAX
+///     as its size, so sizing a buffer from that seek throws bad_alloc -- on a
+///     background thread, with nothing to catch it.  A filelist naming a
+///     directory is a user's typo, not a reason to take the server down;
+///   * a **FIFO** opens and then blocks forever on a writer that never comes.
+///
+/// Both are answered from the handle rather than from the path.  The obvious
+/// spelling -- `is_regular_file()` and then open -- resolves the path twice, and
+/// on the shared filesystems this server is aimed at the second walk is a round
+/// trip per component that buys nothing the first one did not already learn.
+/// Measured on a 60-file warm start, that check was one of three metadata calls
+/// per source file and one of two per shard: the index cache reads every file in
+/// the project to hash it, plus every shard, so it was ~2 avoidable round trips
+/// per file per launch.
+///
+/// O_NONBLOCK is what makes opening safe before the kind is known: on a FIFO it
+/// returns immediately instead of blocking, and on a regular file it has no
+/// effect on the reads below.  fstat() then answers the question on a handle we
+/// already hold.
+///
+/// Sized in one allocation from the handle's own size, and read in one call --
+/// a file that grew since the fstat is still read whole, and one that shrank
+/// comes back short rather than padded.
 inline std::optional<std::string> read_file_text_optional(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in)
+#ifndef _WIN32
+    int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    while (fd < 0 && errno == EINTR)
+        fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return std::nullopt;
+    struct FdGuard {
+        int fd;
+        ~FdGuard() { ::close(fd); }
+    } guard{fd};
+
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode))
         return std::nullopt;
 
-    // Prefer a single allocation/read for regular files.  The fallback keeps the
-    // helper robust for paths where the size cannot be queried or the stream is
-    // not seekable.  Large RTL sources are common, so avoiding repeated string
-    // growth keeps project/background parsing from wasting allocator work.
+    // One byte more than the file claims to hold.  A regular-file read() returns
+    // everything asked for unless it reaches the end, so asking for st_size + 1
+    // makes an unchanged file end on a short read -- one read() per file, no
+    // second call whose only job is to return zero.  Draining with a plain
+    // "until it returns 0" loop instead cost a syscall per file on both halves
+    // of the warm path, measured at +10% on a 1200-file warm start, which is
+    // most of what removing the stat had just bought.
     //
-    // Sized by seeking the handle that is already open rather than by asking the
-    // filesystem about the path a second time: file_size() is another metadata
-    // call for a question this stream can answer, and on a shared filesystem
-    // that is a round trip per file read.
-    in.seekg(0, std::ios::end);
-    const auto hint = in.tellg();
-    in.seekg(0, std::ios::beg);
-
-    // tellg() is a hint, not a promise.  libstdc++ opens a directory
-    // successfully and reports LLONG_MAX as its size, so sizing a string from it
-    // outright throws bad_alloc -- on a background thread, with nothing to catch
-    // it.  A filelist naming a directory is a user's typo, not a reason to take
-    // the server down.  Cap what the hint may reserve and read anything larger
-    // in chunks, which costs one extra pass for a file nobody has and cannot be
-    // talked into an absurd allocation.
-    constexpr std::streamoff kMaxSizeHint = std::streamoff{1} << 30; // 1 GiB
-    if (in && hint >= 0 && hint <= kMaxSizeHint) {
-        std::string text(static_cast<size_t>(hint), '\0');
-        if (hint == 0)
-            return text;
-        in.read(text.data(), hint);
+    // A file that grew under us still reads whole: a full read means there may
+    // be more, and the loop keeps going in bounded steps.  One that shrank comes
+    // back short rather than padded.
+    constexpr size_t kChunk = 256 * 1024;
+    size_t want = static_cast<size_t>(info.st_size) + 1;
+    std::string text;
+    size_t filled = 0;
+    for (;;) {
+        text.resize(filled + want);
+        const ssize_t got = ::read(fd, text.data() + filled, want);
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            return std::nullopt;
+        }
+        filled += static_cast<size_t>(got);
+        if (static_cast<size_t>(got) < want)
+            break;
+        want = kChunk;
+    }
+    text.resize(filled);
+    return text;
+#else
+    // Windows keeps the path check.  What the POSIX branch avoids is a
+    // per-component metadata round trip on a shared/HPC filesystem, which is not
+    // where that build runs -- the same trade normalize_filesystem_path() makes
+    // a few lines down, and for the same reason.
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return std::nullopt;
+    try {
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return std::nullopt;
+        // Sized in one read rather than assembled a character at a time.  The
+        // istreambuf_iterator pair this replaces went through the streambuf's
+        // virtual sgetc/sbumpc per byte and grew the string as it went: 1.17 ms
+        // for a 636 KiB header against 0.036 ms here.
+        //
+        // The size comes from seeking the handle that is already open, not from
+        // a second look at the path.
+        in.seekg(0, std::ios::end);
+        const auto end = in.tellg();
+        if (end < 0)
+            return std::nullopt;
+        in.seekg(0, std::ios::beg);
+        std::string text(static_cast<size_t>(end), '\0');
+        if (end > 0)
+            in.read(text.data(), end);
+        if (in.bad())
+            return std::nullopt;
+        // A file that shrank between the seek and the read is short, not broken.
         text.resize(static_cast<size_t>(in.gcount()));
         return text;
+    } catch (const std::exception&) {
+        return std::nullopt;
     }
-
-    // No usable hint: unseekable, or a size that cannot be true.  Read what the
-    // stream actually gives.  An explicit read() loop rather than
-    // istreambuf_iterator, because the iterator reaches basic_filebuf::underflow,
-    // which throws on a directory whatever the stream's exception mask says.
-    in.clear();
-    in.seekg(0, std::ios::beg);
-    std::string text;
-    char chunk[64 * 1024];
-    while (in.read(chunk, sizeof(chunk)) || in.gcount() > 0)
-        text.append(chunk, static_cast<size_t>(in.gcount()));
-    return text;
+#endif
 }
 
 inline std::string read_file_text_or_empty(const std::filesystem::path& path) {
@@ -315,13 +449,58 @@ inline std::string read_file_text_or_empty(const std::filesystem::path& path) {
 
 inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path);
 
+/// The memo behind normalize_filesystem_path(), by input spelling.
+///
+/// Process-wide and shared by every thread, which is what makes it worth having
+/// -- and what makes the two things below somebody's problem rather than
+/// nobody's.
+struct NormalizedPathCache {
+    /// Above this, the map is dropped rather than grown.
+    ///
+    /// Entries are one per distinct spelling plus one per directory on the way,
+    /// so a project settles at a few tens of thousands and never reaches this.
+    /// A server left running for days across many trees does, and nothing else
+    /// would ever release it: the memo has no expiry, because its whole premise
+    /// is that a resolved path does not change spelling.  Dropping the map costs
+    /// one re-walk per directory afterwards, which is what the first lookup in a
+    /// session pays anyway.
+    static constexpr size_t kMaxEntries = 1u << 16;
+
+    std::mutex mutex;
+    std::unordered_map<std::string, std::string> entries;
+};
+
+inline NormalizedPathCache& normalized_path_cache() {
+    static NormalizedPathCache cache;
+    return cache;
+}
+
+/// Drop every memoized path resolution.
+///
+/// The memo's premise holds for a file being edited and not for the tree being
+/// rearranged underneath it: a branch switch that repoints a vendor-IP symlink
+/// leaves every path under it resolving to where it used to go, for the rest of
+/// the session, and two code paths reaching one file then disagree about its URI
+/// -- the single thing normalize_filesystem_path() exists to prevent.
+///
+/// So the premise is scoped by calling this when the tree is known to have
+/// moved, the way ProjectRootResolver::invalidate() scopes the same premise for
+/// the same kind of answer.  Not on every file change: a save must not cost a
+/// re-walk of the project.
+inline void invalidate_normalized_path_cache() {
+    auto& cache = normalized_path_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.entries.clear();
+}
+
 /// Record @p result for @p key and hand it back, so each return path below is
 /// one line rather than three.
-inline std::filesystem::path
-cache_normalized(std::mutex& mutex, std::unordered_map<std::string, std::string>& cache,
-                 std::string key, std::filesystem::path result) {
-    std::lock_guard<std::mutex> lock(mutex);
-    cache.insert_or_assign(std::move(key), result.string());
+inline std::filesystem::path cache_normalized(std::string key, std::filesystem::path result) {
+    auto& cache = normalized_path_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.entries.size() >= NormalizedPathCache::kMaxEntries)
+        cache.entries.clear();
+    cache.entries.insert_or_assign(std::move(key), result.string());
     return result;
 }
 
@@ -353,13 +532,11 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     // So resolve the parent through this same memo and append the last
     // component.  The prefix is then walked once per directory rather than once
     // per file, and a second file in a directory costs a single lookup.
-    static std::mutex cache_mutex;
-    static std::unordered_map<std::string, std::string> cache;
-
+    auto& cache = normalized_path_cache();
     auto key = path.string();
     {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        if (const auto it = cache.find(key); it != cache.end())
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (const auto it = cache.entries.find(key); it != cache.entries.end())
             return std::filesystem::path(it->second);
     }
 
@@ -398,14 +575,12 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
         // and the answer is then the parent's canonical spelling plus this name.
         (void)std::filesystem::read_symlink(candidate, link_ec);
         if (link_ec)
-            return cache_normalized(cache_mutex, cache, std::move(key),
-                                    candidate.lexically_normal());
+            return cache_normalized(std::move(key), candidate.lexically_normal());
         // A symlink at the leaf: hand it to the full walk.  It re-resolves the
         // prefix, which is wasted, but it is correct and it is rare.
         result = std::filesystem::weakly_canonical(candidate, ec);
         if (!ec)
-            return cache_normalized(cache_mutex, cache, std::move(key),
-                                    result.lexically_normal());
+            return cache_normalized(std::move(key), result.lexically_normal());
     }
 #endif
 
@@ -419,11 +594,7 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
         result = result.lexically_normal();
     }
 
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        cache.insert_or_assign(std::move(key), result.string());
-    }
-    return result;
+    return cache_normalized(std::move(key), std::move(result));
 }
 
 inline bool is_windows_drive_path(std::string_view text) {

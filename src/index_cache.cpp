@@ -251,6 +251,33 @@ public:
         return strings_[id];
     }
 
+    /// A SourceFileID, checked against the file table it was written against.
+    ///
+    /// Every entry that carries one reads it through here, so the invariant
+    /// holds for all fourteen of them rather than for whichever three someone
+    /// remembered to scan afterwards -- and a fifteenth cannot be added without
+    /// it, because `r.u32()` into a `file_id` is now the visibly wrong spelling.
+    ///
+    /// Checked here rather than in a pass over the finished index because the
+    /// file table is deserialized first, so the answer is already available: it
+    /// replaces three full scans (one of them over `references`, which is
+    /// millions of entries on a real design) with one comparison per field.
+    ///
+    /// An out-of-range id is a corrupt shard, which is a cache miss.  Serving it
+    /// would hand the request path a URI belonging to a different file.
+    SourceFileID file_id() {
+        const auto id = u32();
+        if (id != kInvalidSourceFileID && id >= file_table_size_) {
+            failed_ = true;
+            return kInvalidSourceFileID;
+        }
+        return id;
+    }
+
+    /// Size of the table `file_id()` validates against.  Set once, immediately
+    /// after `source_files` is read and before any entry that references it.
+    void set_file_table_size(size_t size) { file_table_size_ = size; }
+
     /// Read a count, then that many elements.  The count is checked against the
     /// bytes remaining before anything is reserved: a element is at least one
     /// byte, so a count larger than what is left cannot be honest.
@@ -312,6 +339,7 @@ private:
     std::string_view bytes_;
     size_t offset_{0};
     std::vector<std::string_view> strings_;
+    size_t file_table_size_{0};
     bool failed_{false};
 };
 
@@ -333,7 +361,7 @@ void write_port(Writer& w, const PortEntry& p) {
 PortEntry read_port(Reader& r) {
     PortEntry p;
     p.name = r.str();
-    p.file_id = r.u32();
+    p.file_id = r.file_id();
     p.direction = r.str();
     p.type = r.str();
     p.decl_type = r.str();
@@ -354,7 +382,7 @@ void write_modport(Writer& w, const ModportEntry& m) {
 ModportEntry read_modport(Reader& r) {
     ModportEntry m;
     m.name = r.str();
-    m.file_id = r.u32();
+    m.file_id = r.file_id();
     m.line = r.i32();
     m.col = r.i32();
     return m;
@@ -381,7 +409,7 @@ void write_module(Writer& w, const ModuleEntry& m) {
 ModuleEntry read_module(Reader& r) {
     ModuleEntry m;
     m.name = r.str();
-    m.file_id = r.u32();
+    m.file_id = r.file_id();
     m.line = r.i32();
     m.col = r.i32();
     m.header_semi_line = r.i32();
@@ -411,7 +439,7 @@ NamedPortConn read_connection(Reader& r) {
     NamedPortConn c;
     c.port_name = r.str();
     c.signal_name = r.str();
-    c.file_id = r.u32();
+    c.file_id = r.file_id();
     c.line = r.i32();
     c.col = r.i32();
     c.hint_col = r.i32();
@@ -434,7 +462,7 @@ InstanceEntry read_instance(Reader& r) {
     i.module_name = r.str();
     i.instance_name = r.str();
     i.parent_module = r.str();
-    i.file_id = r.u32();
+    i.file_id = r.file_id();
     i.line = r.i32();
     i.start_line = r.i32();
     i.end_line = r.i32();
@@ -454,7 +482,7 @@ FieldEntry read_field(Reader& r) {
     FieldEntry f;
     f.name = r.str();
     f.type = r.str();
-    f.file_id = r.u32();
+    f.file_id = r.file_id();
     f.line = r.i32();
     f.col = r.i32();
     return f;
@@ -476,7 +504,7 @@ MethodEntry read_method(Reader& r) {
     m.return_type = r.str();
     m.params = r.str();
     m.is_task = r.boolean();
-    m.file_id = r.u32();
+    m.file_id = r.file_id();
     m.line = r.i32();
     m.col = r.i32();
     return m;
@@ -496,7 +524,7 @@ void write_class(Writer& w, const ClassEntry& c) {
 ClassEntry read_class(Reader& r) {
     ClassEntry c;
     c.name = r.str();
-    c.file_id = r.u32();
+    c.file_id = r.file_id();
     c.base_class = r.str();
     c.parent_scope = r.str();
     c.fields = r.seq<FieldEntry>([&] { return read_field(r); });
@@ -516,7 +544,7 @@ void write_enum_member(Writer& w, const EnumMemberEntry& e) {
 EnumMemberEntry read_enum_member(Reader& r) {
     EnumMemberEntry e;
     e.name = r.str();
-    e.file_id = r.u32();
+    e.file_id = r.file_id();
     e.line = r.i32();
     e.col = r.i32();
     return e;
@@ -540,7 +568,7 @@ TypedefEntry read_typedef(Reader& r) {
     t.name = r.str();
     t.resolved = r.str();
     t.parent_scope = r.str();
-    t.file_id = r.u32();
+    t.file_id = r.file_id();
     t.is_enum = r.boolean();
     t.is_struct = r.boolean();
     t.enum_members = r.seq<EnumMemberEntry>([&] { return read_enum_member(r); });
@@ -561,7 +589,7 @@ void write_macro(Writer& w, const MacroEntry& m) {
 MacroEntry read_macro(Reader& r) {
     MacroEntry m;
     m.name = r.str();
-    m.file_id = r.u32();
+    m.file_id = r.file_id();
     m.is_function_like = r.boolean();
     m.params = r.seq<std::string>([&] { return std::string(r.str()); });
     m.line = r.i32();
@@ -591,7 +619,7 @@ ValueEntry read_value(Reader& r) {
     v.parent_scope = r.str();
     v.generate_label = r.str();
     v.default_value = r.str();
-    v.file_id = r.u32();
+    v.file_id = r.file_id();
     v.scope_start_line = r.i32();
     v.scope_end_line = r.i32();
     v.line = r.i32();
@@ -616,7 +644,7 @@ ImportEntry read_import(Reader& r) {
     i.symbol_name = r.str();
     i.wildcard = r.boolean();
     i.parent_scope = r.str();
-    i.file_id = r.u32();
+    i.file_id = r.file_id();
     i.start_line = r.i32();
     i.end_line = r.i32();
     return i;
@@ -637,7 +665,7 @@ void write_reference(Writer& w, const ReferenceEntry& e) {
 ReferenceEntry read_reference(Reader& r) {
     ReferenceEntry e;
     e.name = r.str();
-    e.file_id = r.u32();
+    e.file_id = r.file_id();
     e.symbol_id.lo = r.u64();
     e.symbol_id.hi = r.u64();
     e.symbol_debug = r.str();
@@ -674,57 +702,6 @@ bool read_scoped_map(Reader& r, size_t bound, std::unordered_map<std::string, si
         out.try_emplace(std::string(key), index);
     }
     return true;
-}
-
-// Slurp a path that is expected to be an ordinary file, or give back nothing.
-//
-// `!in` does not mean "this is readable".  libstdc++ opens a directory
-// successfully and fails only in basic_filebuf::underflow, which *throws*
-// std::ios_base::failure whatever the stream's exception mask says -- so the
-// obvious ifstream + istreambuf_iterator pair terminates the process on a path
-// that is a directory, from a background thread with nothing to catch it.
-// Neither does a successful open promise the read returns: a FIFO opens, then
-// blocks forever on a writer that never comes.
-//
-// is_regular_file() answers both questions, and the catch is the backstop for a
-// path that stops being one between the check and the read.
-std::optional<std::string> read_regular_file(const fs::path& path) {
-    std::error_code ec;
-    if (!fs::is_regular_file(path, ec) || ec)
-        return std::nullopt;
-    try {
-        std::ifstream in(path, std::ios::binary);
-        if (!in)
-            return std::nullopt;
-        // Sized in one read rather than assembled a character at a time.  The
-        // istreambuf_iterator pair this replaces went through the streambuf's
-        // virtual sgetc/sbumpc per byte and grew the string as it went: 1.17 ms
-        // for a 636 KiB header against 0.036 ms here, and this path reads every
-        // file in the project on a warm start to hash it, plus every shard.
-        //
-        // The size comes from seeking the handle that is already open, not from
-        // a second look at the path: file_size() would be another metadata call
-        // per file, which is the thing a shared filesystem charges for.
-        in.seekg(0, std::ios::end);
-        const auto end = in.tellg();
-        if (end < 0)
-            return std::nullopt;
-        in.seekg(0, std::ios::beg);
-        std::string bytes(static_cast<size_t>(end), '\0');
-        if (end > 0)
-            in.read(bytes.data(), end);
-        if (in.bad())
-            return std::nullopt;
-        // A file that shrank between the seek and the read is short, not broken.
-        bytes.resize(static_cast<size_t>(in.gcount()));
-        return bytes;
-    } catch (const std::exception&) {
-        return std::nullopt;
-    }
-}
-
-std::string read_whole_file(const fs::path& path) {
-    return read_regular_file(path).value_or(std::string{});
 }
 
 // A field added to any of these without a matching codec update would be
@@ -789,9 +766,10 @@ std::optional<IndexCache::Digest> IndexCache::digest_file(const fs::path& path) 
     // A path that is not an ordinary file has no digest, and saying so is the
     // whole answer: the caller treats nullopt as "cannot key a shard on this",
     // which is the correct outcome for a directory or a FIFO standing where a
-    // source file used to be.  See read_regular_file() for why the plain
-    // ifstream this replaced aborted the process instead.
-    const auto bytes = read_regular_file(path);
+    // source file used to be.  See read_file_text_optional() for why this
+    // cannot be a plain ifstream, and for why it costs one path lookup rather
+    // than a stat and an open.
+    const auto bytes = read_file_text_optional(path);
     if (!bytes)
         return std::nullopt;
     return digest_bytes(*bytes);
@@ -951,7 +929,7 @@ fs::path IndexCache::shard_path(std::string_view uri) const {
 }
 
 std::optional<IndexCache::Loaded> IndexCache::load(std::string_view uri) const {
-    const auto bytes = read_whole_file(shard_path(uri));
+    const auto bytes = read_file_text_or_empty(shard_path(uri));
     if (bytes.empty())
         return std::nullopt;
     return deserialize_index_shard(bytes);
@@ -988,7 +966,7 @@ size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& 
             continue;
         // Anything but an ordinary file is not a shard, and reading one would
         // throw out of basic_filebuf rather than fail the stream -- the same
-        // trap read_regular_file() exists for.
+        // trap read_file_text_optional() exists for.
         std::error_code kind_ec;
         if (!entry.is_regular_file(kind_ec) || kind_ec)
             continue;
@@ -1203,6 +1181,9 @@ std::optional<IndexCache::Loaded> deserialize_index_shard(std::string_view bytes
     });
 
     index.source_files = r.seq<std::string>([&] { return std::string(r.str()); });
+    // Before any entry that names a file.  The table is written first precisely
+    // so this is possible.
+    r.set_file_table_size(index.source_files.size());
     index.include_dependencies = r.seq<std::string>([&] { return std::string(r.str()); });
     index.modules = r.seq<ModuleEntry>([&] { return read_module(r); });
     index.instances = r.seq<InstanceEntry>([&] { return read_instance(r); });
@@ -1255,25 +1236,6 @@ std::optional<IndexCache::Loaded> deserialize_index_shard(std::string_view bytes
         index.class_by_name.try_emplace(index.classes[i].name, i);
     for (size_t i = 0; i < index.typedefs.size(); ++i)
         index.typedef_by_name.try_emplace(index.typedefs[i].name, i);
-
-    // Every stored file_id has to address the table it was written against; a
-    // shard whose entries point outside it would hand the request path a URI
-    // from another file, or none.
-    const auto valid_file_id = [&](SourceFileID id) {
-        return id == kInvalidSourceFileID || id < index.source_files.size();
-    };
-    for (const auto& module : index.modules) {
-        if (!valid_file_id(module.file_id))
-            return std::nullopt;
-    }
-    for (const auto& reference : index.references) {
-        if (!valid_file_id(reference.file_id))
-            return std::nullopt;
-    }
-    for (const auto& value : index.values) {
-        if (!valid_file_id(value.file_id))
-            return std::nullopt;
-    }
 
     return loaded;
 }

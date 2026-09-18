@@ -236,46 +236,6 @@ static std::string format_emit_text(const std::string& text, const FormatOptions
     return formatted;
 }
 
-static std::string json_string(std::string_view text) {
-    std::string out;
-    // Most SystemVerilog text does not need escaping.  Reserve the common-case
-    // payload plus quotes up front so large formatting/workspace responses do
-    // not grow one byte at a time.  Escaped characters can exceed this estimate,
-    // but the reserve still removes nearly all reallocations for normal files.
-    out.reserve(text.size() + 2 + text.size() / 8);
-    out += "\"";
-    for (char c : text) {
-        switch (c) {
-        case '"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\b':
-            out += "\\b";
-            break;
-        case '\f':
-            out += "\\f";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += c;
-            break;
-        }
-    }
-    out += "\"";
-    return out;
-}
-
 static lsPosition document_end_position(const DocumentState& state) {
     return lsPosition(state.end_line, state.end_character);
 }
@@ -292,8 +252,8 @@ static std::string whole_document_workspace_edit_json(const std::string& uri,
                                                       const DocumentState& state,
                                                       const std::string& new_text) {
     const auto end = document_end_position(state);
-    const auto escaped_uri = json_string(uri);
-    const auto escaped_text = json_string(new_text);
+    const auto escaped_uri = json_quoted(uri);
+    const auto escaped_text = json_quoted(new_text);
     const auto end_line = std::to_string(end.line);
     const auto end_character = std::to_string(end.character);
 
@@ -378,26 +338,26 @@ static std::string did_change_config_file(lsp::Any settings_any) {
 }
 
 static std::string workspace_edit_json(const std::string& uri, const lsTextEdit& edit) {
-    return "{\"changes\":{" + json_string(uri) +
+    return "{\"changes\":{" + json_quoted(uri) +
            ":[{\"range\":{\"start\":{\"line\":" + std::to_string(edit.range.start.line) +
            ",\"character\":" + std::to_string(edit.range.start.character) +
            "},\"end\":{\"line\":" + std::to_string(edit.range.end.line) +
            ",\"character\":" + std::to_string(edit.range.end.character) +
-           "}},\"newText\":" + json_string(edit.newText) + "}]}}";
+           "}},\"newText\":" + json_quoted(edit.newText) + "}]}}";
 }
 
 static void append_rtl_tree_json(std::string& out, const RtlTreeNode& node, bool show_file,
                                  bool show_instance_name, size_t depth = 0) {
     constexpr size_t kMaxRtlTreeJsonDepth = 512;
     out += "{\"name\":";
-    out += json_string(node.name);
+    out += json_quoted(node.name);
     // Always include navigation metadata.  `rtltree.show_file` and
     // `rtltree.show_instance_name` control the rendered label in the client,
     // not whether <CR> can jump to a definition when that label is hidden.
     out += ",\"inst\":";
-    out += json_string(node.inst);
+    out += json_quoted(node.inst);
     out += ",\"file\":";
-    out += json_string(node.file);
+    out += json_quoted(node.file);
     out += ",\"line\":";
     out += std::to_string(node.line);
     out += ",\"col\":";
@@ -713,14 +673,20 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     // first, so the two have to stay in step -- appending to one without the
     // other silently reorders somebody else's burst.
     //
-    // Deduplicated through a set, not a linear scan of what is already there:
-    // a filelist is thousands of entries on a real design, and scanning the
-    // accumulated list per candidate makes discovering one project quadratic in
-    // its own size -- paid on the didOpen that discovers it, which is now the
-    // ordinary path for a client that sends no rootUri.
-    std::unordered_set<std::string> known(project_files_.begin(), project_files_.end());
+    // Deduplicated through `project_file_set_`, not a linear scan of what is
+    // already there: a filelist is thousands of entries on a real design, and
+    // scanning the accumulated list per candidate makes discovering one project
+    // quadratic in its own size -- paid on the didOpen that discovers it, which
+    // is now the ordinary path for a client that sends no rootUri.
+    //
+    // The set is a member and not a local for the same reason one level up.
+    // Rebuilt here per call, it made a *reload* quadratic in the number of
+    // projects instead: reload_all_projects() re-folds every known root, so the
+    // k-th fold rehashed everything the first k-1 had accumulated, on every
+    // lazyverilog.toml save.
+    project_file_set_.reserve(project_files_.size() + vcode.files.size());
     for (size_t i = 0; i < vcode.files.size(); ++i) {
-        if (!known.insert(vcode.files[i]).second)
+        if (!project_file_set_.insert(vcode.files[i]).second)
             continue;
         project_files_.push_back(vcode.files[i]);
         project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
@@ -784,6 +750,7 @@ void LazyVerilogServer::reload_all_projects() {
     project_include_dirs_.clear();
     project_files_.clear();
     project_file_sizes_.clear();
+    project_file_set_.clear();
     project_compilation_inputs_.clear();
     project_filelists_.clear();
 
@@ -828,6 +795,10 @@ void LazyVerilogServer::reload_all_projects() {
 void LazyVerilogServer::invalidate_config_cache() {
     if (root_resolver_)
         root_resolver_->invalidate();
+    // The other process-wide memo of a filesystem answer.  A config appearing or
+    // moving means the tree has been rearranged, which is exactly when a
+    // remembered path resolution can have stopped being true.
+    invalidate_normalized_path_cache();
     {
         std::lock_guard<std::mutex> lock(config_cache_mutex_);
         config_cache_.clear();
@@ -1213,13 +1184,22 @@ void LazyVerilogServer::register_handlers() {
                 // Only if the config really is here.  Recording a root that
                 // holds no lazyverilog.toml would suppress the discovery of the
                 // real one above it.
-                if (info)
-                    fold_project_root(info->source_root);
+                const bool folded = info && fold_project_root(info->source_root);
 
-                if (project_files_.empty()) {
+                if (!folded) {
                     // rootUri names a directory with no config above it.  There
                     // may still be a filelist to index, and no root to
                     // attribute it to.
+                    //
+                    // On "was a project folded", not on "is the filelist empty".
+                    // A project with a config and no filelist satisfies the
+                    // second, and this then overwrote everything the fold had
+                    // just accumulated -- with load_vcode() re-read against
+                    // `root_`, the client's spelling, rather than against the
+                    // project root the fold used.  An editor launched in a
+                    // subdirectory sends that subdirectory, so the two are not
+                    // the same place and the filelist resolved from the wrong
+                    // one.
                     //
                     // Read only here.  fold_project_root() above reads the
                     // filelist of the project it folds, so loading one
@@ -1232,6 +1212,9 @@ void LazyVerilogServer::register_handlers() {
                     project_include_dirs_ = vcode.include_dirs;
                     project_files_        = std::move(vcode.files);
                     project_file_sizes_   = std::move(vcode.file_sizes);
+                    // Nothing was folded, so the set is empty and this is what
+                    // keeps it in step with the assignment.
+                    project_file_set_.insert(project_files_.begin(), project_files_.end());
                     project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
                 }
 
@@ -1439,6 +1422,7 @@ void LazyVerilogServer::register_handlers() {
             deleted_uris.reserve(note.params.changes.size());
 
             bool config_changed = false;
+            bool tree_layout_changed = false;
             for (const auto& change : note.params.changes) {
                 const auto& uri = change.uri.raw_uri_;
                 if (uri.empty())
@@ -1469,7 +1453,21 @@ void LazyVerilogServer::register_handlers() {
                     deleted_uris.push_back(uri);
                 else
                     changed_uris.push_back(uri);
+                // A file appearing or disappearing can change what a path
+                // resolves to -- a symlink repointed by a branch switch, a real
+                // file replacing one, a directory that now exists.  Editing a
+                // file cannot, so a save does not land here: clearing the memo
+                // on every change would make each keystroke's successor re-walk
+                // the project.
+                if (change.type != lsFileChangeType::Changed)
+                    tree_layout_changed = true;
             }
+
+            // Once per batch, not once per event.  A branch switch reports
+            // hundreds of creates and deletes together, and they are one
+            // rearrangement.
+            if (tree_layout_changed)
+                invalidate_normalized_path_cache();
 
             if (config_changed) {
                 // The same two steps didChangeConfiguration takes, and for the
@@ -2018,12 +2016,12 @@ void LazyVerilogServer::register_handlers() {
                         json += ",";
                     const auto& [diag_uri, diag] = diagnostics[i];
                     json += "{";
-                    json += "\"uri\":" + json_string(diag_uri);
-                    json += ",\"file\":" + json_string(uri_to_file(diag_uri));
+                    json += "\"uri\":" + json_quoted(diag_uri);
+                    json += ",\"file\":" + json_quoted(uri_to_file(diag_uri));
                     json += ",\"line\":" + std::to_string(diag.line + 1);
                     json += ",\"col\":" + std::to_string(diag.col + 1);
-                    json += ",\"severity\":" + json_string(severity_text(diag.severity));
-                    json += ",\"message\":" + json_string(diag.message);
+                    json += ",\"severity\":" + json_quoted(severity_text(diag.severity));
+                    json += ",\"message\":" + json_quoted(diag.message);
                     json += "}";
                 }
                 json += "]";
@@ -2047,7 +2045,7 @@ void LazyVerilogServer::register_handlers() {
                 };
                 if (!result.error.empty()) {
                     comma();
-                    json += "\"error\":" + json_string(result.error);
+                    json += "\"error\":" + json_quoted(result.error);
                 }
                 if (result.warn) {
                     comma();
@@ -2064,8 +2062,8 @@ void LazyVerilogServer::register_handlers() {
                     if (i > 0)
                         json += ",";
                     json += "{";
-                    json += "\"src\":" + json_string(pair.src);
-                    json += ",\"dst\":" + json_string(pair.dst);
+                    json += "\"src\":" + json_quoted(pair.src);
+                    json += ",\"dst\":" + json_quoted(pair.dst);
                     json += ",\"missing_if\":" + std::string(pair.missing_if ? "true" : "false");
                     json += ",\"missing_else\":" + std::string(pair.missing_else ? "true" : "false");
                     json += "}";
@@ -2111,7 +2109,7 @@ void LazyVerilogServer::register_handlers() {
 
                 std::string json;
                 json += "{\"changes\":{";
-                json += json_string(uri);
+                json += json_quoted(uri);
                 json += ":[";
                 bool first = true;
                 for (const auto& edit : sorted_edits) {
@@ -2128,7 +2126,7 @@ void LazyVerilogServer::register_handlers() {
                     json += ",\"character\":";
                     json += character_str;
                     json += "}},\"newText\":";
-                    json += json_string(edit.text);
+                    json += json_quoted(edit.text);
                     json += '}';
                 }
                 json += "]}}";
