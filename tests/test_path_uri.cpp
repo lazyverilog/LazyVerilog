@@ -149,6 +149,64 @@ TEST_CASE("normalize_filesystem_path resolves through a memoized parent", "[path
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_CASE("path utils: the normalization memo can be dropped when the tree moves", "[path]") {
+    // The memo's premise is that a path which resolves on disk does not change
+    // spelling while the server is alive.  That is true of a file being edited
+    // and false of a tree being rearranged: repointing a symlink leaves every
+    // path under it resolving to where it used to go, and two code paths
+    // reaching one file then disagree about its URI -- the one thing
+    // normalize_filesystem_path() exists to prevent.
+    const auto root = std::filesystem::temp_directory_path() / "lazyverilog-memo-invalidate";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root / "ip_v1", ec);
+    std::filesystem::create_directories(root / "ip_v2", ec);
+    { std::ofstream out(root / "ip_v1" / "fifo.sv"); out << "module fifo; endmodule\n"; }
+    { std::ofstream out(root / "ip_v2" / "fifo.sv"); out << "module fifo; endmodule\n"; }
+
+    std::error_code link_ec;
+    std::filesystem::create_directory_symlink(root / "ip_v1", root / "ip", link_ec);
+    if (link_ec) {
+        SUCCEED("symlinks unavailable here");
+    }
+    else {
+        const auto through_link = root / "ip" / "fifo.sv";
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v1" / "fifo.sv"));
+
+        // The branch switch.
+        std::filesystem::remove(root / "ip", ec);
+        std::filesystem::create_directory_symlink(root / "ip_v2", root / "ip", link_ec);
+        REQUIRE_FALSE(link_ec);
+
+        // Still the old answer: that is the memo, and it is why an invalidation
+        // hook has to exist at all.
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v1" / "fifo.sv"));
+
+        invalidate_normalized_path_cache();
+
+        CHECK(normalize_filesystem_path(through_link) ==
+              normalize_filesystem_path(root / "ip_v2" / "fifo.sv"));
+    }
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("path utils: the normalization memo does not grow without bound", "[path]") {
+    // Nothing else releases it -- the memo has no expiry, by design -- so a
+    // server left running across many trees would hold every spelling it ever
+    // saw.  The cap is generous enough that a real project never reaches it.
+    const auto base = std::filesystem::temp_directory_path() / "lazyverilog-memo-cap";
+    for (size_t i = 0; i < NormalizedPathCache::kMaxEntries + 64; ++i)
+        (void)normalize_filesystem_path(base / ("m" + std::to_string(i) + ".sv"));
+
+    auto& cache = normalized_path_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    CHECK(cache.entries.size() <= NormalizedPathCache::kMaxEntries);
+    // And it is still a cache, not a disabled one.
+    CHECK(cache.entries.size() > 0);
+}
+
 TEST_CASE("read_file_text_optional survives a path that is not a regular file", "[path]") {
     // A filelist entry naming a directory is a typo, and the background compiler
     // reads filelist entries on its own thread.  libstdc++ opens a directory

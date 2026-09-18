@@ -447,13 +447,58 @@ inline std::string read_file_text_or_empty(const std::filesystem::path& path) {
 
 inline std::filesystem::path normalize_filesystem_path(const std::filesystem::path& path);
 
+/// The memo behind normalize_filesystem_path(), by input spelling.
+///
+/// Process-wide and shared by every thread, which is what makes it worth having
+/// -- and what makes the two things below somebody's problem rather than
+/// nobody's.
+struct NormalizedPathCache {
+    /// Above this, the map is dropped rather than grown.
+    ///
+    /// Entries are one per distinct spelling plus one per directory on the way,
+    /// so a project settles at a few tens of thousands and never reaches this.
+    /// A server left running for days across many trees does, and nothing else
+    /// would ever release it: the memo has no expiry, because its whole premise
+    /// is that a resolved path does not change spelling.  Dropping the map costs
+    /// one re-walk per directory afterwards, which is what the first lookup in a
+    /// session pays anyway.
+    static constexpr size_t kMaxEntries = 1u << 16;
+
+    std::mutex mutex;
+    std::unordered_map<std::string, std::string> entries;
+};
+
+inline NormalizedPathCache& normalized_path_cache() {
+    static NormalizedPathCache cache;
+    return cache;
+}
+
+/// Drop every memoized path resolution.
+///
+/// The memo's premise holds for a file being edited and not for the tree being
+/// rearranged underneath it: a branch switch that repoints a vendor-IP symlink
+/// leaves every path under it resolving to where it used to go, for the rest of
+/// the session, and two code paths reaching one file then disagree about its URI
+/// -- the single thing normalize_filesystem_path() exists to prevent.
+///
+/// So the premise is scoped by calling this when the tree is known to have
+/// moved, the way ProjectRootResolver::invalidate() scopes the same premise for
+/// the same kind of answer.  Not on every file change: a save must not cost a
+/// re-walk of the project.
+inline void invalidate_normalized_path_cache() {
+    auto& cache = normalized_path_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    cache.entries.clear();
+}
+
 /// Record @p result for @p key and hand it back, so each return path below is
 /// one line rather than three.
-inline std::filesystem::path
-cache_normalized(std::mutex& mutex, std::unordered_map<std::string, std::string>& cache,
-                 std::string key, std::filesystem::path result) {
-    std::lock_guard<std::mutex> lock(mutex);
-    cache.insert_or_assign(std::move(key), result.string());
+inline std::filesystem::path cache_normalized(std::string key, std::filesystem::path result) {
+    auto& cache = normalized_path_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.entries.size() >= NormalizedPathCache::kMaxEntries)
+        cache.entries.clear();
+    cache.entries.insert_or_assign(std::move(key), result.string());
     return result;
 }
 
@@ -485,13 +530,11 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
     // So resolve the parent through this same memo and append the last
     // component.  The prefix is then walked once per directory rather than once
     // per file, and a second file in a directory costs a single lookup.
-    static std::mutex cache_mutex;
-    static std::unordered_map<std::string, std::string> cache;
-
+    auto& cache = normalized_path_cache();
     auto key = path.string();
     {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        if (const auto it = cache.find(key); it != cache.end())
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (const auto it = cache.entries.find(key); it != cache.entries.end())
             return std::filesystem::path(it->second);
     }
 
@@ -530,14 +573,12 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
         // and the answer is then the parent's canonical spelling plus this name.
         (void)std::filesystem::read_symlink(candidate, link_ec);
         if (link_ec)
-            return cache_normalized(cache_mutex, cache, std::move(key),
-                                    candidate.lexically_normal());
+            return cache_normalized(std::move(key), candidate.lexically_normal());
         // A symlink at the leaf: hand it to the full walk.  It re-resolves the
         // prefix, which is wasted, but it is correct and it is rare.
         result = std::filesystem::weakly_canonical(candidate, ec);
         if (!ec)
-            return cache_normalized(cache_mutex, cache, std::move(key),
-                                    result.lexically_normal());
+            return cache_normalized(std::move(key), result.lexically_normal());
     }
 #endif
 
@@ -551,11 +592,7 @@ inline std::filesystem::path normalize_filesystem_path(const std::filesystem::pa
         result = result.lexically_normal();
     }
 
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        cache.insert_or_assign(std::move(key), result.string());
-    }
-    return result;
+    return cache_normalized(std::move(key), std::move(result));
 }
 
 inline bool is_windows_drive_path(std::string_view text) {

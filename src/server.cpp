@@ -795,6 +795,10 @@ void LazyVerilogServer::reload_all_projects() {
 void LazyVerilogServer::invalidate_config_cache() {
     if (root_resolver_)
         root_resolver_->invalidate();
+    // The other process-wide memo of a filesystem answer.  A config appearing or
+    // moving means the tree has been rearranged, which is exactly when a
+    // remembered path resolution can have stopped being true.
+    invalidate_normalized_path_cache();
     {
         std::lock_guard<std::mutex> lock(config_cache_mutex_);
         config_cache_.clear();
@@ -1409,6 +1413,7 @@ void LazyVerilogServer::register_handlers() {
             deleted_uris.reserve(note.params.changes.size());
 
             bool config_changed = false;
+            bool tree_layout_changed = false;
             for (const auto& change : note.params.changes) {
                 const auto& uri = change.uri.raw_uri_;
                 if (uri.empty())
@@ -1439,7 +1444,21 @@ void LazyVerilogServer::register_handlers() {
                     deleted_uris.push_back(uri);
                 else
                     changed_uris.push_back(uri);
+                // A file appearing or disappearing can change what a path
+                // resolves to -- a symlink repointed by a branch switch, a real
+                // file replacing one, a directory that now exists.  Editing a
+                // file cannot, so a save does not land here: clearing the memo
+                // on every change would make each keystroke's successor re-walk
+                // the project.
+                if (change.type != lsFileChangeType::Changed)
+                    tree_layout_changed = true;
             }
+
+            // Once per batch, not once per event.  A branch switch reports
+            // hundreds of creates and deletes together, and they are one
+            // rearrangement.
+            if (tree_layout_changed)
+                invalidate_normalized_path_cache();
 
             if (config_changed) {
                 // The same two steps didChangeConfiguration takes, and for the
