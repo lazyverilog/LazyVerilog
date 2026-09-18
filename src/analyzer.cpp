@@ -6405,8 +6405,9 @@ void Analyzer::replace_default_parse_inputs_locked(ParseInputs inputs) {
 }
 
 void Analyzer::set_project_compilation_inputs(std::vector<ProjectCompilationInputs> inputs) {
+    auto shared = std::make_shared<const std::vector<ProjectCompilationInputs>>(std::move(inputs));
     std::lock_guard<std::mutex> lock(map_mutex_);
-    project_compilation_inputs_ = std::move(inputs);
+    project_compilation_inputs_ = std::move(shared);
 }
 
 void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver) {
@@ -7710,12 +7711,19 @@ Analyzer::opened_file_index_shards(const std::string& current_uri) const {
 }
 
 CompilationSnapshot Analyzer::compilation_snapshot() const {
-    std::lock_guard<std::mutex> lock(map_mutex_);
-
     CompilationSnapshot snapshot;
-    // Which project each file belongs to is resolved by the compiler, off this
-    // lock; see CompilationSnapshot::parse_inputs.
+    std::shared_ptr<const std::vector<ProjectCompilationInputs>> projects;
+
+    // map_mutex_ covers gathering what the analyzer knows -- the open buffers,
+    // the merged filelist, the versions -- and nothing after it.  The grouping
+    // below reads only locals and these two pointers, and it walks the
+    // filesystem: deciding which project an unlisted buffer belongs to is an
+    // upward search that stats a directory per level, which on a shared
+    // filesystem is a round trip per level.  That is not work to do while every
+    // request thread is waiting on this lock.
+    std::unique_lock<std::mutex> lock(map_mutex_);
     snapshot.parse_inputs = parse_inputs_;
+    projects = project_compilation_inputs_;
 
     std::unordered_set<std::string> seen_uris;
     // Each file's index in snapshot.files, which is also the dedup set: the
@@ -7765,6 +7773,9 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         });
     }
 
+    // Everything below reads only locals, `projects` and `snapshot.parse_inputs`.
+    lock.unlock();
+
     // One group per project that asked for semantic compilation.
     //
     // Which declaration `fifo u_fifo ();` binds to is decided by the set of
@@ -7786,7 +7797,7 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // fall through to the fallback and compile the union anyway -- with one
     // project's defines over another project's files, publish_diagnostics()
     // then dropping every result, and nothing anywhere saying it had happened.
-    if (!project_compilation_inputs_.empty()) {
+    if (!projects->empty()) {
         // The open buffers, sorted by path.  docs_ is a hash map and the order
         // files enter a Compilation decides which definition wins a tie, so
         // taking bucket order would let one run disagree with the next.
@@ -7803,23 +7814,26 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
         // when asked.  Lazily, because the question only arises for a buffer no
         // project's filelist names: resolving every buffer up front costs an
         // upward directory walk each for the common session where every buffer
-        // is listed and the answer is never needed -- and that walk is exactly
-        // the filesystem work CompilationSnapshot::parse_inputs exists to keep
-        // off this lock.  Once each, because it is a fact about the buffer, not
-        // about the project it is being compared against.
+        // is listed and the answer is never needed.  Once each, because it is a
+        // fact about the buffer, not about the project it is being compared
+        // against.
+        //
+        // The laziness bounds how often the walk happens; running here, after
+        // map_mutex_ is released, is what keeps it off the lock.  It used to
+        // claim the first did the second.
         std::vector<std::optional<std::filesystem::path>> root_of_open(open_files.size());
         const auto open_root = [&](size_t slot) -> const std::filesystem::path& {
             if (!root_of_open[slot])
-                root_of_open[slot] =
-                    parse_inputs_->project_root_for(snapshot.files[open_files[slot]].path);
+                root_of_open[slot] = snapshot.parse_inputs->project_root_for(
+                    snapshot.files[open_files[slot]].path);
             return *root_of_open[slot];
         };
 
-        for (const auto& project : project_compilation_inputs_) {
+        for (const auto& project : *projects) {
             if (!project.background_compilation)
                 continue;
 
-            const auto& inputs = parse_inputs_->for_root(project.root);
+            const auto& inputs = snapshot.parse_inputs->for_root(project.root);
             CompilationGroup group;
             group.root = project.root.string();
             group.defines = inputs.defines;
@@ -7868,8 +7882,8 @@ CompilationSnapshot Analyzer::compilation_snapshot() const {
     // no branch to find it.
     else {
         CompilationGroup fallback;
-        fallback.defines = parse_inputs_->defaults().defines;
-        fallback.include_dirs = parse_inputs_->defaults().include_dirs;
+        fallback.defines = snapshot.parse_inputs->defaults().defines;
+        fallback.include_dirs = snapshot.parse_inputs->defaults().include_dirs;
         fallback.files.reserve(snapshot.files.size());
         for (uint32_t i = 0; i < snapshot.files.size(); ++i)
             fallback.files.push_back(i);
