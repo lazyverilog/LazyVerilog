@@ -673,14 +673,20 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     // first, so the two have to stay in step -- appending to one without the
     // other silently reorders somebody else's burst.
     //
-    // Deduplicated through a set, not a linear scan of what is already there:
-    // a filelist is thousands of entries on a real design, and scanning the
-    // accumulated list per candidate makes discovering one project quadratic in
-    // its own size -- paid on the didOpen that discovers it, which is now the
-    // ordinary path for a client that sends no rootUri.
-    std::unordered_set<std::string> known(project_files_.begin(), project_files_.end());
+    // Deduplicated through `project_file_set_`, not a linear scan of what is
+    // already there: a filelist is thousands of entries on a real design, and
+    // scanning the accumulated list per candidate makes discovering one project
+    // quadratic in its own size -- paid on the didOpen that discovers it, which
+    // is now the ordinary path for a client that sends no rootUri.
+    //
+    // The set is a member and not a local for the same reason one level up.
+    // Rebuilt here per call, it made a *reload* quadratic in the number of
+    // projects instead: reload_all_projects() re-folds every known root, so the
+    // k-th fold rehashed everything the first k-1 had accumulated, on every
+    // lazyverilog.toml save.
+    project_file_set_.reserve(project_files_.size() + vcode.files.size());
     for (size_t i = 0; i < vcode.files.size(); ++i) {
-        if (!known.insert(vcode.files[i]).second)
+        if (!project_file_set_.insert(vcode.files[i]).second)
             continue;
         project_files_.push_back(vcode.files[i]);
         project_file_sizes_.push_back(i < vcode.file_sizes.size() ? vcode.file_sizes[i] : 0);
@@ -744,6 +750,7 @@ void LazyVerilogServer::reload_all_projects() {
     project_include_dirs_.clear();
     project_files_.clear();
     project_file_sizes_.clear();
+    project_file_set_.clear();
     project_compilation_inputs_.clear();
     project_filelists_.clear();
 
@@ -1192,6 +1199,9 @@ void LazyVerilogServer::register_handlers() {
                     project_include_dirs_ = vcode.include_dirs;
                     project_files_        = std::move(vcode.files);
                     project_file_sizes_   = std::move(vcode.file_sizes);
+                    // Reached only when nothing was folded, so the set is empty
+                    // and this is what keeps it in step with the assignment.
+                    project_file_set_.insert(project_files_.begin(), project_files_.end());
                     project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
                 }
 

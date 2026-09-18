@@ -163,6 +163,16 @@ class LazyVerilogServer {
     std::vector<std::string> project_include_dirs_;
     std::vector<std::string> project_files_;
     std::vector<uintmax_t> project_file_sizes_;
+    /// Membership of `project_files_`, kept in step with it.
+    ///
+    /// The dedup is a set rather than a linear scan because a filelist is
+    /// thousands of entries on a real design.  It lives here rather than inside
+    /// fold_project_root() because that function is called once per project and
+    /// rebuilding the set per call made *reloading* quadratic in project count:
+    /// a saved config re-folds every known root, so the k-th fold rehashed
+    /// everything the first k-1 had accumulated.  Twenty projects of five
+    /// thousand files each is ~1M string constructions per save.
+    std::unordered_set<std::string> project_file_set_;
     /// Each project's *own* filelist and its `[compilation]` answer, kept
     /// alongside the union above rather than folded into it.
     ///
