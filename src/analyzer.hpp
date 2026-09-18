@@ -401,7 +401,12 @@ struct ProjectCompilationInputs {
 struct CompilationGroup {
     /// The project this compiles, or empty for the ungrouped fallback.
     std::string root;
-    std::vector<CompilationSourceFile> files;
+    /// Indices into CompilationSnapshot::files, not copies.  The snapshot owns
+    /// every file once, so a file two projects' filelists both name is one
+    /// entry referenced twice rather than two copies of its URI and path --
+    /// which matters because the snapshot is built under the analyzer's map
+    /// lock, and the union is thousands of entries on a real design.
+    std::vector<uint32_t> files;
     /// This project's own, not the merged defaults.  One Compilation has one
     /// preprocessor, which is exactly why it has to be one project's.
     std::vector<std::string> defines;
@@ -409,13 +414,16 @@ struct CompilationGroup {
 };
 
 struct CompilationSnapshot {
+    /// Every file any group compiles, owned once and referenced by index.
     std::vector<CompilationSourceFile> files;
-    std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
-    /// What actually gets compiled: one entry per project whose config asks for
-    /// it.  Empty means no project registered any -- a CLI tool, a test, or a
-    /// client that sent no rootUri -- and then `files` above is compiled as one
-    /// group against the merged defaults, which is what this did before.
+    /// What actually gets compiled.  One entry per project whose config asks
+    /// for it, or -- when no project registered any, which is a CLI tool, a
+    /// test, or a client that sent no rootUri -- a single group with an empty
+    /// root over every file, against the merged defaults.
+    ///
+    /// The fallback is a group rather than a second shape the consumer has to
+    /// reconstruct: `files` says what exists, `groups` says what is compiled,
+    /// and nothing has to know which of two representations is live.
     std::vector<CompilationGroup> groups;
     std::vector<std::string> open_uris;
     std::unordered_map<std::string, uint64_t> uri_versions;
@@ -699,23 +707,16 @@ class Analyzer {
     /// philosophy: current file uses AST, project files use index.
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
 
-    /// The same shards, ordered nearest-first against @p from_path.
+    /// The published shard snapshot, ordered nearest-first against @p state's
+    /// own path -- the order every by-name scan over the project has to run in,
+    /// see by_path_proximity().
     ///
-    /// This is the order every by-name scan over the project has to run in --
-    /// see by_path_proximity() -- and it is memoized because computing it is
-    /// linear in the filelist while the thing it depends on is not: the
-    /// snapshot is immutable and shared until the next publish, and a person
-    /// asks several questions about the same buffer before either changes.
-    /// Ordering per request instead measured 129us on 1500 files and 455us on
-    /// 5000, against a go-to-definition that otherwise answers in single-digit
-    /// microseconds.
-    ///
-    /// Holding @p files keeps the pointers valid and makes its address a sound
-    /// cache key; without that a freed snapshot could be replaced by a new one
-    /// at the same address and this would hand back pointers into it.
+    /// The only public way to ask, deliberately: the two-argument form below is
+    /// private because its @p from_path is the one thing a caller can get wrong
+    /// silently (a URI scores every candidate zero), and @p state already knows
+    /// the answer.
     std::shared_ptr<const std::vector<const ExtraFileInfo*>>
-    ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
-                       std::string_view from_path) const;
+    ranked_extra_files(const DocumentState& state) const;
 
     /// Return the last background-published project-wide shard snapshot.
     ///
@@ -780,6 +781,22 @@ class Analyzer {
   private:
     std::shared_ptr<DocumentState> make_state(const std::string& uri,
                                               const std::string& text) const;
+    /// The same ordering against an explicit snapshot and path.
+    ///
+    /// Memoized, because computing it is linear in the filelist while the thing
+    /// it depends on is not: the snapshot is immutable and shared until the next
+    /// publish, and a person asks several questions about the same buffer before
+    /// either changes.  Ordering per request instead measured 129us on 1500
+    /// files and 455us on 5000, against a go-to-definition that otherwise
+    /// answers in single-digit microseconds.
+    ///
+    /// Holding @p files keeps the pointers valid and makes its address a sound
+    /// cache key; without that a freed snapshot could be replaced by a new one
+    /// at the same address and this would hand back pointers into it.
+    std::shared_ptr<const std::vector<const ExtraFileInfo*>>
+    ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                       std::string_view from_path) const;
+
     /// @p ranked is the candidate files **in the order they should be tried**.
     /// Every search below takes the first that can answer, so that order is
     /// what decides which project a name resolves into; the caller owns it
@@ -876,10 +893,11 @@ class Analyzer {
     /// shared_ptr, so a worker can hold one across a whole parse while a config
     /// reload installs a replacement -- there is no window in which a parse
     /// reads half of one project's inputs and half of another's.
-    /// Guarded by map_mutex_, read by compilation_snapshot().
-    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     std::shared_ptr<const ProjectParseInputs> parse_inputs_ =
         std::make_shared<const ProjectParseInputs>();
+    /// What each project compiles, and whether it wants to.  Guarded by
+    /// map_mutex_, read by compilation_snapshot().
+    std::vector<ProjectCompilationInputs> project_compilation_inputs_;
     // Normalized absolute lexical filesystem paths.  Writers normalize before
     // storing so hot snapshot/request paths can trust the invariant instead of
     // repeating path normalization under map_mutex_ for large filelists.

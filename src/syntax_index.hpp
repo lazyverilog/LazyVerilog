@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <span>
 #include <memory>
 #include <cstdint>
@@ -504,6 +505,35 @@ struct ProjectIndexSnapshot {
 /// separator so a Windows path and a POSIX one score the same way.
 size_t shared_path_prefix_components(std::string_view a, std::string_view b);
 
+/// Each element's proximity score against @p from_path, or nullopt when the
+/// candidates are already in the order a ranking would put them in.
+///
+/// The one place that decides "does this need reordering at all".  One project
+/// open -- the overwhelmingly common case -- scores every candidate identically,
+/// and answering that here rather than at each caller is what keeps the two
+/// ranking entry points from each deriving it their own way and drifting.
+///
+/// `is_sorted` rather than "all scores equal", because a candidate list that
+/// already happens to descend needs no sort either, and the test costs the same.
+template <typename T>
+std::optional<std::vector<size_t>> path_proximity_scores(std::span<const T> items,
+                                                         std::string_view from_path) {
+    if (from_path.empty() || items.size() < 2)
+        return std::nullopt;
+
+    // Score once per candidate rather than once per comparison: the scoring
+    // walks two paths component-wise, and a sort would call it O(n log n)
+    // times on a filelist that is thousands of entries on a real design.
+    std::vector<size_t> score;
+    score.reserve(items.size());
+    for (const auto& item : items)
+        score.push_back(shared_path_prefix_components(from_path, item.path));
+
+    if (std::is_sorted(score.begin(), score.end(), std::greater<>()))
+        return std::nullopt;
+    return score;
+}
+
 /// The elements of @p items, nearest-first against @p from_path.
 ///
 /// Every by-name search over the project's files needs this order, because
@@ -534,33 +564,18 @@ std::vector<const T*> by_path_proximity(std::span<const T> items, std::string_vi
     ranked.reserve(items.size());
     for (const auto& item : items)
         ranked.push_back(&item);
-    if (from_path.empty() || ranked.size() < 2)
+    const auto score = path_proximity_scores(items, from_path);
+    if (!score)
         return ranked;
 
-    // Score once per candidate rather than once per comparison: the scoring
-    // walks two paths component-wise, and a sort would call it O(n log n)
-    // times on a filelist that is thousands of entries on a real design.
-    std::vector<size_t> score;
-    score.reserve(items.size());
-    for (const auto& item : items)
-        score.push_back(shared_path_prefix_components(from_path, item.path));
-
-    // One project open -- the overwhelmingly common case -- scores every
-    // candidate identically, and the order is already the one we would produce.
-    // Leaving early there keeps this a single linear pass with no allocation
-    // beyond the pointers the caller needs anyway.
-    if (std::adjacent_find(score.begin(), score.end(), std::not_equal_to<>()) == score.end())
-        return ranked;
-
-    std::vector<size_t> order;
-    order.reserve(items.size());
-    for (size_t i = 0; i < items.size(); ++i)
-        order.push_back(i);
-    // Stable, so equally distant candidates keep the caller's path order.
-    std::stable_sort(order.begin(), order.end(),
-                     [&score](size_t a, size_t b) { return score[a] > score[b]; });
-    for (size_t i = 0; i < order.size(); ++i)
-        ranked[i] = &items[order[i]];
+    // Stable, so equally distant candidates keep the caller's path order.  The
+    // pointers are sorted in place against the precomputed scores, indexed by
+    // each candidate's offset -- that is what keeps the scoring one pass rather
+    // than one call per comparison.
+    std::stable_sort(ranked.begin(), ranked.end(), [&](const T* a, const T* b) {
+        return (*score)[static_cast<size_t>(a - items.data())] >
+               (*score)[static_cast<size_t>(b - items.data())];
+    });
     return ranked;
 }
 
@@ -570,12 +585,26 @@ std::vector<const T*> by_path_proximity(std::span<const T> items, std::string_vi
 /// consumers by reference.
 template <typename T>
 void order_by_path_proximity(std::vector<T>& items, std::string_view from_path) {
-    if (from_path.empty() || items.size() < 2)
+    // Nothing to move when the candidates are already in the order we would
+    // produce -- see path_proximity_scores(), which is the one place that
+    // decides it.  `items` is the caller's own elements (Connect's are one
+    // FileView per open buffer *and* per project shard), so rebuilding the
+    // vector to reproduce its current order would be the whole cost of the call
+    // in the common session.
+    const auto score = path_proximity_scores(std::span<const T>(items), from_path);
+    if (!score)
         return;
-    const auto ranked = by_path_proximity(std::span<const T>(items), from_path);
+
+    std::vector<size_t> order;
+    order.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i)
+        order.push_back(i);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return (*score)[a] > (*score)[b]; });
+
     std::vector<T> reordered;
     reordered.reserve(items.size());
-    for (const T* item : ranked)
-        reordered.push_back(std::move(items[static_cast<size_t>(item - items.data())]));
+    for (size_t i : order)
+        reordered.push_back(std::move(items[i]));
     items = std::move(reordered);
 }

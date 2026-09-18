@@ -190,8 +190,16 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   *worker*: `background_compilation_debounce_ms` and `log_timing` are one timer and one
   log stream, and `any_project_compiles()` starts it when anybody wants it.
 - A session with **no registered project** — a CLI tool, a test, a client that sent no
-  `rootUri` — has no groups and falls back to one merged `Compilation`, exactly as
-  before.  That fallback is the reason the source libraries below still matter.
+  `rootUri` — gets **one group with an empty root** over every file, against the merged
+  defaults: one merged `Compilation`, exactly as before.  `compilation_snapshot()` emits
+  that group rather than leaving `groups` empty for the compiler to reconstruct, so
+  `groups` is the only answer to "what gets compiled" and `BackgroundCompiler::compile()`
+  needs no branch to find it.  An empty `root` is what marks it, and that is the reason
+  the source libraries below still matter.
+- `CompilationGroup::files` holds **indices into `CompilationSnapshot::files`**, which owns
+  every file once.  A file two projects' filelists both name is one entry referenced twice,
+  not two copies of its URI and path — the snapshot is built under `map_mutex_`, and the
+  union is thousands of entries on a real design.
 - An open buffer under **no** `lazyverilog.toml` joins no group, and that is its config
   speaking, not an oversight.  `config_for()` resolves such a file to `Config{}` and
   `[compilation].background_compilation` defaults to **false**, so

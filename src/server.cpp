@@ -730,9 +730,10 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     // two projects share belongs to both compilations -- dropping it from the
     // second because the first got there first would leave that project unable
     // to resolve a module its filelist names.
+    const size_t project_file_count = vcode.files.size();
     project_compilation_inputs_.push_back(ProjectCompilationInputs{
         .root = source_root,
-        .files = vcode.files,
+        .files = std::move(vcode.files),
         .background_compilation = config.compilation.background_compilation,
     });
 
@@ -760,7 +761,7 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
     // project's path could not answer this question anyway.
     project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
 
-    std::cerr << "[lazyverilog] project " << key << " (" << vcode.files.size() << " files)\n";
+    std::cerr << "[lazyverilog] project " << key << " (" << project_file_count << " files)\n";
     return true;
 }
 
@@ -870,6 +871,13 @@ bool LazyVerilogServer::any_project_compiles() const {
                        });
 }
 
+std::vector<ParseDiagInfo> LazyVerilogServer::semantic_diagnostics_for(const std::string& uri,
+                                                                       const Config& config) const {
+    if (!config.compilation.background_compilation)
+        return {};
+    return analyzer_.semantic_diagnostics(uri);
+}
+
 void LazyVerilogServer::configure_background_compiler() {
     if (!background_compiler_)
         return;
@@ -965,14 +973,12 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
                 add_diag(std::move(diag));
         }
 
-        // This file's project, not the session's: a project with
-        // `[compilation]` off shows no semantic diagnostics in its buffers even
-        // while the project open beside it is compiling.
-        if (file_config->compilation.background_compilation) {
-            auto semantic_diags = analyzer_.semantic_diagnostics(uri);
-            auto& target = diags_by_uri[uri];
-            target.insert(target.end(), semantic_diags.begin(), semantic_diags.end());
-        }
+        // Gated on this file's own project, inside semantic_diagnostics_for().
+        auto semantic_diags = semantic_diagnostics_for(uri, *file_config);
+        auto& semantic_target = diags_by_uri[uri];
+        semantic_target.insert(semantic_target.end(),
+                               std::make_move_iterator(semantic_diags.begin()),
+                               std::make_move_iterator(semantic_diags.end()));
 
         auto& previously_published = diagnostic_uris_by_owner_[uri];
         for (const auto& old_uri : previously_published)
@@ -2001,18 +2007,9 @@ void LazyVerilogServer::register_handlers() {
                         add_diag(uri, std::move(diag));
 
                     // This file's config, for the same reason the lint rules
-                    // above use it: `[compilation]` is per project, so the
-                    // session's answer is the wrong one for every file that is
-                    // not in the session's own project -- including a file
-                    // under no project at all, whose `Config{}` leaves
-                    // `background_compilation` at its default of false.  This
-                    // read stayed on `config_` when the rest went per project,
-                    // two lines below one that had already moved.
-                    if (file_config->compilation.background_compilation) {
-                        auto semantic_diags = analyzer_.semantic_diagnostics(uri);
-                        for (auto diag : semantic_diags)
-                            add_diag(uri, std::move(diag));
-                    }
+                    // above use it; semantic_diagnostics_for() holds the gate.
+                    for (auto& diag : semantic_diagnostics_for(uri, *file_config))
+                        add_diag(uri, std::move(diag));
                 }
 
                 std::string json = "[";
