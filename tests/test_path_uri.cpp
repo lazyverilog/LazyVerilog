@@ -3,6 +3,11 @@
 #include <filesystem>
 #include <fstream>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
 TEST_CASE("path utils: POSIX file URI decoding is unchanged", "[path][uri]") {
     CHECK(path_from_file_uri("file:///tmp/lazyverilog/top.sv") ==
           "/tmp/lazyverilog/top.sv");
@@ -167,3 +172,31 @@ TEST_CASE("read_file_text_optional survives a path that is not a regular file", 
     CHECK(empty_text->empty());
     std::filesystem::remove(empty, ec);
 }
+
+#ifndef _WIN32
+TEST_CASE("read_file_text_optional does not block on a FIFO", "[path]") {
+    // The other hazard the kind check exists for, and the one that decides how
+    // the file is opened: a FIFO opens successfully and then blocks forever on a
+    // writer that never comes.  A filelist naming one would hang an index worker
+    // with no diagnostic at all.
+    //
+    // Answered from the handle rather than from the path -- O_NONBLOCK returns
+    // immediately, fstat() says it is not a regular file, and the read never
+    // happens.  A separate is_regular_file() would answer the same question at
+    // the cost of resolving the path twice, which on a shared filesystem is a
+    // round trip per component of every file in the project.
+    //
+    // POSIX only: mkfifo has no Windows equivalent, and that build keeps the
+    // path check.
+    const auto fifo = std::filesystem::temp_directory_path() / "lazyverilog-fifo.sv";
+    std::error_code ec;
+    std::filesystem::remove(fifo, ec);
+    if (::mkfifo(fifo.c_str(), 0600) != 0)
+        SUCCEED("mkfifo unavailable here");
+    else {
+        // Returns rather than hangs; the test timing out is the failure mode.
+        CHECK_FALSE(read_file_text_optional(fifo).has_value());
+        std::filesystem::remove(fifo, ec);
+    }
+}
+#endif
