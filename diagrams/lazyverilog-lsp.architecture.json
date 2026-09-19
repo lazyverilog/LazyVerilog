@@ -1,0 +1,523 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "LazyVerilog LSP Architecture",
+    "output": "lazyverilog-lsp-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/lazyverilog/LazyVerilog",
+      "provider": "github",
+      "revision": "7c2456e1421d6c6c12ed8db58750921dceab6f64"
+    },
+    "views": [
+      {
+        "id": "edit-path",
+        "label": "Keystroke path",
+        "focus": [
+          "editors",
+          "server",
+          "features",
+          "analyzer",
+          "docs"
+        ],
+        "note": "What runs between a keystroke and the answer the editor renders."
+      },
+      {
+        "id": "index-path",
+        "label": "Background indexing",
+        "focus": [
+          "analyzer",
+          "indexq",
+          "shards",
+          "diskcache"
+        ],
+        "note": "Closed project files become per-file shards that survive a restart."
+      },
+      {
+        "id": "project-model",
+        "label": "Project resolution",
+        "focus": [
+          "projectcfg",
+          "server",
+          "analyzer"
+        ],
+        "note": "The server decides which project a file belongs to, per file."
+      },
+      {
+        "id": "semantic",
+        "label": "Semantic compilation",
+        "focus": [
+          "analyzer",
+          "bgcompiler",
+          "shards"
+        ],
+        "note": "One slang Compilation per project, off the request path."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "editors",
+      "type": "external",
+      "label": "Editor Clients",
+      "sublabel": "Neovim · VS Code",
+      "tag": "sends no rootUri",
+      "pos": [
+        40,
+        192
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "lua/lazyverilog/lsp.lua",
+          "label": "Neovim client"
+        },
+        {
+          "path": "vscode/src/extension.ts",
+          "label": "VS Code extension"
+        }
+      ]
+    },
+    {
+      "id": "projectcfg",
+      "type": "cloud",
+      "label": "Project Resolution",
+      "sublabel": "lazyverilog.toml · .f",
+      "tag": "per file, not session",
+      "pos": [
+        297,
+        60
+      ],
+      "size": [
+        186,
+        72
+      ],
+      "sources": [
+        {
+          "path": "src/project_root.hpp",
+          "line": 40,
+          "label": "ProjectRootResolver"
+        },
+        {
+          "path": "src/parse_inputs.hpp",
+          "line": 52,
+          "label": "ProjectParseInputs"
+        },
+        {
+          "path": "src/filelist.cpp",
+          "line": 325,
+          "label": "load_vcode()"
+        }
+      ]
+    },
+    {
+      "id": "server",
+      "type": "frontend",
+      "label": "LSP Server",
+      "sublabel": "JSON-RPC over stdio",
+      "tag": "1 dispatch + 2 workers",
+      "pos": [
+        297,
+        192
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/server.cpp",
+          "line": 1022,
+          "label": "register_handlers()"
+        },
+        {
+          "path": "src/server.cpp",
+          "line": 912,
+          "label": "publish_diagnostics()"
+        },
+        {
+          "path": "src/request_pool.hpp",
+          "line": 21,
+          "label": "RequestPool"
+        }
+      ]
+    },
+    {
+      "id": "formatter",
+      "type": "backend",
+      "label": "Formatter",
+      "sublabel": "8 passes · slang tokens",
+      "tag": "idempotent by design",
+      "pos": [
+        297,
+        320
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/features/formatter.cpp",
+          "line": 79,
+          "end_line": 103,
+          "label": "format_source()"
+        }
+      ]
+    },
+    {
+      "id": "features",
+      "type": "backend",
+      "label": "Feature Handlers",
+      "sublabel": "one file per feature",
+      "tag": "defs · refs · lint",
+      "pos": [
+        554,
+        192
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/features/completion.cpp",
+          "label": "completion"
+        },
+        {
+          "path": "src/features/definition.cpp",
+          "label": "go-to-definition"
+        },
+        {
+          "path": "src/features/lint.cpp",
+          "label": "lint"
+        }
+      ]
+    },
+    {
+      "id": "diskcache",
+      "type": "database",
+      "label": "Shard Cache",
+      "sublabel": ".cache/lazyverilog",
+      "tag": "content-digest keyed",
+      "pos": [
+        554,
+        320
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/index_cache.hpp",
+          "line": 40,
+          "label": "IndexCache"
+        },
+        {
+          "path": "src/index_cache.hpp",
+          "line": 194,
+          "label": "IndexCacheStorage"
+        }
+      ]
+    },
+    {
+      "id": "bgcompiler",
+      "type": "backend",
+      "label": "Background Compiler",
+      "sublabel": "Compilation per project",
+      "tag": "1 worker · 1.5 s debounce",
+      "pos": [
+        810,
+        64
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/background_compiler.hpp",
+          "line": 47,
+          "label": "BackgroundCompiler"
+        }
+      ]
+    },
+    {
+      "id": "analyzer",
+      "type": "backend",
+      "label": "Analyzer",
+      "sublabel": "slang parse core",
+      "tag": "one per session",
+      "pos": [
+        810,
+        188
+      ],
+      "size": [
+        186,
+        76
+      ],
+      "sources": [
+        {
+          "path": "src/analyzer.hpp",
+          "line": 457,
+          "label": "class Analyzer"
+        },
+        {
+          "path": "src/analyzer.cpp",
+          "line": 8366,
+          "label": "background_index_loop()"
+        }
+      ]
+    },
+    {
+      "id": "indexq",
+      "type": "messagebus",
+      "label": "Index Queue",
+      "sublabel": "largest file first",
+      "tag": "preload + warmup gates",
+      "pos": [
+        810,
+        320
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/analyzer.cpp",
+          "line": 8366,
+          "label": "index worker loop"
+        }
+      ]
+    },
+    {
+      "id": "docs",
+      "type": "database",
+      "label": "Open Buffers",
+      "sublabel": "DocumentState + AST",
+      "tag": "immutable per edit",
+      "pos": [
+        1068,
+        192
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/document_state.hpp",
+          "line": 65,
+          "label": "DocumentState"
+        }
+      ]
+    },
+    {
+      "id": "shards",
+      "type": "database",
+      "label": "Index Snapshot",
+      "sublabel": "per-file index shards",
+      "tag": "path-proximity ranked",
+      "pos": [
+        1068,
+        320
+      ],
+      "size": [
+        186,
+        68
+      ],
+      "sources": [
+        {
+          "path": "src/syntax_index.hpp",
+          "line": 464,
+          "label": "ProjectIndexSnapshot"
+        },
+        {
+          "path": "src/syntax_index.hpp",
+          "line": 338,
+          "label": "SyntaxIndex"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-requests",
+      "from": "editors",
+      "to": "server",
+      "label": "stdio JSON-RPC",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        262,
+        176
+      ]
+    },
+    {
+      "id": "route-handlers",
+      "from": "server",
+      "to": "features",
+      "label": "config_for(uri)",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        518,
+        176
+      ]
+    },
+    {
+      "id": "state-query",
+      "from": "features",
+      "to": "analyzer",
+      "label": "parsed snapshot",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        831,
+        176
+      ]
+    },
+    {
+      "id": "live-snapshot",
+      "from": "analyzer",
+      "to": "docs",
+      "label": "snapshot per edit",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        1032,
+        176
+      ]
+    },
+    {
+      "id": "compile-snapshot",
+      "from": "analyzer",
+      "to": "bgcompiler",
+      "label": "compilation_snapshot()",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        1000,
+        154
+      ]
+    },
+    {
+      "id": "file-config",
+      "from": "projectcfg",
+      "to": "server",
+      "label": "per-file config",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        560,
+        150
+      ]
+    },
+    {
+      "id": "parse-inputs",
+      "from": "projectcfg",
+      "to": "analyzer",
+      "label": "defines · +incdir+",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "format-call",
+      "from": "features",
+      "to": "formatter",
+      "label": "format_source()",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          647,
+          290
+        ],
+        [
+          390,
+          290
+        ]
+      ],
+      "labelAt": [
+        520,
+        284
+      ]
+    },
+    {
+      "id": "queue-files",
+      "from": "analyzer",
+      "to": "indexq",
+      "label": "queues filelist",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        1032,
+        292
+      ]
+    },
+    {
+      "id": "publish-index",
+      "from": "indexq",
+      "to": "shards",
+      "label": "publishes snapshot",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        1032,
+        404
+      ]
+    },
+    {
+      "id": "shard-cache",
+      "from": "indexq",
+      "to": "diskcache",
+      "label": "preload · writer thread",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        775,
+        404
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Request path",
+      "items": [
+        "One thread reads and dispatches, so an edit lands before anything queued behind it",
+        "foldingRange and inlayHint run on a 2-worker pool so they never block completion",
+        "A request arriving mid-parse is answered from the previous snapshot, not with nothing"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Index model",
+      "items": [
+        "Current file: live slang AST. Closed project files: compact index shards",
+        "One union index; a duplicated module name is ranked by path proximity, never filtered",
+        "Shards persist per project, keyed on content digests rather than mtime"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Project model",
+      "items": [
+        "The server resolves each file to its nearest lazyverilog.toml; the editor sends no root",
+        "Defines and +incdir+ are per file, against a single Analyzer",
+        "Compilation is per project; its diagnostics return via the Analyzer cache"
+      ]
+    }
+  ]
+}
