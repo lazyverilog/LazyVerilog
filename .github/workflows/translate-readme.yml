@@ -1,0 +1,82 @@
+name: Translate README
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - scripts/translate-readme/**
+      - .github/workflows/translate-readme.yml
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Language codes, or --tier N, or --all (see scripts/translate-readme --help)"
+        required: false
+        default: "--tier 1"
+        type: string
+      force:
+        description: "Re-translate even when the cached source hash matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+# Serialized: each run commits docs/i18n, so a second run must see the first
+# run's cache rather than race it.
+concurrency:
+  group: translate-readme
+  cancel-in-progress: false
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: scripts/translate-readme/package-lock.json
+
+      - name: Install
+        working-directory: scripts/translate-readme
+        run: npm ci
+
+      # Without this the SDK fails deep in the subprocess with a message that
+      # does not name the missing secret.
+      - name: Check credentials
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not set for this repository."
+            echo "Create one with 'claude setup-token' on an account with API access,"
+            echo "then add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Translate
+        working-directory: scripts/translate-readme
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Through the environment rather than interpolated into the script:
+          # the inputs are argument lists, not shell to be expanded.
+          LANGUAGES: ${{ inputs.languages || '--tier 1' }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+        run: node index.ts $LANGUAGES $FORCE
+
+      - name: Commit translations
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/i18n
+          if git diff --cached --quiet; then
+            echo "no translation changes"
+            exit 0
+          fi
+          git commit -m "docs: refresh README translations"
+          git push origin "HEAD:${{ github.ref_name }}"

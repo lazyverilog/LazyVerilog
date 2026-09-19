@@ -1,0 +1,21 @@
+{
+  "name": "lazyverilog-translate-readme",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Translates the root README.md into docs/i18n/README.<lang>.md with the Claude Agent SDK.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "translate-readme": "node index.ts",
+    "translate:tier1": "node index.ts --tier 1",
+    "translate:tier2": "node index.ts --tier 2",
+    "translate:tier3": "node index.ts --tier 3",
+    "translate:tier4": "node index.ts --tier 4",
+    "translate:all": "node index.ts --all"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.278"
+  }
+}

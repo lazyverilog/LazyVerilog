@@ -25,6 +25,7 @@ SystemVerilog LSP server written in C++. Provides language intelligence (formatt
 | `docs/` | Documentation for formatter options and diagnostics (see `docs/AGENTS.md`) |
 | `tools/` | Dev/benchmark utilities (see `tools/AGENTS.md`) |
 | `lua/` | Neovim plugin Lua integration (see `lua/AGENTS.md`) |
+| `scripts/` | Repository-maintenance scripts, e.g. README translation (see `scripts/AGENTS.md`) |
 
 ## For AI Agents
 
