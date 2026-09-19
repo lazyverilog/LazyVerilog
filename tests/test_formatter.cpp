@@ -1559,6 +1559,54 @@ TEST_CASE("formatter: known statement macro is boundary for following semicolonl
     CHECK(format_source(expected, opts) == expected);
 }
 
+TEST_CASE("formatter: unclassified macro call keeps its own semicolon on the same line",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+
+    // Regression for #128: `LOG_INFO` is left unclassified (no
+    // [format.macros] entry), so it falls into the unknown-macro
+    // statement-position fallback.  That fallback exists for the
+    // semicolonless UVM/OpenTitan pattern (`uvm_info(...) with no `;` in
+    // source) and must not fire when the source already terminates the
+    // macro call with its own `;`.
+    const std::string src =
+        "module top;\n"
+        "initial begin\n"
+        "`LOG_INFO((\"READ test\"));\n"
+        "end\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("`LOG_INFO((\"READ test\"));\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: statement-like macro with a source semicolon keeps it on the same line",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.indent_size = 4;
+    opts.macros.statement_like.push_back("LOG_INFO");
+
+    // Same regression as above, through the force_line_break path: even an
+    // explicitly statement_like-classified macro must not have its own
+    // source `;` split onto the next line.
+    const std::string src =
+        "module top;\n"
+        "initial begin\n"
+        "`LOG_INFO((\"READ test\"));\n"
+        "end\n"
+        "endmodule\n";
+
+    std::string formatted;
+    REQUIRE_NOTHROW(formatted = format_source(src, opts));
+    CHECK(formatted.find("`LOG_INFO((\"READ test\"));\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
 TEST_CASE("formatter: macro arg call after blank line is idempotent", "[formatter]") {
     FormatOptions opts;
     opts.function_call.break_policy = "always";

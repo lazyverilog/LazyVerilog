@@ -1411,6 +1411,20 @@ public:
             }
         }
 
+        // A macro invocation that already carries its own trailing `;` in
+        // source is an ordinary statement-terminated call, not the
+        // semicolonless UVM/OpenTitan pattern the statement-macro line-break
+        // logic below exists for (see the comment on the unknown-macro
+        // fallback below).  Forcing a break at the macro token or its
+        // invocation's closing parenthesis in that case would split the
+        // statement's own semicolon onto its own line; the semicolon's own
+        // must_break_after handling further down already places the correct
+        // line break after it.
+        auto next_is_source_semicolon = [&](size_t after) {
+            size_t next = next_code(tokens, after + 1, tokens.size());
+            return next != npos && kind_is(tokens[next], TK::Semicolon);
+        };
+
         int group = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
@@ -1453,7 +1467,8 @@ public:
                         break_at = tokens[j].immutable.syntax.matching_token;
                     break;
                 }
-                tokens[break_at].mutable_.wrap.must_break_after = true;
+                if (!next_is_source_semicolon(break_at))
+                    tokens[break_at].mutable_.wrap.must_break_after = true;
             }
             if (kind_is(t, TK::MacroUsage) && !t.mutable_.macro.force_line_break) {
                 auto completed_macro_invocation_is_statement_boundary = [&](size_t prev) {
@@ -1515,9 +1530,10 @@ public:
                 if (statement_position) {
                     if (open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
                         size_t close = tokens[open].immutable.syntax.matching_token;
-                        if (close != npos && close < tokens.size())
+                        if (close != npos && close < tokens.size() &&
+                            !next_is_source_semicolon(close))
                             tokens[close].mutable_.wrap.must_break_after = true;
-                    } else {
+                    } else if (!(open != npos && kind_is(tokens[open], TK::Semicolon))) {
                         t.mutable_.wrap.must_break_after = true;
                     }
                 }
