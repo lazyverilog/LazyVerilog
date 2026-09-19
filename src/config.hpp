@@ -11,8 +11,6 @@ struct DesignConfig {
 
 struct CompilationConfig {
     bool background_compilation{false};
-    int background_compilation_debounce_ms{1500};
-    bool log_timing{false};
 };
 
 struct InlayHintConfig {

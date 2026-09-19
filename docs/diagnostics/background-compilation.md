@@ -20,11 +20,15 @@ elaboration two projects' `fifo` and handed one project's defines to the other's
 parse.  The set of files a `.f` names is the scope SystemVerilog binds an
 instantiation over, so that is what each compilation is built from.
 
-`[compilation]` is read **per project**, the same way `[lint]` is.  A project with
-`background_compilation = false` contributes no compilation and shows no semantic
-diagnostics in its buffers, even while a project open beside it has it on.  What
-stays session-level is the worker itself — `background_compilation_debounce_ms`
-and `log_timing` are one timer and one log stream.
+`background_compilation` is read **per project**, the same way `[lint]` is, and it
+is the only key in the table.  A project with `background_compilation = false`
+contributes no compilation and shows no semantic diagnostics in its buffers, even
+while a project open beside it has it on.
+
+What stays session-level is the worker itself — one debounce timer and one
+thread.  It runs whenever any open project wants it, which is why the switch is
+honoured where the work happens (the group a project contributes, and the
+publish for its own buffers) rather than by starting or stopping the worker.
 
 Projects compile one after another rather than in parallel: peak memory is the
 binding resource, so N projects cost N times the wall clock and one project's
@@ -53,8 +57,6 @@ Recommended HPC settings:
 ```toml
 [compilation]
 background_compilation = true
-background_compilation_debounce_ms = 1500
-log_timing = false
 ```
 
 Worker count and thread priority are not configurable. Each worker compiles the
@@ -70,6 +72,8 @@ macOS, where the same call would renice the whole server, and on Windows, which
 has no POSIX nice. A server already started under a higher `nice` keeps that
 priority: the workers only ever yield further, never ask for more.
 
-`log_timing` emits background compilation timing lines to the LSP log. Keep it
-`false` for normal use; enable it temporarily when profiling parse or semantic
-compilation latency.
+Compilation is debounced by a fixed 1500 ms: rapid typing pushes the window out,
+so what it really sets is how long the user must pause before the heaviest thing
+the server runs is allowed to start. It is not configurable — one worker owns the
+timer, so with two projects open a per-project setting could only ever have meant
+"whichever config was read last".

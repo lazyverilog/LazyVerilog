@@ -353,6 +353,12 @@ LazyVerilog can index modules, packages, ports, and cross-file references.
 > `.git` at the top of a monorepo used to outrank the `lazyverilog.toml` sitting beside your
 > file, and that config was silently never read.
 >
+> VS Code does still send an LSP `rootUri`, but it decides nothing: it only tells the server
+> which project to start indexing before you open your first file, so go-to-definition is warm
+> sooner.  Every per-file answer — config, defines and `+incdir+`, index cache location, which
+> semantic compilation a buffer belongs to — comes from that file's own nearest
+> `lazyverilog.toml`, whether or not a root was sent.
+>
 > A monorepo with several RTL projects can therefore give each one its own
 > `lazyverilog.toml`, and one editor session serves them all.
 >
@@ -369,6 +375,7 @@ define = ["VERILATOR", "MY_DEFINE"]
 [compilation]
 background_compilation = true   # run semantic compilation in background workers (richer diagnostics)
                                 # Caution: can be laggy on slow machines.
+                                # Read per project; compilation starts 1.5 s after you stop typing.
 
 [format]
 enable_format_on_save = true # auto-formatting on file save.

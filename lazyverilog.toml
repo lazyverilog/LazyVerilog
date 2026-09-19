@@ -4,8 +4,6 @@ define = ["RTL_SIM"]   # preprocessor defines passed to slang for parsing
 
 [compilation]
 background_compilation = false # run semantic compilation in background workers (slower, richer diagnostics)
-background_compilation_debounce_ms = 10000 # wait after edits before starting semantic compilation
-log_timing = false              # emit [compilation] timing lines to the LSP log for profiling
 
 [lint]
 enable = true                  # global kill-switch; false disables all lint rules

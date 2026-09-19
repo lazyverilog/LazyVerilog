@@ -145,7 +145,7 @@ int main(int argc, char* argv[]) {
 
     analyzer.wait_for_background_index_idle();
     if (!lint_only)
-        run_synchronous_semantic_compile(analyzer, project, error_limit);
+        run_synchronous_semantic_compile(analyzer, error_limit);
 
     std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
     if (!compile_only && project.config.lint.instance.stale_instance_diagnostic)

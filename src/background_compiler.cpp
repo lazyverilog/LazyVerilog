@@ -130,15 +130,12 @@ std::vector<std::thread> BackgroundCompiler::collect_exited_workers_locked() {
 
 void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
     config.thread_count = std::clamp(config.thread_count, 1, kMaxBackgroundCompilerThreads);
-    config.debounce_ms = std::max(0, config.debounce_ms);
 
     std::vector<std::thread> exited_threads;
     {
         std::unique_lock<std::mutex> lock(mutex_);
         enabled_ = config.enabled;
-        log_timing_ = config.log_timing;
         error_limit_ = config.error_limit;
-        debounce_ms_ = config.debounce_ms;
 
         exited_threads = collect_exited_workers_locked();
 
@@ -197,12 +194,20 @@ void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
 }
 
 void BackgroundCompiler::schedule() {
+    schedule_in(kCompilationDebounce);
+}
+
+void BackgroundCompiler::compile_now() {
+    schedule_in(std::chrono::milliseconds{0});
+}
+
+void BackgroundCompiler::schedule_in(std::chrono::milliseconds delay) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_ || stopping_)
         return;
 
     pending_ = true;
-    due_time_ = Clock::now() + std::chrono::milliseconds(debounce_ms_);
+    due_time_ = Clock::now() + delay;
     ++latest_generation_;
     cv_.notify_all();
 }
@@ -301,7 +306,6 @@ void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
 void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
                                        const CompilationGroup& group,
                                        BackgroundCompileResult& result) const {
-    const auto start = Clock::now();
     const auto& parse_inputs = snapshot.parse_inputs;
     const auto file_at = [&](uint32_t index) -> const CompilationSourceFile& {
         return snapshot.files[index];
@@ -453,11 +457,12 @@ void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
             compilation.addSyntaxTree(std::move(tree));
             add_new_assigned_paths();
         } catch (const std::exception& e) {
-            const bool log_timing = log_timing_.load(std::memory_order_relaxed);
-            if (log_timing) {
-                std::cerr << "[lazyverilog] semantic compile skipped " << file.path << ": "
-                          << e.what() << "\n";
-            }
+            // Reported unconditionally.  This used to be guarded by log_timing,
+            // which made a file silently dropped from its own project's
+            // elaboration the default: every diagnostic it would have produced
+            // simply never appeared, and nothing said so.
+            std::cerr << "[lazyverilog] semantic compile skipped " << file.path << ": " << e.what()
+                      << "\n";
             add_new_assigned_paths();
         }
     }
@@ -471,25 +476,13 @@ void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
                 result.diagnostics_by_uri[uri].push_back(std::move(info));
             }
         } catch (const std::exception& e) {
-            const bool log_timing = log_timing_.load(std::memory_order_relaxed);
-            if (log_timing)
-                std::cerr << "[lazyverilog] semantic diagnostics failed: " << e.what() << "\n";
+            std::cerr << "[lazyverilog] semantic diagnostics failed: " << e.what() << "\n";
         }
-    }
-
-    const bool group_log_timing = log_timing_.load(std::memory_order_relaxed);
-    if (group_log_timing) {
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
-        std::cerr << "[lazyverilog][compilation] project "
-                  << (group.root.empty() ? std::string("(none)") : group.root)
-                  << " files=" << group.files.size() << ": " << elapsed.count() << "ms\n";
     }
 }
 
 BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
                                                     CompilationSnapshot snapshot) const {
-    const auto start = Clock::now();
     BackgroundCompileResult result;
     result.generation = generation;
     result.open_uris = std::move(snapshot.open_uris);
@@ -510,11 +503,8 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     // No branch for the "no registered project" session: compilation_snapshot()
     // emits that as a group with an empty root, so `groups` is the only answer
     // to what gets compiled.
-    size_t compiled_file_count = 0;
-    for (const auto& group : snapshot.groups) {
-        compiled_file_count += group.files.size();
+    for (const auto& group : snapshot.groups)
         compile_group(snapshot, group, result);
-    }
 
     // A file two projects' filelists both name is compiled once per project, so
     // an identical diagnostic can arrive twice.  Two *different* diagnostics for
@@ -530,14 +520,5 @@ BackgroundCompileResult BackgroundCompiler::compile(uint64_t generation,
     }
 
     result.uri_versions = std::move(snapshot.uri_versions);
-
-    const bool log_timing = log_timing_.load(std::memory_order_relaxed);
-    if (log_timing) {
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
-        std::cerr << "[lazyverilog][compilation] semantic compilation files="
-                  << compiled_file_count << ": " << elapsed.count() << "ms\n";
-    }
-
     return result;
 }

@@ -31,8 +31,7 @@ void index_cli_project(Analyzer& analyzer, const CliProject& project) {
                                 nullptr, vcode.file_sizes);
 }
 
-void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project,
-                                      uint32_t error_limit) {
+void run_synchronous_semantic_compile(Analyzer& analyzer, uint32_t error_limit) {
     std::mutex mutex;
     std::condition_variable cv;
     bool done = false;
@@ -49,15 +48,14 @@ void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& proj
             cv.notify_one();
         });
 
-    // debounce_ms=0: this is a one-shot blocking compile, not the server's
-    // rapid-edit coalescing path, so there is nothing to wait out.
     compiler.configure(BackgroundCompilerConfig{
         .enabled = true,
-        .debounce_ms = 0,
-        .log_timing = project.config.compilation.log_timing,
         .error_limit = error_limit,
     });
-    compiler.schedule();
+    // compile_now(), not schedule(): this is a one-shot blocking compile, not
+    // the server's rapid-edit path, so there is no next keystroke to coalesce
+    // with and the debounce window would be pure latency on every CLI run.
+    compiler.compile_now();
 
     std::unique_lock<std::mutex> lock(mutex);
     cv.wait(lock, [&] { return done; });

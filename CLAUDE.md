@@ -193,9 +193,27 @@ tools/edit_latency_bench.py ~/work/chip rtl/alu.sv --cpus 0
   no group, and `publish_diagnostics()` gates on `config_for(uri)` so its buffers stay
   quiet while the project open beside it compiles.  `:LintAll` gates on `config_for(uri)`
   too — it walked the merged filelist deciding lint per file and semantic diagnostics
-  from the session, two lines apart.  What stays session-level is the
-  *worker*: `background_compilation_debounce_ms` and `log_timing` are one timer and one
-  log stream, and `any_project_compiles()` starts it when anybody wants it.
+  from the session, two lines apart.  What stays session-level is the *worker*: one
+  debounce timer and one thread, started by `any_project_compiles()` when anybody
+  wants it.  `background_compilation` is the only key in the table.
+- **The compiler has no session config, because there was never a session to read one
+  from.**  `background_compilation_debounce_ms` and `log_timing` were read off the
+  server's `config_` — which with no `rootUri` meant whatever sat above the working
+  directory, and after the first save meant whichever project's config was saved last.
+  The window is `kCompilationDebounce` (1500 ms) in `background_compiler.hpp`; timing
+  lines are gone, and the two `catch` blocks they used to gate now report
+  unconditionally, since a file silently dropped from its own project's elaboration is
+  not a profiling detail.  A caller with nothing to coalesce — a CLI lint run, a test —
+  calls `compile_now()` instead of `schedule()`; that is a property of the call, not a
+  setting.
+- **`root_` is a prefetch hint and nothing else.**  It folds the client's project at
+  `initialize` so the index burst does not wait for the first `didOpen` — which matters
+  when that `didOpen` lands somewhere else entirely, e.g. a restored editor tab in shared
+  IP outside the workspace — and it fixes the head of `reload_all_projects()`' fold
+  order.  Nothing is read from it.  It must not move: `didChangeConfiguration` used to
+  repoint it at whichever `lazyverilog.toml` was saved, which reordered the merged
+  defines and `+incdir+` and so invalidated an arbitrary subset of another project's
+  fallback shards on every save.
 - A session with **no registered project** — a CLI tool, a test, a client that sent no
   `rootUri` — gets **one group with an empty root** over every file, against the merged
   defaults: one merged `Compilation`, exactly as before.  `compilation_snapshot()` emits

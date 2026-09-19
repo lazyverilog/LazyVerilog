@@ -449,15 +449,17 @@ struct LazyVerilogServer::Impl {
 };
 
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
+    // Only a prefetch hint for initialize, and only when the client sends no
+    // root of its own.  Nothing is read from here: a file's config comes from
+    // config_for(), which resolves that file's own project.
     root_ = std::filesystem::current_path();
-    config_ = load_config(root_);
     // One resolver decides all three of a file's answers: which config it is
     // served with, which defines and include directories it parses under, and
     // which directory its shards live in.  Handing the same one to the analyzer
     // means a file's project is worked out by one walk, cached once.
     analyzer_.set_project_root_resolver(root_resolver_);
     // Mirrors read by the handlers that run on the worker pool; see the
-    // declarations.  Refreshed everywhere config_ is.
+    // declarations.
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
 
@@ -754,8 +756,10 @@ void LazyVerilogServer::reload_all_projects() {
     project_compilation_inputs_.clear();
     project_filelists_.clear();
 
-    // The session root first, so it keeps deciding `config_` and the eager
-    // half, then every root discovered since.
+    // The prefetch root first, then every root discovered since.  Which one
+    // leads is arbitrary but must be *stable*: fold order decides the order of
+    // the merged defines and `+incdir+` below.  `root_` is fixed at initialize
+    // and never moves, which is what makes this order the same on every reload.
     if (root_resolver_ && !root_.empty()) {
         if (auto info = root_resolver_->project_info(root_))
             fold_project_root(info->source_root);
@@ -834,8 +838,11 @@ bool LazyVerilogServer::any_project_compiles() const {
     // runs when anybody wants it and each project's switch is honoured where the
     // work actually happens -- the group it contributes, and the publish for its
     // own buffers.
-    if (config_.compilation.background_compilation)
-        return true;
+    //
+    // The projects are the whole answer.  A session config used to be ORed in
+    // here as well, read from whichever directory the server happened to be
+    // launched in when the client sent no rootUri -- so the same tree compiled
+    // or did not depending on where the editor was started from.
     return std::any_of(project_compilation_inputs_.begin(), project_compilation_inputs_.end(),
                        [](const ProjectCompilationInputs& project) {
                            return project.background_compilation;
@@ -854,14 +861,11 @@ void LazyVerilogServer::configure_background_compiler() {
         return;
 
     const bool enabled = any_project_compiles();
-    background_compiler_->configure(BackgroundCompilerConfig{
-        .enabled = enabled,
-        // Session-level on purpose: one timer and one log stream, and a project
-        // cannot have its own copy of either.  The session config is what a
-        // client with a rootUri set, and the defaults otherwise.
-        .debounce_ms = config_.compilation.background_compilation_debounce_ms,
-        .log_timing = config_.compilation.log_timing,
-    });
+    // Whether to run at all is the only thing the projects decide here.  The
+    // coalescing window is the compiler's own kCompilationDebounce: one timer
+    // serves every project, so a per-project setting for it could only ever
+    // have meant "whichever project's config was read last".
+    background_compiler_->configure(BackgroundCompilerConfig{.enabled = enabled});
 
     if (!enabled)
         analyzer_.clear_all_semantic_diagnostics();
@@ -913,9 +917,8 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
     try {
         auto state = analyzer_.get_state(uri);
-        // This file's config, not the session's -- every answer below is a
-        // per-document question, and `config_` is the session's eager-indexing
-        // config.
+        // This file's config: every answer below is a per-document question,
+        // and two buffers open at once can belong to different projects.
         const auto file_config = config_for(uri);
         std::unordered_map<std::string, std::vector<ParseDiagInfo>> diags_by_uri;
         diags_by_uri[uri];
@@ -1138,38 +1141,41 @@ void LazyVerilogServer::register_handlers() {
 
             // Apply the workspace root selected by either the modern LSP
             // `rootUri` field or the legacy `rootPath` fallback.  Keep all
-            // config/vcode/background-index side effects in one place so a
-            // future change (for example, adding another project-level cache or
-            // warning diagnostic) cannot accidentally update only one
-            // initialize branch.
+            // side effects in one place so a future change cannot accidentally
+            // update only one initialize branch.
+            //
+            // This is a prefetch hint and nothing else now.  The client's root
+            // decides no config -- `config_for(uri)` resolves every file's own
+            // -- so all it can do is fold a project the server would otherwise
+            // have waited for a didOpen to find.  That is worth keeping for the
+            // case where the first didOpen lands somewhere else entirely: a
+            // restored VS Code tab in shared IP outside the workspace would
+            // otherwise leave the workspace project unindexed, and
+            // go-to-definition into it answering nothing.
             auto initialize_workspace_root = [&](const std::filesystem::path& p) {
                 if (!std::filesystem::exists(p))
                     return;
 
-                // A client that still sends a root gets its project indexed
-                // before any file is opened, which is worth keeping: it is the
-                // difference between a warm first go-to-definition and one that
-                // waits for a burst to start.  It is no longer the only way a
-                // project is found, though -- didOpen discovers them too -- and
-                // it no longer decides anything per file.
                 root_ = p;
 
                 // Which project the client's root is *in*, which is not always
                 // the directory it named: an editor launched in a subdirectory
-                // sends that subdirectory.  `config_` is read from there, and
-                // it decides `[compilation]` -- the one table that genuinely is
-                // session-wide -- so reading it from the spelling rather than
-                // from the project meant a background_compilation set in the
-                // config above was silently ignored.
+                // sends that subdirectory, and the config it should be read
+                // with sits above it.
                 std::optional<ProjectInfo> info;
                 if (root_resolver_)
                     info = root_resolver_->project_info(root_);
-                const auto config_root = info ? info->source_root : root_;
+                if (!info)
+                    return;
 
+                // A malformed config is reported here and nowhere else along
+                // this path -- fold_project_root() loads every project's config
+                // without asking for the warning, so a project found by didOpen
+                // is still silent about a broken TOML.  That gap predates this
+                // and is not closed here.
                 std::string warn;
                 ConfigWarning warning_detail;
-                config_ = load_config(config_root, &warn, &warning_detail);
-
+                (void)load_config(info->source_root, &warn, &warning_detail);
                 if (!warn.empty())
                     show_warning(warn);
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
@@ -1181,44 +1187,11 @@ void LazyVerilogServer::register_handlers() {
                 // load its filelist a second time and schedule a redundant
                 // full reindex.
                 //
-                // Only if the config really is here.  Recording a root that
-                // holds no lazyverilog.toml would suppress the discovery of the
-                // real one above it.
-                const bool folded = info && fold_project_root(info->source_root);
-
-                if (!folded) {
-                    // rootUri names a directory with no config above it.  There
-                    // may still be a filelist to index, and no root to
-                    // attribute it to.
-                    //
-                    // On "was a project folded", not on "is the filelist empty".
-                    // A project with a config and no filelist satisfies the
-                    // second, and this then overwrote everything the fold had
-                    // just accumulated -- with load_vcode() re-read against
-                    // `root_`, the client's spelling, rather than against the
-                    // project root the fold used.  An editor launched in a
-                    // subdirectory sends that subdirectory, so the two are not
-                    // the same place and the filelist resolved from the wrong
-                    // one.
-                    //
-                    // Read only here.  fold_project_root() above reads the
-                    // filelist of the project it folds, so loading one
-                    // unconditionally parsed every `-f` in the tree twice on
-                    // every launch and stat'ed every entry twice with it --
-                    // load_vcode() takes one metadata call per file to order
-                    // the index queue.
-                    auto vcode            = load_vcode(root_, config_);
-                    project_defines_      = config_.design.define;
-                    project_include_dirs_ = vcode.include_dirs;
-                    project_files_        = std::move(vcode.files);
-                    project_file_sizes_   = std::move(vcode.file_sizes);
-                    // Nothing was folded, so the set is empty and this is what
-                    // keeps it in step with the assignment.
-                    project_file_set_.insert(project_files_.begin(), project_files_.end());
-                    project_filelists_.insert(vcode.filelists.begin(), vcode.filelists.end());
-                }
-
-                apply_project_inputs();
+                // Only if the config really is here -- hence the early return
+                // above.  Recording a root that holds no lazyverilog.toml would
+                // suppress the discovery of the real one above it.
+                if (fold_project_root(info->source_root))
+                    apply_project_inputs();
             };
 
             if (req.params.rootUri && !req.params.rootUri->raw_uri_.empty()) {
@@ -1226,10 +1199,11 @@ void LazyVerilogServer::register_handlers() {
             } else if (req.params.rootPath && !req.params.rootPath->empty()) {
                 initialize_workspace_root(std::filesystem::path(*req.params.rootPath));
             } else {
-                // No workspace root from client; index using the path resolved at
-                // construction time.  project config is only applied here (not in
-                // the constructor) so there is no wasted first-generation parse
-                // when the client does supply a rootUri.
+                // No workspace root from the client -- the shape the Neovim
+                // plugin sends.  Fall back to the working directory, which is
+                // now only a guess at what to prefetch: it folds a project only
+                // if one really sits at or above it, and every per-file answer
+                // comes from that file's own root either way.
                 initialize_workspace_root(root_);
             }
 
@@ -1375,9 +1349,17 @@ void LazyVerilogServer::register_handlers() {
                 // this one.
                 invalidate_config_cache();
 
-                // The project-parse inputs below are still session-wide, so
-                // they reload from the root this config sits in when it names
-                // one.  See the note in initialize about what is still shared.
+                // Re-read the config that was named, for its warning only --
+                // nothing here holds a Config any more.  `root_` is left where
+                // initialize put it: moving it to the saved file's directory
+                // used to reorder reload_all_projects()' folds, which decides
+                // the order of the merged defines and `+incdir+`.  Those are
+                // the analyzer's defaults, their digest keys every shard of a
+                // file under no project, and their order is the header search
+                // order -- so saving a config in one project silently
+                // invalidated an arbitrary subset of another's fallback shards.
+                std::string warn;
+                ConfigWarning warning_detail;
                 {
                     std::string config_file = did_change_config_file(note.params.settings);
                     if (!config_file.empty()) {
@@ -1386,22 +1368,20 @@ void LazyVerilogServer::register_handlers() {
                         std::filesystem::path config_path(config_file);
                         if (config_path.is_relative())
                             config_path = root_ / config_path;
-                        if (config_path.filename() == "lazyverilog.toml")
-                            root_ = config_path.parent_path();
+                        if (config_path.filename() == ProjectRootResolver::kMarker) {
+                            (void)load_config(config_path.parent_path(), &warn, &warning_detail);
+                            std::cerr << "[lazyverilog] reloaded config from "
+                                      << config_path.string() << "\n";
+                        }
                     }
                 }
 
-                // Re-read config from disk on every configuration-change
-                // notification.  `config_` stays the session's: it is what the
-                // eager half and semantic compilation read.
-                std::string warn;
-                ConfigWarning warning_detail;
-                config_ = load_config(root_, &warn, &warning_detail);
-
-                std::cerr << "[lazyverilog] reloaded config from "
-                          << (root_ / "lazyverilog.toml").string() << "\n";
                 if (!warn.empty())
                     show_warning(warn);
+                // Unconditional, including when the payload named no config: it
+                // is also what *clears* a warning already on screen, and a
+                // deleted or repaired lazyverilog.toml has to take its
+                // diagnostic down with it.
                 publish_config_diagnostic(warn.empty() ? nullptr : &warning_detail);
 
                 // Every known project, not just the one that was saved, and in
@@ -1888,7 +1868,13 @@ void LazyVerilogServer::register_handlers() {
         td_codeActionCode::response rsp;
         rsp.id = req.id;
         try {
-            rsp.result = provide_code_actions(analyzer_, config_, req.params);
+            // This file's config, like every other per-document handler.  It
+            // read the session's until now, so a code action offered in one
+            // project was gated on another project's `[lint]` and `[format]`
+            // -- and with no rootUri, on whatever sat above the working
+            // directory.
+            rsp.result = provide_code_actions(
+                analyzer_, *config_for(req.params.textDocument.uri.raw_uri_), req.params);
         } catch (const SafeModeError& e) {
             show_warning(e.what());
         } catch (const std::exception& e) {

@@ -38,8 +38,6 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.design.vcode.empty());
     CHECK(cfg.design.define.empty());
     CHECK(cfg.compilation.background_compilation == false);
-    CHECK(cfg.compilation.background_compilation_debounce_ms == 1500);
-    CHECK(cfg.compilation.log_timing == false);
     CHECK(cfg.inlay_hint.enable == true);
     CHECK(cfg.folding.enable == true);
     CHECK(cfg.format.indent_size == 2);
@@ -72,8 +70,6 @@ define = ["RTL_SIM", "FAST_MODEL"]
 
 [compilation]
 background_compilation = true
-background_compilation_debounce_ms = 750
-log_timing = true
 
 [inlay_hint]
 enable = false
@@ -231,8 +227,6 @@ autoarg_on_save = true
     CHECK(cfg.design.define[1] == "FAST_MODEL");
 
     CHECK(cfg.compilation.background_compilation == true);
-    CHECK(cfg.compilation.background_compilation_debounce_ms == 750);
-    CHECK(cfg.compilation.log_timing == true);
 
     CHECK(cfg.inlay_hint.enable == false);
 
@@ -379,8 +373,6 @@ define = ["RTL_SIM", 123, false]
 
 [compilation]
 background_compilation = "yes"
-background_compilation_debounce_ms = -1
-log_timing = 1
 
 [format]
 indent_size = 0

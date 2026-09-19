@@ -276,14 +276,15 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
 
         // [compilation]
         if (auto p = tbl["compilation"].as_table()) {
+            // The only key here.  `background_compilation_debounce_ms` and
+            // `log_timing` were session-wide settings read from a per-project
+            // table: one worker owns the timer and the log stream, so with two
+            // projects open the server had to pick one project's answer, and
+            // which one it picked was whichever config had been saved last.
+            // The window is kCompilationDebounce now, and timing lines are gone.
             read_bool(p, "background_compilation",
                       "[compilation].background_compilation",
                       cfg.compilation.background_compilation, value_errors);
-            read_int(p, "background_compilation_debounce_ms",
-                     "[compilation].background_compilation_debounce_ms", 0, 600000,
-                     cfg.compilation.background_compilation_debounce_ms, value_errors);
-            read_bool(p, "log_timing", "[compilation].log_timing",
-                      cfg.compilation.log_timing, value_errors);
         }
 
         // [inlay_hint]

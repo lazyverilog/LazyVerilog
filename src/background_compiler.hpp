@@ -28,6 +28,15 @@ struct BackgroundCompileResult {
 /// `MissingTimeScale` alone, so the cutoff is worth being able to raise.
 inline constexpr uint32_t kDefaultCompilationErrorLimit = 64;
 
+/// How long schedule() waits for the edits to stop before compiling.
+///
+/// Not user-configurable, and deliberately not per project: it is one timer on
+/// one worker, so a session with two projects open would have had to pick one
+/// project's answer anyway.  Rapid typing pushes the window out, so what this
+/// really sets is how long the user must pause before the heaviest thing the
+/// server runs is allowed to start.
+inline constexpr std::chrono::milliseconds kCompilationDebounce{1500};
+
 /// Worker count and thread priority are not user-configurable.  Every worker
 /// compiles the whole design rather than sharing one compile, so a second
 /// worker only lets a newer snapshot start before an older one finishes -- at
@@ -37,8 +46,6 @@ inline constexpr uint32_t kDefaultCompilationErrorLimit = 64;
 struct BackgroundCompilerConfig {
     bool enabled{false};
     int thread_count{1};
-    int debounce_ms{1500};
-    bool log_timing{false};
     /// Forwarded to slang's `CompilationOptions::errorLimit`.  0 means
     /// unlimited (slang's own encoding for "no limit").
     uint32_t error_limit{kDefaultCompilationErrorLimit};
@@ -56,19 +63,28 @@ class BackgroundCompiler {
     BackgroundCompiler& operator=(const BackgroundCompiler&) = delete;
 
     void configure(BackgroundCompilerConfig config);
-    /// Request a semantic compile generation.
+    /// Request a semantic compile generation, once the edits have stopped for
+    /// kCompilationDebounce.
     ///
     /// This is intentionally a lightweight trigger: the expensive full-design
     /// CompilationSnapshot is constructed by the worker only after the debounce
     /// window expires.  Rapid edits therefore coalesce before walking the full
     /// filelist / open-document set.
     void schedule();
+    /// Request one with no coalescing window at all.
+    ///
+    /// For a caller that schedules exactly once and blocks for the result -- a
+    /// CLI lint run, a test -- where there is no next keystroke to wait for and
+    /// the window is pure latency.  Having nothing to coalesce is a property of
+    /// the call, which is why it is spelled here rather than as a setting.
+    void compile_now();
     void stop();
 
   private:
     struct WorkerSlot;
 
     void worker_loop(std::shared_ptr<WorkerSlot> slot);
+    void schedule_in(std::chrono::milliseconds delay);
     std::vector<std::thread> collect_exited_workers_locked();
     BackgroundCompileResult compile(uint64_t generation, CompilationSnapshot snapshot) const;
     void compile_group(const CompilationSnapshot& snapshot, const CompilationGroup& group,
@@ -81,11 +97,8 @@ class BackgroundCompiler {
     std::condition_variable cv_;
     bool stopping_{false};
     bool enabled_{false};
-    std::atomic<bool> log_timing_{false};
-    // Read by compile() on worker threads without holding mutex_, same as
-    // log_timing_.
+    // Read by compile() on worker threads without holding mutex_.
     std::atomic<uint32_t> error_limit_{kDefaultCompilationErrorLimit};
-    int debounce_ms_{1500};
     size_t next_worker_id_{0};
     uint64_t latest_generation_{0};
     bool pending_{false};

@@ -56,8 +56,8 @@ class LazyVerilogServer {
     ///
     /// `[compilation]` is per project, so every consumer has to gate on the
     /// asking file's answer.  Spelled at the call sites instead, it drifted the
-    /// first time it changed: one of the two was left reading `config_` while
-    /// the other moved to the file's config, two lines apart.
+    /// first time it changed: one of the two was left reading a session-wide
+    /// config while the other moved to the file's, two lines apart.
     std::vector<ParseDiagInfo> semantic_diagnostics_for(const std::string& uri,
                                                         const Config& config) const;
     void configure_background_compiler();
@@ -193,9 +193,13 @@ class LazyVerilogServer {
     /// Keyed by project root; the empty key is "no project", served defaults.
     mutable std::unordered_map<std::string, std::shared_ptr<const Config>> config_cache_;
 
+    /// The client's `rootUri`/`rootPath`, or the working directory when it
+    /// sends neither.  A prefetch hint only: it names a project to fold at
+    /// initialize so the index burst does not wait for the first didOpen, and
+    /// it fixes the head of reload_all_projects()' fold order.  Nothing is read
+    /// from it -- every per-file answer goes through `root_resolver_`.
     std::filesystem::path root_;
     std::string config_diagnostic_uri_;
-    Config config_;
 
 
     Analyzer analyzer_;

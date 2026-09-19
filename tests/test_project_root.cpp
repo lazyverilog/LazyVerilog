@@ -758,9 +758,9 @@ std::string semantic_messages(Analyzer& analyzer) {
     BackgroundCompilerConfig config;
     config.enabled = true;
     config.thread_count = 1;
-    config.debounce_ms = 0;
     compiler.configure(config);
-    compiler.schedule();
+    // No coalescing window: one scheduled generation, waited on below.
+    compiler.compile_now();
     {
         std::unique_lock<std::mutex> lock(mutex);
         if (!cv.wait_for(lock, std::chrono::seconds(60), [&] { return result.has_value(); }))

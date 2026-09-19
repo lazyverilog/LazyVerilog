@@ -42,5 +42,5 @@ void index_cli_project(Analyzer& analyzer, const CliProject& project);
 /// `error_limit` is forwarded to slang's `CompilationOptions::errorLimit`;
 /// 0 means unlimited.  See `kDefaultCompilationErrorLimit` for why raising it
 /// matters.
-void run_synchronous_semantic_compile(Analyzer& analyzer, const CliProject& project,
+void run_synchronous_semantic_compile(Analyzer& analyzer,
                                       uint32_t error_limit = kDefaultCompilationErrorLimit);
