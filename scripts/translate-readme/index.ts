@@ -246,9 +246,23 @@ async function translate(lang: Language, prompt: string, model: string): Promise
       cwd: REPO_ROOT,
     },
   })) {
+    if (message.type === "assistant" && message.error) {
+      // Surfaced separately: an auth/billing failure lands here
+      // (SDKAssistantMessageError), and the eventual `result` message's own
+      // `.result` text is often just a generic wrap-up, not this detail.
+      console.error(`  ${lang.name}: assistant error ${message.error}`);
+    }
     if (message.type !== "result") continue;
     if (message.subtype !== "success" || message.is_error) {
-      throw new Error(`translation into ${lang.name} failed: ${message.subtype}`);
+      const detail =
+        "errors" in message && message.errors?.length
+          ? message.errors.join("; ")
+          : "result" in message
+            ? message.result
+            : "(no detail on this result)";
+      throw new Error(
+        `translation into ${lang.name} failed: subtype=${message.subtype} is_error=${message.is_error} - ${detail}`,
+      );
     }
     const text = stripDocumentFence(message.result);
     if (text.length === 0) throw new Error(`translation into ${lang.name} came back empty`);
