@@ -5,3 +5,8 @@ __pycache__
 log
 *.log
 dist
+
+# VitePress docs site
+docs/node_modules
+docs/.vitepress/cache
+docs/public/videos

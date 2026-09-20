@@ -1,8 +1,28 @@
 name: CI
 
+# Docs, Markdown, the site workflow and the site-only images are not inputs of the C++
+# build or its tests (assets/ascii_logo.txt is, and is deliberately not ignored), so
+# a change touching only those runs no matrix.  The repo-root lazyverilog.toml is
+# not ignored either.  This is safe only while no CI check is a *required* check:
+# a path-skipped workflow leaves a required check pending forever.  If one becomes
+# required, gate the jobs with an `if:` on a changes job instead.  See docs/dev/site.md.
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "assets/videos/**"
+      - "assets/lazyverilog_logo*.png"
+      - ".github/FUNDING.yml"
+      - ".github/workflows/site.yml"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "assets/videos/**"
+      - "assets/lazyverilog_logo*.png"
+      - ".github/FUNDING.yml"
+      - ".github/workflows/site.yml"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

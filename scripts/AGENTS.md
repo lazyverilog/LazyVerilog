@@ -35,7 +35,7 @@ node index.ts --dry-run ko   # print the prepared source, call no model
   nothing to re-run, which is what makes the push trigger safe. Change the prompt and
   bump `PROMPT_VERSION`, or every cached language stays stale forever.
 - **Relative links are rewritten before the model sees them**, not by it
-  (`rewriteRelativeLinks()`). `README.md` links its siblings as `docs/features.md` and
+  (`rewriteRelativeLinks()`). A README links its siblings as `docs/features.md` and
   `assets/...`; from `docs/i18n/` those resolve two directories too high, so every
   link in every translation would 404. The model is only asked to preserve what it is
   handed — path arithmetic is not a translation decision. `--dry-run` prints exactly

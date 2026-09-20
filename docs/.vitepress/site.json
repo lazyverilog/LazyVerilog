@@ -1,0 +1,69 @@
+{
+  "srcExclude": ["dev/**", "releases/**", "i18n/**", "**/AGENTS.md", "README.md"],
+  "sidebar": [
+    {
+      "text": "Getting started",
+      "items": [
+        { "text": "Installation", "link": "/installation" },
+        { "text": "Usage", "link": "/usage" },
+        { "text": "Configuration", "link": "/configuration" },
+        { "text": "Design & filelist", "link": "/design/" },
+        { "text": "Binary installation", "link": "/lsp/install" },
+        { "text": "All features", "link": "/features" }
+      ]
+    },
+    {
+      "text": "Editor features",
+      "items": [
+        { "text": "LSP features", "link": "/lsp/" },
+        { "text": "Completion", "link": "/lsp/completion" },
+        { "text": "Folding ranges", "link": "/folding/" },
+        { "text": "RTL tree", "link": "/rtl-tree/" },
+        { "text": "Connect", "link": "/connect" },
+        { "text": "Interface", "link": "/interface" },
+        { "text": "Disconnect", "link": "/disconnect" }
+      ]
+    },
+    {
+      "text": "Auto features",
+      "items": [
+        { "text": "AutoInst", "link": "/autoinst/" },
+        { "text": "AutoWire", "link": "/autowire/" },
+        { "text": "AutoArg", "link": "/autoarg/" },
+        { "text": "AutoFunc", "link": "/autofunc/" },
+        { "text": "AutoFF", "link": "/autoff/" }
+      ]
+    },
+    {
+      "text": "Formatter",
+      "items": [
+        { "text": "Options", "link": "/formatter/options" },
+        { "text": "Macro policy", "link": "/formatter/macros" },
+        { "text": "CLI", "link": "/formatter/cli" }
+      ]
+    },
+    {
+      "text": "Linter",
+      "items": [
+        { "text": "Options", "link": "/linter/options" },
+        { "text": "CLI", "link": "/linter/cli" }
+      ]
+    },
+    {
+      "text": "Diagnostics",
+      "items": [
+        { "text": "Background compilation", "link": "/diagnostics/background-compilation" }
+      ]
+    },
+    {
+      "text": "Tools and project",
+      "items": [
+        { "text": "CLI tools", "link": "/cli" },
+        { "text": "RTL tree CLI", "link": "/rtl-tree/cli" },
+        { "text": "Comparison", "link": "/comparison" },
+        { "text": "Demos", "link": "/demos" },
+        { "text": "Contributing", "link": "/contributing" }
+      ]
+    }
+  ]
+}

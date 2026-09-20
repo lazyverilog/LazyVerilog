@@ -1,0 +1,19 @@
+{
+  "name": "lazyverilog-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/copy-assets.mjs",
+    "dev": "vitepress dev",
+    "prebuild": "node scripts/copy-assets.mjs",
+    "build": "vitepress build",
+    "postbuild": "node scripts/finish-dist.mjs",
+    "preview": "vitepress preview",
+    "test": "node --test \"scripts/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@catppuccin/vitepress": "0.1.4",
+    "typescript": "^5.9.0",
+    "vitepress": "1.6.4"
+  }
+}

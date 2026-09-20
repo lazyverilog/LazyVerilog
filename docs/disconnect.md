@@ -1,8 +1,8 @@
 # Disconnect
 
-`Disconnect` is currently exposed through the two-instance `:Interface <inst1>
-<inst2>` floating window. Press `D` on that view to clear an existing shared
-signal connection between the displayed instances.
+`Disconnect` is currently exposed through the two-instance
+`:Interface <inst1> <inst2>` floating window. Press `D` on that view to clear an
+existing shared signal connection between the displayed instances.
 
 ## Command
 

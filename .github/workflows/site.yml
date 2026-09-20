@@ -1,0 +1,117 @@
+name: Site
+
+# Builds the docs in `docs/` with VitePress and publishes the output to
+# lazyverilog/lazyverilog.github.io.  See docs/dev/site.md for the one-time setup
+# (site repo, Pages source, deploy key, `site-publish` environment).
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "!docs/dev/**"
+      - "!docs/releases/**"
+      - "!docs/i18n/**"
+      - "!**/AGENTS.md"
+      - "lazyverilog.toml" # imported into docs/configuration.md at build time
+      - "assets/videos/**"
+      - "assets/lazyverilog_logo*.png"
+      - "vscode/assets/lazyverilog_icon.png"
+      - ".github/workflows/site.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "!docs/dev/**"
+      - "!docs/releases/**"
+      - "!docs/i18n/**"
+      - "!**/AGENTS.md"
+      - "lazyverilog.toml" # imported into docs/configuration.md at build time
+      - "assets/videos/**"
+      - "assets/lazyverilog_logo*.png"
+      - "vscode/assets/lazyverilog_icon.png"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  site-build:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: site-build-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install
+        run: npm ci
+        working-directory: docs
+
+      - name: Build
+        run: npm run build
+        working-directory: docs
+
+      - name: Test the build checker
+        run: node --test "docs/scripts/*.test.mjs"
+
+      - name: Check the built site
+        run: node docs/scripts/check-dist.mjs
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: site-dist
+          path: docs/.vitepress/dist
+          include-hidden-files: true # keeps .nojekyll
+          retention-days: 30
+
+  publish:
+    needs: site-build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: site-publish
+    concurrency:
+      group: site-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: site-dist
+          path: dist-artifact
+
+      # The dist-only assertions again, on the tree that was downloaded: the artifact
+      # hop is where a dotfile (.nojekyll) would silently disappear.
+      - name: Check the downloaded artifact
+        run: node docs/scripts/check-dist.mjs --dist dist-artifact --only A5,A6,A8
+
+      - name: Publish to lazyverilog.github.io
+        env:
+          SITE_DEPLOY_KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+          DOCS_SHA: ${{ github.sha }}
+        working-directory: dist-artifact
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/site_deploy_key"
+          umask 077
+          printf '%s\n' "$SITE_DEPLOY_KEY" > "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git init -q -b main
+          git remote add origin git@github.com:lazyverilog/lazyverilog.github.io.git
+          git add --all
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "Publish docs from lazyverilog/LazyVerilog@${DOCS_SHA}"
+          # Build output only: the history of it is deliberately not kept.
+          git push --force origin main
