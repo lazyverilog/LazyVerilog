@@ -23,6 +23,13 @@ rtl/alu.sv
 rtl/adder.sv
 -f ../my_rtl_list.f
 +incdir+rtl/include
+
+# environment variable
+${MY_RTL_PATH}/top.sv
++incdir+${MY_RTL_PATH}/include
+
+# UVM library
++incdir+uvm/src
 uvm/src/uvm_pkg.sv
 ```
 
@@ -33,17 +40,12 @@ uvm/src/uvm_pkg.sv
 | `+incdir+<dir>` | Add an include directory. `+incdir+<a>+<b>` adds several |
 | others | Comments (`//`, `#`) and any other `+<option>` or `-<flag>` are ignored |
 
-`+incdir+` entries are search paths for `` `include ``, not source files. `$VAR` and `${VAR}` are
-expanded when the variable is defined.
+`+incdir+` entries are search paths for `` `include ``, not source files.
 
-## Libraries with many headers
+**Environment variables.** `$MY_RTL_PATH` and `${MY_RTL_PATH}` are replaced by the variable's value,
+in filelists and in `vcode`. The editor must start with the variable set. A variable that is not set
+is left as written.
 
-For a library such as UVM, list the package file and put the headers on an include path:
-
-```text
-+incdir+./uvm-core/src
-./uvm-core/src/uvm_pkg.sv
-```
-
-`uvm_pkg.sv` is indexed, and its `` `include `` lines resolve through the include directory, so you do
-not list every `.svh`.
+**UVM library.** List the package file and put the headers on an include path. `uvm_pkg.sv` is
+indexed, and its `` `include `` lines resolve through the include directory, so you do not list every
+`.svh`.
