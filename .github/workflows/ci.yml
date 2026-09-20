@@ -1,28 +1,36 @@
 name: CI
 
-# Docs, Markdown, the site workflow and the site-only images are not inputs of the C++
-# build or its tests (assets/ascii_logo.txt is, and is deliberately not ignored), so
-# a change touching only those runs no matrix.  The repo-root lazyverilog.toml is
-# not ignored either.  This is safe only while no CI check is a *required* check:
-# a path-skipped workflow leaves a required check pending forever.  If one becomes
-# required, gate the jobs with an `if:` on a changes job instead.  See docs/dev/site.md.
+# An allow-list: the matrix runs only when a change touches an input of the C++ build
+# or its tests.  A deny-list of "things that are not code" was too loose -- every new
+# kind of file (a script, an editor plugin, a doc) ran seven platforms until someone
+# remembered to add it.  Push runs only on main; a branch is covered by its pull request,
+# so a pushed PR branch no longer builds twice.  This is safe only while no CI check is
+# a *required* check: a path-skipped workflow leaves a required check pending forever.
+# If one becomes required, gate the jobs with an `if:` on a changes job instead.
 on:
   push:
-    paths-ignore:
-      - "docs/**"
-      - "**.md"
-      - "assets/videos/**"
-      - "assets/lazyverilog_logo*.png"
-      - ".github/FUNDING.yml"
-      - ".github/workflows/site.yml"
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/*.cpp"
+      - "tools/*.hpp"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "assets/ascii_logo.txt"
+      - "lazyverilog.toml"
+      - ".github/workflows/ci.yml"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**.md"
-      - "assets/videos/**"
-      - "assets/lazyverilog_logo*.png"
-      - ".github/FUNDING.yml"
-      - ".github/workflows/site.yml"
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/*.cpp"
+      - "tools/*.hpp"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "assets/ascii_logo.txt"
+      - "lazyverilog.toml"
+      - ".github/workflows/ci.yml"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

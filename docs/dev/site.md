@@ -144,9 +144,10 @@ The site repo keeps no history of build output, by design.
 
 ## Required checks
 
-`ci.yml` uses `paths-ignore` for docs and Markdown. That is safe only while no CI status check is a
+`ci.yml` runs only when a C++ build input changes (`src/`, `tests/`, `tools/*.cpp`, `CMakeLists.txt`,
+`cmake/`, the logo, the root config, the workflow itself), and on `push` only for `main`. That is safe only while no CI status check is a
 *required* check on `main`: a workflow skipped by path filters leaves a required check pending
 forever, whereas a job skipped by `if:` reports as skipped and passes. If a check becomes required,
-replace `paths-ignore` with a first `changes` job (checkout with `fetch-depth: 0`, `git diff
+replace the `paths` filter with a first `changes` job (checkout with `fetch-depth: 0`, `git diff
 --name-only` of the base against `HEAD`, fail open when the base cannot be resolved) and gate the
 matrix on it. `site.yml` has the same property for `site-build`.
