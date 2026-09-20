@@ -4,12 +4,25 @@
     {
       "text": "Getting started",
       "items": [
-        { "text": "Installation", "link": "/installation" },
-        { "text": "Usage", "link": "/usage" },
+        {
+          "text": "Installation",
+          "link": "/installation/",
+          "items": [
+            { "text": "Neovim", "link": "/installation/neovim" },
+            { "text": "VS Code", "link": "/installation/vscode" }
+          ]
+        },
+        {
+          "text": "Usage",
+          "link": "/usage/",
+          "items": [
+            { "text": "Neovim", "link": "/usage/neovim" },
+            { "text": "VS Code", "link": "/usage/vscode" }
+          ]
+        },
         { "text": "Configuration", "link": "/configuration" },
         { "text": "Design & filelist", "link": "/design/" },
-        { "text": "Binary installation", "link": "/lsp/install" },
-        { "text": "All features", "link": "/features" }
+        { "text": "Features", "link": "/features" }
       ]
     },
     {
@@ -20,8 +33,7 @@
         { "text": "Folding ranges", "link": "/folding/" },
         { "text": "RTL tree", "link": "/rtl-tree/" },
         { "text": "Connect", "link": "/connect" },
-        { "text": "Interface", "link": "/interface" },
-        { "text": "Disconnect", "link": "/disconnect" }
+        { "text": "Interface", "link": "/interface" }
       ]
     },
     {

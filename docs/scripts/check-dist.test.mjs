@@ -63,27 +63,30 @@ describe('check-dist', { skip }, () => {
     ))
 
   it('A2 fails with too few feature cards', () =>
-    expectFailure('A2', ({ dist }) => edit(path.join(dist, 'index.html'), (s) => s.replaceAll('<article class="box"', '<div class="box"'))))
+    expectFailure('A2', ({ dist }) => edit(path.join(dist, 'features.html'), (s) => s.replaceAll('<article class="box"', '<div class="box"'))))
+
+  it('A10 fails without the installation guide on the landing page', () =>
+    expectFailure('A10', ({ dist }) => edit(path.join(dist, 'index.html'), (s) => s.replaceAll('href="/installation/neovim"', 'href="/elsewhere"'))))
 
   it('A3 fails when a hero action is dropped', () =>
     expectFailure('A3', ({ dist }) =>
-      edit(path.join(dist, 'index.html'), (s) => s.replace(/<a[^>]*VPButton[^>]*href="\/usage"[^>]*>/, (m) => m.replace('VPButton', 'Other'))),
+      edit(path.join(dist, 'index.html'), (s) => s.replace(/<a[^>]*VPButton[^>]*href="\/usage\/"[^>]*>/, (m) => m.replace('VPButton', 'Other'))),
     ))
 
   it('A3 fails when the Sponsor href changes', () =>
     expectFailure('A3', ({ dist }) => edit(path.join(dist, 'index.html'), (s) => s.replaceAll('sponsors/kjoonha', 'sponsors/other'))))
 
   it('A4 fails when an action target page is missing', () =>
-    expectFailure('A4', ({ dist }) => rmSync(path.join(dist, 'installation.html'))))
+    expectFailure('A4', ({ dist }) => rmSync(path.join(dist, 'installation', 'index.html'))))
 
   it('A5 fails on a canonical URL at another origin', () =>
     expectFailure('A5', ({ dist }) =>
-      edit(path.join(dist, 'installation.html'), (s) => s.replace('<link rel="canonical" href="https://lazyverilog.github.io/', '<link rel="canonical" href="https://example.com/')),
+      edit(path.join(dist, 'installation', 'neovim.html'), (s) => s.replace('<link rel="canonical" href="https://lazyverilog.github.io/', '<link rel="canonical" href="https://example.com/')),
     ))
 
   it('A5 fails on an og:url with an extension', () =>
     expectFailure('A5', ({ dist }) =>
-      edit(path.join(dist, 'installation.html'), (s) => s.replace('og:url" content="https://lazyverilog.github.io/installation"', 'og:url" content="https://lazyverilog.github.io/installation.html"')),
+      edit(path.join(dist, 'installation', 'neovim.html'), (s) => s.replace('og:url" content="https://lazyverilog.github.io/installation/neovim"', 'og:url" content="https://lazyverilog.github.io/installation/neovim.html"')),
     ))
 
   it('A5 fails when the og:image file is missing', () => expectFailure('A5', ({ dist }) => rmSync(path.join(dist, 'og.png'))))
@@ -94,11 +97,11 @@ describe('check-dist', { skip }, () => {
     expectFailure('A7', ({ docs }) => writeFileSync(path.join(docs, 'x.md'), '# X\n')))
 
   it('A7 fails for a built page whose source exists but is not built', () =>
-    expectFailure('A7', ({ dist }) => rmSync(path.join(dist, 'usage.html'))))
+    expectFailure('A7', ({ dist }) => rmSync(path.join(dist, 'usage', 'index.html'))))
 
   it('A7 fails for a sidebar link without a page', () =>
     expectFailure('A7', ({ docs }) =>
-      edit(path.join(docs, '.vitepress', 'site.json'), (s) => s.replace('"link": "/usage"', '"link": "/nowhere"')),
+      edit(path.join(docs, '.vitepress', 'site.json'), (s) => s.replace('"link": "/usage/"', '"link": "/nowhere"')),
     ))
 
   it('A7 fails for an emitted page under an excluded directory', () =>

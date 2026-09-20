@@ -1,15 +1,10 @@
 # Contributing
 
-Contributions are welcome.
+Contributions are welcome. Before opening a pull request:
 
-Before sending a pull request:
-
-1. Build the project.
-2. Run the relevant tests.
-3. Add or update tests for formatter, lint, LSP, or automation changes.
-4. Update documentation for user-visible behavior or configuration changes.
-
-Recommended checks:
+1. Build and run the tests.
+2. Add or update tests for formatter, lint, LSP, or automation changes.
+3. Update the docs for user-visible changes.
 
 ```bash
 cmake -B build
@@ -18,30 +13,16 @@ ctest --test-dir build
 ```
 
 ::: warning
-Formatter changes should include focused cases in `tests/test_formatter.cpp` and preserve idempotency and safe-mode guarantees.
+Formatter changes need focused cases in `tests/test_formatter.cpp` and must stay idempotent.
 :::
-
-## Build
-
-Requirements: CMake and a C++20-capable compiler.
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc) --target lazyverilog-lsp
-```
 
 ## Documentation
 
-These pages are built from the `docs/` directory of the
-[LazyVerilog repository](https://github.com/lazyverilog/LazyVerilog) with VitePress and the
-[Catppuccin theme](https://github.com/catppuccin/vitepress). Edit a page with the "Edit this page
-on GitHub" link at its foot.
-
-User-facing pages live outside `docs/dev/`, `docs/releases/`, and `docs/i18n/`; those three
-directories are not published to this site. Add every new page to the sidebar in
-`docs/.vitepress/site.json`; the site's build check fails when a page is missing from it.
+These pages are the `docs/` directory of the
+[repository](https://github.com/lazyverilog/LazyVerilog), built with VitePress. Use "Edit this page on
+GitHub" at the foot of a page to change it. Add a new page to the sidebar in
+`docs/.vitepress/site.json`, or the build check fails.
 
 ## License
 
-LazyVerilog is released under the MIT License. See the
-[`LICENSE`](https://github.com/lazyverilog/LazyVerilog/blob/main/LICENSE) file.
+MIT. See [`LICENSE`](https://github.com/lazyverilog/LazyVerilog/blob/main/LICENSE).

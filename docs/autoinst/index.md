@@ -1,11 +1,10 @@
 # AutoInst
 
-**Code action**
-
-Generates a full named port connection list for a module instantiation. Triggered as a code action when the cursor is on an instantiation with missing or incomplete port connections.
+**Code action.** Fills in the named port connections of a module instance. Put the cursor on an
+instance with missing or incomplete connections.
 
 ```systemverilog
-// before (incomplete)
+// before
 m_fifo u_fifo ();
 
 // after AutoInst
@@ -17,8 +16,5 @@ m_fifo u_fifo (
 );
 ```
 
-Requires the instantiated module definition to be available from the current file or the design filelist (`design.vcode`).
-
-AutoInst currently emits named `.port(signal)` connections.
-
-No dedicated configuration.
+The module must be defined in the current file or the [filelist](../design/index.md). Connections are
+always named (`.port(signal)`). No configuration.

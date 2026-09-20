@@ -1,126 +1,48 @@
-# Interface View
+# Interface
 
-`Interface` is an interactive Neovim view for inspecting and editing signal
-interfaces between instances in the current design.
+A view of the signals shared between instances, where you can also connect and disconnect them.
+Neovim: `:Interface <inst>` or `:Interface <inst1> <inst2>`. VS Code: `LazyVerilog: Interface`.
 
-## Commands
+## One instance
 
-- `:Interface <inst1> <inst2>` — show a two-instance interface table.
-- `:Interface <inst>` — show a single-instance table with sibling connections.
+Read-only. Lists each port, the signal it is connected to, and the sibling ports on the same signal.
 
-The server-side commands are:
+## Two instances
 
-- `lazyverilog.interface`
-- `lazyverilog.singleInterface`
-- `lazyverilog.interfaceConnect`
-- `lazyverilog.interfaceDisconnect`
+A table with the ports of the first instance, the shared signal, and the ports of the second. Ports
+with the same signal name share a row. A port with no partner gets its own row. Arrows show direction:
+`→` output, `←` input, `↔` inout, `|` no match.
 
-## Two-instance view
+In Neovim's floating window, `C` connects, `D` disconnects, and `q` closes.
 
-The two-instance view displays three logical columns:
+### Connect
 
-1. ports from the first instance
-2. shared signal name/type
-3. ports from the second instance
+Press `C`, then choose the row of the first port, the row of the second, and a wire name. The edit
+sets `.port(signal)` on both instances and declares the wire if needed. The wire type follows the
+output port, as in [Connect](connect.md#wire-type).
 
-Rows are built from named port connections. If two ports use the same signal
-name, Interface displays them on the same row. Ports that have no matching signal
-on the other instance are displayed as unconnected rows.
+### Disconnect
 
-Direction arrows are UI hints:
-
-- `→` output direction
-- `←` input direction
-- `↔` inout direction
-- `|` unknown / no matching side
-
-From the floating window:
-
-- `C` starts the connect flow
-- `D` starts the disconnect flow
-- `q` closes the view
-
-## Connect flow from Interface
-
-Pressing `C` asks for:
-
-1. the row containing the first-instance port
-2. the row containing the second-instance port
-3. the bridge signal name
-
-The Lua client sends `lazyverilog.interfaceConnect` with the selected instance
-names, port names, requested signal name, and a UI fallback type. The C++ server
-then re-resolves both ports from the syntax index and chooses the generated
-declaration type from the selected **output** port.
-
-Generated bridge declarations use `logic` for net-style output ports:
-
-```systemverilog
-output wire [5:0] o_data
-// generated bridge signal:
-logic [5:0] data32;
-```
-
-User-defined datatypes and symbolic dimensions are preserved:
-
-```systemverilog
-output payload_t [`BUS_W-1:0] payload
-// generated bridge signal:
-payload_t [`BUS_W-1:0] payload_w;
-```
-
-The returned workspace edit:
-
-- replaces or adds `.port(signal)` on both selected instances
-- adds the bridge declaration if it is not already present
-
-After applying the edit, the Lua client refreshes the Interface view.
-
-## Disconnect flow from Interface
-
-Pressing `D` asks for one row number. The Lua client sends
-`lazyverilog.interfaceDisconnect` with the row's two ports and signal name.
-
-The server returns a workspace edit that:
-
-- clears the selected first-instance connection when it exactly matches the row
-  signal
-- clears the selected second-instance connection when it exactly matches the row
-  signal
-- removes a standalone `wire`, `logic`, or `reg` declaration for that signal when
-  found
-
-Example:
+Press `D` and choose a row. The edit clears `.port(signal)` on both instances when they still match
+the row, and deletes the signal's declaration if it is a simple `wire`, `logic`, or `reg`.
 
 ```systemverilog
 logic [5:0] data32;
-
 memory u_mem2 (.o_data(data32));
 memory u_mem3 (.i_data(data32));
 ```
 
-Disconnect produces:
+becomes
 
 ```systemverilog
 memory u_mem2 (.o_data());
 memory u_mem3 (.i_data());
 ```
 
-See also: [Disconnect](disconnect.md).
+A declaration with several names, an assignment, or another keyword is left for you to remove.
 
-## Single-instance view
+## Limits
 
-The single-instance view lists each port, its connected signal, and sibling
-instance ports that share the same signal. This is a read-only inspection view.
-
-## Implementation notes and limitations
-
-Interface uses slang-backed syntax-index information for modules, ports,
-directions, datatypes, instances, and named port connections. It is not a full
-semantic elaborator.
-
-Text edits are still constructed as targeted source edits. Interface expects
-ordinary module instances with named port connections. It does not elaborate
-SystemVerilog `interface` constructs or modports, and it does not fully model
-complex generate hierarchy, macro-generated instances/connections, or positional
-connections.
+Interface works on syntax, not elaboration. It expects ordinary instances with named connections, and
+does not handle SystemVerilog `interface` or `modport`, complex `generate` hierarchy, macro-generated
+instances, or positional connections.

@@ -54,8 +54,8 @@ export default defineConfig({
   themeConfig: {
     logo: '/favicon.png',
     nav: [
-      { text: 'Installation', link: '/installation' },
-      { text: 'Usage', link: '/usage' },
+      { text: 'Installation', link: '/installation/' },
+      { text: 'Usage', link: '/usage/' },
       { text: 'Configuration', link: '/configuration' },
       { text: 'Features', link: '/features' },
       { text: 'Demos', link: '/demos' },

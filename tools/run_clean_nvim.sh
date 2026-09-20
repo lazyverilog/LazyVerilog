@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch Neovim in a completely isolated profile for testing the public
-# LazyVerilog installation path documented at https://lazyverilog.github.io/installation.
+# LazyVerilog installation path documented at https://lazyverilog.github.io/installation/neovim.
 #
 # Why this script exists:
 #   Developers often have a real ~/.config/nvim with many plugins, autocmds,

@@ -10,8 +10,8 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 
 | File | Description |
 |------|-------------|
-| `index.md` | Landing page of the site (hero, four buttons, feature cards) |
-| `features.md` | Feature index |
+| `index.md` | Landing page of the site (hero, five buttons, the installation guide) |
+| `features.md` | The feature cards, opened by the Features button |
 | `.vitepress/site.json` | Sidebar and the list of directories excluded from the site |
 | `scripts/check-dist.mjs` | Checks the built site; fixtures in `scripts/check-dist.test.mjs` |
 | `AGENTS.md` | This file |
@@ -20,6 +20,8 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 
 | Directory | Purpose |
 |-----------|---------|
+| `installation/` | Install pages: overview, `neovim.md`, `vscode.md` |
+| `usage/` | Usage pages: project config, `neovim.md`, `vscode.md` |
 | `formatter/` | Formatter-specific docs (see `formatter/AGENTS.md`) |
 | `diagnostics/` | Diagnostics and background compilation docs (see `diagnostics/AGENTS.md`) |
 | `linter/` | Linter-specific docs (see `linter/AGENTS.md`) |

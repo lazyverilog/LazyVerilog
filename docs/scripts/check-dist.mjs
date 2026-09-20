@@ -11,9 +11,9 @@ import { pathToFileURL } from 'node:url'
 
 const ORIGIN = 'https://lazyverilog.github.io'
 const SPONSOR = 'https://github.com/sponsors/kjoonha'
-const ACTIONS = ['/installation', '/usage', '/configuration', SPONSOR]
+const ACTIONS = ['/installation/', '/features', '/usage/', '/configuration', SPONSOR]
 const MIN_FEATURES = 9
-const DEEP_PAGE = 'installation'
+const DEEP_PAGE = 'installation/neovim'
 
 const SKIP_SOURCE_DIRS = new Set(['node_modules', '.vitepress', 'public'])
 
@@ -88,13 +88,15 @@ export function runChecks({ dist, docs, only }) {
     else if (!hero.alt?.trim()) fail('A1: hero logo has empty alt text')
   }
 
-  // A2: feature cards.
+  // A2: feature cards, on the Features page.
   if (want('A2')) {
-    const cards = (index.match(/<article class="box"/g) ?? []).length
-    if (cards < MIN_FEATURES) fail(`A2: ${cards} feature cards on the landing page, need at least ${MIN_FEATURES}`)
+    const featuresFile = path.join(dist, 'features.html')
+    const features = existsSync(featuresFile) ? read(featuresFile) : ''
+    const cards = (features.match(/<article class="box"/g) ?? []).length
+    if (cards < MIN_FEATURES) fail(`A2: ${cards} feature cards on the Features page, need at least ${MIN_FEATURES}`)
   }
 
-  // A3 / A4: the four buttons.
+  // A3 / A4: the hero buttons.
   const buttons = tags(index, 'a').map(attrs).filter((a) => (a.class ?? '').split(/\s+/).includes('VPButton')).map((a) => a.href)
   if (want('A3')) {
     const same = buttons.length === ACTIONS.length && ACTIONS.every((h) => buttons.includes(h))
@@ -104,6 +106,12 @@ export function runChecks({ dist, docs, only }) {
     for (const href of buttons.filter((h) => h?.startsWith('/'))) {
       if (!distHas(dist, href)) fail(`A4: hero action ${href} has no built page`)
     }
+  }
+
+  // A10: the installation guide is on the landing page itself.
+  if (want('A10')) {
+    const guide = /<h2[^>]*>\s*Install(?![a-z])/.test(index) && index.includes('href="/installation/neovim"') && index.includes('href="/installation/vscode"')
+    if (!guide) fail('A10: the landing page must hold the installation guide (an "Install" heading with Neovim and VS Code links)')
   }
 
   // A5: canonical and social URLs, on the landing page and one deep page.

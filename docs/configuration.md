@@ -1,11 +1,7 @@
 # Configuration
 
-LazyVerilog finds `lazyverilog.toml` by walking up from each file you open to the nearest one.
-Opening a subdirectory does not hide the config above it, and two projects open side by side each
-use their own file.
-
-The config controls design inputs, semantic compilation, lint rules, formatter policy, RTL tree
-display, inlay hints, and automation helpers.
+Everything is set in `lazyverilog.toml`. The server uses the nearest one above each file you open, so
+two projects open side by side each use their own.
 
 ## Minimal example
 
@@ -24,8 +20,8 @@ enable = true
 
 ## Complete example
 
-This is the `lazyverilog.toml` from the repository root, included here so it cannot drift from
-the file the project actually tests against.
+The `lazyverilog.toml` from the repository root, imported here so it cannot drift from the file the
+project tests against.
 
 <<< ../lazyverilog.toml
 
@@ -33,11 +29,10 @@ the file the project actually tests against.
 
 | Topic | Page |
 |-------|------|
-| Design filelist and preprocessor defines | [Design & filelist](design/index.md) |
-| Formatter options | [Formatter options](formatter/options.md) |
-| Formatter macro policy | [Formatter macros](formatter/macros.md) |
-| Linter options with RTL examples | [Linter options](linter/options.md) |
-| Background semantic diagnostics | [Background compilation](diagnostics/background-compilation.md) |
-| Folding ranges | [Folding](folding/index.md) |
-| RTL tree display | [RTL tree](rtl-tree/index.md) |
-| Automation helpers | [AutoInst](autoinst/index.md), [AutoWire](autowire/index.md), [AutoArg](autoarg/index.md), [AutoFunc](autofunc/index.md), [AutoFF](autoff/index.md) |
+| Filelist and defines | [Design & filelist](design/index.md) |
+| Formatter | [Options](formatter/options.md), [macro policy](formatter/macros.md) |
+| Linter | [Linter options](linter/options.md) |
+| Semantic diagnostics | [Background compilation](diagnostics/background-compilation.md) |
+| Folding and inlay hints | [LSP features](lsp/index.md) |
+| RTL tree | [RTL tree](rtl-tree/index.md) |
+| Code generation | [AutoInst](autoinst/index.md), [AutoWire](autowire/index.md), [AutoArg](autoarg/index.md), [AutoFunc](autofunc/index.md), [AutoFF](autoff/index.md) |

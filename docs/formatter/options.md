@@ -1,6 +1,10 @@
 # Formatter Options
 
-All options live under `[format]` in `lazyverilog.toml`.
+All options live under `[format]` in `lazyverilog.toml`. The formatter never changes anything but
+whitespace; if a safety check fails, the edit is dropped and a warning is shown.
+
+Every `align` option has an `align_adaptive` companion: when `true`, each line computes its own column
+widths instead of sharing the widest in the group.
 
 ---
 
@@ -31,7 +35,8 @@ endmodule
 
 ### `blank_lines_between_items`
 
-Maximum number of blank lines preserved between top-level items (modules, always blocks, assigns, etc.). Extra blank lines beyond this value are collapsed.
+Number of blank lines kept wherever the source has at least one. `0` removes them. A gap that has no
+blank line is never given one. Blank lines inside parentheses or braces are not touched. Range 0 to 100.
 
 ```toml
 [format]
@@ -39,18 +44,15 @@ blank_lines_between_items = 1
 ```
 
 ```systemverilog
+// source: three blank lines between the assigns
 // blank_lines_between_items = 1
-module m_top;
-  assign a = b;
+assign a = b;
 
-  assign c = d;
-endmodule
+assign c = d;
 
-// blank_lines_between_items = 0   (all blank lines removed)
-module m_top;
-  assign a = b;
-  assign c = d;
-endmodule
+// blank_lines_between_items = 0
+assign a = b;
+assign c = d;
 ```
 
 ---
@@ -103,41 +105,13 @@ output  logic            valid
 
 ### `enable_format_on_save`
 
-When `true`, the LSP server applies whole-document formatting in response to
-`textDocument/formatting` requests (typically triggered by editor save).
-
-When `false`, the server skips the whole-document formatter for those requests.
-This does **not** disable other save-time generators.  For example,
-`[autoarg].autoarg_on_save = true` may still return edits from AutoArg; those
-generated edits are formatted as module-header fragments for consistency.
+When `true`, the server formats the whole document on save. It does not stop other save-time
+generators such as `[autoarg].autoarg_on_save`.
 
 ```toml
 [format]
 enable_format_on_save = true
 ```
-
----
-
-### Formatter safety checks
-
-Formatter safety checks are always enabled and are not user-configurable. After
-formatting, LazyVerilog verifies both that non-whitespace source content is
-unchanged and that re-lexing the formatted output produces the same token
-stream. If either check fails, formatting aborts with `SafeModeError`; the LSP
-server reports that warning to the client instead of returning a corrupt edit.
-
----
-
-### `log_path`
-
-Directory path for formatter diagnostic log files. When non-empty, the formatter writes per-pass token dumps into this directory after each format operation. Useful for debugging unexpected formatting output.
-
-```toml
-[format]
-log_path = "/tmp/lv-fmt-logs"
-```
-
-Disabled by default (empty string). Has no effect on formatted output.
 
 ---
 
@@ -449,18 +423,6 @@ very_long_text  = 4;
 ### `lhs_min_width`
 
 Minimum character width of the left-hand side field when `align` is `true`.
-The rendered operator column also includes the configured pre-operator space
-from `assignment_operator_spacing`. For example, with `lhs_min_width = 10`:
-
-```systemverilog
-// assignment_operator_spacing = "both"
-assign d          = a+2;
-a          += 1;
-
-// assignment_operator_spacing = "before"
-assign d         = a+2;
-a         += 1;
-```
 
 ```toml
 [format.statement]
@@ -586,17 +548,6 @@ output logic valid
 
 ---
 
-### `align_adaptive`
-
-When `true`, each port line computes column widths independently using its own content and the minimum widths, rather than aligning to the widest value across the entire port group.
-
-```toml
-[format.port_declaration]
-align_adaptive = false
-```
-
----
-
 ### `section1_min_width` .. `section5_min_width`
 
 Minimum character width for each alignment section. When `tab_align` is `true`, these are snapped to indent grid.
@@ -656,17 +607,6 @@ logic        valid;
 // align = false
 logic [7:0] data;
 logic valid;
-```
-
----
-
-### `align_adaptive`
-
-Per-line adaptive alignment (same concept as port declarations).
-
-```toml
-[format.var_declaration]
-align_adaptive = false
 ```
 
 ---
@@ -1025,31 +965,6 @@ function int add_number (
 
 Controls module header formatting.
 
-### Module header imports and preprocessor includes
-
-SystemVerilog permits package imports inside a module/interface/program header before
-the optional parameter and port lists. The formatter treats each header import as its
-own clause: the module name stays on the first line, each `import ...::*;` line is
-indented one level, and the following `#(...)` parameter list or `(...)` port list
-starts after the import clause.
-
-If a parameter list contains a preprocessor directive such as `` `include ``, the
-parameter list is forced to multiline. The directive is treated as an opaque
-parameter-list item: the formatter keeps it on its own indented line, does not inspect
-the included file, and does not add or remove commas around the directive.
-
-```systemverilog
-module tb_top
-  import tb_top_pkg::*;
-#(
-  parameter int MAX_CYCLES = 2_000_000,
-  `include "el2_param.vh"
-)(
-  input bit core_clk
-);
-```
-
-
 ### `parameter_layout`
 
 - `"block"` — parameters indented one level
@@ -1229,17 +1144,6 @@ modport master (
 
 ---
 
-### `align_adaptive`
-
-Per-line adaptive alignment for modport entries.
-
-```toml
-[format.modport]
-align_adaptive = false
-```
-
----
-
 ### `direction_min_width`
 
 Minimum character width for the direction column (`input`, `output`).
@@ -1269,57 +1173,3 @@ Controls how user-defined macros are classified for formatting purposes. Macro c
 By default, `whitespace_sensitive` contains `DV_CHECK_FATAL`. This preserves the exact argument spelling for that macro unless you override the list in `lazyverilog.toml`.
 
 ---
-
-## Disable regions
-
-The formatter respects inline disable comments. Everything between `// verilog_format: off` and `// verilog_format: on` is passed through verbatim. `` `define `` macro bodies are also passed through unchanged.
-
-```systemverilog
-// verilog_format: off
-assign weird_spacing   =    preserved;
-// verilog_format: on
-```
-
----
-
-## Comments, macros, and preprocessor conditionals
-
-Comments are classified by their structural position before formatting starts.
-The formatter keeps that classification stable across passes:
-
-- Statement-tail comments stay on the same line as the statement or construct they follow.
-- Own-line comments inside lists or expressions stay on their own line.
-- Leading interstitial comments inside lists stay attached to the following item.
-- Inline block comments inside an item stay inline with that item when possible.
-
-Example:
-
-```systemverilog
-// input
-module top(a, b, /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port
-           long_port_name);
-endmodule
-```
-
-With non-ANSI port wrapping enabled, `/* cfg */` is treated as a leading comment
-for `cdefghij`, while the line comment remains attached to the macro port:
-
-```systemverilog
-module top(
-  a, b,
-  /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port
-  long_port_name
-);
-endmodule
-```
-
-Function-like macro uses in lists are treated as list items when they are not
-classified as whitespace-sensitive or statement/declaration/control-flow macros.
-Object-like macro uses are preserved as ordinary tokens. `` `define `` macro
-bodies are passed through unchanged because their whitespace can be semantic.
-
-Preprocessor conditional directives such as `` `ifdef ``, `` `else ``, and
-`` `endif `` are preserved on their own lines. For safety, formatter passes that
-cannot safely reason across conditional branches avoid restructuring the
-surrounding range; existing conditional content is preserved and formatting is
-kept idempotent.

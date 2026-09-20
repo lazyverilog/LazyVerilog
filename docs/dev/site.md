@@ -10,7 +10,8 @@ its `main` branch.
 
 | Path | Role |
 |------|------|
-| `docs/index.md` | Landing page: hero, the four buttons, feature cards. Frontmatter only. |
+| `docs/index.md` | Landing page: hero, the five buttons, and the installation guide as its body. |
+| `docs/features.md` | The feature cards (frontmatter only, `layout: home`). |
 | `docs/.vitepress/config.mts` | Site config: nav, per-page canonical/`og:` tags, theme, search. |
 | `docs/.vitepress/site.json` | Sidebar and `srcExclude`; read by `config.mts` **and** `check-dist`. |
 | `docs/.vitepress/theme/` | Catppuccin CSS import plus the single override in `custom.css`. |
@@ -52,14 +53,15 @@ resolution.
 | Id | Assertion |
 |----|-----------|
 | A1 | Hero logo has alt text |
-| A2 | At least 9 feature cards |
-| A3 | Exactly four hero buttons: `/installation`, `/usage`, `/configuration`, the sponsor page |
+| A2 | At least 9 feature cards on the Features page |
+| A3 | Exactly five hero buttons: `/installation/`, `/features`, `/usage/`, `/configuration`, the sponsor page |
 | A4 | Each internal button target is a built page |
 | A5 | `canonical`/`og:url` are `https://lazyverilog.github.io/…` on the landing page and a deep page; `og:image` exists |
 | A6 | `.nojekyll` exists |
 | A7 | Source pages = built pages = sidebar entries; only three `srcExclude` pattern shapes allowed |
 | A8 | Every local `<img>` in every page exists |
 | A9 | The hero name is not accent-colored (see below) |
+| A10 | The landing page holds the installation guide: an "Install" heading with Neovim and VS Code links |
 
 `docs/scripts/check-dist.test.mjs` applies one mutation per assertion and requires that assertion to
 fail. Defaults resolve from the script's location; an explicit `--dist`/`--docs` is relative to the
@@ -130,7 +132,7 @@ git add --all && git commit -q -m 'Manual publish'
 git push --force origin main
 ```
 
-Then check on the real host: `/` returns 200, `/installation` (no `.html`) returns 200, a missing
+Then check on the real host: `/` returns 200, `/installation/` and `/installation/neovim` (no `.html`) return 200, a missing
 path shows the site's `404.html`, assets load. A manual publish proves Pages and the key; it does
 not exercise the workflow's runner steps (the `site-publish` environment admits only `main`).
 
