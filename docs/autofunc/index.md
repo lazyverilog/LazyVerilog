@@ -1,17 +1,35 @@
 # AutoFunc
 
-**Code action.** Writes a call to a function or task with every argument filled in from its signature.
-Put the cursor on the function or task name.
+**Code action.** Fills in the missing arguments of a function or task call from its signature. Put the
+cursor on the function or task name of a call that has fewer arguments than the signature. A complete
+call gets no action.
 
 ```systemverilog
-function automatic logic [7:0] clamp(input logic [7:0] val, input logic [7:0] limit);
+task add_number(input int a, input int b, output int result);
+    result = a + b;
+endtask
 
-// use_named_arguments = true
-clamp(.val(val), .limit(limit))
+module top;
+    int x, y, sum;
 
-// use_named_arguments = false
-clamp(val, limit)
+    initial begin
+        add_number(x, y);
+    end
+endmodule
 ```
+
+With the cursor on `add_number`, the call becomes:
+
+```systemverilog
+        add_number(.a(x), .b(y), .result(result));
+```
+
+Arguments you already wrote are kept, and each missing one is filled with the parameter's own name.
+An empty call such as `add_number(` becomes `add_number(.a(a), .b(b), .result(result));`. With
+`use_named_arguments = false` the same call becomes `add_number(x, y, result);`.
+
+The result is laid out by the [formatter](../formatter/options.md#format-function-call), so a long call wraps as your
+function-call settings say.
 
 ```toml
 [autofunc]

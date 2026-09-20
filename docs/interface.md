@@ -1,13 +1,19 @@
 # Interface
 
 A view of the signals shared between instances, where you can also connect and disconnect them.
-Neovim: `:Interface <inst>` or `:Interface <inst1> <inst2>`. VS Code: `LazyVerilog: Interface`.
+
+- Neovim: `:Interface <inst>` or `:Interface <inst1> <inst2>`
+- VS Code: `LazyVerilog: Interface`
 
 ## One instance
 
 Read-only. Lists each port, the signal it is connected to, and the sibling ports on the same signal.
 
+![Neovim's Single Interface window for u_cpu: each port, its wire, and the instance ports on that wire](/screenshots/interface-one-neovim.webp)
+
 ## Two instances
+
+![Neovim's Interface window for u_cpu and u_bus: a table of ports and shared signals, with [C]onnect and [D]isconnect](/screenshots/interface-neovim.webp)
 
 A table with the ports of the first instance, the shared signal, and the ports of the second. Ports
 with the same signal name share a row. A port with no partner gets its own row. Arrows show direction:

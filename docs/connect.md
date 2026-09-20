@@ -1,7 +1,10 @@
 # Connect
 
 Wires an output port of one module instance to an input port of another, through their nearest common
-parent. Neovim: `:Connect <source_module> <dest_module>`. VS Code: `LazyVerilog: Connect`.
+parent.
+
+- Neovim: `:Connect <source_module> <dest_module>`
+- VS Code: `LazyVerilog: Connect`
 
 You are asked to pick:
 
@@ -10,6 +13,10 @@ You are asked to pick:
 3. a name for the wire
 
 A preview shows the edits before anything is applied.
+
+![Neovim asking for the source output port of mem_ctrl, with the candidate ports listed](/screenshots/connect-port-neovim.webp)
+
+![Neovim showing the Connect Preview: two port connections and a new wire declaration, with [y] Apply and [n] Cancel](/screenshots/connect-preview-neovim.webp)
 
 ## What it edits
 
