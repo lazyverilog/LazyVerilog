@@ -1,3 +1,4 @@
+#include "banner.hpp"
 #include "cli_project.hpp"
 #include "string_utils.hpp"
 
@@ -31,6 +32,8 @@ void print_tree(const RtlTreeNode& node, const CliProject& project, int depth, s
 } // namespace
 
 int main(int argc, char* argv[]) {
+    print_startup_banner("lazyverilog-rtltree", argc, argv);
+
     std::string filelist_arg;
     std::string file_arg;
     bool reverse = false;

@@ -1,5 +1,7 @@
 #include "server.hpp"
 
+#include "banner.hpp"
+
 #include <cstring>
 #include <iostream>
 
@@ -9,6 +11,8 @@
 #endif
 
 int main(int argc, char* argv[]) {
+    print_startup_banner("lazyverilog-lsp", argc, argv);
+
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "lazyverilog-lsp " << LAZYVERILOG_VERSION << "\n";

@@ -1,4 +1,5 @@
 #include "lint.hpp"
+#include "lint_codes.hpp"
 #include "../lsp_position.hpp"
 #include "../analyzer.hpp"
 #include "../dynamic_file_index.hpp"
@@ -25,9 +26,10 @@ using namespace slang::syntax;
 using namespace slang::parsing;
 
 static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
-                               int sev, std::string msg) {
+                               int sev, LintCode code, std::string msg) {
     ParseDiagInfo d;
     d.severity = sev;
+    d.code     = std::string(lint_code_info(code).code);
     d.message  = std::move(msg);
     if (loc.valid()) {
         try {
@@ -62,10 +64,10 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
 /// This is the same isMacroLoc / isMacroArgLoc split the indexer uses to decide
 /// where a declaration versus a reference belongs.
 static void push_diag(std::vector<ParseDiagInfo>& diags, SourceManager& sm, SourceLocation loc,
-                      int sev, std::string msg) {
+                      int sev, LintCode code, std::string msg) {
     if (loc.valid() && sm.isMacroLoc(loc) && !sm.isMacroArgLoc(loc))
         return;
-    diags.emplace_back(make_diag(sm, loc, sev, std::move(msg)));
+    diags.emplace_back(make_diag(sm, loc, sev, code, std::move(msg)));
 }
 
 static std::vector<ParseDiagInfo> lint_trailing_whitespace(const std::string& text) {
@@ -94,6 +96,7 @@ static std::vector<ParseDiagInfo> lint_trailing_whitespace(const std::string& te
             d.line = line;
             d.col = static_cast<int>(trailing_start - line_start);
             d.severity = 2;
+            d.code = std::string(lint_code_info(LintCode::StyleTrailingWhitespace).code);
             d.message = "[style] trailing whitespace";
             diags.push_back(std::move(d));
         }
@@ -369,19 +372,21 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
 
     void chk_name(const std::string& name, SourceLocation loc,
                   const CachedRegex& re,
-                  const std::string& pat, const char* cat) {
+                  const std::string& pat, const char* cat, LintCode code) {
         if (!re || name.empty()) return;
         if (!std::regex_match(name, *re))
-            push_diag(diags, sm, loc, naming_sev(),
+            push_diag(diags, sm, loc, naming_sev(), code,
                 std::string("[naming] ") + cat + " '" + name + "' does not match pattern '" + pat + "'");
     }
 
     void chk_port(const std::string& name, SourceLocation loc, PortDir dir) {
         if (!cfg.naming.enable) return;
         if (dir == PortDir::Input)
-            chk_name(name, loc, input_port_re_, cfg.naming.input_port_pattern, "input port");
+            chk_name(name, loc, input_port_re_, cfg.naming.input_port_pattern, "input port",
+                     LintCode::NamingInputPort);
         else if (dir == PortDir::Output)
-            chk_name(name, loc, output_port_re_, cfg.naming.output_port_pattern, "output port");
+            chk_name(name, loc, output_port_re_, cfg.naming.output_port_pattern, "output port",
+                     LintCode::NamingOutputPort);
     }
 
     // ── case_missing_default ──────────────────────────────────────────────
@@ -394,6 +399,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     has_default = true;
             if (!has_default)
                 push_diag(diags, sm, node.caseKeyword.location(), statement_sev(),
+                    LintCode::StatementCaseMissingDefault,
                     "[statement] case statement missing default item");
         }
         visitDefault(node);
@@ -415,13 +421,16 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 bool is_auto = has_life && proto.lifetime.rawText() == "automatic";
                 if (!is_auto)
                     push_diag(diags, sm, proto.keyword.location(), function_sev(),
+                        LintCode::FunctionAutomatic,
                         "[function] function declaration should use 'automatic' lifetime");
             } else if (cfg.function.explicit_function_lifetime && !has_life) {
                 push_diag(diags, sm, proto.keyword.location(), function_sev(),
+                    LintCode::FunctionExplicitLifetime,
                     "[function] function declaration missing explicit lifetime (automatic/static)");
             }
         } else if (cfg.function.explicit_task_lifetime && !has_life) {
             push_diag(diags, sm, proto.keyword.location(), function_sev(),
+                LintCode::TaskExplicitLifetime,
                 "[task] task declaration missing explicit lifetime (automatic/static)");
         }
         visitDefault(node);
@@ -442,12 +451,15 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             auto fn_sev = function_sev();
             if (style == "named" && has_positional)
                 push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    LintCode::FunctionCallStyle,
                     "[function] call uses positional arguments; named arguments required");
             else if (style == "positional" && has_named)
                 push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    LintCode::FunctionCallStyle,
                     "[function] call uses named arguments; positional arguments required");
             else if (style == "both" && has_positional && has_named)
                 push_diag(diags, sm, node.left->getFirstToken().location(), fn_sev,
+                    LintCode::FunctionCallStyle,
                     "[function] call mixes positional and named arguments");
         }
         visitDefault(node);
@@ -492,14 +504,17 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 std::string port = std::string(named->name.valueText());
                 if (!seen.insert(port).second)
                     push_diag(diags, sm, named->name.location(), module_sev(),
+                        LintCode::InstanceDuplicateConnection,
                         "[module] duplicate autoinst connection for port '" + port + "'");
                 else if (!has_port(port))
                     push_diag(diags, sm, named->name.location(), module_sev(),
+                        LintCode::InstanceStaleConnection,
                         "[module] stale autoinst connection for unknown port '" + port + "'");
             }
             for_each_port([&](const std::string& port_name) {
                 if (!seen.count(port_name) && inst->decl)
                     push_diag(diags, sm, inst->decl->name.location(), module_sev(),
+                        LintCode::InstanceMissingConnection,
                         "[module] autoinst connection missing port '" + port_name + "'");
             });
         }
@@ -523,12 +538,15 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 }
                 if (style == "named" && has_positional)
                     push_diag(diags, sm, node.type.location(), module_sev(),
+                        LintCode::InstanceStyle,
                         "[module] instance uses positional port connections; named connections required");
                 else if (style == "positional" && has_named)
                     push_diag(diags, sm, node.type.location(), module_sev(),
+                        LintCode::InstanceStyle,
                         "[module] instance uses named port connections; positional connections required");
                 else if (style == "both" && has_positional && has_named)
                     push_diag(diags, sm, node.type.location(), module_sev(),
+                        LintCode::InstanceStyle,
                         "[module] instance mixes positional and named port connections");
             }
         }
@@ -570,22 +588,25 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             ++module_count_;
             if (cfg.module.one_module_per_file && module_count_ > 1)
                 push_diag(diags, sm, node.header->name.location(), module_sev(),
+                    LintCode::ModuleOnePerFile,
                     "[module] more than one module declared in this file");
             if (cfg.naming.enable) {
                 chk_name(name, node.header->name.location(), module_re_,
-                         cfg.naming.module_pattern, "module");
+                         cfg.naming.module_pattern, "module", LintCode::NamingModule);
                 if (cfg.naming.check_module_filename && !file_stem_.empty() && name != file_stem_)
                     push_diag(diags, sm, node.header->name.location(), naming_sev(),
+                        LintCode::NamingModuleFilename,
                         "[naming] module '" + name + "' does not match filename '" + file_stem_ + "'");
             }
         } else if (node.kind == SyntaxKind::InterfaceDeclaration) {
             if (cfg.naming.enable)
                 chk_name(name, node.header->name.location(), interface_re_,
-                         cfg.naming.interface_pattern, "interface");
+                         cfg.naming.interface_pattern, "interface", LintCode::NamingInterface);
         } else if (node.kind == SyntaxKind::PackageDeclaration) {
             if (cfg.naming.enable && cfg.naming.check_package_filename && !file_stem_.empty() &&
                 name != file_stem_)
                 push_diag(diags, sm, node.header->name.location(), naming_sev(),
+                    LintCode::NamingPackageFilename,
                     "[naming] package '" + name + "' does not match filename '" + file_stem_ + "'");
         }
         visitDefault(node);
@@ -623,7 +644,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 if (!decl) continue;
                 auto name = std::string(decl->name.valueText());
                 chk_name(name, decl->name.location(), signal_re_,
-                         cfg.naming.signal_pattern, "signal");
+                         cfg.naming.signal_pattern, "signal", LintCode::NamingSignal);
             }
         }
         visitDefault(node);
@@ -633,13 +654,13 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         if (cfg.naming.enable) {
             if (node.type->kind == SyntaxKind::StructType)
                 chk_name(std::string(node.name.valueText()), node.name.location(), struct_re_,
-                         cfg.naming.struct_pattern, "struct");
+                         cfg.naming.struct_pattern, "struct", LintCode::NamingStruct);
             else if (node.type->kind == SyntaxKind::UnionType)
                 chk_name(std::string(node.name.valueText()), node.name.location(), union_re_,
-                         cfg.naming.union_pattern, "union");
+                         cfg.naming.union_pattern, "union", LintCode::NamingUnion);
             else if (node.type->kind == SyntaxKind::EnumType)
                 chk_name(std::string(node.name.valueText()), node.name.location(), enum_re_,
-                         cfg.naming.enum_pattern, "enum");
+                         cfg.naming.enum_pattern, "enum", LintCode::NamingEnum);
         }
         visitDefault(node);
     }
@@ -650,10 +671,13 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             const auto& re = is_localparam ? localparam_re_ : parameter_re_;
             const auto& pat = is_localparam ? cfg.naming.localparam_pattern : cfg.naming.parameter_pattern;
             const char* cat = is_localparam ? "localparam" : "parameter";
+            const LintCode code =
+                is_localparam ? LintCode::NamingLocalparam : LintCode::NamingParameter;
             for (uint32_t i = 0; i < node.declarators.size(); ++i) {
                 const auto* decl = node.declarators[i];
                 if (!decl) continue;
-                chk_name(std::string(decl->name.valueText()), decl->name.location(), re, pat, cat);
+                chk_name(std::string(decl->name.valueText()), decl->name.location(), re, pat,
+                         cat, code);
             }
         }
         visitDefault(node);
@@ -666,7 +690,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                 if (!decl) continue;
                 auto name = std::string(decl->name.valueText());
                 chk_name(name, decl->name.location(), signal_re_,
-                         cfg.naming.signal_pattern, "signal");
+                         cfg.naming.signal_pattern, "signal", LintCode::NamingSignal);
             }
         }
         visitDefault(node);
@@ -677,11 +701,13 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         if (statement_rules_on() && cfg.statement.no_raw_always &&
             node.kind == SyntaxKind::AlwaysBlock)
             push_diag(diags, sm, node.keyword.location(), statement_sev(),
+                LintCode::StatementRawAlways,
                 "[statement] raw always block should use always_comb, always_ff, or always_latch");
         if (statement_rules_on() && cfg.statement.latch_inference_detection &&
             node.kind == SyntaxKind::AlwaysCombBlock) {
             if (has_latch_risk(*node.statement))
                 push_diag(diags, sm, node.keyword.location(), statement_sev(),
+                    LintCode::StatementLatchInference,
                     "[statement] always_comb block may infer a latch (incomplete if)");
         }
         bool was_ff = in_always_ff_;
@@ -700,9 +726,11 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         if (statement_rules_on() && cfg.statement.blocking_nonblocking_assignments) {
             if (in_always_ff_ && is_blocking_assignment(node.kind))
                 push_diag(diags, sm, node.getFirstToken().location(), statement_sev(),
+                    LintCode::StatementAssignmentKind,
                     "[statement] always_ff should use nonblocking assignments");
             else if (in_always_comb_ && node.kind == SyntaxKind::NonblockingAssignmentExpression)
                 push_diag(diags, sm, node.getFirstToken().location(), statement_sev(),
+                    LintCode::StatementAssignmentKind,
                     "[statement] always_comb should use blocking assignments");
         }
         if (in_always_ff_ && cfg.naming.enable && register_re_ &&
@@ -711,7 +739,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             if (tok.valid() && tok.kind == TokenKind::Identifier) {
                 auto name = std::string(tok.valueText());
                 chk_name(name, tok.location(), register_re_,
-                         cfg.naming.register_pattern, "register");
+                         cfg.naming.register_pattern, "register", LintCode::NamingRegister);
             }
         }
         visitDefault(node);
@@ -721,10 +749,12 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         if (statement_rules_on() && cfg.statement.explicit_begin) {
             if (!is_block_statement(node.statement))
                 push_diag(diags, sm, node.ifKeyword.location(), statement_sev(),
+                    LintCode::StatementExplicitBegin,
                     "[statement] if statement body should use begin/end");
             if (node.elseClause && !node.elseClause->clause->as_if<ConditionalStatementSyntax>() &&
                 !is_block_statement(node.elseClause->clause))
                 push_diag(diags, sm, node.elseClause->elseKeyword.location(), statement_sev(),
+                    LintCode::StatementExplicitBegin,
                     "[statement] else statement body should use begin/end");
         }
         visitDefault(node);
@@ -733,6 +763,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const LoopStatementSyntax& node) {
         if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.repeatOrWhile.location(), statement_sev(),
+                LintCode::StatementExplicitBegin,
                 "[statement] loop body should use begin/end");
         visitDefault(node);
     }
@@ -740,6 +771,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const ForLoopStatementSyntax& node) {
         if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.forKeyword.location(), statement_sev(),
+                LintCode::StatementExplicitBegin,
                 "[statement] for loop body should use begin/end");
         visitDefault(node);
     }
@@ -747,6 +779,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const ForeachLoopStatementSyntax& node) {
         if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.keyword.location(), statement_sev(),
+                LintCode::StatementExplicitBegin,
                 "[statement] foreach loop body should use begin/end");
         visitDefault(node);
     }
@@ -754,6 +787,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const ForeverStatementSyntax& node) {
         if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.foreverKeyword.location(), statement_sev(),
+                LintCode::StatementExplicitBegin,
                 "[statement] forever body should use begin/end");
         visitDefault(node);
     }
@@ -761,6 +795,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     void handle(const DoWhileStatementSyntax& node) {
         if (statement_rules_on() && cfg.statement.explicit_begin && !is_block_statement(node.statement))
             push_diag(diags, sm, node.doKeyword.location(), statement_sev(),
+                LintCode::StatementExplicitBegin,
                 "[statement] do body should use begin/end");
         visitDefault(node);
     }

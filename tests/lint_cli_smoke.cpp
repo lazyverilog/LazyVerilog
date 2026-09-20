@@ -173,6 +173,99 @@ int main(int argc, char** argv) {
               "usage text advertises --maxerror");
     }
 
+    // Diagnostic codes are printed, because --nowarn is unusable if the value it
+    // takes is not visible anywhere.  m_top.sv carries one of each family: a
+    // lint rule and a slang error.
+    {
+        auto result = run_command(lint_bin, shell_quote(top));
+        expect(contains(result.stdout_text, "[lint-naming-input-port]"),
+              "a lint diagnostic prints its code");
+        expect(contains(result.stdout_text, "[UnknownDirective]"),
+              "a slang error prints its slang diagnostic name as its code");
+    }
+
+    // --nowarn on an exact lint code drops that rule and nothing else.
+    {
+        auto result = run_command(lint_bin, "--nowarn lint-naming-input-port " + shell_quote(top));
+        expect(!contains(result.stdout_text, "[lint-naming-input-port]"),
+              "--nowarn <lint code> drops that rule");
+        expect(contains(result.stdout_text, "unknown macro"),
+              "--nowarn <lint code> leaves the compilation diagnostic alone");
+        expect(result.exit_code == 2, "an unsuppressed error still sets exit 2");
+    }
+
+    // The lint namespace is hierarchical: a parent silences its children.
+    {
+        auto category = run_command(lint_bin, "--nowarn lint-naming " + shell_quote(top));
+        expect(!contains(category.stdout_text, "[lint-naming-input-port]"),
+              "--nowarn lint-naming silences a rule inside that category");
+
+        auto everything = run_command(lint_bin, "--nowarn lint " + shell_quote(top));
+        expect(!contains(everything.stdout_text, "[lint-"),
+              "--nowarn lint silences every lint rule");
+        expect(contains(everything.stdout_text, "unknown macro"),
+              "--nowarn lint is not a --compile-only in disguise");
+    }
+
+    // A suppressed error stops setting the exit status.  Silencing a diagnostic
+    // and still failing the build on it would make the flag useless in CI,
+    // which is the one place it is most wanted.
+    {
+        auto result = run_command(lint_bin,
+                                  "--nowarn lint --nowarn UnknownDirective " + shell_quote(top));
+        expect(result.stdout_text.empty(), "both families suppressed leaves no output");
+        expect(result.exit_code == 0, "a suppressed error no longer sets exit 2");
+    }
+
+    // slang group names stand for their members.  m_dut.sv's type mismatch is
+    // `implicit-conv`, which lives in slang's `conversion` group.
+    {
+        const std::string flist = " -f " + shell_quote(maxerror_filelist) + " " +
+                                  shell_quote(maxerror_dut);
+
+        auto plain = run_command(lint_bin, "--maxerror 0" + flist);
+        expect(contains(plain.stdout_text, "[implicit-conv]"),
+              "a slang warning prints its -W option name as its code");
+
+        auto by_code = run_command(lint_bin, "--maxerror 0 --nowarn implicit-conv" + flist);
+        expect(!contains(by_code.stdout_text, "implicit conversion from"),
+              "--nowarn <slang option name> drops that warning");
+
+        auto by_group = run_command(lint_bin, "--maxerror 0 --nowarn conversion" + flist);
+        expect(!contains(by_group.stdout_text, "implicit conversion from"),
+              "--nowarn <slang group> drops the warnings in that group");
+    }
+
+    // A --nowarn value that silences nothing is a typo, and a typo that looks
+    // like it worked is worse than no flag at all.
+    {
+        for (const std::string bad : {"lint-nam", "lint-bogus", "no-such-warning", "lint-naming-mod"}) {
+            auto result = run_command(lint_bin, "--nowarn " + shell_quote(bad) + " " +
+                                                    shell_quote(top));
+            expect(result.exit_code == 1, "--nowarn " + bad + " exits 1");
+            expect(contains(result.stderr_text, "Unknown --nowarn code"),
+                  "--nowarn " + bad + " says which value it rejected");
+        }
+
+        auto missing = run_command(lint_bin, "--nowarn");
+        expect(missing.exit_code == 1, "--nowarn with no value exits 1");
+    }
+
+    // --help is where the code names come from, so it has to carry them.
+    {
+        auto help = run_command(lint_bin, "--help");
+        expect(help.exit_code == 0, "--help exits 0");
+        expect(contains(help.stdout_text, "--nowarn"), "--help advertises --nowarn");
+        expect(contains(help.stdout_text, "lint-naming-module"),
+              "--help lists an individual lint code");
+        expect(contains(help.stdout_text, "lint-style-trailing-whitespace"),
+              "--help lists the whole table, not just the first section");
+        expect(contains(help.stdout_text, "conversion"),
+              "--help lists slang's warning groups");
+        expect(contains(help.stdout_text, "MissingTimeScale"),
+              "--help explains how slang errors are named");
+    }
+
     if (checks_failed > 0) {
         std::cerr << checks_failed << "/" << checks_run << " checks failed\n";
         return 1;

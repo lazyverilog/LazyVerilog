@@ -760,6 +760,50 @@ Diagnostics:
 
 ---
 
+## Diagnostic codes
+
+Every rule reports a code, printed in brackets by `lazyverilog-lint` and accepted by its
+`--nowarn` flag. The two are different tools for the same job: the config key turns a rule off
+for the project, `--nowarn` turns it off for one run.
+
+See [cli.md](cli.md#diagnostic-codes) for how `--nowarn` matching works — the codes are
+hierarchical, so `--nowarn lint-naming` covers every row in the `[lint.naming]` block below.
+
+| Code | Config key |
+|------|------------|
+| `lint-naming-module` | `[lint.naming]` `module_pattern` |
+| `lint-naming-interface` | `[lint.naming]` `interface_pattern` |
+| `lint-naming-input-port` | `[lint.naming]` `input_port_pattern` |
+| `lint-naming-output-port` | `[lint.naming]` `output_port_pattern` |
+| `lint-naming-signal` | `[lint.naming]` `signal_pattern` |
+| `lint-naming-struct` | `[lint.naming]` `struct_pattern` |
+| `lint-naming-union` | `[lint.naming]` `union_pattern` |
+| `lint-naming-enum` | `[lint.naming]` `enum_pattern` |
+| `lint-naming-parameter` | `[lint.naming]` `parameter_pattern` |
+| `lint-naming-localparam` | `[lint.naming]` `localparam_pattern` |
+| `lint-naming-register` | `[lint.naming]` `register_pattern` |
+| `lint-naming-module-filename` | `[lint.naming]` `check_module_filename` |
+| `lint-naming-package-filename` | `[lint.naming]` `check_package_filename` |
+| `lint-module-one-per-file` | `[lint.module]` `one_module_per_file` |
+| `lint-instance-style` | `[lint.instance]` `module_instantiation_style` |
+| `lint-instance-duplicate-connection` | `[lint.instance]` `stale_instance_diagnostic` |
+| `lint-instance-stale-connection` | `[lint.instance]` `stale_instance_diagnostic` |
+| `lint-instance-missing-connection` | `[lint.instance]` `stale_instance_diagnostic` |
+| `lint-statement-case-missing-default` | `[lint.statement]` `case_missing_default` |
+| `lint-statement-raw-always` | `[lint.statement]` `no_raw_always` |
+| `lint-statement-latch-inference` | `[lint.statement]` `latch_inference_detection` |
+| `lint-statement-assignment-kind` | `[lint.statement]` `blocking_nonblocking_assignments` |
+| `lint-statement-explicit-begin` | `[lint.statement]` `explicit_begin` |
+| `lint-function-automatic` | `[lint.function]` `functions_automatic` |
+| `lint-function-call-style` | `[lint.function]` `function_call_style` |
+| `lint-function-explicit-lifetime` | `[lint.function]` `explicit_function_lifetime` |
+| `lint-task-explicit-lifetime` | `[lint.function]` `explicit_task_lifetime` |
+| `lint-style-trailing-whitespace` | `[lint.style]` `trailing_whitespace` |
+
+`lazyverilog-lint --help` prints this list with a one-line description of each rule.
+
+---
+
 ## Complete example configuration
 
 ```toml
