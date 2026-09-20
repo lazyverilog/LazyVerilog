@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/lazyverilog_logo.png" alt="LazyVerilog logo" width="260">
+  <img src="docs/public/logo.webp" alt="LazyVerilog logo" width="260">
 </p>
 
 <h1 align="center">⚡ LazyVerilog</h1>

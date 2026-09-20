@@ -19,7 +19,7 @@ indent_size = 4
 use_named_arguments = true
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `indent_size` | `4` | Indent for multiline argument lists. Does not follow `[format].indent_size` (default `2`), so set both if you want them to match |
-| `use_named_arguments` | `true` | Generate `.arg(value)` instead of positional arguments |
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `autofunc` | `indent_size` | `4` | Indent for multiline argument lists. Does not follow `[format].indent_size` (default `2`), so set both if you want them to match |
+| `autofunc` | `use_named_arguments` | `true` | Generate `.arg(value)` instead of positional arguments |

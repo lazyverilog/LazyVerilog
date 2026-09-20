@@ -27,7 +27,7 @@ group_by_instance = false
 sort_by_name = true
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `group_by_instance` | `false` | Group declarations by the instance they come from |
-| `sort_by_name` | `false` | Sort declarations alphabetically |
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `autowire` | `group_by_instance` | `false` | Group declarations by the instance they come from |
+| `autowire` | `sort_by_name` | `false` | Sort declarations alphabetically |

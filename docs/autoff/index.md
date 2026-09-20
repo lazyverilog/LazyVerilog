@@ -33,6 +33,6 @@ Requirements:
 register_pattern = "^r_"
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `register_pattern` | `"^r_"` | Regex. The signal matching it is the register, the other is the source |
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `autoff` | `register_pattern` | `"^r_"` | Regex. The signal matching it is the register, the other is the source |

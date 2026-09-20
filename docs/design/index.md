@@ -9,29 +9,29 @@ vcode = "demo/vcode.f"
 define = ["RTL_SIM"]
 ```
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `vcode` | string | Filelist path, relative to `lazyverilog.toml` |
-| `define` | string[] | Preprocessor defines for every design file |
+| Section | Option | Type | Description |
+|---------|--------|------|-------------|
+| `design` | `vcode` | string | Filelist path, relative to `lazyverilog.toml` |
+| `design` | `define` | string[] | Preprocessor defines for every design file |
 
 ## Filelist format
 
 One source file per line, with paths relative to the filelist.
 
 ```text
-rtl/m_alu.sv
-rtl/m_adder.sv
--f ../shared/shared.vc
+rtl/alu.sv
+rtl/adder.sv
+-f ../my_rtl_list.f
 +incdir+rtl/include
-vendor/uvm/src/uvm_pkg.sv
+uvm/src/uvm_pkg.sv
 ```
 
-| Syntax | Effect |
-|--------|--------|
-| `// ...` or `# ...` | Comment |
+| Line | Effect |
+|------|--------|
+| `rtl.sv` | A source file to index |
 | `-f <filelist>` | Load a nested filelist, its paths relative to itself |
 | `+incdir+<dir>` | Add an include directory. `+incdir+<a>+<b>` adds several |
-| other `+<option>`, `-<flag>` | Ignored |
+| others | Comments (`//`, `#`) and any other `+<option>` or `-<flag>` are ignored |
 
 `+incdir+` entries are search paths for `` `include ``, not source files. `$VAR` and `${VAR}` are
 expanded when the variable is defined.

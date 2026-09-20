@@ -75,7 +75,8 @@ accent color as large text, so `theme/custom.css` sets exactly one variable,
 
 `docs/public/logo.webp`, `og.png` and `favicon.png` are committed copies made from
 `assets/lazyverilog_logo.png` and `vscode/assets/lazyverilog_icon.png`, which stay the source of
-truth.
+truth. The script also makes the black shadow behind the LV letters transparent in `logo.webp`;
+the README uses that file too.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install pillow==12.3.0

@@ -23,6 +23,6 @@ settings, including the non-ANSI ports-per-line options.
 autoarg_on_save = true
 ```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `autoarg_on_save` | `false` | Regenerate port lists for every module in the file on save |
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `autoarg` | `autoarg_on_save` | `false` | Regenerate port lists for every module in the file on save |
