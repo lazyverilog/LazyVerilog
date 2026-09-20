@@ -17,6 +17,7 @@ Developer utilities for benchmarking and debugging the lazyverilog server. Not p
 | `edit_latency_bench.py` | Steady-state edit loop: replays keystrokes at a real server and times `foldingRange`, `inlayHint`, and `didChange`→diagnostics (`tools/edit_latency_bench.py <project> <file> [--cpus 0] [--gap 0.6]`) |
 | `run_parse_bench_opentitan.sh` | Runs formatter performance sweep against OpenTitan RTL corpus |
 | `diff_once_twice` | Idempotency checker — formats a `.sv` file once and twice, then diffs pass-by-pass logs to find the first non-idempotent pass |
+| `record/` | Records the Demos-page GIFs and documentation screenshots from a real Neovim: fixed size, theme and demo project (`python tools/record/scenes.py --list`; see `record/README.md`) |
 
 ## For AI Agents
 

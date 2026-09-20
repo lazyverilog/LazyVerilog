@@ -1,0 +1,32 @@
+[design]
+vcode = "files.f"
+
+[rtltree]
+show_file = false
+
+[format]
+indent_size = 4
+
+[format.port_declaration]
+section1_min_width = 6
+section2_min_width = 5
+section3_min_width = 6
+section4_min_width = 6
+section5_min_width = 0
+
+[lint]
+enable = true
+
+[lint.naming]
+enable = true
+severity = "warning"
+module_pattern = "^m_.*$"
+input_port_pattern = "^i_.*$"
+output_port_pattern = "^o_.*$"
+
+[lint.statement]
+enable = true
+severity = "warning"
+no_raw_always = true
+blocking_nonblocking_assignments = true
+case_missing_default = true
