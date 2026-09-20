@@ -2,10 +2,13 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include "banner.hpp"
 #include "features/formatter.hpp"
 #include "config.hpp"
 
 int main(int argc, char* argv[]) {
+    print_startup_banner("lazyverilog-fmt", argc, argv);
+
     const char* log_path = nullptr;
     const char* path = nullptr;
     bool in_place = false;

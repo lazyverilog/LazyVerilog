@@ -12,7 +12,7 @@ SystemVerilog LSP server written in C++. Provides language intelligence (formatt
 | `CMakeLists.txt` | CMake build configuration |
 | `lazyverilog.toml` | LSP server config — formatting and linting options |
 | `CLAUDE.md` | Project instructions for AI agents |
-| `README.md` | Project overview and usage |
+| `README.md` | Demo, comparison, feature list, and a Getting Started link to the documentation site (https://lazyverilog.github.io) |
 | `.gitmodules` | Git submodule configuration |
 
 ## Subdirectories
@@ -21,7 +21,7 @@ SystemVerilog LSP server written in C++. Provides language intelligence (formatt
 |-----------|---------|
 | `src/` | C++ source — server core + all LSP feature implementations (see `src/AGENTS.md`) |
 | `tests/` | Unit and integration tests (see `tests/AGENTS.md`) |
-| `docs/` | Documentation for formatter options and diagnostics (see `docs/AGENTS.md`) |
+| `docs/` | Documentation source, built into https://lazyverilog.github.io with VitePress (see `docs/AGENTS.md`) |
 | `tools/` | Dev/benchmark utilities (see `tools/AGENTS.md`) |
 | `lua/` | Neovim plugin Lua integration (see `lua/AGENTS.md`) |
 | `scripts/` | Repository-maintenance scripts, e.g. README translation (see `scripts/AGENTS.md`) |

@@ -1,88 +1,44 @@
 # Connect
 
-`Connect` is an interactive Neovim command for wiring one module instance output
-port to another module instance input port through their nearest common parent.
+Wires an output port of one module instance to an input port of another, through their nearest common
+parent.
 
-## Commands
+- Neovim: `:Connect <source_module> <dest_module>`
+- VS Code: `LazyVerilog: Connect`
 
-- `:Connect <source_module> <dest_module>`
-  - shows instances of `source_module`
-  - shows output ports on the selected source instance
-  - shows instances of `dest_module`
-  - shows input ports on the selected destination instance
-  - asks for a wire name
-  - shows a confirmation preview before applying edits
+You are asked to pick:
 
-The server-side commands are:
+1. an instance of the source module, and its output port
+2. an instance of the destination module, and its input port
+3. a name for the wire
 
-- `lazyverilog.connectInfo`
-- `lazyverilog.connectApplyPreview`
-- `lazyverilog.connectApply`
+A preview shows the edits before anything is applied.
 
-## Behavior
+![Neovim asking for the source output port of mem_ctrl, with the candidate ports listed](/screenshots/connect-port-neovim.webp)
 
-Connect uses the current open buffers plus configured design filelist files to
-find module declarations and instantiations. Module, port, direction, datatype,
-instance, and named-connection information comes from the slang-backed syntax
-index.
+![Neovim showing the Connect Preview: two port connections and a new wire declaration, with [y] Apply and [n] Cancel](/screenshots/connect-preview-neovim.webp)
 
-When the user confirms the preview, Connect generates local text edits to:
+## What it edits
 
-- connect or replace `.port(signal)` on the selected source and destination
-  instances
-- declare the requested signal in the common parent module when it is not already
-  declared
-- for cross-hierarchy paths, add pass-through ports on intermediate modules
-- warn in the preview when an existing connection will be overwritten
-- warn but continue on source/destination type mismatch, using the source output
-  port as the declaration source
+- Sets `.port(signal)` on both instances, replacing an existing connection (the preview warns).
+- Declares the wire in the common parent if it is not declared yet.
+- For instances in different branches of the hierarchy, adds pass-through ports on the modules between.
+- On a type mismatch it warns and continues, using the source port's type.
 
-## Declaration type rules
+## Wire type
 
-Generated bridge signals prefer the **source/output port** datatype. If the
-source port is being created during the same Connect operation and therefore has
-no existing datatype to copy, LazyVerilog falls back to the destination/input
-port datatype. If neither selected leaf port exists yet, the bridge declaration
-uses `logic`.
-
-For net-style output ports, the generated bridge signal is a variable declaration
-using `logic`, not a net declaration:
+The wire copies the source port's type. Net-style outputs become `logic`, and user-defined types and
+symbolic dimensions are kept as written:
 
 ```systemverilog
-module memory(output wire [5:0] o_data);
-endmodule
-
-// generated bridge declaration
-logic [5:0] data32;
+output wire [5:0] o_data              // becomes: logic [5:0] data32;
+output payload_t [`BUS_W-1:0] payload // becomes: payload_t [`BUS_W-1:0] payload_w;
 ```
 
-Symbolic and user-defined datatype text is preserved syntactically:
+If neither port exists yet, the wire is `logic`.
 
-```systemverilog
-output payload_t [`BUS_W-1:0] payload
-// -> payload_t [`BUS_W-1:0] payload_w;
+## Limits
 
-output logic [DEPTH-1:0] data
-// -> logic [DEPTH-1:0] data_w;
-```
-
-If an older UI/client supplies only a packed dimension such as `[WIDTH-1:0]`, the
-server falls back to a valid variable declaration:
-
-```systemverilog
-logic [WIDTH-1:0] data_w;
-```
-
-## Implementation notes and limitations
-
-The structural model is syntax-index based, not a full semantic elaboration. It
-supports normal named module instance connections and hierarchy built from parsed
-modules/instances.
-
-Text edits are still constructed as targeted source edits, so complex generated
-or macro-expanded text can require manual cleanup. Known limitations include:
-
-- complex generate hierarchy
-- macro-generated instances or connections
-- positional port connections
-- real SystemVerilog `interface` / `modport` elaboration
+Connect works on syntax, not elaboration, so it does not handle complex `generate` hierarchy,
+macro-generated instances, positional connections, or SystemVerilog `interface`/`modport` ports.
+Check the preview when the code is unusual.

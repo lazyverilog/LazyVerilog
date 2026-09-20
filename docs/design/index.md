@@ -1,6 +1,7 @@
 # Design & Filelist
 
-Design-wide features (go-to-definition, find references, inlay hints, workspace symbols, AutoInst, completion) require the relevant source files to be indexed. Provide a filelist to load the design.
+Cross-file features (go to definition, references, inlay hints, workspace symbols, AutoInst,
+completion) need your source files indexed. Point `lazyverilog.toml` at a filelist:
 
 ```toml
 [design]
@@ -8,58 +9,43 @@ vcode = "demo/vcode.f"
 define = ["RTL_SIM"]
 ```
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `vcode` | string | Path to filelist (`.f`) relative to the `lazyverilog.toml` file |
-| `define` | string[] | Preprocessor defines passed to the parser for all design files |
+| Section | Option | Type | Description |
+|---------|--------|------|-------------|
+| `design` | `vcode` | string | Filelist path, relative to `lazyverilog.toml` |
+| `design` | `define` | string[] | Preprocessor defines for every design file |
 
 ## Filelist format
 
-One source file path per line. Paths are relative to the filelist's directory.
-Nested filelists are supported with `-f`; nested relative paths are resolved
-relative to the parent filelist that contains the `-f` entry.
+One source file per line, with paths relative to the filelist.
 
 ```text
-rtl/m_alu.sv
-rtl/m_adder.sv
--f ../shared/shared.vc
+rtl/alu.sv
+rtl/adder.sv
+-f ../my_rtl_list.f
 +incdir+rtl/include
-vendor/uvm/src/uvm_pkg.sv
+
+# environment variable
+${MY_RTL_PATH}/top.sv
++incdir+${MY_RTL_PATH}/include
+
+# UVM library
++incdir+uvm/src
+uvm/src/uvm_pkg.sv
 ```
 
-Parsing rules:
+| Line | Effect |
+|------|--------|
+| `rtl.sv` | A source file to index |
+| `-f <filelist>` | Load a nested filelist, its paths relative to itself |
+| `+incdir+<dir>` | Add an include directory. `+incdir+<a>+<b>` adds several |
+| others | Comments (`//`, `#`) and any other `+<option>` or `-<flag>` are ignored |
 
-| Syntax | Effect |
-|--------|--------|
-| `// ...` | Line comment |
-| `# ...` | Line comment |
-| `-f <filelist>` | Load a nested filelist; relative paths are resolved from the parent filelist |
-| `+incdir+<dir>` | Add include search directory; `<dir>` is relative to the `.f` file |
-| `+incdir+<dir_a>+<dir_b>` | Add multiple include search directories |
-| `+<option>` | Other compiler options are silently ignored |
-| `-<flag>` | Compiler flags are silently ignored |
+`+incdir+` entries are search paths for `` `include ``, not source files.
 
-`+incdir+` entries are **not** parsed as source files. They are passed to slang's include resolver so explicit source files can resolve `` `include "..." `` directives.
+**Environment variables.** `$MY_RTL_PATH` and `${MY_RTL_PATH}` are replaced by the variable's value,
+in filelists and in `vcode`. The editor must start with the variable set. A variable that is not set
+is left as written.
 
-Environment variables in filelist, source, and include-directory paths are expanded
-in `$VAR` and `${VAR}` form when the variable is defined. Undefined variables are
-left unchanged.
-
-## Include-heavy libraries
-
-For libraries such as UVM, list the package/source file and use `+incdir+` for headers:
-
-```text
-# demo/vcode.f
-+incdir+./uvm-core/src
-./uvm-core/src/uvm_pkg.sv
-```
-
-With that setup, `uvm_pkg.sv` is the explicit indexed source file, and slang resolves lines such as:
-
-```systemverilog
-`include "base/uvm_base.svh"
-`include "comps/uvm_comps.svh"
-```
-
-through the configured include directory. This avoids parsing each UVM `.svh` as a separate filelist source while still allowing the package parse to discover classes, typedefs, methods, and macros for completion.
+**UVM library.** List the package file and put the headers on an include path. `uvm_pkg.sv` is
+indexed, and its `` `include `` lines resolve through the include directory, so you do not list every
+`.svh`.

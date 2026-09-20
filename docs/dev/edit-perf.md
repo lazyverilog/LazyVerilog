@@ -194,7 +194,7 @@ keystrokes for folding, and 0 against 4 for hints, even though
 `vim.lsp.inlay_hint.enable(true)` was called and `is_enabled()` reports true.
 
 `lazyverilog.toml` is read from `<root>` and nowhere else (see
-[Usage step 1](../../README.md#-usage)), so a project whose config sits elsewhere
+[Usage step 1](../usage/index.md#_1-add-a-lazyverilog-toml)), so a project whose config sits elsewhere
 gets defaults.  That used to be the end of the story, because capabilities are
 exchanged once at `initialize`.  It no longer is.
 

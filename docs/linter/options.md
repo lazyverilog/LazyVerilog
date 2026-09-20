@@ -2,10 +2,9 @@
 
 All options live under `[lint]` in `lazyverilog.toml`.
 
-Linting runs as part of foreground document diagnostics on open/change and publishes
-diagnostics via `textDocument/publishDiagnostics`. Optional background semantic
-compilation is separate and may contribute additional semantic diagnostics.
-Included files (`` `include ``) are skipped — only the top-level file is linted.
+Rules run as you type and are published as editor diagnostics. Only the file you edit is linted, not
+its `` `include `` files. Slower semantic diagnostics are separate: see
+[Background compilation](../diagnostics/background-compilation.md).
 
 ---
 
@@ -53,8 +52,6 @@ assign a = b;
 assign a = b;
 ```
 
-Diagnostic: `[style] trailing whitespace`
-
 ---
 
 ## `[lint.naming]`
@@ -86,8 +83,6 @@ module m_alu (input logic a, output logic b);
 endmodule
 ```
 
-Diagnostic: `[naming] module 'alu' does not match pattern '^m_.*$'`
-
 ---
 
 ### `input_port_pattern`
@@ -108,8 +103,6 @@ endmodule
 module m_top (input logic i_clk, input logic i_rst_n);
 endmodule
 ```
-
-Diagnostic: `[naming] input port 'clk' does not match pattern '^i_.*$'`
 
 ---
 
@@ -132,8 +125,6 @@ module m_top (output logic o_valid);
 endmodule
 ```
 
-Diagnostic: `[naming] output port 'valid' does not match pattern '^o_.*$'`
-
 ---
 
 ### `signal_pattern`
@@ -152,8 +143,6 @@ logic [7:0] data;
 // good
 logic [7:0] s_data;
 ```
-
-Diagnostic: `[naming] signal 'data' does not match pattern '^s_.*$'`
 
 ---
 
@@ -180,8 +169,6 @@ always_ff @(posedge i_clk) begin
 end
 ```
 
-Diagnostic: `[naming] register 'count' does not match pattern '^r_.*$'`
-
 ---
 
 ### `interface_pattern`
@@ -202,8 +189,6 @@ endinterface
 interface axi_intf ();
 endinterface
 ```
-
-Diagnostic: `[naming] interface 'axi_bus' does not match pattern '.*_intf$'`
 
 ---
 
@@ -230,8 +215,6 @@ typedef struct packed {
 } packet_t;
 ```
 
-Diagnostic: `[naming] struct typedef 'packet' does not match pattern '.*_t$'`
-
 ---
 
 ### `union_pattern`
@@ -257,8 +240,6 @@ typedef union packed {
 } data_word_u;
 ```
 
-Diagnostic: `[naming] union typedef 'data_word' does not match pattern '.*_u$'`
-
 ---
 
 ### `enum_pattern`
@@ -282,8 +263,6 @@ typedef enum logic [1:0] {
 } state_e;
 ```
 
-Diagnostic: `[naming] enum typedef 'state' does not match pattern '.*_e$'`
-
 ---
 
 ### `parameter_pattern`
@@ -305,8 +284,6 @@ module m_fifo #(parameter W_DATA = 8) ();
 endmodule
 ```
 
-Diagnostic: `[naming] parameter 'DATA_WIDTH' does not match pattern '^W_.*$'`
-
 ---
 
 ### `localparam_pattern`
@@ -325,8 +302,6 @@ localparam DEPTH = 16;
 // good
 localparam LP_DEPTH = 16;
 ```
-
-Diagnostic: `[naming] localparam 'DEPTH' does not match pattern '^LP_.*$'`
 
 ---
 
@@ -350,8 +325,6 @@ module m_alu (...);
 endmodule
 ```
 
-Diagnostic: `[naming] module 'm_adder' does not match filename 'm_alu'`
-
 ---
 
 ### `check_package_filename`
@@ -373,8 +346,6 @@ endpackage
 package m_alu_pkg;
 endpackage
 ```
-
-Diagnostic: `[naming] package 'utils_pkg' does not match filename 'm_alu_pkg'`
 
 ---
 
@@ -407,10 +378,6 @@ endmodule
 module m_foo ();
 endmodule
 ```
-
-Diagnostic: `[module] more than one module declared in this file`
-
----
 
 ---
 
@@ -450,11 +417,6 @@ m_fifo u_fifo (
 );
 ```
 
-Diagnostics:
-- `[module] instance uses positional port connections; named connections required`
-- `[module] instance uses named port connections; positional connections required`
-- `[module] instance mixes positional and named port connections`
-
 ---
 
 ### `stale_instance_diagnostic`
@@ -476,10 +438,6 @@ m_fifo u_fifo (
     // o_data missing
 );
 ```
-
-Diagnostics:
-- `[module] autoinst connection missing port 'o_data'`
-- `[module] stale autoinst connection for unknown port 'i_unused'`
 
 ---
 
@@ -511,8 +469,6 @@ always_ff @(posedge i_clk) begin
     r_q <= i_d;
 end
 ```
-
-Diagnostic: `[statement] raw always block should use always_comb, always_ff, or always_latch`
 
 ---
 
@@ -548,10 +504,6 @@ always_comb begin
 end
 ```
 
-Diagnostics:
-- `[statement] always_ff should use nonblocking assignments`
-- `[statement] always_comb should use blocking assignments`
-
 ---
 
 ### `latch_inference_detection`
@@ -580,8 +532,6 @@ always_comb begin
     end
 end
 ```
-
-Diagnostic: `[statement] always_comb block may infer a latch (incomplete if)`
 
 ---
 
@@ -613,8 +563,6 @@ always_comb begin
 end
 ```
 
-Diagnostic: `[statement] case statement missing default item`
-
 ---
 
 ### `explicit_begin`
@@ -640,8 +588,6 @@ always_comb begin
     end
 end
 ```
-
-Diagnostic: `[statement] if statement body should use begin/end`
 
 ---
 
@@ -674,8 +620,6 @@ function automatic logic [7:0] clamp(input logic [7:0] val);
 endfunction
 ```
 
-Diagnostic: `[function] function declaration missing explicit lifetime (automatic/static)`
-
 ---
 
 ### `explicit_task_lifetime`
@@ -701,8 +645,6 @@ task automatic drive_bus(input logic [7:0] data);
 endtask
 ```
 
-Diagnostic: `[task] task declaration missing explicit lifetime (automatic/static)`
-
 ---
 
 ### `functions_automatic`
@@ -725,8 +667,6 @@ function automatic logic [7:0] clamp(input logic [7:0] val);
     return val;
 endfunction
 ```
-
-Diagnostic: `[function] function declaration should use 'automatic' lifetime`
 
 ---
 
@@ -753,10 +693,14 @@ logic [7:0] s_result = clamp(i_val, 8'hF0);
 logic [7:0] s_result = clamp(.val(i_val), .limit(8'hF0));
 ```
 
-Diagnostics:
-- `[function] call uses positional arguments; named arguments required`
-- `[function] call uses named arguments; positional arguments required`
-- `[function] call mixes positional and named arguments`
+---
+
+## Diagnostic codes
+
+Every rule has a code such as `lint-naming-input-port`, shown in brackets by `lazyverilog-lint`. Codes
+are hierarchical (`lint-naming` covers every naming rule) and `lazyverilog-lint --help` lists them
+all. To silence a rule for the whole project, use its config key above. To silence it for one run, use
+[`--nowarn`](cli.md#diagnostic-codes).
 
 ---
 

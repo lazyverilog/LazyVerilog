@@ -1,127 +1,72 @@
-# Linter CLI (`lazyverilog-lint`)
+# Linter CLI
 
-`lazyverilog-lint` is a standalone command-line linter. It parses one file — or every file in a
-`-f` filelist — and pretty-prints lint diagnostics and compilation diagnostics (parse errors plus
-semantic diagnostics) to stdout.
-
-## Build
+`lazyverilog-lint` lints one file, or every file in a filelist, and prints lint and compilation
+diagnostics. See [CLI tools](../cli.md) to build it.
 
 ```bash
-cmake -B build
-cmake --build build -j$(nproc) --target lazyverilog-lint
+lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] [--maxerror <n>] [--nowarn <code>]... [<file>]
 ```
 
-The binary is placed at `build/lazyverilog-lint`.
-
-## Usage
-
-```bash
-lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] [--maxerror <n>] [<file>]
-```
-
-At least one of `-f <filelist>` or `<file>` is required.
-
-## Arguments
-
-| Argument | Description |
-|----------|--------------|
-| `<file>` | Path to a `.sv` / `.svh` file. Report diagnostics for this file only. |
-
-## Options
+Give at least `-f <filelist>` or `<file>`.
 
 | Flag | Description |
 |------|-------------|
-| `-f <filelist>`, `--filelist <filelist>` | Project filelist (`.f`) to index. With no `<file>`, lint every file it lists. With `<file>`, index the filelist for cross-file/semantic context but report only `<file>`'s diagnostics. Overrides `lazyverilog.toml`'s `[design] vcode`. |
-| `--lint-only` | Print only lint-rule diagnostics; skip compilation and drop parse/semantic diagnostics. |
-| `--compile-only` | Print only compilation diagnostics (parse + semantic); skip lint rules. |
-| `--maxerror <n>` | Maximum compilation errors before slang stops elaborating. Default `64`; `0` means unlimited. See [Error limit](#error-limit). |
-| `--version` | Print the version and exit. |
-| `-h`, `--help` | Print usage and exit. |
+| `-f <filelist>` | With no `<file>`, lint every listed file. With `<file>`, use the filelist for context and report only that file. Overrides `[design].vcode` |
+| `--lint-only` | Lint rules only; skip compilation |
+| `--compile-only` | Compilation diagnostics only; skip lint rules |
+| `--maxerror <n>` | Stop elaborating after `<n>` errors. Default `64`, `0` for no limit |
+| `--nowarn <code>` | Hide diagnostics with this code. Repeatable |
+| `--version` | Print the version |
 
-## Error limit
-
-Slang stops elaborating once a compilation has produced more than `--maxerror`
-errors. When that happens it abandons the rest of the pass, so **every
-diagnostic it had not reached yet is silently never reported** — no truncation
-notice is printed. The result looks like a clean design when it is not.
-
-The default of `64` is slang's own
-`CompilationOptions::errorLimit`, and it is easy to reach by accident. The
-common trigger is an inconsistent timescale: as soon as one design element
-carries a `` `timescale ``, slang emits `MissingTimeScale` for *every* module
-and package that lacks one. A single vendor IP or testbench file is enough to
-blow past 64 errors on that diagnostic alone, at which point the rest of the
-design goes unchecked.
-
-The symptom is a run that reports nothing but timescale errors:
-
-```text
-$ lazyverilog-lint -f rtl/vcode.f rtl/dut.sv
-rtl/dut.sv:4:9: error: design element does not have a time scale defined but others in the design do
-rtl/dut.sv:9:8: error: design element does not have a time scale defined but others in the design do
-```
-
-Lift the limit to see what was hidden behind it:
-
-```text
-$ lazyverilog-lint --maxerror 0 -f rtl/vcode.f rtl/dut.sv
-rtl/dut.sv:4:9: error: design element does not have a time scale defined but others in the design do
-rtl/dut.sv:9:8: error: design element does not have a time scale defined but others in the design do
-rtl/dut.sv:14:12: warning: implicit conversion from 'type_b' to 'type_a'
-```
-
-`--maxerror` sets the elaboration cutoff only; it does not cap how many
-diagnostics are printed, and there is no matching warning limit because slang
-does not have one — warnings are always unlimited.
-
-If a run reports only timescale errors, raise the limit before concluding the
-design is clean. The durable fix is to make the timescale consistent (add one
-everywhere, or drop the outlier) so the errors are not produced at all.
-
-This flag applies to `lazyverilog-lint` only. The LSP server keeps slang's
-default of 64.
-
-## Configuration
-
-`lazyverilog-lint` automatically finds `lazyverilog.toml` by walking up from `<file>`'s directory
-(or the current directory in `-f`-only mode). `[design]`, `[compilation]`, and `[lint]` options
-apply exactly as they do in the LSP server. See [options.md](options.md) for the full list of
-`[lint]` options.
-
-## Output format
-
-One line per diagnostic:
-
-```text
-<file>:<line>:<col>: <severity>: <message>
-```
-
-`<line>` and `<col>` are 1-based. `<severity>` is one of `error`, `warning`, `info`, or `hint`.
-
-## Examples
-
-Lint a single file (compilation + lint diagnostics):
+Options come from the nearest `lazyverilog.toml`: `[design]`, `[compilation]`, and `[lint]` (see
+[Linter options](options.md)).
 
 ```bash
-./build/lazyverilog-lint rtl/memory_top.sv
-```
-
-Lint a single file, lint rules only:
-
-```bash
-./build/lazyverilog-lint --lint-only rtl/memory_top.sv
-```
-
-Lint every file in a project filelist:
-
-```bash
+./build/lazyverilog-lint rtl/top.sv
+./build/lazyverilog-lint --lint-only rtl/top.sv
 ./build/lazyverilog-lint -f rtl/vcode.f
 ```
 
-## Exit Codes
+## Output
+
+One line per diagnostic, with 1-based line and column:
+
+```text
+<file>:<line>:<col>: <severity>: <message> [<code>]
+```
+
+Severity is `error`, `warning`, `info`, or `hint`.
+
+## Error limit
+
+Once a compilation passes `--maxerror` errors, slang stops and **the rest of the design is never
+checked, with no notice**. A run that prints only `MissingTimeScale` errors (common when one file has a
+`` `timescale `` and others do not) may hide real problems behind them. Rerun with `--maxerror 0`. The
+lasting fix is a consistent timescale.
+
+## Diagnostic codes
+
+Every diagnostic prints its code in brackets, and `--nowarn` takes that code:
+
+```bash
+lazyverilog-lint --nowarn lint-naming-input-port --nowarn width-trunc rtl/alu.sv
+```
+
+- **Lint rules** are named `lint-<section>-<rule>`. A prefix silences its children:
+  `lint` is every rule, `lint-naming` every naming rule. A value that matches nothing is rejected.
+  `lazyverilog-lint --help` lists them all.
+- **Compilation warnings** use slang's names (`width-trunc`, `unused-net`) and groups (`conversion`,
+  `unused`, `pedantic`).
+- **Compilation errors** use slang's CamelCase names (`MissingTimeScale`, `UnknownModule`). These
+  are taken as written, so a misspelling silences nothing.
+
+A hidden error no longer sets exit code 2. Hiding does not free the `--maxerror` budget: hidden errors
+still count toward it.
+
+## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| `0` | Success — no error-severity diagnostics |
-| `1` | Usage error, or `<file>` could not be opened |
-| `2` | At least one error-severity diagnostic was reported |
+| `0` | No error-severity diagnostics |
+| `1` | Usage error, or file could not be opened |
+| `2` | At least one error-severity diagnostic |

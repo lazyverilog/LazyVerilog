@@ -1,0 +1,14 @@
+rtl/soc_top.sv
+rtl/cpu_core.sv
+rtl/alu.sv
+rtl/reg_file.sv
+rtl/bus_ctrl.sv
+rtl/mem_ctrl.sv
+rtl/fmt_demo.sv
+rtl/comp_demo.sv
+rtl/inst_demo.sv
+rtl/wire_demo.sv
+rtl/arg_demo.sv
+rtl/sig_demo.sv
+rtl/fold_demo.sv
+rtl/m_lint_demo.sv

@@ -1,14 +1,15 @@
 # AutoFF
 
-**Commands:** `lazyverilog.autoffPreview`, `lazyverilog.autoffApply`, `lazyverilog.autoffAllPreview`, `lazyverilog.autoffAllApply`
+**Commands:** `lazyverilog.autoffPreview`, `lazyverilog.autoffApply`, `lazyverilog.autoffAllPreview`,
+`lazyverilog.autoffAllApply`
 
-Inserts missing assignments into an existing `always_ff` block. AutoFF looks for a two-signal declaration on the cursor line — one name matching `[autoff].register_pattern` (the register destination) and one not (the combinational source) — then inserts `<= '0` in the reset branch and `<= src` in the capture branch for any signal not already assigned.
+Adds the missing assignments for a register to an existing `always_ff` block. Put the cursor on a
+declaration of exactly two signals: one whose name matches `register_pattern` (the register) and one
+that does not (its source).
 
 ```systemverilog
-// Two-signal declaration: r_count matches register_pattern, w_count does not
-logic [7:0] r_count, w_count;
+logic [7:0] r_count, w_count;   // r_count is the register, w_count its source
 
-// Existing always_ff in the same file (must already be present):
 always_ff @(posedge i_clk or negedge i_rst_n) begin
     if (!i_rst_n) begin
         // AutoFF inserts: r_count <= '0;
@@ -18,23 +19,20 @@ always_ff @(posedge i_clk or negedge i_rst_n) begin
 end
 ```
 
-`autoffPreview` / `autoffAllPreview` return preview pairs that the Neovim plugin displays in a confirmation floating window. If accepted, `autoffApply` / `autoffAllApply` write the edits.
+The first branch is treated as reset and the `else` branch as capture, whatever the clock and reset
+are called. A signal already assigned is skipped. The preview is shown in a confirmation window in
+Neovim. The `All` commands do every qualifying declaration in the file at once.
 
-`autoffAllApply` scans the whole file for qualifying two-signal declarations and fills all of them at once.
+Requirements:
 
-Clock and reset signal names are not interpreted. AutoFF only requires the existing `always_ff @(...) begin ... end` body to contain an `if (...) begin ... end else begin ... end` structure; the first branch is treated as reset and the `else` branch as capture.
-
-**Requirements:**
-- An `always_ff` block with an `if/else begin` structure must already exist in the file.
-- The cursor line must contain a declaration with exactly two signals, exactly one matching the register pattern and exactly one not matching it. Ambiguous declarations are skipped; AutoFF does not guess from declaration order.
-
-Controlled by the register naming pattern:
+- The `always_ff` must already exist and have an `if (...) begin ... end else begin ... end` body.
+- The declaration must have exactly one register-named signal. Ambiguous lines are skipped.
 
 ```toml
 [autoff]
 register_pattern = "^r_"
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `register_pattern` | string | `"^r_"` | Regex — the signal whose name matches is treated as the register (destination); the other is the source |
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `autoff` | `register_pattern` | `"^r_"` | Regex. The signal matching it is the register, the other is the source |

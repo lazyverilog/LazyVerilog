@@ -1,4 +1,5 @@
 #include "background_compiler.hpp"
+#include "diagnostic_code.hpp"
 #include "lsp_position.hpp"
 #include "cpu_budget.hpp"
 #include "syntax_index_shared.hpp"
@@ -63,6 +64,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
         uri = fallback_uri;
     }
 
+    info.code = slang_diagnostic_code(engine, diagnostic.code);
     auto sev = slang::getDefaultSeverity(diagnostic.code);
     if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
         info.severity = 1;

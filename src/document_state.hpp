@@ -27,6 +27,11 @@ struct ParseDiagInfo {
     int severity{3}; // lsDiagnosticSeverity: 1=Error,2=Warn,3=Info,4=Hint
     std::string message;
     std::string uri; // file URI for the diagnostic location; empty = owning document
+    // Stable name for the rule or slang diagnostic that produced this, e.g.
+    // "lint-naming-module", "width-trunc", "MissingTimeScale".  It is what
+    // lazyverilog-lint prints in brackets and what --nowarn takes.  Empty only
+    // for a diagnostic built by a caller that has no code to give.
+    std::string code;
 };
 
 /// Drop exact duplicates from @p diags, keeping the first of each.

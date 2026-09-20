@@ -142,7 +142,7 @@
     "type": "git",
     "url": "https://github.com/lazyverilog/LazyVerilog.git"
   },
-  "homepage": "https://github.com/lazyverilog/LazyVerilog#readme",
+  "homepage": "https://lazyverilog.github.io/",
   "bugs": {
     "url": "https://github.com/lazyverilog/LazyVerilog/issues"
   }

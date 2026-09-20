@@ -1,143 +1,42 @@
 # Folding Ranges
 
-LazyVerilog provides editor folding ranges for common SystemVerilog structure.
-When your editor supports LSP folding, these ranges let you collapse large or
-repetitive sections without changing the source text.
+LazyVerilog gives your editor folds for common SystemVerilog structure. They come from a fast scan of
+the tokens, so they work while you type. Single-line constructs never fold.
 
-## Module headers
+| Fold | Covers |
+|------|--------|
+| Module | `module` through `endmodule`, header included |
+| Header lists | the `#(...)` parameter list and the `(...)` port list |
+| Declarations | a run of consecutive declarations |
+| Imports | a run of consecutive `import` lines |
+| Comments | consecutive own-line comments, and block comments |
+| Preprocessor | each branch of `` `ifdef ``, `` `else ``, `` `endif `` |
+| Blocks | `begin`/`end`, `case`, `generate`, `fork`/`join`, `function`, `task`, `class`, `constraint`, `covergroup`, `clocking`, `typedef enum`/`struct`/`union` |
 
-Parameterized module headers expose separate folds for the parameter list and
-the port list.
+## Declaration runs
 
-```systemverilog
-module folding_demo #(
-    parameter int WIDTH = 8,
-    parameter int DEPTH = 16,
-    parameter int STAGES = 3
-)(
-    input  logic             clk,
-    input  logic             rst_n,
-    output logic [WIDTH-1:0] data_out
-);
-```
-
-Available folds:
-
-- parameter list: the `#(...)` section
-- port list: the following `(...)` section
-- whole module: from `module` through `endmodule`
-
-## Module bodies
-
-A module can be folded as one whole region, including its header.
-
-```systemverilog
-module top;
-    logic a;
-    logic b;
-endmodule
-```
-
-Folding inside the module body can collapse the whole module, unless the cursor
-is inside a smaller nested fold such as a declaration run, comment block, or
-procedural block.
-
-## Declarations
-
-Consecutive declarations fold as a single declaration section.
-
-```systemverilog
-logic [7:0] data_q;
-logic       valid_q;
-logic       ready_q;
-```
-
-The same behavior applies to different declaration forms, including parameters,
-nets, variables, and user-defined types.
-
-```systemverilog
-localparam int WIDTH = 8;
-wire [WIDTH-1:0] data_w;
-payload_t        payload_q;
-logic            valid_q;
-```
-
-A non-declaration statement breaks the declaration fold.
+A run folds when its lines start with a keyword or type: `logic`, `wire`, `reg`, `var`, `integer`,
+`localparam`, `input`, and so on. Any other statement ends the run.
 
 ```systemverilog
 logic a;
 logic b;
-assign b = a;
+assign b = a;   // ends the run
 logic c;
 logic d;
 ```
 
-This creates two declaration folds: `a/b` and `c/d`.
+This gives two folds, `a`/`b` and `c`/`d`.
 
-## Non-ANSI port declarations
+## Limits
 
-For non-ANSI modules, consecutive semicolon-terminated port declarations fold as
-a declaration section. They can also fold together with following ordinary
-signal declarations.
+- A declaration that starts with a user-defined type (`state_e state_q;`) does not fold. It looks the
+  same as an instance to a token scan, so LazyVerilog does not guess.
+- An instance does not fold as a whole. Its `#(...)` override list folds on its own.
+- The parameter list and the port list share the `)(` line, so Neovim merges them into one header fold.
 
-```systemverilog
-module top (
-    clk,
-    rst_n,
-    data_in,
-    data_out
-);
-    input  logic     clk;
-    input  logic     rst_n;
-    input  payload_t data_in;
-    output payload_t data_out;
-    logic            valid_q;
-    logic [3:0]      count_q;
-endmodule
-```
+## Turn it off
 
-## Imports
-
-Consecutive package imports fold as one import section.
-
-```systemverilog
-import pkg_a::*;
-import pkg_b::item_t;
-import pkg_c::*;
-```
-
-## Comments
-
-Consecutive own-line comments fold as one comment block.
-
-```systemverilog
-// First line
-// Second line
-// Third line
-```
-
-Trailing comments do not start a comment fold.
-
-## Preprocessor regions
-
-Preprocessor conditional branches can be folded independently.
-
-```systemverilog
-`ifdef USE_A
-assign y = a;
-`else
-assign y = b;
-`endif
-```
-
-## Procedural and structural blocks
-
-Common multi-line blocks are foldable, including:
-
-- `begin` / `end`
-- `case` / `endcase`
-- `generate` / `endgenerate`
-- `fork` / `join` variants
-- function and task bodies
-- class, constraint, and covergroup bodies
-- typedef enum / struct / union bodies
+Set `[folding].enable = false` in `lazyverilog.toml`, and `folding = false` in the Neovim
+[`setup()`](../installation/neovim.md) to stop the editor asking. See
+[LSP features](../lsp/index.md#folding-ranges).

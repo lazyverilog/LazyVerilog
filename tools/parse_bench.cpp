@@ -1,3 +1,4 @@
+#include "banner.hpp"
 #include "document_state.hpp"
 #include "dynamic_file_index.hpp"
 #include "syntax_index.hpp"
@@ -256,6 +257,8 @@ void print_stats(const char* label, const std::vector<FileResult>& results,
 } // namespace
 
 int main(int argc, char** argv) {
+    print_startup_banner("parse-bench", argc, argv);
+
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--version") {
             std::cout << "parse-bench " << LAZYVERILOG_VERSION << "\n";

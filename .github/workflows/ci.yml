@@ -1,8 +1,36 @@
 name: CI
 
+# An allow-list: the matrix runs only when a change touches an input of the C++ build
+# or its tests.  A deny-list of "things that are not code" was too loose -- every new
+# kind of file (a script, an editor plugin, a doc) ran seven platforms until someone
+# remembered to add it.  Push runs only on main; a branch is covered by its pull request,
+# so a pushed PR branch no longer builds twice.  This is safe only while no CI check is
+# a *required* check: a path-skipped workflow leaves a required check pending forever.
+# If one becomes required, gate the jobs with an `if:` on a changes job instead.
 on:
   push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/*.cpp"
+      - "tools/*.hpp"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "assets/ascii_logo.txt"
+      - "lazyverilog.toml"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "tools/*.cpp"
+      - "tools/*.hpp"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "assets/ascii_logo.txt"
+      - "lazyverilog.toml"
+      - ".github/workflows/ci.yml"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

@@ -10,13 +10,18 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 
 | File | Description |
 |------|-------------|
-| `README.md` | Documentation index / entry point |
+| `index.md` | Landing page of the site (hero, five buttons, the installation guide) |
+| `features.md` | The feature cards, opened by the Features button |
+| `.vitepress/site.json` | Sidebar and the list of directories excluded from the site |
+| `scripts/check-dist.mjs` | Checks the built site; fixtures in `scripts/check-dist.test.mjs` |
 | `AGENTS.md` | This file |
 
 ## Subdirectories
 
 | Directory | Purpose |
 |-----------|---------|
+| `installation/` | Install pages: overview, `neovim.md`, `vscode.md` |
+| `usage/` | Usage pages: project config, `neovim.md`, `vscode.md` |
 | `formatter/` | Formatter-specific docs (see `formatter/AGENTS.md`) |
 | `diagnostics/` | Diagnostics and background compilation docs (see `diagnostics/AGENTS.md`) |
 | `linter/` | Linter-specific docs (see `linter/AGENTS.md`) |
@@ -25,6 +30,9 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 
 ### Working In This Directory
 - When adding a new `lazyverilog.toml` config option, update `formatter/options.md`
-- Keep `README.md` as a navigation index — do not add detailed content there
+- Every user-facing page is published to https://lazyverilog.github.io: add it to the sidebar in `.vitepress/site.json` or the site build check fails
+- User-facing docs live **outside** `dev/`, `releases/` and `i18n/`; those three directories are not published (`releases/` is read by `tools/release.sh`)
+- `README.md` at the repository root keeps the demo, comparison, and feature list; installation, usage, and configuration live here and the README only links to the site
+- Preview locally: `npm --prefix docs ci && npm --prefix docs run dev` (see `dev/site.md`)
 
 <!-- MANUAL: -->

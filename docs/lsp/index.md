@@ -1,134 +1,41 @@
 # LSP Features
 
-Standard Language Server Protocol features.
+Standard Language Server Protocol features. None of these need configuration except where noted.
 
----
+| Feature | What it does |
+|---------|--------------|
+| Hover | Kind, type, and documentation of the symbol under the cursor |
+| Go to definition | Jumps to the declaration |
+| Find references | All uses of a symbol, including macros (`` `WIDTH `` at its `` `define `` or any use) |
+| Rename | Renames a symbol across all references. Keywords cannot be renamed |
+| Completion | Context-aware suggestions; see [Completion](completion.md) |
+| Signature help | Parameters while typing a call or a `#(...)` list; triggers on `(` and `,` |
+| Workspace symbols | Case-insensitive substring search over modules and classes. Needs `[design].vcode` |
+| Inlay hints | See below |
+| Folding ranges | See [Folding](../folding/index.md) |
 
-## Hover
+Cross-file features need the project indexed through a filelist. See
+[Design & filelist](../design/index.md).
 
-**LSP:** `textDocument/hover`
+## Inlay hints
 
-Shows symbol information at the cursor — kind, type signature, and documentation — as a markdown popup.
-
-No configuration.
-
----
-
-## Go to Definition
-
-**LSP:** `textDocument/definition`
-
-Jumps to the declaration of the symbol under the cursor.
-
-No configuration.
-
----
-
-## Find References
-
-**LSP:** `textDocument/references`
-
-Finds all usages of the symbol under the cursor. Includes the declaration if `includeDeclaration` is set by the client.
-
-Macro references are supported for both preprocessor declarations and invocation sites:
-
-```systemverilog
-`define WIDTH 32
-logic [`WIDTH-1:0] data;
-```
-
-Running Find References on either `WIDTH` occurrence reports the macro declaration and matching macro uses that are visible in open or indexed project files.
-
-No configuration.
-
----
-
-## Rename
-
-**LSP:** `textDocument/prepareRename`, `textDocument/rename`
-
-Renames a symbol across all references. SystemVerilog keywords cannot be renamed.
-
-No configuration.
-
----
-
-## Completion
-
-**LSP:** `textDocument/completion`
-
-**Trigger characters:** `.` `$`
-
-Offers very limited completions: fixed SystemVerilog keywords plus module and port names indexed from the current file.
-
-No configuration.
-
----
-
-## Signature Help
-
-**LSP:** `textDocument/signatureHelp`
-
-**Trigger characters:** `(` `,`
-
-Displays parameter signatures while typing function/task calls and module instantiations. Tracks the active parameter as you move between arguments. Also handles module parameter lists (`#(...)`).
-
-No configuration.
-
----
-
-## Workspace Symbols
-
-**LSP:** `workspace/symbol`
-
-Searches modules and classes from indexed design files. Matching is case-insensitive substring matching.
-
-Requires the design index to be populated via `design.vcode`. See [design](../design/index.md).
-
-No configuration.
-
----
-
-## Inlay Hints
-
-**LSP:** `textDocument/inlayHint`
-
-Displays inline hints inside module instantiations:
-
-- **Port hints** — direction and type of each connected port shown inline.
-- **Coverage hint** — `N/M` connected port count shown at the opening parenthesis.
-
-Hints for instances whose module definitions live in `design.vcode` are refreshed after the background project index is published.  This means a file opened immediately at startup may first receive an empty hint response, then receive hints once the filelist index is ready.
+Inside each module instantiation, LazyVerilog shows the direction and type of every connected port,
+and an `N/M` count of connected ports at the opening parenthesis. Instances of modules from the
+filelist show hints once the background index is ready, so a file opened at startup may briefly show
+none.
 
 ```toml
 [inlay_hint]
 enable = true
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | bool | `true` | Set `false` to disable all inlay hints |
-
 ## Folding ranges
-
-Neovim re-requests the whole file's folding ranges from every `didChange`, so on
-very large RTL files this is a per-keystroke cost.  Turning the capability off
-stops the client asking at all — measured 0 requests against 6 over five
-keystrokes.
 
 ```toml
 [folding]
 enable = true
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable` | bool | `true` | Set `false` to stop advertising `foldingRangeProvider` |
-
-Changing this mid-session reaches only clients that advertise
-`textDocument.foldingRange.dynamicRegistration` — VS Code does, Neovim does not —
-because otherwise the capability sent at `initialize` is final.  Everywhere else
-it takes effect on restart, and the server says so on stderr.
-
-`[inlay_hint].enable` works the same way, and Neovim *does* opt in there, so
-editing it and saving takes effect immediately with no restart.
+Neovim asks for folds and inlay hints on every edit. With `enable = false` the server answers with
+nothing. To stop the requests altogether, also set `folding = false` or `inlay_hints = false` in the
+Neovim [`setup()`](../installation/neovim.md).

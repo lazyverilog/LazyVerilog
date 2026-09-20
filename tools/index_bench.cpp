@@ -12,6 +12,7 @@
 // repeat loop here does not clear anything between iterations; use --cache off
 // to measure the parse itself, or tools/startup_bench.py, which clears the
 // cache per run unless asked for --warm.
+#include "banner.hpp"
 #include "analyzer.hpp"
 #include "index_cache.hpp"
 #include "config.hpp"
@@ -26,6 +27,8 @@
 #include <vector>
 
 int main(int argc, char** argv) {
+    print_startup_banner("index-bench", argc, argv);
+
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--version") {
             std::cout << "index-bench " << LAZYVERILOG_VERSION << "\n";
