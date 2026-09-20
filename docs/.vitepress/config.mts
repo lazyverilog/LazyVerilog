@@ -29,7 +29,10 @@ export default defineConfig({
 
   sitemap: { hostname: `${ORIGIN}/` },
 
-  head: [['link', { rel: 'icon', type: 'image/png', href: '/favicon.png' }]],
+  head: [
+    ['link', { rel: 'icon', type: 'image/png', href: '/favicon.png' }],
+    ['meta', { name: 'google-site-verification', content: 'vh-FRd2nvpbDm_MCPhcAn8aonZtL6SDefa0yzVZWgAw' }],
+  ],
 
   // Per-page canonical and social tags.  A static `head` entry would repeat the
   // landing-page URL on every page.
