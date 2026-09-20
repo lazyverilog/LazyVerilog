@@ -9,11 +9,11 @@ hero:
 features:
   - icon: 🎯
     title: Accurate parsing
-    details: SystemVerilog is parsed by slang, including UVM, classes, and packages.
-    link: /design/
+    details: "SystemVerilog is parsed by accurate parser: slang."
+    link: https://chipsalliance.github.io/sv-tests-results/
   - icon: 🎨
     title: Formatting
-    details: An idempotent, token-based formatter you configure per project.
+    details: Highly customizable formatter.
     link: /formatter/options
   - icon: 🚨
     title: Lint diagnostics
@@ -26,29 +26,25 @@ features:
   - icon: 💡
     title: Hover, completion, signature help
     details: Symbol details, context-aware completion, and signatures for functions and tasks.
-    link: /lsp/completion
+    link: /lsp/
   - icon: 💬
     title: Inlay hints
     details: Port directions shown on every instantiation.
-    link: /lsp/
+    link: /lsp/#inlay-hints
   - icon: ⚙️
     title: RTL automation
     details: AutoInst, AutoWire, AutoArg, AutoFunc, and AutoFF as code actions.
     link: /autoinst/
   - icon: 🌳
-    title: RTL tree and connect
-    details: Browse the module hierarchy and wire instances together interactively.
+    title: RTL tree
+    details: Browse the module hierarchy, forward or reverse.
     link: /rtl-tree/
-  - icon: 🧰
-    title: Project-local config
-    details: One lazyverilog.toml near your RTL controls the whole toolchain.
-    link: /configuration
+  - icon: 🔌
+    title: Connect
+    details: Wire an output of one instance to an input of another.
+    link: /connect
   - icon: ⌨️
     title: CLI tools
     details: lazyverilog-fmt, lazyverilog-lint, and lazyverilog-rtltree for scripts and CI.
     link: /cli
-  - icon: 🧩
-    title: Neovim and VS Code
-    details: Native plugin and extension that install the matching server binary for you.
-    link: /installation/
 ---
