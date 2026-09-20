@@ -23,9 +23,6 @@ hero:
     - theme: alt
       text: Configuration
       link: /configuration
-    - theme: alt
-      text: Sponsor
-      link: https://github.com/sponsors/kjoonha
 ---
 
 ## Install

@@ -10,7 +10,7 @@ its `main` branch.
 
 | Path | Role |
 |------|------|
-| `docs/index.md` | Landing page: hero, the five buttons, and the installation guide as its body. |
+| `docs/index.md` | Landing page: hero, the four buttons, and the installation guide as its body. |
 | `docs/features.md` | The feature cards (frontmatter only, `layout: home`). |
 | `docs/.vitepress/config.mts` | Site config: nav, per-page canonical/`og:` tags, theme, search. |
 | `docs/.vitepress/site.json` | Sidebar and `srcExclude`; read by `config.mts` **and** `check-dist`. |
@@ -54,7 +54,7 @@ resolution.
 |----|-----------|
 | A1 | Hero logo has alt text |
 | A2 | At least 9 feature cards on the Features page |
-| A3 | Exactly five hero buttons: `/installation/`, `/features`, `/usage/`, `/configuration`, the sponsor page |
+| A3 | Exactly four hero buttons: `/installation/`, `/features`, `/usage/`, `/configuration` |
 | A4 | Each internal button target is a built page |
 | A5 | `canonical`/`og:url` are `https://lazyverilog.github.io/…` on the landing page and a deep page; `og:image` exists |
 | A6 | `.nojekyll` exists |

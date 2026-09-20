@@ -10,8 +10,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 const ORIGIN = 'https://lazyverilog.github.io'
-const SPONSOR = 'https://github.com/sponsors/kjoonha'
-const ACTIONS = ['/installation/', '/features', '/usage/', '/configuration', SPONSOR]
+const ACTIONS = ['/installation/', '/features', '/usage/', '/configuration']
 const MIN_FEATURES = 9
 const DEEP_PAGE = 'installation/neovim'
 

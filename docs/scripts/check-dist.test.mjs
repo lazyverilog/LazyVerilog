@@ -73,9 +73,6 @@ describe('check-dist', { skip }, () => {
       edit(path.join(dist, 'index.html'), (s) => s.replace(/<a[^>]*VPButton[^>]*href="\/usage\/"[^>]*>/, (m) => m.replace('VPButton', 'Other'))),
     ))
 
-  it('A3 fails when the Sponsor href changes', () =>
-    expectFailure('A3', ({ dist }) => edit(path.join(dist, 'index.html'), (s) => s.replaceAll('sponsors/kjoonha', 'sponsors/other'))))
-
   it('A4 fails when an action target page is missing', () =>
     expectFailure('A4', ({ dist }) => rmSync(path.join(dist, 'installation', 'index.html'))))
 
