@@ -32,7 +32,7 @@ User-facing and agent-facing documentation for lazyverilog. Covers formatter con
 - When adding a new `lazyverilog.toml` config option, update `formatter/options.md`
 - Every user-facing page is published to https://lazyverilog.github.io: add it to the sidebar in `.vitepress/site.json` or the site build check fails
 - User-facing docs live **outside** `dev/`, `releases/` and `i18n/`; those three directories are not published (`releases/` is read by `tools/release.sh`)
-- `README.md` at the repository root is only a title and a link to the site; put no content there
+- `README.md` at the repository root keeps the demo, comparison, and feature list; installation, usage, and configuration live here and the README only links to the site
 - Preview locally: `npm --prefix docs ci && npm --prefix docs run dev` (see `dev/site.md`)
 
 <!-- MANUAL: -->

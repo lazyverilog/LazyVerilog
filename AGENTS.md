@@ -12,7 +12,7 @@ SystemVerilog LSP server written in C++. Provides language intelligence (formatt
 | `CMakeLists.txt` | CMake build configuration |
 | `lazyverilog.toml` | LSP server config — formatting and linting options |
 | `CLAUDE.md` | Project instructions for AI agents |
-| `README.md` | Title and a link to the documentation site (https://lazyverilog.github.io) |
+| `README.md` | Demo, comparison, feature list, and a Getting Started link to the documentation site (https://lazyverilog.github.io) |
 | `.gitmodules` | Git submodule configuration |
 
 ## Subdirectories

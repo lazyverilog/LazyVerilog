@@ -1,7 +1,7 @@
 # Installation
 
-Pick your editor. Either plugin starts the `lazyverilog-lsp` server for Verilog and SystemVerilog
-files and downloads the matching release binary when it is missing.
+Pick your editor. Either plugin downloads the release binary and starts the server for Verilog and
+SystemVerilog files.
 
 | Editor | Guide |
 |--------|-------|
