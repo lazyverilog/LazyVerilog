@@ -153,3 +153,17 @@ forever, whereas a job skipped by `if:` reports as skipped and passes. If a chec
 replace the `paths` filter with a first `changes` job (checkout with `fetch-depth: 0`, `git diff
 --name-only` of the base against `HEAD`, fail open when the base cannot be resolved) and gate the
 matrix on it. `site.yml` has the same property for `site-build`.
+
+## Search engines
+
+The build already emits `sitemap.xml` (from `sitemap.hostname` in `config.mts`) and a canonical URL on every
+page. `docs/public/robots.txt` allows all crawlers and names the sitemap.
+
+Google only lists a site it has found. To speed that up, add `https://lazyverilog.github.io/` as a URL-prefix
+property in Google Search Console, verify it, and submit `https://lazyverilog.github.io/sitemap.xml`.
+Verify with the HTML-tag method by adding this to `head` in `config.mts`, or by placing the verification
+file Google gives you in `docs/public/`:
+
+```ts
+['meta', { name: 'google-site-verification', content: '<token>' }]
+```
