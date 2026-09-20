@@ -23,8 +23,12 @@ node index.ts --tier 1       # a tier (CI's default)
 node index.ts --dry-run ko   # print the prepared source, call no model
 ```
 
-- Driven in CI by `.github/workflows/translate-readme.yml`, on every push to `main`
-  that touches `README.md`, and on `workflow_dispatch` for a chosen language set.
+- Driven in CI by `.github/workflows/translate-readme.yml`, on a push to `main` that
+  touches `README.md` or `scripts/translate-readme/`, and on `workflow_dispatch` for a
+  chosen language set.  **Latest only**: a push is skipped when a newer commit on `main`
+  has already changed those paths, because that push runs the translation for both, and each
+  run works from the head of `main`, so it sees the previous run's cache.  Editing the
+  workflow file does not start a run; use `workflow_dispatch`.
   Auth is the `CLAUDE_CODE_OAUTH_TOKEN` repository secret, which is what the Agent
   SDK reads; there is no `ANTHROPIC_API_KEY` in this workflow.
 - **The English `README.md` is the only source.** Translations are generated output:

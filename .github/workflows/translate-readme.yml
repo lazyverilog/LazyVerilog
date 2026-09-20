@@ -6,7 +6,6 @@ on:
     paths:
       - README.md
       - scripts/translate-readme/**
-      - .github/workflows/translate-readme.yml
   workflow_dispatch:
     inputs:
       languages:
@@ -24,7 +23,8 @@ permissions:
   contents: write
 
 # Serialized: each run commits docs/i18n, so a second run must see the first
-# run's cache rather than race it.
+# run's cache rather than race it.  GitHub keeps only the newest run that is waiting,
+# so a burst of README pushes queues one run, not one per push.
 concurrency:
   group: translate-readme
   cancel-in-progress: false
@@ -34,21 +34,44 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # The head of the branch, not the pushed commit: a run that waited behind another
+      # one must see that run's translation cache and commit.  Full history, so the
+      # step below can ask which commit last changed the README.
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      # Latest only.  Translating costs model tokens, so a push is skipped when a newer
+      # push has already changed the README (or the translation script): that newer
+      # push runs the translation for both.  A manual run always goes ahead.
+      - name: Skip a push that a newer README change has replaced
+        id: latest
+        if: github.event_name == 'push'
+        run: |
+          git fetch --quiet origin "${{ github.ref_name }}"
+          newest=$(git log --first-parent -1 --format=%H "origin/${{ github.ref_name }}" -- README.md scripts/translate-readme)
+          if [ "$newest" != "$GITHUB_SHA" ]; then
+            echo "Commit $newest changed the README after this push; its run translates it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: actions/setup-node@v4
+        if: steps.latest.outputs.skip != 'true'
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: scripts/translate-readme/package-lock.json
 
       - name: Install
+        if: steps.latest.outputs.skip != 'true'
         working-directory: scripts/translate-readme
         run: npm ci
 
       # Without this the SDK fails deep in the subprocess with a message that
       # does not name the missing secret.
       - name: Check credentials
+        if: steps.latest.outputs.skip != 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
@@ -60,6 +83,7 @@ jobs:
           fi
 
       - name: Translate
+        if: steps.latest.outputs.skip != 'true'
         working-directory: scripts/translate-readme
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -70,6 +94,7 @@ jobs:
         run: node index.ts $LANGUAGES $FORCE
 
       - name: Commit translations
+        if: steps.latest.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -79,4 +104,5 @@ jobs:
             exit 0
           fi
           git commit -m "docs: refresh README translations"
+          git pull --rebase --quiet origin "${{ github.ref_name }}"
           git push origin "HEAD:${{ github.ref_name }}"
