@@ -63,7 +63,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/videos/AutoWire.gif" alt="Auto-wire: generate instance connections and wires in one code action" width="720">
+  <img src="assets/videos/AutoInst.gif" alt="Auto-instantiation: generate a module instance with its ports connected" width="720">
 </p>
 
 <p align="center">
