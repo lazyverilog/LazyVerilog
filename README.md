@@ -62,6 +62,14 @@
   It provides formatting, linting, navigation, hover, completion, inlay hints, and RTL code actions for real SystemVerilog projects.
 </p>
 
+<p align="center">
+  <img src="assets/videos/AutoInst.gif" alt="Auto-instantiation: generate a module instance with its ports connected" width="720">
+</p>
+
+<p align="center">
+  <sub>If LazyVerilog saves you time, a ⭐ helps other RTL engineers find it.</sub>
+</p>
+
 &nbsp;
 
 ## 🎬 Demo
