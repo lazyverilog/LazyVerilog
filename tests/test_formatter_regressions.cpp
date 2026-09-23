@@ -214,6 +214,38 @@ TEST_CASE("formatter regression: a macro configured as an expression never ends 
     CHECK(out.find("`PREFIX x = 1;") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: a multi-line define keeps its configured role", "[formatter][regression]") {
+    // A macro whose `define spans lines is whitespace sensitive; that used to
+    // skip role classification, so `declaration_like` had no effect.
+    // A bare macro before `logic` is a prefix unless configured otherwise, and
+    // only a role can say a macro opens a block -- so both lines below are
+    // decided by [format.macros] alone.
+    FormatOptions opts;
+    opts.macros.declaration_like.push_back("TAG");
+    opts.macros.block_begin_like.push_back("BLK_BEGIN");
+    opts.macros.block_end_like.push_back("BLK_END");
+    const std::string input = "`define TAG \\\n"
+                              "  logic tag_q;\n"
+                              "`define BLK_BEGIN(n) \\\n"
+                              "  begin : n\n"
+                              "`define BLK_END \\\n"
+                              "  end\n"
+                              "module m;\n"
+                              "`TAG logic z;\n"
+                              "always_comb `BLK_BEGIN(b)\n"
+                              "x = 0;\n"
+                              "`BLK_END\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input, opts);
+    CHECK(out.find("module m;\n"
+                   "  `TAG\n"
+                   "  logic z;\n"
+                   "  always_comb\n"
+                   "    `BLK_BEGIN(b)\n"
+                   "      x = 0;\n"
+                   "    `BLK_END\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

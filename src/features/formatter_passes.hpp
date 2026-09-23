@@ -366,6 +366,27 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
     if (kind_is(tokens[body], TK::BeginKeyword))
         return begin_end_statement_end_from(tokens, body);
 
+    // A configured block_begin_like macro is a `begin`: the statement runs to
+    // the invocation of its matching block_end_like macro.
+    if (kind_is(tokens[body], TK::MacroUsage) && tokens[body].mutable_.macro.opens_indent_scope) {
+        int depth = 0;
+        for (size_t i = body; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::MacroUsage) || !is_code_token(tokens[i]))
+                continue;
+            if (tokens[i].mutable_.macro.opens_indent_scope)
+                ++depth;
+            else if (tokens[i].mutable_.macro.closes_indent_scope && --depth == 0) {
+                size_t end = i;
+                size_t open = next_code(tokens, i + 1, tokens.size());
+                if (open != npos && kind_is(tokens[open], TK::OpenParenthesis) &&
+                    tokens[open].immutable.syntax.matching_token != npos)
+                    end = tokens[open].immutable.syntax.matching_token;
+                return end;
+            }
+        }
+        return npos;
+    }
+
     if (kind_is(tokens[body], TK::IfKeyword)) {
         size_t cond_open = next_code(tokens, body + 1, tokens.size());
         if (cond_open == npos || !kind_is(tokens[cond_open], TK::OpenParenthesis) ||
@@ -1569,8 +1590,13 @@ public:
                 const bool whitespace_sensitive =
                     mc.is_whitespace_sensitive(t.lex.text) ||
                     local_whitespace_sensitive.count(macro_name) > 0;
+                t.mutable_.macro.suppress_alignment = true;
+                // Whitespace sensitivity is about the argument spelling; the
+                // role is about where the invocation sits among statements.
+                // They are independent -- a multi-line `define used as a
+                // declaration_like item helper is both -- so freezing the
+                // arguments must not skip the role below.
                 if (whitespace_sensitive) {
-                    t.mutable_.macro.suppress_alignment = true;
                     size_t open = next_code(tokens, &t - tokens.data() + 1, tokens.size());
                     if (open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
                         size_t close = tokens[open].immutable.syntax.matching_token;
@@ -1581,14 +1607,9 @@ public:
                             }
                         }
                     }
-                } else {
-                    t.mutable_.macro.suppress_alignment = true;
+                }
+                {
                     MacroRole role = mc.classify(t.lex.text);
-                    if (role == MacroRole::StatementLike || role == MacroRole::DeclarationLike ||
-                        role == MacroRole::ControlFlowLike || role == MacroRole::BlockBeginLike ||
-                        role == MacroRole::BlockEndLike) {
-                        t.mutable_.macro.suppress_wrapping = false;
-                    }
                     if (role == MacroRole::BlockBeginLike)
                         t.mutable_.macro.opens_indent_scope = true;
                     if (role == MacroRole::BlockEndLike)
@@ -1613,8 +1634,11 @@ private:
                 continue;
             const size_t end = macro_invocation_end(tokens, i);
             bool ends = tokens[end].immutable.topology.may_end_macro_statement;
-            if (mc.is_configured_expression(t.lex.text) ||
-                mc.classify(t.lex.text) == MacroRole::ControlFlowLike) {
+            const MacroRole role = mc.classify(t.lex.text);
+            // A block-begin macro opens a body that runs to its block-end
+            // macro (see simple_statement_end_from), exactly like `begin`.
+            if (mc.is_configured_expression(t.lex.text) || role == MacroRole::ControlFlowLike ||
+                role == MacroRole::BlockBeginLike) {
                 ends = false;
             } else if (t.mutable_.macro.force_line_break) {
                 const size_t next = next_code(tokens, end + 1, tokens.size());
