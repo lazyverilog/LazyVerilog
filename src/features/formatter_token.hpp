@@ -187,6 +187,10 @@ struct TopologyFacts {
     // `do begin ... end while (c);`).  It controls nothing.
     bool ends_do_while{false};
 
+    // The `[` of an SVA repetition -- `[*n]`, `[+]`, `[->n]`, `[=n]` --
+    // whose operator is not the implication or assignment it spells.
+    bool is_repetition_bracket{false};
+
     // Set on the last token of a macro invocation -- the bare macro, or the
     // `)` closing its arguments -- that stands as a whole statement or item
     // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,

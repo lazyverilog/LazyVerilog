@@ -1418,6 +1418,14 @@ public:
                 in_covergroup = false;
         }
         mark_property_expressions(tokens);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::OpenBracket) || !tokens[i].immutable.syntax.in_property_expr)
+                continue;
+            const size_t op = next_code(tokens, i + 1, tokens.size());
+            tokens[i].immutable.topology.is_repetition_bracket =
+                op != npos && (kind_is(tokens[op], TK::Star) || kind_is(tokens[op], TK::Plus) ||
+                               kind_is(tokens[op], TK::MinusArrow) || kind_is(tokens[op], TK::Equals));
+        }
 
         size_t stmt_start = 0;
         int stmt_pd = 0;
@@ -4520,6 +4528,19 @@ public:
                 t.mutable_.space.spaces_before = 0;
                 t.mutable_.space.suppress_space = true;
                 continue;
+            }
+
+            // SVA repetition `b[->1]`, `b[=2:$]`: the operator binds to its
+            // bracket and its count.
+            {
+                const size_t li = prev_code(tokens, i);
+                const size_t lli = li == npos ? npos : prev_code(tokens, li);
+                if ((li != npos && tokens[li].immutable.topology.is_repetition_bracket) ||
+                    (lli != npos && tokens[lli].immutable.topology.is_repetition_bracket)) {
+                    t.mutable_.space.spaces_before = 0;
+                    t.mutable_.space.suppress_space = true;
+                    continue;
+                }
             }
 
             // An inline conditional directive is delimited by whitespace:

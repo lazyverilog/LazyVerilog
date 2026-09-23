@@ -1087,3 +1087,32 @@ endmodule
         CHECK(out.find("f(-1, -a, ~b)") != std::string::npos);
     }
 }
+
+TEST_CASE("formatter regression: SVA repetition operators bind to their brackets", "[formatter][regression]") {
+    const std::string input = R"SV(module handshake (input logic clk, req, ack);
+  a_ack: assert property (@(posedge clk) req |-> ack[->1] ##1 !ack[=2]);
+endmodule
+)SV";
+    const std::string expected = R"SV(module handshake(
+  input logic clk, req, ack
+);
+  a_ack: assert property (@(posedge clk) req |-> ack[->1] ##1 !ack[=2]);
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: every SVA repetition form stays closed up", "[formatter][regression]") {
+    const std::string input = R"SV(module m (input logic clk, a, b);
+  property p; @(posedge clk) a[->1:3] |-> b[=1:$] ##1 b[*2:4] ##1 b[+] ##1 b[*]; endproperty
+  assert property (@(posedge clk) a |-> b[->1] ##1 b[=2] ##1 b[*3]);
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    const std::string out = format_stable(input);
+    CHECK(parses_cleanly(out));
+    CHECK(out.find("a[->1:3] |-> b[=1:$] ##1 b[*2:4] ##1 b[+] ##1 b[*];") != std::string::npos);
+    CHECK(out.find("a |-> b[->1] ##1 b[=2] ##1 b[*3]);") != std::string::npos);
+}
