@@ -767,3 +767,32 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: UDP table rows keep their columns and endtable its level", "[formatter][regression]") {
+    const std::string input = R"SV(primitive udp_dff (q, d, clk);
+  output q; reg q;
+  input d, clk;
+  // d  clk  : q : q+
+  table
+     0  (01) : ? : 0 ;
+     1  (01) : ? : 1 ;
+     ?  (1?) : ? : - ;
+  endtable
+endprimitive
+)SV";
+    const std::string expected = R"SV(primitive udp_dff(q, d, clk);
+  output q;
+  reg q;
+  input d, clk;
+  // d  clk  : q : q+
+  table
+    0  (01) : ? : 0;
+    1  (01) : ? : 1;
+    ?  (1?) : ? : -;
+  endtable
+endprimitive
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}

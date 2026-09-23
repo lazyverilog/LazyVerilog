@@ -67,6 +67,8 @@ static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
         // and turns `4'b1???` into a conditional; only this fact sees it.
         if (x.lex.continues_vector_literal != y.lex.continues_vector_literal)
             return false;
+        if (x.lex.is_table_row != y.lex.is_table_row)
+            return false;
     }
     return true;
 }

@@ -74,6 +74,14 @@ struct LexemeFacts {
     // keeps these pieces closed up, so the fact survives re-lexing.
     bool continues_vector_literal{false};
 
+    // One row of a UDP `table`, from its first symbol to just before its `;`,
+    // kept as one token with its source spelling.  Rows are grids people
+    // align by hand (`0  (01) : ? : 0`), and splitting them into symbols let
+    // spacing close `(1?)` up to `(1 ?)` and flatten every column.  The row's
+    // text is carried through like the inside of a block comment; only its
+    // indentation is formatted.
+    bool is_table_row{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.

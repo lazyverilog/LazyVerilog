@@ -149,7 +149,7 @@ public:
 
             if (disabled_) {
                 add_raw_until_token(token);
-            } else {
+            } else if (!add_table_row(token)) {
                 add_slang_token(token);
             }
         }
@@ -227,6 +227,7 @@ private:
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
+    bool in_table_{false};
     bool just_entered_disabled_region_{false};
     size_t passthrough_end_{0}; // end of a frozen multiline define block
     int line_{0};
@@ -504,6 +505,41 @@ private:
         if (p == name || std::isdigit(static_cast<unsigned char>(source_[name])))
             return std::string::npos;
         return p;
+    }
+
+    // Inside a UDP `table`, fold each row into one token (see
+    // LexemeFacts::is_table_row).  A row ends at its `;`, which stays a token
+    // of its own so every "where does this item end" question still sees it.
+    // Returns false when the token is not the start of a row.
+    bool add_table_row(const slang::parsing::Token& token) {
+        using TKind = slang::parsing::TokenKind;
+        if (token.kind == TKind::TableKeyword) {
+            in_table_ = true;
+            return false;
+        }
+        if (!in_table_ || !token.location().valid())
+            return false;
+        if (token.kind == TKind::EndTableKeyword || token.kind == TKind::EndOfFile) {
+            in_table_ = false;
+            return false;
+        }
+        if (token.kind == TKind::Semicolon)
+            return false;
+        const size_t pos = token.location().offset();
+        size_t semi = source_.find(';', pos);
+        const size_t endtable = source_.find("endtable", pos);
+        if (semi == std::string::npos || (endtable != std::string::npos && endtable < semi))
+            return false;
+        size_t end = semi;
+        while (end > pos && std::isspace(static_cast<unsigned char>(source_[end - 1])))
+            --end;
+        consume_gap_to(pos);
+        std::string_view row(source_.data() + pos, end - pos);
+        add_token(TKind::Unknown, row, pos, false, false);
+        tokens_.back().lex.is_table_row = true;
+        consume_text(row, false);
+        passthrough_end_ = end;
+        return true;
     }
 
     void add_raw_until_token(const slang::parsing::Token& token) {

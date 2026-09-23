@@ -28,7 +28,7 @@ inline bool is_open_block(TK k) {
            k == TK::GenerateKeyword || k == TK::CoverGroupKeyword ||
            k == TK::PropertyKeyword || k == TK::SequenceKeyword || k == TK::CheckerKeyword ||
            k == TK::ClockingKeyword || k == TK::ConfigKeyword || k == TK::PrimitiveKeyword ||
-           k == TK::SpecifyKeyword || k == TK::ForkKeyword ||
+           k == TK::SpecifyKeyword || k == TK::TableKeyword || k == TK::ForkKeyword ||
            // Closed by `endcase` / `endsequence` like their plain forms.
            k == TK::RandCaseKeyword || k == TK::RandSequenceKeyword;
 }
@@ -1952,8 +1952,12 @@ public:
             }
             // `generate` opens a region like `begin`; its first item starts
             // the next line.
-            if (kind_is(t, TK::GenerateKeyword) || kind_is(t, TK::SpecifyKeyword))
+            if (kind_is(t, TK::GenerateKeyword) || kind_is(t, TK::SpecifyKeyword) ||
+                kind_is(t, TK::TableKeyword))
                 t.mutable_.wrap.must_break_after = true;
+            // Each UDP row is a line of its own.
+            if (t.lex.is_table_row)
+                t.mutable_.wrap.must_break_before = true;
             // `randcase` has no header; its first item starts the next line.
             if (kind_is(t, TK::RandCaseKeyword))
                 t.mutable_.wrap.must_break_after = true;
