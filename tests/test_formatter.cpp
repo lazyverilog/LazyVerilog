@@ -3638,7 +3638,121 @@ TEST_CASE("formatter: case item label keeps simple statement", "[formatter]") {
     REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
     CHECK(formatted.find("4: a") != std::string::npos);
     CHECK(formatted.find("= f();") != std::string::npos);
-    CHECK(formatted.find("8 /* comment */ : b") != std::string::npos);
+    CHECK(formatted.find("8 /* comment */: b") != std::string::npos);
+}
+
+// Issue #137: a macro label after `end` or `;` read as a semicolonless
+// statement macro and broke before its `:`, and the space before the colon
+// depended on whether the label's last token was a literal.
+TEST_CASE("formatter: case item labels format the same whatever the label is", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "`define NOP 2'b00\n"
+                        "`define MOV 2'b11\n"
+                        "module m;\n"
+                        "always_ff @(posedge clk) begin\n"
+                        "case (bus_a)\n"
+                        "`NOP : begin\n"
+                        "$display(\"1\");\n"
+                        "end\n"
+                        "`MOV: begin\n"
+                        "$display(\"2\");\n"
+                        "end\n"
+                        "8'b0111: begin\n"
+                        "$display(\"4\");\n"
+                        "end\n"
+                        "default : begin\n"
+                        "$display(\"default\");\n"
+                        "end\n"
+                        "endcase\n"
+                        "case (sel)\n"
+                        "`A: y = 1;\n"
+                        "`B : y = 2;\n"
+                        "`C, `D: y = 3;\n"
+                        "4'hc4 : y = 4;\n"
+                        "4'h12: y = 5;\n"
+                        "ST_IDLE : y = 6;\n"
+                        "`F(1) : y = 7;\n"
+                        "(a ? b : c) : y = 8;\n"
+                        "default: y = 0;\n"
+                        "endcase\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    for (const char* label : {"`NOP: begin", "`MOV: begin", "8'b0111: begin", "default: begin",
+                              "`A: y", "`B: y", "`C, `D: y", "4'hc4: y", "4'h12: y",
+                              "ST_IDLE: y", "`F(1): y", "(a ? b : c): y", "default: y"}) {
+        INFO("label: " << label);
+        CHECK(formatted.find(label) != std::string::npos);
+    }
+    CHECK(formatted.find("\n            : ") == std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: case item colon is found only at the item's own position", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "module m;\n"
+                        "generate\n"
+                        "case (P)\n"
+                        "0 : begin : g0\n"
+                        "assign a = 1;\n"
+                        "end : g0\n"
+                        "ONE : assign a = 2;\n"
+                        "endcase\n"
+                        "endgenerate\n"
+                        "always_comb begin\n"
+                        "case (s)\n"
+                        "A : case (t)\n"
+                        "B : y = 1;\n"
+                        "endcase\n"
+                        "C : y = a ? b : c;\n"
+                        "D : lbl : y = 6;\n"
+                        "E : y = '{default : 0};\n"
+                        "default y = 9;\n"
+                        "endcase\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    // Item labels, including a nested case's and ones after a named `end`.
+    for (const char* label : {"0: begin", "ONE: assign", "A: case", "B: y", "C: y", "D: lbl"}) {
+        INFO("label: " << label);
+        CHECK(formatted.find(label) != std::string::npos);
+    }
+    // Colons inside the item's statement are not labels.
+    CHECK(formatted.find("a ? b : c;") != std::string::npos);
+    CHECK(formatted.find("lbl : y") != std::string::npos);
+    CHECK(formatted.find("'{default : 0}") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: macro that starts an expression statement stays on its line",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "module m;\n"
+                        "always_comb begin\n"
+                        "x = 1;\n"
+                        "`REG = 2;\n"
+                        "`ARR[0] <= 3;\n"
+                        "`FIELD(1).f = 4;\n"
+                        "`CHECK_BARE\n"
+                        "y = 5;\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    CHECK(formatted.find("`REG = 2;") != std::string::npos);
+    CHECK(formatted.find("`ARR[0] <= 3;") != std::string::npos);
+    CHECK(formatted.find("`FIELD(1).f = 4;") != std::string::npos);
+    // A bare macro followed by another statement is still a statement of its own.
+    CHECK(formatted.find("`CHECK_BARE\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
 }
 
 TEST_CASE("formatter: coverpoint macro body stays multiline", "[formatter]") {

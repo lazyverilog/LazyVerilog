@@ -280,6 +280,19 @@ logic [7:0] data;
 logic [7 : 0] data;
 ```
 
+This option only affects ranges. A case item's colon is not configurable: it is
+always written `label: statement`, whether the label is a literal, an
+identifier, a macro, or `default`.
+
+```systemverilog
+case (op)
+    `NOP: y = 0;
+    4'hc4: y = 1;
+    ST_IDLE: y = 2;
+    default: y = 3;
+endcase
+```
+
 ---
 
 ### `indexed_part_select_spacing`

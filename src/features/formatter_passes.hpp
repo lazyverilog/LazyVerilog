@@ -1075,6 +1075,104 @@ public:
                     tokens[open].immutable.topology.opens_brace_block;
             }
         }
+
+        mark_case_item_colons(tokens);
+    }
+
+private:
+    // A case item is `<labels> : <statement>`, and the labels are arbitrary
+    // expressions, so the item's colon is found by position rather than by the
+    // token in front of it: the first `:` at the case body's own depth after a
+    // point where an item can start -- the header's `)`, a `;`, an `end`/`join`
+    // back at that depth, or a nested `endcase`.  Once found, the rest of the
+    // item is a statement and its colons (statement labels, `begin : blk`,
+    // ternaries, assignment-pattern keys) are not labels.  A `?` seen while
+    // looking owns the next `:`, so a ternary inside a label is not cut short.
+    static void mark_case_item_colons(TokenStream& tokens) {
+        struct CaseBody {
+            int pd, bd, brd, block_depth;
+            size_t header_end;
+            bool seeking;
+            int pending_questions;
+        };
+        std::vector<CaseBody> cases;
+        int block_depth = 0;
+        auto at_body_depth = [&](const Tok& t, const CaseBody& c) {
+            return t.immutable.syntax.paren_depth == c.pd &&
+                   t.immutable.syntax.bracket_depth == c.bd &&
+                   t.immutable.syntax.brace_depth == c.brd &&
+                   block_depth == c.block_depth;
+        };
+        auto item_can_start = [&](CaseBody& c) {
+            c.seeking = true;
+            c.pending_questions = 0;
+        };
+
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& t = tokens[i];
+            if (!is_code_token(t))
+                continue;
+
+            if (kind_is(t, TK::BeginKeyword) || kind_is(t, TK::ForkKeyword)) {
+                ++block_depth;
+                continue;
+            }
+            if (kind_is(t, TK::EndKeyword) || kind_is(t, TK::JoinKeyword) ||
+                kind_is(t, TK::JoinAnyKeyword) || kind_is(t, TK::JoinNoneKeyword)) {
+                block_depth = std::max(0, block_depth - 1);
+                if (!cases.empty() && at_body_depth(t, cases.back()))
+                    item_can_start(cases.back());
+                continue;
+            }
+
+            if (kind_is(t, TK::CaseKeyword) || kind_is(t, TK::CaseXKeyword) ||
+                kind_is(t, TK::CaseZKeyword) || kind_is(t, TK::RandCaseKeyword)) {
+                CaseBody c{t.immutable.syntax.paren_depth, t.immutable.syntax.bracket_depth,
+                           t.immutable.syntax.brace_depth, block_depth, npos, false, 0};
+                size_t open = kind_is(t, TK::RandCaseKeyword)
+                    ? npos : next_code(tokens, i + 1, tokens.size());
+                if (open != npos && kind_is(tokens[open], TK::OpenParenthesis))
+                    c.header_end = tokens[open].immutable.syntax.matching_token;
+                if (c.header_end == npos)
+                    c.seeking = true;
+                cases.push_back(c);
+                continue;
+            }
+            if (cases.empty())
+                continue;
+            if (kind_is(t, TK::EndCaseKeyword)) {
+                cases.pop_back();
+                if (!cases.empty() && at_body_depth(t, cases.back()))
+                    item_can_start(cases.back());
+                continue;
+            }
+
+            CaseBody& c = cases.back();
+            if (i == c.header_end) {
+                item_can_start(c);
+                continue;
+            }
+            if (!at_body_depth(t, c))
+                continue;
+            if (kind_is(t, TK::Semicolon)) {
+                item_can_start(c);
+            } else if (c.seeking && kind_is(t, TK::Question)) {
+                ++c.pending_questions;
+            } else if (c.seeking && kind_is(t, TK::Colon)) {
+                if (c.pending_questions > 0) {
+                    --c.pending_questions;
+                    continue;
+                }
+                // `end : blk` names the block that just closed.
+                size_t p = prev_code(tokens, i);
+                if (p != npos && (is_close_block(tokens[p].lex.kind) ||
+                                  kind_is(tokens[p], TK::BeginKeyword) ||
+                                  kind_is(tokens[p], TK::ForkKeyword)))
+                    continue;
+                t.immutable.topology.is_case_item_colon = true;
+                c.seeking = false;
+            }
+        }
     }
 };
 
@@ -1425,6 +1523,27 @@ public:
             return next != npos && kind_is(tokens[next], TK::Semicolon);
         };
 
+        // The unknown-macro fallback reads "a macro at a statement start" as a
+        // whole semicolonless statement.  A macro that the next token carries
+        // on as an operand is not one: it is a case label (`` `OP: ``,
+        // `` `A, `B: ``) or the start of an expression statement
+        // (`` `REG = 1; ``, `` `ARR[0] <= 1; ``), and a break there splits the
+        // label from its colon or the target from its assignment.
+        auto next_continues_expression = [&](size_t after) {
+            size_t next = next_code(tokens, after + 1, tokens.size());
+            if (next == npos)
+                return false;
+            const TK k = tokens[next].lex.kind;
+            return k == TK::Semicolon || k == TK::Colon || k == TK::Comma || k == TK::Question ||
+                   is_binary_op(k) || is_assignment_op(k) ||
+                   k == TK::TripleEquals || k == TK::ExclamationDoubleEquals ||
+                   k == TK::DoubleEqualsQuestion || k == TK::ExclamationEqualsQuestion ||
+                   k == TK::Dot || k == TK::OpenBracket || k == TK::DoubleColon ||
+                   k == TK::Apostrophe || k == TK::PlusColon || k == TK::MinusColon ||
+                   k == TK::DoublePlus || k == TK::DoubleMinus ||
+                   k == TK::CloseParenthesis || k == TK::CloseBracket || k == TK::CloseBrace;
+        };
+
         int group = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
@@ -1531,9 +1650,9 @@ public:
                     if (open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
                         size_t close = tokens[open].immutable.syntax.matching_token;
                         if (close != npos && close < tokens.size() &&
-                            !next_is_source_semicolon(close))
+                            !next_continues_expression(close))
                             tokens[close].mutable_.wrap.must_break_after = true;
-                    } else if (!(open != npos && kind_is(tokens[open], TK::Semicolon))) {
+                    } else if (!next_continues_expression(i)) {
                         t.mutable_.wrap.must_break_after = true;
                     }
                 }
@@ -4091,6 +4210,11 @@ public:
                                            kind_is(L, TK::BeginKeyword) || kind_is(L, TK::ForkKeyword)))
                 spaces = 0;
             if (kind_is(t, TK::Colon) && is_numeric(L) && !in_dim)
+                spaces = 0;
+            // Case item labels are `label: stmt` whatever the label ends in.
+            // Deciding from the left token alone gave `8'b0111:` but
+            // `4'hc4 :`, `` `OP :`` and `default :`.
+            if (kind_is(t, TK::Colon) && t.immutable.topology.is_case_item_colon)
                 spaces = 0;
             if (kind_is(t, TK::Colon) && is_identifier_like(L)) {
                 size_t nx = next_code(tokens, i + 1, tokens.size());

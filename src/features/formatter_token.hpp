@@ -131,6 +131,11 @@ struct TopologyFacts {
     // matching CloseParenthesis (exclusive on both ends).  Precomputed by
     // SyntaxPass to replace O(n) backward scans.
     bool inside_argument_list{false};
+
+    // The `:` that ends a case item's label list (`` `OP, 4'hc: ``,
+    // `default:`).  What precedes it can be any expression -- a literal, an
+    // identifier, a macro -- so spacing cannot be decided from the left token.
+    bool is_case_item_colon{false};
 };
 
 // 4. InputTriviaFacts: observation of original whitespace.  These are facts
