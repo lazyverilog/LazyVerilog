@@ -154,10 +154,39 @@ public:
             }
         }
         mark_attribute_instances();
+        mark_vector_literal_digits();
         return tokens_;
     }
 
 private:
+    // slang's NumberParser takes the first vector-digit token after a base
+    // marker whatever trivia precedes it, then keeps taking vector-digit
+    // tokens only while each touches the previous one
+    // (SyntaxFacts::isPossibleVectorDigit plus `trivia().empty()`).  Mirror
+    // that rule exactly: anything looser glues a following identifier onto a
+    // literal, anything tighter lets spacing turn a `?` digit into `? :`.
+    void mark_vector_literal_digits() {
+        using TKind = slang::parsing::TokenKind;
+        auto is_vector_digit = [](TKind k) {
+            return k == TKind::IntegerLiteral || k == TKind::Question ||
+                   k == TKind::RealLiteral || k == TKind::Identifier;
+        };
+        for (size_t i = 0; i + 1 < tokens_.size(); ++i) {
+            if (tokens_[i].lex.kind != TKind::IntegerBase)
+                continue;
+            size_t j = i + 1;
+            if (!is_vector_digit(tokens_[j].lex.kind))
+                continue;
+            tokens_[j].lex.continues_vector_literal = true;
+            while (j + 1 < tokens_.size() && is_vector_digit(tokens_[j + 1].lex.kind) &&
+                   tokens_[j].lex.range.end().offset() == tokens_[j + 1].lex.range.start().offset()) {
+                ++j;
+                tokens_[j].lex.continues_vector_literal = true;
+            }
+            i = j;
+        }
+    }
+
     // `(*` and `*)` are single lexemes in the LRM, so an attribute instance is
     // exactly an OpenParenthesis whose Star follows with no gap, closed by a
     // Star whose CloseParenthesis follows with no gap.  Comparing byte offsets

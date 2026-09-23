@@ -63,6 +63,10 @@ static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
             return false;
         if (x.lex.is_escaped_identifier != y.lex.is_escaped_identifier)
             return false;
+        // Separating a `?` digit from its literal leaves every token intact
+        // and turns `4'b1???` into a conditional; only this fact sees it.
+        if (x.lex.continues_vector_literal != y.lex.continues_vector_literal)
+            return false;
     }
     return true;
 }

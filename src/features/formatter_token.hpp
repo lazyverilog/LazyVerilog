@@ -66,6 +66,14 @@ struct LexemeFacts {
     // a pass from input trivia.
     bool in_attribute_instance{false};
 
+    // A piece of a based literal's value after its base marker.  slang lexes
+    // `4'b1??0` as `4`, `'b`, `1`, `?`, `?`, `0` and its parser joins the
+    // pieces back only while no trivia separates them -- a spaced `?` is the
+    // conditional operator.  Membership is therefore decided by byte
+    // adjacency, recorded here where byte positions are known; the formatter
+    // keeps these pieces closed up, so the fact survives re-lexing.
+    bool continues_vector_literal{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.

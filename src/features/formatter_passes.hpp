@@ -129,35 +129,6 @@ inline bool is_numeric(const Tok& t) {
            t.lex.kind == TK::TimeLiteral;
 }
 
-inline bool is_based_literal_body_piece(const Tok& t) {
-    // Slang lexes based literals by kind, not as one raw token.  For example:
-    //
-    //   12'h7c4  -> IntegerLiteral("12"), IntegerBase("'h"),
-    //               IntegerLiteral("7"), Identifier("c4")
-    //   4'b10xz  -> IntegerLiteral("4"),  IntegerBase("'b"),
-    //               IntegerLiteral("10"), Identifier("xz")
-    //
-    // The formatter must keep every body piece adjacent to the preceding
-    // IntegerBase; otherwise it can render illegal/changed literals such as
-    // `12'h7 c4`.
-    return t.lex.kind == TK::IntegerLiteral ||
-           t.lex.kind == TK::UnbasedUnsizedLiteral ||
-           t.lex.kind == TK::Identifier;
-}
-
-inline bool is_based_literal_continuation(const TokenStream& tokens, size_t idx) {
-    if (idx >= tokens.size() || !is_based_literal_body_piece(tokens[idx]))
-        return false;
-    for (size_t n = idx; n > 0; --n) {
-        size_t p = n - 1;
-        if (kind_is(tokens[p], TK::IntegerBase))
-            return true;
-        if (!is_based_literal_body_piece(tokens[p]))
-            return false;
-    }
-    return false;
-}
-
 inline bool is_identifier_like(const Tok& t) {
     return t.lex.kind == TK::Identifier || t.lex.kind == TK::SystemIdentifier ||
            t.lex.kind == TK::MacroUsage;
@@ -1156,7 +1127,9 @@ private:
                 continue;
             if (kind_is(t, TK::Semicolon)) {
                 item_can_start(c);
-            } else if (c.seeking && kind_is(t, TK::Question)) {
+            } else if (c.seeking && kind_is(t, TK::Question) &&
+                       !t.lex.continues_vector_literal) {
+                // `4'b1???:` -- those `?` are digits, not conditionals.
                 ++c.pending_questions;
             } else if (c.seeking && kind_is(t, TK::Colon)) {
                 if (c.pending_questions > 0) {
@@ -2185,6 +2158,20 @@ private:
         }
 
         freeze_attribute_instances(tokens);
+        freeze_vector_literals(tokens);
+    }
+
+    // A based literal's value pieces must stay adjacent (see
+    // LexemeFacts::continues_vector_literal); a line break is trivia too.
+    static void freeze_vector_literals(TokenStream& tokens) {
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            if (!tokens[i].lex.continues_vector_literal)
+                continue;
+            tokens[i].mutable_.wrap.must_break_before = false;
+            tokens[i].mutable_.wrap.can_break_before = false;
+            tokens[i - 1].mutable_.wrap.must_break_after = false;
+            tokens[i - 1].mutable_.wrap.can_break_after = false;
+        }
     }
 
     // An attribute instance is an atom: `(* async_reg = "true" *)` annotates the
@@ -4005,25 +3992,24 @@ public:
                 continue;
             }
 
+            // Slang represents based literals as multiple tokens -- `12'h7c4`
+            // is `12`, `'h`, `7`, `c4` and `4'b1??0` is `4`, `'b`, `1`, `?`,
+            // `?`, `0`.  Keep the size against its base and the value pieces
+            // closed up; a space before a `?` digit re-lexes it as the
+            // conditional operator, so no later rule may reopen the gap.
+            if ((kind_is(t, TK::IntegerBase) && kind_is(L, TK::IntegerLiteral)) ||
+                t.lex.continues_vector_literal) {
+                t.mutable_.space.spaces_before = 0;
+                t.mutable_.space.suppress_space = true;
+                continue;
+            }
+
             // Basic no-space rules
             if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
             if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis))
                 spaces = 1;
             // Empty positional argument: `, ,` — keep one space so the slot is visible
             if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
-
-            // Slang represents based literals as multiple adjacent tokens.
-            // Preserve adjacency around the base marker and all following
-            // body chunks:
-            //
-            //   12 'h 7 c4  ->  12'h7c4
-            //   4  'b 10 xz ->  4'b10xz
-            //
-            // This rule is purely TokenKind-driven and therefore remains
-            // idempotent after the first formatting pass.
-            if ((kind_is(t, TK::IntegerBase) && kind_is(L, TK::IntegerLiteral)) ||
-                is_based_literal_continuation(tokens, i))
-                spaces = 0;
 
             // Unary ops: no space after.
             // Exception: `~ &a`, `~ |a`, `~ ^a` — tilde followed by a
