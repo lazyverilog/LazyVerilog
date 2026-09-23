@@ -2269,15 +2269,23 @@ public:
             // physical line break after the comment.  The semicolon path above
             // handles ordinary statements, but EOF comments after final
             // `endmodule` / `endclass` labels need the same treatment.
+            //
+            // The break goes after the whole run of trailing comments, not
+            // the first: `end /* p_next */ // combinational` is one line.
             if (t.mutable_.wrap.must_break_after && t.lex.comment_kind == CommentLexemeKind::None) {
+                size_t last_trailing = npos;
                 for (size_t j = i + 1; j < tokens.size(); ++j) {
                     if (is_passthrough(tokens[j])) continue;
-                    if (tokens[j].lex.comment_kind != CommentLexemeKind::None &&
-                        tokens[j].immutable.comment.role == CommentRole::Trailing) {
-                        t.mutable_.wrap.must_break_after = false;
-                        tokens[j].mutable_.wrap.must_break_after = true;
-                    }
-                    break;
+                    if (tokens[j].lex.comment_kind == CommentLexemeKind::None ||
+                        tokens[j].immutable.comment.role != CommentRole::Trailing)
+                        break;
+                    last_trailing = j;
+                }
+                if (last_trailing != npos) {
+                    t.mutable_.wrap.must_break_after = false;
+                    for (size_t j = i + 1; j < last_trailing; ++j)
+                        tokens[j].mutable_.wrap.must_break_after = false;
+                    tokens[last_trailing].mutable_.wrap.must_break_after = true;
                 }
             }
         }

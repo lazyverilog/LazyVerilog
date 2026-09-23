@@ -1138,3 +1138,19 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: a chain of trailing comments after end stays on its line", "[formatter][regression]") {
+    const std::string input = R"SV(module fsm;
+  always_comb begin
+  end /* p_next */ // combinational
+endmodule /* fsm */ // end of file
+)SV";
+    const std::string expected = R"SV(module fsm;
+  always_comb begin
+  end /* p_next */ // combinational
+endmodule /* fsm */ // end of file
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
