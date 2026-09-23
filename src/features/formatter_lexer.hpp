@@ -364,6 +364,13 @@ private:
                 return;
             }
             if (format_on) disabled_ = false;
+            // The comment is its own token now, so its text is not leading
+            // whitespace of the next one.  Counting the `\n` inside a block
+            // comment there made `/* a\n b */ reg k;` report a line break
+            // before `reg` that is not in the source; once formatting moved
+            // `reg` down a line, the second pass saw two and added a blank.
+            consume_text(raw, false);
+            return;
         }
         // Whitespace trivia is not a token.  It only contributes immutable source
         // layout facts used by passes such as WrapPass and BlankLinePass.

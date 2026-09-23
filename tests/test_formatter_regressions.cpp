@@ -79,6 +79,27 @@ TEST_CASE("formatter regression: a conditional's colon after a number keeps its 
                  "endmodule\n");
 }
 
+TEST_CASE("formatter regression: code after a multi-line block comment gets no phantom blank line", "[formatter][regression]") {
+    const std::string input = "module t;\n"
+                              "wire w = a; // trailing\n"
+                              "/* block\n"
+                              "   comment */ reg k;\n"
+                              "/* another\n"
+                              "   one */\n"
+                              "reg j;\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input, indent4());
+    CHECK(out == "module t;\n"
+                 "    wire w = a; // trailing\n"
+                 "    /* block\n"
+                 "   comment */\n"
+                 "    reg k;\n"
+                 "    /* another\n"
+                 "   one */\n"
+                 "    reg j;\n"
+                 "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
