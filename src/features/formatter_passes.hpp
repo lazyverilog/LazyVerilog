@@ -648,34 +648,23 @@ inline int token_text_width(const TokenStream& tokens, size_t first, size_t end)
     return w;
 }
 
-inline int canonical_space_between(const Tok& left, const Tok& right) {
-    if (no_space_before(right.lex.kind) || no_space_after(left.lex.kind))
-        return 0;
-    if (kind_is(left, TK::Dot) || kind_is(right, TK::Dot) ||
-        kind_is(left, TK::DoubleColon) || kind_is(right, TK::DoubleColon))
-        return 0;
-    if (kind_is(right, TK::OpenBracket) &&
-        (is_identifier_like(left) || kind_is(left, TK::CloseBracket) ||
-         kind_is(left, TK::CloseParenthesis)))
-        return 0;
-    if (kind_is(right, TK::OpenParenthesis) &&
-        (is_identifier_like(left) || is_control_keyword(left.lex.kind) ||
-         kind_is(left, TK::CloseParenthesis) || kind_is(left, TK::Hash)))
-        return 0;
-    return 1;
-}
-
-inline int canonical_width(const TokenStream& tokens, size_t first, size_t end) {
+// Width of [first, end) as the renderer will print it on one line: token text
+// plus the gaps SpacingPass decided.  AlignPass runs after SpacingPass, so it
+// measures what will actually be emitted.  It used to measure with a private
+// copy of the spacing rules, which knew nothing of case-item colons or based
+// literals (`4'h12: yy` measured 10 wide and rendered 9) and so misplaced the
+// columns it was computing.
+inline int rendered_width(const TokenStream& tokens, size_t first, size_t end) {
     int w = 0;
-    size_t prev = npos;
+    bool first_code = true;
     end = std::min(end, tokens.size());
     for (size_t i = first; i < end; ++i) {
         const Tok& t = tokens[i];
         if (!is_code_token(t)) continue;
-        if (prev != npos)
-            w += canonical_space_between(tokens[prev], t);
+        if (!first_code && !t.mutable_.space.suppress_space)
+            w += t.mutable_.space.spaces_before;
         w += token_width(t);
-        prev = i;
+        first_code = false;
     }
     return w;
 }
@@ -2798,9 +2787,25 @@ public:
                     //   assign d          = a;
                     //          ^^^^^^^^^^^ 10-column LHS field + one
                     //                       pre-operator space
-                    ln.lhs_prefix_width = canonical_width(tokens, scan_start, after_assign) + 1;
+                    ln.lhs_prefix_width = rendered_width(tokens, scan_start, after_assign) + 1;
                     scan_start = after_assign;
                 }
+            }
+            // `4'h12: y = 5;` -- the case label is a prefix of the line, like
+            // `assign `, so the assignment's LHS field starts after it.
+            for (size_t k = scan_start; k < end_idx; ++k) {
+                if (!is_code_token(tokens[k]))
+                    continue;
+                if (tokens[k].immutable.topology.is_case_item_colon) {
+                    const size_t after_label = next_code(tokens, k + 1, end_idx);
+                    if (after_label != npos) {
+                        ln.lhs_prefix_width = rendered_width(tokens, scan_start, after_label) + 1;
+                        scan_start = after_label;
+                    }
+                    break;
+                }
+                if (kind_is(tokens[k], TK::Semicolon) || is_assignment_op(tokens[k].lex.kind))
+                    break;
             }
             ln.lhs_first = scan_start;
             for (size_t k = scan_start; k < end_idx; ++k) {
@@ -2822,7 +2827,7 @@ public:
             }
             // Compute LHS width
             if (ln.assign_idx != npos) {
-                ln.lhs_width = canonical_width(tokens, scan_start, ln.assign_idx);
+                ln.lhs_width = rendered_width(tokens, scan_start, ln.assign_idx);
                 // Count identifiers at bracket depth 0 only: arr[b] has one
                 // top-level identifier (arr), so it should not be treated like
                 // a two-identifier user-defined-type declaration (packet_t v).
@@ -2869,15 +2874,24 @@ public:
                     ++j;
                 if (j - li >= 2) {
                     int group_lhs = opts_.statement.lhs_min_width;
-                    for (size_t k = li; k < j; ++k)
-                        group_lhs = std::max(group_lhs, lines[k].lhs_width);
+                    int group_prefix = 0;
                     for (size_t k = li; k < j; ++k) {
+                        group_lhs = std::max(group_lhs, lines[k].lhs_width);
+                        group_prefix = std::max(group_prefix, lines[k].lhs_prefix_width);
+                    }
+                    for (size_t k = li; k < j; ++k) {
+                        // Adaptive keeps each line's own prefix and field;
+                        // otherwise every operator in the group shares one
+                        // column, whatever case label stands in front of it.
                         const int lhs_field = opts_.statement.align_adaptive
                             ? std::max(opts_.statement.lhs_min_width, lines[k].lhs_width)
                             : group_lhs;
+                        const int prefix = opts_.statement.align_adaptive
+                            ? lines[k].lhs_prefix_width
+                            : group_prefix;
                         const int target = opts_.tab_align
-                            ? snap_to_grid(lines[k].lhs_prefix_width + lhs_field + op_gap, opts_.indent_size)
-                            : lines[k].lhs_prefix_width + lhs_field + op_gap;
+                            ? snap_to_grid(prefix + lhs_field + op_gap, opts_.indent_size)
+                            : prefix + lhs_field + op_gap;
                         tokens[lines[k].assign_idx].mutable_.align.enabled = true;
                         tokens[lines[k].assign_idx].mutable_.align.target_column =
                             lines[k].indent + target;
@@ -2981,7 +2995,7 @@ public:
                         tokens[type_first].mutable_.align.target_column =
                             base + option_width(std::max(opts_.port_declaration.section1_min_width,
                                                          token_width(tokens[first]) + 1), opts_);
-                        int type_width = canonical_width(tokens, type_first, name);
+                        int type_width = rendered_width(tokens, type_first, name);
                         name_target = tokens[type_first].mutable_.align.target_column +
                                       snap_to_grid(type_width + 1, opts_.indent_size);
                     }
@@ -3008,7 +3022,7 @@ public:
                     tokens[eq].mutable_.align.enabled = true;
                     tokens[eq].mutable_.align.target_column = name_target + section3;
                     if (semi != npos) {
-                        int rhs_width = canonical_width(tokens, eq + 1, semi);
+                        int rhs_width = rendered_width(tokens, eq + 1, semi);
                         if (!opts_.var_declaration.align_adaptive || rhs_width < section4) {
                             tokens[semi].mutable_.align.enabled = true;
                             tokens[semi].mutable_.align.target_column =
@@ -3019,7 +3033,7 @@ public:
                     tokens[semi].mutable_.align.enabled = true;
                     tokens[semi].mutable_.align.target_column =
                         align_name ? (name_target + section3 + section4)
-                                   : (base + canonical_width(tokens, first, semi) + section3 - 1);
+                                   : (base + rendered_width(tokens, first, semi) + section3 - 1);
                 }
             }
         }
@@ -3205,7 +3219,7 @@ public:
                     if (!is_vline[j]) { ++j; continue; }
                     group_type_width = std::max(
                         group_type_width,
-                        canonical_width(tokens, vlines[j].first,
+                        rendered_width(tokens, vlines[j].first,
                                         vlines[j].packed_dim != npos ? vlines[j].packed_dim
                                                                      : vlines[j].first_name));
                     if (vlines[j].packed_dim != npos) {
@@ -3292,7 +3306,7 @@ public:
                     int dim_col = preferred_dim_col;
                     if (vl.packed_dim != npos) {
                         dim_col = std::max(dim_col,
-                                           vl.indent + canonical_width(tokens, vl.first, vl.packed_dim) + 1);
+                                           vl.indent + rendered_width(tokens, vl.first, vl.packed_dim) + 1);
                         tokens[vl.packed_dim].mutable_.align.enabled = true;
                         tokens[vl.packed_dim].mutable_.align.target_column = dim_col;
                     }
@@ -3314,7 +3328,7 @@ public:
                                                 dim_col + token_text_width(tokens, vl.packed_dim, close + 1) + 1);
                     } else {
                         name_col = std::max(name_col,
-                                            vl.indent + canonical_width(tokens, vl.first, vl.first_name) + 1);
+                                            vl.indent + rendered_width(tokens, vl.first, vl.first_name) + 1);
                     }
                     size_t unpacked_dim = npos;
                     for (size_t k = vl.first_name + 1; k < vl.first_delim; ++k) {
@@ -3541,7 +3555,7 @@ public:
                 out.direction_width = token_width(tokens[ln.first]);
                 out.type_width = type_first == npos
                                      ? 0
-                                     : canonical_width(tokens, type_first,
+                                     : rendered_width(tokens, type_first,
                                                        packed_dim != npos ? packed_dim : first_name);
                 if (packed_dim != npos) {
                     size_t packed_close = tokens[packed_dim].immutable.syntax.matching_token;
@@ -3722,7 +3736,7 @@ public:
                 int type_col = base + token_width(tokens[ln.first]) + 1;
                 tokens[type_first].mutable_.align.enabled = true;
                 tokens[type_first].mutable_.align.target_column = type_col;
-                int type_width = canonical_width(tokens, type_first, dim);
+                int type_width = rendered_width(tokens, type_first, dim);
                 int dim_target = type_col + type_width + 1;
                 if (!opts_.port_declaration.align_adaptive)
                     dim_target = std::max(dim_target, base + opts_.port_declaration.section1_min_width +
@@ -3782,7 +3796,7 @@ public:
                     }
                     int tw = type_first == npos
                                  ? 0
-                                 : canonical_width(tokens, type_first, packed_dim != npos ? packed_dim : name);
+                                 : rendered_width(tokens, type_first, packed_dim != npos ? packed_dim : name);
                     size_t unpacked_dim = npos;
                     for (size_t k = name + 1; k < item.last; ++k) {
                         if (kind_is(tokens[k], TK::OpenBracket)) {
@@ -3879,7 +3893,7 @@ public:
 
                     int packed_col = preferred_packed_col;
                     if (d.packed_dim != npos && d.type_first != npos) {
-                        int packed_width = canonical_width(tokens, d.type_first, d.packed_dim);
+                        int packed_width = rendered_width(tokens, d.type_first, d.packed_dim);
                         packed_col = std::max(packed_col, type_target + packed_width + 1);
                         tokens[d.packed_dim].mutable_.align.enabled = true;
                         tokens[d.packed_dim].mutable_.align.target_column = packed_col;

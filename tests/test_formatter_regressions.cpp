@@ -472,6 +472,34 @@ TEST_CASE("formatter regression: only an identifier names an instance", "[format
                                         "endmodule\n");
 }
 
+TEST_CASE("formatter regression: statement alignment measures case labels as rendered", "[formatter][regression]") {
+    const std::string input = "module m;\n"
+                              "always_comb begin\n"
+                              "case (s)\n"
+                              "4'h1: y = 5;\n"
+                              "4'h12: yy = 6;\n"
+                              "default: y_long = 7;\n"
+                              "endcase\n"
+                              "end\n"
+                              "endmodule\n";
+    FormatOptions opts;
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 0;
+
+    SECTION("shared column") {
+        opts.statement.align_adaptive = false;
+        CHECK(format_stable(input, opts).find("      4'h1: y         = 5;\n"
+                                              "      4'h12: yy       = 6;\n"
+                                              "      default: y_long = 7;\n") != std::string::npos);
+    }
+    SECTION("adaptive") {
+        opts.statement.align_adaptive = true;
+        CHECK(format_stable(input, opts).find("      4'h1: y = 5;\n"
+                                              "      4'h12: yy = 6;\n"
+                                              "      default: y_long = 7;\n") != std::string::npos);
+    }
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
