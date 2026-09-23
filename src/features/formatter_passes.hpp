@@ -1237,6 +1237,22 @@ public:
             }
         }
 
+        // `end : blk`, `begin : blk`, `endmodule : m` -- a colon that names
+        // the block its keyword opens or closes.  Only keywords take a label;
+        // a `}` never does, so `{a, b}: y = 0;` is a case label and
+        // `c ? {a} : {b}` a conditional.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::Colon))
+                continue;
+            const size_t p = prev_code(tokens, i);
+            if (p == npos)
+                continue;
+            const TK k = tokens[p].lex.kind;
+            tokens[i].immutable.topology.is_block_name_colon =
+                k == TK::BeginKeyword || is_fork_block_open(tokens, p) ||
+                (is_close_block(k) && k != TK::CloseBrace) || is_outer_close(k);
+        }
+
         mark_case_items_and_macro_statements(tokens);
     }
 
@@ -1390,10 +1406,7 @@ private:
                     continue;
                 }
                 // `end : blk` names the block that just closed.
-                size_t p = prev_code(tokens, i);
-                if (p != npos && (is_close_block(tokens[p].lex.kind) ||
-                                  kind_is(tokens[p], TK::BeginKeyword) ||
-                                  kind_is(tokens[p], TK::ForkKeyword)))
+                if (t.immutable.topology.is_block_name_colon)
                     continue;
                 t.immutable.topology.is_case_item_colon = true;
                 c.seeking = false;
@@ -1815,7 +1828,8 @@ public:
                      is_expression_brace(tokens, t.immutable.syntax.matching_token))))))
                 t.mutable_.wrap.must_break_before = true;
             size_t next_i = next_code(tokens, i + 1, tokens.size());
-            bool followed_by_label_colon = next_i != npos && kind_is(tokens[next_i], TK::Colon);
+            bool followed_by_label_colon =
+                next_i != npos && tokens[next_i].immutable.topology.is_block_name_colon;
             bool close_brace_before_decl_name =
                 kind_is(t, TK::CloseBrace) && next_i != npos &&
                 (kind_is(tokens[next_i], TK::Identifier) || kind_is(tokens[next_i], TK::SystemIdentifier));
@@ -1840,12 +1854,11 @@ public:
                      is_expression_brace(tokens, t.immutable.syntax.matching_token)))))) {
                 t.mutable_.wrap.must_break_after = true;
             }
+            // The name after `begin :` / `end :` ends the line its keyword
+            // would have ended.
             if (is_identifier_like(t)) {
                 size_t p = prev_code(tokens, i);
-                size_t pp = p == npos ? npos : prev_code(tokens, p);
-                if (p != npos && pp != npos && kind_is(tokens[p], TK::Colon) &&
-                    (is_close_block(tokens[pp].lex.kind) || is_outer_close(tokens[pp].lex.kind) ||
-                     kind_is(tokens[pp], TK::BeginKeyword)))
+                if (p != npos && tokens[p].immutable.topology.is_block_name_colon)
                     t.mutable_.wrap.must_break_after = true;
             }
             if (opts_.statement.begin_newline &&
@@ -4271,8 +4284,7 @@ public:
             }
 
             // End-label colon: `endclass: Foo`, `endfunction: bar`, etc. — no space before `:`
-            if (kind_is(t, TK::Colon) && (is_close_block(L.lex.kind) || is_outer_close(L.lex.kind) ||
-                                           kind_is(L, TK::BeginKeyword) || kind_is(L, TK::ForkKeyword)))
+            if (kind_is(t, TK::Colon) && t.immutable.topology.is_block_name_colon)
                 spaces = 0;
             // Case item labels are `label: stmt` whatever the label ends in.
             // Deciding from the left token alone gave `8'b0111:` but

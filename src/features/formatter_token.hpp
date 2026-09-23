@@ -148,6 +148,10 @@ struct TopologyFacts {
     // identifier, a macro -- so spacing cannot be decided from the left token.
     bool is_case_item_colon{false};
 
+    // The `:` naming a block after its keyword: `begin : blk`, `end : blk`,
+    // `fork : f`, `endmodule : m`.  Never after `}` -- braces take no label.
+    bool is_block_name_colon{false};
+
     // Set on the last token of a macro invocation -- the bare macro, or the
     // `)` closing its arguments -- that stands as a whole statement or item
     // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,
