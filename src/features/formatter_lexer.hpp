@@ -354,7 +354,23 @@ private:
             bool format_on = is_format_marker(raw, format_on_re_, opts_.format_on_comment_pattern);
             const CommentLexemeKind comment_kind =
                 trivia.kind == TV::LineComment ? CommentLexemeKind::Line : CommentLexemeKind::Block;
-            add_token(TK::Unknown, raw, pos, false, disabled_ || format_off || format_on,
+            // A format-off marker keeps its original column, like the region
+            // it opens: the frozen body carries the on-marker's leading
+            // whitespace verbatim, so the off-marker carries its own.  Only
+            // when it starts its line -- after code, the gap is ordinary
+            // spacing.
+            std::string_view marker = raw;
+            size_t marker_pos = pos;
+            if (format_off && (pending_newlines_ > 0 || tokens_.empty())) {
+                size_t line_start = pos;
+                while (line_start > 0 && (source_[line_start - 1] == ' ' || source_[line_start - 1] == '\t'))
+                    --line_start;
+                if (line_start == 0 || source_[line_start - 1] == '\n') {
+                    marker = std::string_view(source_.data() + line_start, pos + raw.size() - line_start);
+                    marker_pos = line_start;
+                }
+            }
+            add_token(TK::Unknown, marker, marker_pos, false, disabled_ || format_off || format_on,
                       comment_kind, format_off, format_on);
             if (format_off) {
                 disabled_ = true;

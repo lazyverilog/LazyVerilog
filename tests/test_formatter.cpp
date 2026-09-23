@@ -3719,9 +3719,10 @@ TEST_CASE("formatter: case item colon is found only at the item's own position",
         INFO("label: " << label);
         CHECK(formatted.find(label) != std::string::npos);
     }
-    // Colons inside the item's statement are not labels.
+    // Colons inside the item's statement are not case labels.  `lbl` is the
+    // statement's own label, which spaces like any statement label.
     CHECK(formatted.find("a ? b : c;") != std::string::npos);
-    CHECK(formatted.find("lbl : y") != std::string::npos);
+    CHECK(formatted.find("D: lbl: y = 6;") != std::string::npos);
     CHECK(formatted.find("'{default : 0}") != std::string::npos);
     CHECK(format_source(formatted, opts) == formatted);
 }

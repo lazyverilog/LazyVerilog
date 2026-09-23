@@ -1314,6 +1314,23 @@ public:
         }
 
         mark_case_items_and_macro_statements(tokens);
+
+        // `lbl: stmt` -- an identifier where a statement or item starts,
+        // followed by `:`.  Runs after the case walk, whose colons it must
+        // see as statement starts (`ST_A: lbl: assert ...`).
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::Colon) || !is_code_token(tokens[i]))
+                continue;
+            if (tokens[i].immutable.topology.is_case_item_colon ||
+                tokens[i].immutable.topology.is_block_name_colon)
+                continue;
+            const size_t name = prev_code(tokens, i);
+            if (name != npos && kind_is(tokens[name], TK::Identifier) &&
+                tokens[i].immutable.syntax.paren_depth == 0 &&
+                tokens[i].immutable.syntax.bracket_depth == 0 &&
+                at_statement_start(tokens, name))
+                tokens[i].immutable.topology.is_item_label_colon = true;
+        }
     }
 
 private:
@@ -1357,9 +1374,10 @@ private:
             if (owner == npos)
                 return false;
             const TK o = tokens[owner].lex.kind;
+            // A randsequence header is followed by its first production.
             return o == TK::IfKeyword || o == TK::ForKeyword || o == TK::ForeachKeyword ||
                    o == TK::WhileKeyword || o == TK::RepeatKeyword || o == TK::WaitKeyword ||
-                   o == TK::At || o == TK::Hash;
+                   o == TK::At || o == TK::Hash || o == TK::RandSequenceKeyword;
         }
         return false;
     }
@@ -4272,8 +4290,9 @@ public:
                 continue;
             }
 
-            // # hash: no space before next token
-            if (kind_is(L, TK::Hash)) {
+            // # hash: no space before next token.  `##` is the cycle delay
+            // (`a ##1 b`, `##[1:3]`) and binds the same way.
+            if (kind_is(L, TK::Hash) || kind_is(L, TK::DoubleHash)) {
                 t.mutable_.space.spaces_before = 0;
                 t.mutable_.space.suppress_space = true;
                 continue;
@@ -4396,6 +4415,10 @@ public:
             if (kind_is(t, TK::At)) {
                 bool standalone = kind_is(L, TK::Semicolon);
                 spaces = (!standalone && wants_before(opts_.spacing.procedural_event_control_at_spacing)) ? 1 : 0;
+                // `assert property (@(posedge clk) ...)` -- right after a
+                // `(` the parenthesis spacing decides, not the event rule.
+                if (kind_is(L, TK::OpenParenthesis))
+                    spaces = opts_.spacing.space_inside_parens ? 1 : 0;
             }
             if (kind_is(L, TK::At)) {
                 bool standalone = i >= 2 && kind_is(tokens[i-2], TK::Semicolon);
@@ -4434,11 +4457,10 @@ public:
             // number.
             if (kind_is(t, TK::Colon) && t.immutable.topology.is_case_item_colon)
                 spaces = 0;
-            if (kind_is(t, TK::Colon) && is_identifier_like(L)) {
-                size_t nx = next_code(tokens, i + 1, tokens.size());
-                if (nx != npos && kind_is(tokens[nx], TK::CoverPointKeyword))
-                    spaces = 0;
-            }
+            // `a_x: assert property ...`, `cp: coverpoint x;`, `g: if (P)`
+            // -- a label names the statement or item that follows it.
+            if (kind_is(t, TK::Colon) && t.immutable.topology.is_item_label_colon)
+                spaces = 0;
 
             // semicolon_spacing: controls space before/after `;` inside for-loop headers
             // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)

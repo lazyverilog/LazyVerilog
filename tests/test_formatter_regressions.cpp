@@ -346,7 +346,8 @@ TEST_CASE("formatter regression: randcase and randsequence open their own scope"
                    "      3: a = 1;\n"
                    "    endcase\n"
                    "    randsequence (main)\n") != std::string::npos);
-    CHECK(out.find("      first : {\n"
+    CHECK(out.find("      main: first second;\n"
+                   "      first: {\n"
                    "        a = 1;\n"
                    "      };\n") != std::string::npos);
     CHECK(out.find("\n    endsequence\n"
@@ -625,6 +626,42 @@ TEST_CASE("formatter regression: generate and case-inside headers end where they
     CHECK(out.find("    priority case (s) inside\n"
                    "      [0:1]: y = 0;\n"
                    "      default: y = 1;\n") != std::string::npos);
+}
+
+TEST_CASE("formatter regression: cycle delays, property events and labels space tightly", "[formatter][regression]") {
+    const std::string input = "module p(input clk, a, b);\n"
+                              "a_x : assert property (@(posedge clk) a |-> b) else $error(\"x\");\n"
+                              "c_y : cover property (@(posedge clk) a ##1 b ##[1:3] a);\n"
+                              "covergroup cg @(posedge clk);\n"
+                              "cp_a : coverpoint a;\n"
+                              "cp_b: coverpoint b;\n"
+                              "x : cross cp_a, cp_b;\n"
+                              "endgroup\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(out.find("  a_x: assert property (@(posedge clk) a |-> b)\n") != std::string::npos);
+    CHECK(out.find("  c_y: cover property (@(posedge clk) a ##1 b ##[1:3] a);\n") != std::string::npos);
+    CHECK(out.find("    cp_a: coverpoint a;\n"
+                   "    cp_b: coverpoint b;\n"
+                   "    x: cross cp_a, cp_b;\n") != std::string::npos);
+}
+
+TEST_CASE("formatter regression: a format-off marker keeps its indent", "[formatter][regression]") {
+    const std::string input = "module m;\n"
+                              "  // verilog_format: off\n"
+                              "  localparam logic [3:0] LUT [4] = '{4'h1, 4'h2,\n"
+                              "                                     4'h4, 4'h8};\n"
+                              "  // verilog_format: on\n"
+                              "logic z;\n"
+                              "endmodule\n";
+    CHECK(format_stable(input) == "module m;\n"
+                                  "  // verilog_format: off\n"
+                                  "  localparam logic [3:0] LUT [4] = '{4'h1, 4'h2,\n"
+                                  "                                     4'h4, 4'h8};\n"
+                                  "  // verilog_format: on\n"
+                                  "  logic z;\n"
+                                  "endmodule\n");
 }
 
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {

@@ -152,6 +152,10 @@ struct TopologyFacts {
     // `fork : f`, `endmodule : m`.  Never after `}` -- braces take no label.
     bool is_block_name_colon{false};
 
+    // The `:` after a statement or item label: `a_x: assert property ...`,
+    // `cp: coverpoint x;`, `x: cross a, b;`.
+    bool is_item_label_colon{false};
+
     // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
     bool is_replication_brace{false};
 
