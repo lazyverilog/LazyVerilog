@@ -121,6 +121,11 @@ struct SyntaxFacts {
     // Between a clocking declaration's header and its `endclocking`.  Its
     // `input v;` / `output a, b;` items are clocking signals, not ports.
     bool in_clocking_block{false};
+    // Inside a property or sequence expression: the parentheses of
+    // `assert property (...)` / `cover sequence (...)` / `expect (...)`, or a
+    // `property`/`sequence` declaration through its end keyword.  `if`/`else`
+    // and `case` there are property operators, not statements.
+    bool in_property_expr{false};
 };
 
 // 3. TopologyFacts: stable graph-ish structural labels that make later passes

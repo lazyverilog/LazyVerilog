@@ -822,3 +822,21 @@ endinterface
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: if-else and case inside a property stay property expressions", "[formatter][regression]") {
+    const std::string input = R"SV(module req_checks (input logic clk, req, gnt, busy);
+  a_resp: assert property (@(posedge clk) if (req) gnt else !busy);
+  a_sel: assert property (@(posedge clk) case (busy) 1'b0: !gnt; default: 1; endcase);
+endmodule
+)SV";
+    const std::string expected = R"SV(module req_checks(
+  input logic clk, req, gnt, busy
+);
+  a_resp: assert property (@(posedge clk) if (req) gnt else !busy);
+  a_sel: assert property (@(posedge clk) case (busy) 1'b0: !gnt; default: 1; endcase);
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}

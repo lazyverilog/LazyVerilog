@@ -135,6 +135,17 @@ inline bool is_code_token(const Tok& t) {
     return t.lex.comment_kind == CommentLexemeKind::None && !t.lex.is_directive && !is_passthrough(t);
 }
 
+// `if`/`else`/`case`/`endcase` used as property operators
+// (`assert property (@(posedge c) if (a) b else c);`).  They take none of the
+// statement layout their procedural spellings get.
+inline bool is_property_operator_keyword(const Tok& t) {
+    if (!t.immutable.syntax.in_property_expr)
+        return false;
+    const TK k = t.lex.kind;
+    return k == TK::IfKeyword || k == TK::ElseKeyword || k == TK::CaseKeyword ||
+           k == TK::EndCaseKeyword;
+}
+
 inline bool is_covergroup_event_at(const TokenStream& tokens, size_t at) {
     if (at >= tokens.size() || !kind_is(tokens[at], TK::At))
         return false;
@@ -285,7 +296,7 @@ inline bool opens_design_unit_at(const TokenStream& tokens, size_t idx) {
 inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     if (idx >= tokens.size())
         return false;
-    if (tokens[idx].immutable.topology.is_prototype)
+    if (tokens[idx].immutable.topology.is_prototype || is_property_operator_keyword(tokens[idx]))
         return false;
     if (kind_is(tokens[idx], TK::ForkKeyword))
         return is_fork_block_open(tokens, idx);
@@ -322,7 +333,7 @@ inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
 // what stops an expression brace from dropping a level it never added and
 // shifting every following line of the file.
 inline bool closes_indent_scope_at(const TokenStream& tokens, size_t idx) {
-    if (idx >= tokens.size())
+    if (idx >= tokens.size() || is_property_operator_keyword(tokens[idx]))
         return false;
     if (kind_is(tokens[idx], TK::CloseBrace)) {
         const size_t open = tokens[idx].immutable.syntax.matching_token;
@@ -1276,6 +1287,8 @@ public:
             if (kind_is(t, TK::EndGroupKeyword))
                 in_covergroup = false;
         }
+        mark_property_expressions(tokens);
+
         size_t stmt_start = 0;
         int stmt_pd = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
@@ -1313,7 +1326,10 @@ public:
         // the rest of the file.
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
-            if (kind_is(t, TK::OpenBrace)) {
+            if (is_property_operator_keyword(t)) {
+                t.immutable.topology.opens_indent_scope = false;
+                t.immutable.topology.closes_indent_scope = false;
+            } else if (kind_is(t, TK::OpenBrace)) {
                 t.immutable.topology.opens_indent_scope = t.immutable.topology.opens_brace_block;
             } else if (kind_is(t, TK::CloseBrace)) {
                 const size_t open = t.immutable.syntax.matching_token;
@@ -1451,6 +1467,50 @@ private:
     // two depend on each other: a semicolonless macro statement ends a case
     // item just as a `;` does (`` 2'd0: `NOP 2'd1: ... ``), and a case item's
     // colon is where a macro statement can start.
+    // SyntaxFacts::in_property_expr.  Needs matching_token, so it runs after
+    // the delimiter walk.
+    static void mark_property_expressions(TokenStream& tokens) {
+        auto is_assertion = [](TK k) {
+            return k == TK::AssertKeyword || k == TK::AssumeKeyword || k == TK::CoverKeyword ||
+                   k == TK::RestrictKeyword || k == TK::ExpectKeyword;
+        };
+        auto mark = [&](size_t first, size_t last) {
+            for (size_t k = first; k <= last && k < tokens.size(); ++k)
+                tokens[k].immutable.syntax.in_property_expr = true;
+        };
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!is_code_token(tokens[i]))
+                continue;
+            const TK k = tokens[i].lex.kind;
+            const bool decl_keyword = k == TK::PropertyKeyword || k == TK::SequenceKeyword;
+            size_t open = npos;
+            if (k == TK::ExpectKeyword) {
+                open = next_code(tokens, i + 1, tokens.size());
+            } else if (decl_keyword) {
+                const size_t p = prev_code(tokens, i);
+                if (p != npos && is_assertion(tokens[p].lex.kind)) {
+                    open = next_code(tokens, i + 1, tokens.size());
+                } else {
+                    // A declaration: through its end keyword.
+                    const TK end_kind = k == TK::PropertyKeyword ? TK::EndPropertyKeyword
+                                                                 : TK::EndSequenceKeyword;
+                    size_t e = i + 1;
+                    while (e < tokens.size() && !kind_is(tokens[e], end_kind))
+                        ++e;
+                    if (e < tokens.size()) {
+                        mark(i + 1, e - 1);
+                        i = e;
+                    }
+                    continue;
+                }
+            }
+            if (open == npos || !kind_is(tokens[open], TK::OpenParenthesis) ||
+                tokens[open].immutable.syntax.matching_token == npos)
+                continue;
+            mark(open + 1, tokens[open].immutable.syntax.matching_token - 1);
+        }
+    }
+
     static void mark_case_items_and_macro_statements(TokenStream& tokens) {
         struct CaseBody {
             int pd, bd, brd, block_depth;
@@ -1942,7 +2002,7 @@ public:
             }
             if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token != npos) {
                 size_t before_open = prev_code(tokens, t.immutable.syntax.matching_token);
-                if (before_open != npos &&
+                if (before_open != npos && !is_property_operator_keyword(tokens[before_open]) &&
                     (kind_is(tokens[before_open], TK::CaseKeyword) ||
                      kind_is(tokens[before_open], TK::CaseXKeyword) ||
                      kind_is(tokens[before_open], TK::CaseZKeyword) ||
@@ -1971,8 +2031,9 @@ public:
             if (kind_is(t, TK::Comma)) t.mutable_.wrap.can_break_after = true;
             // Close-block keywords always start a new line; CloseBrace only when
             // not inside a parenthesised expression (e.g. `inside {A, B}`).
+            const bool property_keyword = is_property_operator_keyword(t);
             if (is_outer_close(t.lex.kind) ||
-                (is_close_block(t.lex.kind) &&
+                (is_close_block(t.lex.kind) && !property_keyword &&
                  !(kind_is(t, TK::CloseBrace) &&
                    (t.immutable.syntax.paren_depth > 0 ||
                     (t.immutable.syntax.matching_token != npos &&
@@ -1994,7 +2055,7 @@ public:
             if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
                 (is_fork_block_open(tokens, i) && !followed_by_label_colon) ||
                 (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
-                (is_close_block(t.lex.kind) && !followed_by_label_colon &&
+                (is_close_block(t.lex.kind) && !followed_by_label_colon && !property_keyword &&
                  !end_before_do_while &&
                  !close_brace_before_decl_name &&
                  !close_brace_before_semicolon &&
@@ -2038,7 +2099,7 @@ public:
             }
             if (opts_.statement.wrap_end_else_clauses && kind_is(t, TK::ElseKeyword) && i > 0 && (kind_is(tokens[i - 1], TK::EndKeyword) || kind_is(tokens[i - 1], TK::CloseBrace))) t.mutable_.wrap.must_break_before = true;
             // else always breaks unless wrap_end_else_clauses handled it above
-            if (kind_is(t, TK::ElseKeyword)) {
+            if (kind_is(t, TK::ElseKeyword) && !property_keyword) {
                 bool prev_is_end_or_brace = (i > 0 && (kind_is(tokens[i-1], TK::EndKeyword) || kind_is(tokens[i-1], TK::CloseBrace)));
                 if (!prev_is_end_or_brace)
                     t.mutable_.wrap.must_break_before = true;
@@ -2465,7 +2526,7 @@ private:
                 continue;
             }
 
-            if (kind_is(t, TK::ElseKeyword)) {
+            if (kind_is(t, TK::ElseKeyword) && !is_property_operator_keyword(t)) {
                 size_t body = next_code(tokens, i + 1, tokens.size());
                 if (body != npos &&
                     !kind_is(tokens[body], TK::BeginKeyword) &&
@@ -2476,7 +2537,7 @@ private:
                 continue;
             }
 
-            if (is_single_stmt_control(t.lex.kind))
+            if (is_single_stmt_control(t.lex.kind) && !is_property_operator_keyword(t))
                 ctrl_expr_pending = true;
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
                 ctrl_expr_pending = false;
@@ -2581,7 +2642,7 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
         out[body].push_back(end);
     };
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (!is_code_token(tokens[i]))
+        if (!is_code_token(tokens[i]) || is_property_operator_keyword(tokens[i]))
             continue;
         const TK k = tokens[i].lex.kind;
         if (is_procedural_block_keyword(k)) {
