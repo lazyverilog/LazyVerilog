@@ -123,11 +123,6 @@ inline bool is_port_direction(TK k) {
     return k == TK::InputKeyword || k == TK::OutputKeyword ||
            k == TK::InOutKeyword || k == TK::RefKeyword;
 }
-inline bool is_numeric(const Tok& t) {
-    return t.lex.kind == TK::IntegerLiteral || t.lex.kind == TK::IntegerBase ||
-           t.lex.kind == TK::UnbasedUnsizedLiteral || t.lex.kind == TK::RealLiteral ||
-           t.lex.kind == TK::TimeLiteral;
-}
 
 inline bool is_identifier_like(const Tok& t) {
     return t.lex.kind == TK::Identifier || t.lex.kind == TK::SystemIdentifier ||
@@ -4195,11 +4190,11 @@ public:
             if (kind_is(t, TK::Colon) && (is_close_block(L.lex.kind) || is_outer_close(L.lex.kind) ||
                                            kind_is(L, TK::BeginKeyword) || kind_is(L, TK::ForkKeyword)))
                 spaces = 0;
-            if (kind_is(t, TK::Colon) && is_numeric(L) && !in_dim)
-                spaces = 0;
             // Case item labels are `label: stmt` whatever the label ends in.
             // Deciding from the left token alone gave `8'b0111:` but
-            // `4'hc4 :`, `` `OP :`` and `default :`.
+            // `4'hc4 :`, `` `OP :`` and `default :` -- and closed up the
+            // conditional in `c ? 4'd1 : 4'd2`, whose colon also follows a
+            // number.
             if (kind_is(t, TK::Colon) && t.immutable.topology.is_case_item_colon)
                 spaces = 0;
             if (kind_is(t, TK::Colon) && is_identifier_like(L)) {

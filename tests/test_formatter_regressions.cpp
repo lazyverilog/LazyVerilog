@@ -57,6 +57,28 @@ TEST_CASE("formatter regression: wildcard digits stay inside their literal", "[f
     CHECK(out.find("(d ==? 4'b1??0) ? 'b? : '0;") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: a conditional's colon after a number keeps its space", "[formatter][regression]") {
+    const std::string input = "module t;\n"
+                              "always_comb begin\n"
+                              "case (s)\n"
+                              "2'd0: y = c ? 4'd1 : 4'd2;\n"
+                              "1 : y = c ? 1.5 : 2;\n"
+                              "endcase\n"
+                              "end\n"
+                              "assign z = c ? 8'hff : 0;\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input, indent4());
+    CHECK(out == "module t;\n"
+                 "    always_comb begin\n"
+                 "        case (s)\n"
+                 "            2'd0: y = c ? 4'd1 : 4'd2;\n"
+                 "            1: y = c ? 1.5 : 2;\n"
+                 "        endcase\n"
+                 "    end\n"
+                 "    assign z = c ? 8'hff : 0;\n"
+                 "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
