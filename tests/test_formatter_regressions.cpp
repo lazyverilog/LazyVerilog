@@ -526,7 +526,7 @@ TEST_CASE("formatter regression: a delay after a semicolon starts its own line",
                                   "#(\n"
                                   "  parameter int W = 1\n"
                                   ")(\n"
-                                  "  input     logic                                   c\n"
+                                  "  input logic c\n"
                                   ");\n"
                                   "endmodule\n");
 }
@@ -586,7 +586,9 @@ TEST_CASE("formatter regression: each ifdef branch of a port list is its own ite
                                         "endmodule\n");
 
     // Aligned, both branches put `q` in the same column.
-    const std::string aligned = format_stable(input);
+    FormatOptions align_on;
+    align_on.port_declaration.align = true;
+    const std::string aligned = format_stable(input, align_on);
     const size_t first = aligned.find("[63:0]");
     const size_t second = aligned.find("[31:0]");
     REQUIRE(first != std::string::npos);
@@ -662,6 +664,28 @@ TEST_CASE("formatter regression: a format-off marker keeps its indent", "[format
                                   "  // verilog_format: on\n"
                                   "  logic z;\n"
                                   "endmodule\n");
+}
+
+TEST_CASE("formatter regression: port alignment is opt-in with modest adaptive columns", "[formatter][regression]") {
+    const std::string input = "module m (input logic clk, input logic [7:0] data, output logic valid);\n"
+                              "endmodule\n";
+    CHECK(format_stable(input) == "module m(\n"
+                                  "  input logic clk,\n"
+                                  "  input logic [7:0] data,\n"
+                                  "  output logic valid\n"
+                                  ");\n"
+                                  "endmodule\n");
+
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    // Five 12-column sections; the old 10/20/20/30/30 put the comma past
+    // column 110.
+    CHECK(format_stable(input, opts) == "module m(\n"
+                                        "  input       logic                   clk                     ,\n"
+                                        "  input       logic       [7:0]       data                    ,\n"
+                                        "  output      logic                   valid\n"
+                                        ");\n"
+                                        "endmodule\n");
 }
 
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {

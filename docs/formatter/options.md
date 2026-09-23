@@ -542,7 +542,7 @@ Port declarations are split into 5 sections:
 
 ### `align`
 
-Enable column alignment of the 5 sections across consecutive port declarations.
+Enable column alignment of the 5 sections across consecutive port declarations. Default: `false`.
 
 ```toml
 [format.port_declaration]
@@ -561,17 +561,30 @@ output logic valid
 
 ---
 
-### `section1_min_width` .. `section5_min_width`
+### `align_adaptive`
 
-Minimum character width for each alignment section. When `tab_align` is `true`, these are snapped to indent grid.
+When `true` (default), a section wider than its minimum widens only its own line instead of pushing every
+port in the group to the same column.
 
 ```toml
 [format.port_declaration]
-section1_min_width = 10   # direction column
-section2_min_width = 20   # type column
-section3_min_width = 20   # dimension column
-section4_min_width = 30   # port name column
-section5_min_width = 30   # trailing column
+align_adaptive = true
+```
+
+---
+
+### `section1_min_width` .. `section5_min_width`
+
+Minimum character width for each alignment section. When `tab_align` is `true`, these are snapped to indent grid.
+Section 5 pads the trailing column, so a port's `,` or `;` lines up after it. Default: `12` for each section.
+
+```toml
+[format.port_declaration]
+section1_min_width = 12   # direction column
+section2_min_width = 12   # type column
+section3_min_width = 12   # dimension column
+section4_min_width = 12   # port name column
+section5_min_width = 12   # trailing column
 ```
 
 ```systemverilog

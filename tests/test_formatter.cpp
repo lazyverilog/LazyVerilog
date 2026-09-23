@@ -37,6 +37,20 @@ FormatOptions var_section_stress_options(bool align_adaptive) {
     return opts;
 }
 
+// The port-declaration defaults before alignment became opt-in (align on,
+// fixed 10/20/20/30/30 columns).  Tests whose expected output was written
+// against those columns pin them here: they test headers, comments and
+// directives, not the defaults.  Explicit settings after this call still win.
+void pin_legacy_port_columns(FormatOptions& opts) {
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = false;
+    opts.port_declaration.section1_min_width = 10;
+    opts.port_declaration.section2_min_width = 20;
+    opts.port_declaration.section3_min_width = 20;
+    opts.port_declaration.section4_min_width = 30;
+    opts.port_declaration.section5_min_width = 30;
+}
+
 } // namespace
 
 TEST_CASE("formatter: function calls support block layout", "[formatter]") {
@@ -474,6 +488,7 @@ TEST_CASE("formatter: block module parameter comments do not emit trailing white
 
 TEST_CASE("formatter: multiline ANSI module header preserves line comments", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -529,6 +544,7 @@ TEST_CASE("formatter: instance parameter comments do not trip safe mode", "[form
 
 TEST_CASE("formatter: imported parameterized ANSI header is idempotent", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.tab_align = true;
@@ -559,6 +575,7 @@ TEST_CASE("formatter: imported parameterized ANSI header is idempotent", "[forma
 
 TEST_CASE("formatter: ANSI module header after package import is aligned", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1062,6 +1079,7 @@ TEST_CASE("formatter: non-adaptive var declarations align semicolon to longest t
 
 TEST_CASE("formatter: module header closing line comment is preserved", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1078,6 +1096,7 @@ TEST_CASE("formatter: module header closing line comment is preserved", "[format
 
 TEST_CASE("formatter: final ANSI port with line comment does not gain comma", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1360,6 +1379,7 @@ TEST_CASE("formatter: instance after semicolonless macro call keeps instance lay
 TEST_CASE("formatter: configured RTL macros provide declaration statement and block boundaries",
           "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.instance.align = true;
@@ -3134,6 +3154,7 @@ TEST_CASE("formatter: tab_align snaps statement assignment columns", "[formatter
 
 TEST_CASE("formatter: tab_align snaps declaration columns", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.indent_size = 4;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.tab_align = true;
@@ -3219,6 +3240,7 @@ TEST_CASE("formatter: tab_align snaps fixed instance connection columns", "[form
 TEST_CASE("formatter: tab_align does not align equals inside headers or for controls",
           "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.indent_size = 4;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.statement.align = true;
@@ -3596,6 +3618,7 @@ TEST_CASE("formatter: instance port alignment crosses preprocessor conditionals"
 
 TEST_CASE("formatter: ANSI port directives do not receive commas", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.port_declaration.align = true;
     opts.port_declaration.align_adaptive = true;
