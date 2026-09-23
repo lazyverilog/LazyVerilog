@@ -230,8 +230,55 @@ inline bool is_covergroup_sample_function_header(const TokenStream& tokens, size
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end);
 
+// A `function`/`task` that is only a prototype, or a `typedef class`.  The
+// qualifiers that make a prototype sit between the keyword and the previous
+// item boundary: `extern`, `pure virtual`, `import "DPI-C" context c_name =`,
+// `export "DPI-C"`, and a modport's `import`/`export`.  SyntaxPass freezes the
+// answer as TopologyFacts::is_prototype.
+inline bool is_prototype_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size())
+        return false;
+    const TK k = tokens[idx].lex.kind;
+    if (k == TK::ClassKeyword) {
+        size_t p = prev_code(tokens, idx);
+        if (p != npos && kind_is(tokens[p], TK::InterfaceKeyword))
+            p = prev_code(tokens, p);
+        return p != npos && kind_is(tokens[p], TK::TypedefKeyword);
+    }
+    if (k != TK::FunctionKeyword && k != TK::TaskKeyword)
+        return false;
+    for (size_t p = prev_code(tokens, idx); p != npos; p = prev_code(tokens, p)) {
+        switch (tokens[p].lex.kind) {
+        case TK::ExternKeyword: case TK::PureKeyword: case TK::ImportKeyword:
+        case TK::ExportKeyword:
+            return true;
+        case TK::VirtualKeyword: case TK::StaticKeyword: case TK::ProtectedKeyword:
+        case TK::LocalKeyword: case TK::ContextKeyword: case TK::ForkJoinKeyword:
+        case TK::StringLiteral: case TK::Identifier: case TK::Equals:
+            continue;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+inline bool opens_design_unit_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size() || !is_outer_open(tokens[idx].lex.kind))
+        return false;
+    if (!kind_is(tokens[idx], TK::InterfaceKeyword))
+        return true;
+    const size_t p = prev_code(tokens, idx);
+    if (p != npos && kind_is(tokens[p], TK::VirtualKeyword))
+        return false;
+    const size_t n = next_code(tokens, idx + 1, tokens.size());
+    return !(n != npos && kind_is(tokens[n], TK::ClassKeyword));
+}
+
 inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     if (idx >= tokens.size())
+        return false;
+    if (tokens[idx].immutable.topology.is_prototype)
         return false;
     if (kind_is(tokens[idx], TK::ForkKeyword))
         return is_fork_block_open(tokens, idx);
@@ -1140,6 +1187,11 @@ public:
         bool in_covergroup = false;
         bool in_modport = false;
         bool in_clocking_block = false;
+        // Read by opens_indent_scope_at() in the walk below.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            tokens[i].immutable.topology.is_prototype = is_prototype_at(tokens, i);
+            tokens[i].immutable.topology.opens_design_unit = opens_design_unit_at(tokens, i);
+        }
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (kind_is(t, TK::EndClockingKeyword))
@@ -1153,7 +1205,7 @@ public:
             t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
             t.immutable.syntax.in_clocking_block = in_clocking_block;
-            t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex.kind);
+            t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || t.immutable.topology.opens_design_unit;
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind);
 
             if (kind_is(t, TK::OpenParenthesis)) {
@@ -1946,8 +1998,8 @@ public:
                 t.mutable_.wrap.must_break_after = true;
             }
             // The name after `begin :` / `end :` ends the line its keyword
-            // would have ended.
-            if (is_identifier_like(t)) {
+            // would have ended -- whatever it lexes as (`endfunction : new`).
+            if (is_code_token(t)) {
                 size_t p = prev_code(tokens, i);
                 if (p != npos && tokens[p].immutable.topology.is_block_name_colon)
                     t.mutable_.wrap.must_break_after = true;
@@ -2544,13 +2596,9 @@ public:
     const char* name() const override { return "indent"; }
     void run(TokenStream& tokens) override {
         int level = 0;
-        // Declaration-qualifier tracking: `import "DPI-C" function/task` and
-        // `extern function/task` are header-only declarations — their function/
-        // task keyword must NOT open an indent scope.  `typedef class` forward
-        // declarations must NOT open a class scope either.
-        bool in_import  = false; // active from ImportKeyword until ;
-        bool in_extern  = false; // active from ExternKeyword until ;
-        bool in_typedef = false; // active from TypedefKeyword until ;
+        // Prototypes (`extern`/`pure virtual`/DPI `function`, `typedef class`)
+        // open no scope: opens_indent_scope_at() reads
+        // TopologyFacts::is_prototype.
 
         // Every non-block body of a control -- `always`/`initial`/`final`,
         // `if`/`for`/`foreach`/`while`/`repeat`, `else`, `forever` -- is one
@@ -2569,12 +2617,6 @@ public:
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (is_passthrough(t)) continue;
-
-            // Track declaration-qualifier context
-            if (kind_is(t, TK::ImportKeyword))  in_import  = true;
-            if (kind_is(t, TK::ExternKeyword))  in_extern  = true;
-            if (kind_is(t, TK::TypedefKeyword)) in_typedef = true;
-            if (kind_is(t, TK::Semicolon))      { in_import = false; in_extern = false; in_typedef = false; }
 
             // Compute indent — close tokens first so they dedent before assignment
             bool closes = closes_indent_scope_at(tokens, i) || is_outer_close(t.lex.kind) ||
@@ -2601,7 +2643,7 @@ public:
                 t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
             if (is_outer_close(t.lex.kind))
                 t.mutable_.indent.base_indent = 0;
-            else if (is_outer_open(t.lex.kind) && opts_.default_indent_level_inside_outmost_block == 0)
+            else if (t.immutable.topology.opens_design_unit && opts_.default_indent_level_inside_outmost_block == 0)
                 t.mutable_.indent.base_indent = 0; // OuterOpen itself is at outer level
             if (is_conditional_preprocessor_directive(t))
                 t.mutable_.indent.base_indent = 0;
@@ -2611,18 +2653,13 @@ public:
             // Open scope after assigning indent to the opener token.
             // Suppress for function/task used as qualifiers in import/extern
             // declarations, and for class used in typedef forward declarations.
-            if (is_outer_open(t.lex.kind))
+            const bool design_unit = t.immutable.topology.opens_design_unit;
+            if (design_unit)
                 outer_units.push_back({level, open_bodies.size()});
             if (!closes) {
-                bool is_qualifier_fn_task =
-                    (in_import || in_extern) &&
-                    (kind_is(t, TK::FunctionKeyword) || kind_is(t, TK::TaskKeyword));
-                bool is_typedef_class =
-                    in_typedef && kind_is(t, TK::ClassKeyword);
-                if (!is_qualifier_fn_task && !is_typedef_class &&
-                    (opens_indent_scope_at(tokens, i) ||
-                     (is_outer_open(t.lex.kind) && opts_.default_indent_level_inside_outmost_block > 0) ||
-                     t.mutable_.macro.opens_indent_scope))
+                if (opens_indent_scope_at(tokens, i) ||
+                    (design_unit && opts_.default_indent_level_inside_outmost_block > 0) ||
+                    t.mutable_.macro.opens_indent_scope)
                     ++level;
             }
 

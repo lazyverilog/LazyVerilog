@@ -692,3 +692,51 @@ TEST_CASE("formatter regression: a spaced conditional after a literal stays a co
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
 }
+
+TEST_CASE("formatter regression: prototypes and interface classes open no indent scope", "[formatter][regression]") {
+    const std::string input = R"SV(package dpi_pkg;
+  export "DPI-C" function sv_get_status;
+  import "DPI-C" context function int c_step(input int n);
+  function int sv_get_status();
+    return 0;
+  endfunction
+  interface class resettable;
+    pure virtual function void reset();
+  endclass
+  virtual class base_driver implements resettable;
+    function new();
+    endfunction : new
+    pure virtual task drive(input int n);
+    virtual function void reset();
+    endfunction
+  endclass
+endpackage
+
+module after_pkg;
+endmodule
+)SV";
+    const std::string expected = R"SV(package dpi_pkg;
+  export "DPI-C" function sv_get_status;
+  import "DPI-C" context function int c_step(input int n);
+  function int sv_get_status();
+    return 0;
+  endfunction
+  interface class resettable;
+    pure virtual function void reset();
+  endclass
+  virtual class base_driver implements resettable;
+    function new();
+    endfunction: new
+    pure virtual task drive(input int n);
+    virtual function void reset();
+    endfunction
+  endclass
+endpackage
+
+module after_pkg;
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}

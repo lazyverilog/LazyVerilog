@@ -159,6 +159,17 @@ struct TopologyFacts {
     // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
     bool is_replication_brace{false};
 
+    // A `function`/`task` keyword that declares a prototype with no body --
+    // `extern`, `import "DPI-C"`, `export "DPI-C"`, `pure virtual`, a
+    // modport's `import task` -- or a `class` forward-declared by `typedef`.
+    // Nothing closes these, so they open no indent scope.
+    bool is_prototype{false};
+
+    // A `module`/`interface`/`package`/`program` keyword that starts a design
+    // unit.  `interface class` and `virtual interface` do not: the first is a
+    // class closed by `endclass`, the second a variable's type.
+    bool opens_design_unit{false};
+
     // Set on the last token of a macro invocation -- the bare macro, or the
     // `)` closing its arguments -- that stands as a whole statement or item
     // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,
