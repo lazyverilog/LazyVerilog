@@ -1286,7 +1286,19 @@ public:
             // leaving matching_token unset -- and left brace_depth short by one
             // for the rest of the file.
             else if (kind_is(t, TK::OpenBrace) || kind_is(t, TK::ApostropheOpenBrace)) { braces.push_back(i); brace_ctx.emplace_back(pd, bd); ++brd; }
-            else if (kind_is(t, TK::CloseBrace)) { if (!braces.empty()) { auto j = braces.back(); braces.pop_back(); brace_ctx.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; } brd = std::max(0, brd - 1); }
+            else if (kind_is(t, TK::CloseBrace)) {
+                if (!braces.empty()) {
+                    auto j = braces.back(); braces.pop_back(); brace_ctx.pop_back();
+                    tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j;
+                    // A brace that directly holds a statement block is one:
+                    // `constraint c { foreach (q[i]) { q[i] > 0; } }` has no
+                    // `;` of its own, and no expression brace holds a block.
+                    if (tokens[j].immutable.topology.opens_brace_block && !braces.empty() &&
+                        brace_ctx.back() == std::pair<int, int>(pd, bd))
+                        tokens[braces.back()].immutable.topology.opens_brace_block = true;
+                }
+                brd = std::max(0, brd - 1);
+            }
             if (kind_is(t, TK::Semicolon)) {
                 // A `;` at the brace's own depth makes the brace a statement
                 // block.  No expression brace can hold one.
@@ -2853,6 +2865,13 @@ public:
         for (size_t open = 0; open < tokens.size(); ++open) {
             WrapListKind kind = tokens[open].mutable_.wrap.list_kind;
             if (kind == WrapListKind::None || tokens[open].mutable_.wrap.list_open != open)
+                continue;
+            // A statement block (`constraint c { ... }`) is `;`-separated,
+            // not a list: it opens an indent scope, and the main loop above
+            // already indents its statements and their controlled bodies.
+            // Forcing each top-level "item" to one indent flattened
+            // `if (c) len < 4;` and `foreach (q[i]) q[i] > 0;`.
+            if (kind == WrapListKind::BraceBlock && tokens[open].immutable.topology.opens_brace_block)
                 continue;
             size_t close = tokens[open].immutable.syntax.matching_token;
             if (close == npos || close >= tokens.size())

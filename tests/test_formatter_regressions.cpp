@@ -900,3 +900,71 @@ endmodule
     CHECK(parses_cleanly(input));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: brace-less bodies inside a constraint are indented", "[formatter][regression]") {
+    const std::string input = R"SV(class pkt;
+  rand int len, kind;
+  rand int payload[4];
+  constraint c_shape {
+    if (kind == 0) len < 4; else { len >= 4; }
+    foreach (payload[i]) payload[i] > 0;
+  }
+endclass
+)SV";
+    const std::string expected = R"SV(class pkt;
+  rand int len, kind;
+  rand int payload[4];
+  constraint c_shape {
+    if (kind == 0)
+      len < 4;
+    else {
+      len >= 4;
+    }
+    foreach (payload[i])
+      payload[i] > 0;
+  }
+endclass
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a constraint whose only item is a braced block still indents", "[formatter][regression]") {
+    const std::string input = R"SV(class c;
+  rand int q[4]; int N;
+  constraint a { foreach (q[i]) { i < N -> q[i] != 0; } }
+  constraint b { foreach (q[i]) { q[i] != 0; } }
+  constraint d { foreach (q[i]) { i -> q[i] != 0; } }
+  constraint e { foreach (q[i]) { i < N; } }
+endclass
+)SV";
+    const std::string expected = R"SV(class c;
+  rand int q[4];
+  int N;
+  constraint a {
+    foreach (q[i]) {
+      i < N -> q[i] != 0;
+    }
+  }
+  constraint b {
+    foreach (q[i]) {
+      q[i] != 0;
+    }
+  }
+  constraint d {
+    foreach (q[i]) {
+      i -> q[i] != 0;
+    }
+  }
+  constraint e {
+    foreach (q[i]) {
+      i < N;
+    }
+  }
+endclass
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
