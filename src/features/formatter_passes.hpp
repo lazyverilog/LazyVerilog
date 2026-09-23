@@ -1872,9 +1872,21 @@ public:
                     (kind_is(tokens[before_open], TK::CaseKeyword) ||
                      kind_is(tokens[before_open], TK::CaseXKeyword) ||
                      kind_is(tokens[before_open], TK::CaseZKeyword) ||
-                     kind_is(tokens[before_open], TK::RandSequenceKeyword)))
-                    t.mutable_.wrap.must_break_after = true;
+                     kind_is(tokens[before_open], TK::RandSequenceKeyword))) {
+                    // `case (x) inside` / `case (x) matches` -- the header
+                    // runs through the keyword.
+                    const size_t after = next_code(tokens, i + 1, tokens.size());
+                    if (after != npos && (kind_is(tokens[after], TK::InsideKeyword) ||
+                                          kind_is(tokens[after], TK::MatchesKeyword)))
+                        tokens[after].mutable_.wrap.must_break_after = true;
+                    else
+                        t.mutable_.wrap.must_break_after = true;
+                }
             }
+            // `generate` opens a region like `begin`; its first item starts
+            // the next line.
+            if (kind_is(t, TK::GenerateKeyword))
+                t.mutable_.wrap.must_break_after = true;
             // `randcase` has no header; its first item starts the next line.
             if (kind_is(t, TK::RandCaseKeyword))
                 t.mutable_.wrap.must_break_after = true;

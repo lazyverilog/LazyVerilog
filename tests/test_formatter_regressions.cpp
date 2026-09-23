@@ -596,6 +596,37 @@ TEST_CASE("formatter regression: each ifdef branch of a port list is its own ite
     CHECK(aligned.find("\n`else\n") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: generate and case-inside headers end where they end", "[formatter][regression]") {
+    const std::string input = "module g #(parameter P = 1);\n"
+                              "generate case (P)\n"
+                              "0: begin : a\n"
+                              "logic x;\n"
+                              "end\n"
+                              "default: begin : b\n"
+                              "logic y;\n"
+                              "end\n"
+                              "endcase endgenerate\n"
+                              "always_comb begin\n"
+                              "priority case (s) inside\n"
+                              "[0:1]: y = 0;\n"
+                              "default: y = 1;\n"
+                              "endcase\n"
+                              "end\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(out.find("  generate\n"
+                   "    case (P)\n"
+                   "      0: begin: a\n"
+                   "        logic x;\n"
+                   "      end\n") != std::string::npos);
+    CHECK(out.find("    endcase\n"
+                   "  endgenerate\n") != std::string::npos);
+    CHECK(out.find("    priority case (s) inside\n"
+                   "      [0:1]: y = 0;\n"
+                   "      default: y = 1;\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
