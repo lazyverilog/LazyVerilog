@@ -1173,3 +1173,54 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: new, type and dimension spacing after keywords", "[formatter][regression]") {
+    const std::string input = R"SV(module misc;
+  int da[], q[$];
+  event done;
+  initial begin
+    da = new[4];
+    wait (q.size() > 0);
+    q[0] = type(q[0])'(3);
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module misc;
+  int da [], q [$];
+  event done;
+  initial begin
+    da = new[4];
+    wait(q.size() > 0);
+    q[0] = type(q[0])'(3);
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: binsof and tagged pattern variables", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+  typedef union tagged { void Invalid; int Valid; } maybe_t;
+  maybe_t v;
+  bit [3:0] a, b;
+  covergroup cg;
+    cp: coverpoint a;
+    cq: coverpoint b;
+    x: cross cp, cq { ignore_bins i1 = binsof(cp) intersect {1}; }
+  endgroup
+  initial begin
+    case (v) matches
+      tagged Valid .n: $display(n);
+      default: ;
+    endcase
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    const std::string out = format_stable(input);
+    CHECK(parses_cleanly(out));
+    CHECK(out.find("binsof(cp) intersect {1};") != std::string::npos);
+    CHECK(out.find("tagged Valid .n: $display(n);") != std::string::npos);
+}

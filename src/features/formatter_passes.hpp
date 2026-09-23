@@ -305,11 +305,17 @@ inline bool is_covergroup_sample_function_header(const TokenStream& tokens, size
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end);
 
-// A `.` that opens a named connection or port expression rather than a member
-// select keeps a space after the token before it: `, .b(x)` and a modport's
-// `input .a(addr)`.
-inline bool dot_keeps_space_after(const Tok& prev) {
-    return kind_is(prev, TK::Comma) || is_port_direction(prev.lex.kind);
+// A `.` that opens a named connection, port expression or pattern variable
+// rather than a member select keeps a space after the token before it:
+// `, .b(x)`, a modport's `input .a(addr)`, and `tagged Valid .n`.
+inline bool dot_keeps_space_after(const TokenStream& tokens, size_t dot) {
+    const size_t p = prev_code(tokens, dot);
+    if (p == npos)
+        return false;
+    if (kind_is(tokens[p], TK::Comma) || is_port_direction(tokens[p].lex.kind))
+        return true;
+    const size_t pp = prev_code(tokens, p);
+    return kind_is(tokens[p], TK::Identifier) && pp != npos && kind_is(tokens[pp], TK::TaggedKeyword);
 }
 
 // A `function`/`task` that is only a prototype, or a `typedef class`.  The
@@ -4614,7 +4620,7 @@ public:
                 t.mutable_.space.suppress_space = true;
                 continue;
             }
-            if (kind_is(t, TK::Dot) && dot_keeps_space_after(L)) {
+            if (kind_is(t, TK::Dot) && dot_keeps_space_after(tokens, i)) {
                 spaces = 1;
             } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {
                 t.mutable_.space.spaces_before = 0;
@@ -4632,7 +4638,8 @@ public:
 
             // No space before '[' when it's an index/dimension on an identifier or closer
             if (kind_is(t, TK::OpenBracket) &&
-                (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis)))
+                (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis) ||
+                 kind_is(L, TK::NewKeyword)))
                 spaces = 0;
             if (kind_is(t, TK::OpenBracket) && is_identifier_like(L) &&
                 t.immutable.syntax.matching_token != npos) {
@@ -4654,7 +4661,9 @@ public:
             // than an identifier, but `new(...)` is a constructor call and must
             // follow the same option -- otherwise every class constructor
             // renders as `new (name)`.
-            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword)))
+            // `type(x)` and `binsof(cp)` are call-shaped keywords too.
+            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword) ||
+                                                        kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword)))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::InstancePorts &&
                 opts_.instance.align)
@@ -4806,7 +4815,7 @@ public:
 
             if ((kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) ||
                 (kind_is(t, TK::Comma) && !kind_is(L, TK::Comma)) ||
-                (kind_is(t, TK::Dot) && !dot_keeps_space_after(L)) || kind_is(t, TK::DoubleColon))
+                (kind_is(t, TK::Dot) && !dot_keeps_space_after(tokens, i)) || kind_is(t, TK::DoubleColon))
                 spaces = 0;
             if (kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&
