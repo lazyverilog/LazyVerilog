@@ -1546,11 +1546,7 @@ TEST_CASE("formatter: known statement macro is boundary for following semicolonl
         "initial begin\n"
         "    `uvm_info(`gfn, \"msg\", UVM_HIGH)\n"
         "    `PROJECT_BARE\n"
-        "    `PROJECT_CHECK_EQ(\n"
-        "        a,\n"
-        "        b,\n"
-        "        \"first\"\n"
-        "    )\n"
+        "    `PROJECT_CHECK_EQ(a, b, \"first\")\n"
         "    `PROJECT_CHECK_EQ(c, d, \"second\")\n"
         "end\n"
         "endmodule\n";

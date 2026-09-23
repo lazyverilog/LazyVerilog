@@ -1097,7 +1097,10 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
         if (br != npos)
             inst = prev_code(tokens, br);
     }
-    if (inst == npos || !is_identifier_like(tokens[inst])) return false;
+    // An instance name is a plain identifier.  `$display(` is a system task
+    // call, and the `(` after a macro (`` `T_DATA `CAT(d, 2); ``) is that
+    // macro's own argument list -- neither is a port list, whatever precedes.
+    if (inst == npos || !kind_is(tokens[inst], TK::Identifier)) return false;
     size_t mod = prev_code(tokens, inst);
     if (mod == npos) return false;
     if (kind_is(tokens[mod], TK::CloseBracket)) {

@@ -451,6 +451,27 @@ TEST_CASE("formatter regression: indexes inside concatenations and calls stay cl
     CHECK(std::regex_search(out, std::regex("input +logic +a +\\[4\\] *,")));
 }
 
+TEST_CASE("formatter regression: only an identifier names an instance", "[formatter][regression]") {
+    FormatOptions opts;
+    opts.macros.object_like_expr.push_back("PREFIX");
+    const std::string input = "module m;\n"
+                              "`T_DATA `CAT(d, 2);\n"
+                              "`MOD_NAME u_c (.a(b));\n"
+                              "initial begin\n"
+                              "`PREFIX $display(\"x\");\n"
+                              "end\n"
+                              "endmodule\n";
+    CHECK(format_stable(input, opts) == "module m;\n"
+                                        "  `T_DATA `CAT(d, 2);\n"
+                                        "  `MOD_NAME u_c(\n"
+                                        "    .a(b)\n"
+                                        "  );\n"
+                                        "  initial begin\n"
+                                        "    `PREFIX $display(\"x\");\n"
+                                        "  end\n"
+                                        "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
