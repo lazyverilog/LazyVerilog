@@ -2298,6 +2298,60 @@ private:
     const FormatOptions& opts_;
 };
 
+// body start -> body end for every control body that is not a block: the
+// statement an `always`/`initial`/`final`, an `if`/`for`/`foreach`/`while`/
+// `repeat`, an `else` or a `forever` controls.  One token can start several
+// (`always if ...` starts the `always` body; the `if` body starts later), so
+// each start maps to a list.  A body that is itself a block (`begin`, `fork`,
+// a brace block) is left out -- the block indents its own contents.
+inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(const TokenStream& tokens) {
+    std::unordered_map<size_t, std::vector<size_t>> out;
+    auto add = [&](size_t body, size_t end) {
+        if (body == npos || body >= tokens.size() || end == npos || end < body)
+            return;
+        const Tok& b = tokens[body];
+        if (kind_is(b, TK::BeginKeyword) || is_fork_block_open(tokens, body) ||
+            kind_is(b, TK::OpenBrace))
+            return;
+        if (closes_indent_scope_at(tokens, body) || is_outer_close(b.lex.kind) ||
+            b.mutable_.macro.closes_indent_scope)
+            return;
+        out[body].push_back(end);
+    };
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!is_code_token(tokens[i]))
+            continue;
+        const TK k = tokens[i].lex.kind;
+        if (is_procedural_block_keyword(k)) {
+            const size_t body = procedural_body_start(tokens, i);
+            if (body == npos)
+                continue;
+            size_t end = simple_statement_end_from(tokens, body);
+            if (end == npos)
+                end = tokens[i].immutable.syntax.stmt_end;
+            add(body, end);
+        } else if (k == TK::ElseKeyword) {
+            // `else if` is indented by the nested `if` itself.
+            const size_t body = next_code(tokens, i + 1, tokens.size());
+            if (body != npos && !kind_is(tokens[body], TK::IfKeyword))
+                add(body, simple_statement_end_from(tokens, body));
+        } else if (k == TK::ForeverKeyword) {
+            add(next_code(tokens, i + 1, tokens.size()), simple_statement_end_from(tokens, i));
+        } else if (is_single_stmt_control(k)) {
+            // `end while (c);` closes a do-while; it controls nothing.
+            if (k == TK::WhileKeyword) {
+                const size_t p = prev_code(tokens, i);
+                if (p != npos && kind_is(tokens[p], TK::EndKeyword))
+                    continue;
+            }
+            const size_t body = single_statement_control_body_start(tokens, i);
+            if (body != npos)
+                add(body, simple_statement_end_from(tokens, body));
+        }
+    }
+    return out;
+}
+
 // IndentPass owns IndentMetadata and reads wrap/source facts.  The level is a
 // deterministic stack over token kinds, so format(format(x)) recomputes the same
 // levels from canonical output.
@@ -2315,114 +2369,23 @@ public:
         bool in_extern  = false; // active from ExternKeyword until ;
         bool in_typedef = false; // active from TypedefKeyword until ;
 
-        // Single-statement control-flow indent state
-        bool ctrl_expr_pending  = false;  // seen if/for/while/foreach/repeat, waiting for (
-        int  ctrl_paren_open    = 0;      // paren_depth when ( was pushed for control expr
-        bool single_stmt_pending = false; // control expr closed, waiting for begin or non-begin
-        bool single_stmt_active  = false; // extra +1 indent applied; waiting for ;
-        int  single_stmt_paren_depth = 0; // paren depth at single_stmt start (for ; detection)
-        int  paren_depth = 0;
+        // Every non-block body of a control -- `always`/`initial`/`final`,
+        // `if`/`for`/`foreach`/`while`/`repeat`, `else`, `forever` -- is one
+        // level deeper than its control until the statement ends.  Bodies
+        // nest (`for (...) if (...) return i;`), so the levels are a stack:
+        // a single flag here once let the outer body's level leak for the
+        // rest of the file.
+        const auto body_extents = controlled_body_extents(tokens);
+        std::vector<size_t> open_bodies; // body end token, innermost last
 
-        bool ctrl_just_closed = false; // defers single_stmt_pending resolution by one token
-        std::unordered_map<size_t, size_t> procedural_body_end;
-        std::unordered_map<size_t, size_t> else_body_end;
-        std::unordered_map<size_t, size_t> forever_body_end;
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!is_procedural_block_keyword(tokens[i].lex.kind))
-                continue;
-            size_t body = procedural_body_start(tokens, i);
-            if (body == npos || body >= tokens.size())
-                continue;
-            if (kind_is(tokens[body], TK::BeginKeyword) ||
-                kind_is(tokens[body], TK::ForkKeyword) ||
-                kind_is(tokens[body], TK::OpenBrace))
-                continue;
-            size_t body_end = simple_statement_end_from(tokens, body);
-            procedural_body_end[body] = body_end == npos ? tokens[i].immutable.syntax.stmt_end : body_end;
-        }
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!kind_is(tokens[i], TK::ElseKeyword))
-                continue;
-            size_t body = next_code(tokens, i + 1, tokens.size());
-            if (body == npos || body >= tokens.size())
-                continue;
-            // An `else if` chain is syntactically an `else` whose body is
-            // another `if` statement, but indentation should be owned by that
-            // nested `if` and by its own body opener (`begin`, `{`, or a
-            // single-statement body).
-            //
-            // Treating the `if` token as a generic non-block `else` body adds
-            // a temporary extra indent level until the whole nested `if`
-            // statement ends.  For a block-form chain such as:
-            //
-            //   else if (cond) begin
-            //       a = 1;
-            //   end
-            //
-            // that stale extra level makes `a = 1;` render one indent too
-            // deep and makes the matching `end` render at the statement-body
-            // level instead of the `if` level.  Skip `IfKeyword` here so the
-            // ordinary control-expression / block-scope machinery below is
-            // the single source of indentation for the nested conditional.
-            if (kind_is(tokens[body], TK::IfKeyword))
-                continue;
-            if (kind_is(tokens[body], TK::BeginKeyword) ||
-                kind_is(tokens[body], TK::ForkKeyword) ||
-                kind_is(tokens[body], TK::OpenBrace))
-                continue;
-            size_t body_end = simple_statement_end_from(tokens, body);
-            if (body_end != npos)
-                else_body_end[body] = body_end;
-        }
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!kind_is(tokens[i], TK::ForeverKeyword))
-                continue;
-            size_t body = next_code(tokens, i + 1, tokens.size());
-            if (body == npos || body >= tokens.size())
-                continue;
-            if (kind_is(tokens[body], TK::BeginKeyword) || kind_is(tokens[body], TK::ForkKeyword))
-                continue;
-            size_t body_end = simple_statement_end_from(tokens, i);
-            if (body_end != npos)
-                forever_body_end[body] = body_end;
-        }
-        bool procedural_body_active = false;
-        size_t procedural_body_stmt_end = npos;
-        bool else_body_active = false;
-        size_t else_body_stmt_end = npos;
-        bool forever_body_active = false;
-        size_t forever_body_stmt_end = npos;
+        // A design unit restores the level it started at, so a level leaked
+        // inside one can never shift the next unit.
+        struct OuterUnit { int level; size_t open_bodies; };
+        std::vector<OuterUnit> outer_units;
 
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (is_passthrough(t)) continue;
-
-            // Track parens for single-stmt detection
-            if (kind_is(t, TK::OpenParenthesis)) ++paren_depth;
-            else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0) --paren_depth;
-
-            // Detect control expression start
-            if (is_single_stmt_control(t.lex.kind) && !kind_is(t, TK::ForeverKeyword)) {
-                ctrl_expr_pending = true;
-            }
-            if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
-                ctrl_expr_pending = false;
-                ctrl_paren_open = paren_depth; // depth after increment above
-            }
-            // Detect control expression close — set pending but don't resolve yet (defer to next token)
-            if (kind_is(t, TK::CloseParenthesis) && ctrl_paren_open > 0 && paren_depth == ctrl_paren_open - 1) {
-                ctrl_paren_open = 0;
-                bool do_while_tail = false;
-                if (t.immutable.syntax.matching_token != npos) {
-                    size_t control = prev_code(tokens, t.immutable.syntax.matching_token);
-                    size_t before_control = control == npos ? npos : prev_code(tokens, control);
-                    do_while_tail = control != npos && before_control != npos &&
-                        kind_is(tokens[control], TK::WhileKeyword) &&
-                        kind_is(tokens[before_control], TK::EndKeyword);
-                }
-                single_stmt_pending = !do_while_tail;
-                ctrl_just_closed = true;
-            }
 
             // Track declaration-qualifier context
             if (kind_is(t, TK::ImportKeyword))  in_import  = true;
@@ -2434,35 +2397,17 @@ public:
             bool closes = closes_indent_scope_at(tokens, i) || is_outer_close(t.lex.kind) ||
                           t.mutable_.macro.closes_indent_scope;
             if (closes) level = std::max(0, level - 1);
+            if (is_outer_close(t.lex.kind) && !outer_units.empty()) {
+                level = outer_units.back().level;
+                open_bodies.resize(std::min(open_bodies.size(), outer_units.back().open_bodies));
+                outer_units.pop_back();
+            }
 
-            // Resolve single-stmt pending on first non-passthrough, non-comment token AFTER control expr close
-            if (single_stmt_pending && !ctrl_just_closed && t.lex.comment_kind == CommentLexemeKind::None) {
-                single_stmt_pending = false;
-                bool is_block = kind_is(t, TK::BeginKeyword) ||
-                                is_fork_block_open(tokens, i) ||
-                                kind_is(t, TK::OpenBrace);
-                if (!is_block && !closes) {
-                    level++;
-                    single_stmt_active = true;
-                    single_stmt_paren_depth = paren_depth;
+            if (auto it = body_extents.find(i); it != body_extents.end()) {
+                for (size_t end : it->second) {
+                    ++level;
+                    open_bodies.push_back(end);
                 }
-            }
-            ctrl_just_closed = false;
-
-            if (auto it = procedural_body_end.find(i); it != procedural_body_end.end()) {
-                ++level;
-                procedural_body_active = true;
-                procedural_body_stmt_end = it->second;
-            }
-            if (auto it = else_body_end.find(i); it != else_body_end.end()) {
-                ++level;
-                else_body_active = true;
-                else_body_stmt_end = it->second;
-            }
-            if (auto it = forever_body_end.find(i); it != forever_body_end.end()) {
-                ++level;
-                forever_body_active = true;
-                forever_body_stmt_end = it->second;
             }
 
             t.mutable_.indent.base_indent = level * opts_.indent_size;
@@ -2483,6 +2428,8 @@ public:
             // Open scope after assigning indent to the opener token.
             // Suppress for function/task used as qualifiers in import/extern
             // declarations, and for class used in typedef forward declarations.
+            if (is_outer_open(t.lex.kind))
+                outer_units.push_back({level, open_bodies.size()});
             if (!closes) {
                 bool is_qualifier_fn_task =
                     (in_import || in_extern) &&
@@ -2496,26 +2443,10 @@ public:
                     ++level;
             }
 
-            // Close single-stmt at semicolon at the right depth
-            if (single_stmt_active && paren_depth == single_stmt_paren_depth &&
-                (kind_is(t, TK::Semicolon) || t.mutable_.macro.ends_statement)) {
+            // Several nested bodies can end on one token (`for (..) if (..) x;`).
+            while (!open_bodies.empty() && open_bodies.back() <= i) {
                 level = std::max(0, level - 1);
-                single_stmt_active = false;
-            }
-            if (procedural_body_active && i == procedural_body_stmt_end) {
-                level = std::max(0, level - 1);
-                procedural_body_active = false;
-                procedural_body_stmt_end = npos;
-            }
-            if (else_body_active && i == else_body_stmt_end) {
-                level = std::max(0, level - 1);
-                else_body_active = false;
-                else_body_stmt_end = npos;
-            }
-            if (forever_body_active && i == forever_body_stmt_end) {
-                level = std::max(0, level - 1);
-                forever_body_active = false;
-                forever_body_stmt_end = npos;
+                open_bodies.pop_back();
             }
         }
 

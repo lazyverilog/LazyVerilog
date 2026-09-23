@@ -246,6 +246,57 @@ TEST_CASE("formatter regression: a multi-line define keeps its configured role",
                    "    `BLK_END\n") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: nested single-statement controls release every level", "[formatter][regression]") {
+    const std::string input = "package k;\n"
+                              "function automatic int f(input int x);\n"
+                              "for (int i = 0; i < 4; i++) if (x[i]) return i;\n"
+                              "for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) if (x[j]) y = 1; else y = 2;\n"
+                              "return 0;\n"
+                              "endfunction\n"
+                              "endpackage\n"
+                              "module after_pkg;\n"
+                              "always if (a) if (b) x = 1;\n"
+                              "initial forever #5 clk = ~clk;\n"
+                              "logic z;\n"
+                              "endmodule\n";
+    CHECK(format_stable(input) == "package k;\n"
+                                  "  function automatic int f(input int x);\n"
+                                  "    for (int i = 0; i < 4; i++)\n"
+                                  "      if (x[i])\n"
+                                  "        return i;\n"
+                                  "    for (int i = 0; i < 4; i++)\n"
+                                  "      for (int j = 0; j < 4; j++)\n"
+                                  "        if (x[j])\n"
+                                  "          y = 1;\n"
+                                  "        else\n"
+                                  "          y = 2;\n"
+                                  "    return 0;\n"
+                                  "  endfunction\n"
+                                  "endpackage\n"
+                                  "module after_pkg;\n"
+                                  "  always\n"
+                                  "    if (a)\n"
+                                  "      if (b)\n"
+                                  "        x = 1;\n"
+                                  "  initial\n"
+                                  "    forever\n"
+                                  "      #5 clk = ~clk;\n"
+                                  "  logic z;\n"
+                                  "endmodule\n");
+}
+
+TEST_CASE("formatter regression: a design unit cannot inherit a leaked level", "[formatter][regression]") {
+    // Whatever goes wrong inside one unit, the next starts at column 0.
+    const std::string input = "module a;\n"
+                              "initial if (x) `NOP\n"
+                              "endmodule\n"
+                              "module b;\n"
+                              "logic z;\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    CHECK(out.find("endmodule\nmodule b;\n  logic z;\nendmodule\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
