@@ -2786,6 +2786,13 @@ private:
                 if (k != i)
                     tokens[k].mutable_.wrap.must_break_before = false;
             }
+            // An attribute on a design unit has a line of its own, as do the
+            // others stacked with it: `(* keep_hierarchy *)` above `module`.
+            size_t n = next_code(tokens, end + 1, tokens.size());
+            while (n != npos && tokens[n].lex.in_attribute_instance)
+                n = next_code(tokens, n + 1, tokens.size());
+            if (n != npos && tokens[n].immutable.topology.opens_design_unit)
+                tokens[end].mutable_.wrap.must_break_after = true;
             i = end;
         }
     }

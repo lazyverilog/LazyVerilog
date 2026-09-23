@@ -1154,3 +1154,22 @@ endmodule /* fsm */ // end of file
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: an attribute on a design unit has its own line", "[formatter][regression]") {
+    const std::string input = R"SV((* keep_hierarchy = "yes" *)
+module sync2 (input logic clk, d, output logic q);
+  (* ASYNC_REG = "TRUE" *) logic s0;
+endmodule
+)SV";
+    const std::string expected = R"SV((* keep_hierarchy = "yes" *)
+module sync2(
+  input logic clk, d,
+  output logic q
+);
+  (* ASYNC_REG = "TRUE" *) logic s0;
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
