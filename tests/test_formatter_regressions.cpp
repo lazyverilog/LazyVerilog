@@ -530,6 +530,40 @@ TEST_CASE("formatter regression: a delay after a semicolon starts its own line",
                                   "endmodule\n");
 }
 
+TEST_CASE("formatter regression: a name after a port declaration stays on its line", "[formatter][regression]") {
+    FormatOptions opts;
+    opts.port_declaration.align = false;
+    const std::string input = "module m (input wire clk, input wire [7:0] a, b, // two\n"
+                              " input c, d = 1'b0, output logic y);\n"
+                              "endmodule\n"
+                              "interface i;\n"
+                              "logic valid, data, ready;\n"
+                              "modport mst (output valid, data, input ready);\n"
+                              "endinterface\n"
+                              "module n (a, b, c);\n"
+                              "endmodule\n";
+    CHECK(format_stable(input, opts) == "module m(\n"
+                                        "  input wire clk,\n"
+                                        "  input wire [7:0] a, b, // two\n"
+                                        "  input c, d = 1'b0,\n"
+                                        "  output logic y\n"
+                                        ");\n"
+                                        "endmodule\n"
+                                        "interface i;\n"
+                                        "  logic valid, data, ready;\n"
+                                        "  modport mst (\n"
+                                        "    output valid, data,\n"
+                                        "    input ready\n"
+                                        "  );\n"
+                                        "endinterface\n"
+                                        "module n(\n"
+                                        "  a,\n"
+                                        "  b,\n"
+                                        "  c\n"
+                                        ");\n"
+                                        "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

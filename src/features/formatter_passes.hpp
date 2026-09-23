@@ -2089,6 +2089,45 @@ public:
                     }
                 }
             }
+
+            // `input wire [7:0] a, b,` and a modport's `output valid, data,`:
+            // an item that is only a name continues the declaration before
+            // it, so it stays on that declaration's line.  Only after a
+            // declaration item -- a non-ANSI list is all bare names and keeps
+            // its own layout above.
+            const bool ansi_ports = kind == WrapListKind::ModulePorts && !items.empty() &&
+                                    is_declaration_keyword(tokens[items.front().first].lex.kind);
+            if (ansi_ports || kind == WrapListKind::ModportBody) {
+                auto is_bare_name = [&](const ListItem& item) {
+                    if (!kind_is(tokens[item.first], TK::Identifier))
+                        return false;
+                    size_t k = next_code(tokens, item.first + 1, item.last + 1);
+                    while (k != npos && kind_is(tokens[k], TK::OpenBracket) &&
+                           tokens[k].immutable.syntax.matching_token != npos)
+                        k = next_code(tokens, tokens[k].immutable.syntax.matching_token + 1, item.last + 1);
+                    return k == npos || kind_is(tokens[k], TK::Equals);
+                };
+                auto comma_carries_line_comment = [&](size_t comma) {
+                    for (size_t c = comma + 1; c < tokens.size(); ++c) {
+                        if (tokens[c].lex.comment_kind != CommentLexemeKind::None)
+                            return true;
+                        if (is_code_token(tokens[c]))
+                            return false;
+                    }
+                    return false;
+                };
+                bool continues = false; // an earlier item on this line declared
+                for (size_t n = 0; n < items.size(); ++n) {
+                    const bool bare = is_bare_name(items[n]);
+                    if (n > 0 && bare && continues && items[n - 1].comma != npos &&
+                        !comma_carries_line_comment(items[n - 1].comma)) {
+                        tokens[items[n].first].mutable_.wrap.must_break_before = false;
+                        tokens[items[n - 1].comma].mutable_.wrap.must_break_after = false;
+                    } else {
+                        continues = !bare;
+                    }
+                }
+            }
         };
 
         auto contains_kind = [&](size_t first, size_t end, TK kind) {
