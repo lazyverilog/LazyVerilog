@@ -401,6 +401,33 @@ TEST_CASE("formatter regression: a case label starting with a brace is a label, 
                                   "endmodule: m\n");
 }
 
+TEST_CASE("formatter regression: a fork keeps its label", "[formatter][regression]") {
+    const std::string input = "module m;\n"
+                              "initial begin\n"
+                              "fork : watchdog\n"
+                              "begin #100; $fatal(1, \"timeout\"); end\n"
+                              "join_none : watchdog\n"
+                              "fork a(); b(); join\n"
+                              "disable fork;\n"
+                              "end\n"
+                              "endmodule\n";
+    CHECK(format_stable(input) == "module m;\n"
+                                  "  initial begin\n"
+                                  "    fork: watchdog\n"
+                                  "      begin\n"
+                                  "        #100;\n"
+                                  "        $fatal(1, \"timeout\");\n"
+                                  "      end\n"
+                                  "    join_none: watchdog\n"
+                                  "    fork\n"
+                                  "      a();\n"
+                                  "      b();\n"
+                                  "    join\n"
+                                  "    disable fork;\n"
+                                  "  end\n"
+                                  "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

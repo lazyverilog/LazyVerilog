@@ -1841,7 +1841,7 @@ public:
             bool end_before_do_while =
                 kind_is(t, TK::EndKeyword) && next_i != npos && kind_is(tokens[next_i], TK::WhileKeyword);
             if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
-                is_fork_block_open(tokens, i) ||
+                (is_fork_block_open(tokens, i) && !followed_by_label_colon) ||
                 (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
                 (is_close_block(t.lex.kind) && !followed_by_label_colon &&
                  !end_before_do_while &&
