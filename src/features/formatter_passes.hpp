@@ -807,16 +807,6 @@ inline bool is_module_header_import_semicolon(const TokenStream& tokens, size_t 
 
 inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open) {
     int pd = 0;
-    size_t direct_prev = prev_code(tokens, open);
-    bool open_after_parameter_list = false;
-    if (direct_prev != npos && kind_is(tokens[direct_prev], TK::CloseParenthesis)) {
-        size_t param_open = tokens[direct_prev].immutable.syntax.matching_token;
-        open_after_parameter_list = param_open != npos &&
-                                    tokens[param_open].immutable.topology.starts_parameter_list;
-    }
-    bool open_follows_header_import =
-        (direct_prev != npos && kind_is(tokens[direct_prev], TK::Semicolon)) ||
-        open_after_parameter_list;
     for (size_t n = open; n > 0; --n) {
         size_t i = n - 1;
         if (!is_code_token(tokens[i])) continue;
@@ -824,11 +814,18 @@ inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open)
         else if (kind_is(tokens[i], TK::OpenParenthesis) && pd > 0) --pd;
         if (pd == 0 && starts_module_like_header(tokens[i].lex.kind))
             return i;
+        // Only a header import's `;` (`module m import p::*; (...)`) sits
+        // inside a header.  Any other one ends an item, and a `(` after it --
+        // a specify path `(clk => q) = 1;` after `specparam ...;` -- is not
+        // the header's port list.
         if (pd == 0 && kind_is(tokens[i], TK::Semicolon) &&
-            !open_follows_header_import &&
             !is_module_header_import_semicolon(tokens, i))
             break;
         if (pd == 0 && (is_outer_close(tokens[i].lex.kind) || is_close_block(tokens[i].lex.kind)))
+            break;
+        // A header holds no block: a `(` inside `specify`, `begin`, ...
+        // belongs to that block.
+        if (pd == 0 && is_open_block(tokens[i].lex.kind) && !kind_is(tokens[i], TK::OpenBrace))
             break;
     }
     return npos;
@@ -1955,7 +1952,7 @@ public:
             }
             // `generate` opens a region like `begin`; its first item starts
             // the next line.
-            if (kind_is(t, TK::GenerateKeyword))
+            if (kind_is(t, TK::GenerateKeyword) || kind_is(t, TK::SpecifyKeyword))
                 t.mutable_.wrap.must_break_after = true;
             // `randcase` has no header; its first item starts the next line.
             if (kind_is(t, TK::RandCaseKeyword))

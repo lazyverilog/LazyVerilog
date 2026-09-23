@@ -740,3 +740,30 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: specify paths are not a port list", "[formatter][regression]") {
+    const std::string input = R"SV(module dff_timing (input d, clk, output q);
+  specify
+    specparam tCQ = 1.2;
+    (clk => q) = (tCQ, tCQ);
+    (posedge clk => (q +: d)) = 1.0;
+    $setup(d, posedge clk, 0.5);
+  endspecify
+endmodule
+)SV";
+    const std::string expected = R"SV(module dff_timing(
+  input d, clk,
+  output q
+);
+  specify
+    specparam tCQ = 1.2;
+    (clk => q) = (tCQ, tCQ);
+    (posedge clk => (q +: d)) = 1.0;
+    $setup(d, posedge clk, 0.5);
+  endspecify
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
