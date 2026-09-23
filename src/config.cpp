@@ -182,6 +182,7 @@ static std::vector<std::string> validate_config(const Config& cfg) {
     add_macro_role(cfg.format.macros.statement_like, "statement_like");
     add_macro_role(cfg.format.macros.declaration_like, "declaration_like");
     add_macro_role(cfg.format.macros.control_flow_like, "control_flow_like");
+    add_macro_role(cfg.format.macros.statement_terminator_like, "statement_terminator_like");
     add_macro_role(cfg.format.macros.block_begin_like, "block_begin_like");
     add_macro_role(cfg.format.macros.block_end_like, "block_end_like");
     for (const auto& [name, roles] : macro_roles) {
@@ -494,6 +495,9 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                 append_string_array(macros, "control_flow_like",
                                     "[format.macros].control_flow_like",
                                     cfg.format.macros.control_flow_like, value_errors);
+                append_string_array(macros, "statement_terminator_like",
+                                    "[format.macros].statement_terminator_like",
+                                    cfg.format.macros.statement_terminator_like, value_errors);
                 append_string_array(macros, "block_begin_like",
                                     "[format.macros].block_begin_like",
                                     cfg.format.macros.block_begin_like, value_errors);

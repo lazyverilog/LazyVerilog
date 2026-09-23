@@ -10,6 +10,7 @@ function_like_expr = ["MY_CLAMP"]
 statement_like = ["uvm_info", "DV_CHECK_EQ"]
 declaration_like = ["uvm_component_utils"]
 control_flow_like = ["MY_IF"]
+statement_terminator_like = ["SEMI"]
 block_begin_like = ["uvm_object_utils_begin"]
 block_end_like = ["uvm_object_utils_end"]
 whitespace_sensitive = ["DV_SPINWAIT"]
@@ -27,6 +28,7 @@ Names work with or without the leading backtick. Put a macro in one role only.
 | `statement_like` | A complete statement: `` `uvm_info(...) `` | Line break after it |
 | `declaration_like` | Declaration-level macros: `` `uvm_object_utils(T) `` | Line break after it |
 | `control_flow_like` | A macro used like `if`: `` `MY_IF(en) `` | No alignment inside; no forced break. Use `statement_like` if it should end the line |
+| `statement_terminator_like` | A macro that expands to a statement's `;`: `` `define SEMI ; `` | Ends the statement it closes: line break after it, and the next statement is formatted as a new one |
 | `block_begin_like` | Opens a block: `` `uvm_object_utils_begin `` | Line break, then indents what follows |
 | `block_end_like` | Closes that block | Un-indents, then line break |
 | `whitespace_sensitive` | Arguments whose exact spacing matters | Arguments are left exactly as written |

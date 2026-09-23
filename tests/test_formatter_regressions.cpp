@@ -1224,3 +1224,33 @@ endmodule
     CHECK(out.find("binsof(cp) intersect {1};") != std::string::npos);
     CHECK(out.find("tagged Valid .n: $display(n);") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a configured statement terminator macro ends its statement", "[formatter][regression]") {
+    const std::string input = R"SV(`define SEMI ;
+module m (input logic en, rst_n, output logic st);
+  always_comb begin
+    st = en `SEMI
+    if (!rst_n) st = '0;
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(`define SEMI ;
+module m(
+  input logic en, rst_n,
+  output logic st
+);
+  always_comb begin
+    st = en `SEMI
+    if (!rst_n)
+      st = '0;
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    FormatOptions opts;
+    opts.macros.statement_terminator_like = {"SEMI"};
+    CHECK(format_stable(input, opts) == expected);
+    // Without the role the macro is an unknown expression leaf, as before.
+    CHECK(format_stable(input) != expected);
+}

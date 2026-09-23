@@ -1862,7 +1862,7 @@ inline bool is_struct_or_union_body_brace(const TokenStream& tokens, size_t brac
 }
 
 // MacroClassifier + MacroRole — used by MacroPass to categorise macro tokens.
-enum class MacroRole { ObjectLikeExpr, FunctionLikeExpr, StatementLike, DeclarationLike, ControlFlowLike, BlockBeginLike, BlockEndLike };
+enum class MacroRole { ObjectLikeExpr, FunctionLikeExpr, StatementLike, DeclarationLike, ControlFlowLike, BlockBeginLike, BlockEndLike, StatementTerminatorLike };
 
 struct MacroClassifier {
     std::unordered_set<std::string> object_like_expr;
@@ -1870,6 +1870,7 @@ struct MacroClassifier {
     std::unordered_set<std::string> statement_like;
     std::unordered_set<std::string> declaration_like;
     std::unordered_set<std::string> control_flow_like;
+    std::unordered_set<std::string> statement_terminator_like;
     std::unordered_set<std::string> block_begin_like;
     std::unordered_set<std::string> block_end_like;
     std::unordered_set<std::string> whitespace_sensitive;
@@ -1887,6 +1888,7 @@ struct MacroClassifier {
         add(statement_like,    m.statement_like);
         add(declaration_like,  m.declaration_like);
         add(control_flow_like, m.control_flow_like);
+        add(statement_terminator_like, m.statement_terminator_like);
         add(block_begin_like,  m.block_begin_like);
         add(block_end_like,    m.block_end_like);
         add(whitespace_sensitive, m.whitespace_sensitive);
@@ -1908,6 +1910,7 @@ struct MacroClassifier {
         if (block_end_like.count(name))    return MacroRole::BlockEndLike;
         if (block_begin_like.count(name))  return MacroRole::BlockBeginLike;
         if (control_flow_like.count(name)) return MacroRole::ControlFlowLike;
+        if (statement_terminator_like.count(name)) return MacroRole::StatementTerminatorLike;
         if (declaration_like.count(name))  return MacroRole::DeclarationLike;
         if (statement_like.count(name))    return MacroRole::StatementLike;
 
@@ -2029,7 +2032,9 @@ private:
     // Settle where semicolonless macro statements end.  SyntaxPass found the
     // ones TokenKinds can prove; [format.macros] overrides it both ways -- a
     // configured statement or item macro always ends one (unless its own `;`
-    // follows), and a configured expression or control-flow macro never does.
+    // follows), a configured terminator (`` `define SEMI ; ``) always ends
+    // the statement it closes, and a configured expression or control-flow
+    // macro never does.
     static void mark_statement_ends(TokenStream& tokens, const MacroClassifier& mc) {
         for (size_t i = 0; i < tokens.size(); ++i) {
             const Tok& t = tokens[i];
@@ -2040,8 +2045,10 @@ private:
             const MacroRole role = mc.classify(t.lex.text);
             // A block-begin macro opens a body that runs to its block-end
             // macro (see simple_statement_end_from), exactly like `begin`.
-            if (mc.is_configured_expression(t.lex.text) || role == MacroRole::ControlFlowLike ||
-                role == MacroRole::BlockBeginLike) {
+            if (role == MacroRole::StatementTerminatorLike) {
+                ends = true;
+            } else if (mc.is_configured_expression(t.lex.text) || role == MacroRole::ControlFlowLike ||
+                       role == MacroRole::BlockBeginLike) {
                 ends = false;
             } else if (t.mutable_.macro.force_line_break) {
                 const size_t next = next_code(tokens, end + 1, tokens.size());
