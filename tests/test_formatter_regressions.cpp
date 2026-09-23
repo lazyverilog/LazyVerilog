@@ -564,6 +564,38 @@ TEST_CASE("formatter regression: a name after a port declaration stays on its li
                                         "endmodule\n");
 }
 
+TEST_CASE("formatter regression: each ifdef branch of a port list is its own item", "[formatter][regression]") {
+    const std::string input = "module b (\n"
+                              "`ifdef WIDE\n"
+                              "output [63:0] q\n"
+                              "`else\n"
+                              "output [31:0] q\n"
+                              "`endif\n"
+                              ");\n"
+                              "endmodule\n";
+    FormatOptions opts;
+    opts.port_declaration.align = false;
+    CHECK(format_stable(input, opts) == "module b(\n"
+                                        "`ifdef WIDE\n"
+                                        "  output [63:0] q\n"
+                                        "`else\n"
+                                        "  output [31:0] q\n"
+                                        "`endif\n"
+                                        ");\n"
+                                        "endmodule\n");
+
+    // Aligned, both branches put `q` in the same column.
+    const std::string aligned = format_stable(input);
+    const size_t first = aligned.find("[63:0]");
+    const size_t second = aligned.find("[31:0]");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(second != std::string::npos);
+    const size_t first_line = aligned.rfind('\n', first);
+    const size_t second_line = aligned.rfind('\n', second);
+    CHECK(aligned.find('q', first) - first_line == aligned.find('q', second) - second_line);
+    CHECK(aligned.find("\n`else\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

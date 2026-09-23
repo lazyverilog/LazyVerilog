@@ -686,12 +686,26 @@ struct ListItem {
     size_t comma{npos};
 };
 
+inline bool is_conditional_preprocessor_directive(const Tok& t);
+
 inline std::vector<ListItem> top_level_list_items(const TokenStream& tokens, size_t first, size_t close) {
     std::vector<ListItem> out;
     size_t start = next_code(tokens, first, close);
     size_t last = npos;
     int pd = 0, bd = 0, brd = 0;
     for (size_t i = first; i < close && i < tokens.size(); ++i) {
+        // `` `ifdef WIDE output [63:0] q `else output [31:0] q `endif `` --
+        // the branches have no comma between them, but a conditional
+        // directive at the list's own depth still separates two items.
+        // Without this the second branch was part of the first item, so its
+        // `` `else `` took the item indent and the two alignments disagreed.
+        if (pd == 0 && bd == 0 && brd == 0 && is_conditional_preprocessor_directive(tokens[i])) {
+            if (start != npos && last != npos)
+                out.push_back({start, last, npos});
+            start = next_code(tokens, i + 1, close);
+            last = npos;
+            continue;
+        }
         if (!is_code_token(tokens[i])) continue;
         if (kind_is(tokens[i], TK::OpenParenthesis)) ++pd;
         else if (kind_is(tokens[i], TK::CloseParenthesis) && pd > 0) --pd;
@@ -2644,6 +2658,10 @@ public:
             if (first >= tokens.size()) return;
             tokens[first].mutable_.indent.base_indent = std::max(0, indent);
             for (size_t k = first + 1; k <= last && k < tokens.size(); ++k) {
+                // Conditional directives stay at column 0 (see the main loop);
+                // one nested inside an item must not take the item's indent.
+                if (is_conditional_preprocessor_directive(tokens[k]))
+                    continue;
                 if (tokens[k].mutable_.wrap.must_break_before ||
                     (tokens[k].lex.comment_kind != CommentLexemeKind::None && tokens[k].immutable.comment.role == CommentRole::OwnLine))
                     tokens[k].mutable_.indent.base_indent = std::max(0, indent);
