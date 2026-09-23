@@ -412,7 +412,9 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
         else if (kind_is(tokens[i], TK::CloseBracket) && bd > 0) --bd;
         else if (kind_is(tokens[i], TK::OpenBrace) || kind_is(tokens[i], TK::ApostropheOpenBrace)) ++brd;
         else if (kind_is(tokens[i], TK::CloseBrace) && brd > 0) --brd;
-        if (pd == 0 && bd == 0 && brd == 0 && kind_is(tokens[i], TK::Semicolon))
+        // A semicolonless macro statement ends where its `;` would be.
+        if (pd == 0 && bd == 0 && brd == 0 &&
+            (kind_is(tokens[i], TK::Semicolon) || tokens[i].mutable_.macro.ends_statement))
             return i;
     }
     return npos;
@@ -426,6 +428,148 @@ inline bool is_declaration_keyword(TK k) {
 inline bool starts_module_like_header(TK k) {
     return k == TK::ModuleKeyword || k == TK::InterfaceKeyword ||
            k == TK::MacromoduleKeyword || k == TK::ProgramKeyword;
+}
+
+// -----------------------------------------------------------------------------
+// Semicolonless macro statements
+// -----------------------------------------------------------------------------
+// UVM and OpenTitan invoke statement and item macros with no `;`:
+//
+//   `uvm_info(`gfn, "msg", UVM_LOW)
+//   `ASSERT(CntNoOverflow_A, cnt_q != '1)
+//   always_comb ...
+//
+// Nothing in the token stream says the macro ends a statement, so every
+// question "where does this statement end" used to fall through to the next
+// `;` -- which belongs to a different statement.  These helpers answer it once,
+// from TokenKinds, for SyntaxPass to freeze as
+// TopologyFacts::may_end_macro_statement.
+
+// A token that can only carry on the operand in front of it.  A macro followed
+// by one of these is part of an expression -- a case label (`` `OP: ``), an
+// assignment target (`` `REG = 1; ``), a member select (`` `FIELD(1).f ``).
+inline bool continues_operand(TK k) {
+    return k == TK::Semicolon || k == TK::Colon || k == TK::Comma || k == TK::Question ||
+           is_binary_op(k) || is_assignment_op(k) ||
+           k == TK::TripleEquals || k == TK::ExclamationDoubleEquals ||
+           k == TK::DoubleEqualsQuestion || k == TK::ExclamationEqualsQuestion ||
+           k == TK::Dot || k == TK::OpenBracket || k == TK::DoubleColon ||
+           k == TK::Apostrophe || k == TK::PlusColon || k == TK::MinusColon ||
+           k == TK::DoublePlus || k == TK::DoubleMinus ||
+           k == TK::CloseParenthesis || k == TK::CloseBracket || k == TK::CloseBrace ||
+           k == TK::Hash || k == TK::At || k == TK::OpenParenthesis;
+}
+
+// Keywords that begin a statement, a module item or a class item and can never
+// continue an expression.
+inline bool starts_new_statement_keyword(TK k) {
+    if (is_close_block(k) && k != TK::CloseBrace)
+        return true;
+    if (is_outer_close(k) || is_outer_open(k) || is_procedural_block_keyword(k))
+        return true;
+    switch (k) {
+    case TK::AssignKeyword: case TK::DeassignKeyword: case TK::ForceKeyword:
+    case TK::ReleaseKeyword: case TK::IfKeyword: case TK::ElseKeyword:
+    case TK::CaseKeyword: case TK::CaseXKeyword: case TK::CaseZKeyword:
+    case TK::RandCaseKeyword: case TK::RandSequenceKeyword: case TK::ForKeyword:
+    case TK::ForeachKeyword: case TK::WhileKeyword: case TK::DoKeyword:
+    case TK::RepeatKeyword: case TK::ForeverKeyword: case TK::ForkKeyword:
+    case TK::BeginKeyword: case TK::ReturnKeyword: case TK::BreakKeyword:
+    case TK::ContinueKeyword: case TK::WaitKeyword: case TK::DisableKeyword:
+    case TK::UniqueKeyword: case TK::Unique0Keyword: case TK::PriorityKeyword:
+    case TK::AssertKeyword: case TK::AssumeKeyword: case TK::CoverKeyword:
+    case TK::RestrictKeyword: case TK::ExpectKeyword: case TK::GenerateKeyword:
+    case TK::GenVarKeyword: case TK::FunctionKeyword: case TK::TaskKeyword:
+    case TK::TypedefKeyword: case TK::ImportKeyword: case TK::ExportKeyword:
+    case TK::ParameterKeyword: case TK::LocalParamKeyword: case TK::DefParamKeyword:
+    case TK::PropertyKeyword: case TK::SequenceKeyword: case TK::ClassKeyword:
+    case TK::VirtualKeyword: case TK::ModPortKeyword: case TK::ClockingKeyword:
+    case TK::DefaultKeyword: case TK::CoverGroupKeyword: case TK::ConstraintKeyword:
+    case TK::BindKeyword: case TK::LetKeyword: case TK::GlobalKeyword:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Keywords that begin a data or net declaration.  Unlike the list above these
+// also follow a prefix macro (`` `MY_ATTR logic a; ``), so they end a macro
+// statement only after an invocation with arguments.
+inline bool starts_declaration_keyword(TK k) {
+    return is_var_decl_leading_keyword(k) || is_port_direction(k) ||
+           k == TK::VarKeyword || k == TK::StructKeyword || k == TK::EnumKeyword ||
+           k == TK::UnionKeyword || k == TK::RandKeyword || k == TK::RandCKeyword ||
+           k == TK::TriKeyword || k == TK::UWireKeyword || k == TK::NetTypeKeyword;
+}
+
+// The invocation's last token: the `)` closing its arguments, or the macro.
+inline size_t macro_invocation_end(const TokenStream& tokens, size_t macro) {
+    size_t open = next_code(tokens, macro + 1, tokens.size());
+    if (open != npos && kind_is(tokens[open], TK::OpenParenthesis) &&
+        tokens[open].immutable.syntax.matching_token != npos)
+        return tokens[open].immutable.syntax.matching_token;
+    return macro;
+}
+
+// First code token after `idx` and after any `[...]` dimensions that follow.
+inline size_t next_code_past_dimensions(const TokenStream& tokens, size_t idx) {
+    size_t n = next_code(tokens, idx + 1, tokens.size());
+    while (n != npos && kind_is(tokens[n], TK::OpenBracket) &&
+           tokens[n].immutable.syntax.matching_token != npos)
+        n = next_code(tokens, tokens[n].immutable.syntax.matching_token + 1, tokens.size());
+    return n;
+}
+
+// Given a macro that sits where a statement or item can start, decide whether
+// its invocation is the whole statement: the token after it must begin a new
+// one.  Returns the invocation's last token, or npos when it is not.
+//
+// `in_case_item` is true when the macro is the statement of a case item.  Its
+// successor there can be the next item's label -- any expression -- so only a
+// token that continues the operand keeps them together.
+inline size_t macro_statement_end(const TokenStream& tokens, size_t macro, bool in_case_item) {
+    const size_t end = macro_invocation_end(tokens, macro);
+    const bool has_args = end != macro;
+    const size_t next = next_code(tokens, end + 1, tokens.size());
+    if (next == npos)
+        return end;
+    const Tok& n = tokens[next];
+    const TK k = n.lex.kind;
+    if (continues_operand(k))
+        return npos;
+    if (in_case_item)
+        return end;
+    if (k == TK::MacroUsage) {
+        // `` `T_DATA `CAT(d, 2); `` declares a name spelled by a macro; the
+        // first macro is its type.  `` `CHECK_A `CHECK_B(x) `` are two
+        // statements.
+        if (!has_args) {
+            const size_t after = next_code_past_dimensions(tokens, macro_invocation_end(tokens, next));
+            if (after != npos && (kind_is(tokens[after], TK::Semicolon) ||
+                                  kind_is(tokens[after], TK::Comma) ||
+                                  kind_is(tokens[after], TK::Equals)))
+                return npos;
+        }
+        return end;
+    }
+    if (starts_new_statement_keyword(k) || k == TK::SystemIdentifier)
+        return end;
+    if (starts_declaration_keyword(k))
+        return has_args ? end : npos;
+    if (k == TK::Identifier) {
+        const size_t after = next_code_past_dimensions(tokens, next);
+        const TK a = after == npos ? TK::Unknown : tokens[after].lex.kind;
+        if (has_args) {
+            // `` `MY_T(8) sig; `` declares `sig`; `` `uvm_info(...) foo = 1; ``
+            // and `` `ASSERT(...) prim_x u_x (...); `` are new statements.
+            return (a == TK::Semicolon || a == TK::Comma) ? npos : end;
+        }
+        // A bare macro before a name is a type or prefix (`` `T_DATA d0; ``,
+        // `` `MOD u (...) ``) unless that name is plainly assigned or stepped.
+        const bool assigned = is_assignment_op(a) || a == TK::DoublePlus || a == TK::DoubleMinus;
+        return assigned ? end : npos;
+    }
+    return npos;
 }
 
 inline int snap_to_grid(int value, int indent_size) {
@@ -810,6 +954,8 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
     auto is_macro_item_boundary = [&](size_t prev) {
         if (prev == npos)
             return false;
+        if (tokens[prev].mutable_.macro.ends_statement)
+            return true;
 
         // Some project macros expand to complete module items but are invoked
         // without a trailing semicolon.  OpenTitan's DV alert helper is a
@@ -1042,10 +1188,57 @@ public:
             }
         }
 
-        mark_case_item_colons(tokens);
+        mark_case_items_and_macro_statements(tokens);
     }
 
 private:
+    // Can a statement or item begin at `idx`?  Read from the facts already
+    // frozen for the tokens before it, so a macro that ends a statement makes
+    // the next macro's position a start too (`` `uvm_info(..) `CHECK(..) ``).
+    static bool at_statement_start(const TokenStream& tokens, size_t idx) {
+        const size_t p = prev_code(tokens, idx);
+        if (p == npos)
+            return true;
+        const Tok& pt = tokens[p];
+        const TK k = pt.lex.kind;
+        if (k == TK::Semicolon || k == TK::BeginKeyword || k == TK::ElseKeyword ||
+            k == TK::DoKeyword || k == TK::ForeverKeyword || k == TK::GenerateKeyword ||
+            is_outer_close(k) || is_procedural_block_keyword(k))
+            return true;
+        if (k == TK::ForkKeyword)
+            return is_fork_block_open(tokens, p);
+        if (is_close_block(k))
+            return k != TK::CloseBrace || pt.immutable.topology.closes_indent_scope;
+        if (pt.immutable.topology.is_case_item_colon || pt.immutable.topology.may_end_macro_statement)
+            return true;
+        // `begin : name` -- the label is part of the opener.
+        if (k == TK::Identifier) {
+            const size_t colon = prev_code(tokens, p);
+            const size_t opener = colon == npos ? npos : prev_code(tokens, colon);
+            if (opener != npos && kind_is(tokens[colon], TK::Colon) &&
+                (kind_is(tokens[opener], TK::BeginKeyword) || kind_is(tokens[opener], TK::ForkKeyword)))
+                return true;
+        }
+        // `#10 stmt` and `#(T) stmt` -- a delay control prefixes a statement.
+        if (k == TK::IntegerLiteral || k == TK::RealLiteral || k == TK::TimeLiteral ||
+            k == TK::Identifier) {
+            const size_t hash = prev_code(tokens, p);
+            if (hash != npos && kind_is(tokens[hash], TK::Hash))
+                return true;
+        }
+        // The `)` closing a control header or an event/delay control.
+        if (k == TK::CloseParenthesis && pt.immutable.syntax.matching_token != npos) {
+            const size_t owner = prev_code(tokens, pt.immutable.syntax.matching_token);
+            if (owner == npos)
+                return false;
+            const TK o = tokens[owner].lex.kind;
+            return o == TK::IfKeyword || o == TK::ForKeyword || o == TK::ForeachKeyword ||
+                   o == TK::WhileKeyword || o == TK::RepeatKeyword || o == TK::WaitKeyword ||
+                   o == TK::At || o == TK::Hash;
+        }
+        return false;
+    }
+
     // A case item is `<labels> : <statement>`, and the labels are arbitrary
     // expressions, so the item's colon is found by position rather than by the
     // token in front of it: the first `:` at the case body's own depth after a
@@ -1054,7 +1247,12 @@ private:
     // item is a statement and its colons (statement labels, `begin : blk`,
     // ternaries, assignment-pattern keys) are not labels.  A `?` seen while
     // looking owns the next `:`, so a ternary inside a label is not cut short.
-    static void mark_case_item_colons(TokenStream& tokens) {
+    //
+    // The same walk freezes TopologyFacts::may_end_macro_statement, because the
+    // two depend on each other: a semicolonless macro statement ends a case
+    // item just as a `;` does (`` 2'd0: `NOP 2'd1: ... ``), and a case item's
+    // colon is where a macro statement can start.
+    static void mark_case_items_and_macro_statements(TokenStream& tokens) {
         struct CaseBody {
             int pd, bd, brd, block_depth;
             size_t header_end;
@@ -1078,6 +1276,17 @@ private:
             auto& t = tokens[i];
             if (!is_code_token(t))
                 continue;
+
+            if (kind_is(t, TK::MacroUsage) && at_statement_start(tokens, i)) {
+                const bool in_case_item = !cases.empty() && !cases.back().seeking &&
+                                          at_body_depth(t, cases.back());
+                const size_t end = macro_statement_end(tokens, i, in_case_item);
+                if (end != npos) {
+                    tokens[end].immutable.topology.may_end_macro_statement = true;
+                    if (in_case_item)
+                        item_can_start(cases.back());
+                }
+            }
 
             if (kind_is(t, TK::BeginKeyword) || kind_is(t, TK::ForkKeyword)) {
                 ++block_depth;
@@ -1290,6 +1499,13 @@ struct MacroClassifier {
     bool is_whitespace_sensitive(const std::string& raw_text) const {
         return whitespace_sensitive.count(extract_name(raw_text)) > 0;
     }
+
+    // classify() defaults an unknown macro to ObjectLikeExpr; this is only
+    // true when the user said so.
+    bool is_configured_expression(const std::string& raw_text) const {
+        const std::string name = extract_name(raw_text);
+        return object_like_expr.count(name) > 0 || function_like_expr.count(name) > 0;
+    }
 };
 
 inline std::string extract_define_name(const std::string& raw_text) {
@@ -1383,8 +1599,31 @@ public:
                 }
             }
         }
+        mark_statement_ends(tokens, mc);
     }
 private:
+    // Settle where semicolonless macro statements end.  SyntaxPass found the
+    // ones TokenKinds can prove; [format.macros] overrides it both ways -- a
+    // configured statement or item macro always ends one (unless its own `;`
+    // follows), and a configured expression or control-flow macro never does.
+    static void mark_statement_ends(TokenStream& tokens, const MacroClassifier& mc) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const Tok& t = tokens[i];
+            if (!kind_is(t, TK::MacroUsage) || !is_code_token(t))
+                continue;
+            const size_t end = macro_invocation_end(tokens, i);
+            bool ends = tokens[end].immutable.topology.may_end_macro_statement;
+            if (mc.is_configured_expression(t.lex.text) ||
+                mc.classify(t.lex.text) == MacroRole::ControlFlowLike) {
+                ends = false;
+            } else if (t.mutable_.macro.force_line_break) {
+                const size_t next = next_code(tokens, end + 1, tokens.size());
+                ends = next == npos || !kind_is(tokens[next], TK::Semicolon);
+            }
+            tokens[end].mutable_.macro.ends_statement = ends;
+        }
+    }
+
     const FormatOptions& opts_;
 };
 
@@ -1395,93 +1634,10 @@ public:
     explicit WrapPass(const FormatOptions& opts) : opts_(opts) {}
     const char* name() const override { return "wrap"; }
     void run(TokenStream& tokens) override {
-        std::vector<bool> procedural_context(tokens.size(), false);
-        {
-            // Bare-unknown-macro fallback below is intentionally limited to
-            // procedural statement contexts.  A bare macro in module/class item
-            // space can be a declaration prefix, attribute wrapper, item
-            // generator, or expression fragment:
-            //
-            //   `MY_ATTR logic a;
-            //   `MY_DECL_PREFIX my_type x;
-            //   `MY_MODULE_ITEM_HELPER
-            //
-            // Inside procedural code, a macro that appears where a statement
-            // can start is much more likely to be a semicolonless statement
-            // helper.  Precompute a conservative token-kind context once here
-            // instead of asking macro classification to guess each unknown
-            // macro's semantic role.  The unknown-macro fallback below is
-            // deliberately *only* a procedural formatting policy:
-            //
-            //   if unknown macro is at procedural statement start:
-            //       if it has (...) break after the matching ')'
-            //       else break after the macro token
-            //   else:
-            //       keep object-like expression behavior
-            bool in_import = false;
-            bool in_extern = false;
-            bool in_typedef = false;
-            int subroutine_depth = 0;
-
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                if (!is_code_token(tokens[i]))
-                    continue;
-
-                procedural_context[i] = subroutine_depth > 0;
-
-                if (kind_is(tokens[i], TK::ImportKeyword))
-                    in_import = true;
-                if (kind_is(tokens[i], TK::ExternKeyword))
-                    in_extern = true;
-                if (kind_is(tokens[i], TK::TypedefKeyword))
-                    in_typedef = true;
-
-                const bool qualifier_fn_task =
-                    (in_import || in_extern) &&
-                    (kind_is(tokens[i], TK::FunctionKeyword) ||
-                     kind_is(tokens[i], TK::TaskKeyword));
-                if (!qualifier_fn_task &&
-                    !is_covergroup_sample_function_header(tokens, i) &&
-                    (kind_is(tokens[i], TK::FunctionKeyword) ||
-                     kind_is(tokens[i], TK::TaskKeyword))) {
-                    ++subroutine_depth;
-                    procedural_context[i] = true;
-                } else if ((kind_is(tokens[i], TK::EndFunctionKeyword) ||
-                            kind_is(tokens[i], TK::EndTaskKeyword)) &&
-                           subroutine_depth > 0) {
-                    procedural_context[i] = true;
-                    --subroutine_depth;
-                }
-
-                if (kind_is(tokens[i], TK::Semicolon)) {
-                    in_import = false;
-                    in_extern = false;
-                    in_typedef = false;
-                }
-            }
-
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                if (!is_code_token(tokens[i]) ||
-                    !is_procedural_block_keyword(tokens[i].lex.kind))
-                    continue;
-                size_t body = procedural_body_start(tokens, i);
-                if (body == npos || body >= tokens.size())
-                    continue;
-                size_t body_end = simple_statement_end_from(tokens, body);
-                if (body_end == npos || body_end >= tokens.size())
-                    body_end = tokens[i].immutable.syntax.stmt_end;
-                if (body_end == npos || body_end >= tokens.size())
-                    continue;
-                for (size_t k = body; k <= body_end; ++k)
-                    procedural_context[k] = true;
-            }
-        }
-
         // A macro invocation that already carries its own trailing `;` in
         // source is an ordinary statement-terminated call, not the
         // semicolonless UVM/OpenTitan pattern the statement-macro line-break
-        // logic below exists for (see the comment on the unknown-macro
-        // fallback below).  Forcing a break at the macro token or its
+        // logic below exists for.  Forcing a break at the macro token or its
         // invocation's closing parenthesis in that case would split the
         // statement's own semicolon onto its own line; the semicolon's own
         // must_break_after handling further down already places the correct
@@ -1489,27 +1645,6 @@ public:
         auto next_is_source_semicolon = [&](size_t after) {
             size_t next = next_code(tokens, after + 1, tokens.size());
             return next != npos && kind_is(tokens[next], TK::Semicolon);
-        };
-
-        // The unknown-macro fallback reads "a macro at a statement start" as a
-        // whole semicolonless statement.  A macro that the next token carries
-        // on as an operand is not one: it is a case label (`` `OP: ``,
-        // `` `A, `B: ``) or the start of an expression statement
-        // (`` `REG = 1; ``, `` `ARR[0] <= 1; ``), and a break there splits the
-        // label from its colon or the target from its assignment.
-        auto next_continues_expression = [&](size_t after) {
-            size_t next = next_code(tokens, after + 1, tokens.size());
-            if (next == npos)
-                return false;
-            const TK k = tokens[next].lex.kind;
-            return k == TK::Semicolon || k == TK::Colon || k == TK::Comma || k == TK::Question ||
-                   is_binary_op(k) || is_assignment_op(k) ||
-                   k == TK::TripleEquals || k == TK::ExclamationDoubleEquals ||
-                   k == TK::DoubleEqualsQuestion || k == TK::ExclamationEqualsQuestion ||
-                   k == TK::Dot || k == TK::OpenBracket || k == TK::DoubleColon ||
-                   k == TK::Apostrophe || k == TK::PlusColon || k == TK::MinusColon ||
-                   k == TK::DoublePlus || k == TK::DoubleMinus ||
-                   k == TK::CloseParenthesis || k == TK::CloseBracket || k == TK::CloseBrace;
         };
 
         int group = 0;
@@ -1557,74 +1692,13 @@ public:
                 if (!next_is_source_semicolon(break_at))
                     tokens[break_at].mutable_.wrap.must_break_after = true;
             }
-            if (kind_is(t, TK::MacroUsage) && !t.mutable_.macro.force_line_break) {
-                auto completed_macro_invocation_is_statement_boundary = [&](size_t prev) {
-                    if (prev == npos || prev >= tokens.size())
-                        return false;
-
-                    // A macro in UVM / OpenTitan style often has no semicolon
-                    // in source:
-                    //
-                    //   `uvm_info(...)
-                    //   `DV_CHEESE
-                    //   `DV_CHECK_EQ(...)
-                    //
-                    // This is a formatting-policy boundary, not macro
-                    // classification.  Known statement-like macros set
-                    // force_line_break.  Unknown macros that were previously
-                    // accepted as procedural statement-start fallback set
-                    // must_break_after on either their bare macro token or on
-                    // the invocation's closing parenthesis.  A following
-                    // unknown macro may use that already-decided line boundary
-                    // as its own statement-start boundary.
-                    //
-                    // Keep this boundary recognition macro-structural: accept a
-                    // bare line-ending macro token, or the matching close
-                    // parenthesis of a macro invocation that is line-ending.
-                    // This lets conservative unknown-macro fallback boundaries
-                    // chain after a known statement-like macro:
-                    //
-                    //   `uvm_info(...)          // known statement-like
-                    //   `PROJECT_BARE
-                    //   `PROJECT_CHECK(...)
-                    if (kind_is(tokens[prev], TK::MacroUsage))
-                        return tokens[prev].mutable_.macro.force_line_break ||
-                               tokens[prev].mutable_.wrap.must_break_after;
-
-                    if (!kind_is(tokens[prev], TK::CloseParenthesis))
-                        return false;
-
-                    size_t open = tokens[prev].immutable.syntax.matching_token;
-                    if (open == npos || open >= tokens.size())
-                        return false;
-                    size_t macro = prev_code(tokens, open);
-                    if (macro == npos || !kind_is(tokens[macro], TK::MacroUsage))
-                        return false;
-
-                    return tokens[macro].mutable_.macro.force_line_break ||
-                           tokens[prev].mutable_.wrap.must_break_after;
-                };
-
-                size_t prev = prev_code(tokens, i);
-                bool statement_position =
-                    i < procedural_context.size() && procedural_context[i] &&
-                    (prev == npos || kind_is(tokens[prev], TK::Semicolon) ||
-                     kind_is(tokens[prev], TK::BeginKeyword) ||
-                     is_close_block(tokens[prev].lex.kind) ||
-                     is_outer_close(tokens[prev].lex.kind) ||
-                     completed_macro_invocation_is_statement_boundary(prev));
-                size_t open = next_code(tokens, i + 1, tokens.size());
-                if (statement_position) {
-                    if (open != npos && kind_is(tokens[open], TK::OpenParenthesis)) {
-                        size_t close = tokens[open].immutable.syntax.matching_token;
-                        if (close != npos && close < tokens.size() &&
-                            !next_continues_expression(close))
-                            tokens[close].mutable_.wrap.must_break_after = true;
-                    } else if (!next_continues_expression(i)) {
-                        t.mutable_.wrap.must_break_after = true;
-                    }
-                }
-            }
+            // A semicolonless macro statement or item (`` `uvm_info(...) ``,
+            // `` `ASSERT(...) ``) ends here, so the next one starts a line.
+            // Where that is, is decided once by SyntaxPass and MacroPass
+            // (MacroMetadata::ends_statement); an invocation followed by its
+            // own `;` never carries it.
+            if (t.mutable_.macro.ends_statement && !next_is_source_semicolon(i))
+                t.mutable_.wrap.must_break_after = true;
             if (i > 0 &&
                 tokens[i - 1].immutable.comment.role == CommentRole::Trailing &&
                 tokens[i - 1].lex.comment_kind == CommentLexemeKind::Line)
@@ -2399,7 +2473,8 @@ public:
             }
 
             // Close single-stmt at semicolon at the right depth
-            if (single_stmt_active && kind_is(t, TK::Semicolon) && paren_depth == single_stmt_paren_depth) {
+            if (single_stmt_active && paren_depth == single_stmt_paren_depth &&
+                (kind_is(t, TK::Semicolon) || t.mutable_.macro.ends_statement)) {
                 level = std::max(0, level - 1);
                 single_stmt_active = false;
             }

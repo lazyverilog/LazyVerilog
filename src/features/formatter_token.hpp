@@ -144,6 +144,15 @@ struct TopologyFacts {
     // `default:`).  What precedes it can be any expression -- a literal, an
     // identifier, a macro -- so spacing cannot be decided from the left token.
     bool is_case_item_colon{false};
+
+    // Set on the last token of a macro invocation -- the bare macro, or the
+    // `)` closing its arguments -- that stands as a whole statement or item
+    // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,
+    // `` `NOP ``).  Decided from TokenKinds alone: the macro sits where a
+    // statement or item can start, and the next token can only begin a new
+    // one.  MacroPass refines it with [format.macros] into
+    // MacroMetadata::ends_statement, which is what formatting passes read.
+    bool may_end_macro_statement{false};
 };
 
 // 4. InputTriviaFacts: observation of original whitespace.  These are facts
@@ -217,7 +226,10 @@ struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment
 struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
 struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
 struct BlankLineMetadata { int before{0}; };
-struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; };
+// ends_statement: this token ends a semicolonless macro statement or item.
+// Every consumer that asks "where does this statement end" treats it like the
+// statement's `;` (see TopologyFacts::may_end_macro_statement).
+struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; bool ends_statement{false}; };
 
 struct MutableData {
     WrapMetadata wrap;
