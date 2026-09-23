@@ -1116,3 +1116,25 @@ endmodule
     CHECK(out.find("a[->1:3] |-> b[=1:$] ##1 b[*2:4] ##1 b[+] ##1 b[*];") != std::string::npos);
     CHECK(out.find("a |-> b[->1] ##1 b[=2] ##1 b[*3]);") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a deferred assertion's final opens no block", "[formatter][regression]") {
+    const std::string input = R"SV(module deferred (input logic a, b);
+  always_comb begin
+    a_x: assert final (!(a && b)) else $error("both");
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module deferred(
+  input logic a, b
+);
+  always_comb begin
+    a_x: assert final (!(a && b))
+    else
+      $error("both");
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}

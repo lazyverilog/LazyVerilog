@@ -215,6 +215,19 @@ inline bool unary_pair_merges(TK l, TK t) {
     }
 }
 
+// `initial`/`always*`/`final` opening a procedural block.  A deferred
+// assertion's `final` (`assert final (c);`, also `assume`/`cover`) is not
+// one: it has no body, only the assertion's condition.
+inline bool is_procedural_block_at(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size() || !is_procedural_block_keyword(tokens[idx].lex.kind))
+        return false;
+    if (!kind_is(tokens[idx], TK::FinalKeyword))
+        return true;
+    const size_t p = prev_code(tokens, idx);
+    return !(p != npos && (kind_is(tokens[p], TK::AssertKeyword) || kind_is(tokens[p], TK::AssumeKeyword) ||
+                           kind_is(tokens[p], TK::CoverKeyword)));
+}
+
 // Operators whose spelling is also a unary operator.
 inline bool is_sign_or_reduction_op(TK k) {
     return k == TK::Plus || k == TK::Minus || k == TK::And || k == TK::Or || k == TK::Xor ||
@@ -403,7 +416,7 @@ inline size_t next_code(const TokenStream& tokens, size_t first, size_t end) {
 }
 
 inline size_t procedural_body_start(const TokenStream& tokens, size_t proc) {
-    if (proc >= tokens.size() || !is_procedural_block_keyword(tokens[proc].lex.kind))
+    if (!is_procedural_block_at(tokens, proc))
         return npos;
 
     size_t cur = next_code(tokens, proc + 1, tokens.size());
@@ -1566,7 +1579,7 @@ private:
         const TK k = pt.lex.kind;
         if (k == TK::Semicolon || k == TK::BeginKeyword || k == TK::ElseKeyword ||
             k == TK::DoKeyword || k == TK::ForeverKeyword || k == TK::GenerateKeyword ||
-            is_outer_close(k) || is_procedural_block_keyword(k))
+            is_outer_close(k) || is_procedural_block_at(tokens, p))
             return true;
         if (k == TK::ForkKeyword)
             return is_fork_block_open(tokens, p);
@@ -2628,7 +2641,7 @@ public:
 private:
     static void apply_procedural_block_wrap(TokenStream& tokens) {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!is_procedural_block_keyword(tokens[i].lex.kind))
+            if (!is_procedural_block_at(tokens, i))
                 continue;
             size_t body = procedural_body_start(tokens, i);
             if (body == npos || body >= tokens.size())
@@ -2796,7 +2809,7 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
         if (!is_code_token(tokens[i]) || is_property_operator_keyword(tokens[i]))
             continue;
         const TK k = tokens[i].lex.kind;
-        if (is_procedural_block_keyword(k)) {
+        if (is_procedural_block_at(tokens, i)) {
             const size_t body = procedural_body_start(tokens, i);
             if (body == npos)
                 continue;
