@@ -230,6 +230,13 @@ inline bool is_covergroup_sample_function_header(const TokenStream& tokens, size
 
 inline size_t next_code(const TokenStream& tokens, size_t first, size_t end);
 
+// A `.` that opens a named connection or port expression rather than a member
+// select keeps a space after the token before it: `, .b(x)` and a modport's
+// `input .a(addr)`.
+inline bool dot_keeps_space_after(const Tok& prev) {
+    return kind_is(prev, TK::Comma) || is_port_direction(prev.lex.kind);
+}
+
 // A `function`/`task` that is only a prototype, or a `typedef class`.  The
 // qualifiers that make a prototype sit between the keyword and the previous
 // item boundary: `extern`, `pure virtual`, `import "DPI-C" context c_name =`,
@@ -2196,6 +2203,16 @@ public:
                                     is_declaration_keyword(tokens[items.front().first].lex.kind);
             if (ansi_ports || kind == WrapListKind::ModportBody) {
                 auto is_bare_name = [&](const ListItem& item) {
+                    // A modport port expression `.d(data)` continues the
+                    // direction before it the same way a name does.
+                    if (kind == WrapListKind::ModportBody && kind_is(tokens[item.first], TK::Dot)) {
+                        const size_t name = next_code(tokens, item.first + 1, item.last + 1);
+                        const size_t open = name == npos ? npos : next_code(tokens, name + 1, item.last + 1);
+                        return open != npos && kind_is(tokens[open], TK::OpenParenthesis) &&
+                               tokens[open].immutable.syntax.matching_token != npos &&
+                               next_code(tokens, tokens[open].immutable.syntax.matching_token + 1,
+                                         item.last + 1) == npos;
+                    }
                     if (!kind_is(tokens[item.first], TK::Identifier))
                         return false;
                     size_t k = next_code(tokens, item.first + 1, item.last + 1);
@@ -2308,9 +2325,18 @@ public:
 
             size_t prev = prev_code(tokens, open);
             if (prev != npos && kind_is(tokens[prev], TK::Identifier)) {
+                // Only a modport item's own parentheses: its name follows
+                // `modport` or, in `modport a (...), b (...);`, a comma at
+                // the keyword's depth.  A port expression `.a(addr)` and a
+                // prototype `import task send(...)` inside the item are not.
                 size_t before_name = prev_code(tokens, prev);
-                if ((before_name != npos && kind_is(tokens[before_name], TK::ModPortKeyword)) ||
-                    tokens[open].immutable.syntax.in_modport) {
+                const bool modport_item =
+                    before_name != npos &&
+                    (kind_is(tokens[before_name], TK::ModPortKeyword) ||
+                     (kind_is(tokens[before_name], TK::Comma) &&
+                      tokens[open].immutable.syntax.in_modport &&
+                      tokens[open].immutable.syntax.paren_depth == 0));
+                if (modport_item) {
                     apply_list(open, WrapListKind::ModportBody, true, true, true);
                     size_t close = tokens[open].immutable.syntax.matching_token;
                     size_t comma = close == npos ? npos : next_code(tokens, close + 1, tokens.size());
@@ -4320,7 +4346,7 @@ public:
                 t.mutable_.space.suppress_space = true;
                 continue;
             }
-            if ((kind_is(t, TK::Dot) && kind_is(L, TK::Comma))) {
+            if (kind_is(t, TK::Dot) && dot_keeps_space_after(L)) {
                 spaces = 1;
             } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {
                 t.mutable_.space.spaces_before = 0;
@@ -4509,7 +4535,7 @@ public:
 
             if ((kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) ||
                 (kind_is(t, TK::Comma) && !kind_is(L, TK::Comma)) ||
-                (kind_is(t, TK::Dot) && !kind_is(L, TK::Comma)) || kind_is(t, TK::DoubleColon))
+                (kind_is(t, TK::Dot) && !dot_keeps_space_after(L)) || kind_is(t, TK::DoubleColon))
                 spaces = 0;
             if (kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&

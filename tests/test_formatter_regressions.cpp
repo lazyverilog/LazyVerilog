@@ -796,3 +796,29 @@ endprimitive
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: modport port expressions and prototypes stay inline", "[formatter][regression]") {
+    const std::string input = R"SV(interface bus_if;
+  logic [31:0] addr, data;
+  modport mon (input .a(addr), .d(data));
+  modport drv (output addr, import task send(input int n));
+  task send(input int n); endtask
+endinterface
+)SV";
+    const std::string expected = R"SV(interface bus_if;
+  logic [31:0] addr, data;
+  modport mon (
+    input .a(addr), .d(data)
+  );
+  modport drv (
+    output addr,
+    import task send(input int n)
+  );
+  task send(input int n);
+  endtask
+endinterface
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
