@@ -968,3 +968,53 @@ endclass
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: an indexed name after a control header or pattern key is not a declarator", "[formatter][regression]") {
+    const std::string input = R"SV(module clr (input logic [31:0] a, input logic sel);
+  typedef struct packed { logic [15:0] hi, lo; } pair_t;
+  logic [7:0] mem [4];
+  pair_t p;
+  always_comb begin
+    foreach (mem[i]) mem[i] = '0;
+    if (sel) mem[0] = a[7:0];
+    p = '{hi: a[31:16], lo: a[15:0]};
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module clr(
+  input logic [31:0] a,
+  input logic sel
+);
+  typedef struct packed {
+    logic [15:0] hi, lo;
+  } pair_t;
+  logic [7:0] mem [4];
+  pair_t p;
+  always_comb begin
+    foreach (mem[i])
+      mem[i] = '0;
+    if (sel)
+      mem[0] = a[7:0];
+    p = '{hi : a[31:16], lo : a[15:0]};
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: the last port's unpacked dimension is spaced like the others", "[formatter][regression]") {
+    const std::string input = R"SV(module lanes (input logic [7:0] din [4], output logic [7:0] dout [4]);
+endmodule
+)SV";
+    const std::string expected = R"SV(module lanes(
+  input logic [7:0] din [4],
+  output logic [7:0] dout [4]
+);
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}

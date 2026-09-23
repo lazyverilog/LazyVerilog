@@ -891,6 +891,22 @@ inline bool is_function_task_declaration_open(const TokenStream& tokens, size_t 
     return false;
 }
 
+// The `)` closing a control header or timing control -- `if (c)`,
+// `foreach (m[i])`, `@(posedge clk)`, `#(D)` -- ends what comes before the
+// statement it controls.
+inline bool closes_control_header(const TokenStream& tokens, size_t close) {
+    if (close >= tokens.size() || !kind_is(tokens[close], TK::CloseParenthesis))
+        return false;
+    const size_t open = tokens[close].immutable.syntax.matching_token;
+    const size_t before = open == npos ? npos : prev_code(tokens, open);
+    if (before == npos)
+        return false;
+    const TK k = tokens[before].lex.kind;
+    return is_single_stmt_control(k) || is_control_keyword(k) || k == TK::WaitKeyword ||
+           k == TK::At || k == TK::Hash || k == TK::CaseKeyword || k == TK::CaseXKeyword ||
+           k == TK::CaseZKeyword;
+}
+
 inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open) {
     if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenBracket))
         return false;
@@ -904,8 +920,14 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
     size_t after = next_code(tokens, close + 1, tokens.size());
     if (after == npos)
         return false;
+    // The last ANSI port or function argument is followed by the list's `)`.
+    const bool ends_port_list =
+        kind_is(tokens[after], TK::CloseParenthesis) &&
+        tokens[after].immutable.syntax.matching_token != npos &&
+        (tokens[tokens[after].immutable.syntax.matching_token].immutable.topology.starts_port_list ||
+         is_function_task_declaration_open(tokens, tokens[after].immutable.syntax.matching_token));
     if (!(kind_is(tokens[after], TK::Semicolon) || kind_is(tokens[after], TK::Comma) ||
-          is_assignment_op(tokens[after].lex.kind)))
+          is_assignment_op(tokens[after].lex.kind) || ends_port_list))
         return false;
 
     // Where the bracket's own list element starts: back to the `;` or `,` at
@@ -917,52 +939,83 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
     // so starting from the element keeps `{mem[g], ...}` and
     // `` `CHECK(m[k], 0) `` indexes while `module m(input logic a [4], ...`
     // still starts at `input`.
+    //
+    // Nor does a declarator follow a control header (`foreach (m[i]) m[i] =
+    // 0;`, `@(posedge clk) m[0] <= x;`) or a colon at its depth (a case
+    // item, a statement label, an assignment-pattern key `'{hi: a[3:0]}`),
+    // so the walk stops there too.  With `stop_at_comma` false it runs on to
+    // the start of the whole declaration, for `int a[], b[$];`.
     const int pd = tokens[open].immutable.syntax.paren_depth;
+    const int bd = tokens[open].immutable.syntax.bracket_depth;
     const int brd = tokens[open].immutable.syntax.brace_depth;
-    size_t stmt_begin = npos;
-    for (size_t n = open; n > 0; --n) {
-        const size_t i = n - 1;
-        if (!is_code_token(tokens[i]))
-            continue;
-        const auto& sx = tokens[i].immutable.syntax;
-        const bool enclosing = sx.paren_depth < pd || sx.brace_depth < brd;
-        const bool separator = sx.paren_depth == pd && sx.brace_depth == brd &&
-                               (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::Comma));
-        if (enclosing || separator)
-            break;
-        stmt_begin = i;
-    }
-    if (stmt_begin == npos || stmt_begin >= open)
+    auto element_start = [&](bool stop_at_comma) {
+        size_t begin = npos;
+        for (size_t n = open; n > 0; --n) {
+            const size_t i = n - 1;
+            if (!is_code_token(tokens[i]))
+                continue;
+            const auto& sx = tokens[i].immutable.syntax;
+            const bool enclosing = sx.paren_depth < pd || sx.brace_depth < brd;
+            const bool here = sx.paren_depth == pd && sx.brace_depth == brd;
+            const bool separator = here && (kind_is(tokens[i], TK::Semicolon) ||
+                                            (stop_at_comma && kind_is(tokens[i], TK::Comma)));
+            const bool colon = here && sx.bracket_depth == bd && kind_is(tokens[i], TK::Colon);
+            if (enclosing || separator || colon || closes_control_header(tokens, i))
+                break;
+            begin = i;
+        }
+        return begin;
+    };
+
+    // `logic a [4]`, `input logic [7:0] d [2]`, or `my_t m [4]`.
+    auto declares = [&](size_t first, size_t last) {
+        if (is_var_decl_leading_keyword(tokens[first].lex.kind) ||
+            is_port_direction(tokens[first].lex.kind))
+            return true;
+        // User-defined types can lead a declaration with an identifier-like
+        // token.  Accept the pattern only when the element contains at least
+        // two identifier-like tokens before the dimension and no
+        // member-access dot, which keeps array indexing expressions such as
+        // `foo.bar[3:0]` from being misclassified as declarations.
+        int identifier_count = 0;
+        for (size_t i = first; i < last; ++i) {
+            if (!is_code_token(tokens[i]))
+                continue;
+            if (kind_is(tokens[i], TK::Dot))
+                return false;
+            if (is_identifier_like(tokens[i]))
+                ++identifier_count;
+        }
+        return identifier_count >= 2;
+    };
+
+    const size_t elem = element_start(true);
+    if (elem == npos || elem >= open)
         return false;
 
     // Declarations place trailing unpacked dimensions before any initializer,
     // so if the element already contains an assignment operator before the
     // candidate bracket, this is an expression such as `assign y = arr[3:0];`
     // however the statement began.
-    for (size_t i = stmt_begin; i < open; ++i) {
+    for (size_t i = elem; i < open; ++i) {
         if (is_assignment_op(tokens[i].lex.kind))
             return false;
     }
-
-    if (is_var_decl_leading_keyword(tokens[stmt_begin].lex.kind) ||
-        is_port_direction(tokens[stmt_begin].lex.kind))
+    if (declares(elem, open))
         return true;
 
-    // User-defined types can lead a declaration with an identifier-like token.
-    // Accept the pattern only when the statement contains at least two
-    // identifier-like tokens before the dimension and no member-access dot,
-    // which keeps array indexing expressions such as `foo.bar[3:0]` from being
-    // misclassified as declarations.
-    int identifier_count = 0;
-    for (size_t i = stmt_begin; i < open; ++i) {
-        if (!is_code_token(tokens[i]))
-            continue;
-        if (kind_is(tokens[i], TK::Dot))
-            return false;
-        if (is_identifier_like(tokens[i]))
-            ++identifier_count;
-    }
-    return identifier_count >= 2;
+    // A later declarator of a multi-name declaration is only a name
+    // (`int da[], q[$];`); it is a declarator when the declaration it
+    // continues is one.
+    const size_t first = element_start(false);
+    if (elem != open - 1 || first == npos || first >= elem)
+        return false;
+    size_t first_end = first;
+    while (first_end < elem && !(kind_is(tokens[first_end], TK::Comma) &&
+                                 tokens[first_end].immutable.syntax.paren_depth == pd &&
+                                 tokens[first_end].immutable.syntax.brace_depth == brd))
+        ++first_end;
+    return declares(first, first_end);
 }
 
 inline size_t module_header_import_owner(const TokenStream& tokens, size_t import_idx) {
