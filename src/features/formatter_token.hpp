@@ -110,6 +110,9 @@ struct SyntaxFacts {
     bool in_class_decl{false};
     bool in_covergroup{false};
     bool in_modport{false};
+    // Between a clocking declaration's header and its `endclocking`.  Its
+    // `input v;` / `output a, b;` items are clocking signals, not ports.
+    bool in_clocking_block{false};
 };
 
 // 3. TopologyFacts: stable graph-ish structural labels that make later passes

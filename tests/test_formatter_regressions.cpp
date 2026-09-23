@@ -297,6 +297,31 @@ TEST_CASE("formatter regression: a design unit cannot inherit a leaked level", "
     CHECK(out.find("endmodule\nmodule b;\n  logic z;\nendmodule\n") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: property, sequence and clocking references open no scope", "[formatter][regression]") {
+    const std::string input = "interface i(input clk);\n"
+                              "logic v, a, b;\n"
+                              "clocking cb @(posedge clk); input v; output a, b; endclocking\n"
+                              "default clocking cb;\n"
+                              "modport m (input v, clocking cb);\n"
+                              "a_x: assert property (@(posedge clk) a |-> b) else $error(\"x\");\n"
+                              "c_y: cover sequence (@(posedge clk) a ##1 b);\n"
+                              "property p; @(posedge clk) a |=> b; endproperty\n"
+                              "sequence s; a ##1 b; endsequence\n"
+                              "logic z;\n"
+                              "endinterface\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(out.find("  clocking cb @(posedge clk);\n"
+                   "    input v;\n"
+                   "    output a, b;\n"
+                   "  endclocking\n"
+                   "  default clocking cb;\n"
+                   "  modport m (") != std::string::npos);
+    CHECK(out.find("\n  property p;\n    @(posedge clk) a |=> b;\n  endproperty\n") != std::string::npos);
+    CHECK(out.find("\n  sequence s;\n") != std::string::npos);
+    CHECK(out.find("\n  logic z;\nendinterface\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

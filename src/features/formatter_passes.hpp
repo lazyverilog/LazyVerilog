@@ -226,6 +226,8 @@ inline bool is_covergroup_sample_function_header(const TokenStream& tokens, size
     return false;
 }
 
+inline size_t next_code(const TokenStream& tokens, size_t first, size_t end);
+
 inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     if (idx >= tokens.size())
         return false;
@@ -238,6 +240,24 @@ inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     // not.  SyntaxPass froze which is which.
     if (kind_is(tokens[idx], TK::OpenBrace))
         return tokens[idx].immutable.topology.opens_brace_block;
+    // `property`/`sequence` open a block only as a declaration.  After an
+    // assertion keyword they introduce an expression, which no
+    // `endproperty` ever closes:  `a_x: assert property (@(posedge c) a);`
+    if (kind_is(tokens[idx], TK::PropertyKeyword) || kind_is(tokens[idx], TK::SequenceKeyword)) {
+        const size_t p = prev_code(tokens, idx);
+        const TK pk = p == npos ? TK::Unknown : tokens[p].lex.kind;
+        return pk != TK::AssertKeyword && pk != TK::AssumeKeyword && pk != TK::CoverKeyword &&
+               pk != TK::RestrictKeyword && pk != TK::ExpectKeyword;
+    }
+    // A clocking declaration names its event: `[default|global] clocking
+    // [cb] @(...)`.  `default clocking cb;` and a modport's `clocking cb`
+    // only refer to one and have no `endclocking`.
+    if (kind_is(tokens[idx], TK::ClockingKeyword)) {
+        size_t n = next_code(tokens, idx + 1, tokens.size());
+        if (n != npos && kind_is(tokens[n], TK::Identifier))
+            n = next_code(tokens, n + 1, tokens.size());
+        return n != npos && kind_is(tokens[n], TK::At);
+    }
     return is_open_block(tokens[idx].lex.kind);
 }
 
@@ -1087,8 +1107,11 @@ public:
         bool in_class_decl = false;
         bool in_covergroup = false;
         bool in_modport = false;
+        bool in_clocking_block = false;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
+            if (kind_is(t, TK::EndClockingKeyword))
+                in_clocking_block = false;
             t.immutable.syntax.paren_depth = pd;
             t.immutable.syntax.bracket_depth = bd;
             t.immutable.syntax.brace_depth = brd;
@@ -1097,6 +1120,7 @@ public:
             t.immutable.syntax.in_class_decl = in_class_decl;
             t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
+            t.immutable.syntax.in_clocking_block = in_clocking_block;
             t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || is_outer_open(t.lex.kind);
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind);
 
@@ -1137,6 +1161,8 @@ public:
             if (kind_is(t, TK::ClassKeyword)) in_class_decl = true;
             if (kind_is(t, TK::CoverGroupKeyword)) in_covergroup = true;
             if (kind_is(t, TK::ModPortKeyword)) in_modport = true;
+            if (kind_is(t, TK::ClockingKeyword) && t.immutable.topology.opens_indent_scope)
+                in_clocking_block = true;
             if (kind_is(t, TK::OpenParenthesis)) { parens.push_back(i); ++pd; }
             else if (kind_is(t, TK::CloseParenthesis)) { if (!parens.empty()) { auto j = parens.back(); parens.pop_back(); tokens[j].immutable.syntax.matching_token = i; t.immutable.syntax.matching_token = j; t.immutable.topology.ends_argument_list = tokens[j].immutable.topology.starts_argument_list; } pd = std::max(0, pd - 1); }
             else if (kind_is(t, TK::OpenBracket)) { brackets.push_back(i); ++bd; }
@@ -2804,6 +2830,10 @@ public:
                 if (!is_type_keyword(tokens[first].lex.kind) &&
                     !is_port_direction(tokens[first].lex.kind))
                     continue;
+                // `input v;` in a clocking block is a clocking signal, not a
+                // port; the port columns (section widths) do not apply.
+                if (tokens[first].immutable.syntax.in_clocking_block)
+                    continue;
 
                 size_t semi = npos;
                 size_t eq = npos;
@@ -3353,8 +3383,10 @@ public:
             auto parse_non_ansi_port_line = [&](size_t line_index) {
                 NonAnsiPortDecl out;
                 const auto& ln = lines[line_index];
+                // A clocking block's `input v;` is a clocking signal, not a port.
                 if (ln.first == npos || !is_port_direction(tokens[ln.first].lex.kind) ||
-                    tokens[ln.first].immutable.syntax.paren_depth != 0)
+                    tokens[ln.first].immutable.syntax.paren_depth != 0 ||
+                    tokens[ln.first].immutable.syntax.in_clocking_block)
                     return out;
 
                 size_t semi = npos;
