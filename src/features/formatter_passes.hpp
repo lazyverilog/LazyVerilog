@@ -474,6 +474,20 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
         return npos;
     }
 
+    // `do stmt while (c);` is one statement ending at the `;` after `while`.
+    if (kind_is(tokens[body], TK::DoKeyword)) {
+        const size_t inner_end = simple_statement_end_from(tokens, next_code(tokens, body + 1, tokens.size()));
+        const size_t w = inner_end == npos ? npos : next_code(tokens, inner_end + 1, tokens.size());
+        if (w == npos || !kind_is(tokens[w], TK::WhileKeyword))
+            return inner_end;
+        const size_t open = next_code(tokens, w + 1, tokens.size());
+        if (open == npos || !kind_is(tokens[open], TK::OpenParenthesis) ||
+            tokens[open].immutable.syntax.matching_token == npos)
+            return inner_end;
+        const size_t semi = next_code(tokens, tokens[open].immutable.syntax.matching_token + 1, tokens.size());
+        return semi != npos && kind_is(tokens[semi], TK::Semicolon) ? semi : inner_end;
+    }
+
     if (kind_is(tokens[body], TK::IfKeyword)) {
         size_t cond_open = next_code(tokens, body + 1, tokens.size());
         if (cond_open == npos || !kind_is(tokens[cond_open], TK::OpenParenthesis) ||
@@ -1387,6 +1401,17 @@ public:
 
         mark_case_items_and_macro_statements(tokens);
 
+        // The `while` after a `do`'s body.  Needs the macro-statement ends
+        // frozen just above.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::DoKeyword) || !is_code_token(tokens[i]))
+                continue;
+            const size_t end = simple_statement_end_from(tokens, next_code(tokens, i + 1, tokens.size()));
+            const size_t w = end == npos ? npos : next_code(tokens, end + 1, tokens.size());
+            if (w != npos && kind_is(tokens[w], TK::WhileKeyword))
+                tokens[w].immutable.topology.ends_do_while = true;
+        }
+
         // `lbl: stmt` -- an identifier where a statement or item starts,
         // followed by `:`.  Runs after the case walk, whose colons it must
         // see as statement starts (`ST_A: lbl: assert ...`).
@@ -1994,10 +2019,7 @@ public:
                 size_t open = (p != npos && kind_is(tokens[p], TK::CloseParenthesis))
                     ? tokens[p].immutable.syntax.matching_token : npos;
                 size_t control = open == npos ? npos : prev_code(tokens, open);
-                size_t before_control = control == npos ? npos : prev_code(tokens, control);
-                if (control != npos && before_control != npos &&
-                    kind_is(tokens[control], TK::WhileKeyword) &&
-                    kind_is(tokens[before_control], TK::EndKeyword))
+                if (control != npos && tokens[control].immutable.topology.ends_do_while)
                     t.mutable_.wrap.must_break_before = false;
             }
             if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token != npos) {
@@ -2051,7 +2073,7 @@ public:
                 kind_is(t, TK::CloseBrace) && next_i != npos && kind_is(tokens[next_i], TK::ElseKeyword) &&
                 !opts_.statement.wrap_end_else_clauses;
             bool end_before_do_while =
-                kind_is(t, TK::EndKeyword) && next_i != npos && kind_is(tokens[next_i], TK::WhileKeyword);
+                kind_is(t, TK::EndKeyword) && next_i != npos && tokens[next_i].immutable.topology.ends_do_while;
             if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
                 (is_fork_block_open(tokens, i) && !followed_by_label_colon) ||
                 (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
@@ -2516,7 +2538,24 @@ private:
             else if (kind_is(t, TK::CloseParenthesis) && paren_depth > 0)
                 --paren_depth;
 
-            if (kind_is(t, TK::ForeverKeyword)) {
+            // A control's body starts its own line -- including a body that
+            // is itself a `forever`/`do` (`if (c) do ... while (d);`).
+            auto break_pending_body = [&](size_t at) {
+                Tok& b = tokens[at];
+                if (!single_stmt_pending || ctrl_just_closed || b.lex.comment_kind != CommentLexemeKind::None)
+                    return;
+                single_stmt_pending = false;
+                const bool is_block = kind_is(b, TK::BeginKeyword) ||
+                                      is_fork_block_open(tokens, at) ||
+                                      kind_is(b, TK::OpenBrace);
+                const bool closes = is_close_block(b.lex.kind) || is_outer_close(b.lex.kind) ||
+                                    b.mutable_.macro.closes_indent_scope;
+                if (!is_block && !closes)
+                    b.mutable_.wrap.must_break_before = true;
+            };
+
+            if (kind_is(t, TK::ForeverKeyword) || kind_is(t, TK::DoKeyword)) {
+                break_pending_body(i);
                 size_t body = next_code(tokens, i + 1, tokens.size());
                 if (body != npos &&
                     !kind_is(tokens[body], TK::BeginKeyword) &&
@@ -2551,25 +2590,13 @@ private:
                 bool do_while_tail = false;
                 if (t.immutable.syntax.matching_token != npos) {
                     size_t control = prev_code(tokens, t.immutable.syntax.matching_token);
-                    size_t before_control = control == npos ? npos : prev_code(tokens, control);
-                    do_while_tail = control != npos && before_control != npos &&
-                        kind_is(tokens[control], TK::WhileKeyword) &&
-                        kind_is(tokens[before_control], TK::EndKeyword);
+                    do_while_tail = control != npos && tokens[control].immutable.topology.ends_do_while;
                 }
                 single_stmt_pending = !do_while_tail;
                 ctrl_just_closed = true;
             }
 
-            if (single_stmt_pending && !ctrl_just_closed && t.lex.comment_kind == CommentLexemeKind::None) {
-                single_stmt_pending = false;
-                const bool is_block = kind_is(t, TK::BeginKeyword) ||
-                                      is_fork_block_open(tokens, i) ||
-                                      kind_is(t, TK::OpenBrace);
-                const bool closes = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind) ||
-                                    t.mutable_.macro.closes_indent_scope;
-                if (!is_block && !closes)
-                    t.mutable_.wrap.must_break_before = true;
-            }
+            break_pending_body(i);
             ctrl_just_closed = false;
         }
 
@@ -2660,13 +2687,13 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
                 add(body, simple_statement_end_from(tokens, body));
         } else if (k == TK::ForeverKeyword) {
             add(next_code(tokens, i + 1, tokens.size()), simple_statement_end_from(tokens, i));
+        } else if (k == TK::DoKeyword) {
+            const size_t body = next_code(tokens, i + 1, tokens.size());
+            add(body, simple_statement_end_from(tokens, body));
         } else if (is_single_stmt_control(k)) {
-            // `end while (c);` closes a do-while; it controls nothing.
-            if (k == TK::WhileKeyword) {
-                const size_t p = prev_code(tokens, i);
-                if (p != npos && kind_is(tokens[p], TK::EndKeyword))
-                    continue;
-            }
+            // The `while` closing a do-while controls nothing.
+            if (tokens[i].immutable.topology.ends_do_while)
+                continue;
             const size_t body = single_statement_control_body_start(tokens, i);
             if (body != npos)
                 add(body, simple_statement_end_from(tokens, body));

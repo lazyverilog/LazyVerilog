@@ -840,3 +840,63 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: a do-while with a single-statement body keeps its while", "[formatter][regression]") {
+    const std::string input = R"SV(module tb;
+  int n;
+  initial begin
+    do n++; while (n < 10);
+    $display("n=%0d", n);
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module tb;
+  int n;
+  initial begin
+    do
+      n++;
+    while (n < 10);
+    $display("n=%0d", n);
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: nested do-while bodies and a do-while as an if body", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+  int n;
+  initial begin
+    do begin n++; end while (n < 5);
+    do do n--; while (n > 2); while (n > 0);
+    if (n) do n++; while (n < 9); else n = 0;
+    n = 1;
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  int n;
+  initial begin
+    do begin
+      n++;
+    end while (n < 5);
+    do
+      do
+        n--;
+      while (n > 2);
+    while (n > 0);
+    if (n)
+      do
+        n++;
+      while (n < 9);
+    else
+      n = 0;
+    n = 1;
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
