@@ -1820,10 +1820,11 @@ public:
                 tokens[i - 1].lex.comment_kind == CommentLexemeKind::Line)
                 t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) {
-                size_t next = next_code(tokens, i + 1, tokens.size());
-                t.mutable_.wrap.must_break_after =
-                    is_module_header_import_semicolon(tokens, i) ||
-                    !(next != npos && kind_is(tokens[next], TK::Hash));
+                // Every statement-ending `;` ends its line -- including one
+                // before a delay (`@(posedge clk); #1 x = y;`), which used to
+                // be exempt.  The module-header `import p::*; #(...)` that
+                // exemption was for breaks as a header import anyway.
+                t.mutable_.wrap.must_break_after = true;
                 ++group;
                 // If a trailing comment immediately follows on the same line,
                 // defer the line break to after the comment so it renders inline.

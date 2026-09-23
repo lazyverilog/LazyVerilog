@@ -500,6 +500,36 @@ TEST_CASE("formatter regression: statement alignment measures case labels as ren
     }
 }
 
+TEST_CASE("formatter regression: a delay after a semicolon starts its own line", "[formatter][regression]") {
+    const std::string input = "module d;\n"
+                              "initial begin\n"
+                              "@(posedge clk); #1 a = 1;\n"
+                              "b = 2; #2;\n"
+                              "`DISPLAY(\"s\"); #1 `DISPLAY(\"t\");\n"
+                              "end\n"
+                              "endmodule\n"
+                              "module e import p::*; #(parameter int W = 1) (input logic c);\n"
+                              "endmodule\n";
+    CHECK(format_stable(input) == "module d;\n"
+                                  "  initial begin\n"
+                                  "    @(posedge clk);\n"
+                                  "    #1 a = 1;\n"
+                                  "    b = 2;\n"
+                                  "    #2;\n"
+                                  "    `DISPLAY(\"s\");\n"
+                                  "    #1 `DISPLAY(\"t\");\n"
+                                  "  end\n"
+                                  "endmodule\n"
+                                  "module e\n"
+                                  "  import p::*;\n"
+                                  "#(\n"
+                                  "  parameter int W = 1\n"
+                                  ")(\n"
+                                  "  input     logic                                   c\n"
+                                  ");\n"
+                                  "endmodule\n");
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");
