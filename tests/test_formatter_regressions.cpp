@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/SyntaxTree.h>
+#include <regex>
 #include <string>
 
 namespace {
@@ -426,6 +427,28 @@ TEST_CASE("formatter regression: a fork keeps its label", "[formatter][regressio
                                   "    disable fork;\n"
                                   "  end\n"
                                   "endmodule\n");
+}
+
+TEST_CASE("formatter regression: indexes inside concatenations and calls stay closed up", "[formatter][regression]") {
+    const std::string input = "module m(input logic a [4], input logic [1:0] b);\n"
+                              "localparam int N = 2;\n"
+                              "wire [7:0] w = {4{a[0], b[0]}};\n"
+                              "wire [7:0] x = {(N){b}, {2'd2{a[1]}}};\n"
+                              "logic [7:0] mem [4];\n"
+                              "my_t arr [2];\n"
+                              "assign req = '{id: 0, addr: {mem[1], 24'h0}};\n"
+                              "initial `CHECK_EQ(mem[1], 0)\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(out.find("wire [7:0] w = {4{a[0], b[0]}};") != std::string::npos);
+    CHECK(out.find("wire [7:0] x = {(N){b}, {2'd2{a[1]}}};") != std::string::npos);
+    CHECK(out.find("logic [7:0] mem [4];") != std::string::npos);
+    CHECK(out.find("my_t arr [2];") != std::string::npos);
+    CHECK(out.find("{mem[1], 24'h0}") != std::string::npos);
+    CHECK(out.find("`CHECK_EQ(mem[1], 0)") != std::string::npos);
+    // An ANSI port's unpacked dimension is still a declaration dimension.
+    CHECK(std::regex_search(out, std::regex("input +logic +a +\\[4\\] *,")));
 }
 
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {

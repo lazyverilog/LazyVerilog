@@ -152,6 +152,9 @@ struct TopologyFacts {
     // `fork : f`, `endmodule : m`.  Never after `}` -- braces take no label.
     bool is_block_name_colon{false};
 
+    // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
+    bool is_replication_brace{false};
+
     // Set on the last token of a macro invocation -- the bare macro, or the
     // `)` closing its arguments -- that stands as a whole statement or item
     // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,

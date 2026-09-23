@@ -829,21 +829,45 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
           is_assignment_op(tokens[after].lex.kind)))
         return false;
 
-    size_t stmt_begin = tokens[open].immutable.syntax.stmt_begin;
+    // Where the bracket's own list element starts: back to the `;` or `,` at
+    // its depth, or to the `(`/`{` enclosing it.  SyntaxFacts::stmt_begin
+    // splits at every comma whatever its depth, so for the `a[0]` in
+    // `wire [7:0] w = {4{a[0], b[0]}};` it named `wire` and the bracket read
+    // as a declaration's trailing dimension (`{4{a [0], ...`).  A
+    // declaration never nests inside an expression's braces or parentheses,
+    // so starting from the element keeps `{mem[g], ...}` and
+    // `` `CHECK(m[k], 0) `` indexes while `module m(input logic a [4], ...`
+    // still starts at `input`.
+    const int pd = tokens[open].immutable.syntax.paren_depth;
+    const int brd = tokens[open].immutable.syntax.brace_depth;
+    size_t stmt_begin = npos;
+    for (size_t n = open; n > 0; --n) {
+        const size_t i = n - 1;
+        if (!is_code_token(tokens[i]))
+            continue;
+        const auto& sx = tokens[i].immutable.syntax;
+        const bool enclosing = sx.paren_depth < pd || sx.brace_depth < brd;
+        const bool separator = sx.paren_depth == pd && sx.brace_depth == brd &&
+                               (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::Comma));
+        if (enclosing || separator)
+            break;
+        stmt_begin = i;
+    }
     if (stmt_begin == npos || stmt_begin >= open)
         return false;
 
-    if (is_var_decl_leading_keyword(tokens[stmt_begin].lex.kind))
-        return true;
-
     // Declarations place trailing unpacked dimensions before any initializer,
-    // so if the statement already contains an assignment operator before the
-    // candidate bracket, this is much more likely to be an expression such as
-    // `assign y = arr[3:0];` than a variable declaration.
+    // so if the element already contains an assignment operator before the
+    // candidate bracket, this is an expression such as `assign y = arr[3:0];`
+    // however the statement began.
     for (size_t i = stmt_begin; i < open; ++i) {
         if (is_assignment_op(tokens[i].lex.kind))
             return false;
     }
+
+    if (is_var_decl_leading_keyword(tokens[stmt_begin].lex.kind) ||
+        is_port_direction(tokens[stmt_begin].lex.kind))
+        return true;
 
     // User-defined types can lead a declaration with an identifier-like token.
     // Accept the pattern only when the statement contains at least two
@@ -1251,6 +1275,36 @@ public:
             tokens[i].immutable.topology.is_block_name_colon =
                 k == TK::BeginKeyword || is_fork_block_open(tokens, p) ||
                 (is_close_block(k) && k != TK::CloseBrace) || is_outer_close(k);
+        }
+
+        // `{4{a}}`, `{(N){a}}`, `{2'd2{a}}` -- the inner brace of a
+        // replication follows its multiplier directly after the outer `{`.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::OpenBrace) || tokens[i].immutable.topology.opens_brace_block)
+                continue;
+            size_t start = prev_code(tokens, i);
+            if (start == npos)
+                continue;
+            const TK k = tokens[start].lex.kind;
+            if (k == TK::CloseParenthesis) {
+                start = tokens[start].immutable.syntax.matching_token;
+            } else if (k == TK::IntegerLiteral || k == TK::Identifier || k == TK::MacroUsage ||
+                       k == TK::Question || k == TK::RealLiteral) {
+                // Walk back over a based literal's pieces to its size.
+                while (start != npos && tokens[start].lex.continues_vector_literal)
+                    start = prev_code(tokens, start);
+                if (start != npos && kind_is(tokens[start], TK::IntegerBase)) {
+                    const size_t size = prev_code(tokens, start);
+                    if (size != npos && kind_is(tokens[size], TK::IntegerLiteral))
+                        start = size;
+                }
+            } else {
+                continue;
+            }
+            const size_t outer = start == npos ? npos : prev_code(tokens, start);
+            tokens[i].immutable.topology.is_replication_brace =
+                outer != npos && kind_is(tokens[outer], TK::OpenBrace) &&
+                !tokens[outer].immutable.topology.opens_brace_block;
         }
 
         mark_case_items_and_macro_statements(tokens);
@@ -4323,6 +4377,10 @@ public:
                 if (!event_control_close)
                 spaces = 0;
             }
+
+            // `{4{a}}` -- the multiplier binds to its replicated braces.
+            if (kind_is(t, TK::OpenBrace) && t.immutable.topology.is_replication_brace)
+                spaces = 0;
 
             // Stream concatenation header: `{`, the stream operator, an optional
             // slice size, then the braces holding the operand all bind tightly.
