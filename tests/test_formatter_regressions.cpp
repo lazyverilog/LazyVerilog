@@ -1018,3 +1018,72 @@ endmodule
     CHECK(parses_cleanly(expected));
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: postfix increments space like operands", "[formatter][regression]") {
+    const std::string input = R"SV(module cnt;
+  int x, y;
+  initial begin
+    for (int i = 0; i < 4; i++) y = i;
+    if (x++ > 3) y = x-- + 1;
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module cnt;
+  int x, y;
+  initial begin
+    for (int i = 0; i < 4; i++)
+      y = i;
+    if (x++ > 3)
+      y = x-- + 1;
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: unary signs and reductions bind; binary xnor spaces", "[formatter][regression]") {
+    const std::string input = R"SV(module ops (input logic [3:0] a, b, c, output logic [3:0] y, output logic p);
+  assign y = -a + (b ^~ c);
+  assign p = &c | ^c;
+endmodule
+)SV";
+    const std::string expected = R"SV(module ops(
+  input logic [3:0] a, b, c,
+  output logic [3:0] y,
+  output logic p
+);
+  assign y = -a + (b ^~ c);
+  assign p = &c | ^c;
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(parses_cleanly(expected));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: operator position under every binary spacing style", "[formatter][regression]") {
+    const std::string input = R"SV(module m (input logic [3:0] a, b, c, output logic [3:0] y);
+  int x, v;
+  always_comb begin
+    y = -a + +b - -c;
+    y = (a ^~ b) | (b ~^ a) ^ ~a;
+    y = a & |c & ~&c | ^c;
+    y = f(-1, -a, ~b);
+    v = x++ + ++x;
+    v = x-- - --x;
+    if (x++ > 3) v = x-- + 1;
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    for (const char* style : {"both", "none"}) {
+        FormatOptions opts;
+        opts.spacing.binary_operator_spacing = style;
+        const std::string out = format_stable(input, opts);
+        INFO("style " << style << ":\n" << out);
+        CHECK(parses_cleanly(out));
+        CHECK(out.find("f(-1, -a, ~b)") != std::string::npos);
+    }
+}

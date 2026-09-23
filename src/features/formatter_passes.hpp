@@ -170,6 +170,57 @@ inline size_t prev_code(const TokenStream& tokens, size_t before) {
     return npos;
 }
 
+// Operator position, decided from the code token before the operator.  `-`,
+// `+`, `&`, `|`, `^`, `~&`, `~|`, `~^`, `^~` are unary after anything that
+// cannot end an operand (`=`, `(`, `,`, `?`, another operator, a keyword) and
+// binary after one that can.  `++`/`--` are postfix after an operand.
+inline bool in_prefix_position(const TokenStream& tokens, size_t idx);
+
+inline bool ends_operand(const TokenStream& tokens, size_t idx) {
+    const Tok& t = tokens[idx];
+    const TK k = t.lex.kind;
+    if (k == TK::DoublePlus || k == TK::DoubleMinus)
+        return !in_prefix_position(tokens, idx);
+    return is_identifier_like(t) || t.lex.continues_vector_literal ||
+           k == TK::IntegerLiteral || k == TK::RealLiteral || k == TK::TimeLiteral ||
+           k == TK::UnbasedUnsizedLiteral || k == TK::StringLiteral || k == TK::Dollar ||
+           k == TK::CloseParenthesis || k == TK::CloseBracket || k == TK::CloseBrace ||
+           k == TK::ThisKeyword || k == TK::SuperKeyword || k == TK::NullKeyword;
+}
+
+inline bool in_prefix_position(const TokenStream& tokens, size_t idx) {
+    const size_t p = prev_code(tokens, idx);
+    return p == npos || !ends_operand(tokens, p);
+}
+
+// A unary operator directly followed by the start of its operand, where
+// closing the gap would re-lex the pair as another token: `~ &a` (`~&`),
+// `- -b` (`--`), `^ ~a` (`^~`), `& &b` (`&&`).
+inline bool unary_pair_merges(TK l, TK t) {
+    switch (l) {
+    case TK::Plus: case TK::DoublePlus:
+        return t == TK::Plus || t == TK::DoublePlus;
+    case TK::Minus: case TK::DoubleMinus:
+        return t == TK::Minus || t == TK::DoubleMinus;
+    case TK::And: case TK::TildeAnd:
+        return t == TK::And;
+    case TK::Or: case TK::TildeOr:
+        return t == TK::Or;
+    case TK::Xor: case TK::TildeXor: case TK::XorTilde:
+        return t == TK::Tilde || t == TK::TildeAnd || t == TK::TildeOr || t == TK::TildeXor;
+    case TK::Tilde:
+        return t == TK::And || t == TK::Or || t == TK::Xor || t == TK::XorTilde;
+    default:
+        return false;
+    }
+}
+
+// Operators whose spelling is also a unary operator.
+inline bool is_sign_or_reduction_op(TK k) {
+    return k == TK::Plus || k == TK::Minus || k == TK::And || k == TK::Or || k == TK::Xor ||
+           k == TK::TildeAnd || k == TK::TildeOr || k == TK::TildeXor || k == TK::XorTilde;
+}
+
 inline bool is_fork_block_open(const TokenStream& tokens, size_t fork_idx) {
     if (fork_idx >= tokens.size() || !kind_is(tokens[fork_idx], TK::ForkKeyword))
         return false;
@@ -4490,14 +4541,22 @@ public:
             // Exception: `~ &a`, `~ |a`, `~ ^a` — tilde followed by a
             // reduction operator must keep a space so it isn't read as
             // the compound `~&` / `~|` / `~^` operator.
-            if (is_unary_op(L.lex.kind)) {
-                bool tilde_before_reduction = kind_is(L, TK::Tilde) &&
-                    (kind_is(t, TK::And) || kind_is(t, TK::Or) || kind_is(t, TK::Xor));
-                if (!tilde_before_reduction) {
+            //
+            // Which tokens are unary depends on position: `-a`, `&c` and
+            // prefix `++x` bind to their operand, while binary `b ^~ c` and
+            // postfix `x++ > 3` space like any binary operator.
+            const size_t li = prev_code(tokens, i);
+            const bool L_prefix = li != npos && li == i - 1 && in_prefix_position(tokens, li);
+            const bool L_unary =
+                (is_unary_op(L.lex.kind) || is_sign_or_reduction_op(L.lex.kind)) &&
+                (L_prefix || kind_is(L, TK::Tilde) || kind_is(L, TK::Exclamation));
+            if (L_unary) {
+                if (!unary_pair_merges(L.lex.kind, t.lex.kind)) {
                     t.mutable_.space.spaces_before = 0;
                     t.mutable_.space.suppress_space = true;
                     continue;
                 }
+                spaces = 1;
             }
 
             // Hierarchy: . and ::
@@ -4599,9 +4658,12 @@ public:
             bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
                           (L.immutable.syntax.bracket_depth > 0 && !kind_is(L, TK::CloseBracket));
             const std::string& bop_mode = in_dim ? opts_.spacing.dimension_binary_operator_spacing : opts_.spacing.binary_operator_spacing;
-            if (is_binary_op(t.lex.kind) && !is_assign(t))
+            // A sign or reduction in unary position is not a binary operator:
+            // `f(-a)`, `y = &c`.  Its own gap after it was settled above.
+            const bool t_unary = is_sign_or_reduction_op(t.lex.kind) && in_prefix_position(tokens, i);
+            if (is_binary_op(t.lex.kind) && !is_assign(t) && !t_unary)
                 spaces = wants_before(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex.kind) && !is_assign(L))
+            if (is_binary_op(L.lex.kind) && !is_assign(L) && !L_unary)
                 spaces = wants_after(bop_mode) ? 1 : 0;
             if (is_binary_op(L.lex.kind) && !is_assign(L) &&
                 can_begin_unary_expression(t.lex.kind)) {
