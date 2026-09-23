@@ -442,7 +442,9 @@ private:
         // ``ifdef\nFOO`).  Macro usages were remapped above and intentionally
         // remain ordinary tokens.
         if (directive) {
-            size_t line_end = source_.find('\n', pos);
+            size_t line_end = conditional_directive_end(token, pos);
+            if (line_end == std::string::npos)
+                line_end = source_.find('\n', pos);
             if (line_end == std::string::npos)
                 line_end = source_.size();
             std::string_view directive_raw(source_.data() + pos, line_end - pos);
@@ -456,6 +458,36 @@ private:
 
         add_token(kind, raw, pos, directive, false);
         consume_text(raw, false);
+    }
+
+    // A conditional directive ends with its own operand, not with the line:
+    // `` `ifdef NAME `` / `` `ifndef NAME `` / `` `elsif NAME `` take one
+    // identifier, `` `else `` / `` `endif `` take none.  Swallowing the rest of
+    // the line made `` reg [`ifdef W 63 `else 31 `endif :0] r; `` one token,
+    // hiding its `]` -- bracket depth never closed and every later spacing
+    // rule acted as if it were inside a dimension.  The keyword and its name
+    // stay one token, so `` `ifdef FOO `` still cannot be split apart.
+    // Returns npos for every other directive, which keeps its line.
+    size_t conditional_directive_end(const slang::parsing::Token& token, size_t pos) const {
+        using SK = slang::syntax::SyntaxKind;
+        const SK k = token.directiveKind();
+        const size_t keyword_end = pos + token.rawText().size();
+        if (k == SK::ElseDirective || k == SK::EndIfDirective)
+            return keyword_end;
+        if (k != SK::IfDefDirective && k != SK::IfNDefDirective && k != SK::ElsIfDirective)
+            return std::string::npos;
+        size_t p = keyword_end;
+        while (p < source_.size() && (source_[p] == ' ' || source_[p] == '\t'))
+            ++p;
+        const size_t name = p;
+        auto is_name_char = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+        };
+        while (p < source_.size() && is_name_char(source_[p]))
+            ++p;
+        if (p == name || std::isdigit(static_cast<unsigned char>(source_[name])))
+            return std::string::npos;
+        return p;
     }
 
     void add_raw_until_token(const slang::parsing::Token& token) {

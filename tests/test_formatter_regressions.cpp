@@ -354,6 +354,32 @@ TEST_CASE("formatter regression: randcase and randsequence open their own scope"
                    "  final begin\n") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: a conditional directive inside a dimension ends with its operand", "[formatter][regression]") {
+    const std::string input = "module m(\n"
+                              "input clk,\n"
+                              "`ifdef HAS_RESET\n"
+                              "input rst_n,\n"
+                              "`endif // HAS_RESET\n"
+                              "output q\n"
+                              ");\n"
+                              "reg [`ifdef WIDE 63 `else 31 `endif :0] r;\n"
+                              "always @* begin\n"
+                              "case (r)\n"
+                              "2'd1: q = r+1;\n"
+                              "endcase\n"
+                              "end\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(parses_cleanly(out));
+    CHECK(out.find("  reg [`ifdef WIDE 63 `else 31 `endif :0] r;\n"
+                   "  always @* begin\n"
+                   "    case (r)\n"
+                   "      2'd1: q = r + 1;\n") != std::string::npos);
+    CHECK(out.find("\n`ifdef HAS_RESET\n") != std::string::npos);
+    CHECK(out.find("\n`endif // HAS_RESET\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

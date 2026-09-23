@@ -1715,8 +1715,13 @@ public:
                 // token into the comment text on the next formatting pass.
                 t.mutable_.wrap.must_break_after = true;
             }
-            // PP directives (ifdef/endif/else/define/…) are always on their own line.
-            if (t.lex.is_directive) {
+            // PP directives (ifdef/endif/else/define/…) are always on their own
+            // line -- except a conditional inside a dimension, which selects a
+            // bound (`` [`ifdef W 63 `else 31 `endif :0] ``) and reads best
+            // where it stands.  It is a complete lexeme, so staying inline is
+            // as safe as any other token.
+            if (t.lex.is_directive &&
+                !(is_conditional_preprocessor_directive(t) && t.immutable.syntax.bracket_depth > 0)) {
                 t.mutable_.wrap.must_break_before = true;
                 t.mutable_.wrap.must_break_after = true;
             }
@@ -4067,6 +4072,14 @@ public:
                 t.lex.continues_vector_literal) {
                 t.mutable_.space.spaces_before = 0;
                 t.mutable_.space.suppress_space = true;
+                continue;
+            }
+
+            // An inline conditional directive is delimited by whitespace:
+            // `` `else31 `` would re-lex as a macro named `else31`.
+            if (L.lex.is_directive || (t.lex.is_directive && !kind_is(L, TK::OpenBracket))) {
+                t.mutable_.space.spaces_before = 1;
+                t.mutable_.space.suppress_space = false;
                 continue;
             }
 
