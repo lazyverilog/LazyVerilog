@@ -322,6 +322,38 @@ TEST_CASE("formatter regression: property, sequence and clocking references open
     CHECK(out.find("\n  logic z;\nendinterface\n") != std::string::npos);
 }
 
+TEST_CASE("formatter regression: randcase and randsequence open their own scope", "[formatter][regression]") {
+    const std::string input = "module m;\n"
+                              "initial begin\n"
+                              "randcase 1: a = 0;\n"
+                              "3: a = 1;\n"
+                              "endcase\n"
+                              "randsequence (main)\n"
+                              "main : first second;\n"
+                              "first : { a = 1; };\n"
+                              "second : { a = 2; };\n"
+                              "endsequence\n"
+                              "b = 1;\n"
+                              "end\n"
+                              "final begin b = 2; end\n"
+                              "endmodule\n";
+    const std::string out = format_stable(input);
+    INFO("formatted:\n" << out);
+    CHECK(out.find("  initial begin\n"
+                   "    randcase\n"
+                   "      1: a = 0;\n"
+                   "      3: a = 1;\n"
+                   "    endcase\n"
+                   "    randsequence (main)\n") != std::string::npos);
+    CHECK(out.find("      first : {\n"
+                   "        a = 1;\n"
+                   "      };\n") != std::string::npos);
+    CHECK(out.find("\n    endsequence\n"
+                   "    b = 1;\n"
+                   "  end\n"
+                   "  final begin\n") != std::string::npos);
+}
+
 TEST_CASE("formatter regression: a spaced conditional after a literal stays a conditional", "[formatter][regression]") {
     const std::string out = format_stable("assign y = 4'hc ? a : b;\n");
     CHECK(out == "assign y = 4'hc ? a : b;\n");

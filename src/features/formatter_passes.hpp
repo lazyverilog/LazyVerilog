@@ -28,7 +28,9 @@ inline bool is_open_block(TK k) {
            k == TK::GenerateKeyword || k == TK::CoverGroupKeyword ||
            k == TK::PropertyKeyword || k == TK::SequenceKeyword || k == TK::CheckerKeyword ||
            k == TK::ClockingKeyword || k == TK::ConfigKeyword || k == TK::PrimitiveKeyword ||
-           k == TK::SpecifyKeyword || k == TK::ForkKeyword;
+           k == TK::SpecifyKeyword || k == TK::ForkKeyword ||
+           // Closed by `endcase` / `endsequence` like their plain forms.
+           k == TK::RandCaseKeyword || k == TK::RandSequenceKeyword;
 }
 inline bool is_outer_open(TK k) {
     return k == TK::ModuleKeyword || k == TK::InterfaceKeyword || k == TK::PackageKeyword ||
@@ -1790,9 +1792,13 @@ public:
                 if (before_open != npos &&
                     (kind_is(tokens[before_open], TK::CaseKeyword) ||
                      kind_is(tokens[before_open], TK::CaseXKeyword) ||
-                     kind_is(tokens[before_open], TK::CaseZKeyword)))
+                     kind_is(tokens[before_open], TK::CaseZKeyword) ||
+                     kind_is(tokens[before_open], TK::RandSequenceKeyword)))
                     t.mutable_.wrap.must_break_after = true;
             }
+            // `randcase` has no header; its first item starts the next line.
+            if (kind_is(t, TK::RandCaseKeyword))
+                t.mutable_.wrap.must_break_after = true;
             if (kind_is(t, TK::Comma)) t.mutable_.wrap.can_break_after = true;
             // Close-block keywords always start a new line; CloseBrace only when
             // not inside a parenthesised expression (e.g. `inside {A, B}`).
@@ -1855,7 +1861,10 @@ public:
                 }
             }
             if (kind_is(t, TK::OpenBrace)) {
-                if (is_struct_or_union_body_brace(tokens, i))
+                // A statement block's `}` already starts a line; its `{` ends
+                // one, as `begin` does (`first : { a = 1; };` in randsequence).
+                if (is_struct_or_union_body_brace(tokens, i) ||
+                    t.immutable.topology.opens_brace_block)
                     t.mutable_.wrap.must_break_after = true;
             }
             if (opts_.statement.wrap_end_else_clauses && kind_is(t, TK::ElseKeyword) && i > 0 && (kind_is(tokens[i - 1], TK::EndKeyword) || kind_is(tokens[i - 1], TK::CloseBrace))) t.mutable_.wrap.must_break_before = true;
