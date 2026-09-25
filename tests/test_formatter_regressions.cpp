@@ -1761,3 +1761,203 @@ endclass
     CHECK(parses_cleanly(input));
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: the implicit event list is spaced like a first token", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always @(*) o = a;
+always @( * ) o = b;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    always @(*)
+        o = a;
+    always @(*)
+        o = b;
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: the implicit event list takes the event-control paren padding", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always @(*) o = a;
+always @(posedge c) o = b;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    always @( * )
+        o = a;
+    always @( posedge c )
+        o = b;
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.spacing.space_inside_event_control_parens = true;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a concatenation target aligns like a single name", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+{p, q} = r;
+x = 1;
+'{s, t} = u;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        {p, q}     = r;
+        x          = 1;
+        '{s, t}    = u;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a line after a conditional colon or an event or continues the expression", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always @(posedge clk or // c
+negedge rst_n)
+q <= d;
+assign w = sel ? f(a) : // c
+g(b);
+initial case (s)
+1: x = 1;
+default: x = 2;
+endcase
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    always @(posedge clk or // c
+        negedge rst_n)
+        q <= d;
+    assign w = sel ? f(a) : // c
+        g(b);
+    initial
+        case (s)
+            1: x = 1;
+            default: x = 2;
+        endcase
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: hanging arguments after an inline block comment start under the paren", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+x = 1;
+zz = /* c */ f(aaaa, bbbb, cccc);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        x          = 1;
+        zz         = /* c */ f(aaaa,
+                               bbbb,
+                               cccc);
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 3;
+    opts.function_call.layout = "hanging";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a blank line inside a statement starts a continuation line", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+y = a +
+
+f(aaaa, bbbb, cccc);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        y = a +
+
+            f(aaaa,
+              bbbb,
+              cccc);
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 3;
+    opts.function_call.layout = "hanging";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: hanging arguments after a multi-line block comment start from its last line", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+x = 1;
+y = /* a
+b */ func(aaaa, bbbb, cccc);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        x          = 1;
+        y          = /* a
+b */ func(aaaa,
+          bbbb,
+          cccc);
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 3;
+    opts.function_call.layout = "hanging";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a line led by the conditional colon or after a property or continues the expression", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial y = sel ? a // why
+: b;
+property p;
+a or // c
+b;
+endproperty
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial
+        y = sel ? a // why
+            : b;
+    property p;
+        a or // c
+            b;
+    endproperty
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}

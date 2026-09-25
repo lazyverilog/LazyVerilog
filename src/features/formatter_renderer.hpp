@@ -102,7 +102,11 @@ inline std::string render_tokens(const TokenStream& tokens) {
         }
 
         out += tok.lex.text;
-        col += static_cast<int>(tok.lex.text.size());
+        // A block comment spanning lines leaves the column after its last
+        // line break, as a passthrough token does.
+        const size_t nl = last_newline_offset(tok.lex.text);
+        col = nl == std::string::npos ? col + static_cast<int>(tok.lex.text.size())
+                                      : static_cast<int>(tok.lex.text.size() - nl - 1);
 
         if (tok.mutable_.wrap.must_break_after) {
             trim_trailing_spaces(out);
