@@ -20,7 +20,8 @@ struct RenderDecision {
 inline RenderDecision compose(const Tok& tok) {
     RenderDecision out;
     out.newline_before = tok.mutable_.wrap.must_break_before || tok.mutable_.comment.force_own_line;
-    out.indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent + tok.mutable_.comment.relative_indent;
+    out.indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent + tok.mutable_.comment.relative_indent +
+                 tok.mutable_.align.indent_shift;
     out.spaces_before = tok.mutable_.space.suppress_space ? 0 : tok.mutable_.space.spaces_before;
     out.blank_lines = tok.mutable_.blank.before;
     out.passthrough = is_passthrough(tok);
@@ -30,13 +31,6 @@ inline RenderDecision compose(const Tok& tok) {
 
 inline void trim_trailing_spaces(std::string& out) {
     while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
-}
-
-inline size_t last_newline_offset(std::string_view text) {
-    for (size_t n = text.size(); n > 0; --n)
-        if (text[n - 1] == '\n')
-            return n - 1;
-    return std::string_view::npos;
 }
 
 inline std::string render_tokens(const TokenStream& tokens) {

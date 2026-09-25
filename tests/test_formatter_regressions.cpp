@@ -1254,3 +1254,510 @@ endmodule
     // Without the role the macro is an unknown expression leaf, as before.
     CHECK(format_stable(input) != expected);
 }
+
+// FORMAT_BUG_FIX3.md: K-1 .. K-15.
+
+TEST_CASE("formatter regression: wrapped call arguments follow statement-alignment padding (hanging)", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+y = f(arg_one, arg_two, arg_three);
+long_name_zz = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        y          = f(arg_one,
+                       arg_two,
+                       arg_three);
+        long_name_zz = 1;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 3;
+    opts.function_call.layout = "hanging";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: wrapped call arguments follow statement-alignment padding (block)", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+y = f(arg_one, arg_two, arg_three);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial begin
+        y          = f(
+                         arg_one,
+                         arg_two,
+                         arg_three
+                     );
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 3;
+    opts.function_call.layout = "block";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: declaration alignment stays off casts, return types and hanging argument lists", "[formatter][regression]") {
+    const std::string input = R"SV(class c;
+task run();
+void'(arr.sum() with (int'(item)));
+endtask
+static function base#(T, W) create();
+endfunction
+function void do_it(input int a, output int bbbbbbbbbb);
+endfunction
+logic [3:0] a;
+endclass
+)SV";
+    const std::string expected = R"SV(class c;
+    task run();
+        void'(arr.sum() with (int'(item)));
+    endtask
+    static function base #(T, W) create();
+    endfunction
+    function void do_it(input int a,
+                        output int bbbbbbbbbb);
+    endfunction
+    logic  [3:0]       a       ;
+endclass
+)SV";
+    FormatOptions opts = indent4();
+    opts.var_declaration.align = true;
+    opts.var_declaration.section2_min_width = 12;
+    opts.var_declaration.section3_min_width = 8;
+    opts.function_declaration.layout = "hanging";
+    opts.function_declaration.line_length = 30;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an own-line comment inside a continued expression keeps the continuation indent", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+assign d = a +
+// c
+b;
+initial begin
+x = a +
+// c
+b;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    assign d = a +
+        // c
+        b;
+    initial begin
+        x = a +
+            // c
+            b;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a parameter override list with a comment expands", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+fifo #(.W(8), .D(4) // depth
+) u (.clk(clk));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    fifo #(
+        .W(8),
+        .D(4) // depth
+    ) u(
+        .clk(clk)
+    );
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an empty positional connection takes the port indent", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+sub u (
+.a(a),
+.b(b)
+);
+sub u2 (clk,
+ a,
+ ,
+ y);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    sub u(
+        .a(a),
+        .b(b)
+    );
+    sub u2(
+        clk,
+        a,
+        ,
+        y
+    );
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an inline constraint block stays on its line", "[formatter][regression]") {
+    const std::string input = R"SV(class c;
+task run();
+if (!this.randomize() with {data < 5; id == 3;}) $error("f");
+endtask
+endclass
+)SV";
+    const std::string expected = R"SV(class c;
+    task run();
+        if (!this.randomize() with { data < 5; id == 3; })
+            $error("f");
+    endtask
+endclass
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a class specialization parameter list stays inline", "[formatter][regression]") {
+    const std::string input = R"SV(class c extends p #(T);
+endclass
+class d extends p #(.T(byte), .W(4));
+endclass
+class e #(type T = int) extends p #(T, 4);
+endclass
+)SV";
+    const std::string expected = R"SV(class c extends p #(T);
+endclass
+class d extends p #(.T(byte), .W(4));
+endclass
+class e #(
+    type T = int
+) extends p #(T, 4);
+endclass
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a member-select LHS joins assignment alignment", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always_ff @(posedge clk) begin
+s.a <= d;
+s.bb <= 1'b1;
+y <= 1'b0;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    always_ff @(posedge clk) begin
+        s.a        <= d;
+        s.bb       <= 1'b1;
+        y          <= 1'b0;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 10;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: the first assign in a labelled generate block keeps its select", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+for (genvar g = 0; g < 2; g++) begin : gen
+assign wl[g] = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    for (genvar g = 0; g < 2; g++) begin: gen
+        assign wl[g] = 1;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an assignment pattern after a key keeps its space", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+parameter pkt_t DEF = '{tag: 4'h1, data: '{raw: 8'h0}};
+initial x = c ? '{1} : '{2};
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    parameter pkt_t DEF = '{tag : 4'h1, data : '{raw : 8'h0}};
+    initial
+        x = c ? '{1} : '{2};
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: new with a size and an initializer stays joined", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial d = new[10](d);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    initial
+        d = new[10](d);
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: gate and bind instances are laid out as instances", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+and #1 g1 (o1, i1, i2), g2 (o2, i3, i4);
+bind fifo chk u_chk (.clk(clk), .a(a));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    and #1 g1(o1, i1, i2), g2(o2, i3, i4);
+    bind fifo chk u_chk(
+        .clk(clk),
+        .a(a)
+    );
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.function_call.break_policy = "always";
+    opts.function_call.arg_count = 2;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: space_inside_parens is symmetric on overrides and after a concatenation", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+fifo #(.WIDTH(8)) u (.d({d[3:0], d[7:4]}), .q(q));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    fifo #( .WIDTH( 8 ) ) u(
+        .d( {d[3:0], d[7:4]} ),
+        .q( q )
+    );
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.spacing.space_inside_parens = true;
+    opts.function_call.space_inside_paren = true;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: port alignment covers interface ports and comment-led rows", "[formatter][regression]") {
+    const std::string input = R"SV(module p (
+input logic a,
+interface.slave bus,
+bus_if.master mbus,
+/* c */ input logic b,
+output logic [7:0] q
+);
+endmodule
+)SV";
+    const std::string expected = R"SV(module p(
+    input   logic           a,
+    interface.slave         bus,
+    bus_if.master           mbus,
+    /* c */ input logic     b,
+    output  logic   [7:0]   q
+);
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.port_declaration.align = true;
+    opts.port_declaration.section1_min_width = 8;
+    opts.port_declaration.section2_min_width = 8;
+    opts.port_declaration.section3_min_width = 8;
+    opts.port_declaration.section4_min_width = 6;
+    opts.port_declaration.section5_min_width = 0;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: timing controls align like the assignment they lead", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+wire #(1,2) w1, w2;
+initial begin
+#(2) a = b;
+cc = d;
+@(posedge clk) e = f;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    wire #(1, 2) w1, w2     ;
+    initial begin
+        #(2) a           = b;
+        cc               = d;
+        @(posedge clk) e = f;
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 0;
+    opts.var_declaration.align = true;
+    opts.var_declaration.section2_min_width = 14;
+    opts.var_declaration.section3_min_width = 6;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an event-control star and a case-inside header continue no expression", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always @*
+o = clk;
+always_comb begin
+priority case (s) inside
+[0:1]: y = 0;
+default: y = 1;
+endcase
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    always @*
+        o = clk;
+    always_comb begin
+        priority case (s) inside
+            [0:1]: y = 0;
+            default: y = 1;
+        endcase
+    end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a long interface type widens a non-adaptive port group", "[formatter][regression]") {
+    const std::string input = R"SV(module p (
+input logic a,
+some_long_interface_name.master mbus,
+input logic bb
+);
+endmodule
+)SV";
+    const std::string expected = R"SV(module p(
+    input logic                     a,
+    some_long_interface_name.master mbus,
+    input logic                     bb
+);
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = false;
+    opts.port_declaration.section1_min_width = 6;
+    opts.port_declaration.section2_min_width = 6;
+    opts.port_declaration.section3_min_width = 4;
+    opts.port_declaration.section4_min_width = 6;
+    opts.port_declaration.section5_min_width = 0;
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an SVA not before a sequence instance is no gate", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+and g1 (o1, i1, i2);
+sequence s1(x); x; endsequence
+property pr(a);
+not s1(a);
+endproperty
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    and g1(o1, i1, i2);
+    sequence s1(x);
+        x;
+    endsequence
+    property pr(a);
+        not s1(a);
+    endproperty
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: each ifdef branch continues the expression before it", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+localparam int W =
+`ifdef WIDE
+64;
+`else
+32;
+`endif
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+    localparam int W =
+`ifdef WIDE
+        64;
+`else
+        32;
+`endif
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an inline constraint holding a line comment breaks after its brace", "[formatter][regression]") {
+    const std::string input = R"SV(class c;
+task run();
+if (!randomize() with { a < 5; // c
+b > 2; }) $error("x");
+endtask
+endclass
+)SV";
+    const std::string expected = R"SV(class c;
+    task run();
+        if (!randomize() with {
+            a < 5; // c
+            b > 2; })
+            $error("x");
+    endtask
+endclass
+)SV";
+    FormatOptions opts = indent4();
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input, opts) == expected);
+}

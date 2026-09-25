@@ -14,6 +14,44 @@ using TK = slang::parsing::TokenKind;
 
 inline bool kind_is(const Tok& t, TK k) { return t.lex.kind == k; }
 inline bool is_passthrough(const Tok& t) { return t.mutable_.macro.passthrough || t.lex.is_whitespace_sensitive; }
+inline size_t last_newline_offset(std::string_view text) {
+    for (size_t n = text.size(); n > 0; --n)
+        if (text[n - 1] == '\n')
+            return n - 1;
+    return std::string_view::npos;
+}
+
+// Whether BlankLinePass puts blank lines before `tokens[i]`.  It reads only
+// immutable facts, so a pass that runs earlier -- AlignPass, walking the lines
+// the renderer will emit -- can ask it too: a blank line also breaks the line.
+inline bool is_blank_line_boundary(const TokenStream& tokens, size_t i) {
+    const Tok& t = tokens[i];
+    int boundary_newlines = t.immutable.input_trivia.original_newlines_before;
+
+    // Passthrough tokens are rendered verbatim, so a physical item
+    // boundary can be split across the previous token's immutable text
+    // and this token's ordinary leading trivia.  This happens for
+    // multiline macro definitions frozen as one whitespace-sensitive
+    // directive:
+    //
+    //   `define FOO \
+    //     foo();\n
+    //   \n
+    //   `define BAR ...
+    //
+    // The first newline is part of the raw `define token; the second
+    // is the gap before `define BAR.  Together they represent one
+    // blank separator line.  Keep this policy here rather than
+    // inventing lexer-side pending trivia after a token has already
+    // been emitted.
+    if (i > 0 && is_passthrough(tokens[i - 1]) && !tokens[i - 1].lex.text.empty() &&
+        tokens[i - 1].lex.text.back() == '\n')
+        boundary_newlines += 1;
+
+    return boundary_newlines > 1 &&
+           t.immutable.syntax.paren_depth == 0 &&
+           t.immutable.syntax.brace_depth == 0;
+}
 inline int token_width(const Tok& t) { return static_cast<int>(t.lex.text.size()); }
 
 inline bool is_control_keyword(TK k) {
@@ -1032,6 +1070,11 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             const bool colon = here && sx.bracket_depth == bd && kind_is(tokens[i], TK::Colon);
             if (enclosing || separator || colon || closes_control_header(tokens, i))
                 break;
+            // `begin : gen` -- the block's name belongs to its opener, not to
+            // the first item after it (`begin : gen assign wl[g] = 1;`).
+            const size_t before = prev_code(tokens, i);
+            if (before != npos && tokens[before].immutable.topology.is_block_name_colon)
+                break;
             begin = i;
         }
         return begin;
@@ -1172,7 +1215,8 @@ inline size_t module_header_parameter_hash_owner(const TokenStream& tokens, size
     return find_header_keyword_before(tokens, open);
 }
 
-inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
+// Can a module item (an instantiation) start right after `prev`?
+inline bool follows_module_item_boundary(const TokenStream& tokens, size_t prev) {
     auto is_basic_sv_item_boundary = [&](size_t prev) {
         if (prev == npos)
             return true;
@@ -1292,7 +1336,79 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
 
         return false;
     };
+    return follows_sv_item_boundary(prev);
+}
 
+inline bool is_gate_keyword(TK k) {
+    switch (k) {
+    case TK::AndKeyword: case TK::NandKeyword: case TK::OrKeyword: case TK::NorKeyword:
+    case TK::XorKeyword: case TK::XnorKeyword: case TK::BufKeyword: case TK::NotKeyword:
+    case TK::BufIf0Keyword: case TK::BufIf1Keyword: case TK::NotIf0Keyword: case TK::NotIf1Keyword:
+    case TK::NmosKeyword: case TK::PmosKeyword: case TK::RnmosKeyword: case TK::RpmosKeyword:
+    case TK::CmosKeyword: case TK::RcmosKeyword: case TK::TranKeyword: case TK::RtranKeyword:
+    case TK::TranIf0Keyword: case TK::TranIf1Keyword: case TK::RtranIf0Keyword: case TK::RtranIf1Keyword:
+    case TK::PullUpKeyword: case TK::PullDownKeyword:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The instance name before a port list, `u_x` or `u_x[3:0]`; npos when the
+// token before `open` is not one.
+inline size_t instance_name_before(const TokenStream& tokens, size_t open) {
+    size_t inst = prev_code(tokens, open);
+    if (inst != npos && kind_is(tokens[inst], TK::CloseBracket)) {
+        size_t br = tokens[inst].immutable.syntax.matching_token;
+        inst = br == npos ? npos : prev_code(tokens, br);
+    }
+    return inst != npos && kind_is(tokens[inst], TK::Identifier) ? inst : npos;
+}
+
+// `and #1 g1 (o1, i1, i2), g2 (o2, i3, i4);` and
+// `bufif0 (strong0, weak1) #(1:2:3) b1 (o, i, en);` -- the terminal list of a
+// named gate-primitive instance.  The gate keyword must stand where a module
+// item starts, so a sequence instance in `a and s1(x)` is not one.
+inline bool is_gate_terminal_open(const TokenStream& tokens, size_t open) {
+    if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenParenthesis))
+        return false;
+    const size_t inst = instance_name_before(tokens, open);
+    if (inst == npos)
+        return false;
+    size_t k = prev_code(tokens, inst);
+    // A later instance of the same gate statement.
+    if (k != npos && kind_is(tokens[k], TK::Comma)) {
+        const size_t close = prev_code(tokens, k);
+        return close != npos && kind_is(tokens[close], TK::CloseParenthesis) &&
+               tokens[close].immutable.syntax.matching_token != npos &&
+               is_gate_terminal_open(tokens, tokens[close].immutable.syntax.matching_token);
+    }
+    // Delay: `#1`, `#d`, `#(1:2:3)`.
+    if (k != npos && kind_is(tokens[k], TK::CloseParenthesis) &&
+        tokens[k].immutable.syntax.matching_token != npos) {
+        const size_t hash = prev_code(tokens, tokens[k].immutable.syntax.matching_token);
+        if (hash != npos && kind_is(tokens[hash], TK::Hash))
+            k = prev_code(tokens, hash);
+    } else if (k != npos) {
+        const size_t hash = prev_code(tokens, k);
+        if (hash != npos && kind_is(tokens[hash], TK::Hash))
+            k = prev_code(tokens, hash);
+    }
+    // Drive or pull strength: `(strong0, weak1)`.
+    if (k != npos && kind_is(tokens[k], TK::CloseParenthesis) &&
+        tokens[k].immutable.syntax.matching_token != npos) {
+        const size_t kw = prev_code(tokens, tokens[k].immutable.syntax.matching_token);
+        if (kw != npos && is_gate_keyword(tokens[kw].lex.kind))
+            k = kw;
+    }
+    // `property p; not s1(a); endproperty` -- there `not` is a property
+    // operator and `s1(a)` a sequence instance.
+    return k != npos && is_gate_keyword(tokens[k].lex.kind) &&
+           !tokens[k].immutable.syntax.in_property_expr &&
+           follows_module_item_boundary(tokens, prev_code(tokens, k));
+}
+
+inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
     size_t inst = prev_code(tokens, open);
     if (inst != npos && kind_is(tokens[inst], TK::CloseBracket)) {
         size_t br = tokens[inst].immutable.syntax.matching_token;
@@ -1315,9 +1431,32 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
         if (hash != npos && kind_is(tokens[hash], TK::Hash))
             mod = prev_code(tokens, hash);
     }
+    // `sub u1 (...), u2 (...);` -- a later instance of the same statement.
+    if (mod != npos && kind_is(tokens[mod], TK::Comma) && tokens[open].immutable.syntax.paren_depth == 0) {
+        const size_t close = prev_code(tokens, mod);
+        return close != npos && kind_is(tokens[close], TK::CloseParenthesis) &&
+               tokens[close].immutable.syntax.matching_token != npos &&
+               is_instance_port_open(tokens, tokens[close].immutable.syntax.matching_token);
+    }
     if (mod == npos || !is_identifier_like(tokens[mod])) return false;
     size_t prev = prev_code(tokens, mod);
-    return follows_sv_item_boundary(prev);
+    if (follows_module_item_boundary(tokens, prev))
+        return true;
+    // `bind fifo chk u_chk (...)`, `bind top.u_a: u_b chk u_chk (...)` --
+    // the bind target runs from `bind` to the instantiated module.
+    for (size_t n = mod; n > 0; --n) {
+        const size_t i = n - 1;
+        if (!is_code_token(tokens[i]))
+            continue;
+        if (kind_is(tokens[i], TK::BindKeyword))
+            return follows_module_item_boundary(tokens, prev_code(tokens, i));
+        if (!(is_identifier_like(tokens[i]) || kind_is(tokens[i], TK::Dot) ||
+              kind_is(tokens[i], TK::Colon) || kind_is(tokens[i], TK::Comma) ||
+              kind_is(tokens[i], TK::OpenBracket) || kind_is(tokens[i], TK::CloseBracket) ||
+              kind_is(tokens[i], TK::IntegerLiteral)))
+            return false;
+    }
+    return false;
 }
 
 // SyntaxPass is the early fact-freeze pass.  It writes SyntaxFacts,
@@ -1425,8 +1564,10 @@ public:
             if (kind_is(t, TK::Semicolon)) {
                 // A `;` at the brace's own depth makes the brace a statement
                 // block.  No expression brace can hold one.
-                if (!braces.empty() && brace_ctx.back() == std::pair<int, int>(pd, bd))
+                if (!braces.empty() && brace_ctx.back() == std::pair<int, int>(pd, bd)) {
                     tokens[braces.back()].immutable.topology.opens_brace_block = true;
+                    t.immutable.topology.separates_brace_block_items = true;
+                }
                 in_function_decl = false;
                 in_task_decl = false;
                 in_modport = false;
@@ -1777,19 +1918,36 @@ private:
     }
 };
 
-inline bool is_class_extends_parameter_list(const TokenStream& tokens, size_t open) {
+// The keyword that owns a `#(` in a class header: `class` for the class's own
+// parameter port list (`class base #(type T = int)`), `extends`/`implements`
+// for a specialization of another class (`extends p #(T)`).  npos when the
+// `#(` is not in a class header.
+inline size_t class_header_parameter_list_owner(const TokenStream& tokens, size_t open) {
     size_t hash = prev_code(tokens, open);
     if (hash == npos || !kind_is(tokens[hash], TK::Hash))
-        return false;
+        return npos;
     for (size_t n = hash; n > 0; --n) {
         size_t i = n - 1;
         if (!is_code_token(tokens[i])) continue;
         if (kind_is(tokens[i], TK::Semicolon))
             break;
-        if (kind_is(tokens[i], TK::ExtendsKeyword) || kind_is(tokens[i], TK::ClassKeyword))
-            return true;
+        if (kind_is(tokens[i], TK::ExtendsKeyword) || kind_is(tokens[i], TK::ImplementsKeyword) ||
+            kind_is(tokens[i], TK::ClassKeyword))
+            return i;
     }
-    return false;
+    return npos;
+}
+
+// `extends p #(...)` -- a list of values, not declarations.
+inline bool is_class_extends_parameter_list(const TokenStream& tokens, size_t open) {
+    const size_t owner = class_header_parameter_list_owner(tokens, open);
+    return owner != npos && !kind_is(tokens[owner], TK::ClassKeyword);
+}
+
+// `class base #(type T = int, int W = 8)` -- the class's own parameter ports.
+inline bool is_class_header_parameter_list(const TokenStream& tokens, size_t open) {
+    const size_t owner = class_header_parameter_list_owner(tokens, open);
+    return owner != npos && kind_is(tokens[owner], TK::ClassKeyword);
 }
 
 // Reads the classification SyntaxPass already froze.  The previous version
@@ -2248,7 +2406,8 @@ public:
             if (opts_.statement.begin_newline &&
                 (kind_is(t, TK::BeginKeyword) ||
                  is_fork_block_open(tokens, i) ||
-                 (kind_is(t, TK::OpenBrace) && !is_expression_brace(tokens, i))))
+                 (kind_is(t, TK::OpenBrace) && !is_expression_brace(tokens, i) &&
+                  t.immutable.syntax.paren_depth == 0)))
                 t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::OpenBrace) && is_multiline_brace_construct(tokens, i)) {
                 if (opts_.statement.begin_newline)
@@ -2265,8 +2424,24 @@ public:
             if (kind_is(t, TK::OpenBrace)) {
                 // A statement block's `}` already starts a line; its `{` ends
                 // one, as `begin` does (`first : { a = 1; };` in randsequence).
+                // Not inside parentheses: an inline constraint in a condition
+                // (`if (!randomize() with { a < 5; })`) has its `;`s and `}`
+                // kept on the line, so breaking only after `{` split it once.
+                // One holding a `//` or own-line comment cannot stay on a line.
+                auto holds_breaking_comment = [&]() {
+                    const size_t close = t.immutable.syntax.matching_token;
+                    if (close == npos)
+                        return false;
+                    for (size_t k = i + 1; k < close && k < tokens.size(); ++k)
+                        if (tokens[k].lex.comment_kind == CommentLexemeKind::Line ||
+                            (tokens[k].lex.comment_kind != CommentLexemeKind::None &&
+                             tokens[k].immutable.comment.role == CommentRole::OwnLine))
+                            return true;
+                    return false;
+                };
                 if (is_struct_or_union_body_brace(tokens, i) ||
-                    t.immutable.topology.opens_brace_block)
+                    (t.immutable.topology.opens_brace_block &&
+                     (t.immutable.syntax.paren_depth == 0 || holds_breaking_comment())))
                     t.mutable_.wrap.must_break_after = true;
             }
             if (opts_.statement.wrap_end_else_clauses && kind_is(t, TK::ElseKeyword) && i > 0 && (kind_is(tokens[i - 1], TK::EndKeyword) || kind_is(tokens[i - 1], TK::CloseBrace))) t.mutable_.wrap.must_break_before = true;
@@ -2539,18 +2714,38 @@ public:
             }
 
             if (tokens[open].immutable.topology.starts_parameter_list) {
-                if (find_header_keyword_before(tokens, open) == npos &&
-                    !is_class_extends_parameter_list(tokens, open))
-                    continue;
+                // A specialization (`extends p #(T)`) is a list of values,
+                // like an instance's override list: it breaks only when it
+                // does not fit the line.  The declaration gate below --
+                // one parameter per line -- is for parameter port lists.
+                //
+                // Any other `#(` -- an instance's override list, a
+                // parameterized type -- stays as written on one line unless
+                // something inside ends a line anyway: a `//` comment, an
+                // own-line comment or a directive.  Left joined, whatever
+                // follows that break lands at the statement's indent and
+                // reads as a new statement.
+                const bool specialization = is_class_extends_parameter_list(tokens, open);
+                const bool declaration = find_header_keyword_before(tokens, open) != npos ||
+                                         is_class_header_parameter_list(tokens, open);
                 auto items = top_level_list_items(tokens, open + 1, close);
                 if (items.empty())
                     continue;
                 bool block = opts_.module.parameter_layout != "hanging";
-                bool expand = block || items.size() > 1 ||
-                              parameter_list_contains_directive(tokens, open, close) ||
-                              (line_prefix_width(tokens, open) + 1 +
-                               compact_width(tokens, open + 1, close) + 1 >
-                               opts_.function_declaration.line_length);
+                const int one_line = line_prefix_width(tokens, open) + 1 +
+                                     compact_width(tokens, open + 1, close) + 1;
+                const bool directive = parameter_list_contains_directive(tokens, open, close);
+                bool breaks_inside = directive;
+                for (size_t k = open + 1; k < close && !breaks_inside; ++k)
+                    breaks_inside = tokens[k].lex.comment_kind == CommentLexemeKind::Line ||
+                                    (tokens[k].lex.comment_kind != CommentLexemeKind::None &&
+                                     tokens[k].immutable.comment.role == CommentRole::OwnLine);
+                bool expand = declaration
+                    ? block || items.size() > 1 || directive ||
+                      one_line > opts_.function_declaration.line_length
+                    : specialization
+                    ? breaks_inside || one_line > opts_.function_call.line_length
+                    : breaks_inside;
                 if (expand) {
                     apply_list(open, block ? WrapListKind::ModuleParametersBlock
                                            : WrapListKind::ModuleParametersHanging,
@@ -2591,6 +2786,10 @@ public:
                 apply_list(open, WrapListKind::InstancePorts, true, true, true);
                 continue;
             }
+            // A gate's terminals are positional and few; the instance stays
+            // on its line rather than being broken like a call.
+            if (is_gate_terminal_open(tokens, open))
+                continue;
 
             bool is_decl = false;
             for (size_t j = open; j > 0; --j) {
@@ -2658,8 +2857,106 @@ public:
                 t.mutable_.wrap.must_break_after = true;
             }
         }
+
+        mark_expression_continuations(tokens);
     }
 private:
+    // A comment inside an expression ends a line in the middle of it:
+    //
+    //   assign d = a +
+    //              // why
+    //              b;
+    //
+    // The comment and the operand after it continue the expression, so they
+    // are indented past the statement rather than landing at its column,
+    // where they read as a new statement.  A line continues an expression
+    // when the code before it cannot end one -- an operator, an opening
+    // delimiter, a comma inside one -- or when the line itself starts with a
+    // binary operator (`| b;`).  Only lines no list layout owns: an item of
+    // a wrapped list, and the comments between items, take the list's
+    // indent, and a statement block's contents their scope's.  Decided here,
+    // after every break is final, from TokenKinds only.
+    static void mark_expression_continuations(TokenStream& tokens) {
+        std::vector<size_t> opens; // enclosing delimiters, innermost last
+        size_t prev = npos;        // last code token
+        struct Branch { size_t prev; std::vector<size_t> opens; };
+        std::vector<Branch> branches; // state at each open `ifdef, innermost last
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            Tok& t = tokens[i];
+            if (is_passthrough(t))
+                continue;
+            const bool starts_line = i > 0 && (t.mutable_.wrap.must_break_before ||
+                                               tokens[i - 1].mutable_.wrap.must_break_after);
+            if (starts_line && prev != npos && !t.lex.is_directive &&
+                !t.mutable_.macro.suppress_wrapping && !t.lex.in_attribute_instance &&
+                t.mutable_.wrap.list_kind == WrapListKind::None) {
+                const Tok& p = tokens[prev];
+                const size_t enclosing = opens.empty() ? npos : opens.back();
+                const bool in_list = enclosing != npos &&
+                                     tokens[enclosing].mutable_.wrap.list_open == enclosing &&
+                                     tokens[enclosing].mutable_.wrap.list_kind != WrapListKind::None;
+                const bool list_boundary = in_list && (prev == enclosing || kind_is(p, TK::Comma));
+                const bool block_open = (kind_is(p, TK::OpenBrace) &&
+                                         (p.immutable.topology.opens_brace_block ||
+                                          is_struct_or_union_body_brace(tokens, prev)));
+                const TK pk = p.lex.kind;
+                // `case (s) inside` / `matches`: the header's own break, set
+                // above, ends the header; the first case item is no operand.
+                const bool case_header_end = (pk == TK::InsideKeyword || pk == TK::MatchesKeyword) &&
+                                             p.mutable_.wrap.must_break_after;
+                // `always @*` -- the `*` is an event control, not a product.
+                const size_t before_prev = prev_code(tokens, prev);
+                const bool event_star = pk == TK::Star && before_prev != npos &&
+                                        kind_is(tokens[before_prev], TK::At);
+                const bool open_delim = pk == TK::OpenParenthesis || pk == TK::OpenBracket ||
+                                        pk == TK::OpenBrace || pk == TK::ApostropheOpenBrace;
+                const bool continues =
+                    is_binary_op(pk) || is_assignment_op(pk) || pk == TK::Question || open_delim ||
+                    (pk == TK::Comma && enclosing != npos) ||
+                    (t.lex.comment_kind == CommentLexemeKind::None && is_binary_op(t.lex.kind) &&
+                     !in_prefix_position(tokens, i));
+                if (continues && !list_boundary && !block_open && !case_header_end && !event_star &&
+                    !p.lex.in_attribute_instance)
+                    t.mutable_.wrap.continuation = true;
+            }
+            // Each branch of `` `ifdef `` continues from what preceded the
+            // `` `ifdef ``, not from the end of the branch before it.
+            if (t.lex.is_directive) {
+                using SK = slang::syntax::SyntaxKind;
+                switch (t.lex.directive_kind) {
+                case SK::IfDefDirective:
+                case SK::IfNDefDirective:
+                    branches.push_back({prev, opens});
+                    break;
+                case SK::ElsIfDirective:
+                case SK::ElseDirective:
+                    if (!branches.empty()) {
+                        prev = branches.back().prev;
+                        opens = branches.back().opens;
+                    }
+                    break;
+                case SK::EndIfDirective:
+                    if (!branches.empty())
+                        branches.pop_back();
+                    break;
+                default:
+                    break;
+                }
+            }
+            if (!is_code_token(t))
+                continue;
+            const TK k = t.lex.kind;
+            if (k == TK::OpenParenthesis || k == TK::OpenBracket || k == TK::OpenBrace ||
+                k == TK::ApostropheOpenBrace) {
+                opens.push_back(i);
+            } else if ((k == TK::CloseParenthesis || k == TK::CloseBracket || k == TK::CloseBrace) &&
+                       !opens.empty()) {
+                opens.pop_back();
+            }
+            prev = i;
+        }
+    }
+
     static void apply_procedural_block_wrap(TokenStream& tokens) {
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (!is_procedural_block_at(tokens, i))
@@ -2963,7 +3260,8 @@ public:
         };
         auto column_before = [&](size_t idx) {
             size_t s = line_start_of(idx);
-            int base = tokens[s].mutable_.indent.base_indent;
+            int base = tokens[s].mutable_.indent.base_indent +
+                       tokens[s].mutable_.indent.continuation_indent;
             int col = base;
 
             // Indentation is now intentionally downstream of spacing.  The
@@ -3001,9 +3299,15 @@ public:
             }
             return col;
         };
-        auto set_item_indent = [&](size_t first, size_t last, int indent) {
+        // `anchor` is the token the indent was measured from; AlignPass moves
+        // the line by whatever alignment padding lands before it.
+        auto set_indent = [&](size_t k, int indent, size_t anchor) {
+            tokens[k].mutable_.indent.base_indent = std::max(0, indent);
+            tokens[k].mutable_.indent.anchor_token = anchor;
+        };
+        auto set_item_indent = [&](size_t first, size_t last, int indent, size_t anchor) {
             if (first >= tokens.size()) return;
-            tokens[first].mutable_.indent.base_indent = std::max(0, indent);
+            set_indent(first, indent, anchor);
             for (size_t k = first + 1; k <= last && k < tokens.size(); ++k) {
                 // Conditional directives stay at column 0 (see the main loop);
                 // one nested inside an item must not take the item's indent.
@@ -3011,7 +3315,7 @@ public:
                     continue;
                 if (tokens[k].mutable_.wrap.must_break_before ||
                     (tokens[k].lex.comment_kind != CommentLexemeKind::None && tokens[k].immutable.comment.role == CommentRole::OwnLine))
-                    tokens[k].mutable_.indent.base_indent = std::max(0, indent);
+                    set_indent(k, indent, anchor);
             }
         };
 
@@ -3033,9 +3337,12 @@ public:
             if (items.empty())
                 continue;
 
-            int base = tokens[line_start_of(open)].mutable_.indent.base_indent;
+            const size_t open_line = line_start_of(open);
+            int base = tokens[open_line].mutable_.indent.base_indent +
+                       tokens[open_line].mutable_.indent.continuation_indent;
             int item_indent = base + opts_.indent_size;
             int close_indent = base;
+            size_t anchor = open_line;
 
             size_t name = prev_code(tokens, open);
             int name_col = (name == npos) ? base : column_before(name);
@@ -3045,10 +3352,12 @@ public:
             case WrapListKind::FunctionBlock:
                 item_indent = name_col + opts_.indent_size;
                 close_indent = name_col;
+                if (name != npos) anchor = name;
                 break;
             case WrapListKind::FunctionHanging:
                 item_indent = after_open_col;
                 close_indent = after_open_col;
+                anchor = open;
                 break;
             case WrapListKind::ModuleParametersBlock:
                 item_indent = base + opts_.indent_size;
@@ -3057,6 +3366,7 @@ public:
             case WrapListKind::ModuleParametersHanging:
                 item_indent = after_open_col;
                 close_indent = after_open_col;
+                anchor = open;
                 break;
             case WrapListKind::FunctionDeclBlock:
                 item_indent = base + opts_.indent_size;
@@ -3065,14 +3375,32 @@ public:
             case WrapListKind::FunctionDeclHanging:
                 item_indent = after_open_col;
                 close_indent = after_open_col;
+                anchor = open;
                 break;
             case WrapListKind::InstancePorts:
+                // Ports indent from the instantiated module's line, not from
+                // wherever a hanging `#(...)` override list left the `(`.
+                if (size_t inst = instance_name_before(tokens, open); inst != npos) {
+                    size_t mod = prev_code(tokens, inst);
+                    if (mod != npos && kind_is(tokens[mod], TK::CloseParenthesis) &&
+                        tokens[mod].immutable.syntax.matching_token != npos) {
+                        const size_t hash = prev_code(tokens, tokens[mod].immutable.syntax.matching_token);
+                        if (hash != npos && kind_is(tokens[hash], TK::Hash))
+                            mod = prev_code(tokens, hash);
+                    }
+                    if (mod != npos && is_identifier_like(tokens[mod])) {
+                        anchor = line_start_of(mod);
+                        base = tokens[anchor].mutable_.indent.base_indent;
+                    }
+                }
                 item_indent = base + std::max(0, opts_.instance.port_indent_level) * opts_.indent_size;
                 close_indent = base;
                 break;
             case WrapListKind::ModulePorts:
-                if (size_t hdr = find_header_keyword_before(tokens, open); hdr != npos)
+                if (size_t hdr = find_header_keyword_before(tokens, open); hdr != npos) {
                     base = tokens[hdr].mutable_.indent.base_indent;
+                    anchor = npos;
+                }
                 item_indent = base + opts_.indent_size;
                 close_indent = base;
                 break;
@@ -3087,21 +3415,41 @@ public:
             }
 
             for (const auto& item : items)
-                set_item_indent(item.first, item.last, item_indent);
+                set_item_indent(item.first, item.last, item_indent, anchor);
+            // An empty item (`sub u (clk, a, , y);`) is only its comma, and
+            // top_level_list_items() has no item for it; the comma still
+            // starts a line of the list and takes the item indent.
+            {
+                int pd = 0, bd = 0, brd = 0;
+                for (size_t k = open + 1; k < close; ++k) {
+                    if (!is_code_token(tokens[k])) continue;
+                    const TK kk = tokens[k].lex.kind;
+                    if (kk == TK::OpenParenthesis) ++pd;
+                    else if (kk == TK::CloseParenthesis && pd > 0) --pd;
+                    else if (kk == TK::OpenBracket) ++bd;
+                    else if (kk == TK::CloseBracket && bd > 0) --bd;
+                    else if (kk == TK::OpenBrace || kk == TK::ApostropheOpenBrace) ++brd;
+                    else if (kk == TK::CloseBrace && brd > 0) --brd;
+                    else if (kk == TK::Comma && pd == 0 && bd == 0 && brd == 0 &&
+                             (tokens[k].mutable_.wrap.must_break_before ||
+                              tokens[k - 1].mutable_.wrap.must_break_after))
+                        set_indent(k, item_indent, anchor);
+                }
+            }
             for (size_t k = open + 1; k < close; ++k) {
                 if (tokens[k].lex.comment_kind != CommentLexemeKind::None &&
                     (tokens[k].immutable.comment.role == CommentRole::OwnLine ||
                      tokens[k].mutable_.wrap.must_break_before))
-                    tokens[k].mutable_.indent.base_indent = std::max(0, item_indent);
+                    set_indent(k, item_indent, anchor);
                 if ((kind == WrapListKind::ModuleParametersBlock ||
                      kind == WrapListKind::ModuleParametersHanging) &&
                     tokens[k].lex.is_directive &&
                     !is_conditional_preprocessor_directive(tokens[k]) &&
                     tokens[k].mutable_.wrap.must_break_before)
-                    tokens[k].mutable_.indent.base_indent = std::max(0, item_indent);
+                    set_indent(k, item_indent, anchor);
             }
             if (tokens[close].mutable_.wrap.must_break_before)
-                tokens[close].mutable_.indent.base_indent = std::max(0, close_indent);
+                set_indent(close, close_indent, anchor);
         }
     }
 private: const FormatOptions& opts_;
@@ -3179,11 +3527,15 @@ public:
                 (is_type_keyword(tokens[cur_first].lex.kind) ||
                  is_port_direction(tokens[cur_first].lex.kind) ||
                  ((kind_is(tokens[cur_first], TK::ParameterKeyword) ||
-                   kind_is(tokens[cur_first], TK::LocalParamKeyword)) &&
+                   kind_is(tokens[cur_first], TK::LocalParamKeyword) ||
+                   kind_is(tokens[cur_first], TK::TypeKeyword)) &&
                   tokens[cur_first].immutable.syntax.paren_depth > 0)))
                 ln.disabled = true;
             if (cur_first != npos && cur_first < inside_control_begin.size() &&
                 inside_control_begin[cur_first])
+                ln.disabled = true;
+            // A line continuing an expression is part of the statement above.
+            if (cur_first != npos && tokens[cur_first].mutable_.wrap.continuation)
                 ln.disabled = true;
             // Find assignment op at depth 0
             int pd = 0, bd = 0, brd = 0;
@@ -3243,14 +3595,29 @@ public:
                 // Count identifiers at bracket depth 0 only: arr[b] has one
                 // top-level identifier (arr), so it should not be treated like
                 // a two-identifier user-defined-type declaration (packet_t v).
+                // A member select names one variable too: `cb.data <= d` has
+                // one top-level name, while `bus_if.master m = ...` still
+                // has two.  A timing control names no variable either:
+                // `#5 a = b`, `#dly a = b` and `@(posedge clk) a = b` all
+                // align like `a = b`, the control counted in the LHS field.
                 int identifiers_before_assign = 0;
-                int ident_bd = 0;
+                int ident_bd = 0, ident_pd = 0;
                 for (size_t k = scan_start; k < ln.assign_idx; ++k) {
                     if (is_passthrough(tokens[k])) continue;
                     if (kind_is(tokens[k], TK::OpenBracket)) ++ident_bd;
                     else if (kind_is(tokens[k], TK::CloseBracket) && ident_bd > 0) --ident_bd;
-                    if (ident_bd == 0 && is_code_token(tokens[k]) && is_identifier_like(tokens[k]))
-                        ++identifiers_before_assign;
+                    else if (kind_is(tokens[k], TK::OpenParenthesis)) ++ident_pd;
+                    else if (kind_is(tokens[k], TK::CloseParenthesis) && ident_pd > 0) --ident_pd;
+                    if (ident_bd == 0 && ident_pd == 0 && is_code_token(tokens[k]) &&
+                        is_identifier_like(tokens[k])) {
+                        const size_t before = prev_code(tokens, k);
+                        const bool member = before != npos && before >= scan_start && kind_is(tokens[before], TK::Dot);
+                        const bool control = before != npos && before >= scan_start &&
+                                             (kind_is(tokens[before], TK::Hash) || kind_is(tokens[before], TK::At) ||
+                                              kind_is(tokens[before], TK::DoubleHash));
+                        if (!member && !control)
+                            ++identifiers_before_assign;
+                    }
                 }
                 if (identifiers_before_assign >= 2)
                     ln.disabled = true;
@@ -3321,6 +3688,26 @@ public:
             }
         }
 
+        // Can this line open a variable declaration?  A leading type keyword
+        // is not enough: `void'(...)` and `int'(x) ...` are casts,
+        // `static function base #(T) create();` is a subroutine header, and
+        // `int W = 8)` inside parentheses is a later line of a wrapped
+        // parameter or argument list, which the list's own layout places.
+        auto starts_variable_declaration = [&](const Line& ln) {
+            if (ln.first == npos || ln.end <= ln.first)
+                return false;
+            if (tokens[ln.first].immutable.syntax.paren_depth > 0)
+                return false;
+            const size_t nx = next_code(tokens, ln.first + 1, ln.end);
+            if (nx != npos && kind_is(tokens[nx], TK::Apostrophe))
+                return false;
+            for (size_t k = ln.first; k < ln.end; ++k)
+                if (is_code_token(tokens[k]) &&
+                    (kind_is(tokens[k], TK::FunctionKeyword) || kind_is(tokens[k], TK::TaskKeyword)))
+                    return false;
+            return true;
+        };
+
         if (opts_.var_declaration.align) {
             int declaration_line_count = 0;
             int declaration_keyword_width = 0;
@@ -3343,6 +3730,8 @@ public:
                 // `input v;` in a clocking block is a clocking signal, not a
                 // port; the port columns (section widths) do not apply.
                 if (tokens[first].immutable.syntax.in_clocking_block)
+                    continue;
+                if (!starts_variable_declaration(ln))
                     continue;
 
                 size_t semi = npos;
@@ -3508,13 +3897,19 @@ public:
                 return npos;
             };
 
+            // A comma inside a net delay `wire #(1, 2) w1, w2;` or a
+            // parameterized type `p #(A, B) h;` separates no declarators.
             auto first_top_level_delim = [&](size_t begin, size_t end) {
-                int bd = 0;
+                int bd = 0, pd = 0, brd = 0;
                 for (size_t k = begin; k < end; ++k) {
                     if (!is_code_token(tokens[k])) continue;
                     if (kind_is(tokens[k], TK::OpenBracket)) ++bd;
                     else if (kind_is(tokens[k], TK::CloseBracket) && bd > 0) --bd;
-                    else if (bd == 0 && kind_is(tokens[k], TK::Comma))
+                    else if (kind_is(tokens[k], TK::OpenParenthesis)) ++pd;
+                    else if (kind_is(tokens[k], TK::CloseParenthesis) && pd > 0) --pd;
+                    else if (kind_is(tokens[k], TK::OpenBrace) || kind_is(tokens[k], TK::ApostropheOpenBrace)) ++brd;
+                    else if (kind_is(tokens[k], TK::CloseBrace) && brd > 0) --brd;
+                    else if (bd == 0 && pd == 0 && brd == 0 && kind_is(tokens[k], TK::Comma))
                         return k;
                 }
                 return end;
@@ -3552,6 +3947,8 @@ public:
                 if (ln.first == npos || ln.end <= ln.first)
                     return false;
                 if (is_port_direction(tokens[ln.first].lex.kind))
+                    return false;
+                if (!starts_variable_declaration(ln))
                     return false;
                 size_t eq = npos;
                 size_t semi = find_statement_semicolon(ln, eq);
@@ -4174,10 +4571,34 @@ public:
                     size_t unpacked_dim;
                     size_t comma;
                     int typew;
+                    int leadw;      // section1 as rendered: direction, or a whole interface type,
+                                    // a leading `/* c */` included (it moves its own row only)
+                    bool directed;  // false: `bus_if.master m`, `my_t x` -- no direction
+                };
+                // Width of the row from `first` (its first code token) through
+                // `last`, a leading `/* c */` included -- rendered_width()
+                // skips comments.
+                auto row_width_through = [&](size_t first, size_t last) {
+                    size_t row = first;
+                    while (row > 0 && !tokens[row].mutable_.wrap.must_break_before &&
+                           !tokens[row - 1].mutable_.wrap.must_break_after &&
+                           tokens[row - 1].lex.comment_kind == CommentLexemeKind::Block)
+                        --row;
+                    int w = 0;
+                    for (size_t k = row; k <= last; ++k) {
+                        if (k != row && !tokens[k].mutable_.space.suppress_space)
+                            w += tokens[k].mutable_.space.spaces_before;
+                        w += token_width(tokens[k]);
+                    }
+                    return w;
                 };
                 std::vector<Decl> decls;
                 for (const auto& item : items) {
-                    if (!is_port_direction(tokens[item.first].lex.kind))
+                    const bool directed = is_port_direction(tokens[item.first].lex.kind);
+                    // An interface port (`intf.mp bus`, `interface.slave b`) or
+                    // a typed port with no direction: its type takes section1.
+                    if (!directed && !kind_is(tokens[item.first], TK::InterfaceKeyword) &&
+                        !kind_is(tokens[item.first], TK::Identifier))
                         continue;
                     size_t name = npos;
                     int pd = 0, bd = 0, brd = 0;
@@ -4198,6 +4619,18 @@ public:
                     }
                     if (name == npos || name <= item.first)
                         continue;
+                    if (!directed) {
+                        size_t unpacked_dim = npos;
+                        for (size_t k = name + 1; k < item.last; ++k) {
+                            if (kind_is(tokens[k], TK::OpenBracket)) {
+                                unpacked_dim = k;
+                                break;
+                            }
+                        }
+                        decls.push_back({item.first, npos, npos, name, unpacked_dim, item.comma, 0,
+                                         row_width_through(item.first, prev_code(tokens, name)), false});
+                        continue;
+                    }
                     size_t type_first = next_code(tokens, item.first + 1, name);
                     size_t packed_dim = npos;
                     for (size_t k = item.first + 1; k < name; ++k) {
@@ -4216,7 +4649,8 @@ public:
                             break;
                         }
                     }
-                    decls.push_back({item.first, type_first, packed_dim, name, unpacked_dim, item.comma, tw});
+                    decls.push_back({item.first, type_first, packed_dim, name, unpacked_dim, item.comma, tw,
+                                     row_width_through(item.first, item.first), true});
                 }
                 int base = decls.empty() ? 0 : tokens[decls.front().first].mutable_.indent.base_indent;
                 const int s1 = option_width(opts_.port_declaration.section1_min_width, opts_);
@@ -4233,9 +4667,14 @@ public:
                 int group_type_width = 0;
                 int group_packed_width = 0;
                 int group_name_width = 0;
+                int group_undirected_width = 0; // `intf.mp` spans sections 1-3
                 for (const auto& d : decls) {
-                    group_direction_width =
-                        std::max(group_direction_width, token_width(tokens[d.first]));
+                    group_name_width = std::max(group_name_width, token_width(tokens[d.name]));
+                    if (!d.directed) {
+                        group_undirected_width = std::max(group_undirected_width, d.leadw);
+                        continue;
+                    }
+                    group_direction_width = std::max(group_direction_width, token_width(tokens[d.first]));
                     group_type_width = std::max(group_type_width, d.typew);
                     if (d.packed_dim != npos) {
                         group_has_packed = true;
@@ -4245,7 +4684,6 @@ public:
                                 std::max(group_packed_width,
                                          token_text_width(tokens, d.packed_dim, packed_close + 1));
                     }
-                    group_name_width = std::max(group_name_width, token_width(tokens[d.name]));
                 }
                 // `align_adaptive=true` preserves the historical behavior:
                 // each later boundary may adapt to the current declaration's
@@ -4278,9 +4716,16 @@ public:
                         ? s3
                         : option_width(std::max(opts_.port_declaration.section3_min_width,
                                                 group_packed_width + 1), opts_);
+                // A non-adaptive group widens for an interface type the way it
+                // widens for a long direction: the type section takes the rest.
+                const int undirected_extra =
+                    opts_.port_declaration.align_adaptive
+                        ? 0
+                        : option_width(std::max(0, group_undirected_width + 1 -
+                                                       (effective_s1 + effective_s2 + effective_s3)), opts_);
 
                 const int preferred_type_col = base + effective_s1;
-                const int preferred_packed_col = preferred_type_col + effective_s2;
+                const int preferred_packed_col = preferred_type_col + effective_s2 + undirected_extra;
                 // The port name is section4.  It always begins after the
                 // direction, type, and packed-dimension sections.  A missing
                 // section2 or section3 token is an empty field with preserved
@@ -4296,8 +4741,7 @@ public:
                 const int preferred_comma_col = preferred_trailing_col + s5;
 
                 for (const auto& d : decls) {
-                    int type_target = std::max(preferred_type_col,
-                                               base + token_width(tokens[d.first]) + 1);
+                    int type_target = std::max(preferred_type_col, base + d.leadw + 1);
                     if (d.type_first != npos) {
                         tokens[d.type_first].mutable_.align.enabled = true;
                         tokens[d.type_first].mutable_.align.target_column = type_target;
@@ -4322,8 +4766,7 @@ public:
                     } else if (d.type_first != npos) {
                         decl_name_target = std::max(decl_name_target, type_target + d.typew + 1);
                     } else {
-                        decl_name_target = std::max(decl_name_target,
-                                                    base + token_width(tokens[d.first]) + 1);
+                        decl_name_target = std::max(decl_name_target, base + d.leadw + 1);
                     }
                     tokens[d.name].mutable_.align.enabled = true;
                     tokens[d.name].mutable_.align.target_column = decl_name_target;
@@ -4498,8 +4941,81 @@ public:
                 }
             }
         }
+        shift_column_anchored_lines(tokens, opts_.blank_lines_between_items);
     }
-private: const FormatOptions& opts_;
+private:
+    // IndentPass measures a hanging list's column (and a block call's name
+    // column) from SpaceMetadata alone, before any padding exists:
+    //
+    //   y          = f(a,
+    //         b);          <- measured from `y = f(`
+    //
+    // Walk the lines the way render_tokens() will, tracking how far each
+    // token has been pushed right of where IndentPass measured it, and move
+    // each line whose indent was measured from a column by the drift of that
+    // column's token.  The drift carries the anchor line's own shift, so a
+    // list nested in a shifted list moves with it.  Alignment targets on a
+    // shifted line move with the line, keeping their padding.
+    static void shift_column_anchored_lines(TokenStream& tokens, int blank_lines_between_items) {
+        std::vector<int> drift(tokens.size(), 0);
+        int col = 0;     // column as rendered
+        int natural = 0; // column as IndentPass measured it
+        int line_shift = 0;
+        bool at_line_start = true;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            Tok& tok = tokens[i];
+            // BlankLinePass runs later; a blank line it will emit breaks the line too.
+            if (i > 0 && (tok.mutable_.wrap.must_break_before || tok.mutable_.comment.force_own_line ||
+                          (blank_lines_between_items > 0 && is_blank_line_boundary(tokens, i))))
+                at_line_start = true;
+            if (is_passthrough(tok)) {
+                // Emitted verbatim with no indent, as render_tokens() does.
+                if (at_line_start) {
+                    col = natural = 0;
+                    line_shift = 0;
+                }
+                drift[i] = col - natural;
+                std::string_view text(tok.lex.text);
+                const size_t nl = last_newline_offset(text);
+                if (nl == std::string_view::npos) {
+                    col += static_cast<int>(text.size());
+                    natural += static_cast<int>(text.size());
+                    at_line_start = false;
+                } else {
+                    col = natural = static_cast<int>(text.size() - nl - 1);
+                    line_shift = 0;
+                    at_line_start = col == 0;
+                }
+                if (tok.mutable_.wrap.must_break_after) at_line_start = true;
+                continue;
+            }
+            if (at_line_start) {
+                const int indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent +
+                                   tok.mutable_.comment.relative_indent;
+                const size_t anchor = tok.mutable_.indent.anchor_token;
+                line_shift = (anchor != npos && anchor < i) ? drift[anchor] : 0;
+                tok.mutable_.align.indent_shift = line_shift;
+                natural = std::max(0, indent);
+                col = std::max(0, indent + line_shift);
+                at_line_start = false;
+            } else {
+                const int spaces = tok.mutable_.space.suppress_space ? 0 : tok.mutable_.space.spaces_before;
+                natural += spaces;
+                int gap = spaces;
+                if (tok.mutable_.align.enabled && tok.mutable_.align.target_column >= 0) {
+                    tok.mutable_.align.target_column += line_shift;
+                    if (col < tok.mutable_.align.target_column)
+                        gap = std::max(gap, tok.mutable_.align.target_column - col);
+                }
+                col += gap;
+            }
+            drift[i] = col - natural;
+            col += static_cast<int>(tok.lex.text.size());
+            natural += static_cast<int>(tok.lex.text.size());
+            if (tok.mutable_.wrap.must_break_after) at_line_start = true;
+        }
+    }
+    const FormatOptions& opts_;
 };
 
 // CommentPass owns CommentMetadata and reads stable syntax comment roles.
@@ -4627,7 +5143,14 @@ public:
                 t.mutable_.space.suppress_space = true;
                 continue;
             }
-            if (kind_is(t, TK::Dot) && dot_keeps_space_after(tokens, i)) {
+            // `#( .WIDTH(8) )` -- a padded `(` pads before a named connection
+            // too, as it does before any other first token.
+            const bool padded_open = kind_is(L, TK::OpenParenthesis) &&
+                (opts_.spacing.space_inside_parens ||
+                 (L.immutable.topology.starts_argument_list && opts_.function_call.space_inside_paren));
+            const bool dot_spaced = kind_is(t, TK::Dot) &&
+                (dot_keeps_space_after(tokens, i) || padded_open);
+            if (dot_spaced) {
                 spaces = 1;
             } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {
                 t.mutable_.space.spaces_before = 0;
@@ -4672,7 +5195,16 @@ public:
             else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword) ||
                                                         kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword)))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
-            if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::InstancePorts &&
+            // `new[10](init)` -- the initializer is the constructor's argument
+            // list, so it spaces like `new(...)`.
+            else if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::CloseBracket) &&
+                     L.immutable.syntax.matching_token != npos) {
+                const size_t before_dim = prev_code(tokens, L.immutable.syntax.matching_token);
+                if (before_dim != npos && kind_is(tokens[before_dim], TK::NewKeyword))
+                    spaces = opts_.function_call.space_before_paren ? 1 : 0;
+            }
+            if (kind_is(t, TK::OpenParenthesis) &&
+                (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i)) &&
                 opts_.instance.align)
                 spaces = 1;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::ModportBody)
@@ -4694,12 +5226,32 @@ public:
             // concatenation renders `{f, {g, h}}` rather than `{f, {g, h} }`.
             if (kind_is(L, TK::CloseBrace) && closes_indent_scope_at(tokens, i - 1) &&
                 !kind_is(t, TK::Semicolon) && !kind_is(t, TK::Comma)) spaces = 1;
-            if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis)) spaces = 0;
+            // A statement block kept on one line, `with { a < 5; b == 3; }`,
+            // is padded inside its braces like `begin ... end`.
+            if (kind_is(L, TK::OpenBrace) && L.immutable.topology.opens_brace_block)
+                spaces = 1;
+            if (kind_is(t, TK::CloseBrace) && t.immutable.syntax.matching_token != npos &&
+                kind_is(tokens[t.immutable.syntax.matching_token], TK::OpenBrace) &&
+                tokens[t.immutable.syntax.matching_token].immutable.topology.opens_brace_block)
+                spaces = 1;
+            // A padded `)` keeps its pad after a `}` as after anything else.
+            if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis) &&
+                !opts_.spacing.space_inside_parens &&
+                !(t.immutable.topology.ends_argument_list && opts_.function_call.space_inside_paren))
+                spaces = 0;
 
             // Apostrophe / cast: no space
             if (kind_is(t, TK::Apostrophe) || kind_is(L, TK::Apostrophe)) spaces = 0;
-            // Apostrophe-open-brace assignment patterns / casts.
-            if (kind_is(t, TK::ApostropheOpenBrace)) spaces = 0;
+            // Apostrophe-open-brace assignment patterns / casts.  Only a
+            // cast's type (`pkt_t'{...}`) and an opening delimiter bind to the
+            // pattern; after a comma, a pattern key's `:` or a `?` it is an
+            // operand like any other (`data : '{raw : 0}`, `c ? '{1} : '{2}`).
+            if (kind_is(t, TK::ApostropheOpenBrace) &&
+                (is_identifier_like(L) || is_type_keyword(L.lex.kind) ||
+                 kind_is(L, TK::CloseParenthesis) || kind_is(L, TK::CloseBracket) ||
+                 kind_is(L, TK::OpenParenthesis) || kind_is(L, TK::OpenBracket) ||
+                 kind_is(L, TK::OpenBrace) || kind_is(L, TK::ApostropheOpenBrace)))
+                spaces = 0;
 
             // Postfix ++ / --: no space before when attached to an identifier, ], or )
             if ((kind_is(t, TK::DoublePlus) || kind_is(t, TK::DoubleMinus)) &&
@@ -4815,14 +5367,20 @@ public:
 
             // semicolon_spacing: controls space before/after `;` inside for-loop headers
             // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)
-            if (kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth > 0)
+            // A brace block's own `;` inside parentheses (`with { a; b; }`)
+            // ends a statement, not a header clause.
+            auto header_semicolon = [](const Tok& tok) {
+                return kind_is(tok, TK::Semicolon) && tok.immutable.syntax.paren_depth > 0 &&
+                       !tok.immutable.topology.separates_brace_block_items;
+            };
+            if (header_semicolon(t))
                 spaces = wants_before(opts_.spacing.semicolon_spacing) ? 1 : 0;
-            if (kind_is(L, TK::Semicolon) && L.immutable.syntax.paren_depth > 0)
+            if (header_semicolon(L))
                 spaces = wants_after(opts_.spacing.semicolon_spacing) ? 1 : 0;
 
-            if ((kind_is(t, TK::Semicolon) && t.immutable.syntax.paren_depth == 0) ||
+            if ((kind_is(t, TK::Semicolon) && !header_semicolon(t)) ||
                 (kind_is(t, TK::Comma) && !kind_is(L, TK::Comma)) ||
-                (kind_is(t, TK::Dot) && !dot_keeps_space_after(tokens, i)) || kind_is(t, TK::DoubleColon))
+                (kind_is(t, TK::Dot) && !dot_spaced) || kind_is(t, TK::DoubleColon))
                 spaces = 0;
             if (kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&
@@ -4872,41 +5430,11 @@ public:
     const char* name() const override { return "blank_line"; }
     void run(TokenStream& tokens) override {
         for (size_t i = 0; i < tokens.size(); ++i) {
-            auto& t = tokens[i];
-            int boundary_newlines = t.immutable.input_trivia.original_newlines_before;
-
-            // Passthrough tokens are rendered verbatim, so a physical item
-            // boundary can be split across the previous token's immutable text
-            // and this token's ordinary leading trivia.  This happens for
-            // multiline macro definitions frozen as one whitespace-sensitive
-            // directive:
-            //
-            //   `define FOO \
-            //     foo();\n
-            //   \n
-            //   `define BAR ...
-            //
-            // The first newline is part of the raw `define token; the second
-            // is the gap before `define BAR.  Together they represent one
-            // blank separator line.  Keep this policy in BlankLinePass rather
-            // than inventing lexer-side pending trivia after a token has
-            // already been emitted.
-            if (i > 0 && passthrough_text_ends_with_newline(tokens[i - 1]))
-                boundary_newlines += 1;
-
-            if (boundary_newlines > 1 &&
-                t.immutable.syntax.paren_depth == 0 &&
-                t.immutable.syntax.brace_depth == 0)
-                t.mutable_.blank.before = std::max(0, opts_.blank_lines_between_items);
+            if (is_blank_line_boundary(tokens, i))
+                tokens[i].mutable_.blank.before = std::max(0, opts_.blank_lines_between_items);
         }
     }
 private:
-    static bool passthrough_text_ends_with_newline(const Tok& tok) {
-        return is_passthrough(tok) &&
-               !tok.lex.text.empty() &&
-               tok.lex.text.back() == '\n';
-    }
-
     const FormatOptions& opts_;
 };
 

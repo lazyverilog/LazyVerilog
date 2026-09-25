@@ -187,6 +187,11 @@ struct TopologyFacts {
     // `do begin ... end while (c);`).  It controls nothing.
     bool ends_do_while{false};
 
+    // A `;` whose innermost enclosing delimiter is a statement-block brace
+    // (`with { a < 5; b == 3; }`), even when that brace sits inside
+    // parentheses.  It ends a constraint, not a `for` header clause.
+    bool separates_brace_block_items{false};
+
     // The `[` of an SVA repetition -- `[*n]`, `[+]`, `[->n]`, `[=n]` --
     // whose operator is not the implication or assignment it spells.
     bool is_repetition_bracket{false};
@@ -267,8 +272,14 @@ struct WrapMetadata {
     WrapListKind list_kind{WrapListKind::None};
     size_t list_open{npos};
 };
+// anchor_token: the token whose rendered column this indent was measured from
+// (npos: the indent follows the nesting level alone).
 struct IndentMetadata { int base_indent{0}; int continuation_indent{0}; size_t anchor_token{npos}; };
-struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; };
+// indent_shift: columns AlignPass adds to a line-start token's indent.  An
+// indent measured from a column (a hanging list's `(`, a block call's name)
+// was measured before alignment padded the line that column is on; the shift
+// moves it by the padding that lands before its IndentMetadata::anchor_token.
+struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; int indent_shift{0}; };
 struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
 struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
 struct BlankLineMetadata { int before{0}; };
