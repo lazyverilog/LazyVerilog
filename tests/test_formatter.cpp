@@ -37,6 +37,20 @@ FormatOptions var_section_stress_options(bool align_adaptive) {
     return opts;
 }
 
+// The port-declaration defaults before alignment became opt-in (align on,
+// fixed 10/20/20/30/30 columns).  Tests whose expected output was written
+// against those columns pin them here: they test headers, comments and
+// directives, not the defaults.  Explicit settings after this call still win.
+void pin_legacy_port_columns(FormatOptions& opts) {
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = false;
+    opts.port_declaration.section1_min_width = 10;
+    opts.port_declaration.section2_min_width = 20;
+    opts.port_declaration.section3_min_width = 20;
+    opts.port_declaration.section4_min_width = 30;
+    opts.port_declaration.section5_min_width = 30;
+}
+
 } // namespace
 
 TEST_CASE("formatter: function calls support block layout", "[formatter]") {
@@ -474,6 +488,7 @@ TEST_CASE("formatter: block module parameter comments do not emit trailing white
 
 TEST_CASE("formatter: multiline ANSI module header preserves line comments", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -529,6 +544,7 @@ TEST_CASE("formatter: instance parameter comments do not trip safe mode", "[form
 
 TEST_CASE("formatter: imported parameterized ANSI header is idempotent", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.tab_align = true;
@@ -559,6 +575,7 @@ TEST_CASE("formatter: imported parameterized ANSI header is idempotent", "[forma
 
 TEST_CASE("formatter: ANSI module header after package import is aligned", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1062,6 +1079,7 @@ TEST_CASE("formatter: non-adaptive var declarations align semicolon to longest t
 
 TEST_CASE("formatter: module header closing line comment is preserved", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1078,6 +1096,7 @@ TEST_CASE("formatter: module header closing line comment is preserved", "[format
 
 TEST_CASE("formatter: final ANSI port with line comment does not gain comma", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.port_declaration.align = true;
@@ -1360,6 +1379,7 @@ TEST_CASE("formatter: instance after semicolonless macro call keeps instance lay
 TEST_CASE("formatter: configured RTL macros provide declaration statement and block boundaries",
           "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.indent_size = 4;
     opts.instance.align = true;
@@ -1546,11 +1566,7 @@ TEST_CASE("formatter: known statement macro is boundary for following semicolonl
         "initial begin\n"
         "    `uvm_info(`gfn, \"msg\", UVM_HIGH)\n"
         "    `PROJECT_BARE\n"
-        "    `PROJECT_CHECK_EQ(\n"
-        "        a,\n"
-        "        b,\n"
-        "        \"first\"\n"
-        "    )\n"
+        "    `PROJECT_CHECK_EQ(a, b, \"first\")\n"
         "    `PROJECT_CHECK_EQ(c, d, \"second\")\n"
         "end\n"
         "endmodule\n";
@@ -3138,6 +3154,7 @@ TEST_CASE("formatter: tab_align snaps statement assignment columns", "[formatter
 
 TEST_CASE("formatter: tab_align snaps declaration columns", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.indent_size = 4;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.tab_align = true;
@@ -3223,6 +3240,7 @@ TEST_CASE("formatter: tab_align snaps fixed instance connection columns", "[form
 TEST_CASE("formatter: tab_align does not align equals inside headers or for controls",
           "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.indent_size = 4;
     opts.default_indent_level_inside_outmost_block = 0;
     opts.statement.align = true;
@@ -3600,6 +3618,7 @@ TEST_CASE("formatter: instance port alignment crosses preprocessor conditionals"
 
 TEST_CASE("formatter: ANSI port directives do not receive commas", "[formatter]") {
     FormatOptions opts;
+    pin_legacy_port_columns(opts);
     opts.default_indent_level_inside_outmost_block = 0;
     opts.port_declaration.align = true;
     opts.port_declaration.align_adaptive = true;
@@ -3638,7 +3657,122 @@ TEST_CASE("formatter: case item label keeps simple statement", "[formatter]") {
     REQUIRE_NOTHROW(formatted = format_source(input, cfg.format));
     CHECK(formatted.find("4: a") != std::string::npos);
     CHECK(formatted.find("= f();") != std::string::npos);
-    CHECK(formatted.find("8 /* comment */ : b") != std::string::npos);
+    CHECK(formatted.find("8 /* comment */: b") != std::string::npos);
+}
+
+// Issue #137: a macro label after `end` or `;` read as a semicolonless
+// statement macro and broke before its `:`, and the space before the colon
+// depended on whether the label's last token was a literal.
+TEST_CASE("formatter: case item labels format the same whatever the label is", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "`define NOP 2'b00\n"
+                        "`define MOV 2'b11\n"
+                        "module m;\n"
+                        "always_ff @(posedge clk) begin\n"
+                        "case (bus_a)\n"
+                        "`NOP : begin\n"
+                        "$display(\"1\");\n"
+                        "end\n"
+                        "`MOV: begin\n"
+                        "$display(\"2\");\n"
+                        "end\n"
+                        "8'b0111: begin\n"
+                        "$display(\"4\");\n"
+                        "end\n"
+                        "default : begin\n"
+                        "$display(\"default\");\n"
+                        "end\n"
+                        "endcase\n"
+                        "case (sel)\n"
+                        "`A: y = 1;\n"
+                        "`B : y = 2;\n"
+                        "`C, `D: y = 3;\n"
+                        "4'hc4 : y = 4;\n"
+                        "4'h12: y = 5;\n"
+                        "ST_IDLE : y = 6;\n"
+                        "`F(1) : y = 7;\n"
+                        "(a ? b : c) : y = 8;\n"
+                        "default: y = 0;\n"
+                        "endcase\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    for (const char* label : {"`NOP: begin", "`MOV: begin", "8'b0111: begin", "default: begin",
+                              "`A: y", "`B: y", "`C, `D: y", "4'hc4: y", "4'h12: y",
+                              "ST_IDLE: y", "`F(1): y", "(a ? b : c): y", "default: y"}) {
+        INFO("label: " << label);
+        CHECK(formatted.find(label) != std::string::npos);
+    }
+    CHECK(formatted.find("\n            : ") == std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: case item colon is found only at the item's own position", "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "module m;\n"
+                        "generate\n"
+                        "case (P)\n"
+                        "0 : begin : g0\n"
+                        "assign a = 1;\n"
+                        "end : g0\n"
+                        "ONE : assign a = 2;\n"
+                        "endcase\n"
+                        "endgenerate\n"
+                        "always_comb begin\n"
+                        "case (s)\n"
+                        "A : case (t)\n"
+                        "B : y = 1;\n"
+                        "endcase\n"
+                        "C : y = a ? b : c;\n"
+                        "D : lbl : y = 6;\n"
+                        "E : y = '{default : 0};\n"
+                        "default y = 9;\n"
+                        "endcase\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    // Item labels, including a nested case's and ones after a named `end`.
+    for (const char* label : {"0: begin", "ONE: assign", "A: case", "B: y", "C: y", "D: lbl"}) {
+        INFO("label: " << label);
+        CHECK(formatted.find(label) != std::string::npos);
+    }
+    // Colons inside the item's statement are not case labels.  `lbl` is the
+    // statement's own label, which spaces like any statement label.
+    CHECK(formatted.find("a ? b : c;") != std::string::npos);
+    CHECK(formatted.find("D: lbl: y = 6;") != std::string::npos);
+    CHECK(formatted.find("'{default : 0}") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: macro that starts an expression statement stays on its line",
+          "[formatter]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    std::string input = "module m;\n"
+                        "always_comb begin\n"
+                        "x = 1;\n"
+                        "`REG = 2;\n"
+                        "`ARR[0] <= 3;\n"
+                        "`FIELD(1).f = 4;\n"
+                        "`CHECK_BARE\n"
+                        "y = 5;\n"
+                        "end\n"
+                        "endmodule\n";
+
+    std::string formatted = format_source(input, opts);
+    INFO("formatted:\n" << formatted);
+    CHECK(formatted.find("`REG = 2;") != std::string::npos);
+    CHECK(formatted.find("`ARR[0] <= 3;") != std::string::npos);
+    CHECK(formatted.find("`FIELD(1).f = 4;") != std::string::npos);
+    // A bare macro followed by another statement is still a statement of its own.
+    CHECK(formatted.find("`CHECK_BARE\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
 }
 
 TEST_CASE("formatter: coverpoint macro body stays multiline", "[formatter]") {

@@ -149,15 +149,44 @@ public:
 
             if (disabled_) {
                 add_raw_until_token(token);
-            } else {
+            } else if (!add_table_row(token)) {
                 add_slang_token(token);
             }
         }
         mark_attribute_instances();
+        mark_vector_literal_digits();
         return tokens_;
     }
 
 private:
+    // slang's NumberParser takes the first vector-digit token after a base
+    // marker whatever trivia precedes it, then keeps taking vector-digit
+    // tokens only while each touches the previous one
+    // (SyntaxFacts::isPossibleVectorDigit plus `trivia().empty()`).  Mirror
+    // that rule exactly: anything looser glues a following identifier onto a
+    // literal, anything tighter lets spacing turn a `?` digit into `? :`.
+    void mark_vector_literal_digits() {
+        using TKind = slang::parsing::TokenKind;
+        auto is_vector_digit = [](TKind k) {
+            return k == TKind::IntegerLiteral || k == TKind::Question ||
+                   k == TKind::RealLiteral || k == TKind::Identifier;
+        };
+        for (size_t i = 0; i + 1 < tokens_.size(); ++i) {
+            if (tokens_[i].lex.kind != TKind::IntegerBase)
+                continue;
+            size_t j = i + 1;
+            if (!is_vector_digit(tokens_[j].lex.kind))
+                continue;
+            tokens_[j].lex.continues_vector_literal = true;
+            while (j + 1 < tokens_.size() && is_vector_digit(tokens_[j + 1].lex.kind) &&
+                   tokens_[j].lex.range.end().offset() == tokens_[j + 1].lex.range.start().offset()) {
+                ++j;
+                tokens_[j].lex.continues_vector_literal = true;
+            }
+            i = j;
+        }
+    }
+
     // `(*` and `*)` are single lexemes in the LRM, so an attribute instance is
     // exactly an OpenParenthesis whose Star follows with no gap, closed by a
     // Star whose CloseParenthesis follows with no gap.  Comparing byte offsets
@@ -198,6 +227,7 @@ private:
     TokenStream tokens_;
     size_t cursor_{0};
     bool disabled_{false};
+    bool in_table_{false};
     bool just_entered_disabled_region_{false};
     size_t passthrough_end_{0}; // end of a frozen multiline define block
     int line_{0};
@@ -325,7 +355,23 @@ private:
             bool format_on = is_format_marker(raw, format_on_re_, opts_.format_on_comment_pattern);
             const CommentLexemeKind comment_kind =
                 trivia.kind == TV::LineComment ? CommentLexemeKind::Line : CommentLexemeKind::Block;
-            add_token(TK::Unknown, raw, pos, false, disabled_ || format_off || format_on,
+            // A format-off marker keeps its original column, like the region
+            // it opens: the frozen body carries the on-marker's leading
+            // whitespace verbatim, so the off-marker carries its own.  Only
+            // when it starts its line -- after code, the gap is ordinary
+            // spacing.
+            std::string_view marker = raw;
+            size_t marker_pos = pos;
+            if (format_off && (pending_newlines_ > 0 || tokens_.empty())) {
+                size_t line_start = pos;
+                while (line_start > 0 && (source_[line_start - 1] == ' ' || source_[line_start - 1] == '\t'))
+                    --line_start;
+                if (line_start == 0 || source_[line_start - 1] == '\n') {
+                    marker = std::string_view(source_.data() + line_start, pos + raw.size() - line_start);
+                    marker_pos = line_start;
+                }
+            }
+            add_token(TK::Unknown, marker, marker_pos, false, disabled_ || format_off || format_on,
                       comment_kind, format_off, format_on);
             if (format_off) {
                 disabled_ = true;
@@ -335,6 +381,13 @@ private:
                 return;
             }
             if (format_on) disabled_ = false;
+            // The comment is its own token now, so its text is not leading
+            // whitespace of the next one.  Counting the `\n` inside a block
+            // comment there made `/* a\n b */ reg k;` report a line break
+            // before `reg` that is not in the source; once formatting moved
+            // `reg` down a line, the second pass saw two and added a blank.
+            consume_text(raw, false);
+            return;
         }
         // Whitespace trivia is not a token.  It only contributes immutable source
         // layout facts used by passes such as WrapPass and BlankLinePass.
@@ -406,7 +459,9 @@ private:
         // ``ifdef\nFOO`).  Macro usages were remapped above and intentionally
         // remain ordinary tokens.
         if (directive) {
-            size_t line_end = source_.find('\n', pos);
+            size_t line_end = conditional_directive_end(token, pos);
+            if (line_end == std::string::npos)
+                line_end = source_.find('\n', pos);
             if (line_end == std::string::npos)
                 line_end = source_.size();
             std::string_view directive_raw(source_.data() + pos, line_end - pos);
@@ -420,6 +475,71 @@ private:
 
         add_token(kind, raw, pos, directive, false);
         consume_text(raw, false);
+    }
+
+    // A conditional directive ends with its own operand, not with the line:
+    // `` `ifdef NAME `` / `` `ifndef NAME `` / `` `elsif NAME `` take one
+    // identifier, `` `else `` / `` `endif `` take none.  Swallowing the rest of
+    // the line made `` reg [`ifdef W 63 `else 31 `endif :0] r; `` one token,
+    // hiding its `]` -- bracket depth never closed and every later spacing
+    // rule acted as if it were inside a dimension.  The keyword and its name
+    // stay one token, so `` `ifdef FOO `` still cannot be split apart.
+    // Returns npos for every other directive, which keeps its line.
+    size_t conditional_directive_end(const slang::parsing::Token& token, size_t pos) const {
+        using SK = slang::syntax::SyntaxKind;
+        const SK k = token.directiveKind();
+        const size_t keyword_end = pos + token.rawText().size();
+        if (k == SK::ElseDirective || k == SK::EndIfDirective)
+            return keyword_end;
+        if (k != SK::IfDefDirective && k != SK::IfNDefDirective && k != SK::ElsIfDirective)
+            return std::string::npos;
+        size_t p = keyword_end;
+        while (p < source_.size() && (source_[p] == ' ' || source_[p] == '\t'))
+            ++p;
+        const size_t name = p;
+        auto is_name_char = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+        };
+        while (p < source_.size() && is_name_char(source_[p]))
+            ++p;
+        if (p == name || std::isdigit(static_cast<unsigned char>(source_[name])))
+            return std::string::npos;
+        return p;
+    }
+
+    // Inside a UDP `table`, fold each row into one token (see
+    // LexemeFacts::is_table_row).  A row ends at its `;`, which stays a token
+    // of its own so every "where does this item end" question still sees it.
+    // Returns false when the token is not the start of a row.
+    bool add_table_row(const slang::parsing::Token& token) {
+        using TKind = slang::parsing::TokenKind;
+        if (token.kind == TKind::TableKeyword) {
+            in_table_ = true;
+            return false;
+        }
+        if (!in_table_ || !token.location().valid())
+            return false;
+        if (token.kind == TKind::EndTableKeyword || token.kind == TKind::EndOfFile) {
+            in_table_ = false;
+            return false;
+        }
+        if (token.kind == TKind::Semicolon)
+            return false;
+        const size_t pos = token.location().offset();
+        size_t semi = source_.find(';', pos);
+        const size_t endtable = source_.find("endtable", pos);
+        if (semi == std::string::npos || (endtable != std::string::npos && endtable < semi))
+            return false;
+        size_t end = semi;
+        while (end > pos && std::isspace(static_cast<unsigned char>(source_[end - 1])))
+            --end;
+        consume_gap_to(pos);
+        std::string_view row(source_.data() + pos, end - pos);
+        add_token(TKind::Unknown, row, pos, false, false);
+        tokens_.back().lex.is_table_row = true;
+        consume_text(row, false);
+        passthrough_end_ = end;
+        return true;
     }
 
     void add_raw_until_token(const slang::parsing::Token& token) {

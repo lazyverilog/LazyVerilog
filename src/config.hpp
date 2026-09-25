@@ -29,14 +29,17 @@ struct StatementOptions {
     bool wrap_end_else_clauses{false};
 };
 
+// Alignment is opt-in.  When it is on, the built-in widths are modest and
+// adaptive: the old 10/20/20/30/30 fixed columns padded `input logic clk,` out
+// to column ~110 before its comma for anyone who had not set them.
 struct PortDeclarationOptions {
-    bool align{true};
-    bool align_adaptive{false};
-    int section1_min_width{10};
-    int section2_min_width{20};
-    int section3_min_width{20};
-    int section4_min_width{30};
-    int section5_min_width{30};
+    bool align{false};
+    bool align_adaptive{true};
+    int section1_min_width{12};
+    int section2_min_width{12};
+    int section3_min_width{12};
+    int section4_min_width{12};
+    int section5_min_width{12};
 };
 
 struct VarDeclarationOptions {
@@ -144,6 +147,8 @@ struct MacroOptions {
         "uvm_object_param_utils",    "uvm_component_param_utils",
         "uvm_sequence_utils"};
     std::vector<std::string> control_flow_like;
+    // Macros that expand to a statement's end, e.g. `` `define SEMI ; ``.
+    std::vector<std::string> statement_terminator_like;
     std::vector<std::string> block_begin_like{
         "uvm_object_utils_begin",       "uvm_component_utils_begin",
         "uvm_object_param_utils_begin", "uvm_component_param_utils_begin",

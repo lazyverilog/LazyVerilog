@@ -128,6 +128,7 @@ function_like_expr = ["RTL_MASKED"]
 statement_like = ["RTL_CHECK_EQ"]
 declaration_like = ["RTL_ALERT_CONNECT"]
 control_flow_like = ["RTL_IF_ENABLED"]
+statement_terminator_like = ["RTL_SEMI"]
 block_begin_like = ["RTL_PIPE_STAGE_BEGIN"]
 block_end_like = ["RTL_PIPE_STAGE_END"]
 whitespace_sensitive = ["RTL_LITERAL_PASTE"]
@@ -276,6 +277,7 @@ autoarg_on_save = true
     CHECK(has_macro(cfg.format.macros.statement_like, "RTL_CHECK_EQ"));
     CHECK(has_macro(cfg.format.macros.declaration_like, "RTL_ALERT_CONNECT"));
     CHECK(has_macro(cfg.format.macros.control_flow_like, "RTL_IF_ENABLED"));
+    CHECK(has_macro(cfg.format.macros.statement_terminator_like, "RTL_SEMI"));
     CHECK(has_macro(cfg.format.macros.block_begin_like, "RTL_PIPE_STAGE_BEGIN"));
     CHECK(has_macro(cfg.format.macros.block_end_like, "RTL_PIPE_STAGE_END"));
     CHECK(has_macro(cfg.format.macros.whitespace_sensitive, "RTL_LITERAL_PASTE"));

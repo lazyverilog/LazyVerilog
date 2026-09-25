@@ -66,6 +66,22 @@ struct LexemeFacts {
     // a pass from input trivia.
     bool in_attribute_instance{false};
 
+    // A piece of a based literal's value after its base marker.  slang lexes
+    // `4'b1??0` as `4`, `'b`, `1`, `?`, `?`, `0` and its parser joins the
+    // pieces back only while no trivia separates them -- a spaced `?` is the
+    // conditional operator.  Membership is therefore decided by byte
+    // adjacency, recorded here where byte positions are known; the formatter
+    // keeps these pieces closed up, so the fact survives re-lexing.
+    bool continues_vector_literal{false};
+
+    // One row of a UDP `table`, from its first symbol to just before its `;`,
+    // kept as one token with its source spelling.  Rows are grids people
+    // align by hand (`0  (01) : ? : 0`), and splitting them into symbols let
+    // spacing close `(1?)` up to `(1 ?)` and flatten every column.  The row's
+    // text is carried through like the inside of a block comment; only its
+    // indentation is formatted.
+    bool is_table_row{false};
+
     // Comment spelling is a lexical fact.  Formatting passes should not peek at
     // token text to distinguish `//` from `/* ... */`; doing so couples policy
     // to source spelling and has caused non-idempotent comment handling bugs.
@@ -102,6 +118,14 @@ struct SyntaxFacts {
     bool in_class_decl{false};
     bool in_covergroup{false};
     bool in_modport{false};
+    // Between a clocking declaration's header and its `endclocking`.  Its
+    // `input v;` / `output a, b;` items are clocking signals, not ports.
+    bool in_clocking_block{false};
+    // Inside a property or sequence expression: the parentheses of
+    // `assert property (...)` / `cover sequence (...)` / `expect (...)`, or a
+    // `property`/`sequence` declaration through its end keyword.  `if`/`else`
+    // and `case` there are property operators, not statements.
+    bool in_property_expr{false};
 };
 
 // 3. TopologyFacts: stable graph-ish structural labels that make later passes
@@ -131,6 +155,55 @@ struct TopologyFacts {
     // matching CloseParenthesis (exclusive on both ends).  Precomputed by
     // SyntaxPass to replace O(n) backward scans.
     bool inside_argument_list{false};
+
+    // The `:` that ends a case item's label list (`` `OP, 4'hc: ``,
+    // `default:`).  What precedes it can be any expression -- a literal, an
+    // identifier, a macro -- so spacing cannot be decided from the left token.
+    bool is_case_item_colon{false};
+
+    // The `:` naming a block after its keyword: `begin : blk`, `end : blk`,
+    // `fork : f`, `endmodule : m`.  Never after `}` -- braces take no label.
+    bool is_block_name_colon{false};
+
+    // The `:` after a statement or item label: `a_x: assert property ...`,
+    // `cp: coverpoint x;`, `x: cross a, b;`.
+    bool is_item_label_colon{false};
+
+    // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
+    bool is_replication_brace{false};
+
+    // A `function`/`task` keyword that declares a prototype with no body --
+    // `extern`, `import "DPI-C"`, `export "DPI-C"`, `pure virtual`, a
+    // modport's `import task` -- or a `class` forward-declared by `typedef`.
+    // Nothing closes these, so they open no indent scope.
+    bool is_prototype{false};
+
+    // A `module`/`interface`/`package`/`program` keyword that starts a design
+    // unit.  `interface class` and `virtual interface` do not: the first is a
+    // class closed by `endclass`, the second a variable's type.
+    bool opens_design_unit{false};
+
+    // The `while` that closes a `do` (`do x++; while (c);`,
+    // `do begin ... end while (c);`).  It controls nothing.
+    bool ends_do_while{false};
+
+    // A `;` whose innermost enclosing delimiter is a statement-block brace
+    // (`with { a < 5; b == 3; }`), even when that brace sits inside
+    // parentheses.  It ends a constraint, not a `for` header clause.
+    bool separates_brace_block_items{false};
+
+    // The `[` of an SVA repetition -- `[*n]`, `[+]`, `[->n]`, `[=n]` --
+    // whose operator is not the implication or assignment it spells.
+    bool is_repetition_bracket{false};
+
+    // Set on the last token of a macro invocation -- the bare macro, or the
+    // `)` closing its arguments -- that stands as a whole statement or item
+    // with no `;` of its own (`` `uvm_info(...) ``, `` `ASSERT(...) ``,
+    // `` `NOP ``).  Decided from TokenKinds alone: the macro sits where a
+    // statement or item can start, and the next token can only begin a new
+    // one.  MacroPass refines it with [format.macros] into
+    // MacroMetadata::ends_statement, which is what formatting passes read.
+    bool may_end_macro_statement{false};
 };
 
 // 4. InputTriviaFacts: observation of original whitespace.  These are facts
@@ -199,12 +272,21 @@ struct WrapMetadata {
     WrapListKind list_kind{WrapListKind::None};
     size_t list_open{npos};
 };
+// anchor_token: the token whose rendered column this indent was measured from
+// (npos: the indent follows the nesting level alone).
 struct IndentMetadata { int base_indent{0}; int continuation_indent{0}; size_t anchor_token{npos}; };
-struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; };
+// indent_shift: columns AlignPass adds to a line-start token's indent.  An
+// indent measured from a column (a hanging list's `(`, a block call's name)
+// was measured before alignment padded the line that column is on; the shift
+// moves it by the padding that lands before its IndentMetadata::anchor_token.
+struct AlignMetadata { bool enabled{false}; int target_column{-1}; int alignment_group{-1}; int indent_shift{0}; };
 struct SpaceMetadata { int spaces_before{1}; bool suppress_space{false}; };
 struct CommentMetadata { bool preserve_internal_indent{true}; bool force_own_line{false}; int relative_indent{0}; };
 struct BlankLineMetadata { int before{0}; };
-struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; };
+// ends_statement: this token ends a semicolonless macro statement or item.
+// Every consumer that asks "where does this statement end" treats it like the
+// statement's `;` (see TopologyFacts::may_end_macro_statement).
+struct MacroMetadata { bool passthrough{false}; bool suppress_alignment{false}; bool suppress_wrapping{false}; bool opens_indent_scope{false}; bool closes_indent_scope{false}; bool force_line_break{false}; bool ends_statement{false}; };
 
 struct MutableData {
     WrapMetadata wrap;
