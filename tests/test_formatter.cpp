@@ -3405,12 +3405,14 @@ TEST_CASE("formatter: event control and for semicolon spacing options", "[format
     opts.spacing.space_inside_event_control_parens = true;
     opts.spacing.semicolon_spacing = "both";
 
+    // A statement `@(e);` after a `;` is the same event control as
+    // `always @(e)` and follows the same options (L-11).
     CHECK(format_source("module top;\nalways@(posedge clk) q <= d;\n@(posedge clk);\nfor(i = 0;i < "
                         "N;i++) a = b;\nendmodule\n",
                         opts) == "module top;\n"
                                  "always @ ( posedge clk )\n"
                                  "  q <= d;\n"
-                                 "@(posedge clk);\n"
+                                 "@ ( posedge clk );\n"
                                  "for (i = 0 ; i < N ; i++)\n"
                                  "  a = b;\n"
                                  "endmodule\n");

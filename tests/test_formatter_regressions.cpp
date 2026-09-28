@@ -1961,3 +1961,421 @@ endmodule
     CHECK(parses_cleanly(input));
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: a generic interface port opens no scope", "[formatter][regression]") {
+    const std::string input = R"SV(module m (interface g);
+wire a;
+endmodule
+module n;
+wire c;
+endmodule
+module m2 (interface.mst g, input logic x);
+wire a;
+endmodule
+class c; virtual interface bus_if vif; endclass
+)SV";
+    const std::string expected = R"SV(module m(
+  interface g
+);
+  wire a;
+endmodule
+module n;
+  wire c;
+endmodule
+module m2(
+  interface.mst g,
+  input logic x
+);
+  wire a;
+endmodule
+class c;
+  virtual interface bus_if vif;
+endclass
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a nested module closes at its own depth", "[formatter][regression]") {
+    const std::string input = R"SV(module outer;
+module inner;
+wire a;
+endmodule
+wire b;
+endmodule
+module next;
+wire c;
+endmodule
+)SV";
+    const std::string expected = R"SV(module outer;
+  module inner;
+    wire a;
+  endmodule
+  wire b;
+endmodule
+module next;
+  wire c;
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: alternative module headers under ifdef are one unit", "[formatter][regression]") {
+    const std::string input = R"SV(`ifdef A
+module m (input a);
+`else
+module m (input b);
+`endif
+wire w;
+endmodule
+module n;
+wire c;
+endmodule
+)SV";
+    const std::string expected = R"SV(`ifdef A
+module m(
+  input a
+);
+`else
+module m(
+  input b
+);
+`endif
+  wire w;
+endmodule
+module n;
+  wire c;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: always inside a property is an operator, not a block", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+a1: assert property (@(posedge clk) s_eventually always a);
+a2: assert property (@(posedge clk) a |-> always [1:3] b);
+always @(posedge clk) x <= y;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  a1: assert property (@(posedge clk) s_eventually always a);
+  a2: assert property (@(posedge clk) a |-> always [1:3] b);
+  always @(posedge clk)
+    x <= y;
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: every ifdef branch of a brace-less body keeps its indent", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always_comb
+`ifdef FAST
+x = 1;
+`else
+x = 2;
+`endif
+initial
+if (a)
+`ifdef FAST
+x = 1;
+`elsif MID
+x = 3;
+`else
+x = 2;
+`endif
+assign y = 1;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always_comb
+`ifdef FAST
+    x = 1;
+`else
+    x = 2;
+`endif
+  initial
+    if (a)
+`ifdef FAST
+      x = 1;
+`elsif MID
+      x = 3;
+`else
+      x = 2;
+`endif
+  assign y = 1;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: instances as generate bodies or with attributes are instances", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+if (N > 2)
+sub u_b (.a(a));
+for (genvar k = 0; k < 4; k++)
+sub u_c [3:0] (.a(a));
+(* keep *) sub u_d (.a(a));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  if (N > 2)
+    sub u_b(
+      .a(a)
+    );
+  for (genvar k = 0; k < 4; k++)
+    sub u_c[3:0] (
+      .a(a)
+    );
+  (* keep *) sub u_d(
+    .a(a)
+  );
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a hanging call whose paren is past the limit is not broken", "[formatter][regression]") {
+    const std::string input =
+        "module m;\n"
+        "assign y = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb + "
+        "cccccccccccccccccccc + g(d);\n"
+        "endmodule\n";
+    const std::string expected =
+        "module m;\n"
+        "  assign y = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa + bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb + "
+        "cccccccccccccccccccc + g(d);\n"
+        "endmodule\n";
+    for (const char* layout : {"hanging", "block"}) {
+        FormatOptions opts;
+        opts.function_call.layout = layout;
+        INFO("layout = " << layout);
+        CHECK(format_stable(input, opts) == expected);
+    }
+}
+
+TEST_CASE("formatter regression: every unpacked declarator is spaced from its name", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+logic a [4];
+logic b [2][3];
+int e [2], f [3][4];
+initial m2[1][2] = 0;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  logic a [4];
+  logic b [2][3];
+  int e [2], f [3][4];
+  initial
+    m2[1][2] = 0;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a macro-call declarator is aligned as one name", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+logic [3:0] `CAT(foo, _q);
+logic [7:0] bar;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+logic               [3:0]               `CAT(foo, _q)                       ;
+logic               [7:0]               bar                                 ;
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a leading comma after an ifdef stays with its item", "[formatter][regression]") {
+    const std::string input = R"SV(module m #(
+parameter int W = 8
+`ifdef WIDE
+, parameter int X = 64
+`endif
+) (
+input logic a
+`ifdef WIDE
+, input logic b
+`endif
+);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m #(
+  parameter int W = 8
+`ifdef WIDE
+  , parameter int X = 64
+`endif
+)(
+  input logic a
+`ifdef WIDE
+  , input logic b
+`endif
+);
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a comma inside a bins item does not split the item", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+covergroup cg @(posedge clk);
+cp: coverpoint a {
+bins tr = (1 => 2), (4 => 5);
+bins s = {1, 2}, t = {3};
+}
+endgroup
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  covergroup cg @(posedge clk);
+    cp: coverpoint a {
+      bins tr = (1 => 2), (4 => 5);
+      bins s = {1, 2}, t = {3};
+    }
+  endgroup
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: every procedural event control follows the options", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+@(posedge clk);
+@(ev1 or ev2);
+@(negedge clk) x = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+initial begin
+    @ ( posedge clk );
+    @ ( ev1 or ev2 );
+    @ ( negedge clk ) x = 1;
+end
+endmodule
+)SV";
+    FormatOptions opts = indent4();
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.spacing.procedural_event_control_at_spacing = "both";
+    opts.spacing.space_inside_event_control_parens = true;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a statement label after an end label is a label", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial begin
+begin : blk end : blk
+lbl: x = 3;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    begin: blk
+    end: blk
+    lbl: x = 3;
+  end
+endmodule
+)SV";
+    CHECK(parses_cleanly(input));
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: an attribute is spaced as one unit", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+sub (* keep *) u (.a(a));
+function (* noinline *) int f(); return 1; endfunction
+(* keep *) wire w;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  sub (* keep *) u(
+    .a(a)
+  );
+  function (* noinline *) int f();
+    return 1;
+  endfunction
+  (* keep *) wire w;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+
+    FormatOptions opts;
+    opts.spacing.binary_operator_spacing = "none";
+    const std::string none = format_stable(input, opts);
+    CHECK(none.find("(* keep *)") != std::string::npos);
+    CHECK(none.find("(* noinline *)") != std::string::npos);
+}
+
+TEST_CASE("formatter regression: SVA repetition brackets bind whatever the dimension options", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+sequence s; a ##1 b [*1:3] ##1 c [->2] ##1 d [=3]; endsequence
+assign z = q[1:0];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  sequence s;
+    a ##1 b[*1:3] ##1 c[->2] ##1 d[=3];
+  endsequence
+  assign z = q[ 1 : 0 ];
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.space_inside_dimension_brackets = true;
+    opts.spacing.range_colon_spacing = "both";
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: empty for clauses add no padding", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+initial for (;;) break;
+initial for (i = 0; i < 3;) i++;
+endmodule
+)SV";
+    for (const char* mode : {"none", "after", "both"}) {
+        FormatOptions opts;
+        opts.spacing.semicolon_spacing = mode;
+        INFO("semicolon_spacing = " << mode);
+        const std::string out = format_stable(input, opts);
+        CHECK(out.find("for (;;)") != std::string::npos);
+        // The last clause is empty: nothing between its `;` and the `)`.
+        CHECK(out.find(";)") != std::string::npos);
+        CHECK(out.find("; )") == std::string::npos);
+    }
+}
+
+TEST_CASE("formatter regression: an operator is never glued to a comment", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+assign y = a + // carry-in
+b;
+assign z = a && /* gate */ b;
+always_ff /* c */ @(posedge clk) q <= d;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  assign y=a+ // carry-in
+    b;
+  assign z=a&& /* gate */ b;
+  always_ff /* c */ @(posedge clk)
+    q<=d;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.binary_operator_spacing = "none";
+    opts.spacing.assignment_operator_spacing = "none";
+    opts.spacing.procedural_event_control_at_spacing = "none";
+    CHECK(format_stable(input, opts) == expected);
+}
