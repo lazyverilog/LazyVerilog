@@ -2379,3 +2379,280 @@ endmodule
     opts.spacing.procedural_event_control_at_spacing = "none";
     CHECK(format_stable(input, opts) == expected);
 }
+
+// Round 5 (M-1..M-12).
+
+TEST_CASE("formatter regression: a select target with <= or += is not a declaration", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+logic [7:0] q;
+always_ff @(posedge clk) begin
+mem[w] <= d;
+cnt[i] += d;
+pkg::arr[i] = d;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  logic   [7:0]   q       ;
+  always_ff @(posedge clk) begin
+    mem[w] <= d;
+    cnt[i] += d;
+    pkg::arr[i] = d;
+  end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.section1_min_width = 8;
+    opts.var_declaration.section2_min_width = 8;
+    opts.var_declaration.section3_min_width = 8;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an own-line comment before a brace-less body is indented with it", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always_comb begin
+if (a)
+// c1
+x = 1;
+else
+// c2
+x = 0;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always_comb begin
+    if (a)
+      // c1
+      x = 1;
+    else
+      // c2
+      x = 0;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a case item's statement is a controlled body", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always_comb begin
+case (s)
+A: if (go) n = B; else n = A;
+B:
+// c
+z = 2;
+endcase
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always_comb begin
+    case (s)
+      A: if (go)
+          n = B;
+        else
+          n = A;
+      B:
+        // c
+        z = 2;
+    endcase
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: an ANSI list led by an interface port is not packed as non-ANSI", "[formatter][regression]") {
+    const std::string input = R"SV(module m (axi_if.master m_axi, input logic b, output logic c);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m(
+  axi_if.master m_axi,
+  input logic b,
+  output logic c
+);
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 3;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: the statement after a format-off region is aligned", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+always_comb begin
+x = 1;
+// verilog_format: off
+q   =    r;
+// verilog_format: on
+yy = zz;
+yyy = zzz;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always_comb begin
+    x    = 1;
+// verilog_format: off
+q   =    r;
+// verilog_format: on
+    yy   = zz;
+    yyy  = zzz;
+  end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 4;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: calls inside brackets are not broken per argument", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+logic [clog(A,B,C)-1:0] w;
+logic [7:0] q;
+always_comb y = mem[hash(a,b,c)];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  logic [clog(A, B, C)-1:0] w;
+  logic [7:0] q;
+  always_comb
+    y = mem[hash(a, b, c)];
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_call.break_policy = "always";
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: scoped and var-led declarations are aligned", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+pkg::cfg_t cfg;
+var logic vl;
+logic [7:0] data_q;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  pkg::cfg_t       cfg    ;
+  var logic        vl     ;
+  logic      [7:0] data_q ;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.section1_min_width = 4;
+    opts.var_declaration.section2_min_width = 4;
+    opts.var_declaration.section3_min_width = 4;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: instance port name width counts the dot", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+sub u (.a(a), .long_port(long_signal), .z(z));
+sub v (.abcdefghijklmnopqrs(x), .b(y));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  sub u (
+    .a                  (a          ),
+    .long_port          (long_signal),
+    .z                  (z          )
+  );
+  sub v (
+    .abcdefghijklmnopqrs (x),
+    .b                   (y)
+  );
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.instance.align = true;
+    opts.instance.instance_port_name_width = 20;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: hanging function arguments get no port-list dimension padding", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+function automatic logic f(input logic a, input logic [7:0] b);
+return a;
+endfunction
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  function automatic logic f(input logic a,
+                             input logic [7:0] b);
+    return a;
+  endfunction
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_declaration.layout = "hanging";
+    opts.function_declaration.line_length = 40;
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = false;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: strength parens and comment-only parens space like code", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+wire (pull1, pull0) [3:0] pw = 4'h0;
+trireg (small) [7:0] tr;
+sub u (.a(/* unused */), .b(q));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  wire (pull1, pull0) [3:0] pw = 4'h0;
+  trireg (small) [7:0] tr;
+  sub u(
+    .a(/* unused */),
+    .b(q)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+    CHECK(parses_cleanly(expected));
+}
+
+TEST_CASE("formatter regression: a scoped name before a select is not a declaration", "[formatter][regression]") {
+    const std::string input = R"SV(module m;
+pkg::type_t arr [4];
+always_comb pkg::arr[i] = d;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  pkg::type_t arr [4];
+  always_comb
+    pkg::arr[i] = d;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a parameter's unpacked dimension is spaced like a variable's", "[formatter][regression]") {
+    const std::string input = R"SV(module m #(parameter int P[2] = '{0, 1}, parameter type T = logic [3:0]) ();
+localparam logic [7:0] LUT[4] = '{1, 2, 3, 4};
+parameter int A[2] = '{0, 1};
+localparam int B[2][3] = '{default: 0};
+localparam int W = C[1] + $size(A[0]);
+parameter int X = 1, Y[2] = '{0, 1};
+logic t[2];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m #(
+  parameter int P [2] = '{0, 1},
+  parameter type T = logic [3:0]
+)();
+  localparam logic [7:0] LUT [4] = '{1, 2, 3, 4};
+  parameter int A [2] = '{0, 1};
+  localparam int B [2][3] = '{default : 0};
+  localparam int W = C[1] + $size(A[0]);
+  parameter int X = 1, Y [2] = '{0, 1};
+  logic t [2];
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+    CHECK(parses_cleanly(expected));
+}

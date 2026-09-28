@@ -357,7 +357,7 @@ TEST_CASE("formatter: module parameter layout block", "[formatter]") {
           "    parameter type T = logic [7:0],\n"
           "    parameter int DEPTH = 8,\n"
           "    parameter int SIZE = 4,\n"
-          "    parameter logic [7:0] TABLE[SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33}\n"
+          "    parameter logic [7:0] TABLE [SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33}\n"
           ")(\n"
           "    input logic clk\n"
           ");\n"
@@ -379,7 +379,7 @@ TEST_CASE("formatter: module parameter layout hanging", "[formatter]") {
           "module register #(parameter type T = logic [7:0],\n"
           "                  parameter int DEPTH = 8,\n"
           "                  parameter int SIZE = 4,\n"
-          "                  parameter logic [7:0] TABLE[SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33})(\n"
+          "                  parameter logic [7:0] TABLE [SIZE] = '{8'h00, 8'h11, 8'h22, 8'h33})(\n"
           "    input logic clk\n"
           ");\n"
           "endmodule\n");
@@ -4277,9 +4277,9 @@ TEST_CASE("formatter: instance alignment strict versus adaptive", "[formatter][o
     CHECK(format_source("module top;\nchild u(.a(a), .long_port(long_signal), .z(z));\nendmodule\n", opts) ==
           "module top;\n"
           "child u (\n"
-          "    .a       (a          ),\n"
+          "    .a         (a          ),\n"
           "    .long_port (long_signal),\n"
-          "    .z       (z          )\n"
+          "    .z         (z          )\n"
           ");\n"
           "endmodule\n");
 

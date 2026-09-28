@@ -774,6 +774,31 @@ inline bool starts_declaration_keyword(TK k) {
            k == TK::TriKeyword || k == TK::UWireKeyword || k == TK::NetTypeKeyword;
 }
 
+// Drive and charge strength keywords: `(strong0, weak1)`, `trireg (small)`.
+inline bool is_strength_keyword(TK k) {
+    switch (k) {
+        case TK::Supply0Keyword: case TK::Supply1Keyword:
+        case TK::Strong0Keyword: case TK::Strong1Keyword:
+        case TK::Pull0Keyword: case TK::Pull1Keyword:
+        case TK::Weak0Keyword: case TK::Weak1Keyword:
+        case TK::HighZ0Keyword: case TK::HighZ1Keyword:
+        case TK::SmallKeyword: case TK::MediumKeyword: case TK::LargeKeyword:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// `)` closing a drive or charge strength -- `wire (pull1, pull0) [3:0] w`.
+// What follows is a declaration's packed dimension, not a select.
+inline bool closes_strength(const TokenStream& tokens, size_t close) {
+    if (!kind_is(tokens[close], TK::CloseParenthesis)) return false;
+    const size_t open = tokens[close].immutable.syntax.matching_token;
+    if (open == npos) return false;
+    const size_t first = next_code(tokens, open + 1, close);
+    return first != npos && is_strength_keyword(tokens[first].lex.kind);
+}
+
 // The invocation's last token: the `)` closing its arguments, or the macro.
 inline size_t macro_invocation_end(const TokenStream& tokens, size_t macro) {
     size_t open = next_code(tokens, macro + 1, tokens.size());
@@ -1126,10 +1151,14 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
         return begin;
     };
 
-    // `logic a [4]`, `input logic [7:0] d [2]`, or `my_t m [4]`.
+    // `logic a [4]`, `input logic [7:0] d [2]`, `my_t m [4]`, or
+    // `localparam logic [7:0] LUT [4]` -- a parameter's unpacked dimension
+    // is spaced like a variable's.
     auto declares = [&](size_t first, size_t last) {
         if (is_var_decl_leading_keyword(tokens[first].lex.kind) ||
-            is_port_direction(tokens[first].lex.kind))
+            is_port_direction(tokens[first].lex.kind) ||
+            kind_is(tokens[first], TK::ParameterKeyword) ||
+            kind_is(tokens[first], TK::LocalParamKeyword))
             return true;
         // User-defined types can lead a declaration with an identifier-like
         // token.  Accept the pattern only when the element contains at least
@@ -1142,7 +1171,10 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
                 continue;
             if (kind_is(tokens[i], TK::Dot))
                 return false;
-            if (is_identifier_like(tokens[i]))
+            // `pkg::arr[i]` names one thing; a scoped name counts once.
+            const size_t before = prev_code(tokens, i);
+            if (is_identifier_like(tokens[i]) &&
+                !(before != npos && before >= first && kind_is(tokens[before], TK::DoubleColon)))
                 ++identifier_count;
         }
         return identifier_count >= 2;
@@ -2656,8 +2688,37 @@ public:
                 tokens[after_open].mutable_.wrap.must_break_after = true;
             }
 
-            if (kind == WrapListKind::ModulePorts && !items.empty() &&
-                !is_declaration_keyword(tokens[items.front().first].lex.kind)) {
+            // A port declared without a keyword still declares: `bus_if.mp m`,
+            // `pkg::cfg_t cfg`, `my_t [3:0] v` -- a name straight after a
+            // name or a `]`.  Non-ANSI items are bare port expressions (`a`,
+            // `a[3:0]`, `.a(b)`, `{a, b}`) and never have that shape.
+            auto declares_port = [&](size_t first, size_t last) {
+                if (is_declaration_keyword(tokens[first].lex.kind))
+                    return true;
+                int pd = 0, bd = 0, brd = 0;
+                size_t prev = npos;
+                for (size_t k = first; k <= last; ++k) {
+                    if (!is_code_token(tokens[k])) continue;
+                    if (kind_is(tokens[k], TK::OpenParenthesis)) ++pd;
+                    else if (kind_is(tokens[k], TK::CloseParenthesis) && pd > 0) --pd;
+                    else if (kind_is(tokens[k], TK::OpenBracket)) ++bd;
+                    else if (kind_is(tokens[k], TK::CloseBracket) && bd > 0) --bd;
+                    else if (kind_is(tokens[k], TK::OpenBrace)) ++brd;
+                    else if (kind_is(tokens[k], TK::CloseBrace) && brd > 0) --brd;
+                    if (pd != 0 || bd != 0 || brd != 0)
+                        continue;
+                    if (prev != npos && is_identifier_like(tokens[k]) &&
+                        (is_identifier_like(tokens[prev]) || kind_is(tokens[prev], TK::CloseBracket)))
+                        return true;
+                    prev = k;
+                }
+                return false;
+            };
+            bool non_ansi_ports = kind == WrapListKind::ModulePorts && !items.empty();
+            for (size_t n = 0; non_ansi_ports && n < items.size(); ++n)
+                if (declares_port(items[n].first, items[n].last))
+                    non_ansi_ports = false;
+            if (non_ansi_ports) {
                 int per_line = 1;
                 if (opts_.module.non_ansi_port_per_line_enabled)
                     per_line = std::max(1, opts_.module.non_ansi_port_per_line);
@@ -2766,7 +2827,12 @@ public:
             if (!is_code_token(tokens[i]))
                 continue;
             if (kind_is(tokens[i], TK::OpenParenthesis)) {
-                nested_argument_open[i] = !argument_stack.empty();
+                // A call inside a dimension or select (`logic [f(a, b)-1:0]`,
+                // `mem[h(a, b)]`) is an operand, like a call inside another
+                // call's arguments: breaking it one argument per line splits
+                // the declaration or select around it.
+                nested_argument_open[i] = !argument_stack.empty() ||
+                                          tokens[i].immutable.syntax.bracket_depth > 0;
                 if (tokens[i].immutable.topology.starts_argument_list)
                     argument_stack.push_back(i);
             } else if (kind_is(tokens[i], TK::CloseParenthesis) &&
@@ -3317,7 +3383,15 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
         if (closes_indent_scope_at(tokens, body) || is_outer_close(b.lex.kind) ||
             b.mutable_.macro.closes_indent_scope)
             return;
-        out[body].push_back(extend_over_conditional_branches(tokens, body, end));
+        const size_t extent_end = extend_over_conditional_branches(tokens, body, end);
+        // `if (a)` / `// c` / `x = 1;` -- an own-line comment between a
+        // control and its body belongs to the body and takes its level.
+        size_t start = body;
+        while (start > 0 && tokens[start - 1].lex.comment_kind != CommentLexemeKind::None &&
+               tokens[start - 1].immutable.comment.role == CommentRole::OwnLine &&
+               !is_passthrough(tokens[start - 1]))
+            --start;
+        out[start].push_back(extent_end);
     };
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (!is_code_token(tokens[i]) || is_property_operator_keyword(tokens[i]))
@@ -3341,6 +3415,15 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
         } else if (k == TK::DoKeyword) {
             const size_t body = next_code(tokens, i + 1, tokens.size());
             add(body, simple_statement_end_from(tokens, body));
+        } else if (tokens[i].immutable.topology.is_case_item_colon &&
+                   !tokens[i].immutable.syntax.in_property_expr) {
+            // A case item's statement sits one level inside its label, as
+            // the contents of `A: begin ... end` do: `A:` / `// c` / `x = 1;`
+            // indents `x`, and `A: if (c) x = 1; else x = 2;` puts `else` at
+            // the statement's level rather than the label's.
+            const size_t body = next_code(tokens, i + 1, tokens.size());
+            if (body != npos && !kind_is(tokens[body], TK::Semicolon))
+                add(body, simple_statement_end_from(tokens, body));
         } else if (is_single_stmt_control(k)) {
             // The `while` closing a do-while controls nothing.
             if (tokens[i].immutable.topology.ends_do_while)
@@ -3875,8 +3958,12 @@ public:
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& tok = tokens[i];
             if (is_passthrough(tok)) continue;
+            // A format-off region -- its body through the `verilog_format: on`
+            // line -- ends its line.  It is passthrough and carries no break,
+            // which folded the statement after it into the region's line.
             if (i > 0 && (tok.mutable_.wrap.must_break_before ||
-                          tokens[i - 1].mutable_.wrap.must_break_after)) {
+                          tokens[i - 1].mutable_.wrap.must_break_after ||
+                          tokens[i - 1].lex.is_disabled_region_body)) {
                 push_line(i);
             }
             if (cur_first == npos) cur_first = i;
@@ -4219,18 +4306,50 @@ public:
                 if (semi == npos)
                     return false;
 
-                bool plausible_start = is_var_decl_leading_keyword(tokens[ln.first].lex.kind);
+                bool plausible_start = is_var_decl_leading_keyword(tokens[ln.first].lex.kind) ||
+                                       kind_is(tokens[ln.first], TK::VarKeyword);
+                // Last token of a leading type name: `pkg::cfg_t cfg;` -- a
+                // scoped type name is one type, and the declarator follows it.
+                size_t type_last = ln.first;
                 if (!plausible_start && is_identifier_like(tokens[ln.first])) {
-                    size_t nx = next_code(tokens, ln.first + 1, semi);
+                    for (;;) {
+                        const size_t sep = next_code(tokens, type_last + 1, semi);
+                        if (sep == npos || !kind_is(tokens[sep], TK::DoubleColon))
+                            break;
+                        const size_t part = next_code(tokens, sep + 1, semi);
+                        if (part == npos || !is_identifier_like(tokens[part]))
+                            break;
+                        type_last = part;
+                    }
+                    size_t nx = next_code(tokens, type_last + 1, semi);
                     plausible_start = nx != npos &&
                         (is_identifier_like(tokens[nx]) || kind_is(tokens[nx], TK::OpenBracket));
                 }
                 if (!plausible_start)
                     return false;
+                // `arr[i] <= d;` / `cnt[i] += 1;` -- a declaration's only
+                // top-level assignment is its initializer `=`; any other
+                // assignment operator before it makes the line a statement,
+                // or `arr` reads as the type, `[i]` as its packed dimension
+                // and `d` as the declarator.
+                {
+                    int pd = 0, bd = 0, brd = 0;
+                    for (size_t k = ln.first; k < (eq == npos ? semi : eq); ++k) {
+                        if (!is_code_token(tokens[k])) continue;
+                        if (kind_is(tokens[k], TK::OpenParenthesis)) ++pd;
+                        else if (kind_is(tokens[k], TK::CloseParenthesis) && pd > 0) --pd;
+                        else if (kind_is(tokens[k], TK::OpenBracket)) ++bd;
+                        else if (kind_is(tokens[k], TK::CloseBracket) && bd > 0) --bd;
+                        else if (kind_is(tokens[k], TK::OpenBrace) || kind_is(tokens[k], TK::ApostropheOpenBrace)) ++brd;
+                        else if (kind_is(tokens[k], TK::CloseBrace) && brd > 0) --brd;
+                        else if (pd == 0 && bd == 0 && brd == 0 && is_assignment_op(tokens[k].lex.kind))
+                            return false;
+                    }
+                }
 
                 size_t first_delim = first_top_level_delim(ln.first + 1, eq == npos ? semi : eq);
                 size_t first_name = previous_decl_name(ln.first + 1, first_delim);
-                if (first_name == npos || first_name <= ln.first)
+                if (first_name == npos || first_name <= type_last)
                     return false;
                 // A user-defined type declaration and a module/interface instance can
                 // both begin with two identifier-like tokens:
@@ -4802,6 +4921,12 @@ public:
                 if (ln.first == npos || !is_port_direction(tokens[ln.first].lex.kind) ||
                     tokens[ln.first].immutable.syntax.paren_depth == 0)
                     continue;
+                // Module ports only: a hanging function or task argument list
+                // (`f(input logic [7:0] a,` / `input logic [7:0] b,`) has
+                // direction-led lines too, and its layout places them.
+                const size_t list_delim = prev_code(tokens, ln.first);
+                if (list_delim == npos || tokens[list_delim].mutable_.wrap.list_kind != WrapListKind::ModulePorts)
+                    continue;
                 size_t dim = npos;
                 for (size_t k = ln.first + 1; k < ln.end; ++k) {
                     if (kind_is(tokens[k], TK::Semicolon) || kind_is(tokens[k], TK::Comma))
@@ -5094,7 +5219,7 @@ public:
             size_t close = tokens[open].immutable.syntax.matching_token;
             if (close == npos) continue;
             auto items = top_level_list_items(tokens, open + 1, close);
-            int max_port = option_width(opts_.instance.instance_port_name_width, opts_);
+            int max_namew = 0;
             int max_sig = opts_.instance.instance_port_between_paren_width;
             struct Conn { size_t name, op, cl; int namew, sigw; };
             std::vector<Conn> conns;
@@ -5109,23 +5234,24 @@ public:
                 if (cl == npos || cl > item.last) continue;
                 int nw = token_width(tokens[name]);
                 int sw = compact_width(tokens, op + 1, cl);
-                max_port = std::max(max_port, nw);
+                max_namew = std::max(max_namew, nw);
                 max_sig = std::max(max_sig, sw);
                 conns.push_back({name, op, cl, nw, sw});
             }
             for (const auto& c : conns) {
                 int item_indent = tokens[prev_code(tokens, c.name)].mutable_.indent.base_indent;
-                int port_width = opts_.instance.align_adaptive
-                    ? std::max(option_width(opts_.instance.instance_port_name_width, opts_), c.namew)
-                    : max_port;
                 int sig_width = opts_.instance.align_adaptive
                     ? std::max(opts_.instance.instance_port_between_paren_width, c.sigw)
                     : max_sig;
                 tokens[c.op].mutable_.align.enabled = true;
                 tokens[c.op].mutable_.align.alignment_group = group;
-                int configured_port_width = option_width(opts_.instance.instance_port_name_width, opts_);
-                tokens[c.op].mutable_.align.target_column = item_indent +
-                    (c.namew >= configured_port_width ? c.namew + 2 : port_width);
+                // The field runs from `.` to `(`: the dot, the name and at
+                // least one space.  Non-adaptive sizes every row by the
+                // widest name so the `(` share one column.
+                const int configured_port_width = option_width(opts_.instance.instance_port_name_width, opts_);
+                const int namew = opts_.instance.align_adaptive ? c.namew : max_namew;
+                tokens[c.op].mutable_.align.target_column =
+                    item_indent + std::max(configured_port_width, namew + 2);
                 tokens[c.cl].mutable_.align.enabled = true;
                 tokens[c.cl].mutable_.align.alignment_group = group;
                 tokens[c.cl].mutable_.align.target_column =
@@ -5411,8 +5537,15 @@ public:
 
             // Basic no-space rules
             if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
-            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis))
-                spaces = 1;
+            // `( /*autoinst*/` keeps its space before the list.  A block
+            // comment that is the parens' only content is padded like any
+            // other first token, symmetric with its `)`: `.o(/* unused */)`.
+            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis)) {
+                const bool sole_content = t.lex.comment_kind == CommentLexemeKind::Block &&
+                    L.immutable.syntax.matching_token != npos &&
+                    next_code(tokens, i + 1, tokens.size()) == L.immutable.syntax.matching_token;
+                if (!sole_content) spaces = 1;
+            }
             // Empty positional argument: `, ,` — keep one space so the slot is visible
             if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
 
@@ -5470,7 +5603,8 @@ public:
             // No space before '[' when it's an index/dimension on an identifier or closer
             if (kind_is(t, TK::OpenBracket) &&
                 (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis) ||
-                 kind_is(L, TK::NewKeyword)))
+                 kind_is(L, TK::NewKeyword)) &&
+                !closes_strength(tokens, i - 1))
                 spaces = 0;
             if (kind_is(t, TK::OpenBracket) && is_identifier_like(L) &&
                 t.immutable.syntax.matching_token != npos) {
