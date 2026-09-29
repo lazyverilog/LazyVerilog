@@ -2972,6 +2972,15 @@ public:
                 }
                 if (kind_is(tokens[k], TK::Semicolon)) break;
             }
+            // `sequence s(a, b)`, `property p(...)`, `let max(a, b)` -- the
+            // formals of a declaration, laid out like a function's.
+            if (const size_t name = prev_code(tokens, open);
+                !is_decl && name != npos && kind_is(tokens[name], TK::Identifier)) {
+                const size_t kw = prev_code(tokens, name);
+                is_decl = kw != npos && (kind_is(tokens[kw], TK::SequenceKeyword) ||
+                                         kind_is(tokens[kw], TK::PropertyKeyword) ||
+                                         kind_is(tokens[kw], TK::LetKeyword));
+            }
             if (is_decl) {
                 int approx = line_prefix_width(tokens, open) + 1 + compact_width(tokens, open + 1, close) + 1;
                 if (approx > opts_.function_declaration.line_length) {

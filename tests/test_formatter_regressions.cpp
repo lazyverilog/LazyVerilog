@@ -2788,3 +2788,35 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: sequence property and let formals are declarations and not calls", "[formatter][regression]") {
+    // N-6: `name(` after `sequence`/`property`/`let` was broken per argument
+    // under `function_call.break_policy = "always"`.  They follow
+    // `function_declaration.*` now, like a function's formals.
+    const std::string input = R"SV(module m;
+sequence s_req(sig, n);
+sig ##n !sig;
+endsequence
+property p_x(a, b);
+@(posedge clk) a |-> s_req(a, 2);
+endproperty
+let max(a, b) = (a > b) ? a : b;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  sequence s_req(sig, n);
+    sig ##n !sig;
+  endsequence
+  property p_x(a, b);
+    @(posedge clk) a |-> s_req(
+                           a,
+                           2
+                         );
+  endproperty
+  let max(a, b) = (a > b) ? a : b;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_call.break_policy = "always";
+    CHECK(format_stable(input, opts) == expected);
+}
