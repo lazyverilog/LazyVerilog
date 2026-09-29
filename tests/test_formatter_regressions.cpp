@@ -2707,3 +2707,32 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: a long override list breaks per override and not inside one", "[formatter][regression]") {
+    // N-3: the `#(...)` list was never measured, so the only paren the
+    // line-length rule found was `.USER_WIDTH(`, broken as a one-argument
+    // call and hung at column 98.
+    const std::string input = R"SV(module m;
+axi_xbar #(.NUM_MASTERS(4), .NUM_SLAVES(8), .ADDR_WIDTH(64), .DATA_WIDTH(512), .ID_WIDTH(8), .USER_WIDTH(16)) u_xbar (.clk(clk));
+axi_xbar #(.NUM_MASTERS(4), .NUM_SLAVES(8)) u_short (.clk(clk));
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  axi_xbar #(
+    .NUM_MASTERS(4),
+    .NUM_SLAVES(8),
+    .ADDR_WIDTH(64),
+    .DATA_WIDTH(512),
+    .ID_WIDTH(8),
+    .USER_WIDTH(16)
+  ) u_xbar(
+    .clk(clk)
+  );
+  axi_xbar #(.NUM_MASTERS(4), .NUM_SLAVES(8)) u_short(
+    .clk(clk)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+    CHECK(parses_cleanly(expected));
+}

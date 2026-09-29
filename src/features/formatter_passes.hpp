@@ -2032,12 +2032,6 @@ inline size_t class_header_parameter_list_owner(const TokenStream& tokens, size_
     return npos;
 }
 
-// `extends p #(...)` -- a list of values, not declarations.
-inline bool is_class_extends_parameter_list(const TokenStream& tokens, size_t open) {
-    const size_t owner = class_header_parameter_list_owner(tokens, open);
-    return owner != npos && !kind_is(tokens[owner], TK::ClassKeyword);
-}
-
 // `class base #(type T = int, int W = 8)` -- the class's own parameter ports.
 inline bool is_class_header_parameter_list(const TokenStream& tokens, size_t open) {
     const size_t owner = class_header_parameter_list_owner(tokens, open);
@@ -2833,7 +2827,10 @@ public:
                 // the declaration or select around it.
                 nested_argument_open[i] = !argument_stack.empty() ||
                                           tokens[i].immutable.syntax.bracket_depth > 0;
-                if (tokens[i].immutable.topology.starts_argument_list)
+                // A `#(...)` list is a list of values too: the paren of a
+                // named override `.W(16)` inside it is an operand, not a call.
+                if (tokens[i].immutable.topology.starts_argument_list ||
+                    tokens[i].immutable.topology.starts_parameter_list)
                     argument_stack.push_back(i);
             } else if (kind_is(tokens[i], TK::CloseParenthesis) &&
                        tokens[i].immutable.syntax.matching_token != npos) {
@@ -2869,18 +2866,15 @@ public:
             }
 
             if (tokens[open].immutable.topology.starts_parameter_list) {
-                // A specialization (`extends p #(T)`) is a list of values,
-                // like an instance's override list: it breaks only when it
-                // does not fit the line.  The declaration gate below --
-                // one parameter per line -- is for parameter port lists.
-                //
-                // Any other `#(` -- an instance's override list, a
-                // parameterized type -- stays as written on one line unless
-                // something inside ends a line anyway: a `//` comment, an
-                // own-line comment or a directive.  Left joined, whatever
-                // follows that break lands at the statement's indent and
-                // reads as a new statement.
-                const bool specialization = is_class_extends_parameter_list(tokens, open);
+                // Any `#(` that is not a parameter port list -- a
+                // specialization (`extends p #(T)`), an instance's override
+                // list, a parameterized type -- is a list of values: it stays
+                // on one line unless it does not fit, or something inside
+                // ends a line anyway: a `//` comment, an own-line comment or
+                // a directive.  Left joined, whatever follows that break
+                // lands at the statement's indent and reads as a new
+                // statement.  The declaration gate below -- one parameter
+                // per line -- is for parameter port lists.
                 const bool declaration = find_header_keyword_before(tokens, open) != npos ||
                                          is_class_header_parameter_list(tokens, open);
                 auto items = top_level_list_items(tokens, open + 1, close);
@@ -2898,9 +2892,7 @@ public:
                 bool expand = declaration
                     ? block || items.size() > 1 || directive ||
                       one_line > opts_.function_declaration.line_length
-                    : specialization
-                    ? breaks_inside || one_line > opts_.function_call.line_length
-                    : breaks_inside;
+                    : breaks_inside || one_line > opts_.function_call.line_length;
                 if (expand) {
                     apply_list(open, block ? WrapListKind::ModuleParametersBlock
                                            : WrapListKind::ModuleParametersHanging,
