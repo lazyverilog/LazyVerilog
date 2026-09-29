@@ -2127,7 +2127,7 @@ endmodule
       .a(a)
     );
   for (genvar k = 0; k < 4; k++)
-    sub u_c[3:0] (
+    sub u_c[3:0](
       .a(a)
     );
   (* keep *) sub u_d(
@@ -3108,4 +3108,32 @@ endmodule
     opts.spacing.binary_operator_spacing = "none";
     CHECK(format_stable(input, opts) == expected);
     CHECK(parses_cleanly(expected));
+}
+
+TEST_CASE("formatter regression: an instance array spaces its paren like a plain instance", "[formatter][regression]") {
+    // N-16: `u_one(` follows `function_call.space_before_paren`, but an
+    // array's `(` after `]` fell through to the default space.
+    const std::string input = R"SV(module m;
+stage u_arr [3:0] (.a(a));
+stage u_one (.a(a));
+and g_arr [3:0] (o, a, b);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  stage u_arr[3:0](
+    .a(a)
+  );
+  stage u_one(
+    .a(a)
+  );
+  and g_arr[3:0](o, a, b);
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+
+    FormatOptions spaced;
+    spaced.function_call.space_before_paren = true;
+    const std::string out = format_stable(input, spaced);
+    CHECK(out.find("u_arr[3:0] (") != std::string::npos);
+    CHECK(out.find("u_one (") != std::string::npos);
 }

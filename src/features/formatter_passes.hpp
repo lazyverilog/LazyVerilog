@@ -5840,6 +5840,11 @@ public:
                 const size_t before_dim = prev_code(tokens, L.immutable.syntax.matching_token);
                 if (before_dim != npos && kind_is(tokens[before_dim], TK::NewKeyword))
                     spaces = opts_.function_call.space_before_paren ? 1 : 0;
+                // `u_arr[3:0](...)` -- an instance array's connections space
+                // like the plain instance's `u_one(...)`.
+                else if (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts ||
+                         is_gate_terminal_open(tokens, i))
+                    spaces = opts_.function_call.space_before_paren ? 1 : 0;
             }
             if (kind_is(t, TK::OpenParenthesis) &&
                 (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i)) &&
