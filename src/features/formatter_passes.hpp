@@ -160,9 +160,10 @@ inline bool is_type_keyword(TK k) {
            k == TK::EventKeyword || k == TK::VoidKeyword ||
            k == TK::SignedKeyword || k == TK::UnsignedKeyword || k == TK::PackedKeyword;
 }
+// `rand`/`randc` qualify a class property the way `static` does.
 inline bool is_var_decl_leading_keyword(TK k) {
     return is_type_keyword(k) || k == TK::AutomaticKeyword || k == TK::StaticKeyword ||
-           k == TK::ConstKeyword;
+           k == TK::ConstKeyword || k == TK::RandKeyword || k == TK::RandCKeyword;
 }
 inline bool is_port_direction(TK k) {
     return k == TK::InputKeyword || k == TK::OutputKeyword ||
@@ -775,7 +776,7 @@ inline bool starts_new_statement_keyword(TK k) {
 inline bool starts_declaration_keyword(TK k) {
     return is_var_decl_leading_keyword(k) || is_port_direction(k) ||
            k == TK::VarKeyword || k == TK::StructKeyword || k == TK::EnumKeyword ||
-           k == TK::UnionKeyword || k == TK::RandKeyword || k == TK::RandCKeyword ||
+           k == TK::UnionKeyword ||
            k == TK::TriKeyword || k == TK::UWireKeyword || k == TK::NetTypeKeyword;
 }
 

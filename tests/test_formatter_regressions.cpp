@@ -914,7 +914,7 @@ endclass
 )SV";
     const std::string expected = R"SV(class pkt;
   rand int len, kind;
-  rand int payload[4];
+  rand int payload [4];
   constraint c_shape {
     if (kind == 0)
       len < 4;
@@ -941,7 +941,7 @@ TEST_CASE("formatter regression: a constraint whose only item is a braced block 
 endclass
 )SV";
     const std::string expected = R"SV(class c;
-  rand int q[4];
+  rand int q [4];
   int N;
   constraint a {
     foreach (q[i]) {
@@ -2912,4 +2912,44 @@ endmodule
     FormatOptions opts;
     opts.macros.statement_like.push_back("MY_STMT");
     CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: rand and randc properties are declarations", "[formatter][regression]") {
+    // N-10: `rand`/`randc` qualify a property as `static` does, but neither
+    // the declaration aligner nor the declarator-dimension spacing took a
+    // line starting with them as a declaration.
+    const std::string input = R"SV(class c;
+int da[];
+rand int ra[];
+rand bit [7:0] rb;
+randc logic [3:0] rc;
+static int s;
+endclass
+)SV";
+    const std::string expected = R"SV(class c;
+  int da [];
+  rand int ra [];
+  rand bit [7:0] rb;
+  randc logic [3:0] rc;
+  static int s;
+endclass
+)SV";
+    CHECK(format_stable(input) == expected);
+
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 12;
+    opts.var_declaration.section2_min_width = 8;
+    opts.var_declaration.section3_min_width = 6;
+    opts.var_declaration.section4_min_width = 4;
+    const std::string aligned = R"SV(class c;
+  int                 da    []  ;
+  rand int            ra    []  ;
+  rand bit    [7:0]   rb        ;
+  randc logic [3:0]   rc        ;
+  static int          s         ;
+endclass
+)SV";
+    CHECK(format_stable(input, opts) == aligned);
 }
