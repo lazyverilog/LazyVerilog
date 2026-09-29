@@ -2830,6 +2830,11 @@ public:
             return false;
         };
 
+        // A brace-less body starts its own line, so the calls below must be
+        // measured from there rather than from the end of its header.
+        apply_procedural_block_wrap(tokens);
+        apply_single_statement_control_wrap(tokens);
+
         // Precompute whether an opening parenthesis is nested inside another
         // argument-list parenthesis.  Keeping this as a vector avoids the old
         // per-open backward scan, which was quadratic on generated files with
@@ -3013,8 +3018,9 @@ public:
             }
         }
 
-        apply_procedural_block_wrap(tokens);
-        apply_single_statement_control_wrap(tokens);
+        // Last, so no list packing above can break inside these.
+        freeze_attribute_instances(tokens);
+        freeze_vector_literals(tokens);
 
         // Final comment line-boundary normalization belongs in WrapPass, not
         // CommentPass: it writes only WrapMetadata and runs after all list
@@ -3264,9 +3270,6 @@ private:
             break_pending_body(i);
             ctrl_just_closed = false;
         }
-
-        freeze_attribute_instances(tokens);
-        freeze_vector_literals(tokens);
     }
 
     // A based literal's value pieces must stay adjacent (see

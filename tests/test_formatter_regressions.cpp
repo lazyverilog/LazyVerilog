@@ -2759,3 +2759,32 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: a call in a brace-less body is measured from its own line", "[formatter][regression]") {
+    // N-5: the body wrap ran after the call-break loop, so the call was
+    // measured as though it still followed its `if (...)` header.
+    const std::string input = R"SV(module m;
+initial begin
+if (some_long_condition_signal && another_long_condition_signal && third_cond) report_error("ID", "failed");
+if (some_long_condition_signal && another_long_condition_signal && third_cond) `uvm_error("ID", "failed")
+end
+always @(posedge clk_with_a_long_name or negedge rst_with_a_long_name_n or posedge x) q <= compute(a, b);
+function (* noinline *) int f(input int x); return x; endfunction
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    if (some_long_condition_signal && another_long_condition_signal && third_cond)
+      report_error("ID", "failed");
+    if (some_long_condition_signal && another_long_condition_signal && third_cond)
+      `uvm_error("ID", "failed")
+  end
+  always @(posedge clk_with_a_long_name or negedge rst_with_a_long_name_n or posedge x)
+    q <= compute(a, b);
+  function (* noinline *) int f(input int x);
+    return x;
+  endfunction
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
