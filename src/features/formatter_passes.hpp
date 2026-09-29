@@ -3691,7 +3691,14 @@ public:
 
             size_t name = prev_code(tokens, open);
             int name_col = (name == npos) ? base : column_before(name);
+            // A hanging list's items line up with its first one, which sits
+            // after whatever space the inside-paren options put after `(`.
             int after_open_col = column_before(open) + token_width(tokens[open]);
+            if (const size_t first = next_code(tokens, open + 1, close);
+                first != npos && !tokens[first].mutable_.wrap.must_break_before &&
+                !tokens[open].mutable_.wrap.must_break_after &&
+                !tokens[first].mutable_.space.suppress_space)
+                after_open_col += tokens[first].mutable_.space.spaces_before;
 
             switch (kind) {
             case WrapListKind::FunctionBlock:

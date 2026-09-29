@@ -2820,3 +2820,36 @@ endmodule
     opts.function_call.break_policy = "always";
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: hanging items line up with the first item after a spaced paren", "[formatter][regression]") {
+    // N-7: the hanging column was taken right after `(`, ignoring the space
+    // the inside-paren options put there, so every continuation line sat
+    // one column left of the first item.
+    const std::string input = R"SV(module exprs #(parameter int W = 32, parameter type T = logic) (input logic a);
+function int add(int alpha, int beta); return alpha + beta; endfunction
+initial x = foo(alpha_arg, beta_arg);
+endmodule
+)SV";
+    const std::string expected = R"SV(module exprs #( parameter int W = 32,
+                parameter type T = logic )(
+  input logic a
+);
+  function int add( int alpha,
+                    int beta );
+    return alpha + beta;
+  endfunction
+  initial
+    x = foo( alpha_arg,
+             beta_arg );
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_call.layout = "hanging";
+    opts.function_call.space_inside_paren = true;
+    opts.function_call.line_length = 20;
+    opts.function_declaration.layout = "hanging";
+    opts.function_declaration.line_length = 20;
+    opts.module.parameter_layout = "hanging";
+    opts.spacing.space_inside_parens = true;
+    CHECK(format_stable(input, opts) == expected);
+}
