@@ -1793,7 +1793,8 @@ public:
         }
 
         // `{4{a}}`, `{(N){a}}`, `{2'd2{a}}` -- the inner brace of a
-        // replication follows its multiplier directly after the outer `{`.
+        // replication follows its multiplier directly after the outer `{`,
+        // or after the `'{` of a replicated assignment pattern (`'{4{a}}`).
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (!kind_is(tokens[i], TK::OpenBrace) || tokens[i].immutable.topology.opens_brace_block)
                 continue;
@@ -1818,8 +1819,10 @@ public:
             }
             const size_t outer = start == npos ? npos : prev_code(tokens, start);
             tokens[i].immutable.topology.is_replication_brace =
-                outer != npos && kind_is(tokens[outer], TK::OpenBrace) &&
-                !tokens[outer].immutable.topology.opens_brace_block;
+                outer != npos &&
+                ((kind_is(tokens[outer], TK::OpenBrace) &&
+                  !tokens[outer].immutable.topology.opens_brace_block) ||
+                 kind_is(tokens[outer], TK::ApostropheOpenBrace));
         }
 
         // `q <= repeat (n) @(e) d;` -- a `repeat` right after an assignment

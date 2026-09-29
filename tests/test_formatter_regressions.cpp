@@ -3022,3 +3022,27 @@ endmodule
     opts.spacing.procedural_event_control_at_spacing = "none";
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: a replicated assignment pattern binds its multiplier", "[formatter][regression]") {
+    // N-13: only a `{` could open a replication, so `'{4{8'hAA}}` came out
+    // as `'{4 {8'hAA}}` beside an untouched `{4{8'hAA}}`.
+    const std::string input = R"SV(module m;
+initial begin
+arr = '{4{8'hAA}};
+arr = '{2{a, b}};
+arr = '{(N){1'b0}};
+cat = {4{8'hAA}};
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    arr = '{4{8'hAA}};
+    arr = '{2{a, b}};
+    arr = '{(N){1'b0}};
+    cat = {4{8'hAA}};
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
