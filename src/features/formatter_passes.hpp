@@ -4818,6 +4818,20 @@ public:
                                              ? s4
                                              : option_width(std::max(opts_.port_declaration.section4_min_width,
                                                                      group_name_width + 1), opts_);
+                // Section5 holds the unpacked dimension.  Non-adaptive widens it
+                // to the group's widest one so the separator column stays common.
+                int group_unpacked_width = 0;
+                for (size_t gi = li; gi < j; ++gi) {
+                    const size_t open = port_lines[gi].unpacked_dim;
+                    if (open == npos) continue;
+                    const size_t close = tokens[open].immutable.syntax.matching_token;
+                    if (close != npos)
+                        group_unpacked_width = std::max(group_unpacked_width,
+                                                        token_text_width(tokens, open, close + 1));
+                }
+                const int effective_s5 = opts_.port_declaration.align_adaptive
+                                             ? s5
+                                             : std::max(s5, group_unpacked_width);
 
                 for (size_t gi = li; gi < j; ++gi) {
                     const auto& pl = port_lines[gi];
@@ -4839,7 +4853,7 @@ public:
                     const int preferred_name_col = preferred_packed_col + effective_s3;
                     const int trailing_gap = 0;
                     const int preferred_unpacked_col = preferred_name_col + effective_s4 + trailing_gap;
-                    const int preferred_first_sep_col = preferred_unpacked_col + s5;
+                    const int preferred_first_sep_col = preferred_unpacked_col + effective_s5;
 
                     const int type_col = std::max(preferred_type_col,
                                                   base + pl.direction_width + 1);
@@ -4877,9 +4891,18 @@ public:
                         tokens[pl.unpacked_dim].mutable_.align.enabled = true;
                         tokens[pl.unpacked_dim].mutable_.align.target_column = unpacked_col;
                     }
+                    // The separator returns to its preferred column whenever
+                    // this line's text ends before it; an overflow moves only
+                    // the boundaries it actually overlaps.
+                    int text_end = name_col + pl.name_width;
+                    if (pl.unpacked_dim != npos) {
+                        const size_t close = tokens[pl.unpacked_dim].immutable.syntax.matching_token;
+                        if (close != npos)
+                            text_end = unpacked_col + token_text_width(tokens, pl.unpacked_dim, close + 1);
+                    }
                     tokens[pl.first_delim].mutable_.align.enabled = true;
                     tokens[pl.first_delim].mutable_.align.target_column =
-                        std::max(preferred_first_sep_col, unpacked_col + s5);
+                        std::max(preferred_first_sep_col, text_end);
 
                     // Subsequent comma declarators on the same non-ANSI line
                     // are still aligned relative to the previous separator.
@@ -5138,7 +5161,20 @@ public:
                     (opts_.port_declaration.align_adaptive ? s4
                                                            : option_width(std::max(opts_.port_declaration.section4_min_width,
                                                                                    group_name_width + 1), opts_));
-                const int preferred_comma_col = preferred_trailing_col + s5;
+                // Section5 holds the unpacked dimension.  Non-adaptive widens it
+                // to the group's widest one so the `,` column stays common.
+                int group_unpacked_width = 0;
+                for (const auto& d : decls) {
+                    if (d.unpacked_dim == npos) continue;
+                    const size_t close = tokens[d.unpacked_dim].immutable.syntax.matching_token;
+                    if (close != npos)
+                        group_unpacked_width = std::max(group_unpacked_width,
+                                                        token_text_width(tokens, d.unpacked_dim, close + 1));
+                }
+                const int effective_s5 = opts_.port_declaration.align_adaptive
+                                             ? s5
+                                             : std::max(s5, group_unpacked_width);
+                const int preferred_comma_col = preferred_trailing_col + effective_s5;
 
                 for (const auto& d : decls) {
                     int type_target = std::max(preferred_type_col, base + d.leadw + 1);
@@ -5173,17 +5209,22 @@ public:
 
                     // Section5/trailing begins at its preferred column when
                     // possible.  A long section4 name repairs this boundary,
-                    // but a locally repaired name column does not otherwise
-                    // force the comma boundary to drift right.
-                    const int trailing_start = std::max(preferred_trailing_col,
-                                                        decl_name_target + token_width(tokens[d.name]) + 1);
-                    const int comma_target = std::max(preferred_comma_col,
-                                                      trailing_start + s5);
+                    // and the comma returns to its own preferred column as
+                    // soon as this line's text ends before it: an overflow
+                    // moves only the boundaries it actually overlaps.
+                    const int name_end = decl_name_target + token_width(tokens[d.name]);
+                    const int trailing_start = std::max(preferred_trailing_col, name_end + 1);
+                    int text_end = name_end;
 
                     if (d.unpacked_dim != npos) {
                         size_t close = tokens[d.unpacked_dim].immutable.syntax.matching_token;
                         if (close == npos)
                             continue;
+                        text_end = trailing_start + token_text_width(tokens, d.unpacked_dim, close + 1);
+                    }
+                    const int comma_target = std::max(preferred_comma_col, text_end);
+
+                    if (d.unpacked_dim != npos) {
                         tokens[d.unpacked_dim].mutable_.align.enabled = true;
                         tokens[d.unpacked_dim].mutable_.align.target_column = trailing_start;
                         if (d.comma != npos && s5 > 0) {

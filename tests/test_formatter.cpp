@@ -750,8 +750,8 @@ TEST_CASE("formatter: ANSI port declaration sections with align_adaptive true",
 
     const std::string expected =
         "module memory_top(\n"
-        "    input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]         ,\n"
-        "    input     packet_t   [1:0]       i_diveeeeeeeee [1:0]         ,\n"
+        "    input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]      ,\n"
+        "    input     packet_t   [1:0]       i_diveeeeeeeee [1:0]       ,\n"
         "    output    logic      [1:0]       o_mul        [1:0]\n"
         ");\n";
 
@@ -774,7 +774,7 @@ TEST_CASE("formatter: adaptive ANSI ports keep space before trailing unpacked di
 
     const std::string expected =
         "module memory_top(\n"
-        "    input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]         ,\n"
+        "    input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]      ,\n"
         "    input     packet_t   [1:0]       i_diveeeeeeeee [1:0][3:0][1:0][3:1],\n"
         "    output    logic      [1:0]       o_mul        [1:0][3:0][1:0][3:1]\n"
         ");\n";
@@ -828,8 +828,8 @@ TEST_CASE("formatter: non-ANSI port declaration sections with align_adaptive tru
         "    i_diveeeeeeeee,\n"
         "    o_mul\n"
         ");\n"
-        "input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]         ;\n"
-        "input     packet_t   [1:0]       i_diveeeeeeeee [1:0]         ;\n"
+        "input     looooooooong_t [LOOOOOOOOOONG:0] i_clk [1:0]      ;\n"
+        "input     packet_t   [1:0]       i_diveeeeeeeee [1:0]       ;\n"
         "output    logic      [1:0]       o_mul        [1:0]         ;\n"
         "endmodule\n";
 
@@ -995,9 +995,9 @@ TEST_CASE("formatter: port declaration reserves section5 without trailing text",
 
     const std::string expected =
         "module top(\n"
-        "    input     packet_t               i_diveeeeeeeee               ,\n"
+        "    input     packet_t               i_diveeeeeeeee             ,\n"
         "    // test\n"
-        "    input     packet_t               i_diveeeeeeeee [1:0][1:0]    ,\n"
+        "    input     packet_t               i_diveeeeeeeee [1:0][1:0]  ,\n"
         "    output    logic      [1:0]       o_mul\n"
         ");\n";
     CHECK(result == expected);
