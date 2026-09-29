@@ -3547,6 +3547,11 @@ public:
                     tokens[hdr].mutable_.indent.base_indent + opts_.indent_size;
             if (size_t hdr = module_header_parameter_hash_owner(tokens, i); hdr != npos)
                 t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
+            // The port list's `(` -- on a line of its own after a header
+            // `import` -- sits with its header, as a `#(` there does.
+            if (t.immutable.topology.starts_port_list)
+                if (size_t hdr = find_header_keyword_before(tokens, i); hdr != npos)
+                    t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
             const bool nested_unit = t.immutable.topology.opens_design_unit && !outer_units.empty();
             if (is_outer_close(t.lex.kind))
                 t.mutable_.indent.base_indent = closed_unit_opener == npos

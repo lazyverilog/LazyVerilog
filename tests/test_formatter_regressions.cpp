@@ -2853,3 +2853,34 @@ endmodule
     opts.spacing.space_inside_parens = true;
     CHECK(format_stable(input, opts) == expected);
 }
+
+TEST_CASE("formatter regression: the port list paren after a header import sits with its header", "[formatter][regression]") {
+    // N-8: the `(` starting a line after `import p::*;` took the body's
+    // indent, so it shared a column with its ports and `);` sat left of it.
+    const std::string input = R"SV(module pkg_user
+import my_pkg::*;
+(
+input logic a
+);
+endmodule
+module outer;
+module inner import p::*; (input a); endmodule
+endmodule
+)SV";
+    const std::string expected = R"SV(module pkg_user
+  import my_pkg::*;
+(
+  input logic a
+);
+endmodule
+module outer;
+  module inner
+    import p::*;
+  (
+    input a
+  );
+  endmodule
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
