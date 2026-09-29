@@ -4068,6 +4068,7 @@ public:
 
                 size_t semi = npos;
                 size_t eq = npos;
+                size_t comma = npos;
                 int pd = 0, bd = 0, brd = 0;
                 for (size_t k = first; k < ln.end; ++k) {
                     if (!is_code_token(tokens[k])) continue;
@@ -4080,6 +4081,8 @@ public:
                     if (pd == 0 && bd == 0 && brd == 0) {
                         if (eq == npos && kind_is(tokens[k], TK::Equals))
                             eq = k;
+                        if (comma == npos && kind_is(tokens[k], TK::Comma))
+                            comma = k;
                         if (kind_is(tokens[k], TK::Semicolon)) {
                             semi = k;
                             break;
@@ -4089,12 +4092,26 @@ public:
                 if (semi == npos)
                     continue;
 
+                // The column belongs to the first declarator: `logic a, b;`
+                // aligns `a`, and `b` follows its comma.
                 size_t name = npos;
-                size_t name_limit = eq == npos ? semi : eq;
+                // Port-direction lines keep their own column rules below.
+                if (is_port_direction(tokens[first].lex.kind))
+                    comma = npos;
+                size_t name_limit = std::min(eq == npos ? semi : eq, comma == npos ? semi : comma);
                 for (size_t n = name_limit; n > first + 1; --n) {
                     size_t k = n - 1;
                     if (!is_code_token(tokens[k]))
                         continue;
+                    // `d [N]` -- an unpacked dimension trails the name; an
+                    // identifier inside it is not the declarator.
+                    if (kind_is(tokens[k], TK::CloseBracket)) {
+                        const size_t open = tokens[k].immutable.syntax.matching_token;
+                        if (open == npos || open <= first)
+                            break;
+                        n = open + 1;
+                        continue;
+                    }
                     // `logic [3:0] `CAT(foo, _q);` -- the macro call is the
                     // name; nothing inside its arguments is a column.
                     if (kind_is(tokens[k], TK::CloseParenthesis)) {
@@ -4158,6 +4175,11 @@ public:
                     name_target = tokens[dim].mutable_.align.target_column + section2;
                 } else if (dim == npos && section1 > 0) {
                     name_target = base + section1 + section2;
+                } else if (dim == npos && declaration_line_count >= 2) {
+                    // The same name column as a line with a packed dimension,
+                    // measured from the widest keyword rather than this
+                    // line's own, so `int a;` and `logic b;` line up.
+                    name_target = base + declaration_keyword_width + 1 + section2;
                 }
 
                 const bool align_name = declaration_line_count >= 2 || dim != npos ||

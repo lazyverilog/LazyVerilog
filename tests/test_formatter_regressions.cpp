@@ -2682,3 +2682,28 @@ TEST_CASE("formatter regression: a CRLF multi-line define stays verbatim", "[for
     out.erase(std::remove(out.begin(), out.end(), '\r'), out.end());
     CHECK(out == lf);
 }
+
+TEST_CASE("formatter regression: default-width declaration alignment uses the first declarator", "[formatter][regression]") {
+    // N-2: with section1_min_width = 0 (the default) the name column went to
+    // the last identifier -- `ready` in `logic valid, ready;`, `N` in
+    // `d [N]` -- and was measured from each line's own keyword.
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    const std::string input = R"SV(module m;
+int a;
+logic b;
+int unsigned c;
+logic [3:0] d [N];
+logic valid, ready;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  int                                 a                             ;
+  logic                               b                             ;
+  int unsigned                        c                             ;
+  logic [3:0]                         d [N]                         ;
+  logic                               valid, ready                  ;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected);
+}
