@@ -2884,3 +2884,32 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: a select after a semicolonless macro line is not a declaration", "[formatter][regression]") {
+    // N-9: the macro and the assignment after it read as one
+    // `type name [dim]` declaration, so the select was spaced (`mem [0]`).
+    // A macro-named type with a plain `;` after its dimensions still is one.
+    const std::string input = R"SV(module m;
+initial begin
+`INIT_PROLOG
+mem[0] = 1;
+`MY_STMT
+mem[1] = 2;
+end
+`WORD_T mem3 [4];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    `INIT_PROLOG
+    mem[0] = 1;
+    `MY_STMT
+    mem[1] = 2;
+  end
+  `WORD_T mem3 [4];
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.macros.statement_like.push_back("MY_STMT");
+    CHECK(format_stable(input, opts) == expected);
+}

@@ -1146,7 +1146,10 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             const bool separator = here && (kind_is(tokens[i], TK::Semicolon) ||
                                             (stop_at_comma && kind_is(tokens[i], TK::Comma)));
             const bool colon = here && sx.bracket_depth == bd && kind_is(tokens[i], TK::Colon);
-            if (enclosing || separator || colon || closes_control_header(tokens, i))
+            // A semicolonless macro statement (`` `INIT_PROLOG ``) ends the
+            // statement before, as a `;` would.
+            if (enclosing || separator || colon || closes_control_header(tokens, i) ||
+                tokens[i].mutable_.macro.ends_statement)
                 break;
             // `begin : gen` -- the block's name belongs to its opener, not to
             // the first item after it (`begin : gen assign wl[g] = 1;`).
@@ -1199,6 +1202,13 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
         if (is_assignment_op(tokens[i].lex.kind))
             return false;
     }
+    // `` `MACRO m[0] = 1; `` -- a macro followed by an assigned select.  A
+    // macro-named type declares with `;` after its dimensions
+    // (`` `WORD_T m [4]; ``); one whose element is assigned is more often a
+    // statement macro in front of an assignment, which no TokenKind can
+    // tell apart, and reading it as a declaration spaces the select.
+    if (kind_is(tokens[elem], TK::MacroUsage) && is_assignment_op(tokens[after].lex.kind))
+        return false;
     if (declares(elem, open))
         return true;
 
