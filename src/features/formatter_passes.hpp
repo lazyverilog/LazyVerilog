@@ -5899,6 +5899,21 @@ public:
                 // `(` the parenthesis spacing decides, not the event rule.
                 if (kind_is(L, TK::OpenParenthesis))
                     spaces = opts_.spacing.space_inside_parens ? 1 : 0;
+                // The option is about the keyword the event control follows
+                // (`always @(e)`).  An intra-assignment event takes the
+                // operator's spacing (`q <= @(e) d;`), and a control's `)`
+                // or delay is always separated from the `@` after it
+                // (`wait (a) @(e) x = 1;`, `#5 @(e) x = 1;`,
+                // `q <= repeat (2) @(e) d;`).
+                const size_t before_L = prev_code(tokens, i - 1);
+                const size_t L_open = kind_is(L, TK::CloseParenthesis) ? L.immutable.syntax.matching_token : npos;
+                const size_t L_owner = L_open == npos ? npos : prev_code(tokens, L_open);
+                if (L_assign)
+                    spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
+                else if (closes_control_header(tokens, i - 1) ||
+                         (before_L != npos && kind_is(tokens[before_L], TK::Hash)) ||
+                         (L_owner != npos && tokens[L_owner].immutable.topology.is_intra_assignment_repeat))
+                    spaces = 1;
             }
             if (kind_is(L, TK::At)) {
                 const bool covergroup_event = is_covergroup_event_at(tokens, i - 1);

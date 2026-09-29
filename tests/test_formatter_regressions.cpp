@@ -2990,3 +2990,35 @@ endmodule
 endmodule
 )SV");
 }
+
+TEST_CASE("formatter regression: procedural event at spacing none does not glue an intra-statement event", "[formatter][regression]") {
+    // N-12: the `@` option is about the keyword an event control follows
+    // (`always@(e)`).  It also closed the `@` up against an assignment
+    // operator, a `wait (...)`, a delay and an intra-assignment `repeat`.
+    const std::string input = R"SV(module m;
+always @(posedge clk) q <= d;
+initial begin
+q <= @(posedge clk) d;
+q = @(negedge clk) d;
+q <= repeat (2) @(posedge clk) d;
+wait (a) @(posedge clk) q = 2;
+#5 @(posedge clk) q = 3;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always@(posedge clk)
+    q <= d;
+  initial begin
+    q <= @(posedge clk) d;
+    q = @(negedge clk) d;
+    q <= repeat (2) @(posedge clk) d;
+    wait(a) @(posedge clk) q = 2;
+    #5 @(posedge clk) q = 3;
+  end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.procedural_event_control_at_spacing = "none";
+    CHECK(format_stable(input, opts) == expected);
+}
