@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -137,6 +138,29 @@ inline bool is_unary_op(TK k) {
            k == TK::DoublePlus || k == TK::DoubleMinus;
 }
 
+// Would `a` written directly before `b` lex differently -- some operator
+// starting inside `a` running on into `b` (`&` `&b` -> `&&`, `^` `~b` -> `^~`,
+// `-` `-b` -> `--`)?  Maximal munch is the only way two adjacent operators
+// can merge, so this is the whole question.
+inline bool operators_would_merge(std::string_view a, std::string_view b) {
+    static constexpr std::string_view kOps[] = {
+        "**", "==", "!=", "===", "!==", "==?", "!=?", "<=", ">=", "&&", "||",
+        "~&", "~|", "~^", "^~", "<<", ">>", "<<<", ">>>", "->", "<->", "->>",
+        "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=",
+        ">>=", "<<<=", ">>>=", "+:", "-:", "::", "&&&", "|->", "|=>", "=>",
+        "*>", "(*", "*)", "//", "/*", "@@", "##", "#-#", "#=#", ".*",
+    };
+    for (size_t p = 0; p < a.size(); ++p) {
+        const size_t tail = a.size() - p;
+        for (std::string_view op : kOps) {
+            if (op.size() <= tail || op.substr(0, tail) != a.substr(p))
+                continue;
+            if (b.substr(0, op.size() - tail) == op.substr(tail))
+                return true;
+        }
+    }
+    return false;
+}
 inline bool can_begin_unary_expression(TK k) {
     // SystemVerilog unary operators include the arithmetic signs, logical and
     // bitwise negation, and reduction operators.  Some of these tokens are also
@@ -5909,8 +5933,10 @@ public:
                 //   a ^ ~b   -> a^~b   // xnor token
                 //
                 // Keep one syntactic separator independent of the configured
-                // binary_operator_spacing style.
-                spaces = std::max(spaces, 1);
+                // binary_operator_spacing style -- where one is needed.
+                // `a*-b` and `c&~d` lex as written.
+                if (operators_would_merge(L.lex.text, t.lex.text))
+                    spaces = std::max(spaces, 1);
             }
             // `@(*)` -- the `*` is the implicit event list, not a multiplication,
             // so the `(` before it spaces like the one before any first token.

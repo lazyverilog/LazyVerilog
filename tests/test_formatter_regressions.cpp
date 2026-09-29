@@ -3076,3 +3076,36 @@ endmodule
     CHECK(format_stable("module m;\nassign #(1:2:3) w = x;\nendmodule\n", both) ==
           "module m;\n  assign #(1 : 2 : 3) w = x;\nendmodule\n");
 }
+
+TEST_CASE("formatter regression: binary spacing none separates a unary operator only where it would merge", "[formatter][regression]") {
+    // N-15: every unary operator after a binary one kept a space, although
+    // only a pair that lexes as one token (`a- -b`, `a& &b`, `a^ ~b`) needs it.
+    const std::string input = R"SV(module m;
+assign y = a * -b + c & ~d;
+assign y = ~&a | ~|b;
+assign y = a - -b;
+assign y = a + +b;
+assign y = a & &b;
+assign y = a && &b;
+assign y = a ^ ~b;
+assign y = a | |b;
+assign y = a - !b;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  assign y = a*-b+c&~d;
+  assign y = ~&a|~|b;
+  assign y = a- -b;
+  assign y = a+ +b;
+  assign y = a& &b;
+  assign y = a&& &b;
+  assign y = a^ ~b;
+  assign y = a| |b;
+  assign y = a-!b;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.binary_operator_spacing = "none";
+    CHECK(format_stable(input, opts) == expected);
+    CHECK(parses_cleanly(expected));
+}
