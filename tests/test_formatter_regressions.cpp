@@ -3137,3 +3137,25 @@ endmodule
     CHECK(out.find("u_arr[3:0] (") != std::string::npos);
     CHECK(out.find("u_one (") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: the last enum item's trailing comment is aligned", "[formatter][regression]") {
+    // N-17: enum alignment pads through each item's comma, and the last item
+    // has none, so its trailing comment sat right after the value.
+    const std::string input = R"SV(typedef enum logic [1:0] {
+S_IDLE = 2'b00, // idle
+S_RUN = 2'b01, // run
+S_ERR = 2'b11 // error
+} st_t;
+)SV";
+    const std::string expected = R"SV(typedef enum logic [1:0] {
+  S_IDLE = 2'b00 , // idle
+  S_RUN  = 2'b01 , // run
+  S_ERR  = 2'b11   // error
+} st_t;
+)SV";
+    FormatOptions opts;
+    opts.enum_declaration.align = true;
+    opts.enum_declaration.enum_name_min_width = 0;
+    opts.enum_declaration.enum_value_min_width = 0;
+    CHECK(format_stable(input, opts) == expected);
+}

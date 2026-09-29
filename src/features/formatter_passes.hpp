@@ -5473,7 +5473,7 @@ public:
 
             if (tokens[open].mutable_.wrap.list_kind == WrapListKind::EnumBody &&
                 opts_.enum_declaration.align) {
-                struct E { size_t first, eq, comma; int namew, valw; };
+                struct E { size_t first, last, eq, comma; int namew, valw; };
                 std::vector<E> es;
                 int namew = option_width(opts_.enum_declaration.enum_name_min_width, opts_);
                 int valw = option_width(opts_.enum_declaration.enum_value_min_width, opts_);
@@ -5486,7 +5486,7 @@ public:
                     int vw = eq == npos ? 0 : compact_width(tokens, eq + 1, item.last + 1);
                     namew = std::max(namew, nw);
                     valw = std::max(valw, vw);
-                    es.push_back({item.first, eq, item.comma, nw, vw});
+                    es.push_back({item.first, item.last, eq, item.comma, nw, vw});
                 }
                 int base = tokens[items.front().first].mutable_.indent.base_indent;
                 for (const auto& e : es) {
@@ -5502,14 +5502,26 @@ public:
                         tokens[e.eq].mutable_.align.enabled = true;
                         tokens[e.eq].mutable_.align.target_column = eq_target;
                     }
+                    const int comma_target =
+                        opts_.tab_align ? (eq_target + snap_to_grid(std::max(1, local_valw) + opts_.indent_size,
+                                                                     opts_.indent_size) - 1) :
+                        (e.eq == npos) ? (local_valw > 0 ? (eq_target + 2 + local_valw)
+                                                         : eq_target)
+                                       : (eq_target + 2 + local_valw);
                     if (e.comma != npos) {
                         tokens[e.comma].mutable_.align.enabled = true;
-                        tokens[e.comma].mutable_.align.target_column =
-                            opts_.tab_align ? (eq_target + snap_to_grid(std::max(1, local_valw) + opts_.indent_size,
-                                                                         opts_.indent_size) - 1) :
-                            (e.eq == npos) ? (local_valw > 0 ? (eq_target + 2 + local_valw)
-                                                             : eq_target)
-                                           : (eq_target + 2 + local_valw);
+                        tokens[e.comma].mutable_.align.target_column = comma_target;
+                    } else {
+                        // The last item has no comma; its trailing comment
+                        // goes where it would sit after one, in line with
+                        // the comments of the items above.
+                        const size_t c = e.last + 1;
+                        if (c < close && tokens[c].lex.comment_kind != CommentLexemeKind::None &&
+                            tokens[c].immutable.comment.role == CommentRole::Trailing &&
+                            !tokens[c].mutable_.wrap.must_break_before) {
+                            tokens[c].mutable_.align.enabled = true;
+                            tokens[c].mutable_.align.target_column = comma_target + 2;
+                        }
                     }
                 }
             }
