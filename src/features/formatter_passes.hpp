@@ -1835,6 +1835,7 @@ public:
                 op != npos && (kind_is(tokens[op], TK::Equals) || kind_is(tokens[op], TK::LessThanEquals));
         }
 
+        mark_min_typ_max_colons(tokens);
         mark_case_items_and_macro_statements(tokens);
 
         // The `while` after a `do`'s body.  Needs the macro-statement ends
@@ -1968,6 +1969,48 @@ private:
                 tokens[open].immutable.syntax.matching_token == npos)
                 continue;
             mark(open + 1, tokens[open].immutable.syntax.matching_token - 1);
+        }
+    }
+
+    // A min:typ:max triple is one value, not a ternary.  It sits directly in
+    // a delay or parameter-value list `#(...)`, or in a specify block's path
+    // delay `= (...)` or timing-check arguments.  Colons that answer a `?`
+    // at the same depth are the ternary's, and a `[` or `{` inside owns its
+    // own colons.
+    static void mark_min_typ_max_colons(TokenStream& tokens) {
+        struct Open { bool mintypmax; int bd, brd, questions; };
+        std::vector<Open> opens;
+        bool in_specify = false;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            Tok& t = tokens[i];
+            if (!is_code_token(t))
+                continue;
+            const auto& sx = t.immutable.syntax;
+            if (kind_is(t, TK::SpecifyKeyword)) in_specify = true;
+            else if (kind_is(t, TK::EndSpecifyKeyword)) in_specify = false;
+            if (kind_is(t, TK::OpenParenthesis)) {
+                const size_t owner = prev_code(tokens, i);
+                const bool delay = owner != npos && kind_is(tokens[owner], TK::Hash);
+                const bool specify_value = in_specify && owner != npos &&
+                    (kind_is(tokens[owner], TK::Equals) || kind_is(tokens[owner], TK::SystemIdentifier));
+                opens.push_back({delay || specify_value, sx.bracket_depth, sx.brace_depth, 0});
+                continue;
+            }
+            if (kind_is(t, TK::CloseParenthesis)) {
+                if (!opens.empty()) opens.pop_back();
+                continue;
+            }
+            if (opens.empty())
+                continue;
+            Open& o = opens.back();
+            if (sx.bracket_depth != o.bd || sx.brace_depth != o.brd)
+                continue;
+            if (kind_is(t, TK::Question)) ++o.questions;
+            else if (kind_is(t, TK::Comma)) o.questions = 0;
+            else if (kind_is(t, TK::Colon)) {
+                if (o.questions > 0) --o.questions;
+                else t.immutable.topology.is_min_typ_max_colon = o.mintypmax;
+            }
         }
     }
 
@@ -5881,8 +5924,11 @@ public:
             if (kind_is(L, TK::InsideKeyword)) spaces = 1;
 
             // Range/part-select
-            if (kind_is(t, TK::Colon) && in_dim) spaces = wants_before(opts_.spacing.range_colon_spacing) ? 1 : 0;
-            if (kind_is(L, TK::Colon) && in_dim) spaces = wants_after(opts_.spacing.range_colon_spacing) ? 1 : 0;
+            // A min:typ:max triple (`#(1:2:3)`) is one value, spaced as a range.
+            const bool t_range_colon = kind_is(t, TK::Colon) && (in_dim || t.immutable.topology.is_min_typ_max_colon);
+            const bool L_range_colon = kind_is(L, TK::Colon) && (in_dim || L.immutable.topology.is_min_typ_max_colon);
+            if (t_range_colon) spaces = wants_before(opts_.spacing.range_colon_spacing) ? 1 : 0;
+            if (L_range_colon) spaces = wants_after(opts_.spacing.range_colon_spacing) ? 1 : 0;
             if (kind_is(t, TK::PlusColon) || kind_is(t, TK::MinusColon)) spaces = wants_before(opts_.spacing.indexed_part_select_spacing) ? 1 : 0;
             if (kind_is(L, TK::PlusColon) || kind_is(L, TK::MinusColon)) spaces = wants_after(opts_.spacing.indexed_part_select_spacing) ? 1 : 0;
 

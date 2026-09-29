@@ -3046,3 +3046,33 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: min typ max colons are spaced as a range and not a ternary", "[formatter][regression]") {
+    // N-14: every colon outside `[...]` took the ternary's spacing, so a
+    // min:typ:max triple came out as `#(1 : 2 : 3)`.  It follows
+    // `range_colon_spacing` now; a real ternary in a delay keeps its own.
+    const std::string input = R"SV(module m;
+bufif0 #(1:2:3, 4:5:6) b1 (o1, i1, en);
+assign #(1:2:3) w = x;
+assign #(c ? 1 : 2) v = x;
+specify
+(posedge CK => (Q +: D)) = (0.15:0.2:0.25, 0.18:0.22:0.3);
+endspecify
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  bufif0 #(1:2:3, 4:5:6) b1(o1, i1, en);
+  assign #(1:2:3) w = x;
+  assign #(c ? 1 : 2) v = x;
+  specify
+    (posedge CK => (Q +: D)) = (0.15:0.2:0.25, 0.18:0.22:0.3);
+  endspecify
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+
+    FormatOptions both;
+    both.spacing.range_colon_spacing = "both";
+    CHECK(format_stable("module m;\nassign #(1:2:3) w = x;\nendmodule\n", both) ==
+          "module m;\n  assign #(1 : 2 : 3) w = x;\nendmodule\n");
+}

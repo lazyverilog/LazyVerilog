@@ -172,6 +172,10 @@ struct TopologyFacts {
     // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
     bool is_replication_brace{false};
 
+    // A `:` of a min:typ:max triple -- `#(1:2:3)`, a specify path delay
+    // `= (1:2:3)`, a timing check limit -- not a ternary's.
+    bool is_min_typ_max_colon{false};
+
     // A `function`/`task` keyword that declares a prototype with no body --
     // `extern`, `import "DPI-C"`, `export "DPI-C"`, `pure virtual`, a
     // modport's `import task` -- or a `class` forward-declared by `typedef`.

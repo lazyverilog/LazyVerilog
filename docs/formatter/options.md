@@ -280,6 +280,9 @@ logic [7:0] data;
 logic [7 : 0] data;
 ```
 
+It also spaces the colons of a min:typ:max triple (`#(1:2:3)`, a specify path delay
+`= (1:2:3)`), which is one value rather than a ternary.
+
 This option only affects ranges. A case item's colon is not configurable: it is
 always written `label: statement`, whether the label is a literal, an
 identifier, a macro, or `default`.
