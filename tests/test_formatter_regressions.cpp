@@ -2953,3 +2953,40 @@ endclass
 )SV";
     CHECK(format_stable(input, opts) == aligned);
 }
+
+TEST_CASE("formatter regression: a relational less-equal on the right is spaced as a comparison", "[formatter][regression]") {
+    // N-11: only a `<=` inside parentheses counted as a comparison, so the
+    // one after `=`/`assign`/another `<=` took the assignment spacing.
+    const std::string input = R"SV(module m;
+assign z = a <= b;
+always_ff @(posedge clk) begin
+q <= d;
+q <= a <= b;
+y = (a <= b) && c;
+end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.binary_operator_spacing = "none";
+    CHECK(format_stable(input, opts) == R"SV(module m;
+  assign z = a<=b;
+  always_ff @(posedge clk) begin
+    q <= d;
+    q <= a<=b;
+    y = (a<=b)&&c;
+  end
+endmodule
+)SV");
+
+    FormatOptions assign_none;
+    assign_none.spacing.assignment_operator_spacing = "none";
+    CHECK(format_stable(input, assign_none) == R"SV(module m;
+  assign z=a <= b;
+  always_ff @(posedge clk) begin
+    q<=d;
+    q<=a <= b;
+    y=(a <= b) && c;
+  end
+endmodule
+)SV");
+}

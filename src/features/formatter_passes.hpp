@@ -1090,6 +1090,30 @@ inline bool closes_control_header(const TokenStream& tokens, size_t close) {
            k == TK::CaseZKeyword;
 }
 
+// A `<=` is a nonblocking assignment only as a statement's first assignment
+// operator, outside every delimiter.  Inside one (`if (a <= b)`,
+// `{a <= b}`), or after another (`y = a <= b;`, `assign z = a <= b;`,
+// `q <= a <= b;`), it compares.
+inline bool is_relational_less_equal(const TokenStream& tokens, size_t idx) {
+    if (idx >= tokens.size() || !kind_is(tokens[idx], TK::LessThanEquals))
+        return false;
+    const auto& sx = tokens[idx].immutable.syntax;
+    if (sx.paren_depth > 0 || sx.bracket_depth > 0 || sx.brace_depth > 0)
+        return true;
+    for (size_t i = prev_code(tokens, idx); i != npos; i = prev_code(tokens, i)) {
+        const Tok& t = tokens[i];
+        if (kind_is(t, TK::Semicolon) || t.mutable_.macro.ends_statement ||
+            closes_control_header(tokens, i) || is_close_block(t.lex.kind) ||
+            kind_is(t, TK::BeginKeyword) || t.immutable.topology.is_case_item_colon)
+            return false;
+        const auto& ts = t.immutable.syntax;
+        if (ts.paren_depth == 0 && ts.bracket_depth == 0 && ts.brace_depth == 0 &&
+            is_assignment_op(t.lex.kind))
+            return true;
+    }
+    return false;
+}
+
 inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open) {
     if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenBracket))
         return false;
@@ -5805,13 +5829,13 @@ public:
             // Assignment operators.
             // LessThanEquals is context-sensitive: inside parens it's a comparison, not
             // non-blocking assignment.  Treat it as a regular binary op in that context.
-            auto is_assign = [&](const Tok& tok) {
-                if (tok.lex.kind == TK::LessThanEquals && tok.immutable.syntax.paren_depth > 0)
-                    return false;
-                return is_assignment_op(tok.lex.kind);
+            auto is_assign = [&](size_t at) {
+                return is_assignment_op(tokens[at].lex.kind) && !is_relational_less_equal(tokens, at);
             };
-            if (is_assign(t)) spaces = wants_before(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
-            if (is_assign(L)) spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
+            const bool t_assign = is_assign(i);
+            const bool L_assign = is_assign(i - 1);
+            if (t_assign) spaces = wants_before(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
+            if (L_assign) spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
 
             // Binary operators (non-assignment).
             // Closing brackets carry depth=1 (before decrement), so exclude them from the
@@ -5822,11 +5846,11 @@ public:
             // A sign or reduction in unary position is not a binary operator:
             // `f(-a)`, `y = &c`.  Its own gap after it was settled above.
             const bool t_unary = is_sign_or_reduction_op(t.lex.kind) && in_prefix_position(tokens, i);
-            if (is_binary_op(t.lex.kind) && !is_assign(t) && !t_unary)
+            if (is_binary_op(t.lex.kind) && !t_assign && !t_unary)
                 spaces = wants_before(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex.kind) && !is_assign(L) && !L_unary)
+            if (is_binary_op(L.lex.kind) && !L_assign && !L_unary)
                 spaces = wants_after(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex.kind) && !is_assign(L) &&
+            if (is_binary_op(L.lex.kind) && !L_assign &&
                 can_begin_unary_expression(t.lex.kind)) {
                 // Do not concatenate a binary operator with the unary operator
                 // that starts its right-hand operand.  SystemVerilog has many
