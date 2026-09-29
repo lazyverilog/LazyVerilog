@@ -187,6 +187,10 @@ struct TopologyFacts {
     // `do begin ... end while (c);`).  It controls nothing.
     bool ends_do_while{false};
 
+    // The `repeat` of an intra-assignment timing control
+    // (`q <= repeat (2) @(posedge clk) d;`).  It controls no statement.
+    bool is_intra_assignment_repeat{false};
+
     // A `;` whose innermost enclosing delimiter is a statement-block brace
     // (`with { a < 5; b == 3; }`), even when that brace sits inside
     // parentheses.  It ends a constraint, not a `for` header clause.

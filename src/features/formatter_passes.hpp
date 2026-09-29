@@ -121,6 +121,11 @@ inline bool is_single_stmt_control(TK k) {
     return k == TK::IfKeyword || k == TK::ForKeyword || k == TK::ForeachKeyword ||
            k == TK::WhileKeyword || k == TK::RepeatKeyword || k == TK::ForeverKeyword;
 }
+// The token form also turns away an intra-assignment `repeat`, which
+// controls no statement.
+inline bool is_single_stmt_control(const Tok& t) {
+    return is_single_stmt_control(t.lex.kind) && !t.immutable.topology.is_intra_assignment_repeat;
+}
 inline bool is_procedural_block_keyword(TK k) {
     return k == TK::InitialKeyword || k == TK::FinalKeyword ||
            k == TK::AlwaysKeyword || k == TK::AlwaysCombKeyword ||
@@ -500,7 +505,7 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body);
 
 inline size_t single_statement_control_body_start(const TokenStream& tokens, size_t control) {
     if (control == npos || control >= tokens.size() ||
-        !is_single_stmt_control(tokens[control].lex.kind))
+        !is_single_stmt_control(tokens[control]))
         return npos;
 
     // `forever` is the one procedural control in this family that has no
@@ -657,7 +662,7 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
         return then_end;
     }
 
-    if (is_single_stmt_control(tokens[body].lex.kind)) {
+    if (is_single_stmt_control(tokens[body])) {
         // SystemVerilog uses the same `statement_or_null` body shape for
         // if/for/foreach/while/repeat/forever.  Find that body syntactically
         // and recurse so nested single-statement controls are treated as one
@@ -1075,6 +1080,8 @@ inline bool closes_control_header(const TokenStream& tokens, size_t close) {
     const size_t open = tokens[close].immutable.syntax.matching_token;
     const size_t before = open == npos ? npos : prev_code(tokens, open);
     if (before == npos)
+        return false;
+    if (tokens[before].immutable.topology.is_intra_assignment_repeat)
         return false;
     const TK k = tokens[before].lex.kind;
     return is_single_stmt_control(k) || is_control_keyword(k) || k == TK::WaitKeyword ||
@@ -1780,6 +1787,16 @@ public:
                 !tokens[outer].immutable.topology.opens_brace_block;
         }
 
+        // `q <= repeat (n) @(e) d;` -- a `repeat` right after an assignment
+        // operator is a timing control on that assignment, not a loop.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!kind_is(tokens[i], TK::RepeatKeyword) || !is_code_token(tokens[i]))
+                continue;
+            const size_t op = prev_code(tokens, i);
+            tokens[i].immutable.topology.is_intra_assignment_repeat =
+                op != npos && (kind_is(tokens[op], TK::Equals) || kind_is(tokens[op], TK::LessThanEquals));
+        }
+
         mark_case_items_and_macro_statements(tokens);
 
         // The `while` after a `do`'s body.  Needs the macro-statement ends
@@ -1847,6 +1864,8 @@ private:
         if (k == TK::CloseParenthesis && pt.immutable.syntax.matching_token != npos) {
             const size_t owner = prev_code(tokens, pt.immutable.syntax.matching_token);
             if (owner == npos)
+                return false;
+            if (tokens[owner].immutable.topology.is_intra_assignment_repeat)
                 return false;
             const TK o = tokens[owner].lex.kind;
             // A randsequence header is followed by its first production.
@@ -3222,7 +3241,7 @@ private:
                 continue;
             }
 
-            if (is_single_stmt_control(t.lex.kind) && !is_property_operator_keyword(t))
+            if (is_single_stmt_control(t) && !is_property_operator_keyword(t))
                 ctrl_expr_pending = true;
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
                 ctrl_expr_pending = false;
@@ -3416,7 +3435,7 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
             const size_t body = next_code(tokens, i + 1, tokens.size());
             if (body != npos && !kind_is(tokens[body], TK::Semicolon))
                 add(body, simple_statement_end_from(tokens, body));
-        } else if (is_single_stmt_control(k)) {
+        } else if (is_single_stmt_control(tokens[i])) {
             // The `while` closing a do-while controls nothing.
             if (tokens[i].immutable.topology.ends_do_while)
                 continue;

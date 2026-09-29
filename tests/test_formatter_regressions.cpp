@@ -2736,3 +2736,26 @@ endmodule
     CHECK(format_stable(input) == expected);
     CHECK(parses_cleanly(expected));
 }
+
+TEST_CASE("formatter regression: an intra-assignment repeat is not a loop", "[formatter][regression]") {
+    // N-4: `repeat (n)` right after `<=`/`=` times the assignment; its body
+    // was broken onto a line of its own as though it were a loop's.
+    const std::string input = R"SV(module m;
+initial begin
+q <= repeat (2) @(posedge clk) d;
+q = repeat (3) @(negedge clk) d;
+repeat (4) x = x + 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    q <= repeat (2) @(posedge clk) d;
+    q = repeat (3) @(negedge clk) d;
+    repeat (4)
+      x = x + 1;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
