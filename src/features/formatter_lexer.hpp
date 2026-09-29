@@ -401,8 +401,11 @@ private:
         // Find end of first line and check for backslash continuation.
         size_t eol = source_.find('\n', start);
         if (eol == std::string::npos) return 0;
+        // On a CRLF line the `\r` belongs to the terminator, not to the text
+        // before it, so `\` `\r` `\n` is a continuation too.
+        auto is_trailing_blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
         size_t check = eol;
-        while (check > start && (source_[check - 1] == ' ' || source_[check - 1] == '\t'))
+        while (check > start && is_trailing_blank(source_[check - 1]))
             --check;
         if (check == start || source_[check - 1] != '\\') return 0;
 
@@ -412,7 +415,7 @@ private:
             size_t next_eol = source_.find('\n', pos);
             size_t line_end = (next_eol == std::string::npos) ? src_size : next_eol;
             size_t chk = line_end;
-            while (chk > pos && (source_[chk - 1] == ' ' || source_[chk - 1] == '\t'))
+            while (chk > pos && is_trailing_blank(source_[chk - 1]))
                 --chk;
             bool has_cont = (chk > pos && source_[chk - 1] == '\\');
             pos = (next_eol == std::string::npos) ? src_size : next_eol + 1;

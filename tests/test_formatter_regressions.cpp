@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/SyntaxTree.h>
+#include <algorithm>
 #include <regex>
 #include <string>
 
@@ -2655,4 +2656,29 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
     CHECK(parses_cleanly(expected));
+}
+
+// ---------------------------------------------------------------------------
+// Round 6 (FORMAT_BUG_FIX6.md)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("formatter regression: a CRLF multi-line define stays verbatim", "[formatter][regression]") {
+    // N-1: `\` `\r` `\n` is a continuation.  Missing it reformatted the body
+    // as module text, moved the `\` to its own line and spaced the `` paste.
+    const std::string lf = "`define REG(n) \\\n"
+                           "\tlogic n``_q; \\\n"
+                           "  always_ff @(posedge clk) n``_q <= n``_d;\n"
+                           "module m;\n"
+                           "endmodule\n";
+    std::string crlf;
+    for (char c : lf) {
+        if (c == '\n')
+            crlf += '\r';
+        crlf += c;
+    }
+    CHECK(format_stable(lf) == lf);
+    // format_source() emits LF; the caller restores the buffer's line ending.
+    std::string out = format_stable(crlf);
+    out.erase(std::remove(out.begin(), out.end(), '\r'), out.end());
+    CHECK(out == lf);
 }
