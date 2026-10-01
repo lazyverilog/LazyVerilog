@@ -4630,3 +4630,37 @@ endclass
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: an empty constraint or coverpoint body stays closed", "[formatter][regression]") {
+    // R-4: `constraint c {}` was split after `{`, and its `}` -- closing a
+    // brace nothing had classified as a block -- took a continuation indent.
+    const std::string input = R"SV(class c;
+constraint c6 {}
+constraint c7 { }
+constraint c9 {
+// own
+}
+covergroup cg; cp: coverpoint a {} cq: coverpoint b { } cr: coverpoint c; endgroup
+endclass
+)SV";
+    const std::string expected = R"SV(
+class c;
+  constraint c6 {}
+  constraint c7 {}
+  constraint c9 {
+    // own
+  }
+  covergroup cg;
+    cp: coverpoint a {}
+    cq: coverpoint b {}
+    cr: coverpoint c;
+  endgroup
+endclass
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    const std::string bnl = format_stable(input, opts);
+    CHECK(bnl.find("constraint c6 {}\n") != std::string::npos);
+    CHECK(bnl.find("  {\n    // own\n  }\n") != std::string::npos);
+}

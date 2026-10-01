@@ -1922,6 +1922,28 @@ public:
             }
         }
 
+        // A constraint or coverpoint body with no item in it -- `constraint c {}`,
+        // or one holding only a comment -- has no `;` to say so, and is a block
+        // all the same: its `}` closes a scope and a label may follow it.
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            auto& t = tokens[i];
+            if (!kind_is(t, TK::OpenBrace) || t.immutable.topology.opens_brace_block ||
+                t.immutable.syntax.paren_depth > 0 || t.immutable.syntax.matching_token == npos ||
+                next_code(tokens, i + 1, tokens.size()) != t.immutable.syntax.matching_token)
+                continue;
+            for (size_t n = i; n > 0; --n) {
+                const auto& h = tokens[n - 1];
+                if (!is_code_token(h))
+                    continue;
+                if (kind_is(h, TK::Semicolon) || kind_is(h, TK::OpenBrace) || kind_is(h, TK::CloseBrace))
+                    break;
+                if (kind_is(h, TK::CoverPointKeyword) || kind_is(h, TK::ConstraintKeyword)) {
+                    t.immutable.topology.opens_brace_block = true;
+                    break;
+                }
+            }
+        }
+
         // Indent scopes for braces can only be settled once every brace has been
         // classified and matched, which is why this is a second pass rather than
         // part of the walk above.  An expression brace opens no scope, and its
@@ -2392,6 +2414,12 @@ inline bool is_stream_operator_at(const TokenStream& tokens, size_t idx) {
     return p != npos && kind_is(tokens[p], TK::OpenBrace);
 }
 
+// `{}` with nothing between the braces, not even a comment.
+inline bool is_empty_brace_pair(const TokenStream& tokens, size_t brace) {
+    return brace < tokens.size() && kind_is(tokens[brace], TK::OpenBrace) &&
+           brace + 1 < tokens.size() && tokens[brace].immutable.syntax.matching_token == brace + 1;
+}
+
 inline bool is_multiline_brace_construct(const TokenStream& tokens, size_t brace) {
     if (brace >= tokens.size() || !kind_is(tokens[brace], TK::OpenBrace))
         return false;
@@ -2780,6 +2808,7 @@ public:
                 (is_close_block(t.lex.kind) && !property_keyword &&
                  !(kind_is(t, TK::CloseBrace) &&
                    (t.immutable.syntax.paren_depth > 0 ||
+                    is_empty_brace_pair(tokens, t.immutable.syntax.matching_token) ||
                     (t.immutable.syntax.matching_token != npos &&
                      is_expression_brace(tokens, t.immutable.syntax.matching_token))))))
                 t.mutable_.wrap.must_break_before = true;
@@ -2831,15 +2860,16 @@ public:
                 (kind_is(t, TK::BeginKeyword) ||
                  is_fork_block_open(tokens, i) ||
                  (kind_is(t, TK::OpenBrace) && !is_expression_brace(tokens, i) &&
-                  t.immutable.syntax.paren_depth == 0)))
+                  !is_empty_brace_pair(tokens, i) && t.immutable.syntax.paren_depth == 0)))
                 t.mutable_.wrap.must_break_before = true;
             if (kind_is(t, TK::OpenBrace) && is_multiline_brace_construct(tokens, i)) {
-                if (opts_.statement.begin_newline)
+                const bool empty = is_empty_brace_pair(tokens, i);
+                if (opts_.statement.begin_newline && !empty)
                     t.mutable_.wrap.must_break_before = true;
-                t.mutable_.wrap.must_break_after = true;
+                t.mutable_.wrap.must_break_after = !empty;
                 if (t.immutable.syntax.matching_token != npos) {
                     size_t close = t.immutable.syntax.matching_token;
-                    tokens[close].mutable_.wrap.must_break_before = true;
+                    tokens[close].mutable_.wrap.must_break_before = !empty;
                     size_t after_close = next_code(tokens, close + 1, tokens.size());
                     tokens[close].mutable_.wrap.must_break_after =
                         !(after_close != npos && kind_is(tokens[after_close], TK::Semicolon));
@@ -2863,7 +2893,9 @@ public:
                             return true;
                     return false;
                 };
-                if (is_struct_or_union_body_brace(tokens, i) ||
+                if (is_empty_brace_pair(tokens, i)) {
+                    // `constraint c {}` -- nothing to put on a line of its own.
+                } else if (is_struct_or_union_body_brace(tokens, i) ||
                     (t.immutable.topology.opens_brace_block &&
                      (t.immutable.syntax.paren_depth == 0 || holds_breaking_comment())))
                     t.mutable_.wrap.must_break_after = true;
@@ -6382,6 +6414,9 @@ public:
                 kind_is(tokens[t.immutable.syntax.matching_token], TK::OpenBrace) &&
                 tokens[t.immutable.syntax.matching_token].immutable.topology.opens_brace_block)
                 spaces = 1;
+            // An empty block has nothing to pad: `constraint c {}`.
+            if (kind_is(t, TK::CloseBrace) && is_empty_brace_pair(tokens, i - 1))
+                spaces = 0;
             // A padded `)` keeps its pad after a `}` as after anything else.
             if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&
