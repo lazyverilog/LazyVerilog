@@ -3789,3 +3789,24 @@ endpackage
         CHECK(format_stable(input) == expected);
     }
 }
+
+TEST_CASE("formatter regression: several leading comments break in one run", "[formatter][regression]") {
+    // Q-1: only the first comment was own-line, so each run split one more.
+    const std::string input = R"SV(module m;
+/* a */ /* b */ /* c */ assign x = 1;
+/* d */ // e
+assign y = 1; /* f */ /* g */
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  /* a */
+  /* b */
+  /* c */
+  assign x = 1;
+  /* d */
+  // e
+  assign y = 1; /* f */ /* g */
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}

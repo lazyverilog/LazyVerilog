@@ -1753,8 +1753,18 @@ public:
                         nx != npos &&
                         tokens[nx].immutable.input_trivia.original_newlines_before == 0;
                 }
+                // `/* a */ /* b */ assign x = 1;` -- a comment that follows
+                // only own-line comments on its line leads the code as they
+                // do.  The first one is broken onto its own line, so calling
+                // the next one trailing left it for the following run to
+                // split, one comment per run.
+                const bool continues_own_line_run =
+                    i > 0 && tokens[i - 1].lex.comment_kind != CommentLexemeKind::None &&
+                    tokens[i - 1].immutable.comment.role == CommentRole::OwnLine &&
+                    t.immutable.input_trivia.original_newlines_before == 0;
                 t.immutable.comment.role =
-                    (t.immutable.input_trivia.starts_original_line && !comma_interstitial_block)
+                    ((t.immutable.input_trivia.starts_original_line && !comma_interstitial_block) ||
+                     continues_own_line_run)
                     ? CommentRole::OwnLine : CommentRole::Trailing;
                 t.immutable.comment.anchor_token = i == 0 ? npos : i - 1;
                 t.immutable.comment.inside_expression = pd > 0 || bd > 0 || brd > 0;
