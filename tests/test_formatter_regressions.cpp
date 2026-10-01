@@ -4799,3 +4799,50 @@ endmodule
     const std::string stmt = "module m;\n  initial begin\n    obj.field = 1;\n    obj.run();\n  end\nendmodule\n";
     CHECK(format_stable(stmt, opts) == stmt);
 }
+
+TEST_CASE("formatter regression: the operand of a prefix operator split by a directive is a continuation", "[formatter][regression]") {
+    // R-12: `` `ifdef INV ~ `endif clk; `` -- `clk` is the operand of `~`, and
+    // it fell back to the statement's indent because `~` is no binary operator.
+    const std::string input = R"SV(module m;
+assign y = `ifdef INV ~ `endif clk;
+assign z = a &
+`ifdef X
+b &
+`endif
+c;
+always_comb begin
+x =
+`ifdef A
+1;
+`else
+2;
+`endif
+y = 3;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign y =
+`ifdef INV
+    ~
+`endif
+    clk;
+  assign z = a &
+`ifdef X
+    b &
+`endif
+    c;
+  always_comb begin
+    x =
+`ifdef A
+      1;
+`else
+      2;
+`endif
+    y = 3;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

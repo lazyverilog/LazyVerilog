@@ -3548,8 +3548,13 @@ private:
                                       (p.immutable.syntax.paren_depth > 0 || p.immutable.syntax.in_property_expr);
                 // `: b;` -- a line led by the conditional's `:` is its second half.
                 const bool leads_conditional_colon = kind_is(t, TK::Colon) && questions.back() > 0;
+                // `` `ifdef INV ~ `endif `` / `clk;` -- an operator that is
+                // only ever a prefix still has its operand to come.
+                const bool prefix_only_op = pk == TK::Tilde || pk == TK::Exclamation ||
+                                            pk == TK::TildeAnd || pk == TK::TildeOr;
                 const bool continues =
                     is_binary_op(pk) || is_assignment_op(pk) || pk == TK::Question || open_delim ||
+                    prefix_only_op ||
                     prev_is_conditional_colon || event_or || leads_conditional_colon ||
                     (pk == TK::Comma && enclosing != npos) ||
                     (t.lex.comment_kind == CommentLexemeKind::None && is_binary_op(t.lex.kind) &&
