@@ -564,6 +564,21 @@ ctest --test-dir build                          # test gate — must pass first
     trailing comments, and must be handled carefully so it does not create
     non-idempotent formatting behavior.
 
+### Formatter Behaviour That Is Intended
+Each of these has been reported as a bug by a stress test and is not one.  Do not report
+it again and do not "fix" it; each is pinned by a regression test.
+- **`statement.begin_newline` moves a `struct`/`union` body `{` to its own line**, the
+  same as `begin`, `fork`, and constraint/coverage braces.  It is every block-opening
+  brace, not only `begin`.  An `enum` `{` stays, because it holds a list and not a block.
+  Documented under `begin_newline` in `docs/formatter/options.md`; pinned by "begin_newline
+  moves a struct or union brace, by design" (round 7, P-21).
+- **`line_length` is a column, indentation included.**  WrapPass runs before IndentPass
+  and cannot read an indent, so it reads `TopologyFacts::scope_depth`, which SyntaxPass
+  writes from the same two predicates IndentPass walks.  A brace-less controlled body and
+  a scope-opening macro are a level it does not count, so the estimate can fall one indent
+  short and never overshoots.  Do not move the length decision after IndentPass, and do
+  not read `IndentMetadata` from WrapPass.
+
 ### Hand-Built JSON
 - The custom `workspace/executeCommand` replies are serialized by hand and handed to the
   transport as a finished string, so nothing downstream re-escapes them.  There is **one**

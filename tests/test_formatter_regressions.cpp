@@ -3159,3 +3159,633 @@ S_ERR = 2'b11 // error
     opts.enum_declaration.enum_value_min_width = 0;
     CHECK(format_stable(input, opts) == expected);
 }
+
+// ---------------------------------------------------------------------------
+// Round 7 (FORMAT_BUG_FIX7.md)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("formatter regression: a list after a format-on marker keeps its indent", "[formatter][regression]") {
+    // P-1: a verbatim region ends a line.  The first statement after
+    // `// verilog_format: on` was measured and indented from inside the region,
+    // so its wrapped list sat at column 0.
+    const std::string input = R"SV(module m;
+  // verilog_format: off
+  wire   a  =  1;
+  // verilog_format: on
+  sub u (
+    .a(a),
+    .d(d)
+  );
+  initial begin
+    // verilog_format: off
+    x  =  1;
+    // verilog_format: on
+    foo(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccccccc, dddddddddddd);
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  // verilog_format: off
+  wire   a  =  1;
+  // verilog_format: on
+  sub u(
+    .a(a),
+    .d(d)
+  );
+  initial begin
+    // verilog_format: off
+    x  =  1;
+    // verilog_format: on
+    foo(
+      aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,
+      cccccccccccccccccccccccccc,
+      dddddddddddd
+    );
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: ifdef branches that each open a begin count one scope", "[formatter][regression]") {
+    // P-2: both branches open the same `begin`; only one is ever compiled, so
+    // the scope is opened once.  The second input is the neighbour that must not
+    // move: a brace-less body split across the branches.
+    {
+        const std::string input = R"SV(module m;
+`ifdef A
+  always_ff @(posedge clk) begin
+`else
+  always_ff @(posedge clk or negedge rst_n) begin
+`endif
+    q <= d;
+  end
+  assign z = 1;
+endmodule
+)SV";
+        const std::string expected = R"SV(module m;
+`ifdef A
+  always_ff @(posedge clk) begin
+`else
+  always_ff @(posedge clk or negedge rst_n) begin
+`endif
+    q <= d;
+  end
+  assign z = 1;
+endmodule
+)SV";
+        CHECK(format_stable(input) == expected);
+    }
+    {
+        const std::string input = R"SV(module m;
+always_comb
+`ifdef A
+x = 1;
+`elsif B
+x = 3;
+`else
+x = 2;
+`endif
+assign z = 1;
+endmodule
+)SV";
+        const std::string expected = R"SV(module m;
+  always_comb
+`ifdef A
+    x = 1;
+`elsif B
+    x = 3;
+`else
+    x = 2;
+`endif
+  assign z = 1;
+endmodule
+)SV";
+        CHECK(format_stable(input) == expected);
+    }
+}
+
+TEST_CASE("formatter regression: a case label with a select is not a declaration", "[formatter][regression]") {
+    // P-3: `x[0]: y = 1;` read as type `x`, packed dimension `[0]` and
+    // declarator `y`.
+    const std::string input = R"SV(module m;
+logic [7:0] x;
+int unsigned cnt;
+always_comb begin
+case (1'b1)
+x[0]: y = 1;
+mem[i][j]: y = 2;
+default: y = 0;
+endcase
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  logic               [7:0]               x                                   ;
+  int unsigned                            cnt                                 ;
+  always_comb begin
+    case (1'b1)
+      x[0]: y = 1;
+      mem[i][j]: y = 2;
+      default: y = 0;
+    endcase
+  end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a parenthesised expression after a clocking or iff paren is not a call", "[formatter][regression]") {
+    // P-5: `disable iff (!rst_n) (req && ...)` -- the second paren follows a
+    // `)`, which is what an argument list does, but this `)` closes an `iff` or
+    // an event control and what follows is an expression.
+    {
+        const std::string input = R"SV(module m;
+ap1: assert property (@(posedge clk) disable iff (!rst_n) (req && some_long_signal_name && another_long_signal_name) |-> ##[1:10] (gnt || timeout_signal_name));
+endmodule
+)SV";
+        const std::string expected = R"SV(module m;
+  ap1: assert property (@(posedge clk) disable iff (!rst_n) (req && some_long_signal_name && another_long_signal_name) |-> ##[1:10] (gnt || timeout_signal_name));
+endmodule
+)SV";
+        CHECK(format_stable(input) == expected);
+    }
+    {
+        const std::string input = R"SV(module m;
+property p; @(posedge clk) (req, v = d) |-> gnt; endproperty
+initial foo(a, b);
+endmodule
+)SV";
+        const std::string expected = R"SV(module m;
+  property p;
+    @(posedge clk) (req, v = d) |-> gnt;
+  endproperty
+  initial
+    foo(
+      a,
+      b
+    );
+endmodule
+)SV";
+        FormatOptions opts;
+        opts.function_call.break_policy = "always";
+        CHECK(format_stable(input, opts) == expected);
+    }
+}
+
+TEST_CASE("formatter regression: an attribute in front of a brace-less body does not end it", "[formatter][regression]") {
+    // P-6: the controlled body was measured from the attribute, so it ended
+    // at `*)` and the statement behind it lost its level.
+    const std::string input = R"SV(module m;
+always @(posedge clk)
+  (* full_case *) case (x)
+    1: y = 1;
+  endcase
+always_comb (* mark *) if (a) b = 1; else b = 2;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always @(posedge clk)
+    (* full_case *) case (x)
+      1: y = 1;
+    endcase
+  always_comb
+    (* mark *) if (a)
+      b = 1;
+    else
+      b = 2;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a select in a sequence or property is not an unpacked dimension", "[formatter][regression]") {
+    // P-7: `b[0];` and `d[0] [=2];` end a property expression, not a
+    // declaration, and take no space before `[`.
+    const std::string input = R"SV(module m;
+property p; @(posedge clk) a |-> b[0]; endproperty
+sequence s; !gnt ##1 d[0] [=2]; endsequence
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  property p;
+    @(posedge clk) a |-> b[0];
+  endproperty
+  sequence s;
+    !gnt ##1 d[0][=2];
+  endsequence
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a macro-sized literal takes no space before its base", "[formatter][regression]") {
+    // P-8: `` `WIDTH'h3 `` is one literal the way `8'h3` is.
+    const std::string input = R"SV(module m;
+assign a = `WIDTH'h3;
+assign b = `W(8)'d1;
+assign d = 8'hFF;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  assign a = `WIDTH'h3;
+  assign b = `W(8)'d1;
+  assign d = 8'hFF;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a packed dimension after a struct body stays on the brace line", "[formatter][regression]") {
+    // P-9: `} [1:0] pair_t;` -- the dimension belongs with the `}` the way
+    // the name does.
+    const std::string input = R"SV(typedef struct packed { logic a; logic b; } [1:0] pair_t;
+typedef struct packed { logic a; } one_t;
+)SV";
+    const std::string expected = R"SV(typedef struct packed {
+  logic a;
+  logic b;
+} [1:0] pair_t;
+typedef struct packed {
+  logic a;
+} one_t;
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: the default-width aligner takes user types and qualifiers", "[formatter][regression]") {
+    // P-10: only a leading type keyword was a declaration here, so `req_t r;`
+    // and `rand int r;` were skipped.  A wider user type widens its own run of
+    // declarations and nothing else: the `logic` lines of module `n` keep the
+    // keyword column.  `memory u_mem();` is an instance and is left alone.
+    const std::string input = R"SV(module m;
+logic [7:0] x;
+int a;
+req_t req_q, req_d;
+pkg::cfg_t cfg;
+rand bit [3:0] k;
+memory u_mem();
+endmodule
+module n;
+logic [7:0] x;
+int a;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  logic      [7:0]                         x                             ;
+  int                                      a                             ;
+  req_t                                    req_q, req_d                  ;
+  pkg::cfg_t                               cfg                           ;
+  rand bit   [3:0]                         k                             ;
+  memory u_mem();
+endmodule
+module n;
+  logic [7:0]                         x                             ;
+  int                                 a                             ;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: net types, genvar, class qualifiers and parameterized types are declarations", "[formatter][regression]") {
+    // P-11: none of these were aligned.  `virtual task`, `virtual class` and
+    // a parameterized instance must stay as they are.
+    const std::string input = R"SV(virtual class base;
+local int b;
+protected bit [3:0] p;
+virtual my_if vif;
+mailbox #(item_c) mbx;
+base_c #(int)::this_t h;
+virtual task t();
+endtask
+endclass
+module m;
+logic [7:0] x;
+tri0 t0;
+supply0 gnd;
+tri [3:0] tb;
+genvar g;
+memory #(8) u_mem();
+endmodule
+)SV";
+    const std::string expected = R"SV(virtual class base;
+  local int                               b                                   ;
+  protected bit       [3:0]               p                                   ;
+  virtual my_if                           vif                                 ;
+  mailbox #(item_c)                       mbx                                 ;
+  base_c #(int)::this_t                   h                                   ;
+  virtual task t();
+  endtask
+endclass
+module m;
+  logic               [7:0]               x                                   ;
+  tri0                                    t0                                  ;
+  supply0                                 gnd                                 ;
+  tri                 [3:0]               tb                                  ;
+  genvar                                  g                                   ;
+  memory #(8) u_mem();
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: an unpacked dimension is spaced the same in every declaration", "[formatter][regression]") {
+    // P-12: the space before `[` was lost after `endfunction`, in a typedef
+    // and behind an attribute.
+    const std::string input = R"SV(module m;
+function void g();
+endfunction
+int q[$], da[];
+typedef int aa_t[string];
+typedef req_t r_t[4];
+(* ram_style = "block" *) reg [7:0] mem[0:255];
+logic u[4];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  function void g();
+  endfunction
+  int q [$], da [];
+  typedef int aa_t [string];
+  typedef req_t r_t [4];
+  (* ram_style = "block" *) reg [7:0] mem [0:255];
+  logic u [4];
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a comment after a function header's paren keeps the arguments indented", "[formatter][regression]") {
+    // P-13: the comment forces the list onto separate lines; the arguments
+    // take the list indent and `);` the header's.
+    const std::string input = R"SV(module m;
+function int f( // after paren
+    int a,
+    int b
+);
+return a + b;
+endfunction
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  function int f( // after paren
+    int a,
+    int b
+  );
+    return a + b;
+  endfunction
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: an ifdef inside an event control continues the line", "[formatter][regression]") {
+    // P-14: `or negedge rst_n` on its own line inside the `@(...)`.
+    const std::string input = R"SV(module m;
+always @(posedge clk
+`ifdef HAS_RST
+         or negedge rst_n
+`endif
+) begin
+q <= d;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  always @(posedge clk
+`ifdef HAS_RST
+    or negedge rst_n
+`endif
+  ) begin
+    q <= d;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: an own-line comment inside a continued expression takes its indent", "[formatter][regression]") {
+    // P-15: the comment sat at statement level between two continuation
+    // lines.
+    const std::string input = R"SV(module m;
+initial begin
+y = a + // plus
+    b - c
+    // own-line in expr
+    + d;
+// statement level
+z = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    y = a + // plus
+      b - c
+      // own-line in expr
+      + d;
+    // statement level
+    z = 1;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: the last port's trailing comment is aligned", "[formatter][regression]") {
+    // P-16: the port analogue of N-17 -- the last port has no comma to pad
+    // through.
+    const std::string input = R"SV(module m (
+  input [W-1:0] d, // data in
+  output reg [W-1:0] q // data out
+);
+endmodule
+module n (
+  input a, // a
+  output logic b [3:0] /* blk */
+);
+endmodule
+)SV";
+    const std::string expected = R"SV(module m(
+  input                   [W-1:0]     d                       , // data in
+  output      reg         [W-1:0]     q                         // data out
+);
+endmodule
+module n(
+  input                               a                       , // a
+  output      logic                   b           [3:0]         /* blk */
+);
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: a leading comma after a line comment stays with its item", "[formatter][regression]") {
+    // P-17: the comma cannot move up behind the `//` comment, and breaking
+    // after it left `,` alone on a line.
+    const std::string input = R"SV(module n (input a // c
+  , input b
+);
+endmodule
+)SV";
+    const std::string expected = R"SV(module n(
+  input a // c
+  , input b
+);
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: a second declarator inside a parameter list is not an assignment line", "[formatter][regression]") {
+    // P-18: `D2 = 4` continues the `parameter` above it; statement alignment
+    // padded its `=` as if it began a statement.
+    const std::string input = R"SV(module m #(
+  parameter W2 = DATA_W * 2, D2 = 4,
+  parameter real R = 1.5
+) (input logic clk);
+assign a = 1;
+assign bbb = 2;
+endmodule
+)SV";
+    const std::string expected = R"SV(module m #(
+  parameter W2 = DATA_W * 2,
+  D2 = 4,
+  parameter real R = 1.5
+)(
+  input logic clk
+);
+  assign a   = 1;
+  assign bbb = 2;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.align = true;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: first_match takes no space before its paren", "[formatter][regression]") {
+    // P-20: `first_match(s)` is spelled like a call.
+    const std::string input = R"SV(module m;
+sequence s; first_match(a ##[1:3] b) ##1 c; endsequence
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  sequence s;
+    first_match(a ##[1:3] b) ##1 c;
+  endsequence
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
+
+TEST_CASE("formatter regression: begin_newline moves a struct or union brace, by design", "[formatter][regression]") {
+    // P-21 was reported as a bug and is not one: `begin_newline` puts every
+    // block-opening brace on its own line, a struct or union body's included.
+    // An enum's `{` holds a list, not a block, and stays.  Do not "fix" this.
+    const std::string input = R"SV(typedef struct packed { logic a; } s_t;
+typedef union packed { logic [1:0] a; logic [1:0] b; } u_t;
+typedef enum logic { A, B } e_t;
+module m;
+always_comb begin
+x = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(typedef struct packed
+{
+  logic a;
+} s_t;
+typedef union packed
+{
+  logic [1:0] a;
+  logic [1:0] b;
+} u_t;
+typedef enum logic {
+  A,
+  B
+} e_t;
+module m;
+  always_comb
+  begin
+    x = 1;
+  end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    CHECK(format_stable(input, opts) == expected);
+}
+
+TEST_CASE("formatter regression: the call length check counts the line's indentation", "[formatter][regression]") {
+    // P-4: WrapPass measured a line from its first token, so a call was only
+    // broken at `line_length` plus its own indent.  The first call ends at
+    // column 101 and is broken; the second ends at column 100 and is not.
+    {
+        const std::string input = R"SV(module m;
+function automatic int f();
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argument);
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argumen);
+endfunction
+endmodule
+)SV";
+        const std::string expected = R"SV(module m;
+  function automatic int f();
+    return compute_something(
+             argument_one_long,
+             argument_two_long,
+             argument_three_long_xyz,
+             argument
+           );
+    return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argumen);
+  endfunction
+endmodule
+)SV";
+        CHECK(format_stable(input) == expected);
+    }
+    {
+        const std::string input = R"SV(package p;
+function automatic int f();
+if (a) begin
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argume);
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argum);
+end
+endfunction
+endpackage
+)SV";
+        const std::string expected = R"SV(package p;
+  function automatic int f();
+    if (a) begin
+      return compute_something(
+               argument_one_long,
+               argument_two_long,
+               argument_three_long_xyz,
+               argume
+             );
+      return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argum);
+    end
+  endfunction
+endpackage
+)SV";
+        CHECK(format_stable(input) == expected);
+    }
+}

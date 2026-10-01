@@ -187,6 +187,14 @@ struct TopologyFacts {
     // class closed by `endclass`, the second a variable's type.
     bool opens_design_unit{false};
 
+    // Indent scopes open at this token, as IndentPass will count them, apart
+    // from the outermost design unit: whether that one indents its items is
+    // `default_indent_level_inside_outmost_block`, an option and not a fact,
+    // so `in_outermost_unit` says only that the token is inside one.  Written
+    // for WrapPass, which measures a line before IndentPass has run.
+    int scope_depth{0};
+    bool in_outermost_unit{false};
+
     // The `while` that closes a `do` (`do x++; while (c);`,
     // `do begin ... end while (c);`).  It controls nothing.
     bool ends_do_while{false};

@@ -463,8 +463,11 @@ data = 2;
 
 ### `begin_newline`
 
-When `true`, block openers after control expressions are placed on a new line. When `false`,
-they stay on the control line. This applies to `begin` and to constraint block braces.
+When `true`, block openers are placed on a new line. When `false`, they stay on the line
+that introduces them. This applies to `begin`, `fork`, and every brace that opens a block:
+constraint and coverage braces, and the body brace of a `struct` or `union`.
+
+An `enum` brace is not moved: it holds a list of names, not a block of declarations.
 
 ```toml
 [format.statement]
@@ -496,6 +499,16 @@ constraint c
     x == 1;
   }
 }
+
+typedef struct packed
+{
+  logic a;
+} s_t;
+
+typedef enum logic {
+  A,
+  B
+} e_t;
 ```
 
 ---
@@ -808,6 +821,9 @@ break_policy = "auto"
 ### `line_length`
 
 When `break_policy = "auto"`, break if the single-line rendering exceeds this character width.
+The width is the whole line as it will be written, indentation included, so the limit is a
+column and a call nested four levels deep breaks at the same column as one at the top level.
+A brace-less body (`if (a) call(...);` on two lines) is measured one indent short.
 
 ```toml
 [format.function_call]
@@ -948,6 +964,7 @@ function void foo(input logic a,
 ### `line_length`
 
 Declarations shorter than this stay single-line. Declarations exceeding this are broken according to `layout`.
+The width includes the declaration's indentation, as it does for `function_call.line_length`.
 
 ```toml
 [format.function_declaration]

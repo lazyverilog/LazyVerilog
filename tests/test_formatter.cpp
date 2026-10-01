@@ -1108,7 +1108,7 @@ TEST_CASE("formatter: final ANSI port with line comment does not gain comma", "[
                         "endinterface\n",
                         opts) == "interface i(\n"
                                  "    input     logic                                   a                                                           , // a\n"
-                                 "    input     logic                                   b // b\n"
+                                 "    input     logic                                   b                                                             // b\n"
                                  ");\n"
                                  "endinterface\n");
 }
