@@ -4096,3 +4096,26 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a DPI alias is not an assignment line", "[formatter][regression]") {
+    // Q-11: the `=` of `import "DPI-C" c_name = function ...` was aligned
+    // with the assignments below it and set their column.
+    const std::string input = R"SV(module m;
+import "DPI-C" c_name = function void sv_alias(string s);
+export "DPI-C" c_exp = function sv_fn;
+assign aaaa = 1;
+assign b = 2;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.align = true;
+    const std::string expected = R"SV(
+module m;
+  import "DPI-C" c_name = function void sv_alias(string s);
+  export "DPI-C" c_exp = function sv_fn;
+  assign aaaa = 1;
+  assign b    = 2;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

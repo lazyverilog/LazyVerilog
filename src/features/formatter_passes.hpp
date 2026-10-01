@@ -4234,6 +4234,11 @@ public:
             // A line continuing an expression is part of the statement above.
             if (cur_first != npos && tokens[cur_first].mutable_.wrap.continuation)
                 ln.disabled = true;
+            // `import "DPI-C" c_name = function void f();` -- the `=` names
+            // the C linkage; nothing is assigned.
+            if (cur_first != npos && (kind_is(tokens[cur_first], TK::ImportKeyword) ||
+                                      kind_is(tokens[cur_first], TK::ExportKeyword)))
+                ln.disabled = true;
             // `parameter W = 8,` / `D = 4,` -- a later line of a wrapped
             // parameter or argument list is placed by the list's own layout;
             // its `=` is a default value, not a statement's assignment.
