@@ -1888,7 +1888,12 @@ public:
         }
         mark_property_expressions(tokens);
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (!kind_is(tokens[i], TK::OpenBracket) || !tokens[i].immutable.syntax.in_property_expr)
+            // `bins t = (1 [->2] => 0);` -- a transition list repeats a value the
+            // way a sequence repeats an expression, and sits in parentheses.
+            const bool in_transition =
+                tokens[i].immutable.syntax.in_covergroup && tokens[i].immutable.syntax.paren_depth > 0;
+            if (!kind_is(tokens[i], TK::OpenBracket) ||
+                !(tokens[i].immutable.syntax.in_property_expr || in_transition))
                 continue;
             const size_t op = next_code(tokens, i + 1, tokens.size());
             tokens[i].immutable.topology.is_repetition_bracket =

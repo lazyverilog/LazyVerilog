@@ -4916,3 +4916,39 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a repetition in a transition bin is not a dimension", "[formatter][regression]") {
+    // S-7: `[->2]` and `[=1:3]` were recognised as repetitions only inside a
+    // property, so in a covergroup `->` and `=` were spaced as operators.
+    const std::string input = R"SV(module m;
+covergroup cg @(posedge clk);
+cp: coverpoint v {
+bins t1 = (3 [*2] => 4);
+bins t2 = (1 [->2] => 0);
+bins t3 = (2 [=1:3] => 5), ([1:2] => 3);
+bins b[4] = {[0:15]};
+}
+endgroup
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  covergroup cg @(posedge clk);
+    cp: coverpoint v {
+      bins t1 = (3 [*2] => 4);
+      bins t2 = (1 [->2] => 0);
+      bins t3 = (2 [=1:3] => 5), ([1:2] => 3);
+      bins b[4] = {[0:15]};
+    }
+  endgroup
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    // The dimension options pad a range and leave a repetition alone.
+    FormatOptions opts;
+    opts.spacing.space_inside_dimension_brackets = true;
+    const std::string padded = format_stable(input, opts);
+    CHECK(padded.find("(3 [*2] => 4)") != std::string::npos);
+    CHECK(padded.find("(1 [->2] => 0)") != std::string::npos);
+    CHECK(padded.find("{[ 0:15 ]}") != std::string::npos);
+}
