@@ -1788,6 +1788,9 @@ public:
                      continues_own_line_run)
                     ? CommentRole::OwnLine : CommentRole::Trailing;
                 t.immutable.comment.anchor_token = i == 0 ? npos : i - 1;
+                t.immutable.comment.ends_line =
+                    i + 1 >= tokens.size() ||
+                    tokens[i + 1].immutable.input_trivia.original_newlines_before > 0;
                 t.immutable.comment.inside_expression = pd > 0 || bd > 0 || brd > 0;
                 t.immutable.comment.inside_arg_list = pd > 0;
             }
@@ -2901,8 +2904,15 @@ public:
                     for (size_t c = item.first; c > open + 1; --c) {
                         size_t p = c - 1;
                         if (tokens[p].lex.comment_kind == CommentLexemeKind::Block) {
+                            // `rst_n, /* reset */` at the end of its line
+                            // describes the item before the comma and stays
+                            // there; see the break placement below.
+                            const bool trails_previous_item =
+                                tokens[p].immutable.comment.role == CommentRole::Trailing &&
+                                tokens[p].immutable.comment.ends_line;
                             if (!(p + 1 < tokens.size() && tokens[p + 1].lex.comment_kind != CommentLexemeKind::None &&
-                                  tokens[p + 1].immutable.comment.role == CommentRole::OwnLine))
+                                  tokens[p + 1].immutable.comment.role == CommentRole::OwnLine) &&
+                                !trails_previous_item)
                                 leading_block_comment = p;
                             break;
                         }
@@ -2947,6 +2957,7 @@ public:
                             tokens[c].immutable.comment.role == CommentRole::Trailing &&
                             (kind == WrapListKind::InstancePorts ||
                              tokens[c].lex.comment_kind == CommentLexemeKind::Line ||
+                             tokens[c].immutable.comment.ends_line ||
                              (c + 1 < tokens.size() && tokens[c + 1].lex.comment_kind != CommentLexemeKind::None &&
                               tokens[c + 1].immutable.comment.role == CommentRole::OwnLine))) {
                             break_token = c;

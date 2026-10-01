@@ -4166,3 +4166,51 @@ endinterface
     CHECK(out.find("    import task t(input int x) ,\n"
                    "    output bbbbbbbbbbbbb       , cc\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a comment ending its line stays with the comma before it", "[formatter][regression]") {
+    // Q-6: `rst_n, /* reset */` moved in front of the next port and read as
+    // describing it.  A comment with code after it on its line still leads
+    // that code.
+    const std::string input = R"SV(module m (
+  input logic clk,
+  input logic rst_n, /* reset */
+  output logic q, /* lead */ output logic r,
+  /* own */ output logic s
+);
+typedef enum { A, /* ea */
+  B, /* eb */ C } e_t;
+sub u (.a(a), /* ca */
+  .b(b));
+initial foo(a, b, /* second */
+  c);
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_call.break_policy = "always";
+    const std::string expected = R"SV(
+module m(
+  input logic clk,
+  input logic rst_n, /* reset */
+  output logic q,
+  /* lead */ output logic r,
+  /* own */ output logic s
+);
+  typedef enum {
+    A, /* ea */
+    B,
+    /* eb */ C
+  } e_t;
+  sub u(
+    .a(a), /* ca */
+    .b(b)
+  );
+  initial
+    foo(
+      a,
+      b, /* second */
+      c
+    );
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

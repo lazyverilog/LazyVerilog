@@ -253,6 +253,11 @@ struct CommentFacts {
     size_t anchor_token{npos};
     bool inside_expression{false};
     bool inside_arg_list{false};
+    // Nothing followed the comment on its source line.  With `role` this is
+    // the whole of what comment placement may know about the original layout:
+    // `a, /* x */` at the end of a line describes `a`, while `a, /* x */ b`
+    // leads `b`.
+    bool ends_line{false};
 };
 
 // -----------------------------------------------------------------------------

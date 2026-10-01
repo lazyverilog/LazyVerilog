@@ -181,6 +181,7 @@ inline void write_token_stream_log(std::ostream& out, const TokenStream& tokens)
         out << "  immutable.comment.anchor_token: " << npos_or_index(imm.comment.anchor_token) << "\n";
         out << "  immutable.comment.inside_expression: " << bool01(imm.comment.inside_expression) << "\n";
         out << "  immutable.comment.inside_arg_list: " << bool01(imm.comment.inside_arg_list) << "\n";
+        out << "  immutable.comment.ends_line: " << bool01(imm.comment.ends_line) << "\n";
 
         // InputTriviaFacts: observation of original whitespace only.
         out << "  immutable.input_trivia.original_spaces_before: " << imm.input_trivia.original_spaces_before << "\n";
