@@ -99,6 +99,9 @@ inline bool is_assignment_op(TK k) {
 inline bool is_binary_op(TK k) {
     return k == TK::Plus || k == TK::Minus || k == TK::Star || k == TK::Slash || k == TK::Percent ||
            k == TK::DoubleEquals || k == TK::ExclamationEquals || k == TK::LessThan || k == TK::GreaterThan ||
+           k == TK::TripleEquals || k == TK::ExclamationDoubleEquals ||
+           k == TK::DoubleEqualsQuestion || k == TK::ExclamationEqualsQuestion ||
+           k == TK::DoubleStar || k == TK::LessThanMinusArrow ||
            k == TK::LessThanEquals || k == TK::GreaterThanEquals || k == TK::DoubleAnd || k == TK::DoubleOr ||
            k == TK::And || k == TK::Or || k == TK::Xor || k == TK::LeftShift || k == TK::RightShift ||
            k == TK::TripleLeftShift || k == TK::TripleRightShift ||

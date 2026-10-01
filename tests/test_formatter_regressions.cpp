@@ -4404,3 +4404,58 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == sections.substr(1));
 }
+
+TEST_CASE("formatter regression: every comparison, power and equivalence operator is binary", "[formatter][regression]") {
+    // R-3: `===`, `!==`, `==?`, `!=?`, `**` and `<->` were missing from the
+    // binary-operator set, so a line broken at one got no continuation
+    // indent and `binary_operator_spacing` skipped them.
+    const std::string input = R"SV(module m;
+assign a = b && // c1
+c;
+assign a = b === // c2
+c;
+assign a = b // c3
+<-> c;
+assign a = b ** // c4
+c;
+assign a = b // c5
+!=? c;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign a = b && // c1
+    c;
+  assign a = b === // c2
+    c;
+  assign a = b // c3
+    <-> c;
+  assign a = b ** // c4
+    c;
+  assign a = b // c5
+    !=? c;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+
+    FormatOptions opts;
+    opts.spacing.binary_operator_spacing = "none";
+    const std::string tight_input = R"SV(module m;
+assign a = b != c; assign a = b !== c; assign a = b ==? c; assign a = b !=? c;
+assign a = b ** c; assign a = b <-> c; assign a = b === -c; assign a = b ** -1;
+endmodule
+)SV";
+    const std::string tight = R"SV(
+module m;
+  assign a = b!=c;
+  assign a = b!==c;
+  assign a = b==?c;
+  assign a = b!=?c;
+  assign a = b**c;
+  assign a = b<->c;
+  assign a = b===-c;
+  assign a = b**-1;
+endmodule
+)SV";
+    CHECK(format_stable(tight_input, opts) == tight.substr(1));
+}
