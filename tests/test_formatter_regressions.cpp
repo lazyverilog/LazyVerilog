@@ -4952,3 +4952,33 @@ endmodule
     CHECK(padded.find("(1 [->2] => 0)") != std::string::npos);
     CHECK(padded.find("{[ 0:15 ]}") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a virtual interface's specialization is not a header's parameter list", "[formatter][regression]") {
+    // S-5: the optional `interface` keyword made `#(16)` look like an
+    // interface declaration's parameter port list, one parameter per line.
+    const std::string input = R"SV(class drv;
+virtual interface bus_if #(16) vif;
+virtual bus_if #(16) vif2;
+virtual interface bus_if #(.AW(16), .DW(8)).mp vif3;
+function new(virtual interface bus_if #(16) v, int a); endfunction
+endclass
+interface bus_if #(parameter W = 8) (input clk);
+endinterface
+)SV";
+    const std::string expected = R"SV(
+class drv;
+  virtual interface bus_if #(16) vif;
+  virtual bus_if #(16) vif2;
+  virtual interface bus_if #(.AW(16), .DW(8)).mp vif3;
+  function new(virtual interface bus_if #(16) v, int a);
+  endfunction
+endclass
+interface bus_if #(
+  parameter W = 8
+)(
+  input clk
+);
+endinterface
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

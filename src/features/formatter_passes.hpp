@@ -1081,6 +1081,13 @@ inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open)
         if (!is_code_token(tokens[i])) continue;
         if (kind_is(tokens[i], TK::CloseParenthesis)) ++pd;
         else if (kind_is(tokens[i], TK::OpenParenthesis) && pd > 0) --pd;
+        // `virtual interface bus_if #(16) vif;` -- the keyword is part of a
+        // type, and the `#(` after it specializes rather than declares.
+        if (pd == 0 && kind_is(tokens[i], TK::InterfaceKeyword)) {
+            const size_t p = prev_code(tokens, i);
+            if (p != npos && kind_is(tokens[p], TK::VirtualKeyword))
+                break;
+        }
         if (pd == 0 && starts_module_like_header(tokens[i].lex.kind))
             return i;
         // Only a header import's `;` (`module m import p::*; (...)`) sits
