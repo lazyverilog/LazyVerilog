@@ -4773,3 +4773,29 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a modport-typed declaration joins the declaration columns", "[formatter][regression]") {
+    // R-11: `my_if.mp ifp;` -- an interface and its modport are one type.
+    // The `.` made the line read as a statement and it was left unaligned.
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    const std::string input = R"SV(module m;
+my_if.mp ifp;
+my_if ifq;
+logic [3:0] a;
+my_if.mp arr [2];
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  my_if.mp                                 ifp                           ;
+  my_if                                    ifq                           ;
+  logic      [3:0]                         a                             ;
+  my_if.mp                                 arr [2]                       ;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+    // A member select is not a type: nothing names a declarator after it.
+    const std::string stmt = "module m;\n  initial begin\n    obj.field = 1;\n    obj.run();\n  end\nendmodule\n";
+    CHECK(format_stable(stmt, opts) == stmt);
+}

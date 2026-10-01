@@ -4761,6 +4761,20 @@ public:
                         type_last = close;
                         continue;
                     }
+                    // `my_if.mp ifp;` -- an interface with its modport is
+                    // one type.  Only with a declarator right after it: a
+                    // member select never has a name following.
+                    if (sep != npos && type_last == ln.first && kind_is(tokens[sep], TK::Dot)) {
+                        const size_t modport = next_code(tokens, sep + 1, semi);
+                        const size_t declarator =
+                            modport == npos ? npos : next_code(tokens, modport + 1, semi);
+                        if (modport == npos || declarator == npos ||
+                            !kind_is(tokens[modport], TK::Identifier) ||
+                            !kind_is(tokens[declarator], TK::Identifier))
+                            break;
+                        type_last = modport;
+                        break;
+                    }
                     if (sep == npos || !kind_is(tokens[sep], TK::DoubleColon))
                         break;
                     const size_t part = next_code(tokens, sep + 1, semi);
