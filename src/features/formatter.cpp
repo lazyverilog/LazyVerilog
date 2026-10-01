@@ -32,6 +32,28 @@ inline std::string_view comparable_token_text(const Tok& token) {
     return strip_trailing_token_whitespace(token.lex.text);
 }
 
+// A block comment spanning lines has its later lines moved with its first
+// one, so the blanks that lead each of those lines are layout, like the
+// indentation of any other line.  Everything else in it must be unchanged.
+static bool same_block_comment_but_indent(const Tok& x, const Tok& y) {
+    if (x.lex.comment_kind != CommentLexemeKind::Block || y.lex.comment_kind != CommentLexemeKind::Block)
+        return false;
+    const std::string_view a = comparable_token_text(x), b = comparable_token_text(y);
+    size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] != b[j])
+            return false;
+        const bool line_end = a[i] == '\n';
+        ++i;
+        ++j;
+        if (line_end) {
+            while (i < a.size() && (a[i] == ' ' || a[i] == '\t')) ++i;
+            while (j < b.size() && (b[j] == ' ' || b[j] == '\t')) ++j;
+        }
+    }
+    return i == a.size() && j == b.size();
+}
+
 static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
     // The formatter safety check compares the *lexed* token stream before and
     // after formatting.
@@ -51,7 +73,8 @@ static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
         const auto& y = b[i];
         if (x.lex.kind != y.lex.kind)
             return false;
-        if (comparable_token_text(x) != comparable_token_text(y))
+        if (comparable_token_text(x) != comparable_token_text(y) &&
+            !same_block_comment_but_indent(x, y))
             return false;
         if (x.lex.comment_kind != y.lex.comment_kind)
             return false;

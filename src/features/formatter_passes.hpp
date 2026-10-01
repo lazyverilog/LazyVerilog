@@ -1833,6 +1833,10 @@ public:
                 t.immutable.comment.ends_line =
                     i + 1 >= tokens.size() ||
                     tokens[i + 1].immutable.input_trivia.original_newlines_before > 0;
+                if (t.lex.comment_kind == CommentLexemeKind::Block &&
+                    t.immutable.comment.role == CommentRole::OwnLine &&
+                    t.lex.text.find('\n') != std::string::npos)
+                    t.immutable.comment.source_column = t.immutable.input_trivia.original_column;
                 t.immutable.comment.inside_expression = pd > 0 || bd > 0 || brd > 0;
                 t.immutable.comment.inside_arg_list = pd > 0;
             }

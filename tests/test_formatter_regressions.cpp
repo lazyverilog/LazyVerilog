@@ -93,11 +93,13 @@ TEST_CASE("formatter regression: code after a multi-line block comment gets no p
     const std::string out = format_stable(input, indent4());
     CHECK(out == "module t;\n"
                  "    wire w = a; // trailing\n"
+                 // The comment's second line keeps its place under the
+                 // first, which moved four columns (R-8).
                  "    /* block\n"
-                 "   comment */\n"
+                 "       comment */\n"
                  "    reg k;\n"
                  "    /* another\n"
-                 "   one */\n"
+                 "       one */\n"
                  "    reg j;\n"
                  "endmodule\n");
 }
@@ -4845,4 +4847,47 @@ module m;
 endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
+}
+
+TEST_CASE("formatter regression: a block comment's later lines move with its first", "[formatter][regression]") {
+    // R-8: only the line holding `/*` was re-indented, so the ` *` column
+    // under it stayed wherever the source had it.
+    const std::string input = R"SV(module m;
+/**
+ * doc comment
+ *   keeps stars
+ */
+logic a;
+always_comb begin
+        /*
+         * deep
+
+      less
+         */
+a = 2; /* t1
+   t2 */
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  /**
+   * doc comment
+   *   keeps stars
+   */
+  logic a;
+  always_comb begin
+    /*
+     * deep
+
+  less
+     */
+    a = 2; /* t1
+   t2 */
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    // Already where it belongs: nothing moves.
+    CHECK(format_stable(expected.substr(1)) == expected.substr(1));
 }

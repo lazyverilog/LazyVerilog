@@ -258,6 +258,11 @@ struct CommentFacts {
     // `a, /* x */` at the end of a line describes `a`, while `a, /* x */ b`
     // leads `b`.
     bool ends_line{false};
+    // Where an own-line block comment spanning lines began on its source line, in
+    // characters.  Its later lines are laid out relative to that column, so
+    // when the first line is re-indented they have to move by the same
+    // amount; -1 for every other comment.
+    int source_column{-1};
 };
 
 // -----------------------------------------------------------------------------

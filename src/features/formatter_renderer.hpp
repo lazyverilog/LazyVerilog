@@ -29,6 +29,35 @@ inline RenderDecision compose(const Tok& tok) {
     return out;
 }
 
+// Emits a block comment with every line after its first moved by `shift`
+// columns.  A line that would move left of column 0 stops there, and a line
+// holding nothing but blanks is left as it is.
+inline void append_shifted_comment(std::string& out, std::string_view text, int shift) {
+    size_t pos = text.find('\n');
+    if (pos == std::string_view::npos) {
+        out += text;
+        return;
+    }
+    out += text.substr(0, pos + 1);
+    ++pos;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        end = end == std::string_view::npos ? text.size() : end + 1;
+        const std::string_view line = text.substr(pos, end - pos);
+        size_t lead = 0;
+        while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t'))
+            ++lead;
+        const bool blank = lead == line.size() || line[lead] == '\n' || line[lead] == '\r';
+        if (blank) {
+            out += line;
+        } else {
+            out.append(static_cast<size_t>(std::max(0, static_cast<int>(lead) + shift)), ' ');
+            out += line.substr(lead);
+        }
+        pos = end;
+    }
+}
+
 inline void trim_trailing_spaces(std::string& out) {
     while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
 }
@@ -101,12 +130,25 @@ inline std::string render_tokens(const TokenStream& tokens) {
             col += spaces;
         }
 
-        out += tok.lex.text;
-        // A block comment spanning lines leaves the column after its last
-        // line break, as a passthrough token does.
-        const size_t nl = last_newline_offset(tok.lex.text);
-        col = nl == std::string::npos ? col + static_cast<int>(tok.lex.text.size())
-                                      : static_cast<int>(tok.lex.text.size() - nl - 1);
+        // A block comment spanning lines: its later lines were written
+        // relative to where the first one began, so they move with it.
+        // Without this only `/**` was re-indented and the ` *` column under
+        // it stayed where the source had it.
+        const int shift = tok.immutable.comment.source_column < 0
+                              ? 0 : col - tok.immutable.comment.source_column;
+        if (shift != 0) {
+            const size_t before = out.size();
+            append_shifted_comment(out, tok.lex.text, shift);
+            const size_t nl = out.rfind('\n');
+            col = static_cast<int>(out.size() - (nl == std::string::npos || nl < before ? before : nl + 1));
+        } else {
+            out += tok.lex.text;
+            // It leaves the column after its last line break, as a
+            // passthrough token does.
+            const size_t nl = last_newline_offset(tok.lex.text);
+            col = nl == std::string::npos ? col + static_cast<int>(tok.lex.text.size())
+                                          : static_cast<int>(tok.lex.text.size() - nl - 1);
+        }
 
         if (tok.mutable_.wrap.must_break_after) {
             trim_trailing_spaces(out);
