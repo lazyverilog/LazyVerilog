@@ -4279,3 +4279,73 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == hanging.substr(1));
 }
+
+TEST_CASE("formatter regression: var alignment leaves a body port declaration to the port aligner", "[formatter][regression]") {
+    // Q-4: with port_declaration.align off, a non-ANSI `input a, b;` was
+    // half placed by the variable aligner: `input       a,  b          ;`.
+    const std::string input = R"SV(module m(a, b, c, d, e, f);
+input a, b;
+input [7:0] c;
+output d;
+input logic e;
+output logic [3:0] f, g;
+wire [3:0] w;
+function automatic int fn;
+input [3:0] x;
+reg [3:0] t;
+fn = x;
+endfunction
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    const std::string expected = R"SV(
+module m(
+  a,
+  b,
+  c,
+  d,
+  e,
+  f
+);
+  input a, b;
+  input [7:0] c;
+  output d;
+  input logic e;
+  output logic [3:0] f, g;
+  wire   [3:0]                         w                             ;
+  function automatic int fn;
+    input [3:0] x;
+    reg    [3:0]                         t                             ;
+    fn = x;
+  endfunction
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    // With the port aligner on, the same lines take its columns as before.
+    opts.port_declaration.align = true;
+    const std::string both = R"SV(
+module m(
+  a,
+  b,
+  c,
+  d,
+  e,
+  f
+);
+  input                               a                       , b                       ;
+  input                   [7:0]       c                       ;
+  output                              d                       ;
+  input       logic                   e                       ;
+  output      logic       [3:0]       f                       , g                       ;
+  wire   [3:0]                         w                             ;
+  function automatic int fn;
+    input                   [3:0]       x                       ;
+    reg    [3:0]                         t                             ;
+    fn = x;
+  endfunction
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == both.substr(1));
+}

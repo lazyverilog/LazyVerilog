@@ -4783,6 +4783,12 @@ public:
                 // port; the port columns (section widths) do not apply.
                 if (tokens[first].immutable.syntax.in_clocking_block)
                     continue;
+                // `input a, b;` in a non-ANSI body is a port declaration.  Its
+                // columns are port_declaration's, and the branch below only
+                // seeds them for that aligner to finish; with it off the line
+                // was left half placed -- `input       a,  b          ;`.
+                if (is_port_direction(tokens[first].lex.kind) && !opts_.port_declaration.align)
+                    continue;
                 if (!starts_variable_declaration(ln))
                     continue;
 
