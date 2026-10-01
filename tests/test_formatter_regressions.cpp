@@ -4580,3 +4580,53 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: the item after a statement block's brace starts a line", "[formatter][regression]") {
+    // R-2: `} name` was kept together for every `}`, which is right only for
+    // the declarator after a struct, union or enum body.
+    const std::string input = R"SV(class c;
+constraint c2 { foreach (arr[i]) { arr[i] > 0; } a == 1; if (a) { b == 1; } else { b == 2; } d == 3; a -> { b == 1; } e == 4; }
+covergroup cg;
+cx: cross cp, cp2 { bins x = binsof(cp); } cy: cross cp, cp2;
+endgroup
+struct { int x; } sa; struct packed { logic y; } [1:0] sb; enum { A, B } ea;
+endclass
+)SV";
+    const std::string expected = R"SV(
+class c;
+  constraint c2 {
+    foreach (arr[i]) {
+      arr[i] > 0;
+    }
+    a == 1;
+    if (a) {
+      b == 1;
+    } else {
+      b == 2;
+    }
+    d == 3;
+    a -> {
+      b == 1;
+    }
+    e == 4;
+  }
+  covergroup cg;
+    cx: cross cp, cp2 {
+      bins x = binsof(cp);
+    }
+    cy: cross cp, cp2;
+  endgroup
+  struct {
+    int x;
+  } sa;
+  struct packed {
+    logic y;
+  } [1:0] sb;
+  enum {
+    A,
+    B
+  } ea;
+endclass
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

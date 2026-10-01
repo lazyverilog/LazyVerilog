@@ -2788,9 +2788,15 @@ public:
                 next_i != npos && tokens[next_i].immutable.topology.is_block_name_colon;
             // `} name;`, and `} [1:0] name;` -- a packed dimension after a
             // struct, union or enum body belongs to the declaration the `}`
-            // is in the middle of.
+            // is in the middle of.  A statement block's `}` is in the middle
+            // of nothing: `foreach (a[i]) { ... } b == 1;` in a constraint, or
+            // `cx: cross a, b { ... } cy: cross a, b;`, starts a new item.
+            const size_t close_opener = kind_is(t, TK::CloseBrace) ? t.immutable.syntax.matching_token : npos;
+            const bool closes_statement_block =
+                close_opener != npos && tokens[close_opener].immutable.topology.opens_brace_block &&
+                !is_struct_or_union_body_brace(tokens, close_opener);
             bool close_brace_before_decl_name =
-                kind_is(t, TK::CloseBrace) && next_i != npos &&
+                kind_is(t, TK::CloseBrace) && !closes_statement_block && next_i != npos &&
                 (kind_is(tokens[next_i], TK::Identifier) || kind_is(tokens[next_i], TK::SystemIdentifier) ||
                  kind_is(tokens[next_i], TK::OpenBracket));
             bool close_brace_before_semicolon =
