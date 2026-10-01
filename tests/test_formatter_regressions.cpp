@@ -3946,3 +3946,43 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: covergroup and checker formals are a declaration's", "[formatter][regression]") {
+    // Q-8: under break_policy "always" the formals were broken per argument
+    // like a call's, while a function's beside them were left alone.
+    const std::string input = R"SV(module m;
+covergroup cg(int lo, int hi) @(posedge clk); coverpoint x; endgroup
+function int f(int lo, int hi); return lo; endfunction
+initial begin cg_inst = new(1, 2); foo(a, b); end
+chk u_chk(clk, a, b);
+endmodule
+checker chk(logic clk, logic a, b); endchecker
+)SV";
+    FormatOptions opts;
+    opts.function_call.break_policy = "always";
+    const std::string expected = R"SV(
+module m;
+  covergroup cg(int lo, int hi) @(posedge clk);
+    coverpoint x;
+  endgroup
+  function int f(int lo, int hi);
+    return lo;
+  endfunction
+  initial begin
+    cg_inst = new(1, 2);
+    foo(
+      a,
+      b
+    );
+  end
+  chk u_chk(
+    clk,
+    a,
+    b
+  );
+endmodule
+checker chk(logic clk, logic a, b);
+endchecker
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}
