@@ -5788,7 +5788,13 @@ public:
                 size_t cl = tokens[op].immutable.syntax.matching_token;
                 if (cl == npos || cl > item.last) continue;
                 int nw = token_width(tokens[name]);
-                int sw = compact_width(tokens, op + 1, cl);
+                // Measured as it will render, from `(` to `)` less the two
+                // parens: a select or a call inside the connection (`a[n]`,
+                // `f(x, y)`) is narrower than a private spacing estimate
+                // makes it, which padded the widest row, and the padding
+                // space_inside_parens puts inside the parens is part of the
+                // field, or the widest row overran the column.
+                int sw = rendered_width(tokens, op, cl + 1) - 2;
                 max_namew = std::max(max_namew, nw);
                 max_sig = std::max(max_sig, sw);
                 conns.push_back({name, op, cl, nw, sw});

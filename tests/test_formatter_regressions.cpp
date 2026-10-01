@@ -4014,3 +4014,51 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: the widest instance connection closes without padding", "[formatter][regression]") {
+    // Q-7: a connection holding a select or a call was measured wider than
+    // it renders, so the widest row came out as `.a (a[n] )`.
+    const std::string input = R"SV(module m;
+sub u (.a(a[n]), .b(b));
+sub v (.a(x), .b(f(x, y)));
+sub w (.c(c[3:0]), .d(d));
+sub x (.c({a, b[1]}), .d(d), .e(), .f(p.q[2] + 1), .g(g(h(1), 2)));
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.instance.align = true;
+    const std::string expected = R"SV(
+module m;
+  sub u (
+    .a (a[n]),
+    .b (b   )
+  );
+  sub v (
+    .a (x      ),
+    .b (f(x, y))
+  );
+  sub w (
+    .c (c[3:0]),
+    .d (d     )
+  );
+  sub x (
+    .c ({a, b[1]} ),
+    .d (d         ),
+    .e (          ),
+    .f (p.q[2] + 1),
+    .g (g(h(1), 2))
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    // With padding inside the parens the column includes it, or the widest
+    // row overruns the others.
+    opts.spacing.space_inside_parens = true;
+    opts.spacing.space_inside_dimension_brackets = true;
+    const std::string spaced = format_stable("module m;\nsub u (.a(a[0]), .b(b[1][2]), .c(c));\nendmodule\n", opts);
+    INFO(spaced);
+    CHECK(spaced.find("    .a ( a[ 0 ]      ),\n"
+                      "    .b ( b[ 1 ][ 2 ] ),\n"
+                      "    .c ( c           )\n") != std::string::npos);
+}
