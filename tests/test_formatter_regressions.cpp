@@ -4459,3 +4459,42 @@ endmodule
 )SV";
     CHECK(format_stable(tight_input, opts) == tight.substr(1));
 }
+
+TEST_CASE("formatter regression: a method named by a keyword is called without a space", "[formatter][regression]") {
+    // R-5: `unique`, `and`, `or` and `xor` are array methods as well as
+    // keywords, and the call rule only knew identifier-like callees.
+    const std::string input = R"SV(module m;
+initial begin
+u = q.unique(); v = q.and(); w = q.or() with (item); x = q.xor(); y = q.min();
+unique case (a) 1: b = 1; endcase
+@(a or (b));
+end
+sub u_s (.a(a), .b (b));
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    u = q.unique();
+    v = q.and();
+    w = q.or() with (item);
+    x = q.xor();
+    y = q.min();
+    unique case (a)
+      1: b = 1;
+    endcase
+    @(a or (b));
+  end
+  sub u_s(
+    .a(a),
+    .b(b)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+
+    FormatOptions opts;
+    opts.function_call.space_before_paren = true;
+    CHECK(format_stable("module m;\ninitial u = q.unique();\nendmodule\n", opts) ==
+          "module m;\n  initial\n    u = q.unique ();\nendmodule\n");
+}

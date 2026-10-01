@@ -6283,7 +6283,10 @@ public:
             // renders as `new (name)`.
             // `type(x)` and `binsof(cp)` are call-shaped keywords too.
             else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword) ||
-                                                        kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword)))
+                                                        kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword) ||
+                                                        // `q.unique()`, `q.and()` -- a member named by a keyword
+                                                        // is still a method.  Nothing but a name follows a `.`.
+                                                        (is_code_token(L) && i >= 2 && kind_is(tokens[i - 2], TK::Dot))))
                 spaces = opts_.function_call.space_before_paren ? 1 : 0;
             // `new[10](init)` -- the initializer is the constructor's argument
             // list, so it spaces like `new(...)`.
