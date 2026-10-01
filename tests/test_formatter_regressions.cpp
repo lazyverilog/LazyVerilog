@@ -3836,3 +3836,38 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: an expression statement led by a select is not a declaration", "[formatter][regression]") {
+    // Q-2: `data[0] < data[1];` read as type `data`, packed dimension `[0]`
+    // and a declarator, and was padded into the declaration columns.
+    const std::string input = R"SV(class c;
+rand bit [7:0] data[4];
+my_t [3:0] x;
+constraint c_d { data[0] < data[1]; foreach (data[i]) { if (i > 0) data[i] > data[i-1]; } }
+endclass
+module m;
+sequence s; a[0] ##1 b[1]; endsequence
+property p; a[0] |-> b[1]; endproperty
+endmodule
+)SV";
+    for (const bool widths : {false, true}) {
+        FormatOptions opts;
+        opts.var_declaration.align = true;
+        if (widths) {
+            opts.var_declaration.align_adaptive = true;
+            opts.var_declaration.section1_min_width = 20;
+            opts.var_declaration.section2_min_width = 20;
+            opts.var_declaration.section3_min_width = 20;
+            opts.var_declaration.section4_min_width = 16;
+        }
+        const std::string out = format_stable(input, opts);
+        INFO(out);
+        CHECK(out.find("    data[0] < data[1];\n") != std::string::npos);
+        CHECK(out.find("        data[i] > data[i-1];\n") != std::string::npos);
+        CHECK(out.find("    a[0] ##1 b[1];\n") != std::string::npos);
+        CHECK(out.find("    a[0] |-> b[1];\n") != std::string::npos);
+        // The real declarations beside them are still aligned.
+        CHECK(out.find("  my_t [3:0] x;") == std::string::npos);
+        CHECK(out.find("  rand bit [7:0] data") == std::string::npos);
+    }
+}

@@ -4595,6 +4595,12 @@ public:
                     else if (kind_is(tokens[k], TK::CloseBrace) && brd > 0) --brd;
                     else if (pd == 0 && bd == 0 && brd == 0 && is_assignment_op(tokens[k].lex.kind))
                         return false;
+                    // `data[0] < data[1];` in a constraint, `a[0] ##1 b[1];`
+                    // in a sequence -- an expression statement that starts
+                    // with a select reads as type, dimension and declarator
+                    // just as the assignments above do.
+                    else if (pd == 0 && bd == 0 && brd == 0 && is_expression_operator(tokens[k].lex.kind))
+                        return false;
                     // `x[0]: y = 1;` -- a case label with a select.  No
                     // declaration holds a case item's colon; without this
                     // `x` reads as the type and `[0]` as its dimension.
