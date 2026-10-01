@@ -3871,3 +3871,78 @@ endmodule
         CHECK(out.find("  rand bit [7:0] data") == std::string::npos);
     }
 }
+
+TEST_CASE("formatter regression: an instance after a keyword-closed item is an instance", "[formatter][regression]") {
+    // Q-5: `endclocking` was not an item boundary, so the instance after it
+    // was laid out as a call and stayed on one line.
+    const std::string input = R"SV(module m;
+clocking cb @(posedge clk); input a; endclocking
+sub u2(.a(a), .b(b));
+clocking cc @(posedge clk); input a; endclocking : cc
+sub u3(.a(a), .b(b));
+covergroup cg; coverpoint x; endgroup
+sub u4(.a(a), .b(b));
+property p; a |-> b; endproperty
+sub u5(.a(a), .b(b));
+sequence s; a ##1 b; endsequence
+sub u6(.a(a), .b(b));
+specify (a => b) = 1; endspecify
+sub u7(.a(a), .b(b));
+class k; endclass
+sub u8(.a(a), .b(b));
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  clocking cb @(posedge clk);
+    input a;
+  endclocking
+  sub u2(
+    .a(a),
+    .b(b)
+  );
+  clocking cc @(posedge clk);
+    input a;
+  endclocking: cc
+  sub u3(
+    .a(a),
+    .b(b)
+  );
+  covergroup cg;
+    coverpoint x;
+  endgroup
+  sub u4(
+    .a(a),
+    .b(b)
+  );
+  property p;
+    a |-> b;
+  endproperty
+  sub u5(
+    .a(a),
+    .b(b)
+  );
+  sequence s;
+    a ##1 b;
+  endsequence
+  sub u6(
+    .a(a),
+    .b(b)
+  );
+  specify
+    (a => b) = 1;
+  endspecify
+  sub u7(
+    .a(a),
+    .b(b)
+  );
+  class k;
+  endclass
+  sub u8(
+    .a(a),
+    .b(b)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

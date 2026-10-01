@@ -1443,7 +1443,17 @@ inline bool follows_module_item_boundary(const TokenStream& tokens, size_t prev)
                // name column instead of using the configured instance-port
                // indentation.
                kind_is(tokens[prev], TK::EndTaskKeyword) ||
-               kind_is(tokens[prev], TK::EndFunctionKeyword);
+               kind_is(tokens[prev], TK::EndFunctionKeyword) ||
+               // The same holds for every other item that closes with a
+               // keyword and no `;`: an instance right after `endclocking`
+               // was laid out as a call.
+               kind_is(tokens[prev], TK::EndClockingKeyword) ||
+               kind_is(tokens[prev], TK::EndGroupKeyword) ||
+               kind_is(tokens[prev], TK::EndPropertyKeyword) ||
+               kind_is(tokens[prev], TK::EndSequenceKeyword) ||
+               kind_is(tokens[prev], TK::EndCheckerKeyword) ||
+               kind_is(tokens[prev], TK::EndSpecifyKeyword) ||
+               kind_is(tokens[prev], TK::EndClassKeyword);
     };
 
     auto follows_named_generate_boundary = [&](size_t prev) {
