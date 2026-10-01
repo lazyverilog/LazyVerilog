@@ -4349,3 +4349,58 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == both.substr(1));
 }
+
+TEST_CASE("formatter regression: an attribute-led declaration joins the declaration columns", "[formatter][regression]") {
+    // Q-14: the line starts with `(*`, so the declaration aligners passed
+    // over it and it sat unaligned between its neighbours.
+    const std::string input = R"SV(module m;
+logic [7:0] a;
+(* keep *) logic dbg;
+logic signed [3:0] bb;
+(* ram_style = "block", very_long_attribute_name = "x" *) reg [7:0] mem [256];
+(* dont_touch *) sub u_s (.a(a));
+(* keep *) my_t [1:0] ut = 0;
+(* full_case *) case (x) 1: y = 1; endcase
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    const std::string defaults = R"SV(
+module m;
+  logic [7:0]                         a                             ;
+  (* keep *) logic                    dbg                           ;
+  logic signed [3:0]                  bb                            ;
+  (* ram_style = "block", very_long_attribute_name = "x" *) reg [7:0] mem [256];
+  (* dont_touch *) sub u_s(
+    .a(a)
+  );
+  (* keep *) my_t [1:0]               ut                            = 0;
+  (* full_case *) case (x)
+    1: y = 1;
+  endcase
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == defaults.substr(1));
+
+    opts.var_declaration.align_adaptive = true;
+    opts.var_declaration.section1_min_width = 20;
+    opts.var_declaration.section2_min_width = 20;
+    opts.var_declaration.section3_min_width = 20;
+    opts.var_declaration.section4_min_width = 16;
+    const std::string sections = R"SV(
+module m;
+  logic               [7:0]               a                                   ;
+  (* keep *) logic                        dbg                                 ;
+  logic signed        [3:0]               bb                                  ;
+  (* ram_style = "block", very_long_attribute_name = "x" *) reg [7:0] mem [256];
+  (* dont_touch *) sub u_s(
+    .a(a)
+  );
+  (* keep *) my_t     [1:0]               ut                  = 0             ;
+  (* full_case *) case (x)
+    1: y = 1;
+  endcase
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == sections.substr(1));
+}

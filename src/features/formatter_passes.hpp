@@ -4706,6 +4706,20 @@ public:
             return true;
         };
 
+        // `(* keep *) logic dbg;` -- an attribute annotates the declaration
+        // and is no part of it.  The declaration aligners read each line from
+        // the first token after it, so the line joins the columns of the
+        // declarations around it instead of being passed over.
+        std::vector<Line> decl_lines = lines;
+        for (Line& ln : decl_lines) {
+            while (ln.first != npos && ln.first < ln.end && tokens[ln.first].lex.in_attribute_instance) {
+                const size_t next = next_code(tokens, ln.first + 1, ln.end);
+                if (next == npos)
+                    break;
+                ln.first = next;
+            }
+        }
+
         if (opts_.var_declaration.align) {
             int declaration_line_count = 0;
             // The width of the type column a line asks for.  A line led by a
@@ -4746,33 +4760,33 @@ public:
             // have.  A wider user type widens only the run of declarations it
             // sits in: one `virtual bus_if #(.W(16)).master vif;` in a class
             // should not move every `logic` in the file.
-            std::vector<int> type_width(lines.size(), 0);
+            std::vector<int> type_width(decl_lines.size(), 0);
             int keyword_width = 0;
-            for (size_t i = 0; i < lines.size(); ++i) {
-                type_width[i] = default_type_width(lines[i]);
+            for (size_t i = 0; i < decl_lines.size(); ++i) {
+                type_width[i] = default_type_width(decl_lines[i]);
                 if (type_width[i] == 0)
                     continue;
                 ++declaration_line_count;
-                const TK lead = tokens[lines[i].first].lex.kind;
+                const TK lead = tokens[decl_lines[i].first].lex.kind;
                 if (is_type_keyword(lead) || is_port_direction(lead))
                     keyword_width = std::max(keyword_width, type_width[i]);
             }
-            std::vector<int> run_width(lines.size(), keyword_width);
-            for (size_t i = 0; i < lines.size();) {
+            std::vector<int> run_width(decl_lines.size(), keyword_width);
+            for (size_t i = 0; i < decl_lines.size();) {
                 if (type_width[i] == 0) {
                     ++i;
                     continue;
                 }
                 size_t j = i;
                 int widest = keyword_width;
-                while (j < lines.size() && type_width[j] > 0 && lines[j].indent == lines[i].indent)
+                while (j < decl_lines.size() && type_width[j] > 0 && decl_lines[j].indent == decl_lines[i].indent)
                     widest = std::max(widest, type_width[j++]);
                 for (size_t k = i; k < j; ++k)
                     run_width[k] = widest;
                 i = j;
             }
-            for (size_t line_index = 0; line_index < lines.size(); ++line_index) {
-                const Line& ln = lines[line_index];
+            for (size_t line_index = 0; line_index < decl_lines.size(); ++line_index) {
+                const Line& ln = decl_lines[line_index];
                 if (ln.first == npos || ln.end <= ln.first)
                     continue;
                 size_t first = ln.first;
@@ -4937,12 +4951,12 @@ public:
 
         if (opts_.var_declaration.align && opts_.var_declaration.section1_min_width > 0) {
 
-            std::vector<VarLine> vlines(lines.size());
-            std::vector<bool> is_vline(lines.size(), false);
-            for (size_t i = 0; i < lines.size(); ++i)
-                is_vline[i] = is_var_decl_line(lines[i], vlines[i]);
+            std::vector<VarLine> vlines(decl_lines.size());
+            std::vector<bool> is_vline(decl_lines.size(), false);
+            for (size_t i = 0; i < decl_lines.size(); ++i)
+                is_vline[i] = is_var_decl_line(decl_lines[i], vlines[i]);
 
-            for (size_t i = 0; i < lines.size();) {
+            for (size_t i = 0; i < decl_lines.size();) {
                 if (!is_vline[i]) {
                     ++i;
                     continue;
@@ -4953,10 +4967,10 @@ public:
                 int group_packed_width = 0;
                 int group_name_width = 0;
                 int group_trailing_width = 0;
-                while (j < lines.size() &&
+                while (j < decl_lines.size() &&
                        (is_vline[j] ||
-                        (lines[j].first != npos &&
-                         tokens[lines[j].first].lex.comment_kind != CommentLexemeKind::None)) &&
+                        (decl_lines[j].first != npos &&
+                         tokens[decl_lines[j].first].lex.comment_kind != CommentLexemeKind::None)) &&
                        (!is_vline[j] || vlines[j].indent == indent)) {
                     // Comment-only line inside a declaration group: skip it without
                     // breaking the group so section2 (packed-dim column) remains
