@@ -6240,6 +6240,11 @@ public:
                     next_code(tokens, i + 1, tokens.size()) == L.immutable.syntax.matching_token;
                 if (!sole_content) spaces = 1;
             }
+            // `typedef enum { // open` -- a comment after a `{` keeps its
+            // space too, as it does after a block brace.
+            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenBrace) &&
+                next_code(tokens, i + 1, tokens.size()) != L.immutable.syntax.matching_token)
+                spaces = 1;
             // Empty positional argument: `, ,` — keep one space so the slot is visible
             if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
 

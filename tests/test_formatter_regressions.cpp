@@ -4552,3 +4552,31 @@ endclass
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a comment after an opening brace keeps its space", "[formatter][regression]") {
+    // R-10: `typedef enum {// open` -- the no-space-after-`{` rule reached
+    // the comment, which a struct's block brace already escaped.
+    const std::string input = R"SV(module m;
+typedef enum { // open
+A0, A1 } e_t;
+typedef struct packed { // s
+logic a; } s_t;
+assign x = {/* c */ a, b}; assign y = {/* only */}; assign w = {a, /* d */ b};
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  typedef enum { // open
+    A0,
+    A1
+  } e_t;
+  typedef struct packed { // s
+    logic a;
+  } s_t;
+  assign x = { /* c */ a, b};
+  assign y = {/* only */};
+  assign w = {a, /* d */ b};
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
