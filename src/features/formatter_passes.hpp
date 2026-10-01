@@ -6428,7 +6428,11 @@ public:
             // No space before '[' when it's an index/dimension on an identifier or closer
             if (kind_is(t, TK::OpenBracket) &&
                 (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis) ||
-                 kind_is(L, TK::NewKeyword)) &&
+                 kind_is(L, TK::NewKeyword) ||
+                 // `{b, c}[3:0]` -- a select on a concatenation.  A `}` that
+                 // closes a block or a struct body ends no expression.
+                 (kind_is(L, TK::CloseBrace) && L.immutable.syntax.matching_token != npos &&
+                  !tokens[L.immutable.syntax.matching_token].immutable.topology.opens_brace_block)) &&
                 !closes_strength(tokens, i - 1))
                 spaces = 0;
             if (kind_is(t, TK::OpenBracket) && is_identifier_like(L) &&

@@ -4891,3 +4891,28 @@ endmodule
     // Already where it belongs: nothing moves.
     CHECK(format_stable(expected.substr(1)) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a select on a concatenation has no space", "[formatter][regression]") {
+    // S-6: the rule that closes up an index listed a name, `]` and `)` as the
+    // token before it, and not the `}` of a concatenation.  A struct body ends
+    // no expression, so its packed dimension keeps the gap.
+    const std::string input = R"SV(module m;
+assign a = {b, c} [3:0];
+assign d = {2{e}}[1];
+initial x = '{1, 2} [0];
+typedef struct packed {logic f;} [3:0] s_t;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign a = {b, c}[3:0];
+  assign d = {2{e}}[1];
+  initial
+    x = '{1, 2}[0];
+  typedef struct packed {
+    logic f;
+  } [3:0] s_t;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
