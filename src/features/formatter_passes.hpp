@@ -2420,8 +2420,42 @@ inline bool is_empty_brace_pair(const TokenStream& tokens, size_t brace) {
            brace + 1 < tokens.size() && tokens[brace].immutable.syntax.matching_token == brace + 1;
 }
 
+// Whether `brace` sits in a statement block that is kept on its line: an
+// inline constraint inside parentheses, `if (!randomize(x) with { ... })`,
+// holding no comment that forces a line to end.
+inline bool is_in_inline_brace_block(const TokenStream& tokens, size_t brace) {
+    if (tokens[brace].immutable.syntax.paren_depth == 0)
+        return false;
+    for (size_t n = brace; n > 0; --n) {
+        const auto& e = tokens[n - 1];
+        if (!is_code_token(e))
+            continue;
+        if ((kind_is(e, TK::CloseBrace) || kind_is(e, TK::CloseParenthesis)) &&
+            e.immutable.syntax.matching_token != npos && e.immutable.syntax.matching_token < n - 1) {
+            n = e.immutable.syntax.matching_token + 1;
+            continue;
+        }
+        if (!kind_is(e, TK::OpenBrace))
+            continue;
+        if (!e.immutable.topology.opens_brace_block || e.immutable.syntax.paren_depth == 0)
+            return false;
+        const size_t close = e.immutable.syntax.matching_token;
+        for (size_t k = n; close != npos && k < close; ++k)
+            if (tokens[k].lex.comment_kind == CommentLexemeKind::Line ||
+                (tokens[k].lex.comment_kind != CommentLexemeKind::None &&
+                 tokens[k].immutable.comment.role == CommentRole::OwnLine))
+                return false;
+        return true;
+    }
+    return false;
+}
+
 inline bool is_multiline_brace_construct(const TokenStream& tokens, size_t brace) {
     if (brace >= tokens.size() || !kind_is(tokens[brace], TK::OpenBrace))
+        return false;
+    // A `dist` list inside an inline constraint stays with it; expanding the
+    // list alone tore the condition apart.
+    if (is_in_inline_brace_block(tokens, brace))
         return false;
     for (size_t n = brace; n > 0; --n) {
         size_t i = n - 1;

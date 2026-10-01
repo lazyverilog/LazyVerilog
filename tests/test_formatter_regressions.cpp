@@ -4664,3 +4664,33 @@ endclass
     CHECK(bnl.find("constraint c6 {}\n") != std::string::npos);
     CHECK(bnl.find("  {\n    // own\n  }\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a dist list inside an inline constraint stays on its line", "[formatter][regression]") {
+    // R-6: the inline `with { ... }` of a condition is kept on one line, and
+    // the `dist` list inside it was expanded anyway.
+    const std::string input = R"SV(class c;
+task t();
+if (!randomize(x) with { x < 9; x dist {1:=1, 2:=2}; }) $error("f");
+randomize(x) with { x dist {1:=1, 2:=2}; };
+endtask
+endclass
+)SV";
+    const std::string expected = R"SV(
+class c;
+  task t();
+    if (!randomize(x) with { x < 9; x dist {1 := 1, 2 := 2}; })
+      $error("f");
+    randomize(x) with {
+      x dist {
+        1 := 1,
+        2 := 2
+      };
+    };
+  endtask
+endclass
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    CHECK(format_stable(input, opts).find("with { x < 9; x dist {1 := 1, 2 := 2}; })\n") != std::string::npos);
+}
