@@ -3313,6 +3313,23 @@ public:
                         args_col <= opts_.function_call.line_length)
                         do_break = true;
                 }
+                // `foo(a, // first` / `b, c);` -- a comment that ends a line
+                // between the arguments breaks the list whatever its length,
+                // and a list that breaks breaks at every argument.  Leaving
+                // the decision at "fits" broke it at the comment alone.
+                if (!do_break && items.size() > 1) {
+                    const int inner = tokens[open].immutable.syntax.paren_depth + 1;
+                    for (size_t k = open + 1; k < close && !do_break; ++k) {
+                        const Tok& c = tokens[k];
+                        if (c.lex.comment_kind == CommentLexemeKind::None || is_passthrough(c) ||
+                            c.immutable.syntax.paren_depth != inner ||
+                            c.immutable.syntax.bracket_depth != tokens[open].immutable.syntax.bracket_depth ||
+                            c.immutable.syntax.brace_depth != tokens[open].immutable.syntax.brace_depth)
+                            continue;
+                        do_break = c.immutable.comment.role == CommentRole::OwnLine ||
+                                   c.lex.comment_kind == CommentLexemeKind::Line;
+                    }
+                }
                 if (do_break && opts_.function_call.break_policy != "never") {
                     bool hanging = opts_.function_call.layout == "hanging";
                     apply_list(open, hanging ? WrapListKind::FunctionHanging

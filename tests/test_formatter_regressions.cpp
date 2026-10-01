@@ -4214,3 +4214,68 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a comment between call arguments breaks the whole list", "[formatter][regression]") {
+    // Q-10: the comment forced one break and the rest of the list was
+    // joined after it at a single indent.
+    const std::string input = R"SV(module m;
+initial begin
+foo(a, // first
+  b, c);
+x = bar(aaaa, bbbb, // why
+  cccc, dddd, eeee);
+baz(a, b); // after
+qux(a,
+  // own
+  b);
+end
+endmodule
+)SV";
+    const std::string block = R"SV(
+module m;
+  initial begin
+    foo(
+      a, // first
+      b,
+      c
+    );
+    x = bar(
+          aaaa,
+          bbbb, // why
+          cccc,
+          dddd,
+          eeee
+        );
+    baz(a, b); // after
+    qux(
+      a,
+      // own
+      b
+    );
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == block.substr(1));
+
+    FormatOptions opts;
+    opts.function_call.layout = "hanging";
+    const std::string hanging = R"SV(
+module m;
+  initial begin
+    foo(a, // first
+        b,
+        c);
+    x = bar(aaaa,
+            bbbb, // why
+            cccc,
+            dddd,
+            eeee);
+    baz(a, b); // after
+    qux(a,
+        // own
+        b);
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == hanging.substr(1));
+}
