@@ -155,6 +155,7 @@ public:
         }
         mark_attribute_instances();
         mark_vector_literal_digits();
+        mark_block_event_keywords();
         return tokens_;
     }
 
@@ -182,6 +183,42 @@ private:
                    tokens_[j].lex.range.end().offset() == tokens_[j + 1].lex.range.start().offset()) {
                 ++j;
                 tokens_[j].lex.continues_vector_literal = true;
+            }
+            i = j;
+        }
+    }
+
+    // `covergroup cg @@(begin f or end g);` -- inside a block event the
+    // words `begin` and `end` say when a named block is entered or left.
+    // They open and close nothing, so they are lexed as the plain words they
+    // are here; left as keywords, the unmatched `begin` indented the rest of
+    // the file.
+    void mark_block_event_keywords() {
+        using TKind = slang::parsing::TokenKind;
+        auto next_code_token = [&](size_t i) {
+            while (i < tokens_.size() &&
+                   (tokens_[i].lex.is_whitespace_sensitive || tokens_[i].lex.is_directive ||
+                    tokens_[i].lex.comment_kind != CommentLexemeKind::None))
+                ++i;
+            return i;
+        };
+        for (size_t i = 0; i < tokens_.size(); ++i) {
+            if (tokens_[i].lex.kind != TKind::DoubleAt || tokens_[i].lex.is_whitespace_sensitive)
+                continue;
+            size_t j = next_code_token(i + 1);
+            if (j >= tokens_.size() || tokens_[j].lex.kind != TKind::OpenParenthesis)
+                continue;
+            int depth = 0;
+            for (; j < tokens_.size(); j = next_code_token(j + 1)) {
+                const TKind k = tokens_[j].lex.kind;
+                if (k == TKind::OpenParenthesis)
+                    ++depth;
+                else if (k == TKind::CloseParenthesis && --depth == 0)
+                    break;
+                else if (k == TKind::Semicolon)
+                    break;
+                else if (k == TKind::BeginKeyword || k == TKind::EndKeyword)
+                    tokens_[j].lex.kind = TKind::Identifier;
             }
             i = j;
         }

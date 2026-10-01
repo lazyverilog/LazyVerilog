@@ -6587,6 +6587,11 @@ public:
                 const bool covergroup_event = is_covergroup_event_at(tokens, i - 1);
                 spaces = (!covergroup_event && wants_after(opts_.spacing.procedural_event_control_at_spacing)) ? 1 : 0;
             }
+            // `@@(begin f)` -- a covergroup's block event, spaced as its `@(e)` is.
+            if (kind_is(t, TK::DoubleAt))
+                spaces = wants_before(opts_.spacing.procedural_event_control_at_spacing) ? 1 : 0;
+            if (kind_is(L, TK::DoubleAt))
+                spaces = 0;
             // space_inside_event_control_parens: add space inside ( ) of procedural event control.
             // Only applies when ( directly follows @ which is not a standalone delay control.
             if (opts_.spacing.space_inside_event_control_parens) {

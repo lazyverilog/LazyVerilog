@@ -4694,3 +4694,30 @@ endclass
     opts.statement.begin_newline = true;
     CHECK(format_stable(input, opts).find("with { x < 9; x dist {1 := 1, 2 := 2}; })\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a block event's begin and end are not blocks", "[formatter][regression]") {
+    // R-1: `@@(begin f)` names the entry of a block.  Treated as a block
+    // keyword, the unmatched `begin` indented everything after it.
+    const std::string input = R"SV(module m;
+covergroup cg3 @@(begin f1 or end f2); cp: coverpoint a; endgroup
+covergroup cg4 @@( begin  f1 ); endgroup
+always @(posedge clk) begin a <= b; end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  covergroup cg3 @@(begin f1 or end f2);
+    cp: coverpoint a;
+  endgroup
+  covergroup cg4 @@(begin f1);
+  endgroup
+  always @(posedge clk) begin
+    a <= b;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    CHECK(format_stable(input, opts).find("  covergroup cg3 @@(begin f1 or end f2);\n") != std::string::npos);
+}
