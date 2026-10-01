@@ -4062,3 +4062,37 @@ endmodule
                       "    .b ( b[ 1 ][ 2 ] ),\n"
                       "    .c ( c           )\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a user-typed parameter joins its alignment group", "[formatter][regression]") {
+    // Q-9: `localparam my_t B = 2;` holds two names and was skipped like
+    // `packet_t v = f();`, which also split the group around it.
+    const std::string input = R"SV(module m #(parameter my_t P = 1, parameter int QQQ = 2) ();
+localparam int A = 1;
+localparam my_t BBBB = 2;
+localparam int CC = 3;
+localparam int unsigned DDDDD = 3;
+localparam pkg::t D = 4;
+parameter state_e INIT = IDLE;
+packet_t v = f();
+x = 1;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.align = true;
+    const std::string expected = R"SV(
+module m #(
+  parameter my_t P = 1,
+  parameter int QQQ = 2
+)();
+  localparam int A              = 1;
+  localparam my_t BBBB          = 2;
+  localparam int CC             = 3;
+  localparam int unsigned DDDDD = 3;
+  localparam pkg::t D           = 4;
+  parameter state_e INIT        = IDLE;
+  packet_t v = f();
+  x = 1;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

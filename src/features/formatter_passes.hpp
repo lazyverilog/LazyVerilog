@@ -4328,7 +4328,12 @@ public:
                             ++identifiers_before_assign;
                     }
                 }
-                if (identifiers_before_assign >= 2)
+                // `localparam my_t B = 2;` holds two names as well, but its
+                // keyword already says what it is, and `localparam int B`
+                // beside it is aligned; skipping it split the group.
+                const bool parameter_decl = kind_is(tokens[scan_start], TK::ParameterKeyword) ||
+                                            kind_is(tokens[scan_start], TK::LocalParamKeyword);
+                if (identifiers_before_assign >= 2 && !parameter_decl)
                     ln.disabled = true;
             }
             lines.push_back(ln);
