@@ -5906,6 +5906,18 @@ public:
                     int dw = token_width(tokens[item.first]);
                     int sw = compact_width(tokens, sig, item.last + 1);
                     dirw = std::max(dirw, dw + 1);
+                    // `import task send(` ... `),` -- a prototype WrapPass
+                    // broke over several lines has no width to put in the
+                    // signal column: its comma follows the `)` that ends it,
+                    // and it must not widen the column for the other items.
+                    bool multi_line = false;
+                    for (size_t k = sig + 1; k <= item.last && !multi_line; ++k)
+                        multi_line = tokens[k].mutable_.wrap.must_break_before ||
+                                     tokens[k - 1].mutable_.wrap.must_break_after;
+                    if (multi_line) {
+                        ms.push_back({item.first, sig, npos, dw, 0});
+                        continue;
+                    }
                     sigw = std::max(sigw, sw);
                     ms.push_back({item.first, sig, item.comma, dw, sw});
                 }

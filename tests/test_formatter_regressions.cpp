@@ -4119,3 +4119,50 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a modport comma follows a multi-line prototype", "[formatter][regression]") {
+    // Q-12: the prototype's whole width went into the signal column, so
+    // the comma after its closing `)` was padded far to the right.
+    const std::string input = R"SV(interface i;
+modport mp (input a, import task send(input int x, output bit ok), output b);
+modport m2 (input a, import task t(input int x), output bbbbbbbbbbbbb, cc);
+endinterface
+)SV";
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.default_indent_level_inside_outmost_block = 0;
+    opts.modport.align = true;
+    opts.modport.align_adaptive = true;
+    opts.modport.direction_min_width = 15;
+    opts.modport.signal_min_width = 10;
+    opts.function_declaration.layout = "block";
+    opts.function_declaration.line_length = 13;
+    const std::string expected = R"SV(
+interface i;
+modport mp (
+    input          a         ,
+    import         task send(
+        input int x,
+        output bit ok
+    ),
+    output         b
+);
+modport m2 (
+    input          a         ,
+    import         task t(
+        input int x
+    ),
+    output         bbbbbbbbbbbbb, cc
+);
+endinterface
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    // A prototype that stays on its line is still an aligned item.
+    FormatOptions plain;
+    plain.modport.align = true;
+    const std::string out = format_stable(input, plain);
+    INFO(out);
+    CHECK(out.find("    import task t(input int x) ,\n"
+                   "    output bbbbbbbbbbbbb       , cc\n") != std::string::npos);
+}
