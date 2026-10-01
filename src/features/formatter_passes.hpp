@@ -6268,6 +6268,14 @@ public:
                  kind_is(L, TK::OpenParenthesis) || kind_is(L, TK::OpenBracket) ||
                  kind_is(L, TK::OpenBrace) || kind_is(L, TK::ApostropheOpenBrace)))
                 spaces = 0;
+            // `tagged Pair '{.a, .b}` -- the name is a union member's tag and
+            // the pattern its value, as in `tagged Valid .n`; it is not the
+            // cast `Pair'{...}`.
+            if (kind_is(t, TK::ApostropheOpenBrace) && kind_is(L, TK::Identifier)) {
+                const size_t tag_kw = prev_code(tokens, i - 1);
+                if (tag_kw != npos && kind_is(tokens[tag_kw], TK::TaggedKeyword))
+                    spaces = 1;
+            }
 
             // Postfix ++ / --: no space before when attached to an identifier, ], or )
             if ((kind_is(t, TK::DoublePlus) || kind_is(t, TK::DoubleMinus)) &&
@@ -6339,8 +6347,11 @@ public:
             // wait keyword: no space before ( (like a function call, not a control keyword)
             if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::WaitKeyword)) spaces = 0;
             // `first_match(s)` is an operator applied to its argument, written
-            // like a call.
-            if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::FirstMatchKeyword)) spaces = 0;
+            // like a call.  So are `strong(s)` and `weak(s)`.
+            if (kind_is(t, TK::OpenParenthesis) &&
+                (kind_is(L, TK::FirstMatchKeyword) || kind_is(L, TK::StrongKeyword) ||
+                 kind_is(L, TK::WeakKeyword)))
+                spaces = 0;
 
             // @ event control spacing.  `always @(e)`, a statement `@(e);` and
             // `@(e) x = 1;` are one construct and follow the same options,

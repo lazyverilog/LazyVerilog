@@ -3986,3 +3986,31 @@ endchecker
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: strong and weak take no space, a tagged pattern keeps one", "[formatter][regression]") {
+    // Q-13: `strong (s)` beside `first_match(s)`, and `tagged Pair'{...}`
+    // written as if `Pair` were a cast's type.
+    const std::string input = R"SV(module m;
+property p6; req |-> strong(##[1:$] gnt); endproperty
+property p7; req |-> weak(gnt[*1:$]); endproperty
+initial begin u = tagged Pair '{.a, .b}; v = tagged Valid 5; w = my_t'{1, 2}; x = int'(y); end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  property p6;
+    req |-> strong(##[1:$] gnt);
+  endproperty
+  property p7;
+    req |-> weak(gnt[*1:$]);
+  endproperty
+  initial begin
+    u = tagged Pair '{.a, .b};
+    v = tagged Valid 5;
+    w = my_t'{1, 2};
+    x = int'(y);
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
