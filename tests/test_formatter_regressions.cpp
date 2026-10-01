@@ -4721,3 +4721,55 @@ endmodule
     opts.statement.begin_newline = true;
     CHECK(format_stable(input, opts).find("  covergroup cg3 @@(begin f1 or end f2);\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a broken qualified call indents from where the callee starts", "[formatter][regression]") {
+    // R-7: block layout measured from the last name segment, so a longer
+    // `obj.sub.` / `pkg::cls::` prefix pushed the arguments further right.
+    FormatOptions opts;
+    opts.function_call.break_policy = "always";
+    const std::string input = R"SV(module m;
+initial begin
+foo(a, b);
+uvm_config_db#(virtual my_if)::set(a, b);
+obj.sub.meth(a, b);
+x = pkg::cls::fn(a, b);
+arr[i].q.push_back(a, b);
+y = a.b(c, d).e(f, g);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    foo(
+      a,
+      b
+    );
+    uvm_config_db #(virtual my_if)::set(
+      a,
+      b
+    );
+    obj.sub.meth(
+      a,
+      b
+    );
+    x = pkg::cls::fn(
+          a,
+          b
+        );
+    arr[i].q.push_back(
+      a,
+      b
+    );
+    y = a.b(
+          c,
+          d
+        ).e(
+          f,
+          g
+        );
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

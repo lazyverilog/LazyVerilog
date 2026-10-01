@@ -4187,6 +4187,37 @@ public:
 
             switch (kind) {
             case WrapListKind::FunctionBlock:
+                // "One level from the call" is from where the callee starts,
+                // not from its last name: `obj.sub.meth(`, `pkg::cls::fn(` and
+                // `cfg_db #(T)::set(` pushed the arguments right by the
+                // length of the prefix.
+                while (name != npos) {
+                    const size_t sep = prev_code(tokens, name);
+                    if (sep == npos || !(kind_is(tokens[sep], TK::Dot) || kind_is(tokens[sep], TK::DoubleColon)))
+                        break;
+                    size_t q = prev_code(tokens, sep);
+                    while (q != npos &&
+                           (kind_is(tokens[q], TK::CloseParenthesis) || kind_is(tokens[q], TK::CloseBracket)) &&
+                           tokens[q].immutable.syntax.matching_token != npos) {
+                        q = prev_code(tokens, tokens[q].immutable.syntax.matching_token);
+                        if (q != npos && kind_is(tokens[q], TK::Hash))
+                            q = prev_code(tokens, q);
+                    }
+                    // A chain already broken (`).next(`) hangs from the line
+                    // its `)` starts, which sits at the chain's own indent.
+                    if (q != npos && line_start_of(q) != open_line) {
+                        name = open_line;
+                        name_col = column_before(name);
+                        break;
+                    }
+                    if (q == npos ||
+                        !(kind_is(tokens[q], TK::Identifier) || kind_is(tokens[q], TK::SystemIdentifier) ||
+                          kind_is(tokens[q], TK::ThisKeyword) || kind_is(tokens[q], TK::SuperKeyword) ||
+                          kind_is(tokens[q], TK::LocalKeyword) || kind_is(tokens[q], TK::UnitSystemName)))
+                        break;
+                    name = q;
+                    name_col = column_before(name);
+                }
                 item_indent = name_col + opts_.indent_size;
                 close_indent = name_col;
                 if (name != npos) anchor = name;
