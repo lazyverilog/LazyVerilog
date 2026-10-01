@@ -1167,6 +1167,16 @@ inline bool is_relational_less_equal(const TokenStream& tokens, size_t idx) {
     return false;
 }
 
+// An operator that joins or negates operands.  A declaration's prefix holds
+// only keywords, names, `::`, `#(...)` and dimensions, so one of these at the
+// statement's own depth makes it an expression: `a |-> b[0];`,
+// `!gnt ##1 d[0];`, `data[0] < data[1];`.
+inline bool is_expression_operator(TK k) {
+    return is_binary_op(k) || k == TK::OrMinusArrow || k == TK::OrEqualsArrow ||
+           k == TK::DoubleHash || k == TK::MinusArrow || k == TK::Question ||
+           k == TK::Exclamation || k == TK::Tilde;
+}
+
 inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open) {
     if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenBracket))
         return false;
@@ -1276,15 +1286,16 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             // prefix holds only keywords, names, `::`, `#(...)` and
             // dimensions.
             const auto& sx = tokens[i].immutable.syntax;
-            const TK k = tokens[i].lex.kind;
-            if (sx.paren_depth == pd && sx.bracket_depth == bd && sx.brace_depth == brd &&
-                (is_binary_op(k) || k == TK::OrMinusArrow || k == TK::OrEqualsArrow ||
-                 k == TK::DoubleHash || k == TK::MinusArrow || k == TK::Question ||
-                 k == TK::Exclamation || k == TK::Tilde))
+            const bool own_depth =
+                sx.paren_depth == pd && sx.bracket_depth == bd && sx.brace_depth == brd;
+            if (own_depth && is_expression_operator(tokens[i].lex.kind))
                 return false;
-            // `pkg::arr[i]` names one thing; a scoped name counts once.
+            // `pkg::arr[i]` names one thing; a scoped name counts once.  So
+            // does a selected one: in `f(w[i][j], a[i])` the first argument
+            // holds one name of its own, and counting `i` and `j` with it
+            // made `a[i]` a later declarator of a declaration `w ... j`.
             const size_t before = prev_code(tokens, i);
-            if (is_identifier_like(tokens[i]) &&
+            if (own_depth && is_identifier_like(tokens[i]) &&
                 !(before != npos && before >= first && kind_is(tokens[before], TK::DoubleColon)))
                 ++identifier_count;
         }

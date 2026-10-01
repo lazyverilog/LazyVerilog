@@ -3810,3 +3810,29 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected);
 }
+
+TEST_CASE("formatter regression: a select in a later argument is not a declarator's dimension", "[formatter][regression]") {
+    // Q-3: `w[i][j]` counted as three names, which made `a[i]` a later
+    // declarator of a declaration and spaced it `a [i]`.
+    const std::string input = R"SV(module m;
+initial begin
+f(w[i][j], a[i], a[j]);
+x = g(w[i], a[i][j], b[k]);
+end
+and g1(w[i][j], a[i], a[j]);
+logic a [3], b [4];
+my_t [N-1:0] c [2], d [3];
+endmodule
+)SV";
+    const std::string expected = R"SV(module m;
+  initial begin
+    f(w[i][j], a[i], a[j]);
+    x = g(w[i], a[i][j], b[k]);
+  end
+  and g1(w[i][j], a[i], a[j]);
+  logic a [3], b [4];
+  my_t [N-1:0] c [2], d [3];
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected);
+}
