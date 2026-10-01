@@ -1180,6 +1180,19 @@ inline bool is_expression_operator(TK k) {
            k == TK::Exclamation || k == TK::Tilde;
 }
 
+// `my_if.mp name` -- exactly a name, a `.`, a name and the declarator,
+// from `first` up to (not including) `last`.
+inline bool is_modport_typed_declarator(const TokenStream& tokens, size_t first, size_t last) {
+    size_t at = first;
+    const TK shape[] = {TK::Identifier, TK::Dot, TK::Identifier, TK::Identifier};
+    for (TK want : shape) {
+        if (at == npos || at >= last || !kind_is(tokens[at], want))
+            return false;
+        at = next_code(tokens, at + 1, tokens.size());
+    }
+    return at != npos && at >= last;
+}
+
 inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open) {
     if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenBracket))
         return false;
@@ -1239,7 +1252,19 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             const bool colon = here && sx.bracket_depth == bd && kind_is(tokens[i], TK::Colon);
             // A semicolonless macro statement (`` `INIT_PROLOG ``) ends the
             // statement before, as a `;` would.
-            if (enclosing || separator || colon || closes_control_header(tokens, i) ||
+            // `mailbox #(int) mb [2];` -- a `#(...)` after a type name
+            // overrides its parameters; it is not a delay control.
+            auto closes_parameter_override = [&]() {
+                if (!kind_is(tokens[i], TK::CloseParenthesis))
+                    return false;
+                const size_t po = tokens[i].immutable.syntax.matching_token;
+                const size_t hash = po == npos ? npos : prev_code(tokens, po);
+                const size_t type = hash == npos || !kind_is(tokens[hash], TK::Hash)
+                    ? npos : prev_code(tokens, hash);
+                return type != npos && kind_is(tokens[type], TK::Identifier);
+            };
+            if (enclosing || separator || colon ||
+                (closes_control_header(tokens, i) && !closes_parameter_override()) ||
                 tokens[i].mutable_.macro.ends_statement)
                 break;
             // `endfunction` / `int q[$];` and `begin` / `int q[$];` -- a
@@ -1271,7 +1296,21 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             is_port_direction(tokens[first].lex.kind) ||
             kind_is(tokens[first], TK::ParameterKeyword) ||
             kind_is(tokens[first], TK::LocalParamKeyword) ||
-            kind_is(tokens[first], TK::TypedefKeyword))
+            kind_is(tokens[first], TK::TypedefKeyword) ||
+            // `tri t [2];`, `var v [2];`, `local int x [2];`, and
+            // `struct { ... } s [4];` -- declarations all, whatever leads.
+            is_net_type_keyword(tokens[first].lex.kind) ||
+            kind_is(tokens[first], TK::VarKeyword) ||
+            kind_is(tokens[first], TK::InterconnectKeyword) ||
+            kind_is(tokens[first], TK::LocalKeyword) ||
+            kind_is(tokens[first], TK::ProtectedKeyword) ||
+            kind_is(tokens[first], TK::StructKeyword) ||
+            kind_is(tokens[first], TK::UnionKeyword) ||
+            kind_is(tokens[first], TK::EnumKeyword))
+            return true;
+        // `my_if.mp ifa [2];` -- an interface modport names the type.  The
+        // declarator follows it directly, which no member select does.
+        if (is_modport_typed_declarator(tokens, first, last))
             return true;
         // User-defined types can lead a declaration with an identifier-like
         // token.  Accept the pattern only when the element contains at least

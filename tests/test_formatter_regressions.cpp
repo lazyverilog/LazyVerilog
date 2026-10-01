@@ -4498,3 +4498,57 @@ endmodule
     CHECK(format_stable("module m;\ninitial u = q.unique();\nendmodule\n", opts) ==
           "module m;\n  initial\n    u = q.unique ();\nendmodule\n");
 }
+
+TEST_CASE("formatter regression: an unpacked dimension is spaced whatever type leads the declaration", "[formatter][regression]") {
+    // R-9: `logic a [2]` but `tri t[2]`, `local int x[2]`, `my_if.mp i[2]`,
+    // `mailbox #(int) mb[2]` and `struct {...} s[4]`.
+    const std::string input = R"SV(module m;
+logic a[2]; my_t mt[2];
+tri t[2]; supply0 g[2]; var v[2]; interconnect ic[2]; my_if.mp ifa[2]; mailbox #(int) mb[2];
+struct { int x; } sb[4];
+enum {P, Q} en[2];
+initial begin
+foo.bar[3:0] = x; w = obj.arr[i].fld[3:0]; q[0] <= d; #(D) m[0] = x; x = a.b[2];
+end
+sub #(.W(8)) u[3:0] (.a(a));
+endmodule
+class c;
+static local int z[2]; local int x[2]; protected bit y[2];
+endclass
+)SV";
+    const std::string expected = R"SV(
+module m;
+  logic a [2];
+  my_t mt [2];
+  tri t [2];
+  supply0 g [2];
+  var v [2];
+  interconnect ic [2];
+  my_if.mp ifa [2];
+  mailbox #(int) mb [2];
+  struct {
+    int x;
+  } sb [4];
+  enum {
+    P,
+    Q
+  } en [2];
+  initial begin
+    foo.bar[3:0] = x;
+    w = obj.arr[i].fld[3:0];
+    q[0] <= d;
+    #(D) m[0] = x;
+    x = a.b[2];
+  end
+  sub #(.W(8)) u[3:0](
+    .a(a)
+  );
+endmodule
+class c;
+  static local int z [2];
+  local int x [2];
+  protected bit y [2];
+endclass
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
