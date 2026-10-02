@@ -3585,9 +3585,39 @@ private:
                 // only ever a prefix still has its operand to come.
                 const bool prefix_only_op = pk == TK::Tilde || pk == TK::Exclamation ||
                                             pk == TK::TildeAnd || pk == TK::TildeOr;
+                // `logic a, // why` / `b;` -- a declarator or an assignment
+                // after a comma outside every delimiter is the rest of the
+                // statement.  Not after a list's `)` (`sub u1 (...),` /
+                // `u2 (...)`, a modport's `), dbg (`): those items own their
+                // layout.  And not a case item's next label (`S1, // c` /
+                // `S2: x = 1;`), which a `:` reached before anything that
+                // ends a declarator gives away.
+                bool statement_comma = pk == TK::Comma && enclosing == npos;
+                if (statement_comma && before_prev != npos &&
+                    kind_is(tokens[before_prev], TK::CloseParenthesis)) {
+                    const size_t list = tokens[before_prev].immutable.syntax.matching_token;
+                    if (list != npos && tokens[list].mutable_.wrap.list_kind != WrapListKind::None)
+                        statement_comma = false;
+                }
+                if (statement_comma) {
+                    int depth = 0;
+                    for (size_t k = i; k < tokens.size(); ++k) {
+                        if (!is_code_token(tokens[k])) continue;
+                        const TK kk = tokens[k].lex.kind;
+                        if (kk == TK::OpenParenthesis || kk == TK::OpenBracket || kk == TK::OpenBrace ||
+                            kk == TK::ApostropheOpenBrace)
+                            ++depth;
+                        else if (kk == TK::CloseParenthesis || kk == TK::CloseBracket || kk == TK::CloseBrace)
+                            --depth;
+                        if (depth != 0) continue;
+                        if (kk == TK::Colon) { statement_comma = false; break; }
+                        if (kk == TK::Semicolon || kk == TK::Question || is_assignment_op(kk))
+                            break;
+                    }
+                }
                 const bool continues =
                     is_binary_op(pk) || is_assignment_op(pk) || pk == TK::Question || open_delim ||
-                    prefix_only_op ||
+                    prefix_only_op || statement_comma ||
                     prev_is_conditional_colon || event_or || leads_conditional_colon ||
                     (pk == TK::Comma && enclosing != npos) ||
                     (t.lex.comment_kind == CommentLexemeKind::None && is_binary_op(t.lex.kind) &&

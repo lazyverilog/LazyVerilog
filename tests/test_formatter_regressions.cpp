@@ -5248,3 +5248,51 @@ endinterface
 )SV";
     CHECK(format_stable(mp_input, mp) == mp_expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a declarator after a commented comma is a continuation", "[formatter][regression]") {
+    // S-2: one declarator per line with a comment each.  The comment forces
+    // the break, and the next declarator landed at the statement's own
+    // indent, where it read as a new statement.
+    const std::string input = R"SV(module m;
+logic [3:0] g, // gg
+            h; // hh
+localparam A = 1, // a
+           B = 2;
+assign x = y, // c
+       z = w ? 1 : 0;
+sub u1 (.a(a)), // c
+    u2 (.b(b));
+always_comb begin
+case (s)
+S1, // c
+S2: x = 1;
+default: x = 0;
+endcase
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  logic [3:0] g, // gg
+    h; // hh
+  localparam A = 1, // a
+    B = 2;
+  assign x = y, // c
+    z = w ? 1 : 0;
+  sub u1(
+    .a(a)
+  ), // c
+  u2(
+    .b(b)
+  );
+  always_comb begin
+    case (s)
+      S1, // c
+      S2: x = 1;
+      default: x = 0;
+    endcase
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
