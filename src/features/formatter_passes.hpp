@@ -6290,7 +6290,7 @@ public:
             auto items = top_level_list_items(tokens, open + 1, close);
             int max_namew = 0;
             int max_sig = opts_.instance.instance_port_between_paren_width;
-            struct Conn { size_t name, op, cl; int namew, sigw; };
+            struct Conn { size_t name, op, cl; int namew, sigw; bool multiline; };
             std::vector<Conn> conns;
             for (const auto& item : items) {
                 size_t dot = item.first;
@@ -6316,9 +6316,19 @@ public:
                 // space_inside_parens puts inside the parens is part of the
                 // field, or the widest row overran the column.
                 int sw = rendered_width(tokens, op, cl + 1) - 2;
+                // `.a({` / `x, // hi` / `y` / `})` -- a connection WrapPass
+                // has broken over lines has no width on this row to align.
+                // Measured as if it were flat, it widened every other row's
+                // field and padded its own `)`, which is on another line.
+                bool multiline = false;
+                for (size_t k = op + 1; k <= cl && !multiline; ++k)
+                    multiline = !is_passthrough(tokens[k]) &&
+                                (tokens[k].mutable_.wrap.must_break_before ||
+                                 tokens[k - 1].mutable_.wrap.must_break_after);
                 max_namew = std::max(max_namew, nw);
-                max_sig = std::max(max_sig, sw);
-                conns.push_back({name, op, cl, nw, sw});
+                if (!multiline)
+                    max_sig = std::max(max_sig, sw);
+                conns.push_back({name, op, cl, nw, sw, multiline});
             }
             for (const auto& c : conns) {
                 int item_indent = tokens[prev_code(tokens, c.name)].mutable_.indent.base_indent;
@@ -6334,6 +6344,8 @@ public:
                 const int namew = opts_.instance.align_adaptive ? c.namew : max_namew;
                 tokens[c.op].mutable_.align.target_column =
                     item_indent + std::max(configured_port_width, namew + 2);
+                if (c.multiline)
+                    continue;
                 tokens[c.cl].mutable_.align.enabled = true;
                 tokens[c.cl].mutable_.align.alignment_group = group;
                 tokens[c.cl].mutable_.align.target_column =

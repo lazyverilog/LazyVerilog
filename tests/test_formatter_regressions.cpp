@@ -6159,3 +6159,57 @@ endmodule
     CHECK(out.find("    `FOO(begin x = 1; y = 2; end)\n") != std::string::npos);
     CHECK(out.find("    `BAR(if (a) begin x = 1; end else begin x = 2; end)\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: instance.align leaves a connection that spans lines unpadded", "[formatter][regression]") {
+    // U-2: a connection broken over lines (a commented concatenation) was
+    // measured as if it were flat: its width set every other row's field and
+    // its own `)`, on another line, was padded out to that column.
+    FormatOptions opts;
+    opts.instance.align = true;
+    const std::string input = R"SV(module m;
+sub u (.aaaa({x, // hi
+y}), .b(b), .cc(c));
+sub u3 (.a(a), .bbb(bbb), .c);
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  sub u (
+    .aaaa ({
+      x, // hi
+      y
+    }),
+    .b    (b),
+    .cc   (c)
+  );
+  sub u3 (
+    .a   (a  ),
+    .bbb (bbb),
+    .c
+  );
+endmodule
+)SV";
+    opts.instance.align_adaptive = false;
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    // Adaptive sizes each row by itself; the broken one is still unpadded.
+    const std::string adaptive = R"SV(
+module m;
+  sub u (
+    .aaaa ({
+      x, // hi
+      y
+    }),
+    .b (b),
+    .cc (c)
+  );
+  sub u3 (
+    .a (a),
+    .bbb (bbb),
+    .c
+  );
+endmodule
+)SV";
+    opts.instance.align_adaptive = true;
+    CHECK(format_stable(input, opts) == adaptive.substr(1));
+}
