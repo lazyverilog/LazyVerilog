@@ -4982,3 +4982,45 @@ endinterface
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a port list led by an interface port keeps names on their declaration", "[formatter][regression]") {
+    // S-3: names stayed on their declaration's line only when the *first*
+    // port started with a keyword, so `bus_if.master bus` ahead of the
+    // directed ports split every later name onto its own line.
+    const std::string input = R"SV(module m (bus_if.master bus, input logic clk, rst_n, output logic [7:0] q, r);
+endmodule
+module m3 (my_t t, u, interface g, h, input x, y);
+endmodule
+module m4 (.a(x), b, input c, d);
+endmodule
+module m2 (a, b, c);
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m(
+  bus_if.master bus,
+  input logic clk, rst_n,
+  output logic [7:0] q, r
+);
+endmodule
+module m3(
+  my_t t, u,
+  interface g, h,
+  input x, y
+);
+endmodule
+module m4(
+  .a(x),
+  b,
+  input c, d
+);
+endmodule
+module m2(
+  a,
+  b,
+  c
+);
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

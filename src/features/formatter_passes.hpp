@@ -3120,7 +3120,8 @@ public:
             // name or a `]`.  Non-ANSI items are bare port expressions (`a`,
             // `a[3:0]`, `.a(b)`, `{a, b}`) and never have that shape.
             auto declares_port = [&](size_t first, size_t last) {
-                if (is_declaration_keyword(tokens[first].lex.kind))
+                // `interface g` / `interface.mp g` -- a generic interface port.
+                if (is_declaration_keyword(tokens[first].lex.kind) || kind_is(tokens[first], TK::InterfaceKeyword))
                     return true;
                 int pd = 0, bd = 0, brd = 0;
                 size_t prev = npos;
@@ -3192,8 +3193,9 @@ public:
             // it, so it stays on that declaration's line.  Only after a
             // declaration item -- a non-ANSI list is all bare names and keeps
             // its own layout above.
-            const bool ansi_ports = kind == WrapListKind::ModulePorts && !items.empty() &&
-                                    is_declaration_keyword(tokens[items.front().first].lex.kind);
+            // The list is ANSI when any item declares; the first one need not
+            // start with a keyword (`bus_if.master bus, input logic clk, rst_n`).
+            const bool ansi_ports = kind == WrapListKind::ModulePorts && !items.empty() && !non_ansi_ports;
             if (ansi_ports || kind == WrapListKind::ModportBody) {
                 auto is_bare_name = [&](const ListItem& item) {
                     // A modport port expression `.d(data)` continues the
@@ -3231,7 +3233,10 @@ public:
                         tokens[items[n].first].mutable_.wrap.must_break_before = false;
                         tokens[items[n - 1].comma].mutable_.wrap.must_break_after = false;
                     } else {
-                        continues = !bare;
+                        // A non-ANSI expression (`.a(x)`) declares nothing a
+                        // name could continue.
+                        continues = !bare && (kind == WrapListKind::ModportBody ||
+                                              declares_port(items[n].first, items[n].last));
                     }
                 }
             }
