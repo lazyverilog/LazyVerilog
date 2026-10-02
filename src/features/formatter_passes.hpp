@@ -3802,9 +3802,58 @@ private:
                     const size_t owner = prev_code(tokens, enclosing);
                     for_header_semicolon = owner != npos && kind_is(tokens[owner], TK::ForKeyword);
                 }
+                // `logic [7:0] // width` / `a, b;`, `typedef logic [7:0] // w` /
+                // `byte_t;`, `assign x // lhs` / `= y;` -- a comment after a
+                // declaration's type, or after the name an assignment is still
+                // to follow, splits a statement that has not ended.  Only at
+                // statement level, only across a comment, and only between
+                // tokens that cannot end and start a statement: a block label
+                // (`begin : blk // c`) and a macro that ends one are not heads.
+                // Not an instance (`sub // s` / `u_sub (`), whose port list owns
+                // its layout, and not a function header's tail (`function int
+                // // ret` / `f();`), which the scope it opens already indents.
+                bool declaration_head = false;
+                const bool statement_level =
+                    enclosing == npos ||
+                    (kind_is(tokens[enclosing], TK::OpenBrace) &&
+                     (tokens[enclosing].immutable.topology.opens_brace_block ||
+                      is_struct_or_union_body_brace(tokens, enclosing)));
+                if (statement_level && t.lex.comment_kind == CommentLexemeKind::None) {
+                    bool comment_between = false;
+                    for (size_t k = prev + 1; k < i && !comment_between; ++k)
+                        comment_between = tokens[k].lex.comment_kind != CommentLexemeKind::None;
+                    const bool label = before_prev != npos && kind_is(tokens[before_prev], TK::Colon);
+                    const bool head =
+                        is_var_decl_leading_keyword(pk) || is_net_type_keyword(pk) ||
+                        pk == TK::VarKeyword || pk == TK::CloseBracket ||
+                        (pk == TK::Identifier && !label && !p.mutable_.macro.ends_statement);
+                    const TK tk = t.lex.kind;
+                    bool tail = tk == TK::Equals || tk == TK::OpenBracket || is_type_keyword(tk);
+                    if (tk == TK::Identifier) {
+                        const size_t after = next_code(tokens, i + 1, tokens.size());
+                        const TK ak = after == npos ? TK::Unknown : tokens[after].lex.kind;
+                        tail = pk != TK::Identifier ||
+                               (ak != TK::OpenParenthesis && ak != TK::Hash);
+                    }
+                    // A function or task header opens the scope its own
+                    // tail is indented by; a prototype (`extern`, `pure`,
+                    // a DPI import) opens none.
+                    bool scope_indents = false;
+                    for (size_t k = prev, seen = 0; k != npos && seen < 12; k = prev_code(tokens, k), ++seen) {
+                        const TK kk = tokens[k].lex.kind;
+                        if (kk == TK::Semicolon || kk == TK::CloseParenthesis)
+                            break;
+                        if (kk == TK::FunctionKeyword || kk == TK::TaskKeyword)
+                            scope_indents = true;
+                        else if (kk == TK::ExternKeyword || kk == TK::PureKeyword ||
+                                 kk == TK::ImportKeyword || kk == TK::ExportKeyword)
+                            scope_indents = false;
+                    }
+                    declaration_head = comment_between && head && tail && !scope_indents;
+                }
                 const bool continues =
                     is_binary_op(pk) || is_assignment_op(pk) || pk == TK::Question || open_delim ||
-                    prefix_only_op || statement_comma || for_header_semicolon ||
+                    prefix_only_op || statement_comma || for_header_semicolon || declaration_head ||
                     prev_is_conditional_colon || event_or || leads_conditional_colon ||
                     leads_conditional_question ||
                     (pk == TK::Comma && enclosing != npos) ||

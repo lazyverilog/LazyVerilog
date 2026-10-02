@@ -6301,3 +6301,69 @@ endmodule
 )SV";
     CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
 }
+
+// U-9: a comment between a declaration's type and its first name (or between
+// an assignment's target and its `=`) splits a statement that has not ended;
+// the rest of it takes the continuation indent.  A block label, an instance
+// and a function header's tail are not such a split.
+TEST_CASE("formatter regression: a statement split by a comment before its first name is indented",
+          "[formatter][regression]") {
+    FormatOptions opts;
+    const std::string input = R"SV(
+module m;
+  logic [7:0] // width
+  a, b;
+  typedef logic [7:0] // width
+  byte_t;
+  assign x // lhs
+  = y;
+  my_t // t
+  v;
+  typedef struct packed {
+    logic [3:0] // w
+    f;
+  } s_t;
+  function automatic int // ret
+    f(int a);
+    return a;
+  endfunction
+  initial begin: blk // c
+    x = 1;
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  logic [7:0] // width
+    a, b;
+  typedef logic [7:0] // width
+    byte_t;
+  assign x // lhs
+    = y;
+  my_t // t
+    v;
+  typedef struct packed {
+    logic [3:0] // w
+      f;
+  } s_t;
+  function automatic int // ret
+    f(int a);
+    return a;
+  endfunction
+  initial begin: blk // c
+    x = 1;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
+    // The instance name stays at the statement's indent.
+    const std::string instance = R"SV(
+module m;
+  sub // s
+  u_sub (
+    .a(a)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(instance.substr(1), opts).find("  sub // s\n  u_sub") != std::string::npos);
+}
