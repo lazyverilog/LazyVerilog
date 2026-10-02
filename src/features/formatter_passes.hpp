@@ -3539,9 +3539,35 @@ public:
                 const bool comment_after_open =
                     open + 1 < close && tokens[open + 1].lex.comment_kind != CommentLexemeKind::None &&
                     !is_passthrough(tokens[open + 1]);
-                if (comment_after_open && !top_level_list_items(tokens, open + 1, close).empty()) {
+                // `function int f(int a, // first` -- a comment that ends a
+                // line between the formals breaks the list too, and a list
+                // that breaks breaks at every formal, as a call's does.  Left
+                // to "fits", the comment's own break was the only one: the
+                // first formal stayed on the `(` and the rest landed at a
+                // continuation indent with the `)` a level in.
+                bool comment_between = false;
+                const int inner = tokens[open].immutable.syntax.paren_depth + 1;
+                for (size_t k = open + 1; k < close && !comment_between && !comment_after_open; ++k) {
+                    const Tok& c = tokens[k];
+                    if (c.lex.comment_kind == CommentLexemeKind::None || is_passthrough(c) ||
+                        c.immutable.syntax.paren_depth != inner ||
+                        c.immutable.syntax.bracket_depth != tokens[open].immutable.syntax.bracket_depth ||
+                        c.immutable.syntax.brace_depth != tokens[open].immutable.syntax.brace_depth)
+                        continue;
+                    comment_between = c.immutable.comment.role == CommentRole::OwnLine ||
+                                      c.lex.comment_kind == CommentLexemeKind::Line;
+                }
+                // `int b // last` -- nor can the `)` close a hanging list on a
+                // line a comment has ended: it would sit alone, under nothing.
+                const bool comment_before_close =
+                    comment_between && tokens[close - 1].lex.comment_kind != CommentLexemeKind::None &&
+                    !is_passthrough(tokens[close - 1]) &&
+                    (tokens[close - 1].lex.comment_kind == CommentLexemeKind::Line ||
+                     tokens[close - 1].immutable.comment.role == CommentRole::OwnLine);
+                if ((comment_after_open || comment_before_close) &&
+                    !top_level_list_items(tokens, open + 1, close).empty()) {
                     apply_list(open, WrapListKind::FunctionDeclBlock, true, true, true);
-                } else if (approx > opts_.function_declaration.line_length) {
+                } else if (comment_between || approx > opts_.function_declaration.line_length) {
                     bool hanging = opts_.function_declaration.layout == "hanging";
                     apply_list(open, hanging ? WrapListKind::FunctionDeclHanging
                                              : WrapListKind::FunctionDeclBlock,

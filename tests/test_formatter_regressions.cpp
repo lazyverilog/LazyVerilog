@@ -6022,3 +6022,91 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == plain.substr(1));
 }
+
+TEST_CASE("formatter regression: a comment between formals breaks the header at every formal", "[formatter][regression]") {
+    // U-1: only a comment right after the `(` made a function or task header
+    // a block.  One after a formal left its own break as the only break: the
+    // first formal stayed on the `(`, the rest sat at a continuation indent
+    // and the `)` a level in -- and a header written as a block was undone.
+    const std::string input = R"SV(module m;
+function int h(
+int a, // first
+int b // second
+);
+return a;
+endfunction
+task t(input int a, // first
+output int b);
+endtask
+function int own(int a,
+// own line
+int b);
+endfunction
+function int g(int a); // after
+endfunction
+function int k(int a /* in */, int b);
+endfunction
+import "DPI-C" function int dpi(int a, // c
+int b);
+endmodule
+)SV";
+    const std::string block = R"SV(
+module m;
+  function int h(
+    int a, // first
+    int b // second
+  );
+    return a;
+  endfunction
+  task t(
+    input int a, // first
+    output int b
+  );
+  endtask
+  function int own(
+    int a,
+    // own line
+    int b
+  );
+  endfunction
+  function int g(int a); // after
+  endfunction
+  function int k(int a /* in */, int b);
+  endfunction
+  import "DPI-C" function int dpi(
+    int a, // c
+    int b
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input) == block.substr(1));
+
+    // A hanging layout hangs the formals from the `(`, unless a comment
+    // leaves the `)` nothing to close on.
+    const std::string hanging = R"SV(
+module m;
+  function int h(
+    int a, // first
+    int b // second
+  );
+    return a;
+  endfunction
+  task t(input int a, // first
+         output int b);
+  endtask
+  function int own(int a,
+                   // own line
+                   int b);
+  endfunction
+  function int g(int a); // after
+  endfunction
+  function int k(int a /* in */, int b);
+  endfunction
+  import "DPI-C" function int dpi(int a, // c
+                                  int b);
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.function_declaration.layout = "hanging";
+    CHECK(format_stable(input, opts) == hanging.substr(1));
+}
