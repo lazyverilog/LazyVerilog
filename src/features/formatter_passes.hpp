@@ -5741,6 +5741,20 @@ public:
             }
         }
 
+        // `input logic clk, rst_n,` -- WrapPass keeps the bare names of one
+        // declaration on its row.  True when `item` sits on the row of the
+        // item before it.
+        auto shares_row = [&](const auto& prev, const auto& item) {
+            if (prev.comma == npos || tokens[item.first].mutable_.wrap.must_break_before ||
+                tokens[prev.comma].mutable_.wrap.must_break_after)
+                return false;
+            // A `//` comment or a directive ends the row whatever the flags say.
+            for (size_t k = prev.last + 1; k < item.first; ++k)
+                if (tokens[k].lex.is_directive || tokens[k].lex.comment_kind == CommentLexemeKind::Line)
+                    return false;
+            return true;
+        };
+
         auto align_declaration_items = [&](WrapListKind list_kind) {
             for (size_t open = 0; open < tokens.size(); ++open) {
                 if (tokens[open].mutable_.wrap.list_kind != list_kind ||
@@ -5756,6 +5770,7 @@ public:
                     size_t name;
                     size_t unpacked_dim;
                     size_t comma;
+                    int namew;      // section4: the name, or the run `clk, rst_n` sharing its row
                     int typew;
                     int leadw;      // section1 as rendered: direction, or a whole interface type,
                                     // a leading `/* c */` included (it moves its own row only)
@@ -5779,7 +5794,17 @@ public:
                     return w;
                 };
                 std::vector<Decl> decls;
-                for (const auto& item : items) {
+                for (size_t n = 0; n < items.size(); ++n) {
+                    const auto& item = items[n];
+                    // The names after the first are one field with it: the
+                    // row's comma is the one that ends the last of them.
+                    size_t run = n;
+                    while (run + 1 < items.size() && shares_row(items[run], items[run + 1]))
+                        ++run;
+                    const bool has_run = run != n;
+                    const size_t row_comma = items[run].comma;
+                    const size_t row_last = items[run].last;
+                    n = run;
                     const bool directed = is_port_direction(tokens[item.first].lex.kind);
                     // An interface port (`intf.mp bus`, `interface.slave b`) or
                     // a typed port with no direction: its type takes section1.
@@ -5813,8 +5838,10 @@ public:
                                 break;
                             }
                         }
-                        decls.push_back({item.first, npos, npos, name, unpacked_dim, item.comma, 0,
-                                         row_width_through(item.first, prev_code(tokens, name)), false});
+                        decls.push_back({item.first, npos, npos, name, has_run ? npos : unpacked_dim, row_comma,
+                                         has_run ? rendered_width(tokens, name, row_last + 1)
+                                                 : token_width(tokens[name]),
+                                         0, row_width_through(item.first, prev_code(tokens, name)), false});
                         continue;
                     }
                     size_t type_first = next_code(tokens, item.first + 1, name);
@@ -5835,8 +5862,11 @@ public:
                             break;
                         }
                     }
-                    decls.push_back({item.first, type_first, packed_dim, name, unpacked_dim, item.comma, tw,
-                                     row_width_through(item.first, item.first), true});
+                    decls.push_back({item.first, type_first, packed_dim, name, has_run ? npos : unpacked_dim,
+                                     row_comma,
+                                     has_run ? rendered_width(tokens, name, row_last + 1)
+                                             : token_width(tokens[name]),
+                                     tw, row_width_through(item.first, item.first), true});
                 }
                 int base = decls.empty() ? 0 : tokens[decls.front().first].mutable_.indent.base_indent;
                 const int s1 = option_width(opts_.port_declaration.section1_min_width, opts_);
@@ -5855,7 +5885,7 @@ public:
                 int group_name_width = 0;
                 int group_undirected_width = 0; // `intf.mp` spans sections 1-3
                 for (const auto& d : decls) {
-                    group_name_width = std::max(group_name_width, token_width(tokens[d.name]));
+                    group_name_width = std::max(group_name_width, d.namew);
                     if (!d.directed) {
                         group_undirected_width = std::max(group_undirected_width, d.leadw);
                         continue;
@@ -5975,7 +6005,7 @@ public:
                     // and the comma returns to its own preferred column as
                     // soon as this line's text ends before it: an overflow
                     // moves only the boundaries it actually overlaps.
-                    const int name_end = decl_name_target + token_width(tokens[d.name]);
+                    const int name_end = decl_name_target + d.namew;
                     const int trailing_start = std::max(preferred_trailing_col, name_end + 1);
                     int text_end = name_end;
 
@@ -6174,7 +6204,10 @@ public:
                     for (size_t k = sig + 1; k <= item.last && !multi_line; ++k)
                         multi_line = tokens[k].mutable_.wrap.must_break_before ||
                                      tokens[k - 1].mutable_.wrap.must_break_after;
-                    if (multi_line) {
+                    // `output addr, wdata, valid,` -- names sharing the row
+                    // are no column either; their commas stay with them.
+                    const size_t n = static_cast<size_t>(&item - items.data());
+                    if (multi_line || (n + 1 < items.size() && shares_row(item, items[n + 1]))) {
                         ms.push_back({item.first, sig, npos, dw, 0});
                         continue;
                     }

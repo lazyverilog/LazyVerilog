@@ -4166,7 +4166,8 @@ endinterface
     const std::string out = format_stable(input, plain);
     INFO(out);
     CHECK(out.find("    import task t(input int x) ,\n"
-                   "    output bbbbbbbbbbbbb       , cc\n") != std::string::npos);
+                   // Names sharing a row keep their commas (S-4).
+                   "    output bbbbbbbbbbbbb, cc\n") != std::string::npos);
 }
 
 TEST_CASE("formatter regression: a comment ending its line stays with the comma before it", "[formatter][regression]") {
@@ -5205,4 +5206,45 @@ module m;
 endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
+}
+
+TEST_CASE("formatter regression: port and modport alignment keep a row's names together", "[formatter][regression]") {
+    // S-4: only the first name of `input logic clk, rst_n` was measured, so
+    // its comma went to the comma column and the other names trailed it:
+    // `clk          , rst_n,`.  The names sharing a row are one field.
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    const std::string input = R"SV(module m (input logic clk, rst_n, output logic [7:0] q, r, input wire en);
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m(
+  input       logic                   clk, rst_n              ,
+  output      logic       [7:0]       q, r                    ,
+  input       wire                    en
+);
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    FormatOptions mp;
+    mp.modport.align = true;
+    const std::string mp_input = R"SV(interface bus_if;
+modport master (output addr, wdata, valid, input rdata, ready);
+modport s (input a, output bb);
+endinterface
+)SV";
+    const std::string mp_expected = R"SV(
+interface bus_if;
+  modport master (
+    output addr, wdata, valid,
+    input  rdata, ready
+  );
+  modport s (
+    input  a ,
+    output bb
+  );
+endinterface
+)SV";
+    CHECK(format_stable(mp_input, mp) == mp_expected.substr(1));
 }
