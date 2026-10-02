@@ -3530,8 +3530,10 @@ public:
                 // `foo(a, // first` / `b, c);` -- a comment that ends a line
                 // between the arguments breaks the list whatever its length,
                 // and a list that breaks breaks at every argument.  Leaving
-                // the decision at "fits" broke it at the comment alone.
-                if (!do_break && items.size() > 1) {
+                // the decision at "fits" broke it at the comment alone.  One
+                // argument is a list too: `foo(a // why` left its `)` alone on
+                // the next line with nothing above it to close.
+                if (!do_break) {
                     const int inner = tokens[open].immutable.syntax.paren_depth + 1;
                     for (size_t k = open + 1; k < close && !do_break; ++k) {
                         const Tok& c = tokens[k];

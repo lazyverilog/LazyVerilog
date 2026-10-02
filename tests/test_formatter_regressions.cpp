@@ -5560,3 +5560,43 @@ endgroup
 endmodule
 )SV", opts) == allman.substr(1));
 }
+
+TEST_CASE("formatter regression: a single argument with a comment breaks like a list", "[formatter][regression]") {
+    // T-8: the comment rule for calls needed more than one argument, so
+    // `foo(a // why` kept its argument on the call's line and dropped the `)`
+    // to the statement's indent.
+    const std::string input = R"SV(module m;
+initial begin
+foo(a // why
+);
+foo(a, // why
+b);
+foo(a); // after
+foo(a /* in */);
+bar(
+// own line
+a);
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    foo(
+      a // why
+    );
+    foo(
+      a, // why
+      b
+    );
+    foo(a); // after
+    foo(a /* in */);
+    bar(
+      // own line
+      a
+    );
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
