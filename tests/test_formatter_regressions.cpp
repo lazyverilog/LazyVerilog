@@ -5333,3 +5333,48 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a randsequence production is not laid out as statements", "[formatter][regression]") {
+    // S-10: `if`, `else` and `repeat` in a production choose between
+    // productions.  They were broken like the procedural keywords, and a
+    // brace-less `initial randsequence` ended its body at the first `;`.
+    const std::string input = R"SV(module m;
+initial
+randsequence (main)
+main: first second;
+first: if (a) x else y;
+second: repeat (3) x;
+third: case (b) 0: x; default: y; endcase;
+fourth: { if (a) b = 1; else b = 2; };
+endsequence
+initial begin
+repeat (3) c = 1;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial
+    randsequence (main)
+      main: first second;
+      first: if (a) x else y;
+      second: repeat (3) x;
+      third: case (b)
+        0: x;
+        default: y;
+      endcase;
+      fourth: {
+        if (a)
+          b = 1;
+        else
+          b = 2;
+      };
+    endsequence
+  initial begin
+    repeat (3)
+      c = 1;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

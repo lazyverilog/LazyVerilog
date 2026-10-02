@@ -221,10 +221,16 @@ inline bool is_code_token(const Tok& t) {
 // each end in a `;` and so end their lines whatever is decided here; treated
 // as an operator it kept its first item on the header's line and the rest
 // unindented.  It is laid out as the block it is written as.
+//
+// A randsequence production's `if`/`else`/`repeat` choose between
+// productions the same way (`first: if (a) x else y;`), and its `case` is a
+// block like the property one.
 inline bool is_property_operator_keyword(const Tok& t) {
+    const TK k = t.lex.kind;
+    if (t.immutable.syntax.in_production)
+        return k == TK::IfKeyword || k == TK::ElseKeyword || k == TK::RepeatKeyword;
     if (!t.immutable.syntax.in_property_expr)
         return false;
-    const TK k = t.lex.kind;
     if (k == TK::CaseKeyword || k == TK::EndCaseKeyword)
         return t.immutable.syntax.paren_depth > 0;
     return k == TK::IfKeyword || k == TK::ElseKeyword;
@@ -646,6 +652,21 @@ inline size_t simple_statement_end_from(const TokenStream& tokens, size_t body) 
                     end = tokens[open].immutable.syntax.matching_token;
                 return end;
             }
+        }
+        return npos;
+    }
+
+    // `initial randsequence (main) ... endsequence` -- one statement, ending
+    // at its own `endsequence` and not at the `;` of its first production.
+    if (kind_is(tokens[body], TK::RandSequenceKeyword)) {
+        int depth = 0;
+        for (size_t i = body; i < tokens.size(); ++i) {
+            if (!is_code_token(tokens[i]))
+                continue;
+            if (kind_is(tokens[i], TK::RandSequenceKeyword))
+                ++depth;
+            else if (kind_is(tokens[i], TK::EndSequenceKeyword) && --depth == 0)
+                return i;
         }
         return npos;
     }
@@ -1786,6 +1807,9 @@ public:
             tokens[i].immutable.topology.is_prototype = is_prototype_at(tokens, i);
             tokens[i].immutable.topology.opens_design_unit = opens_design_unit_at(tokens, i);
         }
+        // Brace depth at each open `randsequence`, innermost last: a
+        // production's `{ ... }` code block holds statements again.
+        std::vector<int> production_brace_depths;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (kind_is(t, TK::EndClockingKeyword))
@@ -1799,6 +1823,12 @@ public:
             t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
             t.immutable.syntax.in_clocking_block = in_clocking_block;
+            if (kind_is(t, TK::EndSequenceKeyword) && !production_brace_depths.empty())
+                production_brace_depths.pop_back();
+            t.immutable.syntax.in_production =
+                !production_brace_depths.empty() && brd == production_brace_depths.back();
+            if (kind_is(t, TK::RandSequenceKeyword))
+                production_brace_depths.push_back(brd);
             t.immutable.topology.opens_indent_scope = opens_indent_scope_at(tokens, i) || t.immutable.topology.opens_design_unit;
             t.immutable.topology.closes_indent_scope = is_close_block(t.lex.kind) || is_outer_close(t.lex.kind);
 
@@ -2904,7 +2934,8 @@ public:
             // `endcase;` -- a property's `case` is an expression, and the
             // `;` that ends the property follows it on its line.
             bool property_endcase_before_semicolon =
-                kind_is(t, TK::EndCaseKeyword) && t.immutable.syntax.in_property_expr && next_i != npos &&
+                kind_is(t, TK::EndCaseKeyword) &&
+                (t.immutable.syntax.in_property_expr || t.immutable.syntax.in_production) && next_i != npos &&
                 kind_is(tokens[next_i], TK::Semicolon);
             bool end_before_do_while =
                 kind_is(t, TK::EndKeyword) && next_i != npos && tokens[next_i].immutable.topology.ends_do_while;

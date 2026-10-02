@@ -126,6 +126,10 @@ struct SyntaxFacts {
     // `property`/`sequence` declaration through its end keyword.  `if`/`else`
     // and `case` there are property operators, not statements.
     bool in_property_expr{false};
+    // In a randsequence production, outside its `{ ... }` code blocks:
+    // `first: if (a) x else y;`.  `if`, `else` and `repeat` there choose
+    // between productions; they control no statement.
+    bool in_production{false};
 };
 
 // 3. TopologyFacts: stable graph-ish structural labels that make later passes
