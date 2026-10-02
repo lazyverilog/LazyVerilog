@@ -26,7 +26,7 @@ struct StatementOptions {
     bool align_adaptive{false};
     int lhs_min_width{1};
     bool begin_newline{false};
-    bool wrap_end_else_clauses{false};
+    bool wrap_end_else_clauses{true};
 };
 
 // Alignment is opt-in.  When it is on, the built-in widths are modest and

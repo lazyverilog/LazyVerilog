@@ -2952,8 +2952,12 @@ public:
                  kind_is(tokens[next_i], TK::OpenBracket));
             bool close_brace_before_semicolon =
                 kind_is(t, TK::CloseBrace) && next_i != npos && kind_is(tokens[next_i], TK::Semicolon);
+            // `end else begin` / `} else {` -- with wrap_end_else_clauses off the
+            // `else` shares the line of the block it follows, whichever kind of
+            // block that is.
             bool close_before_inline_else =
-                kind_is(t, TK::CloseBrace) && next_i != npos && kind_is(tokens[next_i], TK::ElseKeyword) &&
+                (kind_is(t, TK::CloseBrace) || kind_is(t, TK::EndKeyword)) && next_i != npos &&
+                kind_is(tokens[next_i], TK::ElseKeyword) &&
                 !opts_.statement.wrap_end_else_clauses;
             // `endcase;` -- a property's `case` is an expression, and the
             // `;` that ends the property follows it on its line.
