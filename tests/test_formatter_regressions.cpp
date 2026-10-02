@@ -5378,3 +5378,43 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: default sequence in a bin opens no block", "[formatter][regression]") {
+    // T-1: `bins b = default sequence;` is the catch-all transition bin.  The
+    // keyword was read as the start of a sequence declaration, and with no
+    // `endsequence` to close it every later line gained an indent level.
+    const std::string input = R"SV(module m;
+covergroup cg @(posedge clk);
+cp: coverpoint a {
+bins seq = default sequence;
+bins lo = {0};
+}
+cq: coverpoint b;
+endgroup
+sequence s;
+a ##1 b;
+endsequence
+default clocking cb @(posedge clk);
+endclocking
+logic z;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  covergroup cg @(posedge clk);
+    cp: coverpoint a {
+      bins seq = default sequence;
+      bins lo = {0};
+    }
+    cq: coverpoint b;
+  endgroup
+  sequence s;
+    a ##1 b;
+  endsequence
+  default clocking cb @(posedge clk);
+  endclocking
+  logic z;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

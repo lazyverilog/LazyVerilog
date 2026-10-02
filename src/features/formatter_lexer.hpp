@@ -230,6 +230,11 @@ private:
     // this `join` closes nothing and is lexed as the plain word it is here;
     // left as a keyword it closed the enclosing block and every later line
     // lost an indent level.  `rand` is followed by `join` nowhere else.
+    //
+    // `bins rest = default sequence;` -- the same for the catch-all transition
+    // bin: this `sequence` declares nothing and no `endsequence` follows, so
+    // left as a keyword it opened a block the rest of the file sat in.
+    // `default` is followed by `sequence` nowhere else.
     void mark_production_join_keywords() {
         using TKind = slang::parsing::TokenKind;
         size_t prev = tokens_.size();
@@ -239,6 +244,9 @@ private:
                 continue;
             if (tokens_[i].lex.kind == TKind::JoinKeyword && prev < tokens_.size() &&
                 tokens_[prev].lex.kind == TKind::RandKeyword)
+                tokens_[i].lex.kind = TKind::Identifier;
+            if (tokens_[i].lex.kind == TKind::SequenceKeyword && prev < tokens_.size() &&
+                tokens_[prev].lex.kind == TKind::DefaultKeyword)
                 tokens_[i].lex.kind = TKind::Identifier;
             prev = i;
         }
