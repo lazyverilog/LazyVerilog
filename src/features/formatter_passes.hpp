@@ -3363,13 +3363,41 @@ public:
         }
 
         for (size_t open = 0; open < tokens.size(); ++open) {
-            if (!kind_is(tokens[open], TK::OpenParenthesis) && !kind_is(tokens[open], TK::OpenBrace))
+            if (!kind_is(tokens[open], TK::OpenParenthesis) && !kind_is(tokens[open], TK::OpenBrace) &&
+                !kind_is(tokens[open], TK::ApostropheOpenBrace))
                 continue;
             if (tokens[open].mutable_.macro.suppress_wrapping)
                 continue;
             size_t close = tokens[open].immutable.syntax.matching_token;
             if (close == npos || close >= tokens.size())
                 continue;
+
+            // `'{8, // byte` / `16, // half` -- a pattern or a concatenation
+            // stays on its line, and a comment that ends a line inside it
+            // breaks it there anyway.  As with a call's arguments, a list
+            // that breaks breaks at every element: left to the comments
+            // alone, the first element stayed glued to the opener and the
+            // rest landed wherever the statement's continuation put them.
+            auto comment_splits_list = [&](size_t open, size_t close) {
+                const auto& at = tokens[open].immutable.syntax;
+                for (size_t k = open + 1; k < close; ++k) {
+                    const Tok& c = tokens[k];
+                    if (c.lex.comment_kind == CommentLexemeKind::None || is_passthrough(c) ||
+                        c.immutable.syntax.brace_depth != at.brace_depth + 1 ||
+                        c.immutable.syntax.paren_depth != at.paren_depth ||
+                        c.immutable.syntax.bracket_depth != at.bracket_depth)
+                        continue;
+                    if (c.immutable.comment.role == CommentRole::OwnLine ||
+                        c.lex.comment_kind == CommentLexemeKind::Line)
+                        return true;
+                }
+                return false;
+            };
+            if (kind_is(tokens[open], TK::ApostropheOpenBrace)) {
+                if (comment_splits_list(open, close))
+                    apply_list(open, WrapListKind::BraceBlock, true, true, true);
+                continue;
+            }
 
             if (kind_is(tokens[open], TK::OpenBrace)) {
                 bool enum_body = false;
@@ -3382,6 +3410,10 @@ public:
                 if (enum_body) {
                     apply_list(open, WrapListKind::EnumBody, true, true, true);
                 } else if (is_multiline_brace_construct(tokens, open)) {
+                    apply_list(open, WrapListKind::BraceBlock, true, true, true);
+                } else if (!tokens[open].immutable.topology.opens_brace_block &&
+                           !is_struct_or_union_body_brace(tokens, open) &&
+                           comment_splits_list(open, close)) {
                     apply_list(open, WrapListKind::BraceBlock, true, true, true);
                 }
                 continue;

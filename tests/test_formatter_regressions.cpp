@@ -5778,3 +5778,57 @@ endmodule
 )SV";
     CHECK(format_stable(input) == plain.substr(1));
 }
+
+TEST_CASE("formatter regression: a comment inside a pattern or concatenation breaks it at every element", "[formatter][regression]") {
+    // T-5: a pattern stays on its line, and a `//` inside one forced a single
+    // break: the first element stayed glued to the opener and the rest landed
+    // at the statement's continuation indent.
+    const std::string input = R"SV(module m;
+localparam int SIZES [3] = '{
+8,  // byte
+16, // half
+32  // word
+};
+assign bus = {hdr, // header
+payload};
+localparam t T = '{'{1, // one
+2}, '{3, 4}};
+initial begin
+u = '{
+// own line
+a, b};
+w = {a, b}; // after
+v = '{a, /* in */ b};
+p = '{mode: A, sub: '{en: 1, w: 4}, default: 0};
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  localparam int SIZES [3] = '{
+    8, // byte
+    16, // half
+    32 // word
+  };
+  assign bus = {
+    hdr, // header
+    payload
+  };
+  localparam t T = '{'{
+    1, // one
+    2
+  }, '{3, 4}};
+  initial begin
+    u = '{
+      // own line
+      a,
+      b
+    };
+    w = {a, b}; // after
+    v = '{a, /* in */ b};
+    p = '{mode : A, sub : '{en : 1, w : 4}, default : 0};
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
