@@ -1159,10 +1159,24 @@ inline bool is_function_task_declaration_open(const TokenStream& tokens, size_t 
     // backward until a declaration boundary keeps the test token-kind based and
     // idempotent.  Seeing another '(' first means the current '(' belongs to an
     // expression nested inside an already-open declaration header.
+    //
+    // `function type(x) f (int a);` -- a `type(...)` return type has
+    // parentheses of its own.  Its `(` is not the header's, and its balanced
+    // pair is stepped over on the way back from the one that is.
+    const size_t before_open = prev_code(tokens, open);
+    if (before_open != npos && kind_is(tokens[before_open], TK::TypeKeyword))
+        return false;
     for (size_t n = open; n > 0; --n) {
         size_t i = n - 1;
         if (!is_code_token(tokens[i]))
             continue;
+        if (kind_is(tokens[i], TK::CloseParenthesis)) {
+            const size_t match = tokens[i].immutable.syntax.matching_token;
+            if (match != npos && match < i) {
+                n = match + 1;
+                continue;
+            }
+        }
         if (kind_is(tokens[i], TK::FunctionKeyword) || kind_is(tokens[i], TK::TaskKeyword))
             return true;
         if (kind_is(tokens[i], TK::OpenParenthesis) ||

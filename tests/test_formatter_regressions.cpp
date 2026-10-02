@@ -5418,3 +5418,28 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: space_before_paren finds the header past a type(x) return type", "[formatter][regression]") {
+    // T-10: the first `(` after `function` was taken to be the header's.  With
+    // a `type(x)` return type the space went into the type and the function
+    // name got none.
+    FormatOptions opts;
+    opts.function_declaration.space_before_paren = true;
+    const std::string input = R"SV(class c;
+function automatic type(x) tfn(int a); endfunction
+function void g(int a = h(1)); y = h(2); endfunction
+extern function type(x) proto(int a);
+endclass
+)SV";
+    const std::string expected = R"SV(
+class c;
+  function automatic type(x) tfn (int a);
+  endfunction
+  function void g (int a = h(1));
+    y = h(2);
+  endfunction
+  extern function type(x) proto (int a);
+endclass
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}
