@@ -2903,6 +2903,7 @@ public:
             if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token != npos) {
                 size_t before_open = prev_code(tokens, t.immutable.syntax.matching_token);
                 if (before_open != npos && !is_property_operator_keyword(tokens[before_open]) &&
+                    tokens[before_open].immutable.syntax.paren_depth == 0 &&
                     (kind_is(tokens[before_open], TK::CaseKeyword) ||
                      kind_is(tokens[before_open], TK::CaseXKeyword) ||
                      kind_is(tokens[before_open], TK::CaseZKeyword) ||
@@ -2932,8 +2933,18 @@ public:
             // Close-block keywords always start a new line; CloseBrace only when
             // not inside a parenthesised expression (e.g. `inside {A, B}`).
             const bool property_keyword = is_property_operator_keyword(t);
+            // `` `FOO(begin x = 1; end) `` -- a block keyword inside
+            // parentheses is text in a macro argument; no block of the
+            // language sits there.  The `;` beside it already stays on the
+            // line (see above), so the keywords do too: breaking at them
+            // alone expanded half the argument and left the macro's `)` on a
+            // line of its own.  A `}` has its own rules below.
+            const bool block_keyword_in_argument =
+                t.immutable.syntax.paren_depth > 0 && !property_keyword &&
+                (kind_is(t, TK::BeginKeyword) || kind_is(t, TK::ElseKeyword) || is_fork_block_open(tokens, i) ||
+                 (is_close_block(t.lex.kind) && !kind_is(t, TK::CloseBrace)));
             if (is_outer_close(t.lex.kind) ||
-                (is_close_block(t.lex.kind) && !property_keyword &&
+                (is_close_block(t.lex.kind) && !property_keyword && !block_keyword_in_argument &&
                  !(kind_is(t, TK::CloseBrace) &&
                    (t.immutable.syntax.paren_depth > 0 ||
                     is_empty_brace_pair(tokens, t.immutable.syntax.matching_token) ||
@@ -2973,7 +2984,9 @@ public:
                 kind_is(tokens[next_i], TK::Semicolon);
             bool end_before_do_while =
                 kind_is(t, TK::EndKeyword) && next_i != npos && tokens[next_i].immutable.topology.ends_do_while;
-            if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
+            if (block_keyword_in_argument) {
+                // stays on the argument's line
+            } else if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
                 (is_fork_block_open(tokens, i) && !followed_by_label_colon) ||
                 (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
                 (is_close_block(t.lex.kind) && !followed_by_label_colon && !property_keyword &&
@@ -2992,10 +3005,11 @@ public:
             // would have ended -- whatever it lexes as (`endfunction : new`).
             if (is_code_token(t)) {
                 size_t p = prev_code(tokens, i);
-                if (p != npos && tokens[p].immutable.topology.is_block_name_colon)
+                if (p != npos && tokens[p].immutable.topology.is_block_name_colon &&
+                    t.immutable.syntax.paren_depth == 0)
                     t.mutable_.wrap.must_break_after = true;
             }
-            if (opts_.statement.begin_newline &&
+            if (opts_.statement.begin_newline && !block_keyword_in_argument &&
                 (kind_is(t, TK::BeginKeyword) ||
                  is_fork_block_open(tokens, i) ||
                  (kind_is(t, TK::OpenBrace) && !is_expression_brace(tokens, i) &&
@@ -3039,9 +3053,9 @@ public:
                      (t.immutable.syntax.paren_depth == 0 || holds_breaking_comment())))
                     t.mutable_.wrap.must_break_after = true;
             }
-            if (opts_.statement.wrap_end_else_clauses && kind_is(t, TK::ElseKeyword) && i > 0 && (kind_is(tokens[i - 1], TK::EndKeyword) || kind_is(tokens[i - 1], TK::CloseBrace))) t.mutable_.wrap.must_break_before = true;
+            if (opts_.statement.wrap_end_else_clauses && !block_keyword_in_argument && kind_is(t, TK::ElseKeyword) && i > 0 && (kind_is(tokens[i - 1], TK::EndKeyword) || kind_is(tokens[i - 1], TK::CloseBrace))) t.mutable_.wrap.must_break_before = true;
             // else always breaks unless wrap_end_else_clauses handled it above
-            if (kind_is(t, TK::ElseKeyword) && !property_keyword) {
+            if (kind_is(t, TK::ElseKeyword) && !property_keyword && !block_keyword_in_argument) {
                 bool prev_is_end_or_brace = (i > 0 && (kind_is(tokens[i-1], TK::EndKeyword) || kind_is(tokens[i-1], TK::CloseBrace)));
                 if (!prev_is_end_or_brace)
                     t.mutable_.wrap.must_break_before = true;
@@ -3900,7 +3914,12 @@ private:
                     b.mutable_.wrap.must_break_before = true;
             };
 
-            if (kind_is(t, TK::ForeverKeyword) || kind_is(t, TK::DoKeyword)) {
+            // A control inside parentheses is text in a macro argument
+            // (`` `FOO(if (a) x = 1; else x = 2;) ``); its body stays on the
+            // argument's line with everything else there.
+            const bool in_argument = t.immutable.syntax.paren_depth > 0;
+
+            if (!in_argument && (kind_is(t, TK::ForeverKeyword) || kind_is(t, TK::DoKeyword))) {
                 break_pending_body(i);
                 size_t body = next_code(tokens, i + 1, tokens.size());
                 if (body != npos &&
@@ -3911,7 +3930,7 @@ private:
                 continue;
             }
 
-            if (kind_is(t, TK::ElseKeyword) && !is_property_operator_keyword(t)) {
+            if (!in_argument && kind_is(t, TK::ElseKeyword) && !is_property_operator_keyword(t)) {
                 size_t body = next_code(tokens, i + 1, tokens.size());
                 if (body != npos &&
                     !kind_is(tokens[body], TK::BeginKeyword) &&
@@ -3922,7 +3941,7 @@ private:
                 continue;
             }
 
-            if (is_single_stmt_control(t) && !is_property_operator_keyword(t))
+            if (!in_argument && is_single_stmt_control(t) && !is_property_operator_keyword(t))
                 ctrl_expr_pending = true;
             if (ctrl_expr_pending && kind_is(t, TK::OpenParenthesis)) {
                 ctrl_expr_pending = false;

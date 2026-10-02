@@ -6110,3 +6110,52 @@ endmodule
     opts.function_declaration.layout = "hanging";
     CHECK(format_stable(input, opts) == hanging.substr(1));
 }
+
+TEST_CASE("formatter regression: a block inside a macro argument stays on the macro's line", "[formatter][regression]") {
+    // U-11: a `;` inside a macro's parentheses ends no line, but `begin`,
+    // `end`, `else` and a brace-less controlled body did, so an argument
+    // holding a block was half expanded and the macro's `)` was left on a
+    // line of its own.
+    const std::string input = R"SV(module m;
+initial begin
+`FOO(x = 1; y = 2;)
+`FOO(begin x = 1; end)
+`FOO(begin
+x = 1;
+y = 2;
+end)
+`BAR(if (a) x = 1; else x = 2;)
+`BAR(if (a) begin x = 1; end else begin x = 2; end)
+`BAR(fork a(); b(); join_none)
+if (a) begin `FOO(begin x = 1; end) end
+if (a) x = 1; else x = 2;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    `FOO(x = 1; y = 2;)
+    `FOO(begin x = 1; end)
+    `FOO(begin x = 1; y = 2; end)
+    `BAR(if (a) x = 1; else x = 2;)
+    `BAR(if (a) begin x = 1; end else begin x = 2; end)
+    `BAR(fork a(); b(); join_none)
+    if (a) begin
+      `FOO(begin x = 1; end)
+    end
+    if (a)
+      x = 1;
+    else
+      x = 2;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    opts.statement.wrap_end_else_clauses = false;
+    const std::string out = format_stable(input, opts);
+    CHECK(out.find("    `FOO(begin x = 1; y = 2; end)\n") != std::string::npos);
+    CHECK(out.find("    `BAR(if (a) begin x = 1; end else begin x = 2; end)\n") != std::string::npos);
+}
