@@ -6571,8 +6571,12 @@ public:
             const bool padded_open = kind_is(L, TK::OpenParenthesis) &&
                 (opts_.spacing.space_inside_parens ||
                  (L.immutable.topology.starts_argument_list && opts_.function_call.space_inside_paren));
+            // `sub u ((* keep *) .p(x));` -- an attribute keeps a space on each
+            // side, before the connection it annotates as before anything else.
+            const bool after_attribute = kind_is(L, TK::CloseParenthesis) &&
+                                         L.lex.in_attribute_instance;
             const bool dot_spaced = kind_is(t, TK::Dot) &&
-                (dot_keeps_space_after(tokens, i) || padded_open);
+                (dot_keeps_space_after(tokens, i) || padded_open || after_attribute);
             if (dot_spaced) {
                 spaces = 1;
             } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {

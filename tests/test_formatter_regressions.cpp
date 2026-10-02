@@ -5443,3 +5443,28 @@ endclass
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: an attribute keeps a space before the connection it annotates", "[formatter][regression]") {
+    // T-12: `(* keep *) .p(x)` was closed up to `(* keep *).p(x)`, the only
+    // place an attribute instance had no space after it.
+    const std::string input = R"SV(module m;
+sub u ((* keep *) .p(x), (* a = 1 *).q(y), .r(z));
+sub #((* b *) .W(1)) v (.p(x));
+(* keep *) logic w;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  sub u(
+    (* keep *) .p(x),
+    (* a = 1 *) .q(y),
+    .r(z)
+  );
+  sub #((* b *) .W(1)) v(
+    .p(x)
+  );
+  (* keep *) logic w;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
