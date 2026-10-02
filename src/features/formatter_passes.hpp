@@ -6492,6 +6492,14 @@ public:
                          is_gate_terminal_open(tokens, i))
                     spaces = opts_.function_call.space_before_paren ? 1 : 0;
             }
+            // `rand join (0.5) a b` -- the lexer hands a production's `join`
+            // over as a plain word; it is still a keyword and calls nothing.
+            if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::Identifier)) {
+                const size_t word = prev_code(tokens, i);
+                const size_t before = word == npos ? npos : prev_code(tokens, word);
+                if (before != npos && kind_is(tokens[before], TK::RandKeyword))
+                    spaces = 1;
+            }
             if (kind_is(t, TK::OpenParenthesis) &&
                 (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i)) &&
                 opts_.instance.align)

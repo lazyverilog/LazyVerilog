@@ -156,6 +156,7 @@ public:
         mark_attribute_instances();
         mark_vector_literal_digits();
         mark_block_event_keywords();
+        mark_production_join_keywords();
         return tokens_;
     }
 
@@ -221,6 +222,25 @@ private:
                     tokens_[j].lex.kind = TKind::Identifier;
             }
             i = j;
+        }
+    }
+
+    // `main: rand join first second;` -- in a randsequence production
+    // `rand join` interleaves the productions after it.  No `fork` is open, so
+    // this `join` closes nothing and is lexed as the plain word it is here;
+    // left as a keyword it closed the enclosing block and every later line
+    // lost an indent level.  `rand` is followed by `join` nowhere else.
+    void mark_production_join_keywords() {
+        using TKind = slang::parsing::TokenKind;
+        size_t prev = tokens_.size();
+        for (size_t i = 0; i < tokens_.size(); ++i) {
+            if (tokens_[i].lex.is_whitespace_sensitive || tokens_[i].lex.is_directive ||
+                tokens_[i].lex.comment_kind != CommentLexemeKind::None)
+                continue;
+            if (tokens_[i].lex.kind == TKind::JoinKeyword && prev < tokens_.size() &&
+                tokens_[prev].lex.kind == TKind::RandKeyword)
+                tokens_[i].lex.kind = TKind::Identifier;
+            prev = i;
         }
     }
 

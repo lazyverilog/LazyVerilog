@@ -5024,3 +5024,40 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: rand join in a production closes no block", "[formatter][regression]") {
+    // S-1: `join` is a block closer by kind.  After `rand` in a randsequence
+    // production it closes nothing, and every later line lost a level.
+    const std::string input = R"SV(module m;
+initial begin
+randsequence (main)
+main: rand join first second;
+alt: rand join (0.5) first second;
+first: { a = 1; };
+endsequence
+fork a = 1; join
+c = 1;
+end
+assign d = e;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    randsequence (main)
+      main: rand join first second;
+      alt: rand join (0.5) first second;
+      first: {
+        a = 1;
+      };
+    endsequence
+    fork
+      a = 1;
+    join
+    c = 1;
+  end
+  assign d = e;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
