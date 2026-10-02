@@ -4746,25 +4746,26 @@ public:
                 while (j < lines.size() && !lines[j].disabled && lines[j].assign_idx != npos && lines[j].indent == base_indent)
                     ++j;
                 if (j - li >= 2) {
-                    int group_lhs = opts_.statement.lhs_min_width;
-                    int group_prefix = 0;
-                    for (size_t k = li; k < j; ++k) {
-                        group_lhs = std::max(group_lhs, lines[k].lhs_width);
-                        group_prefix = std::max(group_prefix, lines[k].lhs_prefix_width);
-                    }
+                    // The column a line needs is its own prefix plus its own
+                    // field.  The group takes the widest of those -- not the
+                    // widest prefix plus the widest field, which belong to
+                    // different lines: `assign a = 1;` beside
+                    // `defparam u.P = 1;` put every `=` a whole `assign `
+                    // right of the longest line.
+                    auto line_extent = [&](const Line& ln) {
+                        return ln.lhs_prefix_width + std::max(opts_.statement.lhs_min_width, ln.lhs_width);
+                    };
+                    int group_extent = 0;
+                    for (size_t k = li; k < j; ++k)
+                        group_extent = std::max(group_extent, line_extent(lines[k]));
                     for (size_t k = li; k < j; ++k) {
                         // Adaptive keeps each line's own prefix and field;
                         // otherwise every operator in the group shares one
                         // column, whatever case label stands in front of it.
-                        const int lhs_field = opts_.statement.align_adaptive
-                            ? std::max(opts_.statement.lhs_min_width, lines[k].lhs_width)
-                            : group_lhs;
-                        const int prefix = opts_.statement.align_adaptive
-                            ? lines[k].lhs_prefix_width
-                            : group_prefix;
+                        const int extent = opts_.statement.align_adaptive ? line_extent(lines[k]) : group_extent;
                         const int target = opts_.tab_align
-                            ? snap_to_grid(prefix + lhs_field + op_gap, opts_.indent_size)
-                            : prefix + lhs_field + op_gap;
+                            ? snap_to_grid(extent + op_gap, opts_.indent_size)
+                            : extent + op_gap;
                         tokens[lines[k].assign_idx].mutable_.align.enabled = true;
                         tokens[lines[k].assign_idx].mutable_.align.target_column =
                             lines[k].indent + target;

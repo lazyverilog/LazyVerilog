@@ -5895,3 +5895,54 @@ endmodule
     CHECK(format_stable(input, opts) == wrapped.substr(1));
     CHECK(format_stable(input) == wrapped.substr(1));
 }
+
+TEST_CASE("formatter regression: an alignment group takes the widest line, not the widest prefix plus the widest field", "[formatter][regression]") {
+    // U-10: the group column was the longest `assign `/case-label prefix plus
+    // the longest LHS field, which belong to different lines.  `defparam` has
+    // no prefix and a long field, so beside `assign` every `=` moved a whole
+    // `assign ` right of the longest line.
+    FormatOptions opts;
+    opts.statement.align = true;
+    const std::string input = R"SV(module m;
+assign a = 1;
+defparam u.P = 1, u.QQQQ = 2;
+assign zz = 1;
+always_comb case (s)
+pkg::RUN, pkg::WAIT: n = 1;
+default: next_state = 0;
+endcase
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign a     = 1;
+  defparam u.P = 1, u.QQQQ = 2;
+  assign zz    = 1;
+  always_comb
+    case (s)
+      pkg::RUN, pkg::WAIT: n = 1;
+      default: next_state    = 0;
+    endcase
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    // Lines that share a prefix are unchanged.
+    const std::string only_assign = R"SV(
+module m;
+  assign a  = 1, b = 2;
+  assign zz = 1;
+endmodule
+)SV";
+    CHECK(format_stable("module m;\nassign a = 1, b = 2;\nassign zz = 1;\nendmodule\n", opts) == only_assign.substr(1));
+
+    // A minimum field still starts after each line's own prefix.
+    opts.statement.lhs_min_width = 6;
+    const std::string with_min = R"SV(
+module m;
+  assign a      = 1;
+  assign zz     = 1;
+endmodule
+)SV";
+    CHECK(format_stable("module m;\nassign a = 1;\nassign zz = 1;\nendmodule\n", opts) == with_min.substr(1));
+}
