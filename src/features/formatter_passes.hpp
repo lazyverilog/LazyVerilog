@@ -6903,6 +6903,26 @@ public:
             // -- a label names the statement or item that follows it.
             if (kind_is(t, TK::Colon) && t.immutable.topology.is_item_label_colon)
                 spaces = 0;
+            // `instance top.a use lib.cell:cfg;` -- in a config's `use` clause
+            // the colon joins a cell to the configuration that binds it.  It is
+            // part of the name, not a conditional's or a label's.  `use` is a
+            // keyword of config blocks and nothing else.
+            {
+                auto is_use_clause_colon = [&](size_t at) {
+                    if (!kind_is(tokens[at], TK::Colon))
+                        return false;
+                    for (size_t p = prev_code(tokens, at); p != npos; p = prev_code(tokens, p)) {
+                        if (kind_is(tokens[p], TK::UseKeyword))
+                            return true;
+                        if (kind_is(tokens[p], TK::Semicolon) || is_open_block(tokens[p].lex.kind) ||
+                            is_close_block(tokens[p].lex.kind))
+                            return false;
+                    }
+                    return false;
+                };
+                if (is_use_clause_colon(i) || is_use_clause_colon(i - 1))
+                    spaces = 0;
+            }
 
             // semicolon_spacing: controls space before/after `;` inside for-loop headers
             // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)

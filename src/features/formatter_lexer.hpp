@@ -248,6 +248,12 @@ private:
             if (tokens_[i].lex.kind == TKind::SequenceKeyword && prev < tokens_.size() &&
                 tokens_[prev].lex.kind == TKind::DefaultKeyword)
                 tokens_[i].lex.kind = TKind::Identifier;
+            // `cell lib.b use other:config;` -- the suffix of a config's `use`
+            // clause says the cell named is itself a configuration.  A
+            // declaration's `config` never follows a colon.
+            if (tokens_[i].lex.kind == TKind::ConfigKeyword && prev < tokens_.size() &&
+                tokens_[prev].lex.kind == TKind::Colon)
+                tokens_[i].lex.kind = TKind::Identifier;
             prev = i;
         }
     }

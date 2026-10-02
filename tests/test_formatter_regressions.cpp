@@ -5468,3 +5468,35 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a config use clause keeps cell:config closed up", "[formatter][regression]") {
+    // T-9: the colon of `lib.cell:cfg` was spaced like a conditional's.
+    const std::string input = R"SV(config c;
+design lib.top;
+default liblist lib;
+instance top.a use lib.cell:cfg;
+cell lib.b use other : config;
+endconfig
+module m;
+assign y = s ? a:b;
+initial begin : blk
+x = c ? 1:0;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+config c;
+  design lib.top;
+  default liblist lib;
+  instance top.a use lib.cell:cfg;
+  cell lib.b use other:config;
+endconfig
+module m;
+  assign y = s ? a : b;
+  initial begin: blk
+    x = c ? 1 : 0;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
