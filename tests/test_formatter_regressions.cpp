@@ -5658,3 +5658,51 @@ endmodule
 )SV";
     CHECK(format_stable(call_input, calls) == call_expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a line led by ? after a directive continues its statement", "[formatter][regression]") {
+    // T-7: after a conditional directive a line led by `&` or by the
+    // conditional's `:` kept its continuation indent, and one led by `?` fell
+    // back to the statement's own.
+    const std::string input = R"SV(module m;
+assign q = en
+`ifdef INV
+? ~d
+`else
+? d
+`endif
+: 0;
+assign r = en
+`ifdef INV
+& ~d
+`endif
+;
+always_comb
+casez (s)
+3'b1??: y = 1;
+default: y = 0;
+endcase
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign q = en
+`ifdef INV
+    ? ~d
+`else
+    ? d
+`endif
+    : 0;
+  assign r = en
+`ifdef INV
+    & ~d
+`endif
+  ;
+  always_comb
+    casez (s)
+      3'b1??: y = 1;
+      default: y = 0;
+    endcase
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
