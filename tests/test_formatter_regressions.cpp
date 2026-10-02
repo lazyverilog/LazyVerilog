@@ -5061,3 +5061,39 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: an empty instance port list spaces like a filled one", "[formatter][regression]") {
+    // S-11: the instance gap was keyed on the list WrapPass tags, and an
+    // empty `()` is no list, so `u0()` sat beside `u1 (`.
+    const std::string input = R"SV(module m;
+sub u0 ();
+sub u1 (.a(a));
+sub u2 (), u3 (.*);
+sub #() u4 ();
+sub arr [3:0] ();
+initial f();
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.instance.align = true;
+    const std::string expected = R"SV(
+module m;
+  sub u0 ();
+  sub u1 (
+    .a (a)
+  );
+  sub u2 (), u3 (
+    .*
+  );
+  sub #() u4 ();
+  sub arr[3:0] ();
+  initial
+    f();
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+    // Without the option an instance spaces like a call, array or not.
+    const std::string plain = format_stable(input);
+    CHECK(plain.find("  sub u0();\n") != std::string::npos);
+    CHECK(plain.find("  sub arr[3:0]();\n") != std::string::npos);
+}

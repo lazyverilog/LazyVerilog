@@ -2465,7 +2465,8 @@ TEST_CASE("formatter: zero-port instance is not variable declaration aligned", "
                         opts) ==
           "module m;\n"
           "packet_t                                value                               ;\n"
-          "memory u_mem4();\n"
+          // `instance.align` spaces every instance's port list, empty or not (S-11).
+          "memory u_mem4 ();\n"
           "endmodule\n");
 }
 

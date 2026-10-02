@@ -6466,6 +6466,12 @@ public:
             // declarations (or vice versa).  Check it before the generic
             // call-like rule below; wrapped and unwrapped declarations both
             // pass through this spacing pass.
+            // An empty port list (`sub u0 ();`) is no list to WrapPass, so it
+            // is recognised by its shape here.
+            const bool empty_instance_ports =
+                kind_is(t, TK::OpenParenthesis) && t.immutable.syntax.matching_token != npos &&
+                next_code(tokens, i + 1, tokens.size()) == t.immutable.syntax.matching_token &&
+                is_instance_port_open(tokens, i);
             if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
                 spaces = opts_.function_declaration.space_before_paren ? 1 : 0;
             // Function/task call spacing.  `new` lexes as its own keyword rather
@@ -6489,7 +6495,7 @@ public:
                 // `u_arr[3:0](...)` -- an instance array's connections space
                 // like the plain instance's `u_one(...)`.
                 else if (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts ||
-                         is_gate_terminal_open(tokens, i))
+                         is_gate_terminal_open(tokens, i) || empty_instance_ports)
                     spaces = opts_.function_call.space_before_paren ? 1 : 0;
             }
             // `rand join (0.5) a b` -- the lexer hands a production's `join`
@@ -6500,9 +6506,9 @@ public:
                 if (before != npos && kind_is(tokens[before], TK::RandKeyword))
                     spaces = 1;
             }
-            if (kind_is(t, TK::OpenParenthesis) &&
-                (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i)) &&
-                opts_.instance.align)
+            if (kind_is(t, TK::OpenParenthesis) && opts_.instance.align &&
+                (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i) ||
+                 empty_instance_ports))
                 spaces = 1;
             if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::ModportBody)
                 spaces = 1;
