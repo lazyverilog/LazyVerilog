@@ -3794,9 +3794,17 @@ private:
                             break;
                     }
                 }
+                // `for (int i = 0; // init` / `i < 4; // cond` / `i++)` --
+                // the `;` of a `for` header separates its clauses and ends no
+                // statement; the clause after it continues the header.
+                bool for_header_semicolon = false;
+                if (pk == TK::Semicolon && enclosing != npos && kind_is(tokens[enclosing], TK::OpenParenthesis)) {
+                    const size_t owner = prev_code(tokens, enclosing);
+                    for_header_semicolon = owner != npos && kind_is(tokens[owner], TK::ForKeyword);
+                }
                 const bool continues =
                     is_binary_op(pk) || is_assignment_op(pk) || pk == TK::Question || open_delim ||
-                    prefix_only_op || statement_comma ||
+                    prefix_only_op || statement_comma || for_header_semicolon ||
                     prev_is_conditional_colon || event_or || leads_conditional_colon ||
                     leads_conditional_question ||
                     (pk == TK::Comma && enclosing != npos) ||

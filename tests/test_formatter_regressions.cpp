@@ -6257,3 +6257,47 @@ endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected.substr(1));
 }
+
+// U-8: the `;` of a `for` header separates clauses; a clause a comment pushed
+// onto its own line continues the header and takes the continuation indent.
+TEST_CASE("formatter regression: a for header split by comments indents its clauses",
+          "[formatter][regression]") {
+    FormatOptions opts;
+    const std::string input = R"SV(
+module m;
+  initial begin
+    for (int i = 0; // init
+         i < 4; // cond
+         i++) // step
+      x = i;
+    for (int i = 0;
+         // own
+         i < 4; i++)
+      x = i;
+    for (int i = 0; i < 4; i++)
+      x = i;
+    for (;;)
+      x = 1;
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    for (int i = 0; // init
+      i < 4; // cond
+      i++) // step
+      x = i;
+    for (int i = 0;
+      // own
+      i < 4; i++)
+      x = i;
+    for (int i = 0; i < 4; i++)
+      x = i;
+    for (;;)
+      x = 1;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
+}
