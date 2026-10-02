@@ -5296,3 +5296,40 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a property's case is laid out as a block", "[formatter][regression]") {
+    // S-9: each item of a property `case` ends its line at its `;`, but the
+    // keyword was treated as an operator, so the first item stayed on the
+    // header's line and the others were not indented.
+    const std::string input = R"SV(module m;
+property p;
+@(posedge clk) case (mode)
+2'd0: req |-> gnt;
+default: 1'b1;
+endcase
+endproperty
+property r; @(posedge clk) a |-> case (m) 0: a; default: if (b) c else d; endcase; endproperty
+a1: assert property (@(posedge clk) case (m) 0: a; default: b; endcase);
+a2: assert property (@(posedge clk) if (a) b else c);
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  property p;
+    @(posedge clk) case (mode)
+      2'd0: req |-> gnt;
+      default: 1'b1;
+    endcase
+  endproperty
+  property r;
+    @(posedge clk) a |-> case (m)
+      0: a;
+      default: if (b) c else d;
+    endcase;
+  endproperty
+  a1: assert property (@(posedge clk) case (m) 0: a; default: b; endcase);
+  a2: assert property (@(posedge clk) if (a) b else c);
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}

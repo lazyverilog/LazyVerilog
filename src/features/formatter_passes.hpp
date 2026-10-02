@@ -216,12 +216,18 @@ inline bool is_code_token(const Tok& t) {
 // `if`/`else`/`case`/`endcase` used as property operators
 // (`assert property (@(posedge c) if (a) b else c);`).  They take none of the
 // statement layout their procedural spellings get.
+//
+// A property `case` outside every parenthesis is the exception.  Its items
+// each end in a `;` and so end their lines whatever is decided here; treated
+// as an operator it kept its first item on the header's line and the rest
+// unindented.  It is laid out as the block it is written as.
 inline bool is_property_operator_keyword(const Tok& t) {
     if (!t.immutable.syntax.in_property_expr)
         return false;
     const TK k = t.lex.kind;
-    return k == TK::IfKeyword || k == TK::ElseKeyword || k == TK::CaseKeyword ||
-           k == TK::EndCaseKeyword;
+    if (k == TK::CaseKeyword || k == TK::EndCaseKeyword)
+        return t.immutable.syntax.paren_depth > 0;
+    return k == TK::IfKeyword || k == TK::ElseKeyword;
 }
 
 inline bool is_covergroup_event_at(const TokenStream& tokens, size_t at) {
@@ -2895,6 +2901,11 @@ public:
             bool close_before_inline_else =
                 kind_is(t, TK::CloseBrace) && next_i != npos && kind_is(tokens[next_i], TK::ElseKeyword) &&
                 !opts_.statement.wrap_end_else_clauses;
+            // `endcase;` -- a property's `case` is an expression, and the
+            // `;` that ends the property follows it on its line.
+            bool property_endcase_before_semicolon =
+                kind_is(t, TK::EndCaseKeyword) && t.immutable.syntax.in_property_expr && next_i != npos &&
+                kind_is(tokens[next_i], TK::Semicolon);
             bool end_before_do_while =
                 kind_is(t, TK::EndKeyword) && next_i != npos && tokens[next_i].immutable.topology.ends_do_while;
             if ((kind_is(t, TK::BeginKeyword) && !followed_by_label_colon) ||
@@ -2902,6 +2913,7 @@ public:
                 (is_outer_close(t.lex.kind) && !followed_by_label_colon) ||
                 (is_close_block(t.lex.kind) && !followed_by_label_colon && !property_keyword &&
                  !end_before_do_while &&
+                 !property_endcase_before_semicolon &&
                  !close_brace_before_decl_name &&
                  !close_brace_before_semicolon &&
                  !close_before_inline_else &&
