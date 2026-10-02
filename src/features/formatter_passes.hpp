@@ -1334,6 +1334,12 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
             if ((is_close_block(ik) && ik != TK::CloseBrace) || is_outer_close(ik) ||
                 ik == TK::BeginKeyword || ik == TK::ForkKeyword || ik == TK::GenerateKeyword)
                 break;
+            // `if (a) s[1] else s[2];` -- a property's `else` joins two
+            // expressions with no `;` between them, and the walk read
+            // `s[1] else s` as a type and a name.  Nothing before an `else`
+            // belongs to what follows it.
+            if (ik == TK::ElseKeyword)
+                break;
             // `begin : gen` -- the block's name belongs to its opener, not to
             // the first item after it (`begin : gen assign wl[g] = 1;`).
             const size_t before = prev_code(tokens, i);

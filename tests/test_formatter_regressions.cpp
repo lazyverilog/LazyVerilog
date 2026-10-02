@@ -5946,3 +5946,37 @@ endmodule
 )SV";
     CHECK(format_stable("module m;\nassign a = 1;\nassign zz = 1;\nendmodule\n", opts) == with_min.substr(1));
 }
+
+TEST_CASE("formatter regression: an index after a property's else is not a dimension", "[formatter][regression]") {
+    // U-7: `if (a) s[1] else s[2];` has no `;` between its branches, so the
+    // search for a declaration's start ran back past `else` and found two
+    // names -- a type and a declarator -- and spaced `s [2]`.
+    const std::string input = R"SV(module m;
+property p;
+@(posedge clk) if (s[0]) s[1] else s[2];
+endproperty
+property q;
+if (a) b[0] else c[1];
+endproperty
+int d [2];
+always_comb if (a) y[0] = 1; else y[1] = 2;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  property p;
+    @(posedge clk) if (s[0]) s[1] else s[2];
+  endproperty
+  property q;
+    if (a) b[0] else c[1];
+  endproperty
+  int d [2];
+  always_comb
+    if (a)
+      y[0] = 1;
+    else
+      y[1] = 2;
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+}
