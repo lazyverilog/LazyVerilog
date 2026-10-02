@@ -6213,3 +6213,47 @@ endmodule
     opts.instance.align_adaptive = true;
     CHECK(format_stable(input, opts) == adaptive.substr(1));
 }
+
+TEST_CASE("formatter regression: a macro statement after a terminator macro still ends its line", "[formatter][regression]") {
+    // U-5: whether a macro can be a statement is decided from the token in
+    // front of it, and a `statement_terminator_like` macro there is a
+    // statement end only by configuration.  The macro after it was never
+    // asked, so it swallowed the statement that followed.
+    FormatOptions opts;
+    opts.macros.statement_terminator_like = {"SEMI"};
+    const std::string input = R"SV(module m;
+initial begin
+x = 3 `SEMI
+`FOO(a, b)
+if (a) x = 1;
+y = 7;
+`FOO(a, b)
+if (a) x = 1;
+x = 3 `SEMI y = 4 `SEMI
+`REG = 1;
+x = 3 `SEMI
+`MY_T(8) sig;
+end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    x = 3 `SEMI
+    `FOO(a, b)
+    if (a)
+      x = 1;
+    y = 7;
+    `FOO(a, b)
+    if (a)
+      x = 1;
+    x = 3 `SEMI
+    y = 4 `SEMI
+    `REG = 1;
+    x = 3 `SEMI
+    `MY_T(8) sig;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

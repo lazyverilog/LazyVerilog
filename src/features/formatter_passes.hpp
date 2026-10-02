@@ -2771,6 +2771,18 @@ private:
             const size_t end = macro_invocation_end(tokens, i);
             bool ends = tokens[end].immutable.topology.may_end_macro_statement;
             const MacroRole role = mc.classify(t.lex.text);
+            // `` x = 3 `SEMI `` / `` `FOO(a, b) `` / `if (a) ...` -- SyntaxPass
+            // decides whether a macro sits where a statement can start from
+            // the token before it, and cannot know that a macro there ends a
+            // statement by configuration alone.  Such a macro was no start,
+            // so the one after it was never asked whether it is a statement
+            // and swallowed the next.  Ask now, with the same test.
+            if (!ends) {
+                const size_t before = prev_code(tokens, i);
+                if (before != npos && tokens[before].mutable_.macro.ends_statement &&
+                    !tokens[before].immutable.topology.may_end_macro_statement)
+                    ends = macro_statement_end(tokens, i, false) != npos;
+            }
             // A block-begin macro opens a body that runs to its block-end
             // macro (see simple_statement_end_from), exactly like `begin`.
             if (role == MacroRole::StatementTerminatorLike) {
