@@ -6406,3 +6406,53 @@ endmodule
 )SV";
     CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
 }
+
+// U-4: the arguments of a `whitespace_sensitive` macro are left exactly as
+// written -- gaps, line breaks and comments -- because the macro may stringify
+// them.  The lexer freezes the text between the parentheses; the invocation
+// itself is still placed, indented and ended like any other macro.
+TEST_CASE("formatter regression: whitespace_sensitive macro arguments are verbatim",
+          "[formatter][regression]") {
+    FormatOptions opts; // DV_CHECK_FATAL is whitespace-sensitive by default
+    const std::string input = R"SV(
+module m;
+  initial begin
+      `DV_CHECK_FATAL(a   ==   b ,  "msg" )
+    `DV_CHECK_FATAL(  a==b,"msg")
+    `DV_CHECK_FATAL(a ,  // why
+          b /* x */ ,   c)
+    x   =   1;
+    if (a)   `DV_CHECK_FATAL( a,b )
+    y = `DV_CHECK_FATAL( f( x ,y ) , ")" )   +   1;
+    `DV_CHECK_FATAL( )
+    `OTHER(a   ==   b ,  "msg" )
+  end
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  initial begin
+    `DV_CHECK_FATAL(a   ==   b ,  "msg" )
+    `DV_CHECK_FATAL(  a==b,"msg")
+    `DV_CHECK_FATAL(a ,  // why
+          b /* x */ ,   c)
+    x = 1;
+    if (a)
+      `DV_CHECK_FATAL( a,b )
+    y = `DV_CHECK_FATAL( f( x ,y ) , ")" ) + 1;
+    `DV_CHECK_FATAL()
+    `OTHER(a == b, "msg")
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
+
+    // The list takes the name with its backtick too.
+    opts.macros.whitespace_sensitive = {"`OTHER"};
+    CHECK(format_stable(input.substr(1), opts).find("`OTHER(a   ==   b ,  ") != std::string::npos);
+
+    // Off the list, the same macro is spaced like any other call.
+    opts.macros.whitespace_sensitive.clear();
+    const std::string unlisted = format_stable(input.substr(1), opts);
+    CHECK(unlisted.find("`DV_CHECK_FATAL(a == b, \"msg\")") != std::string::npos);
+}

@@ -157,6 +157,7 @@ public:
         mark_vector_literal_digits();
         mark_block_event_keywords();
         mark_production_join_keywords();
+        freeze_whitespace_sensitive_arguments();
         return tokens_;
     }
 
@@ -222,6 +223,88 @@ private:
                     tokens_[j].lex.kind = TKind::Identifier;
             }
             i = j;
+        }
+    }
+
+    // `` `DV_CHECK_FATAL(a   ==   b ,  "msg" ) `` -- a macro listed under
+    // `[format.macros] whitespace_sensitive` may stringify or paste what it is
+    // given, so the text between its parentheses is part of what the source
+    // says.  Freeze it here as one verbatim token, the way a multi-line
+    // `` `define `` and a format-off region are: a pass can only reproduce a
+    // gap by reading the input's whitespace, which no pass may do.  The
+    // parentheses stay tokens, so everything that asks where the invocation
+    // ends still finds its `)`.
+    void freeze_whitespace_sensitive_arguments() {
+        using TKind = slang::parsing::TokenKind;
+        if (opts_.macros.whitespace_sensitive.empty())
+            return;
+        auto listed = [&](std::string_view text) {
+            if (!text.empty() && text.front() == '`')
+                text.remove_prefix(1);
+            // The list takes names with or without the backtick.
+            for (const std::string& entry : opts_.macros.whitespace_sensitive) {
+                std::string_view name = entry;
+                if (!name.empty() && name.front() == '`')
+                    name.remove_prefix(1);
+                if (text == name)
+                    return true;
+            }
+            return false;
+        };
+        auto offset = [](const Tok& t) { return t.lex.range.start().offset(); };
+        for (size_t i = 0; i + 2 < tokens_.size(); ++i) {
+            if (tokens_[i].lex.kind != TKind::MacroUsage || !listed(tokens_[i].lex.text))
+                continue;
+            const size_t open = i + 1;
+            if (tokens_[open].lex.kind != TKind::OpenParenthesis || tokens_[open].lex.is_whitespace_sensitive)
+                continue;
+            // Anything that already owns its own text -- a directive, a
+            // format marker, a frozen region -- is left to its owner.
+            size_t close = open;
+            int depth = 0;
+            bool plain = true;
+            for (size_t j = open; j < tokens_.size(); ++j) {
+                const auto& lex = tokens_[j].lex;
+                if (lex.is_directive || lex.is_whitespace_sensitive || lex.is_format_off_marker ||
+                    lex.is_format_on_marker || lex.is_disabled_region_body) {
+                    plain = false;
+                    break;
+                }
+                if (lex.comment_kind != CommentLexemeKind::None)
+                    continue;
+                if (lex.kind == TKind::OpenParenthesis)
+                    ++depth;
+                else if (lex.kind == TKind::CloseParenthesis && --depth == 0) {
+                    close = j;
+                    break;
+                }
+            }
+            if (!plain || close <= open + 1)
+                continue;
+            const size_t begin = offset(tokens_[open]) + tokens_[open].lex.text.size();
+            const size_t end = offset(tokens_[close]);
+            if (end <= begin || end > source_.size())
+                continue;
+            Tok frozen;
+            frozen.lex.kind = TKind::Unknown;
+            frozen.lex.text.assign(source_, begin, end - begin);
+            frozen.lex.range = slang::SourceRange(
+                slang::SourceLocation(slang::BufferID::getPlaceholder(), begin),
+                slang::SourceLocation(slang::BufferID::getPlaceholder(), end));
+            frozen.lex.is_whitespace_sensitive = true;
+            frozen.immutable.input_trivia.original_column =
+                tokens_[open].immutable.input_trivia.original_column +
+                static_cast<int>(tokens_[open].lex.text.size());
+            frozen.immutable.input_trivia.original_indent = frozen.immutable.input_trivia.original_column;
+            // The gap before `)` is inside the frozen text now.
+            auto& close_trivia = tokens_[close].immutable.input_trivia;
+            close_trivia.original_spaces_before = 0;
+            close_trivia.original_newlines_before = 0;
+            close_trivia.starts_original_line = false;
+            tokens_.erase(tokens_.begin() + static_cast<std::ptrdiff_t>(open + 1),
+                          tokens_.begin() + static_cast<std::ptrdiff_t>(close));
+            tokens_.insert(tokens_.begin() + static_cast<std::ptrdiff_t>(open + 1), std::move(frozen));
+            i = open + 1;
         }
     }
 

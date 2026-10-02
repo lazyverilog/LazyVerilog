@@ -18,6 +18,8 @@ whitespace_sensitive = ["DV_SPINWAIT"]
 
 Names work with or without the leading backtick. Put a macro in one role only.
 `whitespace_sensitive` is an extra safety flag that can go with any role.
+The text between the macro's parentheses is kept byte for byte: gaps, line breaks and
+comments. The invocation itself is still placed and indented by its role.
 
 ## Roles
 
