@@ -3402,7 +3402,14 @@ public:
                 auto items = top_level_list_items(tokens, open + 1, close);
                 if (items.empty())
                     continue;
-                bool block = opts_.module.parameter_layout != "hanging";
+                // `#( // why` -- a hanging list lines its items up under the
+                // first one, which sits on the opener's line.  A comment
+                // there takes that place, so the list is a block, as a
+                // function's formals already are.
+                const bool comment_after_open =
+                    open + 1 < close && tokens[open + 1].lex.comment_kind != CommentLexemeKind::None &&
+                    !is_passthrough(tokens[open + 1]);
+                bool block = opts_.module.parameter_layout != "hanging" || comment_after_open;
                 const int one_line = line_prefix_width(tokens, open, opts_) + 1 +
                                      compact_width(tokens, open + 1, close) + 1;
                 const bool directive = parameter_list_contains_directive(tokens, open, close);
@@ -3547,7 +3554,12 @@ public:
                     }
                 }
                 if (do_break && opts_.function_call.break_policy != "never") {
-                    bool hanging = opts_.function_call.layout == "hanging";
+                    // `foo( // why` -- nothing to hang from: see the parameter
+                    // list above.
+                    const bool comment_after_open =
+                        open + 1 < close && tokens[open + 1].lex.comment_kind != CommentLexemeKind::None &&
+                        !is_passthrough(tokens[open + 1]);
+                    bool hanging = opts_.function_call.layout == "hanging" && !comment_after_open;
                     apply_list(open, hanging ? WrapListKind::FunctionHanging
                                              : WrapListKind::FunctionBlock,
                                !hanging, !hanging, !hanging);

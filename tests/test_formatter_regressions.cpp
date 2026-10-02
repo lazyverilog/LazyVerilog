@@ -5600,3 +5600,61 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a comment after the opener turns a hanging list into a block", "[formatter][regression]") {
+    // T-4: a hanging list lines up under its first item, on the opener's
+    // line.  With a comment there instead, the items hung one column to the
+    // right of nothing and the `)` stayed on the last one.
+    FormatOptions params;
+    params.module.parameter_layout = "hanging";
+    const std::string module_input = R"SV(module a #( // params
+parameter A = 1,
+parameter B = 2
+) (input x);
+endmodule
+module b #(parameter A = 1, // one
+parameter B = 2
+) (input x);
+endmodule
+)SV";
+    const std::string module_expected = R"SV(
+module a #( // params
+  parameter A = 1,
+  parameter B = 2
+)(
+  input x
+);
+endmodule
+module b #(parameter A = 1, // one
+           parameter B = 2)(
+  input x
+);
+endmodule
+)SV";
+    CHECK(format_stable(module_input, params) == module_expected.substr(1));
+
+    FormatOptions calls;
+    calls.function_call.layout = "hanging";
+    const std::string call_input = R"SV(module m;
+initial begin
+foo( // why
+a, b);
+foo(a, // why
+b);
+end
+endmodule
+)SV";
+    const std::string call_expected = R"SV(
+module m;
+  initial begin
+    foo( // why
+      a,
+      b
+    );
+    foo(a, // why
+        b);
+  end
+endmodule
+)SV";
+    CHECK(format_stable(call_input, calls) == call_expected.substr(1));
+}
