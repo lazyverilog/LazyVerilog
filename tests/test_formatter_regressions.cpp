@@ -5137,3 +5137,42 @@ endmodule
     const std::string both_part = format_stable(input, both);
     CHECK(enum_part.substr(0, enum_part.find("  initial")) == both_part.substr(0, both_part.find("  initial")));
 }
+
+TEST_CASE("formatter regression: a clocking or covergroup name is separated from its event", "[formatter][regression]") {
+    // S-8: the `@` option is about the keyword an event control follows.  It
+    // also glued the event to the name a clocking block or covergroup declares.
+    const std::string input = R"SV(module m;
+clocking cb @(posedge clk);
+endclocking
+global clocking gcb @(posedge clk);
+endclocking
+covergroup cg @(posedge clk);
+endgroup
+covergroup cg2 @@(begin f);
+endgroup
+always @(posedge clk) q <= d;
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.spacing.procedural_event_control_at_spacing = "none";
+    const std::string expected = R"SV(
+module m;
+  clocking cb @(posedge clk);
+  endclocking
+  global clocking gcb @(posedge clk);
+  endclocking
+  covergroup cg @(posedge clk);
+  endgroup
+  covergroup cg2 @@(begin f);
+  endgroup
+  always@(posedge clk)
+    q <= d;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+    opts.spacing.procedural_event_control_at_spacing = "after";
+    const std::string after = format_stable(input, opts);
+    CHECK(after.find("  clocking cb @ (posedge clk);\n") != std::string::npos);
+    CHECK(after.find("  covergroup cg @(posedge clk);\n") != std::string::npos);
+    CHECK(after.find("  always@ (posedge clk)\n") != std::string::npos);
+}

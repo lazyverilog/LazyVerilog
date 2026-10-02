@@ -324,7 +324,9 @@ Controls spaces around `@` in procedural event control (`always @(...)`).
 
 The space *before* `@` follows this option only after a keyword.  An intra-assignment event
 takes the assignment operator's spacing (`q <= @(posedge clk) d;`), and an `@` after a control's
-`)` or a delay (`wait (a) @(e)`, `#5 @(e)`) is always separated from it.
+`)` or a delay (`wait (a) @(e)`, `#5 @(e)`) is always separated from it.  So is an `@` after the
+name a clocking block or covergroup declares (`clocking cb @(posedge clk);`,
+`covergroup cg @(posedge clk);`).
 
 Values: `"none"` | `"before"` | `"after"` | `"both"`
 

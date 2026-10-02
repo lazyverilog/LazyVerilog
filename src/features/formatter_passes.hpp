@@ -238,6 +238,18 @@ inline bool is_covergroup_event_at(const TokenStream& tokens, size_t at) {
     return false;
 }
 
+inline size_t prev_code(const TokenStream& tokens, size_t before);
+
+// `clocking cb @(posedge clk);` -- the `@` after the name a clocking block
+// declares.  `default clocking @(e);` has no name and is not one.
+inline bool is_named_clocking_event_at(const TokenStream& tokens, size_t at) {
+    if (at >= tokens.size() || !kind_is(tokens[at], TK::At))
+        return false;
+    const size_t name = prev_code(tokens, at);
+    const size_t kw = name == npos ? npos : prev_code(tokens, name);
+    return kw != npos && kind_is(tokens[name], TK::Identifier) && kind_is(tokens[kw], TK::ClockingKeyword);
+}
+
 inline size_t prev_code(const TokenStream& tokens, size_t before) {
     before = std::min(before, tokens.size());
     for (size_t n = before; n > 0; --n) {
@@ -6679,6 +6691,11 @@ public:
                          (before_L != npos && kind_is(tokens[before_L], TK::Hash)) ||
                          (L_owner != npos && tokens[L_owner].immutable.topology.is_intra_assignment_repeat))
                     spaces = 1;
+                // `clocking cb @(e);`, `covergroup cg @(e);` -- the event
+                // follows the name being declared, not a keyword, and a name
+                // is separated from what comes after it.
+                else if (is_covergroup_event_at(tokens, i) || is_named_clocking_event_at(tokens, i))
+                    spaces = 1;
             }
             if (kind_is(L, TK::At)) {
                 const bool covergroup_event = is_covergroup_event_at(tokens, i - 1);
@@ -6686,7 +6703,7 @@ public:
             }
             // `@@(begin f)` -- a covergroup's block event, spaced as its `@(e)` is.
             if (kind_is(t, TK::DoubleAt))
-                spaces = wants_before(opts_.spacing.procedural_event_control_at_spacing) ? 1 : 0;
+                spaces = 1;
             if (kind_is(L, TK::DoubleAt))
                 spaces = 0;
             // space_inside_event_control_parens: add space inside ( ) of procedural event control.
