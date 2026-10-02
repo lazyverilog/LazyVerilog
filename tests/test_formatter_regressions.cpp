@@ -5176,3 +5176,33 @@ endmodule
     CHECK(after.find("  covergroup cg @(posedge clk);\n") != std::string::npos);
     CHECK(after.find("  always@ (posedge clk)\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: a leading-comma connection row keeps the paren column", "[formatter][regression]") {
+    // S-12: a comma that follows a `//` comment stays in front of the next
+    // connection.  The `(` column was computed as if it were not there.
+    const std::string input = R"SV(module m;
+sub u (
+    .clk(clk) // clock
+  , .rst_n(rst_n) // reset
+  , .q(q)
+);
+sub v (.a(a), .bb(b));
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.instance.align = true;
+    const std::string expected = R"SV(
+module m;
+  sub u (
+    .clk     (clk  ) // clock
+    , .rst_n (rst_n) // reset
+    , .q     (q    )
+  );
+  sub v (
+    .a  (a),
+    .bb (b)
+  );
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+}

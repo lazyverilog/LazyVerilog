@@ -6051,6 +6051,13 @@ public:
                 size_t cl = tokens[op].immutable.syntax.matching_token;
                 if (cl == npos || cl > item.last) continue;
                 int nw = token_width(tokens[name]);
+                // `, .rst_n(rst_n)` -- a comma that had to stay in front of
+                // its connection (after a `//` comment or a directive) shares
+                // the row, so the name field starts that much later.
+                const size_t lead = prev_code(tokens, dot);
+                if (lead != npos && lead > open && kind_is(tokens[lead], TK::Comma) &&
+                    !tokens[dot].mutable_.wrap.must_break_before)
+                    nw += 2;
                 // Measured as it will render, from `(` to `)` less the two
                 // parens: a select or a call inside the connection (`a[n]`,
                 // `f(x, y)`) is narrower than a private spacing estimate
