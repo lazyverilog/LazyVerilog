@@ -5257,7 +5257,12 @@ public:
                 const int section4 = option_width(port_decl ? opts_.port_declaration.section4_min_width
                                                             : opts_.var_declaration.section4_min_width, opts_);
 
-                int name_target = base + token_width(tokens[first]) + section2 + 1;
+                // The type column's width.  `tab_align` puts every column
+                // on the indent grid, and this one was the widest keyword
+                // plus one, unsnapped: the dimension landed off the grid and
+                // carried the name and `;` columns, measured from it, along.
+                const int keyword_field = option_width(declaration_keyword_width + 1, opts_);
+                int name_target = base + option_width(token_width(tokens[first]) + 1, opts_) + section2;
                 if (port_decl) {
                     size_t type_first = next_code(tokens, first + 1, name);
                     if (type_first != npos && type_first < name) {
@@ -5275,7 +5280,7 @@ public:
                     name_target = base + section1 + section2;
                 } else if (dim != npos && declaration_line_count >= 2) {
                     tokens[dim].mutable_.align.enabled = true;
-                    tokens[dim].mutable_.align.target_column = base + declaration_keyword_width + 1;
+                    tokens[dim].mutable_.align.target_column = base + keyword_field;
                     name_target = tokens[dim].mutable_.align.target_column + section2;
                 } else if (dim == npos && section1 > 0) {
                     name_target = base + section1 + section2;
@@ -5283,7 +5288,7 @@ public:
                     // The same name column as a line with a packed dimension,
                     // measured from the widest keyword rather than this
                     // line's own, so `int a;` and `logic b;` line up.
-                    name_target = base + declaration_keyword_width + 1 + section2;
+                    name_target = base + keyword_field + section2;
                 }
 
                 const bool align_name = declaration_line_count >= 2 || dim != npos ||

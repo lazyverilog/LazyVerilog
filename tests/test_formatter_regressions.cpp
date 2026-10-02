@@ -5980,3 +5980,45 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: tab_align puts the declaration type column on the grid", "[formatter][regression]") {
+    // U-3: with the default section1_min_width the dimension column was the
+    // widest type keyword plus one -- 13 here -- and the name and `;`
+    // columns were measured from it, so all three sat off the 4-column grid.
+    FormatOptions opts;
+    opts.tab_align = true;
+    opts.indent_size = 4;
+    opts.var_declaration.align = true;
+    const std::string input = R"SV(module m;
+wire [7:0] w;
+logic [3:0] y;
+logic z;
+shortint unsigned [1:0] s;
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+    wire        [7:0]                           w                               ;
+    logic       [3:0]                           y                               ;
+    logic                                       z                               ;
+    shortint unsigned [1:0]                     s                               ;
+endmodule
+)SV";
+    for (bool adaptive : {true, false}) {
+        opts.var_declaration.align_adaptive = adaptive;
+        CHECK(format_stable(input, opts) == expected.substr(1));
+    }
+
+    // Without tab_align the columns are the widths themselves.
+    opts.tab_align = false;
+    opts.var_declaration.align_adaptive = true;
+    const std::string plain = R"SV(
+module m;
+    wire     [7:0]                         w                             ;
+    logic    [3:0]                         y                             ;
+    logic                                  z                             ;
+    shortint unsigned [1:0]                s                             ;
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == plain.substr(1));
+}
