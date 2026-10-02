@@ -5706,3 +5706,43 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: space_inside_paren pads a constructor like any call", "[formatter][regression]") {
+    // T-11: `new` is a keyword, so its `(` is not an argument list to the
+    // wrapping passes, and the option skipped it -- in a call and in the
+    // constructor's own header.
+    FormatOptions opts;
+    opts.function_call.space_inside_paren = true;
+    const std::string input = R"SV(class c;
+function new(string name); super.new(name); endfunction
+function void g(int a); x = new(a); y = f(a); q = new[4]; z = new; w = (a + b); endfunction
+endclass
+)SV";
+    const std::string expected = R"SV(
+class c;
+  function new( string name );
+    super.new( name );
+  endfunction
+  function void g( int a );
+    x = new( a );
+    y = f( a );
+    q = new[4];
+    z = new;
+    w = (a + b);
+  endfunction
+endclass
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    const std::string plain = R"SV(
+class c;
+  function new(string name);
+    super.new(name);
+  endfunction
+endclass
+)SV";
+    CHECK(format_stable(R"SV(class c;
+function new(string name); super.new(name); endfunction
+endclass
+)SV") == plain.substr(1));
+}

@@ -6595,11 +6595,31 @@ public:
                 t.mutable_.space.suppress_space = true;
                 continue;
             }
+            // function_call.space_inside_paren pads an argument list.  `new` is
+            // a keyword, so its `(` is not marked as one for the wrapping
+            // passes -- a constructor call is not broken like a call -- but it
+            // is one to this option, as it already is to space_before_paren.
+            auto pads_call_open = [&](size_t at) {
+                if (!opts_.function_call.space_inside_paren || !kind_is(tokens[at], TK::OpenParenthesis))
+                    return false;
+                if (tokens[at].immutable.topology.starts_argument_list)
+                    return true;
+                const size_t callee = prev_code(tokens, at);
+                return callee != npos && kind_is(tokens[callee], TK::NewKeyword);
+            };
+            auto pads_call_close = [&](size_t at) {
+                if (!opts_.function_call.space_inside_paren || !kind_is(tokens[at], TK::CloseParenthesis))
+                    return false;
+                if (tokens[at].immutable.topology.ends_argument_list)
+                    return true;
+                const size_t match = tokens[at].immutable.syntax.matching_token;
+                return match != npos && pads_call_open(match);
+            };
             // `#( .WIDTH(8) )` -- a padded `(` pads before a named connection
             // too, as it does before any other first token.
             const bool padded_open = kind_is(L, TK::OpenParenthesis) &&
                 (opts_.spacing.space_inside_parens ||
-                 (L.immutable.topology.starts_argument_list && opts_.function_call.space_inside_paren));
+                 (pads_call_open(i - 1)));
             // `sub u ((* keep *) .p(x));` -- an attribute keeps a space on each
             // side, before the connection it annotates as before anything else.
             const bool after_attribute = kind_is(L, TK::CloseParenthesis) &&
@@ -6699,8 +6719,8 @@ public:
                 spaces = opts_.spacing.control_keyword_space ? 1 : 0;
             if ((kind_is(L, TK::OpenParenthesis) || kind_is(t, TK::CloseParenthesis)) && opts_.spacing.space_inside_parens) spaces = 1;
             // function.space_inside_paren: space inside argument-list parens only
-            if (kind_is(L, TK::OpenParenthesis) && L.immutable.topology.starts_argument_list && opts_.function_call.space_inside_paren) spaces = 1;
-            if (kind_is(t, TK::CloseParenthesis) && t.immutable.topology.ends_argument_list && opts_.function_call.space_inside_paren) spaces = 1;
+            if (kind_is(L, TK::OpenParenthesis) && pads_call_open(i - 1)) spaces = 1;
+            if (kind_is(t, TK::CloseParenthesis) && pads_call_close(i)) spaces = 1;
             if ((kind_is(L, TK::OpenBracket) || kind_is(t, TK::CloseBracket)) && opts_.spacing.space_inside_dimension_brackets) spaces = 1;
 
             // } brace: 1 space after (unless followed by ; or ,).  Only a brace
@@ -6723,7 +6743,7 @@ public:
             // A padded `)` keeps its pad after a `}` as after anything else.
             if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&
-                !(t.immutable.topology.ends_argument_list && opts_.function_call.space_inside_paren))
+                !(pads_call_close(i)))
                 spaces = 0;
 
             // Apostrophe / cast: no space
@@ -6978,7 +6998,7 @@ public:
                 spaces = 0;
             if (kind_is(t, TK::CloseParenthesis) &&
                 !opts_.spacing.space_inside_parens &&
-                !(t.immutable.topology.ends_argument_list && opts_.function_call.space_inside_paren)) {
+                !(pads_call_close(i))) {
                 bool event_control_close = false;
                 if (opts_.spacing.space_inside_event_control_parens &&
                     t.immutable.syntax.matching_token != npos) {
