@@ -4446,6 +4446,14 @@ public:
             if (cur_first != npos && tokens[cur_first].immutable.syntax.paren_depth > 0 &&
                 !kind_is(tokens[cur_first], TK::CloseParenthesis))
                 ln.disabled = true;
+            // `IDLE = 3'd0,` -- an enum member's `=` gives it a value.  Its
+            // columns belong to `enum_declaration.align`.
+            if (cur_first != npos) {
+                const size_t list = tokens[cur_first].mutable_.wrap.list_open;
+                if (list != npos && list < tokens.size() &&
+                    tokens[list].mutable_.wrap.list_kind == WrapListKind::EnumBody)
+                    ln.disabled = true;
+            }
             // Find assignment op at depth 0
             int pd = 0, bd = 0, brd = 0;
             size_t scan_start = (cur_first != npos ? cur_first : cur_start);

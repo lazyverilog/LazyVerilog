@@ -5097,3 +5097,43 @@ endmodule
     CHECK(plain.find("  sub u0();\n") != std::string::npos);
     CHECK(plain.find("  sub arr[3:0]();\n") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: statement.align leaves enum members to their own option", "[formatter][regression]") {
+    // S-13: `NAME = value,` read as an assignment, so `statement.align`
+    // aligned enum values with `enum_declaration.align` off -- in runs that
+    // restarted at every member without a value.
+    const std::string input = R"SV(module m;
+typedef enum logic [2:0] { IDLE = 3'd0, RUNNING = 3'd1, DONE, ERR = 3'd7, LAST_ONE = 3'd6 } st_t;
+initial begin
+a = 1;
+long_name = 2;
+end
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.align = true;
+    const std::string expected = R"SV(
+module m;
+  typedef enum logic [2:0] {
+    IDLE = 3'd0,
+    RUNNING = 3'd1,
+    DONE,
+    ERR = 3'd7,
+    LAST_ONE = 3'd6
+  } st_t;
+  initial begin
+    a         = 1;
+    long_name = 2;
+  end
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+    // The enum option still aligns them, with or without statement.align.
+    FormatOptions only_enum;
+    only_enum.enum_declaration.align = true;
+    FormatOptions both = only_enum;
+    both.statement.align = true;
+    const std::string enum_part = format_stable(input, only_enum);
+    const std::string both_part = format_stable(input, both);
+    CHECK(enum_part.substr(0, enum_part.find("  initial")) == both_part.substr(0, both_part.find("  initial")));
+}
