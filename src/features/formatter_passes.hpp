@@ -2540,8 +2540,18 @@ inline bool is_multiline_brace_construct(const TokenStream& tokens, size_t brace
         if (!is_code_token(tokens[i])) continue;
         if (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::OpenBrace))
             break;
-        if (kind_is(tokens[i], TK::CoverPointKeyword) || kind_is(tokens[i], TK::DistKeyword) ||
-            kind_is(tokens[i], TK::ConstraintKeyword))
+        // `cp: coverpoint {a, b};` -- a coverpoint samples an expression, and
+        // that expression may open with a concatenation.  A bins body follows
+        // the expression, so its `{` comes after an operand; one that follows
+        // the keyword or an operator is still part of the expression.
+        if (kind_is(tokens[i], TK::CoverPointKeyword)) {
+            const size_t before = prev_code(tokens, brace);
+            return before != npos && before != i && !kind_is(tokens[before], TK::Comma) &&
+                   !kind_is(tokens[before], TK::OpenParenthesis) &&
+                   !kind_is(tokens[before], TK::Question) && !kind_is(tokens[before], TK::Colon) &&
+                   !is_binary_op(tokens[before].lex.kind);
+        }
+        if (kind_is(tokens[i], TK::DistKeyword) || kind_is(tokens[i], TK::ConstraintKeyword))
             return true;
     }
     return false;

@@ -5500,3 +5500,63 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: a coverpoint's concatenation is not its bins body", "[formatter][regression]") {
+    // T-2: any `{` after `coverpoint` was laid out as the body, so the
+    // concatenation being sampled was broken one signal per line and the real
+    // body after it landed on a line of its own.
+    const std::string input = R"SV(module m;
+covergroup cg @(posedge clk);
+cp: coverpoint {a, b};
+cq: coverpoint {a, b} iff (v) {
+bins z = {0};
+}
+cr: coverpoint x + {a, b} { bins lo = {0}; bins hi = {1}; }
+cs: coverpoint a[1:0] { bins lo = {0}; }
+ct: coverpoint f(x) iff (v) { bins lo = {0}; }
+endgroup
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  covergroup cg @(posedge clk);
+    cp: coverpoint {a, b};
+    cq: coverpoint {a, b} iff (v) {
+      bins z = {0};
+    }
+    cr: coverpoint x + {a, b} {
+      bins lo = {0};
+      bins hi = {1};
+    }
+    cs: coverpoint a[1:0] {
+      bins lo = {0};
+    }
+    ct: coverpoint f(x) iff (v) {
+      bins lo = {0};
+    }
+  endgroup
+endmodule
+)SV";
+    CHECK(format_stable(input) == expected.substr(1));
+
+    // The body brace still moves under begin_newline; the concatenation's
+    // does not.
+    FormatOptions opts;
+    opts.statement.begin_newline = true;
+    const std::string allman = R"SV(
+module m;
+  covergroup cg @(posedge clk);
+    cq: coverpoint {a, b} iff (v)
+    {
+      bins z = {0};
+    }
+  endgroup
+endmodule
+)SV";
+    CHECK(format_stable(R"SV(module m;
+covergroup cg @(posedge clk);
+cq: coverpoint {a, b} iff (v) { bins z = {0}; }
+endgroup
+endmodule
+)SV", opts) == allman.substr(1));
+}
