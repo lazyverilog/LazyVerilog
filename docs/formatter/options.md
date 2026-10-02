@@ -517,8 +517,11 @@ typedef enum logic {
 
 ### `wrap_end_else_clauses`
 
-When `true`, `else` after `end` or `}` is placed on a new line. When `false`, `end else` or `} else`
-stays on the same line.
+Controls the `else` that follows the `}` of a brace block, as in a constraint. When `true` it is
+placed on a new line. When `false` (the default) `} else` stays on the same line.
+
+The `else` after `end` is not affected: `end` always ends its line, so `else` starts the next one
+under either value.
 
 ```toml
 [format.statement]
@@ -527,24 +530,21 @@ wrap_end_else_clauses = true
 
 ```systemverilog
 // wrap_end_else_clauses = true
-end
-else begin
-  ...
-end
-
 }
 else {
   ...
 }
 
 // wrap_end_else_clauses = false
-end else begin
-  ...
-end
-
 } else {
   ...
 }
+
+// either value
+end
+else begin
+  ...
+end
 ```
 
 ---

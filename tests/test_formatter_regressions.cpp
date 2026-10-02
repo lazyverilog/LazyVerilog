@@ -5832,3 +5832,65 @@ endmodule
 )SV";
     CHECK(format_stable(input) == expected.substr(1));
 }
+
+TEST_CASE("formatter regression: wrap_end_else_clauses governs the else after a brace only", "[formatter][regression]") {
+    // T-6: the option was documented as joining `end else` when false.  It
+    // never did: `end` ends its line under either value, and only `} else`
+    // follows the option.  The documentation now says so; this pins both
+    // values so the two cannot drift apart again.
+    const std::string input = R"SV(module m;
+always_comb begin
+if (a) begin
+x = 1;
+end else begin
+x = 0;
+end
+end
+constraint c { if (a) { x == 1; } else { x == 0; } }
+endmodule
+)SV";
+    const std::string joined = R"SV(
+module m;
+  always_comb begin
+    if (a) begin
+      x = 1;
+    end
+    else begin
+      x = 0;
+    end
+  end
+  constraint c {
+    if (a) {
+      x == 1;
+    } else {
+      x == 0;
+    }
+  }
+endmodule
+)SV";
+    const std::string wrapped = R"SV(
+module m;
+  always_comb begin
+    if (a) begin
+      x = 1;
+    end
+    else begin
+      x = 0;
+    end
+  end
+  constraint c {
+    if (a) {
+      x == 1;
+    }
+    else {
+      x == 0;
+    }
+  }
+endmodule
+)SV";
+    FormatOptions opts;
+    opts.statement.wrap_end_else_clauses = false;
+    CHECK(format_stable(input, opts) == joined.substr(1));
+    opts.statement.wrap_end_else_clauses = true;
+    CHECK(format_stable(input, opts) == wrapped.substr(1));
+}
