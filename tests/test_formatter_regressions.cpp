@@ -5746,3 +5746,35 @@ function new(string name); super.new(name); endfunction
 endclass
 )SV") == plain.substr(1));
 }
+
+TEST_CASE("formatter regression: port alignment keeps an explicit port whole", "[formatter][regression]") {
+    // T-3: `.name(expr)` after a direction was read as a declaration: the `.`
+    // went to the type column and a `[` inside the expression was padded apart
+    // as an unpacked dimension.
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    const std::string input = R"SV(module dut (input logic [3:0] x, input .named({a, b}), output .o(y[1]), input wire z);
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module dut(
+  input       logic       [3:0]       x                       ,
+  input                               .named({a, b})          ,
+  output                              .o(y[1])                ,
+  input       wire                    z
+);
+endmodule
+)SV";
+    CHECK(format_stable(input, opts) == expected.substr(1));
+
+    const std::string plain = R"SV(
+module dut(
+  input logic [3:0] x,
+  input .named({a, b}),
+  output .o(y[1]),
+  input wire z
+);
+endmodule
+)SV";
+    CHECK(format_stable(input) == plain.substr(1));
+}

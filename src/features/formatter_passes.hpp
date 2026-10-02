@@ -5927,6 +5927,18 @@ public:
                     if (!directed && !kind_is(tokens[item.first], TK::InterfaceKeyword) &&
                         !kind_is(tokens[item.first], TK::Identifier))
                         continue;
+                    // `input .named({a, b})`, `output .o(y[1])` -- an explicit
+                    // port has no type and no dimension.  From its `.` to its
+                    // `)` it is the name field; read as a declaration, the `.`
+                    // was the type and a `[` inside the expression an
+                    // unpacked dimension, padded apart from what it indexes.
+                    if (const size_t dot = next_code(tokens, item.first + 1, item.last + 1);
+                        directed && dot != npos && kind_is(tokens[dot], TK::Dot)) {
+                        decls.push_back({item.first, npos, npos, dot, npos, row_comma,
+                                         rendered_width(tokens, dot, row_last + 1), 0,
+                                         row_width_through(item.first, item.first), true});
+                        continue;
+                    }
                     size_t name = npos;
                     int pd = 0, bd = 0, brd = 0;
                     for (size_t n = item.last + 1; n > item.first + 1; --n) {
