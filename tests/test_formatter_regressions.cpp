@@ -6367,3 +6367,42 @@ endmodule
 )SV";
     CHECK(format_stable(instance.substr(1), opts).find("  sub // s\n  u_sub") != std::string::npos);
 }
+
+// U-6: a format-off marker after code is a trailing comment on a line that is
+// still formatted.  It keeps one space from the code instead of dropping to
+// column 0 or gluing to it, and the region still starts on the next line.
+TEST_CASE("formatter regression: a trailing format-off marker stays a trailing comment",
+          "[formatter][regression]") {
+    FormatOptions opts;
+    const std::string input = R"SV(
+module m;
+  assign   a = b;   // verilog_format: off
+  assign   c   =   d;
+  // verilog_format: on
+  assign   e   =   f;
+  assign g = h +// verilog_format: off
+      i   +   j;
+  // verilog_format: on
+  assign   k   =   l;
+  // verilog_format: off
+  assign   n   =   o;
+  // verilog_format: on
+endmodule
+)SV";
+    const std::string expected = R"SV(
+module m;
+  assign a = b; // verilog_format: off
+  assign   c   =   d;
+  // verilog_format: on
+  assign e = f;
+  assign g = h + // verilog_format: off
+      i   +   j;
+  // verilog_format: on
+  assign k = l;
+  // verilog_format: off
+  assign   n   =   o;
+  // verilog_format: on
+endmodule
+)SV";
+    CHECK(format_stable(input.substr(1), opts) == expected.substr(1));
+}

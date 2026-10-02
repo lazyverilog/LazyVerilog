@@ -433,7 +433,8 @@ private:
             // spacing.
             std::string_view marker = raw;
             size_t marker_pos = pos;
-            if (format_off && (pending_newlines_ > 0 || tokens_.empty())) {
+            const bool starts_line = pending_newlines_ > 0 || tokens_.empty();
+            if (format_off && starts_line) {
                 size_t line_start = pos;
                 while (line_start > 0 && (source_[line_start - 1] == ' ' || source_[line_start - 1] == '\t'))
                     --line_start;
@@ -442,8 +443,16 @@ private:
                     marker_pos = line_start;
                 }
             }
-            add_token(TK::Unknown, marker, marker_pos, false, disabled_ || format_off || format_on,
-                      comment_kind, format_off, format_on);
+            // `assign a = b; // verilog_format: off` -- a marker after code is
+            // on a line that is still formatted, so it is an ordinary trailing
+            // comment there: a passthrough token has no spacing and no line of
+            // its own to keep, and was rendered at column 0 or glued to the
+            // code.  The region it opens starts on the next line all the same.
+            const bool trailing_off = format_off && !starts_line &&
+                                      comment_kind == CommentLexemeKind::Line;
+            add_token(TK::Unknown, marker, marker_pos, false,
+                      !trailing_off && (disabled_ || format_off || format_on),
+                      comment_kind, format_off && !trailing_off, format_on);
             if (format_off) {
                 disabled_ = true;
                 just_entered_disabled_region_ = true;
