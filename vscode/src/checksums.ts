@@ -1,13 +1,13 @@
 // SHA-256 checksums keyed by version then platform.
 // Updated by CI alongside lua/lazyverilog/checksums.lua.
 export const RELEASE_CHECKSUMS: Record<string, Record<string, string>> = {
-  "v2.1.0": {
-    "linux-x64": "46aedf66e50d2dd36bd79cab559ffbc0fe3c44a63d9d5467cf8f0b5eea20ff3f",
-    "linux-arm64": "8bc3cc8b21b3f38eb73d0db1013312fcfb0d9907e3dca1896810f1da6cf78385",
-    "linux-x64-static": "93c6ecebf2983f82b567c99b1a8f4cc7722e3432be3fe872026aa96b91e1a3fb",
-    "linux-arm64-static": "155460b52f99db5fca359942d6b635780df0562f620086e9634f4c5e9be01216",
-    "darwin-x64": "c57bb8345d4e2092d82158e1e28a2f95d731c544bc5041cfd39c6c2dc2727f7d",
-    "darwin-arm64": "95eca7d58daeb170c7570f97781501d828560b3f6589c7d532b4a41ea125f398",
-    "windows-x64": "fadde16481954774aab8b3883ad6570ff9befac959fc7514f757cf9ea1c47f07",
+  "v2.1.1": {
+    "linux-x64": "2ab9ec51e5e9b63ac322c176545e4734c0e6760f14d00e6adc5579269a2484b7",
+    "linux-arm64": "84a225f5d29e1d0eae95f58eb28e2d2ca4a543ee31d7ab74d61e247ba18e93ce",
+    "linux-x64-static": "9ffffa803fcbdebff781fbd7e23b662fef13eb398b54ea6ded022f61b0045d27",
+    "linux-arm64-static": "bb3546f9251f57bc4de9ccd8224cc96557027ee777e3e4afa3622ce850579331",
+    "darwin-x64": "0b3d9fc48409a48bac5f3bf59939e34364ee7ddd53ac3b98e5fff9a312fd55de",
+    "darwin-arm64": "d9aa9cb74807bdaba9bcbdd23e78f9eb56917d9c20e79c8d70d4053c0fd1e5e0",
+    "windows-x64": "c80525b2bf311ac0c31f3bec9c12628ec1934f24134973179dbacffb4826899a",
   },
 };
