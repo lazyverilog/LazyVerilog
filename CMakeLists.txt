@@ -321,6 +321,7 @@ set(LAZYVERILOG_SOURCES
     src/features/definition.cpp
     src/features/references.cpp
     src/features/document_highlight.cpp
+    src/features/selection_range.cpp
     src/features/rename.cpp
     src/features/completion.cpp
     src/features/signature_help.cpp
@@ -385,6 +386,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_connect.cpp
     tests/test_references.cpp
     tests/test_document_highlight.cpp
+    tests/test_selection_range.cpp
     tests/test_rename.cpp
     tests/test_definition.cpp
     tests/test_inlay_hints.cpp
@@ -421,6 +423,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/inlay_hints.cpp
     src/features/references.cpp
     src/features/document_highlight.cpp
+    src/features/selection_range.cpp
     src/features/rename.cpp
     src/features/hover.cpp
     src/features/signature_help.cpp

@@ -48,6 +48,7 @@
 #include "LibLsp/lsp/workspace/symbol.h"
 #include "features/completion.hpp"
 #include "features/document_highlight.hpp"
+#include "features/selection_range.hpp"
 #include "features/autoarg.hpp"
 #include "features/autoff.hpp"
 #include "features/autofunc.hpp"
@@ -1086,6 +1087,8 @@ void LazyVerilogServer::register_handlers() {
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.documentHighlightProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
+            caps.selectionRangeProvider =
+                std::make_pair(optional<bool>(true), optional<StaticRegistrationOptions>{});
             caps.workspaceSymbolProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.documentSymbolProvider =
@@ -1800,6 +1803,24 @@ void LazyVerilogServer::register_handlers() {
             rsp.result = *folds;
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] foldingRange error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/selectionRange ───────────────────────────────────────────
+    ep.registerHandler([&](const td_selectionRange::request& req) {
+        // The response holds raw pointers into the answer's parent list, and
+        // LspCpp serializes it on this thread right after the handler returns.
+        // Keeping this thread's last answer alive until its next request is
+        // what makes those pointers valid at serialization time.
+        thread_local SelectionRanges last_answer;
+        td_selectionRange::response rsp;
+        rsp.id = req.id;
+        try {
+            last_answer = provide_selection_range(analyzer_, req.params);
+            rsp.result = last_answer.result;
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] selectionRange error: " << e.what() << "\n";
         }
         return rsp;
     });
