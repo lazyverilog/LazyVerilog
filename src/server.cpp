@@ -47,6 +47,7 @@
 #include "LibLsp/lsp/workspace/execute_command.h"
 #include "LibLsp/lsp/workspace/symbol.h"
 #include "features/completion.hpp"
+#include "features/document_highlight.hpp"
 #include "features/autoarg.hpp"
 #include "features/autoff.hpp"
 #include "features/autofunc.hpp"
@@ -1083,6 +1084,8 @@ void LazyVerilogServer::register_handlers() {
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.referencesProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
+            caps.documentHighlightProvider =
+                std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.workspaceSymbolProvider =
                 std::make_pair(optional<bool>(true), optional<WorkDoneProgressOptions>{});
             caps.documentSymbolProvider =
@@ -1693,6 +1696,18 @@ void LazyVerilogServer::register_handlers() {
             rsp.result = provide_references(analyzer_, req.params);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] references error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/documentHighlight ────────────────────────────────────────
+    ep.registerHandler([&](const td_highlight::request& req) {
+        td_highlight::response rsp;
+        rsp.id = req.id;
+        try {
+            rsp.result = provide_document_highlight(analyzer_, req.params);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] documentHighlight error: " << e.what() << "\n";
         }
         return rsp;
     });
