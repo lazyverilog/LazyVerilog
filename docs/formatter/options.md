@@ -59,7 +59,7 @@ assign c = d;
 
 ### `default_indent_level_inside_outmost_block`
 
-How many indent levels to add inside the outermost `module`, `interface`, or `package` block. Set to `0` to keep module body at column 0.
+How many indent levels to add inside the outermost design unit: `module`, `macromodule`, `interface`, `package`, `program`, `class`, `checker`, `primitive`, or `config`. Set to `0` to keep its body at column 0. A unit nested inside another (a `class` in a `package`) always indents its body.
 
 ```toml
 [format]
@@ -160,7 +160,7 @@ if(a) begin
 
 ### `space_inside_parens`
 
-Insert spaces inside ordinary parentheses.
+Insert spaces inside ordinary parentheses. Empty parentheses stay `()`.
 
 ```toml
 [format.spacing]
@@ -671,7 +671,7 @@ Minimum character width for each section.
 section1_min_width = 16    # type column
 section2_min_width = 12   # dimension column
 section3_min_width = 20   # signal name column
-section4_min_width = 16    # trailing column (0 disables trailing alignment)
+section4_min_width = 16    # trailing column (minimum width; 0 = no minimum)
 ```
 
 ```systemverilog
@@ -691,7 +691,7 @@ Controls formatting of module instantiation port connections.
 
 ### `align`
 
-Align port connections across lines in an instance.
+Align port connections across lines in an instance. With `align = true`, one space also separates the instance name from `(`; with `align = false`, the `(` follows the name directly.
 
 ```toml
 [format.instance]
@@ -707,7 +707,7 @@ m_fifo u_fifo (
 );
 
 // align = false
-m_fifo u_fifo (
+m_fifo u_fifo(
   .clk(clk),
   .data(data),
   .valid(valid)
@@ -727,12 +727,12 @@ port_indent_level = 1
 
 ```systemverilog
 // port_indent_level = 1, indent_size = 4
-m_fifo u_fifo (
+m_fifo u_fifo(
     .clk(clk)
 );
 
 // port_indent_level = 2, indent_size = 4
-m_fifo u_fifo (
+m_fifo u_fifo(
         .clk(clk)
 );
 ```
@@ -918,7 +918,7 @@ foo (a, b);
 
 ### `space_inside_paren`
 
-Insert spaces inside function call parentheses.
+Insert spaces inside function call parentheses. An empty argument list stays `()`.
 
 ```toml
 [format.function_call]

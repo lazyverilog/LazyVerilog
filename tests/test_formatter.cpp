@@ -1745,7 +1745,7 @@ TEST_CASE("formatter: import declarations do not indent on function or task", "[
 TEST_CASE("formatter: extern class method declarations do not indent following declarations",
           "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
 
     const std::string formatted = format_source(
         "class esc_monitor;\n"
@@ -1799,7 +1799,7 @@ TEST_CASE("formatter: typedef class forward declarations do not indent following
 
 TEST_CASE("formatter: labeled endtask stays on one line", "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
 
     CHECK(format_source("class c;\n"
                         "task body();\n"
@@ -1813,7 +1813,7 @@ TEST_CASE("formatter: labeled endtask stays on one line", "[formatter]") {
 
 TEST_CASE("formatter: labeled endtask keeps following task on next line", "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
 
     CHECK(format_source("class c;\n"
                         "task a();\n"
@@ -1831,7 +1831,7 @@ TEST_CASE("formatter: labeled endtask keeps following task on next line", "[form
 
 TEST_CASE("formatter: disable statement target stays on one line", "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
 
     CHECK(format_source("class c;\n"
                         "task body();\n"
@@ -2520,7 +2520,7 @@ TEST_CASE("formatter: format off marker keeps original column and body verbatim"
 
 TEST_CASE("formatter: constraint dist list stays item-per-line with attached semicolon", "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
     opts.indent_size = 4;
 
     CHECK(format_source("class c;\n"
@@ -2540,7 +2540,7 @@ TEST_CASE("formatter: constraint dist list stays item-per-line with attached sem
 
 TEST_CASE("formatter: covergroup event control follows procedural at spacing", "[formatter]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
     opts.indent_size = 4;
     opts.spacing.procedural_event_control_at_spacing = "both";
     opts.spacing.space_inside_event_control_parens = true;
@@ -4063,7 +4063,7 @@ TEST_CASE("formatter: function call spacing options work without forced line bre
 TEST_CASE("formatter: constructor calls follow function_call.space_before_paren",
           "[formatter][options]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
     opts.indent_size = 4;
     opts.function_call.break_policy = "never";
 
@@ -4115,7 +4115,7 @@ TEST_CASE("formatter: function call auto policy breaks by line length and arg co
 
 TEST_CASE("formatter: function declaration block and hanging layouts", "[formatter][options]") {
     FormatOptions opts;
-    opts.default_indent_level_inside_outmost_block = 0;
+    opts.default_indent_level_inside_outmost_block = 1; // class body indents
     opts.indent_size = 4;
     opts.function_declaration.line_length = 40;
 
@@ -4204,7 +4204,8 @@ TEST_CASE("formatter: non-ANSI module port wrapping applies count and max length
     const std::string expected =
         "module top(\n"
         "    a, b,\n"
-        "    /* cfg */ cdefghij, `MACRO_PORT(foo), // macro port\n"
+        "    /* cfg */ cdefghij,\n"
+        "    `MACRO_PORT(foo), // macro port\n"
         "    long_port_name, d,\n"
         "    e\n"
         "); /* header done */\n"
@@ -5041,4 +5042,271 @@ TEST_CASE("formatter: an expression brace does not shift the lines after it",
                                  "  logic x;\n"
                                  "  logic y;\n"
                                  "endmodule\n");
+}
+
+TEST_CASE("formatter: an ANSI port default value stays after the port name", "[formatter][options]") {
+    FormatOptions opts;
+    opts.port_declaration.align = true;
+    const std::string input = "module m (\n"
+                              "  input int a = DEF,\n"
+                              "  input logic b = 1'bz,\n"
+                              "  output logic y\n"
+                              ");\n"
+                              "endmodule\n";
+    const std::string expected = "module m(\n"
+                                 "  input       int                     a = DEF                 ,\n"
+                                 "  input       logic                   b = 1'bz                ,\n"
+                                 "  output      logic                   y\n"
+                                 ");\n"
+                                 "endmodule\n";
+    for (bool adaptive : {true, false}) {
+        opts.port_declaration.align_adaptive = adaptive;
+        const std::string formatted = format_source(input, opts);
+        CHECK(formatted == expected);
+        CHECK(format_source(formatted, opts) == formatted);
+    }
+}
+
+TEST_CASE("formatter: a concatenation in an enum member value is not an enum body", "[formatter]") {
+    FormatOptions opts;
+    const std::string input = "typedef enum logic [3:0] {A = {2'b0, 2'b1}, B = {2{2'b10}}} e_t;\n";
+    std::string formatted = format_source(input, opts);
+    CHECK(formatted == "typedef enum logic [3:0] {\n"
+                       "  A = {2'b0, 2'b1},\n"
+                       "  B = {2{2'b10}}\n"
+                       "} e_t;\n");
+    CHECK(format_source(formatted, opts) == formatted);
+
+    opts.enum_declaration.align = true;
+    formatted = format_source(input, opts);
+    CHECK(formatted == "typedef enum logic [3:0] {\n"
+                       "  A = {2'b0, 2'b1}  ,\n"
+                       "  B = {2{2'b10}}\n"
+                       "} e_t;\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: non-ANSI port rows obey both the count and the length", "[formatter][options]") {
+    FormatOptions opts;
+    opts.module.non_ansi_port_per_line_enabled = true;
+    opts.module.non_ansi_port_per_line = 3;
+    opts.module.non_ansi_port_max_line_length_enabled = true;
+    opts.module.non_ansi_port_max_line_length = 14;
+    const std::string input = "module m (aaaa, bbbb, cccc, dddd);\nendmodule\n";
+    CHECK(format_source(input, opts) == "module m(\n  aaaa, bbbb,\n  cccc, dddd\n);\nendmodule\n");
+
+    // `  aaaa, bbbb, cccc,` is 19 columns: it fits a limit of 19, not 18.
+    opts.module.non_ansi_port_per_line_enabled = false;
+    opts.module.non_ansi_port_max_line_length = 19;
+    CHECK(format_source(input, opts) == "module m(\n  aaaa, bbbb, cccc,\n  dddd\n);\nendmodule\n");
+    opts.module.non_ansi_port_max_line_length = 18;
+    CHECK(format_source(input, opts) == "module m(\n  aaaa, bbbb,\n  cccc, dddd\n);\nendmodule\n");
+}
+
+TEST_CASE("formatter: call wrapping counts the statement alignment padding", "[formatter][options]") {
+    FormatOptions opts;
+    opts.statement.align = true;
+    opts.statement.lhs_min_width = 20;
+    opts.function_call.break_policy = "auto";
+    opts.function_call.arg_count = -1;
+    const std::string input = "module m;\n"
+                              "  initial begin\n"
+                              "    x = foo(aaaaaaaa, bbbbbbbbb);\n"
+                              "  end\n"
+                              "endmodule\n";
+    // The aligned call ends at column 51 (its `)`).
+    const std::string one_line = "    x                    = foo(aaaaaaaa, bbbbbbbbb);\n";
+    opts.function_call.line_length = 51;
+    CHECK(format_source(input, opts).find(one_line) != std::string::npos);
+    opts.function_call.line_length = 50;
+    const std::string formatted = format_source(input, opts);
+    CHECK(formatted.find(one_line) == std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: a pattern initializer keeps the declaration delimiter column", "[formatter][options]") {
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.align_adaptive = false;
+    opts.var_declaration.section1_min_width = 1;
+    opts.var_declaration.section2_min_width = 0;
+    opts.var_declaration.section3_min_width = 1;
+    opts.var_declaration.section4_min_width = 1;
+    const std::string input = "module m;\nlogic a = 1;\nint arr [2] = '{1, 2};\nendmodule\n";
+    for (const char* spacing : {"both", "none", "before", "after"}) {
+        opts.spacing.assignment_operator_spacing = spacing;
+        const std::string formatted = format_source(input, opts);
+        std::istringstream lines(formatted);
+        std::string line;
+        std::vector<size_t> semis;
+        while (std::getline(lines, line))
+            if (line.find("logic") != std::string::npos || line.find("int") != std::string::npos)
+                semis.push_back(line.find(';'));
+        INFO(spacing << "\n" << formatted);
+        REQUIRE(semis.size() == 2);
+        CHECK(semis[0] == semis[1]);
+        CHECK(format_source(formatted, opts) == formatted);
+    }
+    opts.spacing.assignment_operator_spacing = "none";
+    CHECK(format_source(input, opts).find("arr [2]='{1, 2};") != std::string::npos);
+}
+
+TEST_CASE("formatter: several packed dimensions are one packed field", "[formatter][options]") {
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.port_declaration.align = true;
+    for (int* s : {&opts.var_declaration.section1_min_width, &opts.var_declaration.section2_min_width,
+                   &opts.var_declaration.section3_min_width, &opts.var_declaration.section4_min_width,
+                   &opts.port_declaration.section1_min_width, &opts.port_declaration.section2_min_width,
+                   &opts.port_declaration.section3_min_width, &opts.port_declaration.section4_min_width})
+        *s = 1;
+    opts.var_declaration.align_adaptive = false;
+    opts.port_declaration.align_adaptive = false;
+    const std::string formatted = format_source("module m;\n"
+                                                "logic [7:0] d;\n"
+                                                "logic [3:0][7:0] q;\n"
+                                                "endmodule\n"
+                                                "module n (input logic [7:0] d, output logic [3:0][7:0] q);\n"
+                                                "endmodule\n",
+                                                opts);
+    CHECK(formatted == "module m;\n"
+                       "  logic [7:0]      d  ;\n"
+                       "  logic [3:0][7:0] q  ;\n"
+                       "endmodule\n"
+                       "module n(\n"
+                       "  input  logic [7:0]      d             ,\n"
+                       "  output logic [3:0][7:0] q\n"
+                       ");\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+
+    // The field is measured as rendered, spaces inside the brackets included.
+    opts.spacing.space_inside_dimension_brackets = true;
+    const std::string spaced =
+        format_source("module n (input logic clk, input logic [W-1:0] d);\nendmodule\n", opts);
+    std::istringstream lines(spaced);
+    std::string line;
+    std::vector<size_t> names;
+    while (std::getline(lines, line)) {
+        if (line.find("clk") != std::string::npos) names.push_back(line.find("clk"));
+        if (line.find(" d") != std::string::npos) names.push_back(line.find(" d") + 1);
+    }
+    INFO(spaced);
+    REQUIRE(names.size() == 2);
+    CHECK(names[0] == names[1]);
+    CHECK(format_source(spaced, opts) == spaced);
+}
+
+TEST_CASE("formatter: instance connection columns follow tab_align", "[formatter][options]") {
+    FormatOptions opts;
+    opts.indent_size = 4;
+    opts.tab_align = true;
+    opts.instance.align = true;
+    const std::string formatted = format_source("module m;\nsub u (.clk(clk), .data_in(din));\nendmodule\n", opts);
+    CHECK(formatted == "module m;\n"
+                       "    sub u (\n"
+                       "        .clk        (clk),\n"
+                       "        .data_in    (din)\n"
+                       "    );\n"
+                       "endmodule\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: var section4_min_width 0 keeps the trailing column", "[formatter][options]") {
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.section4_min_width = 0;
+    const std::string formatted =
+        format_source("module m;\nlogic a;\nlogic [7:0] bbbbbb = 8;\nendmodule\n", opts);
+    std::istringstream lines(formatted);
+    std::string line, a_line, b_line;
+    while (std::getline(lines, line)) {
+        if (line.find(" a ") != std::string::npos) a_line = line;
+        if (line.find("bbbbbb") != std::string::npos) b_line = line;
+    }
+    INFO(formatted);
+    CHECK(a_line.find(';') == b_line.find('='));
+}
+
+TEST_CASE("formatter: every outermost design unit follows default_indent_level_inside_outmost_block",
+          "[formatter][options]") {
+    const std::string input = "class c;\nint a;\nendclass\n"
+                              "checker ck(input logic clk);\nlogic x;\nendchecker\n"
+                              "primitive p(output o, input a);\ntable\n0 : 0;\nendtable\nendprimitive\n"
+                              "config cfg;\ndesign work.top;\nendconfig\n"
+                              "program pr;\nint z;\nendprogram\n"
+                              "package pk;\nclass d;\nint b;\nendclass\ntypedef class e;\nendpackage\n";
+    FormatOptions opts;
+    opts.default_indent_level_inside_outmost_block = 0;
+    std::string formatted = format_source(input, opts);
+    CHECK(formatted == "class c;\nint a;\nendclass\n"
+                       "checker ck(input logic clk);\nlogic x;\nendchecker\n"
+                       "primitive p(output o, input a);\ntable\n  0 : 0;\nendtable\nendprimitive\n"
+                       "config cfg;\ndesign work.top;\nendconfig\n"
+                       "program pr;\nint z;\nendprogram\n"
+                       "package pk;\nclass d;\n  int b;\nendclass\ntypedef class e;\nendpackage\n");
+    CHECK(format_source(formatted, opts) == formatted);
+
+    opts.default_indent_level_inside_outmost_block = 1;
+    formatted = format_source(input, opts);
+    CHECK(formatted == "class c;\n  int a;\nendclass\n"
+                       "checker ck(input logic clk);\n  logic x;\nendchecker\n"
+                       "primitive p(output o, input a);\n  table\n    0 : 0;\n  endtable\nendprimitive\n"
+                       "config cfg;\n  design work.top;\nendconfig\n"
+                       "program pr;\n  int z;\nendprogram\n"
+                       "package pk;\n  class d;\n    int b;\n  endclass\n  typedef class e;\nendpackage\n");
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: instance.align decides the space before the instance paren", "[formatter][options]") {
+    FormatOptions opts;
+    const std::string input = "module t;\nm_fifo u_fifo (.clk(clk));\nendmodule\n";
+    std::string formatted = format_source(input, opts);
+    CHECK(formatted.find("m_fifo u_fifo(\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+    opts.instance.align = true;
+    formatted = format_source(input, opts);
+    CHECK(formatted.find("m_fifo u_fifo (\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: empty parens are not padded", "[formatter][options]") {
+    const std::string input = "module t;\n"
+                              "initial begin\nx = f(); obj = new(); t(); y = f(a);\nend\n"
+                              "sub u();\n"
+                              "endmodule\n"
+                              "function int f();\nendfunction\n";
+    FormatOptions opts;
+    opts.spacing.space_inside_parens = true;
+    std::string formatted = format_source(input, opts);
+    INFO(formatted);
+    CHECK(formatted.find("( )") == std::string::npos);
+    CHECK(formatted.find("f( a )") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+
+    opts.spacing.space_inside_parens = false;
+    opts.function_call.space_inside_paren = true;
+    formatted = format_source(input, opts);
+    CHECK(formatted.find("( )") == std::string::npos);
+    CHECK(formatted.find("f( a )") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: call wrapping counts the declaration alignment padding", "[formatter][options]") {
+    FormatOptions opts;
+    opts.var_declaration.align = true;
+    opts.var_declaration.section1_min_width = 12;
+    opts.var_declaration.section2_min_width = 0;
+    opts.var_declaration.section3_min_width = 8;
+    opts.function_call.break_policy = "auto";
+    opts.function_call.arg_count = -1;
+    const std::string input = "module m;\nlogic x = foo(aaaaaaaa, bbbbbbbbb);\nendmodule\n";
+    // The aligned line is 49 columns wide; the call ends at column 48.
+    const std::string one_line = "  logic        x       = foo(aaaaaaaa, bbbbbbbbb);\n";
+    opts.function_call.line_length = 48;
+    CHECK(format_source(input, opts).find(one_line) != std::string::npos);
+    opts.function_call.line_length = 47;
+    const std::string formatted = format_source(input, opts);
+    CHECK(formatted.find(one_line) == std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
 }
