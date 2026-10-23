@@ -23,7 +23,22 @@ std::string node_text(const SyntaxNode& node) {
 }
 
 std::string node_text_raw(const slang::SourceManager& sm, const SyntaxNode& node) {
-    const auto range = node.sourceRange();
+    // Span only the tokens actually written.  A missing token the parser
+    // inserted keeps its expected spelling and a one-token range, so
+    // node.sourceRange() can end inside the next real character -- half of a
+    // UTF-8 sequence, which no client can decode.
+    std::optional<slang::SourceRange> first, last;
+    for (auto it = node.tokens_begin(); it != node.tokens_end(); ++it) {
+        const auto token = *it;
+        if (!token || token.isMissing())
+            continue;
+        if (!first)
+            first = token.range();
+        last = token.range();
+    }
+    if (!first)
+        return {};
+    const slang::SourceRange range(first->start(), last->end());
     if (range.start().valid() && range.end().valid() &&
         range.start().buffer() == range.end().buffer()) {
         const auto source = sm.getSourceText(range.start().buffer());

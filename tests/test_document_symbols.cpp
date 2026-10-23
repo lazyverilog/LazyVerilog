@@ -518,3 +518,41 @@ TEST_CASE("documentSymbol: a generate-block declaration is reported once",
     REQUIRE(sig->detail.has_value());
     CHECK(sig->detail->find("logic") != std::string::npos);
 }
+
+static bool is_valid_utf8(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (len == 0 || i + len > s.size())
+            return false;
+        for (size_t k = 1; k < len; ++k)
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
+                return false;
+        i += len;
+    }
+    return true;
+}
+
+// Found by tools/lsp_fuzz.py: a non-ASCII character typed into a packed
+// dimension came back cut in half, and the client could not decode the response.
+TEST_CASE("documentSymbol: a non-ASCII character in a port type stays whole",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_utf8_port.sv";
+    analyzer.open(uri, "module top(\n"
+                       "    output logic [W-1\xc3\xa9Ne9:0] data_o\n"
+                       ");\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* top = find_child(result, "top");
+    REQUIRE(top != nullptr);
+    const auto children = children_of(*top);
+    // Recovery drops `éNe9:0] data_o`: the port is the one left with no name,
+    // and `]` is a missing token the parser inserted.
+    REQUIRE(children.size() == 1);
+    REQUIRE(children[0].detail.has_value());
+    INFO("detail: " << *children[0].detail);
+    CHECK(is_valid_utf8(*children[0].detail));
+    CHECK(*children[0].detail == "output logic [W-1");
+}
