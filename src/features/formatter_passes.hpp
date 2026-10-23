@@ -88,6 +88,16 @@ inline bool is_outer_close(TK k) {
     return k == TK::EndModuleKeyword || k == TK::EndInterfaceKeyword || k == TK::EndPackageKeyword ||
            k == TK::EndProgramKeyword;
 }
+// Design units that are also ordinary blocks elsewhere in the passes:
+// `default_indent_level_inside_outmost_block` treats them as units.
+inline bool is_block_design_unit_open(TK k) {
+    return k == TK::ClassKeyword || k == TK::CheckerKeyword || k == TK::PrimitiveKeyword ||
+           k == TK::ConfigKeyword;
+}
+inline bool closes_design_unit(TK k) {
+    return is_outer_close(k) || k == TK::EndClassKeyword || k == TK::EndCheckerKeyword ||
+           k == TK::EndPrimitiveKeyword || k == TK::EndConfigKeyword;
+}
 inline bool is_assignment_op(TK k) {
     return k == TK::Equals || k == TK::LessThanEquals ||
            k == TK::PlusEqual || k == TK::MinusEqual ||
@@ -458,7 +468,12 @@ inline bool is_prototype_at(const TokenStream& tokens, size_t idx) {
 }
 
 inline bool opens_design_unit_at(const TokenStream& tokens, size_t idx) {
-    if (idx >= tokens.size() || !is_outer_open(tokens[idx].lex.kind))
+    if (idx >= tokens.size())
+        return false;
+    // `typedef class c;` is a prototype; `interface class` opens at `class`.
+    if (is_block_design_unit_open(tokens[idx].lex.kind))
+        return !tokens[idx].immutable.topology.is_prototype;
+    if (!is_outer_open(tokens[idx].lex.kind))
         return false;
     const size_t p = prev_code(tokens, idx);
     if (p != npos && kind_is(tokens[p], TK::ExternKeyword))
@@ -477,6 +492,8 @@ inline bool opens_design_unit_at(const TokenStream& tokens, size_t idx) {
 
 inline bool opens_indent_scope_at(const TokenStream& tokens, size_t idx) {
     if (idx >= tokens.size())
+        return false;
+    if (tokens[idx].immutable.topology.opens_design_unit)
         return false;
     if (tokens[idx].immutable.topology.is_prototype || is_property_operator_keyword(tokens[idx]))
         return false;
@@ -1011,6 +1028,56 @@ inline bool ends_verbatim_line(const Tok& t) {
     return t.lex.is_format_on_marker || t.lex.is_format_off_marker || t.lex.is_disabled_region_body;
 }
 
+// The padding AlignPass will put before the line's assignment operator, when
+// that operator stands before `token_idx`: `statement.align` pads a
+// statement's LHS to `lhs_min_width`, and `var_declaration.align` puts a
+// declaration's initializer `=` at least section1+2+3 past the indent.
+// shortcut: a lower bound -- a non-adaptive group can pad more to match its
+// widest line; upgrade with a group-width fact.
+inline int statement_align_padding(const TokenStream& tokens, size_t line_start, size_t token_idx,
+                                   const FormatOptions& opts) {
+    if (line_start >= tokens.size())
+        return 0;
+    const auto& depth = tokens[line_start].immutable.syntax;
+    const TK lead = tokens[line_start].lex.kind;
+    const bool decl_lead = depth.paren_depth == 0 &&
+        (is_var_decl_leading_keyword(lead) || lead == TK::VarKeyword || is_net_type_keyword(lead));
+    int names = 0;
+    for (size_t k = line_start; k < token_idx && k < tokens.size(); ++k) {
+        const auto& t = tokens[k];
+        if (!is_code_token(t) || t.immutable.syntax.paren_depth != depth.paren_depth ||
+            t.immutable.syntax.bracket_depth != depth.bracket_depth ||
+            t.immutable.syntax.brace_depth != depth.brace_depth)
+            continue;
+        if (kind_is(t, TK::Semicolon))
+            return 0;
+        if (is_assignment_op(t.lex.kind)) {
+            // `logic v = x` / `my_t v = x` is a declaration; statement
+            // alignment skips it.
+            if (decl_lead || (names >= 2 && depth.paren_depth == 0)) {
+                if (!kind_is(t, TK::Equals) || !opts.var_declaration.align ||
+                    opts.var_declaration.section1_min_width <= 0)
+                    return 0;
+                const int sections = option_width(opts.var_declaration.section1_min_width, opts) +
+                                     option_width(opts.var_declaration.section2_min_width, opts) +
+                                     option_width(opts.var_declaration.section3_min_width, opts);
+                // The compact layout puts one space before the `=`.
+                return std::max(0, sections - compact_width(tokens, line_start, k) - 1);
+            }
+            if (names >= 2 || !opts.statement.align || opts.statement.lhs_min_width <= 0)
+                return 0;
+            return std::max(0, opts.statement.lhs_min_width - compact_width(tokens, line_start, k));
+        }
+        if (is_identifier_like(t)) {
+            const size_t p = prev_code(tokens, k);
+            if (p == npos || p < line_start ||
+                !(kind_is(tokens[p], TK::Dot) || kind_is(tokens[p], TK::Hash) || kind_is(tokens[p], TK::At)))
+                ++names;
+        }
+    }
+    return 0;
+}
+
 // The width of the line in front of `token_idx`, indentation included.
 // WrapPass runs before IndentPass, so the indent is taken from the scope depth
 // SyntaxPass recorded for the line's first token rather than from
@@ -1032,7 +1099,8 @@ inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const 
         if (topo.in_outermost_unit && opts.default_indent_level_inside_outmost_block > 0)
             ++levels;
     }
-    return levels * opts.indent_size + compact_width(tokens, line_start, token_idx);
+    return levels * opts.indent_size + compact_width(tokens, line_start, token_idx) +
+           statement_align_padding(tokens, line_start, token_idx, opts);
 }
 
 struct ListItem {
@@ -2183,7 +2251,7 @@ public:
                 const bool closes = closes_indent_scope_at(tokens, i) || is_outer_close(t.lex.kind);
                 if (closes)
                     depth = std::max(0, depth - 1);
-                if (is_outer_close(t.lex.kind) && !units.empty()) {
+                if (closes_design_unit(t.lex.kind) && !units.empty()) {
                     depth = units.back().depth;
                     units.pop_back();
                 }
@@ -3273,16 +3341,17 @@ public:
                 for (size_t n = 0; n < items.size(); ++n) {
                     int item_width = compact_width(tokens, items[n].first, items[n].last + 1);
                     bool keep = n > 0 && line_count < per_line;
-                    if (keep && opts_.module.non_ansi_port_max_line_length_enabled &&
-                        !opts_.module.non_ansi_port_per_line_enabled) {
-                        int projected = line_width + 2 + item_width +
+                    // Both limits apply.  `line_width` holds the previous
+                    // item's comma, so a kept item adds a space and itself.
+                    if (keep && opts_.module.non_ansi_port_max_line_length_enabled) {
+                        int projected = line_width + 1 + item_width +
                                         (items[n].comma != npos ? 1 : 0);
                         keep = projected <= opts_.module.non_ansi_port_max_line_length;
                     }
                     if (keep) {
                         keep_with_prev[n] = true;
                         tokens[items[n].first].mutable_.wrap.must_break_before = false;
-                        line_width += 2 + item_width + (items[n].comma != npos ? 1 : 0);
+                        line_width += 1 + item_width + (items[n].comma != npos ? 1 : 0);
                         ++line_count;
                     } else {
                         line_width = opts_.indent_size + item_width + (items[n].comma != npos ? 1 : 0);
@@ -3440,8 +3509,14 @@ public:
                 for (size_t j = open; j > 0; --j) {
                     size_t k = j - 1;
                     if (!is_code_token(tokens[k])) continue;
-                    if (kind_is(tokens[k], TK::EnumKeyword)) { enum_body = true; break; }
-                    if (kind_is(tokens[k], TK::Semicolon)) break;
+                    // `enum {A = {2'b0, 2'b1}}` -- a member value's braces sit
+                    // one level inside the body and follow its `=`.
+                    if (kind_is(tokens[k], TK::EnumKeyword)) {
+                        enum_body = tokens[k].immutable.syntax.brace_depth ==
+                                    tokens[open].immutable.syntax.brace_depth;
+                        break;
+                    }
+                    if (kind_is(tokens[k], TK::Semicolon) || is_assignment_op(tokens[k].lex.kind)) break;
                 }
                 if (enum_body) {
                     apply_list(open, WrapListKind::EnumBody, true, true, true);
@@ -4314,7 +4389,7 @@ public:
                 --scope_net;
             }
             size_t closed_unit_opener = npos;
-            if (is_outer_close(t.lex.kind) && !outer_units.empty()) {
+            if (closes_design_unit(t.lex.kind) && !outer_units.empty()) {
                 level = outer_units.back().level;
                 open_bodies.resize(std::min(open_bodies.size(), outer_units.back().open_bodies));
                 closed_unit_opener = outer_units.back().opener;
@@ -4340,7 +4415,7 @@ public:
                 if (size_t hdr = find_header_keyword_before(tokens, i); hdr != npos)
                     t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
             const bool nested_unit = t.immutable.topology.opens_design_unit && !outer_units.empty();
-            if (is_outer_close(t.lex.kind))
+            if (closes_design_unit(t.lex.kind))
                 t.mutable_.indent.base_indent = closed_unit_opener == npos
                     ? 0 : tokens[closed_unit_opener].mutable_.indent.base_indent;
             else if (t.immutable.topology.opens_design_unit && !nested_unit &&
@@ -5006,32 +5081,14 @@ public:
             return end;
         };
 
+        // The trailing field as rendered: `[2] = '{1, 2}` keeps the spaces
+        // SpacingPass gave it, after `,` and around `=` alike.
         auto var_trailing_render_width = [&](size_t first, size_t end) {
-            int width = token_text_width(tokens, first, end);
-            for (size_t k = first; k < end && k < tokens.size(); ++k) {
-                if (!is_code_token(tokens[k]) || !kind_is(tokens[k], TK::Equals))
-                    continue;
-
-                // `token_text_width` intentionally keeps bracketed
-                // dimensions compact (`[1:0]`), which is what section4
-                // needs.  Add only the spaces that the renderer will place
-                // around an assignment operator.  The space before `=` is
-                // part of the trailing field only when the trailing field
-                // started earlier, e.g. at an unpacked dimension:
-                //
-                //   [1:0] = value
-                //
-                // If the trailing field itself starts at `=`, only the
-                // after-space belongs to that field:
-                //
-                //   = value
-                if (k != first && wants_before(opts_.spacing.assignment_operator_spacing))
-                    ++width;
-                if (next_code(tokens, k + 1, end) != npos &&
-                    wants_after(opts_.spacing.assignment_operator_spacing))
-                    ++width;
-            }
-            return width;
+            return rendered_width(tokens, first, end);
+        };
+        // The gap SpacingPass put before `=`; its column follows from it.
+        auto gap_before = [&](size_t k) {
+            return tokens[k].mutable_.space.suppress_space ? 0 : tokens[k].mutable_.space.spaces_before;
         };
 
         auto is_var_decl_line = [&](const Line& ln, VarLine& out) {
@@ -5464,12 +5521,13 @@ public:
                         rendered_width(tokens, vlines[j].first,
                                         vlines[j].packed_dim != npos ? vlines[j].packed_dim
                                                                      : vlines[j].first_name));
+                    // Measured as rendered up to the name: `[3:0][7:0]` is one packed field.
                     if (vlines[j].packed_dim != npos) {
                         size_t close = tokens[vlines[j].packed_dim].immutable.syntax.matching_token;
                         if (close != npos && close < vlines[j].first_name)
                             group_packed_width = std::max(
                                 group_packed_width,
-                                token_text_width(tokens, vlines[j].packed_dim, close + 1));
+                                rendered_width(tokens, vlines[j].packed_dim, vlines[j].first_name));
                     }
                     group_name_width = std::max(group_name_width,
                                                 rendered_width(tokens, vlines[j].first_name,
@@ -5568,7 +5626,7 @@ public:
                         size_t close = tokens[vl.packed_dim].immutable.syntax.matching_token;
                         if (close != npos && close < vl.first_name)
                             name_col = std::max(name_col,
-                                                dim_col + token_text_width(tokens, vl.packed_dim, close + 1) + 1);
+                                                dim_col + rendered_width(tokens, vl.packed_dim, vl.first_name) + 1);
                     } else {
                         name_col = std::max(name_col,
                                             vl.indent + rendered_width(tokens, vl.first, vl.first_name) + 1);
@@ -5604,7 +5662,8 @@ public:
                             tokens[after_target].mutable_.align.enabled = true;
                             tokens[after_target].mutable_.align.target_column =
                                 std::max(preferred_trailing_col,
-                                         trailing_start + token_text_width(tokens, open_bracket, close_bracket + 1) + 1);
+                                         trailing_start + rendered_width(tokens, open_bracket, close_bracket + 1) +
+                                             gap_before(after_target));
                         }
                     };
 
@@ -5625,7 +5684,7 @@ public:
                             tokens[vl.eq].mutable_.align.enabled = true;
                             tokens[vl.eq].mutable_.align.target_column =
                                 std::max(preferred_trailing_col,
-                                         name_col + name_width + 1);
+                                         name_col + name_width + gap_before(vl.eq));
                         }
                         tokens[vl.semi].mutable_.align.enabled = true;
                         tokens[vl.semi].mutable_.align.target_column = preferred_delim_col;
@@ -5804,7 +5863,7 @@ public:
                 if (packed_dim != npos) {
                     size_t packed_close = tokens[packed_dim].immutable.syntax.matching_token;
                     if (packed_close != npos && packed_close < first_name)
-                        out.packed_width = token_text_width(tokens, packed_dim, packed_close + 1);
+                        out.packed_width = rendered_width(tokens, packed_dim, first_name);
                 }
                 out.name_width = token_width(tokens[first_name]);
                 return out;
@@ -5916,8 +5975,8 @@ public:
                         size_t packed_close = tokens[pl.packed_dim].immutable.syntax.matching_token;
                         if (packed_close != npos && packed_close < pl.first_name)
                             name_col = std::max(name_col,
-                                                packed_col + token_text_width(tokens, pl.packed_dim,
-                                                                              packed_close + 1) + 1);
+                                                packed_col + rendered_width(tokens, pl.packed_dim,
+                                                                              pl.first_name) + 1);
                     } else if (pl.type_first != npos) {
                         name_col = std::max(name_col, type_col + pl.type_width + 1);
                     } else {
@@ -6101,9 +6160,20 @@ public:
                                          row_width_through(item.first, item.first), true});
                         continue;
                     }
+                    // `input int a = DEF`: the name comes before the default's `=`.
+                    size_t name_end = item.last + 1;
+                    for (size_t k = item.first + 1; k <= item.last; ++k) {
+                        if (is_assignment_op(tokens[k].lex.kind) &&
+                            tokens[k].immutable.syntax.paren_depth == tokens[item.first].immutable.syntax.paren_depth &&
+                            tokens[k].immutable.syntax.bracket_depth == tokens[item.first].immutable.syntax.bracket_depth &&
+                            tokens[k].immutable.syntax.brace_depth == tokens[item.first].immutable.syntax.brace_depth) {
+                            name_end = k;
+                            break;
+                        }
+                    }
                     size_t name = npos;
                     int pd = 0, bd = 0, brd = 0;
-                    for (size_t n = item.last + 1; n > item.first + 1; --n) {
+                    for (size_t n = name_end; n > item.first + 1; --n) {
                         size_t k = n - 1;
                         if (!is_code_token(tokens[k])) continue;
                         if (kind_is(tokens[k], TK::CloseParenthesis)) ++pd;
@@ -6122,15 +6192,16 @@ public:
                         continue;
                     if (!directed) {
                         size_t unpacked_dim = npos;
-                        for (size_t k = name + 1; k < item.last; ++k) {
+                        for (size_t k = name + 1; k < std::min(item.last, name_end); ++k) {
                             if (kind_is(tokens[k], TK::OpenBracket)) {
                                 unpacked_dim = k;
                                 break;
                             }
                         }
+                        const bool name_field_through_end = has_run || (name_end <= item.last && unpacked_dim == npos);
                         decls.push_back({item.first, npos, npos, name, has_run ? npos : unpacked_dim, row_comma,
-                                         has_run ? rendered_width(tokens, name, row_last + 1)
-                                                 : token_width(tokens[name]),
+                                         name_field_through_end ? rendered_width(tokens, name, row_last + 1)
+                                                                : token_width(tokens[name]),
                                          0, row_width_through(item.first, prev_code(tokens, name)), false});
                         continue;
                     }
@@ -6146,16 +6217,18 @@ public:
                                  ? 0
                                  : rendered_width(tokens, type_first, packed_dim != npos ? packed_dim : name);
                     size_t unpacked_dim = npos;
-                    for (size_t k = name + 1; k < item.last; ++k) {
+                    for (size_t k = name + 1; k < std::min(item.last, name_end); ++k) {
                         if (kind_is(tokens[k], TK::OpenBracket)) {
                             unpacked_dim = k;
                             break;
                         }
                     }
+                    // A default value with no unpacked dimension rides in the name field.
+                    const bool name_field_through_end = has_run || (name_end <= item.last && unpacked_dim == npos);
                     decls.push_back({item.first, type_first, packed_dim, name, has_run ? npos : unpacked_dim,
                                      row_comma,
-                                     has_run ? rendered_width(tokens, name, row_last + 1)
-                                             : token_width(tokens[name]),
+                                     name_field_through_end ? rendered_width(tokens, name, row_last + 1)
+                                                            : token_width(tokens[name]),
                                      tw, row_width_through(item.first, item.first), true});
                 }
                 int base = decls.empty() ? 0 : tokens[decls.front().first].mutable_.indent.base_indent;
@@ -6188,7 +6261,7 @@ public:
                         if (packed_close != npos && packed_close < d.name)
                             group_packed_width =
                                 std::max(group_packed_width,
-                                         token_text_width(tokens, d.packed_dim, packed_close + 1));
+                                         rendered_width(tokens, d.packed_dim, d.name));
                     }
                 }
                 // `align_adaptive=true` preserves the historical behavior:
@@ -6280,7 +6353,7 @@ public:
                         if (packed_close != npos && packed_close < d.name) {
                             decl_name_target = std::max(
                                 decl_name_target,
-                                packed_col + token_text_width(tokens, d.packed_dim, packed_close + 1) + 1);
+                                packed_col + rendered_width(tokens, d.packed_dim, d.name) + 1);
                         }
                     } else if (d.type_first != npos) {
                         decl_name_target = std::max(decl_name_target, type_target + d.typew + 1);
@@ -6412,13 +6485,13 @@ public:
                 const int configured_port_width = option_width(opts_.instance.instance_port_name_width, opts_);
                 const int namew = opts_.instance.align_adaptive ? c.namew : max_namew;
                 tokens[c.op].mutable_.align.target_column =
-                    item_indent + std::max(configured_port_width, namew + 2);
+                    item_indent + option_width(std::max(configured_port_width, namew + 2), opts_);
                 if (c.multiline)
                     continue;
                 tokens[c.cl].mutable_.align.enabled = true;
                 tokens[c.cl].mutable_.align.alignment_group = group;
                 tokens[c.cl].mutable_.align.target_column =
-                    tokens[c.op].mutable_.align.target_column + 1 + sig_width;
+                    tokens[c.op].mutable_.align.target_column + option_width(1 + sig_width, opts_);
             }
             ++group;
         }
@@ -7202,6 +7275,9 @@ public:
                 if (before_open != npos && kind_is(tokens[before_open], TK::At))
                     spaces = (opts_.spacing.space_inside_parens || opts_.spacing.space_inside_event_control_parens) ? 1 : 0;
             }
+            // Empty parens have nothing to pad: `f()`, `new()`, `sub u();`.
+            if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token == i - 1)
+                spaces = 0;
 
             // `{4{a}}` -- the multiplier binds to its replicated braces.
             if (kind_is(t, TK::OpenBrace) && t.immutable.topology.is_replication_brace)
