@@ -575,3 +575,31 @@ add_test(
             $<TARGET_FILE:lazyverilog-rtltree>
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# LSP session fuzzer (tools/lsp_fuzz.py, docs/dev/fuzzing.md).  --server is
+# split POSIX-style, so the binary path is single-quoted.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME lsp-fuzz-unit
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lsp_fuzz.py
+    )
+    add_test(
+        NAME lsp-fuzz-smoke
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/lsp_fuzz.py
+                --server "'$<TARGET_FILE:lazyverilog-lsp>'"
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/hpc60
+                --seed 1 --seconds 60
+                --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke
+    )
+    set_tests_properties(lsp-fuzz-smoke PROPERTIES TIMEOUT 120)
+    file(GLOB LAZYVERILOG_FUZZ_SESSIONS CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_sessions/*.jsonl)
+    add_test(
+        NAME lsp-fuzz-replay
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/lsp_fuzz.py
+                --server "'$<TARGET_FILE:lazyverilog-lsp>'"
+                --replay ${LAZYVERILOG_FUZZ_SESSIONS}
+                --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay
+    )
+endif()
