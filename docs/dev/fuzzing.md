@@ -12,6 +12,7 @@ cancels for both live and never-issued ids. It needs Python 3 and nothing else.
 | `crash` | the server exited or closed stdout before `exit`, or exited non-zero after it |
 | `hang` | a request stayed unanswered for `--reply-timeout` seconds (default 10) |
 | `protocol` | the server sent a message that is not UTF-8 JSON |
+| `incremental-mismatch` | after incremental edits, `foldingRange` or `formatting` answered differently than right after a close and reopen with the fuzzer's own copy of the text |
 | `sanitizer` | an ASan/LSan/UBSan report appeared on stderr |
 | `coverage` | the server advertises a provider the fuzzer has no generator for |
 
@@ -19,6 +20,13 @@ Stderr is drained on its own thread, and writes to the server go through a
 queue, so a chatty server or one that stops reading while it writes is not
 mistaken for a hang. A response the client cannot decode used to look exactly
 like a hang; it is now reported as `protocol` with the start of the body.
+
+The reopen check waits for each compared answer before it sends anything else.
+The server answers `foldingRange` off the dispatch thread, from whatever
+snapshot is current when that work runs, and from its last folds while edits
+are queued behind the request. So without the wait, a `didClose` sent right
+behind the request changes the answer, and the check reports a mismatch that
+is not one.
 
 ## Running it
 

@@ -40,7 +40,12 @@ VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
 NEW_NAMES = ["x", "new_name", "a b", "", "\U0001F600", "module"]
 STEP_WEIGHTS = {"open": 5, "change": 30, "full_change": 3, "close": 3, "request": 50,
-                "cancel": 9}
+                "cancel": 9, "reopen_check": 2}
+# Answered from the server's copy of the text alone, so a document edited
+# incrementally must answer exactly as a fresh open of the same text does.
+REOPEN_CHECKED = (("foldingRangeProvider", "textDocument/foldingRange"),
+                  ("documentFormattingProvider", "textDocument/formatting"))
+UNANSWERED = (-32800, -32801)  # RequestCancelled, ContentModified: nothing to compare
 
 
 class MissingGenerator(Exception):
@@ -161,6 +166,9 @@ class Generator:
         self.issued: list[int] = []
         self.next_id = 1
         self._disk: dict[str, str] = {}
+        self.reopen_methods = [m for cap, m in REOPEN_CHECKED if capabilities.get(cap)]
+        self.incremental: set[str] = set()   # open docs with an incremental edit since open
+        self.comparisons: list[tuple[int, int, str, str]] = []
 
     # -- helpers used by GENERATORS --
     def text(self, uri: str) -> str:
@@ -224,6 +232,7 @@ class Generator:
     def _close(self) -> list[dict]:
         uri = self.rng.choice(sorted(self.docs))
         del self.docs[uri]
+        self.incremental.discard(uri)
         self.closed.append(uri)
         return [self.notification("textDocument/didClose", _doc(uri))]
 
@@ -255,6 +264,8 @@ class Generator:
                       "text": new}
         self.docs[uri] = apply_change(text, change)
         self.versions[uri] += 1
+        if not full:
+            self.incremental.add(uri)
         return [self.notification("textDocument/didChange", {
             "textDocument": {"uri": uri, "version": self.versions[uri]},
             "contentChanges": [change]})]
@@ -274,6 +285,30 @@ class Generator:
         method, params = GENERATORS[self.rng.choice(self.methods)](self, uri)
         return [self.request(method, params)]
 
+    def _reopen_check(self) -> list[dict]:
+        """Ask, reopen with the model's text, ask again: the answers must match."""
+        candidates = sorted(self.incremental)
+        if not candidates or not self.reopen_methods:
+            return self._change()
+        uri = self.rng.choice(candidates)
+        self.incremental.discard(uri)
+        params = {"textDocument/foldingRange": _doc(uri),
+                  "textDocument/formatting": {**_doc(uri), "options": FORMAT_OPTIONS}}
+        before = [self.request(m, params[m]) for m in self.reopen_methods]
+        self.versions[uri] += 1
+        reopen = [self.notification("textDocument/didClose", _doc(uri)),
+                  self.notification("textDocument/didOpen", {"textDocument": {
+                      "uri": uri, "languageId": "systemverilog", "version": self.versions[uri],
+                      "text": self.docs[uri]}})]
+        after = [self.request(m, params[m]) for m in self.reopen_methods]
+        self.comparisons += [(b["id"], a["id"], b["method"], uri) for b, a in zip(before, after)]
+        return before + reopen + after
+
+    def take_comparisons(self) -> list[tuple[int, int, str, str]]:
+        """(before id, after id, method, uri) pairs from the last steps, once."""
+        taken, self.comparisons = self.comparisons, []
+        return taken
+
     def _cancel(self) -> list[dict]:
         if self.issued and self.rng.random() < 0.9:
             rid = self.rng.choice(self.issued)
@@ -290,11 +325,22 @@ class Runner:
         self.pending: dict = {}           # id -> (sent_at, method)
         self.answers: dict = {}           # id -> response, for ids in `keep`
         self.keep: set = set()
+        self.comparisons: list = []       # (before id, after id, method, uri)
         self.exiting = False
 
+    def compare(self, before: int, after: int, method: str, uri: str):
+        """Require the answers to `before` and `after` to be identical."""
+        self.record.append({"compare": [before, after, method, uri]})
+        self.keep.update((before, after))
+        self.comparisons.append((before, after, method, uri))
+
     def send(self, msg: dict):
-        self.poll()
-        self.record.append(msg)
+        # A compared answer must describe the text at its own place in the
+        # stream.  The server may answer from a later snapshot while more
+        # messages are queued (foldingRange runs off the dispatch thread), so
+        # nothing goes out until every compared request has been answered.
+        self.wait(lambda: not self.keep.intersection(self.pending))
+        self.record.append({"send": msg})
         if "id" in msg and "method" in msg:
             self.pending[msg["id"]] = (time.monotonic(), msg["method"])
         self.client.send(msg)  # queued; a dead server shows up as EOF in poll()
@@ -315,6 +361,19 @@ class Runner:
                                           f"{c.bad_messages[0][:300]!r}")
             if not self.exiting and (c.eof or c.proc.poll() is not None):
                 raise Failure("crash", f"server exited (code {c.proc.poll()})")
+        for before, after, method, uri in [c for c in self.comparisons
+                                           if c[0] in self.answers and c[1] in self.answers]:
+            self.comparisons.remove((before, after, method, uri))
+            self.keep.difference_update((before, after))
+            first, second = self.answers.pop(before), self.answers.pop(after)
+            if any((a.get("error") or {}).get("code") in UNANSWERED for a in (first, second)):
+                continue  # a cancel in the mix got there first
+            if first.get("result") != second.get("result") or first.get("error") != second.get("error"):
+                raise Failure("incremental-mismatch",
+                              f"{method} on {uri}: answer after incremental edits (id {before}) "
+                              f"differs from a fresh open of the same text (id {after})\n"
+                              f"  incremental: {json.dumps(first)[:2000]}\n"
+                              f"  fresh open:  {json.dumps(second)[:2000]}")
         now = time.monotonic()
         for rid, (sent, method) in self.pending.items():
             if now - sent > self.reply_timeout:
@@ -366,8 +425,8 @@ def write_failure(out: Path, header: dict, record: list[dict], failure: Failure,
     name = f"fail-{header.get('seed', 'replay')}"
     with open(out / f"{name}.jsonl", "w", encoding="utf-8") as f:
         f.write(json.dumps(header) + "\n")
-        for msg in record:
-            f.write(json.dumps({"send": msg}) + "\n")
+        for line in record:
+            f.write(json.dumps(line) + "\n")
     tail = client.stderr_tail.decode("utf-8", errors="replace")
     (out / f"{name}.txt").write_text(
         f"{failure.kind}: {failure.detail}\nmessages sent: {len(record)}\n"
@@ -400,7 +459,10 @@ def fuzz(args) -> int:
         deadline = time.monotonic() + args.seconds
         steps = 0
         while time.monotonic() < deadline:
-            for msg in gen.step():
+            messages = gen.step()
+            for comparison in gen.take_comparisons():
+                runner.compare(*comparison)
+            for msg in messages:
                 runner.wait_capacity()
                 runner.send(msg)
             steps += 1
@@ -419,14 +481,20 @@ def replay(args) -> int:
     for session in args.replay:
         lines = Path(session).read_text(encoding="utf-8").splitlines()
         header = json.loads(lines[0])
-        messages = [json.loads(line)["send"] for line in lines[1:] if line.strip()]
-        messages = [m for m in messages if m.get("method") not in ("shutdown", "exit")]
+        entries = [json.loads(line) for line in lines[1:] if line.strip()]
+        entries = [e for e in entries
+                   if "compare" in e or e["send"].get("method") not in ("shutdown", "exit")]
+        messages = [e["send"] for e in entries if "send" in e]
         root = Path(header.get("root", ".")) if Path(header.get("root", ".")).is_dir() else Path.cwd()
         client = start(args.server, root)
         record: list[dict] = []
         runner = Runner(client, record, args.reply_timeout)
         try:
-            for msg in messages:
+            for entry in entries:
+                if "compare" in entry:
+                    runner.compare(*entry["compare"])
+                    continue
+                msg = entry["send"]
                 runner.wait_capacity()
                 runner.send(msg)
                 if msg.get("method") == "initialize":

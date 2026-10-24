@@ -7,6 +7,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -80,6 +81,16 @@ class Generation(unittest.TestCase):
         self.assertTrue(any(i in issued for i in cancelled))
         self.assertTrue(any(i not in issued for i in cancelled))
 
+    def test_session_mix_includes_reopen_checks(self):
+        gen = lsp_fuzz.Generator(random.Random(3), lsp_fuzz.corpus_files([CORPUS]),
+                                 SERVER_CAPABILITIES)
+        compared = []
+        for _ in range(2000):
+            gen.step()
+            compared.extend(gen.take_comparisons())
+        self.assertEqual({c[2] for c in compared},
+                         {"textDocument/foldingRange", "textDocument/formatting"})
+
     def test_session_mix_includes_closed_uri(self):
         open_uris: set[str] = set()
         hit = False
@@ -93,6 +104,33 @@ class Generation(unittest.TestCase):
             elif "id" in m and uri and uri not in open_uris:
                 hit = True
         self.assertTrue(hit)
+
+
+class StubClient:
+    """Just what Runner.poll() reads from a Client."""
+    def __init__(self, responses: dict):
+        self.cv = threading.Condition()
+        self.responses = {rid: (0.0, msg) for rid, msg in responses.items()}
+        self.sanitizer_hit, self.bad_messages, self.eof = False, [], False
+        self.proc = type("Proc", (), {"poll": staticmethod(lambda: None)})()
+
+
+class Comparison(unittest.TestCase):
+    def poll(self, first: dict, second: dict):
+        runner = lsp_fuzz.Runner(StubClient({1: first, 2: second}), [], reply_timeout=60)
+        runner.compare(1, 2, "textDocument/foldingRange", "file:///a.sv")
+        runner.pending = {1: (time.monotonic(), "m"), 2: (time.monotonic(), "m")}
+        runner.poll()
+
+    def test_different_answers_are_a_mismatch(self):
+        with self.assertRaises(lsp_fuzz.Failure) as caught:
+            self.poll({"id": 1, "result": [1]}, {"id": 2, "result": [2]})
+        self.assertEqual(caught.exception.kind, "incremental-mismatch")
+
+    def test_a_cancelled_answer_is_not_compared(self):
+        cancelled = {"code": -32800, "message": "request cancelled"}
+        self.poll({"id": 1, "result": [1]}, {"id": 2, "error": cancelled})
+        self.poll({"id": 1, "error": cancelled}, {"id": 2, "result": [2]})
 
 
 class Oracle(unittest.TestCase):
@@ -126,6 +164,29 @@ class Oracle(unittest.TestCase):
 
     def test_server_flooding_stdout_is_not_a_deadlock(self):
         code, _ = self.fuzz("--flood-stdout 200", seconds="3")
+        self.assertEqual(code, 0)
+
+    def test_incremental_mismatch_is_reported(self):
+        code, _ = self.fuzz("--corrupt-incremental", seconds="10")
+        self.assertEqual(code, 1)
+        report = next(self.out.glob("fail-*.txt")).read_text()
+        self.assertIn("incremental-mismatch", report)
+        self.assertIn("file:///", report)
+        session = next(self.out.glob("fail-*.jsonl")).read_text()
+        code, _ = run_fuzz("--server", f"{FAKE} --corrupt-incremental", "--replay",
+                           str(next(self.out.glob("fail-*.jsonl"))), "--reply-timeout", "2",
+                           "--out", str(self.out / "replay"))
+        self.assertIn('"compare"', session)
+        self.assertEqual(code, 1)
+
+    def test_incremental_match_passes(self):
+        code, _ = self.fuzz("", seconds="10")
+        self.assertEqual(code, 0)
+
+    def test_answer_from_a_later_snapshot_is_not_a_mismatch(self):
+        # The real server answers foldingRange off the dispatch thread, from
+        # whatever snapshot is current when the work runs.
+        code, _ = self.fuzz("--late-folding", seconds="10")
         self.assertEqual(code, 0)
 
     def test_undecodable_response_is_reported(self):
