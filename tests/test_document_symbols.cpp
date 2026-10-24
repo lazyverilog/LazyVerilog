@@ -336,6 +336,31 @@ TEST_CASE("documentSymbol: a named generate block nests what it declares",
     CHECK(find_child(block_children, "u_sub") != nullptr);
 }
 
+// A module left open inside a generate block swallows the next module.  The
+// inner module starts with no blocks of its own, so the outer block it sits
+// in must not be taken as one of them.
+TEST_CASE("documentSymbol: a module nested inside an open generate block",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_nested_in_generate.sv";
+    analyzer.open(uri, "module outer;\n"
+                       "    if (1) begin : g_first\n"
+                       "    end\n"
+                       "    if (1) begin : g_open\n"
+                       "        logic a;\n"
+                       "module inner;\n"
+                       "    logic b;\n"
+                       "    if (1) begin : g_inner\n"
+                       "        logic c;\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* outer = find_child(result, "outer");
+    REQUIRE(outer != nullptr);
+    CHECK(find_child(children_of(*outer), "g_open") != nullptr);
+}
+
 // LSP splits the two ranges: `range` is the whole declaration, which is what
 // clients fold and show in breadcrumbs; `selectionRange` is the name they
 // reveal.  Reporting the name span as both collapses the outline to points.

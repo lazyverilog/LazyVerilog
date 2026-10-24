@@ -5,6 +5,7 @@
 #include "../syntax_index_shared.hpp"
 #include <functional>
 #include <unordered_map>
+#include <utility>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
@@ -127,7 +128,11 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         shape.extent = extent_of(node);
         ModuleShape* previous = current;
         current = &shape;
+        // Block indices name entries of one module's blocks; a module nested
+        // in an outer module's block (unclosed source) starts its own stack.
+        auto outer_blocks = std::exchange(block_stack, {});
         visitDefault(node);
+        block_stack = std::move(outer_blocks);
         current = previous;
     }
 

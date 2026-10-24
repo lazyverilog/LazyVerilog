@@ -1,0 +1,5 @@
+{"note": "documentSymbol indexed an outer module's generate-block stack into a module nested in that block (fix: ShapeVisitor gives each module its own block stack)"}
+{"send": {"jsonrpc": "2.0", "method": "initialize", "params": {"processId": null, "rootUri": null, "capabilities": {}}, "id": 0}}
+{"send": {"jsonrpc": "2.0", "method": "initialized", "params": {}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///fuzz/nested_in_generate.sv", "languageId": "systemverilog", "version": 1, "text": "module outer;\n    if (1) begin : g_first\n    end\n    if (1) begin : g_open\n        logic a;\nmodule inner;\n    logic b;\n    if (1) begin : g_inner\n        logic c;\n    end\nendmodule\n"}}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/documentSymbol", "params": {"textDocument": {"uri": "file:///fuzz/nested_in_generate.sv"}}, "id": 1}}
