@@ -225,6 +225,7 @@ class Generator:
         uri = self.rng.choice(closed).as_uri()
         text = self.text(uri)
         self.docs[uri] = text
+        self.closed = [u for u in self.closed if u != uri]
         self.versions[uri] = 1
         return [self.notification("textDocument/didOpen", {"textDocument": {
             "uri": uri, "languageId": "systemverilog", "version": 1, "text": text}})]
@@ -254,6 +255,11 @@ class Generator:
         return a, a, "".join(self.rng.choice(noise) for _ in range(self.rng.randint(1, 8)))
 
     def _edit(self, full: bool) -> list[dict]:
+        if self.closed and self.rng.random() < 1 / 50:
+            # A change to a document that is not open: the server must ignore it.
+            return [self.notification("textDocument/didChange", {
+                "textDocument": {"uri": self.rng.choice(self.closed), "version": 1},
+                "contentChanges": [{"text": self.rng.choice(VOCAB)}]})]
         uri = self.rng.choice(sorted(self.docs))
         text = self.docs[uri]
         a, b, new = self._mutation(text)
@@ -320,8 +326,12 @@ class Generator:
 # -- running a session against the server -------------------------------------
 
 class Runner:
-    def __init__(self, client: Client, record: list[dict], reply_timeout: float):
+    def __init__(self, client: Client, record: list[dict], reply_timeout: float,
+                 command_timeout: float | None = None):
         self.client, self.record, self.reply_timeout = client, record, reply_timeout
+        # workspace/executeCommand (lintAll compiles the project) and everything
+        # queued behind it get this instead of reply_timeout.
+        self.command_timeout = command_timeout or reply_timeout
         self.pending: dict = {}           # id -> (sent_at, method)
         self.answers: dict = {}           # id -> response, for ids in `keep`
         self.keep: set = set()
@@ -353,7 +363,11 @@ class Runner:
                 del self.pending[rid]
                 if rid in self.keep:
                     self.answers[rid] = msg
-            c.responses.clear()
+            if c.responses:
+                # A duplicate answer, or one to a cancelled-and-answered or
+                # never-issued id: JSON-RPC allows exactly one per request.
+                raise Failure("protocol", f"response to an id that is not pending: "
+                                          f"{sorted(map(str, c.responses))[:5]}")
             if c.sanitizer_hit:
                 raise Failure("sanitizer", "sanitizer report on stderr")
             if c.bad_messages:
@@ -375,10 +389,12 @@ class Runner:
                               f"  incremental: {json.dumps(first)[:2000]}\n"
                               f"  fresh open:  {json.dumps(second)[:2000]}")
         now = time.monotonic()
+        behind_command = False  # pending is in send order
         for rid, (sent, method) in self.pending.items():
-            if now - sent > self.reply_timeout:
-                raise Failure("hang", f"{method} id={rid} unanswered after "
-                                      f"{self.reply_timeout:g} s")
+            behind_command |= method == "workspace/executeCommand"
+            limit = self.command_timeout if behind_command else self.reply_timeout
+            if now - sent > limit:
+                raise Failure("hang", f"{method} id={rid} unanswered after {limit:g} s")
 
     def wait(self, until):
         while not until():
@@ -449,7 +465,7 @@ def fuzz(args) -> int:
     header = {"seed": args.seed, "root": str(root), "src": [str(s) for s in srcs]}
     client = start(args.server, root)
     record: list[dict] = []
-    runner = Runner(client, record, args.reply_timeout)
+    runner = Runner(client, record, args.reply_timeout, args.command_timeout)
     try:
         caps = runner.initialize(root)
         check_coverage(caps)
@@ -488,7 +504,7 @@ def replay(args) -> int:
         root = Path(header.get("root", ".")) if Path(header.get("root", ".")).is_dir() else Path.cwd()
         client = start(args.server, root)
         record: list[dict] = []
-        runner = Runner(client, record, args.reply_timeout)
+        runner = Runner(client, record, args.reply_timeout, args.command_timeout)
         try:
             for entry in entries:
                 if "compare" in entry:
@@ -520,6 +536,9 @@ def main() -> int:
     ap.add_argument("--out", default="fuzz-out", help="where failing sessions are written")
     ap.add_argument("--reply-timeout", type=float, default=10.0,
                     help="seconds a request may stay unanswered (default 10)")
+    ap.add_argument("--command-timeout", type=float,
+                    help="the same for workspace/executeCommand and requests queued "
+                         "behind it (default: --reply-timeout)")
     ap.add_argument("--replay", nargs="+", metavar="SESSION", help="replay recorded sessions")
     args = ap.parse_args()
     if args.replay:

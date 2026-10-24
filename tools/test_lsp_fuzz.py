@@ -105,6 +105,27 @@ class Generation(unittest.TestCase):
                 hit = True
         self.assertTrue(hit)
 
+    def test_session_mix_includes_change_to_closed_uri(self):
+        open_uris: set[str] = set()
+        hit = False
+        for m in generate(5, 4000):
+            method, params = m.get("method"), m.get("params") or {}
+            uri = (params.get("textDocument") or {}).get("uri")
+            if method == "textDocument/didOpen":
+                open_uris.add(uri)
+            elif method == "textDocument/didClose":
+                open_uris.discard(uri)
+            elif method == "textDocument/didChange" and uri not in open_uris:
+                hit = True
+        self.assertTrue(hit)
+
+    def test_reopened_uri_is_not_counted_closed(self):
+        gen = lsp_fuzz.Generator(random.Random(5), lsp_fuzz.corpus_files([CORPUS]),
+                                 SERVER_CAPABILITIES)
+        for _ in range(3000):
+            gen.step()
+            self.assertFalse(set(gen.closed) & set(gen.docs))
+
 
 class StubClient:
     """Just what Runner.poll() reads from a Client."""
@@ -131,6 +152,37 @@ class Comparison(unittest.TestCase):
         cancelled = {"code": -32800, "message": "request cancelled"}
         self.poll({"id": 1, "result": [1]}, {"id": 2, "error": cancelled})
         self.poll({"id": 1, "error": cancelled}, {"id": 2, "result": [2]})
+
+
+class Watchdog(unittest.TestCase):
+    def runner(self, pending: dict, responses: dict | None = None):
+        runner = lsp_fuzz.Runner(StubClient(responses or {}), [], reply_timeout=1,
+                                 command_timeout=60)
+        runner.pending = pending
+        return runner
+
+    def test_slow_command_is_not_a_hang(self):
+        late = time.monotonic() - 5
+        # A request queued behind the command waits for it too.
+        self.runner({1: (late, "workspace/executeCommand"),
+                     2: (late, "textDocument/hover")}).poll()
+
+    def test_slow_request_is_a_hang_whatever_the_command_timeout(self):
+        late = time.monotonic() - 5
+        with self.assertRaises(lsp_fuzz.Failure) as caught:
+            self.runner({2: (late, "textDocument/hover")}).poll()
+        self.assertEqual(caught.exception.kind, "hang")
+
+    def test_request_sent_before_a_command_keeps_its_timeout(self):
+        late = time.monotonic() - 5
+        with self.assertRaises(lsp_fuzz.Failure):
+            self.runner({1: (late, "textDocument/hover"),
+                         2: (late, "workspace/executeCommand")}).poll()
+
+    def test_response_to_an_id_not_pending_is_a_protocol_failure(self):
+        with self.assertRaises(lsp_fuzz.Failure) as caught:
+            self.runner({}, {7: {"id": 7, "result": None}}).poll()
+        self.assertEqual(caught.exception.kind, "protocol")
 
 
 class Oracle(unittest.TestCase):

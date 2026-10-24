@@ -42,12 +42,14 @@ jobs:
         env:
           UBSAN_OPTIONS: print_stacktrace=1
         # The server runs with the corpus as its cwd, so every path is absolute.
-        # The reply timeout is long because lazyverilog.lintAll compiles all ~950
-        # files, which under ASan takes minutes; a true hang still trips it.
+        # 60 s is the 10 s watchdog with room for ASan.  lazyverilog.lintAll
+        # compiles all ~950 files, which under ASan takes minutes, so commands and
+        # the requests queued behind them get --command-timeout instead.
         run: >
           python3 -I tools/lsp_fuzz.py --server "$PWD/build-asan/lazyverilog-lsp" --root /tmp/rtl1k
           --src "$PWD/tests/rtl/cva6" --src "$PWD/tests/rtl/ibex"
-          --seed ${{ github.run_id }} --seconds 3600 --reply-timeout 600 --out "$PWD/fuzz-out"
+          --seed ${{ github.run_id }} --seconds 3600 --reply-timeout 60 --command-timeout 600
+          --out "$PWD/fuzz-out"
 
       # RTL only: the invariant pass costs about 1.5 s per file, so the whole of
       # both repositories would not fit next to the fuzz hour.
