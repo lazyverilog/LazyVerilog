@@ -21,6 +21,7 @@
 #include "features/hover.hpp"
 #include "features/rename.hpp"
 #include "index_cache.hpp"
+#include "lsp_position.hpp"
 #include "position_encoding.hpp"
 #include "string_utils.hpp"
 
@@ -361,4 +362,15 @@ TEST_CASE("under UTF-8 an outgoing column needs no pass over the line",
     std::cerr << "[position encoding] lsp_column_width(200 bytes): utf-16 " << utf16_ns
               << " ns, utf-8 " << utf8_ns << " ns\n";
     SUCCEED();
+}
+
+TEST_CASE("lsp_column clamps a location past the end of its buffer", "[position_encoding]") {
+    // A missing keyword token at EOF still has its keyword as raw text, so the
+    // end of a node closed by an `endpackage` that was never written lies up to
+    // ten bytes past the buffer.  The column is the one at the end of the text.
+    slang::SourceManager sm;
+    const auto buffer = sm.assignText("ab\ncd");
+    const slang::SourceLocation eof(buffer.id, 5);
+    CHECK(lsp_column(sm, eof) == 2);
+    CHECK(lsp_column(sm, eof + 10) == 2);
 }
