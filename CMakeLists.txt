@@ -394,6 +394,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_completion.cpp
     tests/test_folding_ranges.cpp
     tests/test_document_symbols.cpp
+    tests/test_invariants.cpp
     tests/test_opentitan_benchmark.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
     src/features/completion.cpp
@@ -433,6 +434,7 @@ set(LAZYVERILOG_TEST_SOURCES
 )
 
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
+target_compile_definitions(lazyverilog-tests PRIVATE LAZYVERILOG_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_include_directories(lazyverilog-tests PRIVATE
     src
     tests

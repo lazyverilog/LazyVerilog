@@ -1,0 +1,3 @@
+# Known violations of tests/test_invariants.cpp, skipped until fixed.
+# Format: <invariant> <path relative to the corpus>  # reason
+# Invariants: format, folding, rename-references, definition-backlink
