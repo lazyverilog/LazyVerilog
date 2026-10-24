@@ -6459,3 +6459,38 @@ endmodule
     const std::string unlisted = format_stable(input.substr(1), opts);
     CHECK(unlisted.find("`DV_CHECK_FATAL(a == b, \"msg\")") != std::string::npos);
 }
+
+TEST_CASE("formatter regression: broken code damages only its own lines", "[formatter][regression]") {
+    // Each snippet is broken; the code after it must format exactly as it
+    // does without the snippet.  An unclosed `(` once joined the rest of
+    // the file onto one line, and an extra `end` dedented it to column 0.
+    const std::string tail = R"SV(
+  always_ff @(posedge clk) begin
+    if (en) q <= d;
+    else q <= 0;
+  end
+  assign y = q;
+endmodule
+
+module n (input a, output b);
+  assign b = a;
+endmodule
+)SV";
+    const std::string clean = format_stable("module m;" + tail);
+    const std::string expected_tail = clean.substr(clean.find('\n') + 1);
+    const char* broken[] = {
+        "  assign w = (a + b;\n",
+        "  foo u (.a(a), .b(b);\n",
+        "  logic [7:0 v;\n",
+        "  assign c = {a, b;\n",
+        "  always_comb begin\n    if (x begin\n      z = 1;\n    end\n  end\n",
+        "  always_comb begin\n    z = 1;\n  end\n  end\n",
+        "  function int f(int a);\n    begin\n      return a;\n  endfunction\n",
+    };
+    for (const char* snippet : broken) {
+        INFO(snippet);
+        const std::string out = format_stable("module m;\n" + std::string(snippet) + tail.substr(1));
+        REQUIRE(out.size() >= expected_tail.size());
+        CHECK(out.substr(out.size() - expected_tail.size()) == expected_tail);
+    }
+}

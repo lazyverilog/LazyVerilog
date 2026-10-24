@@ -98,6 +98,22 @@ inline bool closes_design_unit(TK k) {
     return is_outer_close(k) || k == TK::EndClassKeyword || k == TK::EndCheckerKeyword ||
            k == TK::EndPrimitiveKeyword || k == TK::EndConfigKeyword;
 }
+// Keywords that never stand inside a paren, bracket or brace: SyntaxPass
+// drops any group still open there (broken code).  `interface` and
+// `function`/`task` are left out -- they appear in port lists and modports.
+inline bool is_unit_level_sync_keyword(TK k) {
+    return k == TK::ModuleKeyword || k == TK::MacromoduleKeyword || k == TK::PackageKeyword ||
+           k == TK::EndModuleKeyword || k == TK::EndInterfaceKeyword || k == TK::EndPackageKeyword ||
+           k == TK::EndProgramKeyword || k == TK::EndClassKeyword || k == TK::EndCheckerKeyword ||
+           k == TK::EndPrimitiveKeyword || k == TK::EndConfigKeyword || k == TK::EndFunctionKeyword ||
+           k == TK::EndTaskKeyword || k == TK::AlwaysKeyword || k == TK::AlwaysCombKeyword ||
+           k == TK::AlwaysFFKeyword || k == TK::AlwaysLatchKeyword || k == TK::InitialKeyword;
+}
+// Never inside a paren or bracket, but a brace may hold them.
+inline bool is_statement_sync_keyword(TK k) {
+    return k == TK::AssignKeyword || k == TK::BeginKeyword || k == TK::EndKeyword ||
+           k == TK::GenerateKeyword || k == TK::EndGenerateKeyword;
+}
 inline bool is_assignment_op(TK k) {
     return k == TK::Equals || k == TK::LessThanEquals ||
            k == TK::PlusEqual || k == TK::MinusEqual ||
@@ -1914,8 +1930,75 @@ public:
         // Brace depth at each open `randsequence`, innermost last: a
         // production's `{ ... }` code block holds statements again.
         std::vector<int> production_brace_depths;
+        // Broken code recovers here.  A `(` or `[` still open at a token that
+        // can never stand inside one (`endmodule`, `always_ff`, ...) or at a
+        // `;` that ends a statement was never closed: dropping it keeps one
+        // missing `)` from joining the rest of the file onto one line.
+        // Nothing inside a macro argument recovers: it may hold anything.
+        // An assertion's property may hold `;` (`case` items) and the
+        // `always` operator.
+        auto in_arguments_of = [&](std::initializer_list<TK> callers) {
+            for (size_t j : parens) {
+                const size_t p = prev_code(tokens, j);
+                if (p == npos) continue;
+                for (TK c : callers)
+                    if (kind_is(tokens[p], c)) return true;
+            }
+            return false;
+        };
+        auto in_macro_arguments = [&] { return in_arguments_of({TK::MacroUsage}); };
+        auto in_property = [&] {
+            return in_arguments_of({TK::PropertyKeyword, TK::SequenceKeyword, TK::ExpectKeyword});
+        };
+        // Every `(` / `[` opened inside the innermost open brace (or at all,
+        // outside any brace).  The depths always equal the stack sizes.
+        auto inside_brace = [&](size_t open) { return braces.empty() || open > braces.back(); };
+        auto drop_groups = [&] {
+            while (!parens.empty() && inside_brace(parens.back())) parens.pop_back();
+            while (!brackets.empty() && inside_brace(brackets.back())) brackets.pop_back();
+            pd = static_cast<int>(parens.size());
+            bd = static_cast<int>(brackets.size());
+        };
+        auto recover = [&](const Tok& t) {
+            if (!is_code_token(t) || (parens.empty() && brackets.empty() && braces.empty()))
+                return;
+            const bool unit_level = is_unit_level_sync_keyword(t.lex.kind);
+            if (unit_level || is_statement_sync_keyword(t.lex.kind)) {
+                if (in_macro_arguments() || (kind_is(t, TK::AlwaysKeyword) && in_property()))
+                    return;
+                // Braces may hold statements (`constraint`, `randsequence`
+                // code blocks), so only a unit-level keyword drops them.
+                if (unit_level) {
+                    // `assign c = {a, b;` -- its `;` made the brace a
+                    // block; an unclosed one indents nothing.
+                    for (size_t j : braces)
+                        tokens[j].immutable.topology.opens_brace_block = false;
+                    braces.clear();
+                    brace_ctx.clear();
+                    brd = 0;
+                    production_brace_depths.clear();
+                }
+                drop_groups();
+                return;
+            }
+            // `foo(a, b;` -- a `;` inside a paren or bracket.  Only a `for`
+            // header and a macro argument hold one.
+            if (!kind_is(t, TK::Semicolon))
+                return;
+            const bool open_group = (!parens.empty() && inside_brace(parens.back())) ||
+                                    (!brackets.empty() && inside_brace(brackets.back()));
+            if (!open_group || in_macro_arguments() || in_property())
+                return;
+            for (size_t j : parens) {
+                const size_t p = prev_code(tokens, j);
+                if (inside_brace(j) && p != npos && kind_is(tokens[p], TK::ForKeyword))
+                    return;
+            }
+            drop_groups();
+        };
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
+            recover(t);
             if (kind_is(t, TK::EndClockingKeyword))
                 in_clocking_block = false;
             t.immutable.syntax.paren_depth = pd;
@@ -4322,6 +4405,71 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
 // IndentPass owns IndentMetadata and reads wrap/source facts.  The level is a
 // deterministic stack over token kinds, so format(format(x)) recomputes the same
 // levels from canonical output.
+// An open indent scope: the token kind that opened it.  A macro scope
+// (`` `uvm_object_utils_begin ``, a configured block macro) closes on any
+// closer, as it always has: a macro's own closer is not a token kind.
+struct IndentScope {
+    TK opener;
+    bool macro;
+};
+
+inline bool closer_matches(TK closer, TK opener) {
+    switch (closer) {
+    case TK::EndKeyword: return opener == TK::BeginKeyword;
+    case TK::JoinKeyword:
+    case TK::JoinAnyKeyword:
+    case TK::JoinNoneKeyword: return opener == TK::ForkKeyword;
+    case TK::CloseBrace: return opener == TK::OpenBrace;
+    case TK::EndCaseKeyword:
+        return opener == TK::CaseKeyword || opener == TK::CaseXKeyword || opener == TK::CaseZKeyword ||
+               opener == TK::RandCaseKeyword;
+    case TK::EndFunctionKeyword: return opener == TK::FunctionKeyword;
+    case TK::EndTaskKeyword: return opener == TK::TaskKeyword;
+    case TK::EndGenerateKeyword: return opener == TK::GenerateKeyword;
+    case TK::EndGroupKeyword: return opener == TK::CoverGroupKeyword;
+    case TK::EndPropertyKeyword: return opener == TK::PropertyKeyword;
+    case TK::EndSequenceKeyword: return opener == TK::SequenceKeyword || opener == TK::RandSequenceKeyword;
+    case TK::EndClockingKeyword: return opener == TK::ClockingKeyword;
+    case TK::EndSpecifyKeyword: return opener == TK::SpecifyKeyword;
+    case TK::EndTableKeyword: return opener == TK::TableKeyword;
+    case TK::EndClassKeyword: return opener == TK::ClassKeyword;
+    case TK::EndCheckerKeyword: return opener == TK::CheckerKeyword;
+    case TK::EndConfigKeyword: return opener == TK::ConfigKeyword;
+    case TK::EndPrimitiveKeyword: return opener == TK::PrimitiveKeyword;
+    default: return false;
+    }
+}
+
+// A `begin` never encloses these, so an `end` that would have to reach past
+// one to find its `begin` is an extra `end`.
+inline bool is_declaration_scope(TK opener) {
+    return opener == TK::FunctionKeyword || opener == TK::TaskKeyword || opener == TK::GenerateKeyword ||
+           opener == TK::CoverGroupKeyword || opener == TK::PropertyKeyword || opener == TK::SequenceKeyword ||
+           opener == TK::ClockingKeyword || opener == TK::SpecifyKeyword || opener == TK::TableKeyword ||
+           opener == TK::ClassKeyword;
+}
+
+// How many of the open scopes above `floor` the closer `t` closes: its own
+// opener and every scope left open inside it, or none when no open scope is
+// its opener.
+inline size_t scopes_closed_by(const std::vector<IndentScope>& scopes, size_t floor, const Tok& t) {
+    if (scopes.size() <= floor)
+        return 0;
+    if (kind_is(t, TK::MacroUsage) || scopes.back().macro)
+        return 1;
+    const TK k = t.lex.kind;
+    const bool generic = k == TK::EndKeyword || k == TK::JoinKeyword || k == TK::JoinAnyKeyword ||
+                         k == TK::JoinNoneKeyword || k == TK::CloseBrace || k == TK::EndCaseKeyword;
+    for (size_t n = scopes.size(); n > floor; --n) {
+        const IndentScope& s = scopes[n - 1];
+        if (closer_matches(k, s.opener))
+            return scopes.size() - (n - 1);
+        if (s.macro || (generic && is_declaration_scope(s.opener)))
+            return 0;
+    }
+    return 0;
+}
+
 class IndentPass final : public IFormatPass {
 public:
     explicit IndentPass(const FormatOptions& opts) : opts_(opts) {}
@@ -4345,13 +4493,18 @@ public:
         // inside one can never shift the next unit.
         // A nested unit (`module outer; module inner; ... endmodule`, IEEE
         // 1800 23.4) closes at its opener's column, so the opener is kept.
-        struct OuterUnit { int level; size_t open_bodies; size_t opener; };
+        struct OuterUnit { int level; size_t open_bodies; size_t opener; size_t scopes; };
         std::vector<OuterUnit> outer_units;
         // `` `ifdef A module m (input a); `else module m (input b); `endif ``
         // -- alternative headers of one unit.  A branch that opened a unit
         // leaves the next branch where the `` `ifdef `` found it, or the
         // second header would read as a unit nested in the first.
-        struct Branch { int level; size_t outer_units; size_t open_bodies; int scope_net; };
+        // The indent scopes open now, innermost last.  A closer pops the
+        // scope it names (`endfunction` pops a `begin` left open inside the
+        // function too); one that names no open scope -- an extra `end` --
+        // pops nothing, so it cannot dedent the rest of its unit.
+        std::vector<IndentScope> scopes;
+        struct Branch { int level; size_t outer_units; size_t open_bodies; int scope_net; std::vector<IndentScope> scopes; };
         std::vector<Branch> branches;
         // Indent scopes opened minus scopes closed so far; a branch's own
         // share is the difference from the value its `` `ifdef `` saved.
@@ -4366,7 +4519,7 @@ public:
                 switch (t.lex.directive_kind) {
                 case SK::IfDefDirective:
                 case SK::IfNDefDirective:
-                    branches.push_back({level, outer_units.size(), open_bodies.size(), scope_net});
+                    branches.push_back({level, outer_units.size(), open_bodies.size(), scope_net, scopes});
                     break;
                 case SK::ElsIfDirective:
                 case SK::ElseDirective:
@@ -4375,6 +4528,7 @@ public:
                         outer_units.resize(branches.back().outer_units);
                         open_bodies.resize(std::min(open_bodies.size(), branches.back().open_bodies));
                         scope_net = branches.back().scope_net;
+                        scopes = branches.back().scopes;
                     } else if (!branches.empty()) {
                         // Likewise a branch that opened a block:
                         // `` `ifdef A always_ff @(posedge clk) begin `else
@@ -4387,6 +4541,7 @@ public:
                         // and keep their own extent across the branches.
                         level = std::max(0, level - (scope_net - branches.back().scope_net));
                         scope_net = branches.back().scope_net;
+                        scopes = branches.back().scopes;
                     }
                     break;
                 case SK::EndIfDirective:
@@ -4402,8 +4557,14 @@ public:
             bool closes = closes_indent_scope_at(tokens, i) || is_outer_close(t.lex.kind) ||
                           t.mutable_.macro.closes_indent_scope;
             if (closes) {
-                level = std::max(0, level - 1);
-                --scope_net;
+                // A unit's end restores the unit's level below, whatever
+                // was left open inside it.
+                const size_t floor = outer_units.empty() ? 0 : outer_units.back().scopes;
+                const bool unit_end = closes_design_unit(t.lex.kind) && !outer_units.empty();
+                const int popped = unit_end ? 1 : static_cast<int>(scopes_closed_by(scopes, floor, t));
+                scopes.resize(unit_end ? std::min(scopes.size(), floor) : scopes.size() - popped);
+                level = std::max(0, level - popped);
+                scope_net -= popped;
             }
             size_t closed_unit_opener = npos;
             if (closes_design_unit(t.lex.kind) && !outer_units.empty()) {
@@ -4448,7 +4609,7 @@ public:
             // declarations, and for class used in typedef forward declarations.
             const bool design_unit = t.immutable.topology.opens_design_unit;
             if (design_unit)
-                outer_units.push_back({level, open_bodies.size(), i});
+                outer_units.push_back({level, open_bodies.size(), i, scopes.size()});
             if (!closes) {
                 // default_indent_level_inside_outmost_block is about the
                 // outermost unit; a nested one always indents its items.
@@ -4457,6 +4618,8 @@ public:
                     t.mutable_.macro.opens_indent_scope) {
                     ++level;
                     ++scope_net;
+                    if (!design_unit)
+                        scopes.push_back({t.lex.kind, kind_is(t, TK::MacroUsage)});
                 }
             }
 

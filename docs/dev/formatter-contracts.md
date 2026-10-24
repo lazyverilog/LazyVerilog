@@ -109,3 +109,14 @@ expansions, included files -- are skipped. The hpc60 blocks `include a
 header the test does not resolve, so only the style files are checked.
 
 A new topology fact gets a row here and in `facts()`.
+
+## Broken code
+
+The formatter must not let one syntax error spread past its own lines.
+SyntaxPass drops a `(` or `[` still open at a keyword that can never stand
+inside one (`endmodule`, `always_ff`, `assign`, `begin`, ...) or at a `;`
+outside a `for` header, a macro argument and an assertion's property; a
+unit-level keyword drops unclosed braces too. IndentPass closes scopes by
+kind: `endfunction` also closes a `begin` left open inside the function, and
+an extra `end` with no `begin` to close dedents nothing. Guard:
+"broken code damages only its own lines" in `tests/test_formatter_regressions.cpp`.
