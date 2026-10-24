@@ -5302,7 +5302,7 @@ TEST_CASE("formatter: call wrapping counts the declaration alignment padding", "
     opts.function_call.arg_count = -1;
     const std::string input = "module m;\nlogic x = foo(aaaaaaaa, bbbbbbbbb);\nendmodule\n";
     // The aligned line is 49 columns wide; the call ends at column 48.
-    const std::string one_line = "  logic        x       = foo(aaaaaaaa, bbbbbbbbb);\n";
+    const std::string one_line = "  logic       x       = foo(aaaaaaaa, bbbbbbbbb);\n";
     opts.function_call.line_length = 48;
     CHECK(format_source(input, opts).find(one_line) != std::string::npos);
     opts.function_call.line_length = 47;
