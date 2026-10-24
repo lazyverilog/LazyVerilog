@@ -6533,3 +6533,50 @@ TEST_CASE("formatter regression: merge conflict markers stay intact", "[formatte
           "  assign z = y;\n"
           "endmodule\n");
 }
+
+TEST_CASE("formatter regression: line length counts paren spacing and a broken call's close", "[formatter][regression]") {
+    // WrapPass measured `$display( "done", x )` without the spaces
+    // space_inside_parens adds, so a call that fit by the estimate ran past
+    // the limit once printed.
+    FormatOptions spaced;
+    spaced.spacing.space_inside_parens = true;
+    spaced.function_call.line_length = 24;
+    const std::string call = "module m;\n  initial begin\n    $display(\"done\", x);\n  end\nendmodule\n";
+    CHECK(format_stable(call, spaced) ==
+          "module m;\n  initial begin\n    $display(\n      \"done\",\n      x\n    );\n  end\nendmodule\n");
+    spaced.spacing.space_inside_parens = false;
+    CHECK(format_stable(call, spaced) == call);
+
+    // The line after a call broken one argument per line starts under the
+    // call's name, not at the scope indent: the second call was measured
+    // from column 2 and left running to column 54.
+    FormatOptions narrow;
+    narrow.default_indent_level_inside_outmost_block = 0;
+    narrow.function_call.line_length = 40;
+    CHECK(format_stable("module g;\ninitial begin\n  result_value = compute(alpha_value, beta_value) + "
+                        "compute(gamma_value, delta_value) - offset_x;\nend\nendmodule\n",
+                        narrow) ==
+          "module g;\n"
+          "initial begin\n"
+          "  result_value = compute(\n"
+          "                   alpha_value,\n"
+          "                   beta_value\n"
+          "                 ) + compute(\n"
+          "                       gamma_value,\n"
+          "                       delta_value\n"
+          "                     ) - offset_x;\n"
+          "end\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter regression: var_declaration columns never sit inside the text before them", "[formatter][regression]") {
+    // With section2/section3 narrower than a line's dimension or name, the
+    // name's and `=`'s columns were placed inside the text before them.
+    FormatOptions o;
+    o.var_declaration.align = true;
+    o.var_declaration.align_adaptive = true;
+    o.var_declaration.section2_min_width = 0;
+    o.var_declaration.section3_min_width = 0;
+    CHECK(format_stable("module m;\n  logic signed [7:0] a = 1, b;\n  wire [3:0] c;\nendmodule\n", o) ==
+          "module m;\n  logic signed [7:0] a = 1, b;\n  wire         [3:0] c;\nendmodule\n");
+}
