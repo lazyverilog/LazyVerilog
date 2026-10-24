@@ -1524,7 +1524,11 @@ void LazyVerilogServer::register_handlers() {
             }
             if (!note.params.contentChanges.empty()) {
                 auto state = analyzer_.get_state(uri);
-                std::string text = state ? state->text : "";
+                // Not open: applying the change to "" would install a buffer of
+                // fragments that shadows the file's shard until a real didOpen.
+                if (!state)
+                    return;
+                std::string text = state->text;
                 for (const auto& chg : note.params.contentChanges)
                     text = apply_incremental_change(std::move(text), chg);
                 analyzer_.enqueue_parse(uri, std::move(text));
