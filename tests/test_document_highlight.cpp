@@ -184,3 +184,46 @@ TEST_CASE("document highlight: an embedded covergroup's sample() stays in its cl
     std::sort(lines.begin(), lines.end());
     CHECK(lines == std::vector<int>{kRegisterClassLines + 1, call_line});
 }
+
+namespace {
+
+/// Fastest of @p runs highlighting the first class's `rd_cg.sample` in a file
+/// of @p classes register classes.  Every class adds same-named candidates the
+/// highlight has to rule out.
+double fastest_member_highlight_ms(int classes, int runs) {
+    const std::string uri = "file:///tmp/lazyverilog_highlight_member_scaling.sv";
+    const std::string text = register_classes(classes);
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+
+    std::vector<double> samples;
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = provide_document_highlight(analyzer, at(uri, 7, 10));
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        REQUIRE(result.size() == 2);
+    }
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+} // namespace
+
+TEST_CASE("document highlight: cost grows linearly with same-named candidates",
+          "[document-highlight][scaling]") {
+    constexpr int kSmall = 25;
+    constexpr int kLarge = 100; // 4x the classes, the file and the candidates
+    constexpr int kRuns = 5;
+
+    const double small_ms = fastest_member_highlight_ms(kSmall, kRuns);
+    const double large_ms = fastest_member_highlight_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[highlight member scaling] classes " << kSmall << " -> " << kLarge << ": "
+              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // Linear is ~4.  Resolving each candidate with its own walk of the file is
+    // ~16.
+    CHECK(ratio < 8.0);
+}
+

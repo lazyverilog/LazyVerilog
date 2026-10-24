@@ -2141,52 +2141,42 @@ find_subroutine_argument_definition(const slang::syntax::SyntaxTree& tree, const
     return visitor.result;
 }
 
-struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDefinitionVisitor> {
-    const slang::SourceManager& sm;
-    const std::string& uri;
-    const std::string& name;
-    const std::string& preferred_module;
-    const std::string& preferred_package;
-    // Innermost class the cursor sits in.  A class member is visible
-    // unqualified only inside its own class (and the classes extending it,
-    // which the caller resolves separately), so the same-class declaration
-    // answers over every other one; a generated register model declares the
-    // same `sample` in a hundred classes.
-    const std::string& preferred_class;
-    const std::vector<ImportEntry>& visible_imports;
-    int use_line_one_based{0};
-    std::string current_module;
-    std::string current_package;
-    std::string current_class;
-    int aggregate_type_depth{0};
-    std::optional<Location> first_result;
-    std::optional<Location> scoped_result;
-    std::optional<Location> class_result;
-    // How many enclosing lexical scopes each recorded candidate sat in.  A
-    // declaration inside a generate block shadows a module-level one of the same
-    // name, and the module-level declaration is visited first, so "first match
-    // wins" would answer with the shadowed signal.
-    int first_result_depth{-1};
-    int scoped_result_depth{-1};
-    int class_result_depth{-1};
+/// A declaration spelled like the identifier being resolved, with what the walk
+/// knew about its surroundings: everything choose_generic_definition() weighs
+/// except the cursor, so one walk serves every cursor of a references request.
+struct GenericDeclarationCandidate {
+    Location location;
+    // Module and class names, typedef types: visible wherever their scope is.
+    bool scope_sensitive{true};
+    std::string module_name;
+    std::string package_name;
+    std::string class_name;
+    // Innermost lexical scope, in one-based lines; zero means no restriction.
+    std::pair<int, int> innermost_scope{0, 0};
+    // Enclosing scopes that really restrict visibility, i.e. how deeply
+    // shadowed the declaration is.
+    int depth{0};
+    // Subroutine bodies around the declaration.  Their formals and locals are
+    // visible only to a cursor inside every one of them.
+    std::vector<std::pair<int, int>> subroutine_bodies;
+};
 
-    GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
-                             const std::string& name, const std::string& preferred_module,
-                             const std::string& preferred_package,
-                             const std::string& preferred_class,
-                             const std::vector<ImportEntry>& visible_imports,
-                             int use_line_one_based)
-        : sm(sm), uri(uri), name(name), preferred_module(preferred_module),
-          preferred_package(preferred_package), preferred_class(preferred_class),
-          visible_imports(visible_imports), use_line_one_based(use_line_one_based) {}
-
-    std::optional<Location> result() const {
-        if (class_result)
-            return class_result;
-        return scoped_result ? scoped_result : first_result;
-    }
-
-    bool package_member_visible(std::string_view package_name, std::string_view symbol_name) const {
+/// The declaration a use at @p use_line_one_based of @p name means, among
+/// @p candidates in walk order.
+///
+/// @p preferred_class is the innermost class the cursor sits in.  A class
+/// member is visible unqualified only inside its own class (and the classes
+/// extending it, which the caller resolves separately), so the same-class
+/// declaration answers over every other one; a generated register model
+/// declares the same `sample` in a hundred classes.
+static std::optional<Location>
+choose_generic_definition(const std::vector<GenericDeclarationCandidate>& candidates,
+                          const std::string& name, const std::string& preferred_module,
+                          const std::string& preferred_package,
+                          const std::string& preferred_class,
+                          const std::vector<ImportEntry>& visible_imports,
+                          int use_line_one_based) {
+    const auto package_member_visible = [&](std::string_view package_name) {
         if (package_name.empty())
             return true;
 
@@ -2213,11 +2203,85 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
                 continue;
             if (import.end_line > 0 && use_line_one_based > import.end_line)
                 continue;
-            if (import.wildcard || import.symbol_name == symbol_name)
+            if (import.wildcard || import.symbol_name == name)
                 return true;
         }
         return false;
+    };
+
+    const auto contains_use = [&](std::pair<int, int> scope) {
+        const auto [start_line, end_line] = scope;
+        if (start_line > 0 && use_line_one_based < start_line)
+            return false;
+        if (end_line > 0 && use_line_one_based > end_line)
+            return false;
+        return true;
+    };
+
+    std::optional<Location> first_result;
+    std::optional<Location> scoped_result;
+    std::optional<Location> class_result;
+    // A declaration inside a generate block shadows a module-level one of the
+    // same name, and the module-level declaration is visited first, so "first
+    // match wins" would answer with the shadowed signal.
+    int first_result_depth{-1};
+    int scoped_result_depth{-1};
+    int class_result_depth{-1};
+
+    for (const auto& candidate : candidates) {
+        if (!std::all_of(candidate.subroutine_bodies.begin(), candidate.subroutine_bodies.end(),
+                         contains_use))
+            continue;
+        if (!package_member_visible(candidate.package_name))
+            continue;
+        // A declaration inside a block or loop header is only visible to uses
+        // lexically inside that same block:
+        //
+        //     for (int i = 0; i < 10; i++) begin ... end
+        //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
+        //                                               ^ the second `i`, not the first
+        if (candidate.scope_sensitive && !contains_use(candidate.innermost_scope))
+            continue;
+
+        const auto& loc = candidate.location;
+        const int depth = candidate.scope_sensitive ? candidate.depth : 0;
+        if (!first_result || depth > first_result_depth) {
+            first_result = loc;
+            first_result_depth = depth;
+        }
+        if (candidate.scope_sensitive && !preferred_module.empty() &&
+            candidate.module_name == preferred_module &&
+            (!scoped_result || depth > scoped_result_depth)) {
+            scoped_result = loc;
+            scoped_result_depth = depth;
+        }
+        if (candidate.scope_sensitive && !preferred_class.empty() &&
+            candidate.class_name == preferred_class &&
+            (!class_result || depth > class_result_depth)) {
+            class_result = loc;
+            class_result_depth = depth;
+        }
     }
+    if (class_result)
+        return class_result;
+    return scoped_result ? scoped_result : first_result;
+}
+
+/// Every declaration of @p name in the tree, for choose_generic_definition().
+struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDefinitionVisitor> {
+    const slang::SourceManager& sm;
+    const std::string& uri;
+    const std::string& name;
+    std::string current_module;
+    std::string current_package;
+    std::string current_class;
+    int aggregate_type_depth{0};
+    std::vector<std::pair<int, int>> subroutine_bodies;
+    std::vector<GenericDeclarationCandidate> candidates;
+
+    GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
+                             const std::string& name)
+        : sm(sm), uri(uri), name(name) {}
 
     // Lexical declaration scopes (begin/end blocks, loop headers) that enclose
     // the declarations being visited.  A pair of zero lines means "no lexical
@@ -2235,14 +2299,6 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
                                  (int)sm.getLineNumber(range.end()));
     }
 
-    // A declaration inside a block or loop header is only visible to uses
-    // lexically inside that same block:
-    //
-    //     for (int i = 0; i < 10; i++) begin ... end
-    //     for (int i = 0; i < 10; i++) begin o_data[i] = 1; end
-    //                                               ^ the second `i`, not the first
-    /// Enclosing scopes that really restrict visibility, i.e. how deeply
-    /// shadowed a declaration found here is.
     int scope_depth() const {
         int depth = 0;
         for (const auto& [start_line, end_line] : scope_stack)
@@ -2251,41 +2307,19 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         return depth;
     }
 
-    bool cursor_in_innermost_scope() const {
-        if (scope_stack.empty())
-            return true;
-        const auto [start_line, end_line] = scope_stack.back();
-        if (start_line > 0 && use_line_one_based < start_line)
-            return false;
-        if (end_line > 0 && use_line_one_based > end_line)
-            return false;
-        return true;
-    }
-
     void maybe_set(slang::parsing::Token token, bool scope_sensitive = true) {
         if (!token || token.valueText() != name)
             return;
-        if (!package_member_visible(current_package, token.valueText()))
-            return;
-        if (scope_sensitive && !cursor_in_innermost_scope())
-            return;
-
-        auto loc = location_from_token_actual_uri(sm, uri, token);
-        const int depth = scope_sensitive ? scope_depth() : 0;
-        if (!first_result || depth > first_result_depth) {
-            first_result = loc;
-            first_result_depth = depth;
-        }
-        if (scope_sensitive && !preferred_module.empty() && current_module == preferred_module &&
-            (!scoped_result || depth > scoped_result_depth)) {
-            scoped_result = loc;
-            scoped_result_depth = depth;
-        }
-        if (scope_sensitive && !preferred_class.empty() && current_class == preferred_class &&
-            (!class_result || depth > class_result_depth)) {
-            class_result = loc;
-            class_result_depth = depth;
-        }
+        candidates.push_back(GenericDeclarationCandidate{
+            .location = location_from_token_actual_uri(sm, uri, token),
+            .scope_sensitive = scope_sensitive,
+            .module_name = current_module,
+            .package_name = current_package,
+            .class_name = current_class,
+            .innermost_scope = scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back(),
+            .depth = scope_depth(),
+            .subroutine_bodies = subroutine_bodies,
+        });
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
@@ -2425,10 +2459,8 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             return;
         if (uri_from_source_location(sm, range.start()) != uri)
             return;
-        const int start_line = (int)sm.getLineNumber(range.start());
-        const int end_line = (int)sm.getLineNumber(range.end());
-        if (use_line_one_based < start_line || use_line_one_based > end_line)
-            return;
+        subroutine_bodies.emplace_back((int)sm.getLineNumber(range.start()),
+                                       (int)sm.getLineNumber(range.end()));
 
         // A subroutine body is a scope in exactly the way a begin/end block is:
         //
@@ -2442,6 +2474,7 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         push_scope(range);
         visitDefault(node);
         scope_stack.pop_back();
+        subroutine_bodies.pop_back();
     }
 
     void handle(const slang::syntax::TypedefDeclarationSyntax& node) {
@@ -2588,6 +2621,14 @@ static std::optional<Location> find_generic_definition_from_index(
     return scoped_hit ? scoped_hit : first_hit;
 }
 
+static std::vector<GenericDeclarationCandidate>
+generic_declarations(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                     const std::string& name) {
+    GenericDefinitionVisitor visitor(tree.sourceManager(), uri, name);
+    tree.root().visit(visitor);
+    return std::move(visitor.candidates);
+}
+
 static std::optional<Location> find_generic_definition(const slang::syntax::SyntaxTree& tree,
                                                        const std::string& uri,
                                                        const std::string& name,
@@ -2596,11 +2637,9 @@ static std::optional<Location> find_generic_definition(const slang::syntax::Synt
                                                        const std::string& preferred_class,
                                                        const std::vector<ImportEntry>& visible_imports,
                                                        int use_line_one_based) {
-    GenericDefinitionVisitor visitor(tree.sourceManager(), uri, name, preferred_module,
-                                     preferred_package, preferred_class, visible_imports,
-                                     use_line_one_based);
-    tree.root().visit(visitor);
-    return visitor.result();
+    return choose_generic_definition(generic_declarations(tree, uri, name), name,
+                                     preferred_module, preferred_package, preferred_class,
+                                     visible_imports, use_line_one_based);
 }
 
 static std::optional<std::string> class_type_for_object_reference(const SyntaxIndex& index,
@@ -2792,35 +2831,27 @@ struct CovergroupMember {
     std::optional<Location> member;
 };
 
-/// @p member_name of the covergroup @p group embedded in @p scope (a class or
-/// module), when the scope embeds one.
-///
-/// `rd_cg.sample(data)` calls the group's own sample().  An embedded covergroup
-/// is both a type and the class member of that name, so the receiver has no
-/// declared type for the class lookups to follow, and answering from the
-/// enclosing scope instead finds the class's own `sample` -- which every class
-/// of a register model has.  A member the group does not declare (the built-in
-/// sample(), get_coverage()) has no source to answer with.
-static CovergroupMember find_covergroup_member_in_tree(const slang::syntax::SyntaxTree& tree,
-                                                       const std::string& uri,
-                                                       std::string_view scope,
-                                                       std::string_view group,
-                                                       std::string_view member_name) {
-    if (scope.empty() || group.empty() || member_name.empty())
-        return {};
+/// A covergroup a covergroup_declarations() walk found: the scope that embeds
+/// it and its members that have a source name, in declaration order (the
+/// with-function sample() first, then coverpoint and cross labels).
+struct CovergroupDeclaration {
+    std::string scope;
+    std::vector<std::pair<std::string, Location>> members;
+};
 
+/// Every covergroup named @p group in the tree, whatever scope embeds it.
+static std::vector<CovergroupDeclaration>
+covergroup_declarations(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                        std::string_view group) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
-        std::string_view scope;
         std::string_view group;
-        std::string_view member_name;
         std::string current_scope;
-        CovergroupMember result;
+        std::vector<CovergroupDeclaration> groups;
 
-        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view scope,
-                std::string_view group, std::string_view member_name)
-            : sm(sm), uri(uri), scope(scope), group(group), member_name(member_name) {}
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view group)
+            : sm(sm), uri(uri), group(group) {}
 
         void enter(std::string name, const slang::syntax::SyntaxNode& node) {
             auto previous = std::exchange(current_scope, std::move(name));
@@ -2837,34 +2868,72 @@ static CovergroupMember find_covergroup_member_in_tree(const slang::syntax::Synt
         }
 
         void handle(const slang::syntax::CovergroupDeclarationSyntax& node) {
-            if (result.group_found || current_scope != scope || node.name.valueText() != group)
+            if (node.name.valueText() != group)
                 return;
-            result.group_found = true;
-            const auto answer = [&](slang::parsing::Token token) {
-                if (token && token.valueText() == member_name)
-                    result.member = location_from_token_actual_uri(sm, uri, token);
-                return result.member.has_value();
+            auto& found = groups.emplace_back(CovergroupDeclaration{current_scope, {}});
+            const auto add = [&](slang::parsing::Token token) {
+                if (token)
+                    found.members.emplace_back(std::string(token.valueText()),
+                                               location_from_token_actual_uri(sm, uri, token));
             };
             if (const auto* with = node.event
                                        ? node.event->as_if<slang::syntax::WithFunctionSampleSyntax>()
-                                       : nullptr;
-                with && answer(with->sample))
-                return;
+                                       : nullptr)
+                add(with->sample);
             for (const auto* item : node.members) {
                 const slang::syntax::NamedLabelSyntax* label = nullptr;
                 if (const auto* point = item->as_if<slang::syntax::CoverpointSyntax>())
                     label = point->label;
                 else if (const auto* cross = item->as_if<slang::syntax::CoverCrossSyntax>())
                     label = cross->label;
-                if (label && answer(label->name))
-                    return;
+                if (label)
+                    add(label->name);
             }
         }
     };
 
-    Visitor visitor(tree.sourceManager(), uri, scope, group, member_name);
+    Visitor visitor(tree.sourceManager(), uri, group);
     tree.root().visit(visitor);
-    return visitor.result;
+    return std::move(visitor.groups);
+}
+
+/// @p member_name of the first of @p groups embedded in @p scope.
+static CovergroupMember choose_covergroup_member(const std::vector<CovergroupDeclaration>& groups,
+                                                 std::string_view scope,
+                                                 std::string_view member_name) {
+    for (const auto& group : groups) {
+        if (group.scope != scope)
+            continue;
+        CovergroupMember result{.group_found = true};
+        for (const auto& [name, location] : group.members) {
+            if (name == member_name) {
+                result.member = location;
+                break;
+            }
+        }
+        return result;
+    }
+    return {};
+}
+
+/// @p member_name of the covergroup @p group embedded in @p scope (a class or
+/// module), when the scope embeds one.
+///
+/// `rd_cg.sample(data)` calls the group's own sample().  An embedded covergroup
+/// is both a type and the class member of that name, so the receiver has no
+/// declared type for the class lookups to follow, and answering from the
+/// enclosing scope instead finds the class's own `sample` -- which every class
+/// of a register model has.  A member the group does not declare (the built-in
+/// sample(), get_coverage()) has no source to answer with.
+static CovergroupMember find_covergroup_member_in_tree(const slang::syntax::SyntaxTree& tree,
+                                                       const std::string& uri,
+                                                       std::string_view scope,
+                                                       std::string_view group,
+                                                       std::string_view member_name) {
+    if (scope.empty() || group.empty() || member_name.empty())
+        return {};
+    return choose_covergroup_member(covergroup_declarations(tree, uri, group), scope,
+                                    member_name);
 }
 
 /// True when this file declares a generate block labelled @p label.
@@ -2906,44 +2975,45 @@ static std::pair<int, int> source_range_lines_one_based(const slang::SourceManag
     return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
 }
 
-static std::optional<std::string> class_type_for_object_reference_in_tree(
-    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view module_name,
-    std::string_view object_name, int use_line_one_based) {
+/// A declaration of the receiver class_type_for_object_reference_in_tree()
+/// asks about, with the lexical scope that bounds who can see it.
+struct ObjectTypeDeclaration {
+    // The module or class declaring it.
+    std::string owner;
+    // One-based lines; zero means no restriction (a subroutine formal).
+    std::pair<int, int> scope{0, 0};
+    std::string type;
+};
+
+/// Every declaration of @p object_name directly in a module or class, in walk
+/// order; choose_object_type() picks per scope and use line.
+static std::vector<ObjectTypeDeclaration>
+object_type_declarations(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                         std::string_view object_name) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
-        std::string_view module_name;
         std::string_view object_name;
-        int use_line_one_based;
         std::string current_module;
         std::vector<std::pair<int, int>> scope_stack;
-        std::optional<std::string> result;
+        std::vector<ObjectTypeDeclaration> declarations;
 
         Visitor(const slang::SourceManager& sm, const std::string& uri,
-                std::string_view module_name, std::string_view object_name,
-                int use_line_one_based)
-            : sm(sm), uri(uri), module_name(module_name), object_name(object_name),
-              use_line_one_based(use_line_one_based) {}
+                std::string_view object_name)
+            : sm(sm), uri(uri), object_name(object_name) {}
 
         void maybe_set(const slang::syntax::DataTypeSyntax& type,
                        const slang::syntax::SeparatedSyntaxList<slang::syntax::DeclaratorSyntax>& declarators) {
-            if (current_module != module_name)
-                return;
-            const auto [scope_start, scope_end] =
-                scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back();
-            if (scope_start > 0 && use_line_one_based < scope_start)
-                return;
-            if (scope_end > 0 && use_line_one_based > scope_end)
-                return;
+            const auto scope = scope_stack.empty() ? std::pair<int, int>{0, 0} : scope_stack.back();
             for (const auto* decl : declarators) {
                 if (!decl || decl->name.valueText() != object_name)
                     continue;
                 const auto decl_uri = uri_from_source_location(sm, decl->name.location());
                 if (!decl_uri.empty() && decl_uri != uri)
                     continue;
-                const auto type_name = canonical_type_name_from_text(render_syntax_node_text(sm, type));
+                auto type_name = canonical_type_name_from_text(render_syntax_node_text(sm, type));
                 if (!type_name.empty())
-                    result = type_name;
+                    declarations.push_back({current_module, scope, std::move(type_name)});
             }
         }
 
@@ -2969,17 +3039,17 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
 
         // `task run_phase(uvm_phase phase);` — the receiver is an argument.
         void handle(const slang::syntax::FunctionPortSyntax& node) {
-            if (current_module != module_name || !node.dataType || !node.declarator)
+            if (!node.dataType || !node.declarator)
                 return;
             if (node.declarator->name.valueText() != object_name)
                 return;
             const auto decl_uri = uri_from_source_location(sm, node.declarator->name.location());
             if (!decl_uri.empty() && decl_uri != uri)
                 return;
-            const auto type_name =
+            auto type_name =
                 canonical_type_name_from_text(render_syntax_node_text(sm, *node.dataType));
             if (!type_name.empty())
-                result = type_name;
+                declarations.push_back({current_module, {0, 0}, std::move(type_name)});
         }
 
         void handle(const slang::syntax::BlockStatementSyntax& node) {
@@ -2999,9 +3069,35 @@ static std::optional<std::string> class_type_for_object_reference_in_tree(
         }
     };
 
-    Visitor visitor(tree.sourceManager(), uri, module_name, object_name, use_line_one_based);
+    Visitor visitor(tree.sourceManager(), uri, object_name);
     tree.root().visit(visitor);
-    return visitor.result;
+    return std::move(visitor.declarations);
+}
+
+/// The type of the last of @p declarations in @p module_name visible at
+/// @p use_line_one_based.
+static std::optional<std::string>
+choose_object_type(const std::vector<ObjectTypeDeclaration>& declarations,
+                   std::string_view module_name, int use_line_one_based) {
+    std::optional<std::string> result;
+    for (const auto& declaration : declarations) {
+        if (declaration.owner != module_name)
+            continue;
+        const auto [scope_start, scope_end] = declaration.scope;
+        if (scope_start > 0 && use_line_one_based < scope_start)
+            continue;
+        if (scope_end > 0 && use_line_one_based > scope_end)
+            continue;
+        result = declaration.type;
+    }
+    return result;
+}
+
+static std::optional<std::string> class_type_for_object_reference_in_tree(
+    const slang::syntax::SyntaxTree& tree, const std::string& uri, std::string_view module_name,
+    std::string_view object_name, int use_line_one_based) {
+    return choose_object_type(object_type_declarations(tree, uri, object_name), module_name,
+                              use_line_one_based);
 }
 
 /// Declared type of `type_name.field_name` when `type_name` is a typedef'd
@@ -3826,6 +3922,26 @@ static bool contains_position_in_uri(const slang::SourceManager& sm, slang::Sour
     return contains_position(sm, range, line, col) && range_starts_in_uri(sm, range, uri);
 }
 
+/// Indices [first, last) of the @p cursors (sorted (line, col) pairs) that
+/// @p range contains, or none when the range does not start in @p uri: the
+/// containment contains_position_in_uri() tests, for many cursors at once.
+static std::pair<size_t, size_t> cursor_span(const slang::SourceManager& sm,
+                                             const std::vector<std::pair<int, int>>& cursors,
+                                             slang::SourceRange range, const std::string& uri) {
+    if (cursors.empty() || !range.start().valid() || !range.end().valid())
+        return {0, 0};
+    const std::pair<int, int> start{to_lsp_line((int)sm.getLineNumber(range.start())),
+                                    lsp_column(sm, range.start())};
+    const std::pair<int, int> end{to_lsp_line((int)sm.getLineNumber(range.end())),
+                                  lsp_column(sm, range.end())};
+    const auto first = std::lower_bound(cursors.begin(), cursors.end(), start);
+    const auto last = std::lower_bound(first, cursors.end(), end);
+    // Position first: deriving a URI converts the buffer's path.
+    if (first == last || !range_starts_in_uri(sm, range, uri))
+        return {0, 0};
+    return {size_t(first - cursors.begin()), size_t(last - cursors.begin())};
+}
+
 static bool token_contains_position_in_uri(const slang::SourceManager& sm,
                                            const slang::parsing::Token& token,
                                            const std::string& uri, int line, int col) {
@@ -3878,28 +3994,57 @@ struct DefinitionTarget {
     std::string scope_class;
 };
 
+/// Classifies the token under each of a set of cursors in one walk.
+///
+/// One cursor is go-to-definition; many are find_references() asking about
+/// every token spelled like its target, which used to cost one walk of the
+/// whole file per token.  Each cursor keeps the first answer the walk gives it,
+/// so a node that claims one cursor still descends for the others.
 struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionTargetVisitor> {
     const slang::SourceManager& sm;
     const std::string& uri;
-    int line;
-    int col;
-    DefinitionTarget target;
+    // Sorted and unique: (line, col).
+    std::vector<std::pair<int, int>> cursors;
+    std::vector<DefinitionTarget> targets;
     // A macro body token whose expansion covers the cursor.  Held aside rather
     // than accepted outright: the same expansion also covers the arguments the
     // user typed, and an identifier there is the better answer.  Body tokens are
     // visited first, so the walk has to continue past them to find out.
-    DefinitionTarget macro_target;
+    std::vector<DefinitionTarget> macro_targets;
+    size_t unclaimed;
     std::string current_module;
     std::string current_package;
     std::string current_class;
 
-    DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri, int line,
-                            int col)
-        : sm(sm), uri(uri), line(line), col(col) {}
+    DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri,
+                            std::vector<std::pair<int, int>> sorted_cursors)
+        : sm(sm), uri(uri), cursors(std::move(sorted_cursors)), targets(cursors.size()),
+          macro_targets(cursors.size()), unclaimed(cursors.size()) {}
 
-    bool found() const { return target.kind != DefinitionTargetKind::None; }
+    DefinitionTarget result(size_t i) const {
+        return targets[i].kind != DefinitionTargetKind::None ? targets[i] : macro_targets[i];
+    }
 
-    /// Whether @p token may claim the cursor as a definite target.
+    std::pair<size_t, size_t> cursors_in(slang::SourceRange range) const {
+        return cursor_span(sm, cursors, range, uri);
+    }
+
+    /// The target slot of the still-unclaimed cursor @p token covers, if any.
+    /// The caller fills it in, which claims it.
+    DefinitionTarget* unclaimed_cursor_in(const slang::parsing::Token& token) {
+        if (!token || !token.location().valid() || unclaimed == 0)
+            return nullptr;
+        const auto [first, last] = cursors_in(visible_range_for_token(sm, token));
+        for (size_t i = first; i < last; ++i) {
+            if (targets[i].kind == DefinitionTargetKind::None) {
+                --unclaimed;
+                return &targets[i];
+            }
+        }
+        return nullptr;
+    }
+
+    /// The cursor @p token may claim as a definite target, if any.
     ///
     /// visitToken() already defers macro-body tokens: their expansion range is
     /// the whole invocation, which also covers the arguments the user typed, so
@@ -3909,10 +4054,11 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     /// such as `` `define COPY(ARG) function void f(peer_t rhs); ARG = rhs.ARG;
     /// endfunction `` claims a cursor sitting on `cfg` in `` `COPY(cfg) `` and
     /// resolves to peer_t instead of the user's own declaration.
-    bool token_claims_cursor(const slang::parsing::Token& token) const {
-        if (!token_contains_position_in_uri(sm, token, uri, line, col))
-            return false;
-        return !(sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()));
+    DefinitionTarget* claim(const slang::parsing::Token& token) {
+        if (token && token.location().valid() && sm.isMacroLoc(token.location()) &&
+            !sm.isMacroArgLoc(token.location()))
+            return nullptr;
+        return unclaimed_cursor_in(token);
     }
 
     /// Whole dotted receiver written before @p token, outermost first.
@@ -3993,12 +4139,11 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
-        if (token_claims_cursor(node.header->name)) {
-            target.kind = DefinitionTargetKind::Generic;
-            target.name = std::string(node.header->name.valueText());
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (auto* target = claim(node.header->name)) {
+            target->kind = DefinitionTargetKind::Generic;
+            target->name = std::string(node.header->name.valueText());
+            target->scope_module = current_module;
+            target->scope_package = current_package;
         }
 
         auto previous_module = current_module;
@@ -4022,13 +4167,12 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
-        if (token_claims_cursor(node.type)) {
-            target.kind = DefinitionTargetKind::Instance;
-            target.name = std::string(node.type.valueText());
-            target.module_name = target.name;
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (auto* target = claim(node.type)) {
+            target->kind = DefinitionTargetKind::Instance;
+            target->name = std::string(node.type.valueText());
+            target->module_name = target->name;
+            target->scope_module = current_module;
+            target->scope_package = current_package;
         }
 
         const std::string module_name(node.type.valueText());
@@ -4039,13 +4183,12 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                               : nullptr;
                 if (!named)
                     continue;
-                if (token_claims_cursor(named->name)) {
-                    target.kind = DefinitionTargetKind::NamedParameter;
-                    target.name = std::string(named->name.valueText());
-                    target.module_name = module_name;
-                    target.scope_module = current_module;
-                    target.scope_package = current_package;
-                    return;
+                if (auto* target = claim(named->name)) {
+                    target->kind = DefinitionTargetKind::NamedParameter;
+                    target->name = std::string(named->name.valueText());
+                    target->module_name = module_name;
+                    target->scope_module = current_module;
+                    target->scope_package = current_package;
                 }
             }
         }
@@ -4053,27 +4196,28 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         for (const auto* instance : node.instances) {
             if (!instance)
                 continue;
-            if (instance->decl &&
-                token_claims_cursor(instance->decl->name)) {
-                target.kind = DefinitionTargetKind::Instance;
-                target.name = std::string(instance->decl->name.valueText());
-                target.module_name = module_name;
-                target.scope_module = current_module;
-                target.scope_package = current_package;
-                return;
+            if (instance->decl) {
+                if (auto* target = claim(instance->decl->name)) {
+                    target->kind = DefinitionTargetKind::Instance;
+                    target->name = std::string(instance->decl->name.valueText());
+                    target->module_name = module_name;
+                    target->scope_module = current_module;
+                    target->scope_package = current_package;
+                }
             }
 
             for (const auto* connection : instance->connections) {
                 if (!connection)
                     continue;
                 const auto* named = connection->as_if<slang::syntax::NamedPortConnectionSyntax>();
-                if (named && token_claims_cursor(named->name)) {
-                    target.kind = DefinitionTargetKind::NamedPort;
-                    target.name = std::string(named->name.valueText());
-                    target.module_name = module_name;
-                    target.scope_module = current_module;
-                    target.scope_package = current_package;
-                    return;
+                if (!named)
+                    continue;
+                if (auto* target = claim(named->name)) {
+                    target->kind = DefinitionTargetKind::NamedPort;
+                    target->name = std::string(named->name.valueText());
+                    target->module_name = module_name;
+                    target->scope_module = current_module;
+                    target->scope_package = current_package;
                 }
             }
         }
@@ -4094,13 +4238,12 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             const auto* named = argument->as_if<slang::syntax::NamedArgumentSyntax>();
             if (!named)
                 continue;
-            if (token_claims_cursor(named->name)) {
-                target.kind = DefinitionTargetKind::NamedArgument;
-                target.name = std::string(named->name.valueText());
-                target.subroutine_name = subroutine_name;
-                target.scope_module = current_module;
-                target.scope_package = current_package;
-                return;
+            if (auto* target = claim(named->name)) {
+                target->kind = DefinitionTargetKind::NamedArgument;
+                target->name = std::string(named->name.valueText());
+                target->subroutine_name = subroutine_name;
+                target->scope_module = current_module;
+                target->scope_package = current_package;
             }
         }
 
@@ -4140,17 +4283,16 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 node.left->kind == slang::syntax::SyntaxKind::IdentifierSelectName) {
                 if (const auto* right =
                         node.right->as_if<slang::syntax::IdentifierNameSyntax>()) {
-                    if (token_claims_cursor(right->identifier)) {
-                        std::vector<std::string> chain;
-                        collect_dotted_name_chain(node.left, chain);
-                        if (chain.size() == 1) {
-                            target.kind = DefinitionTargetKind::ClassMember;
-                            target.name = std::string(right->identifier.valueText());
-                            target.object_path = std::move(chain);
-                            target.object_name = target.object_path.back();
-                            target.scope_module = current_module;
-                            target.scope_package = current_package;
-                            return;
+                    std::vector<std::string> chain;
+                    collect_dotted_name_chain(node.left, chain);
+                    if (chain.size() == 1) {
+                        if (auto* target = claim(right->identifier)) {
+                            target->kind = DefinitionTargetKind::ClassMember;
+                            target->name = std::string(right->identifier.valueText());
+                            target->object_path = std::move(chain);
+                            target->object_name = target->object_path.back();
+                            target->scope_module = current_module;
+                            target->scope_package = current_package;
                         }
                     }
                 }
@@ -4194,15 +4336,15 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             }
         }
 
-        if (left_identifier && right &&
-            token_claims_cursor(right->identifier)) {
-            target.kind = DefinitionTargetKind::PackageMember;
-            target.name = std::string(right->identifier.valueText());
-            target.package_qualifier = std::string(left_identifier.valueText());
-            target.qualifier_scope = std::move(left_owner);
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (left_identifier && right) {
+            if (auto* target = claim(right->identifier)) {
+                target->kind = DefinitionTargetKind::PackageMember;
+                target->name = std::string(right->identifier.valueText());
+                target->package_qualifier = std::string(left_identifier.valueText());
+                target->qualifier_scope = std::move(left_owner);
+                target->scope_module = current_module;
+                target->scope_package = current_package;
+            }
         }
 
         visitDefault(node);
@@ -4213,13 +4355,12 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     // where a package-qualified name would otherwise resolve to a local
     // declaration of the same name.
     void handle(const slang::syntax::PackageImportItemSyntax& node) {
-        if (token_claims_cursor(node.item)) {
-            target.kind = DefinitionTargetKind::PackageMember;
-            target.name = std::string(node.item.valueText());
-            target.package_qualifier = std::string(node.package.valueText());
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (auto* target = claim(node.item)) {
+            target->kind = DefinitionTargetKind::PackageMember;
+            target->name = std::string(node.item.valueText());
+            target->package_qualifier = std::string(node.package.valueText());
+            target->scope_module = current_module;
+            target->scope_package = current_package;
         }
         visitDefault(node);
     }
@@ -4270,48 +4411,47 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     }
 
     void handle(const slang::syntax::MemberAccessExpressionSyntax& node) {
-        if (token_claims_cursor(node.name)) {
-            target.kind = DefinitionTargetKind::ClassMember;
-            target.name = std::string(node.name.valueText());
-            collect_receiver_chain(node.left, target.object_path);
-            target.object_name =
-                target.object_path.empty() ? std::string{} : target.object_path.back();
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (auto* target = claim(node.name)) {
+            target->kind = DefinitionTargetKind::ClassMember;
+            target->name = std::string(node.name.valueText());
+            collect_receiver_chain(node.left, target->object_path);
+            target->object_name =
+                target->object_path.empty() ? std::string{} : target->object_path.back();
+            target->scope_module = current_module;
+            target->scope_package = current_package;
         }
         visitDefault(node);
     }
 
     void handle(const slang::syntax::NamedTypeSyntax& node) {
-        const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>();
-        if (identifier &&
-            token_claims_cursor(identifier->identifier)) {
-            target.kind = DefinitionTargetKind::Generic;
-            target.name = std::string(identifier->identifier.valueText());
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            return;
+        if (const auto* identifier = node.name->as_if<slang::syntax::IdentifierNameSyntax>()) {
+            if (auto* target = claim(identifier->identifier)) {
+                target->kind = DefinitionTargetKind::Generic;
+                target->name = std::string(identifier->identifier.valueText());
+                target->scope_module = current_module;
+                target->scope_package = current_package;
+            }
         }
         visitDefault(node);
     }
 
     void visitToken(slang::parsing::Token token) {
-        if (found() || !token || !token.location().valid())
+        if (unclaimed == 0 || !token || !token.location().valid())
             return;
 
         if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location())) {
-            if (macro_target.kind != DefinitionTargetKind::None ||
-                !contains_position_in_uri(sm, sm.getExpansionRange(token.location()), uri, line,
-                                          col))
-                return;
-
-            auto macro_name = sm.getMacroName(token.location());
-            if (!macro_name.empty()) {
-                macro_target.kind = DefinitionTargetKind::Macro;
-                macro_target.name = std::string(macro_name);
-                macro_target.scope_module = current_module;
-                macro_target.scope_package = current_package;
+            const auto [first, last] = cursors_in(sm.getExpansionRange(token.location()));
+            for (size_t i = first; i < last; ++i) {
+                if (targets[i].kind != DefinitionTargetKind::None ||
+                    macro_targets[i].kind != DefinitionTargetKind::None)
+                    continue;
+                auto macro_name = sm.getMacroName(token.location());
+                if (macro_name.empty())
+                    break;
+                macro_targets[i].kind = DefinitionTargetKind::Macro;
+                macro_targets[i].name = std::string(macro_name);
+                macro_targets[i].scope_module = current_module;
+                macro_targets[i].scope_package = current_package;
             }
             return;
         }
@@ -4323,40 +4463,47 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         const bool is_member_name_token =
             token.kind == slang::parsing::TokenKind::Identifier ||
             token.kind == slang::parsing::TokenKind::NewKeyword;
-        if (is_member_name_token &&
-            token_contains_position_in_uri(sm, token, uri, line, col)) {
-            auto object_path = receiver_chain_before_member_dot(token);
-            if (!object_path.empty()) {
-                target.kind = DefinitionTargetKind::ClassMember;
-                target.name = std::string(token.valueText());
-                target.object_name = object_path.back();
-                target.object_path = std::move(object_path);
-                target.scope_module = current_module;
-                target.scope_package = current_package;
-                // The receiver of `obj.member` inside a class body is looked up
-                // in that class, so the enclosing class has to travel with the
-                // target just as it does for unqualified names.
-                target.scope_class = current_class;
-                return;
-            }
-            // A bare `new` is an object creation, not a name the user can be
-            // asking about; only `receiver.new` is a member reference.
-            if (token.kind == slang::parsing::TokenKind::NewKeyword)
-                return;
-            target.kind = DefinitionTargetKind::Generic;
-            target.name = std::string(token.valueText());
-            target.scope_module = current_module;
-            target.scope_package = current_package;
-            target.scope_class = current_class;
+        if (!is_member_name_token)
+            return;
+        auto* target = unclaimed_cursor_in(token);
+        if (!target)
+            return;
+        auto object_path = receiver_chain_before_member_dot(token);
+        // A bare `new` is an object creation, not a name the user can be asking
+        // about; only `receiver.new` is a member reference.
+        if (object_path.empty() && token.kind == slang::parsing::TokenKind::NewKeyword) {
+            ++unclaimed;
+            return;
         }
+        target->name = std::string(token.valueText());
+        target->scope_module = current_module;
+        target->scope_package = current_package;
+        // The receiver of `obj.member` inside a class body is looked up in that
+        // class, so the enclosing class has to travel with the target just as it
+        // does for unqualified names.
+        target->scope_class = current_class;
+        if (object_path.empty()) {
+            target->kind = DefinitionTargetKind::Generic;
+            return;
+        }
+        target->kind = DefinitionTargetKind::ClassMember;
+        target->object_name = object_path.back();
+        target->object_path = std::move(object_path);
     }
 };
 
+/// Sorted, without duplicates: the order DefinitionTargetVisitor takes.
+static std::vector<std::pair<int, int>> sorted_cursors(std::vector<std::pair<int, int>> cursors) {
+    std::sort(cursors.begin(), cursors.end());
+    cursors.erase(std::unique(cursors.begin(), cursors.end()), cursors.end());
+    return cursors;
+}
+
 static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tree,
                                              const std::string& uri, int line, int col) {
-    DefinitionTargetVisitor visitor(tree.sourceManager(), uri, line, col);
+    DefinitionTargetVisitor visitor(tree.sourceManager(), uri, {{line, col}});
     tree.root().visit(visitor);
-    return visitor.found() ? visitor.target : visitor.macro_target;
+    return visitor.result(0);
 }
 
 static bool index_entry_location_matches(const SyntaxIndex& idx, SourceFileID file_id,
@@ -4895,24 +5042,25 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     return SymbolInfo{.name = ident, .kind = "unknown", .line = line, .col = col};
 }
 
-std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& uri, int line,
-                                                            int col) const {
-    auto state = get_state(uri);
-    if (!state || !state->tree)
-        return std::nullopt;
-
+/// The Identifier token under each of @p cursors (sorted and unique), in one
+/// walk.
+static std::vector<std::optional<IdentifierAtPosition>>
+identifier_tokens_at(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                     const std::vector<std::pair<int, int>>& cursors) {
     struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
         const slang::SourceManager& sm;
         const std::string& uri;
-        int line;
-        int col;
-        std::optional<IdentifierAtPosition> result;
+        const std::vector<std::pair<int, int>>& cursors;
+        std::vector<std::optional<IdentifierAtPosition>> results;
+        size_t unanswered;
 
-        Visitor(const slang::SourceManager& sm, const std::string& uri, int line, int col)
-            : sm(sm), uri(uri), line(line), col(col) {}
+        Visitor(const slang::SourceManager& sm, const std::string& uri,
+                const std::vector<std::pair<int, int>>& cursors)
+            : sm(sm), uri(uri), cursors(cursors), results(cursors.size()),
+              unanswered(cursors.size()) {}
 
         void visitToken(slang::parsing::Token token) {
-            if (result || !token || token.kind != slang::parsing::TokenKind::Identifier)
+            if (unanswered == 0 || !token || token.kind != slang::parsing::TokenKind::Identifier)
                 return;
             // A macro body token is preprocessor output with no position of its
             // own in the file, so the cursor can never really be on it.  Its
@@ -4922,38 +5070,54 @@ std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& u
             // Arguments are typed at the call site and are hit normally.
             if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
                 return;
-            if (!token_contains_position_in_uri(sm, token, uri, line, col))
-                return;
-
-            const auto start = visible_range_for_token(sm, token).start();
-            const int token_line = to_lsp_line((int)sm.getLineNumber(start));
-            const int token_col = lsp_column(sm, start);
-            const std::string name(token.valueText());
-            result = IdentifierAtPosition{
-                .name = name,
-                .line = token_line,
-                .col = token_col,
-                .end_col = token_col + lsp_column_width(name),
-            };
+            const auto range = visible_range_for_token(sm, token);
+            const auto [first, last] = cursor_span(sm, cursors, range, uri);
+            for (size_t i = first; i < last; ++i) {
+                if (results[i])
+                    continue;
+                const int token_line = to_lsp_line((int)sm.getLineNumber(range.start()));
+                const int token_col = lsp_column(sm, range.start());
+                const std::string name(token.valueText());
+                results[i] = IdentifierAtPosition{
+                    .name = name,
+                    .line = token_line,
+                    .col = token_col,
+                    .end_col = token_col + lsp_column_width(name),
+                };
+                --unanswered;
+            }
         }
     };
 
-    Visitor visitor(state->tree->sourceManager(), uri, line, col);
-    state->tree->root().visit(visitor);
-    if (visitor.result)
-        return visitor.result;
+    Visitor visitor(tree.sourceManager(), uri, cursors);
+    tree.root().visit(visitor);
+    return std::move(visitor.results);
+}
 
-    // A macro invocation leaves no Identifier token at the user's position --
-    // the preprocessor consumed the backtick and the name.  Read the name back
-    // out of the source so `FOO, and a `define of it, stay renameable.
-    if (auto ident = extract_ident_span(state->text, line, col);
-        ident && (is_backtick_identifier(state->text, line, ident->start_col) ||
-                  is_define_identifier(state->text, line, ident->start_col)))
+/// A macro invocation leaves no Identifier token at the user's position -- the
+/// preprocessor consumed the backtick and the name.  Read the name back out of
+/// the source so `FOO, and a `define of it, stay renameable.
+static std::optional<IdentifierAtPosition> macro_identifier_at(const std::string& text, int line,
+                                                               int col) {
+    if (auto ident = extract_ident_span(text, line, col);
+        ident && (is_backtick_identifier(text, line, ident->start_col) ||
+                  is_define_identifier(text, line, ident->start_col)))
         return IdentifierAtPosition{.name = ident->text,
                                     .line = line,
                                     .col = ident->start_col,
                                     .end_col = ident->end_col};
     return std::nullopt;
+}
+
+std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& uri, int line,
+                                                            int col) const {
+    auto state = get_state(uri);
+    if (!state || !state->tree)
+        return std::nullopt;
+
+    if (auto found = identifier_tokens_at(*state->tree, uri, {{line, col}}).front())
+        return found;
+    return macro_identifier_at(state->text, line, col);
 }
 
 static std::optional<Location> include_target_at(const DocumentState& state, int line) {
@@ -5269,12 +5433,139 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     return result;
 }
 
+/// The walks of one document's tree that definition_of_state() makes, done
+/// once for a whole references request instead of once per candidate token.
+///
+/// find_references() resolves every token spelled like its target to tell the
+/// target's uses from other declarations' (visit_tree).  Each resolution walked
+/// the whole file several times, so a name repeated in every class of a
+/// generated file cost (tokens x file size): highlighting `sample` in a 270 KB
+/// UVM register model took over ten seconds.  The cursors' own questions are
+/// answered in one walk up front, every other walk is memoized on its
+/// arguments, and the three whose answer depends on the cursor's line or
+/// enclosing class keep what their walk saw for the name and choose per cursor
+/// -- memoized per class they would walk the file once per class again.
+struct DefinitionTreeQueries {
+    const DocumentState& state;
+    const std::string uri;
+    std::vector<std::pair<int, int>> cursors;
+    std::vector<DefinitionTarget> targets;
+    std::vector<std::optional<IdentifierAtPosition>> identifiers;
+    std::map<std::string, std::vector<GenericDeclarationCandidate>> generic_declarations_by_name;
+    std::map<std::string, std::vector<ObjectTypeDeclaration>> object_type_declarations_by_name;
+    std::map<std::vector<std::string>, std::optional<Location>> locations;
+    std::map<std::string, std::vector<CovergroupDeclaration>> covergroups_by_name;
+    std::map<std::string, bool> generate_labels;
+
+    DefinitionTreeQueries(const DocumentState& state, std::string uri)
+        : state(state), uri(std::move(uri)) {}
+
+    /// Answers the cursors' own questions for @p positions in one walk each.
+    void prefetch(std::vector<std::pair<int, int>> positions) {
+        cursors = sorted_cursors(std::move(positions));
+        DefinitionTargetVisitor visitor(state.tree->sourceManager(), uri, cursors);
+        state.tree->root().visit(visitor);
+        targets.clear();
+        for (size_t i = 0; i < cursors.size(); ++i)
+            targets.push_back(visitor.result(i));
+        identifiers = identifier_tokens_at(*state.tree, uri, cursors);
+    }
+
+    std::optional<size_t> cursor_index(int line, int col) const {
+        const auto it = std::lower_bound(cursors.begin(), cursors.end(), std::pair{line, col});
+        if (it == cursors.end() || *it != std::pair{line, col})
+            return std::nullopt;
+        return size_t(it - cursors.begin());
+    }
+
+    DefinitionTarget target_at(int line, int col) const {
+        if (const auto i = cursor_index(line, col))
+            return targets[*i];
+        return definition_target_at(*state.tree, uri, line, col);
+    }
+
+    /// Analyzer::identifier_at() against this request's snapshot.
+    std::optional<IdentifierAtPosition> identifier_at(int line, int col) const {
+        if (const auto i = cursor_index(line, col); i && identifiers[*i])
+            return identifiers[*i];
+        if (!cursor_index(line, col)) {
+            if (auto found = identifier_tokens_at(*state.tree, uri, {{line, col}}).front())
+                return found;
+        }
+        return macro_identifier_at(state.text, line, col);
+    }
+
+    template <typename Compute>
+    std::optional<Location> location(std::vector<std::string> key, Compute&& compute) {
+        if (auto it = locations.find(key); it != locations.end())
+            return it->second;
+        auto answer = compute();
+        locations.emplace(std::move(key), answer);
+        return answer;
+    }
+
+    std::optional<Location> generic_definition(const std::string& name,
+                                               const std::string& preferred_module,
+                                               const std::string& preferred_package,
+                                               const std::string& preferred_class,
+                                               const std::vector<ImportEntry>& visible_imports,
+                                               int use_line_one_based) {
+        auto it = generic_declarations_by_name.find(name);
+        if (it == generic_declarations_by_name.end())
+            it = generic_declarations_by_name
+                     .emplace(name, generic_declarations(*state.tree, uri, name))
+                     .first;
+        return choose_generic_definition(it->second, name, preferred_module, preferred_package,
+                                         preferred_class, visible_imports, use_line_one_based);
+    }
+
+    std::optional<std::string> object_type(const std::string& scope, const std::string& object,
+                                           int use_line_one_based) {
+        auto it = object_type_declarations_by_name.find(object);
+        if (it == object_type_declarations_by_name.end())
+            it = object_type_declarations_by_name
+                     .emplace(object, object_type_declarations(*state.tree, uri, object))
+                     .first;
+        return choose_object_type(it->second, scope, use_line_one_based);
+    }
+
+    CovergroupMember covergroup_member(const std::string& scope, const std::string& group,
+                                       const std::string& member) {
+        if (scope.empty() || group.empty() || member.empty())
+            return {};
+        auto it = covergroups_by_name.find(group);
+        if (it == covergroups_by_name.end())
+            it = covergroups_by_name.emplace(group, covergroup_declarations(*state.tree, uri, group))
+                     .first;
+        return choose_covergroup_member(it->second, scope, member);
+    }
+
+    bool generate_label_exists(const std::string& label) {
+        if (auto it = generate_labels.find(label); it != generate_labels.end())
+            return it->second;
+        const bool exists = generate_block_label_exists_in_tree(*state.tree, label);
+        generate_labels.emplace(label, exists);
+        return exists;
+    }
+};
+
 std::optional<Location>
 Analyzer::definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
                               std::span<const ExtraFileInfo* const> ranked,
-                              const std::string* skip_extra_uri) const {
+                              const std::string* skip_extra_uri,
+                              DefinitionTreeQueries* tree_queries) const {
     if (!state.tree)
         return std::nullopt;
+
+    // Only the walks of the tree the queries were built for.
+    DefinitionTreeQueries* const queries =
+        tree_queries && &tree_queries->state == &state && tree_queries->uri == uri ? tree_queries
+                                                                                   : nullptr;
+    // A walk of this tree whose answer depends only on its arguments, which
+    // name it in @p key.
+    const auto this_tree = [&](std::vector<std::string> key, auto&& walk) {
+        return queries ? queries->location(std::move(key), walk) : walk();
+    };
 
     auto skip_extra = [&](const ExtraFileInfo* extra) {
         return skip_extra_uri && extra->uri == *skip_extra_uri;
@@ -5313,7 +5604,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                                         std::forward<decltype(probe)>(probe));
     };
 
-    auto target = definition_target_at(*state.tree, uri, line, col);
+    auto target = queries ? queries->target_at(line, col)
+                          : definition_target_at(*state.tree, uri, line, col);
 
     if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
         auto ident = extract_ident_span(state.text, line, col);
@@ -5321,7 +5613,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                        !is_define_identifier(state.text, line, ident->start_col)))
             return std::nullopt;
 
-        if (auto loc = find_macro_definition(*state.tree, uri, ident->text))
+        if (auto loc = this_tree({"macro", ident->text},
+                                 [&] { return find_macro_definition(*state.tree, uri, ident->text); }))
             return loc;
         return nearest_open_buffer_answer(
             [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
@@ -5330,7 +5623,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     if (target.kind == DefinitionTargetKind::Macro) {
-        if (auto loc = find_macro_definition(*state.tree, uri, target.name))
+        if (auto loc = this_tree({"macro", target.name},
+                                 [&] { return find_macro_definition(*state.tree, uri, target.name); }))
             return loc;
         return nearest_open_buffer_answer(
             [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
@@ -5344,8 +5638,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // which find_port_definition() covers.  These were two identical copies.
     if (target.kind == DefinitionTargetKind::NamedPort ||
         target.kind == DefinitionTargetKind::NamedParameter) {
-        if (auto loc = find_port_definition_in_tree(*state.tree, uri, target.module_name,
-                                                    target.name))
+        if (auto loc = this_tree({"port", target.module_name, target.name}, [&] {
+                return find_port_definition_in_tree(*state.tree, uri, target.module_name,
+                                                    target.name);
+            }))
             return loc;
         return nearest_shard_answer([&](const ExtraFileInfo& extra) {
             return find_port_definition(extra.index_ref(), extra.uri, target.module_name,
@@ -5354,8 +5650,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     if (target.kind == DefinitionTargetKind::NamedArgument) {
-        if (auto loc = find_subroutine_argument_definition(*state.tree, uri, target.subroutine_name,
-                                                           target.name))
+        if (auto loc = this_tree({"argument", target.subroutine_name, target.name}, [&] {
+                return find_subroutine_argument_definition(*state.tree, uri,
+                                                           target.subroutine_name, target.name);
+            }))
             return loc;
 
         return nearest_open_buffer_answer(
@@ -5366,7 +5664,9 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     }
 
     if (target.kind == DefinitionTargetKind::Instance) {
-        if (auto loc = find_module_definition_in_tree(*state.tree, uri, target.module_name))
+        if (auto loc = this_tree({"module", target.module_name}, [&] {
+                return find_module_definition_in_tree(*state.tree, uri, target.module_name);
+            }))
             return loc;
         return nearest_shard_answer([&](const ExtraFileInfo& extra) {
             return find_module_definition(extra.index_ref(), extra.uri, target.module_name);
@@ -5418,8 +5718,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // still a qualified lookup, so it must not fall back to unrelated
         // same-named declarations.
         if (state.tree) {
-            if (auto loc =
-                    find_class_scoped_declaration_in_tree(*state.tree, uri, qualifier, target.name))
+            if (auto loc = this_tree({"class-scoped", qualifier, target.name}, [&] {
+                    return find_class_scoped_declaration_in_tree(*state.tree, uri, qualifier,
+                                                                 target.name);
+                }))
                 return loc;
         }
         if (auto loc = find_class_member_in_hierarchy(class_lookup_shards(), qualifier,
@@ -5459,6 +5761,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // matters for a member the derived class also declares -- a constructor
         // always is one, which is why `super.arm()` worked and `super.new()`
         // answered with the derived class's own `new`.
+        const auto receiver_type_in_tree = [&](const std::string& scope) {
+            return queries ? queries->object_type(scope, base_receiver, use_line_one_based)
+                           : class_type_for_object_reference_in_tree(
+                                 *state.tree, uri, scope, base_receiver, use_line_one_based);
+        };
         std::optional<std::string> class_type;
         if (!target.scope_class.empty()) {
             if (base_receiver == "super")
@@ -5469,20 +5776,16 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         if (!class_type)
             class_type = class_type_for_object_reference(current_index, target.scope_module,
                                                           base_receiver, use_line_one_based);
-        if (!class_type) {
-            class_type = class_type_for_object_reference_in_tree(
-                *state.tree, uri, target.scope_module, base_receiver, use_line_one_based);
-        }
+        if (!class_type)
+            class_type = receiver_type_in_tree(target.scope_module);
         // Inside a class body the enclosing scope is the class, not a module,
         // and the receiver may be a property, a method local, an argument, or a
         // field the class only inherits.
         if (!class_type && !target.scope_class.empty()) {
             class_type = class_type_for_object_reference(current_index, target.scope_class,
                                                          base_receiver, use_line_one_based);
-            if (!class_type) {
-                class_type = class_type_for_object_reference_in_tree(
-                    *state.tree, uri, target.scope_class, base_receiver, use_line_one_based);
-            }
+            if (!class_type)
+                class_type = receiver_type_in_tree(target.scope_class);
             if (!class_type) {
                 class_type = find_class_field_type_in_hierarchy(class_lookup_shards(),
                                                                 target.scope_class, base_receiver);
@@ -5548,10 +5851,12 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         }
 
         if (!class_type && target.object_path.size() == 1) {
-            const auto covergroup = find_covergroup_member_in_tree(
-                *state.tree, uri,
-                target.scope_class.empty() ? target.scope_module : target.scope_class,
-                base_receiver, target.name);
+            const auto& scope =
+                target.scope_class.empty() ? target.scope_module : target.scope_class;
+            const auto covergroup =
+                queries ? queries->covergroup_member(scope, base_receiver, target.name)
+                        : find_covergroup_member_in_tree(*state.tree, uri, scope, base_receiver,
+                                                         target.name);
             if (covergroup.group_found)
                 return covergroup.member;
         }
@@ -5588,9 +5893,12 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // `gen_stall_mem.rf_rd_a_hz` — the receiver is a generate block label,
         // not a value, so nothing above can explain it.
         if (state.tree && !target.object_path.empty()) {
-            if (auto loc = find_generate_block_member_in_tree(*state.tree, uri,
-                                                              target.object_path.back(),
-                                                              target.name))
+            if (auto loc = this_tree({"generate-member", target.object_path.back(), target.name},
+                                     [&] {
+                                         return find_generate_block_member_in_tree(
+                                             *state.tree, uri, target.object_path.back(),
+                                             target.name);
+                                     }))
                 return loc;
         }
     }
@@ -5609,7 +5917,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     const auto path_root_names_a_scope = [&](const std::string& root) {
         if (root.empty())
             return false;
-        return (state.tree && generate_block_label_exists_in_tree(*state.tree, root)) ||
+        const bool generate_label =
+            state.tree && (queries ? queries->generate_label_exists(root)
+                                   : generate_block_label_exists_in_tree(*state.tree, root));
+        return generate_label ||
                find_instance_definition(current_index, uri, target.scope_module, root).has_value();
     };
 
@@ -5621,7 +5932,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // classification — slang spells it as a scoped name — so read the dotted
     // path straight from the source and apply the same rule.
     if (!receiver_names_a_scope) {
-        if (auto ident = identifier_at(uri, line, col)) {
+        if (auto ident = queries ? queries->identifier_at(line, col) : identifier_at(uri, line, col)) {
             const auto segments = hierarchical_path_at(state.text, line, col, *ident);
             if (segments.size() >= 2)
                 receiver_names_a_scope = path_root_names_a_scope(segments.front());
@@ -5641,10 +5952,14 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     if (state.tree)
         visible_imports = get_dynamic_index(state).imports;
 
-    if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module,
-                                           target.scope_package, target.scope_class,
-                                           visible_imports,
-                                           use_line_one_based))
+    if (auto loc = queries
+                       ? queries->generic_definition(target.name, target.scope_module,
+                                                     target.scope_package, target.scope_class,
+                                                     visible_imports, use_line_one_based)
+                       : find_generic_definition(*state.tree, uri, target.name,
+                                                 target.scope_module, target.scope_package,
+                                                 target.scope_class, visible_imports,
+                                                 use_line_one_based))
         return loc;
 
     // The receiver half of a hierarchical reference: in `u_leaf.state_q` the
@@ -6280,19 +6595,24 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                       ref_col + lsp_column_width(target->name)});
         };
 
+    // Tree walks every candidate's resolution would repeat, shared per document
+    // for the whole request (DefinitionTreeQueries).
+    std::map<std::string, std::unique_ptr<DefinitionTreeQueries>> tree_queries;
+
     auto visit_tree =
         [&](const slang::syntax::SyntaxTree& tree, const std::string& fallback_uri,
+            const std::function<void(const std::string&, std::vector<std::pair<int, int>>)>&
+                prefetch,
             const std::function<std::optional<Location>(const std::string&, int, int)>& resolver) {
             struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
                 const slang::SourceManager& sm;
                 const std::string& fallback_uri;
                 const std::string& name;
-                const std::function<void(const std::string&, int, int)>& add;
+                std::vector<std::tuple<std::string, int, int>> candidates;
 
                 Visitor(const slang::SourceManager& sm, const std::string& fallback_uri,
-                        const std::string& name,
-                        const std::function<void(const std::string&, int, int)>& add)
-                    : sm(sm), fallback_uri(fallback_uri), name(name), add(add) {}
+                        const std::string& name)
+                    : sm(sm), fallback_uri(fallback_uri), name(name) {}
 
                 void visitToken(slang::parsing::Token token) {
                     if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
@@ -6300,17 +6620,23 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                         return;
 
                     const auto loc = location_from_token_actual_uri(sm, fallback_uri, token);
-                    add(loc.uri, loc.line, loc.col);
+                    candidates.emplace_back(loc.uri, loc.line, loc.col);
                 }
             };
 
-            std::function<void(const std::string&, int, int)> add =
-                [&](const std::string& candidate_uri, int ref_line, int ref_col) {
-                    add_if_same_definition(candidate_uri, ref_line, ref_col, resolver);
-                };
-
-            Visitor visitor(tree.sourceManager(), fallback_uri, target->name, add);
+            Visitor visitor(tree.sourceManager(), fallback_uri, target->name);
             tree.root().visit(visitor);
+
+            // Every candidate is resolved, so ask the tree all of their
+            // questions at once before resolving any.
+            std::map<std::string, std::vector<std::pair<int, int>>> positions_by_uri;
+            for (const auto& [candidate_uri, ref_line, ref_col] : visitor.candidates)
+                positions_by_uri[candidate_uri].emplace_back(ref_line, ref_col);
+            for (auto& [candidate_uri, positions] : positions_by_uri)
+                prefetch(candidate_uri, std::move(positions));
+
+            for (const auto& [candidate_uri, ref_line, ref_col] : visitor.candidates)
+                add_if_same_definition(candidate_uri, ref_line, ref_col, resolver);
         };
 
     std::vector<std::pair<std::string, std::shared_ptr<const DocumentState>>> open_states;
@@ -6420,9 +6746,21 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (auto it = open_state_by_uri.find(candidate_uri); it != open_state_by_uri.end()) {
             if (!it->second)
                 return std::nullopt;
-            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, {});
+            const auto queries = tree_queries.find(candidate_uri);
+            return definition_of_state(*it->second, candidate_uri, ref_line, ref_col, {}, nullptr,
+                                       queries == tree_queries.end() ? nullptr
+                                                                     : queries->second.get());
         }
         return std::nullopt;
+    };
+    auto prefetch_snapshot = [&](const std::string& candidate_uri,
+                                 std::vector<std::pair<int, int>> positions) {
+        const auto it = open_state_by_uri.find(candidate_uri);
+        if (it == open_state_by_uri.end() || !it->second || !it->second->tree)
+            return;
+        auto& queries = tree_queries[candidate_uri];
+        queries = std::make_unique<DefinitionTreeQueries>(*it->second, candidate_uri);
+        queries->prefetch(std::move(positions));
     };
 
     auto add_indexed_reference = [&](const std::string& file_uri, const SyntaxIndex& index,
@@ -6508,7 +6846,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // Verifying candidate tokens against the declaration recovers those
             // uses without widening the SymbolID match to every same-named
             // symbol in the project.
-            visit_tree(*state->tree, state_uri, resolve_snapshot);
+            visit_tree(*state->tree, state_uri, prefetch_snapshot, resolve_snapshot);
     }
 
     // Closed project files are represented by compact reference-occurrence

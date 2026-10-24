@@ -454,6 +454,8 @@ struct RtlTreeNode {
     bool truncated{false};
 };
 
+struct DefinitionTreeQueries;
+
 class Analyzer {
   public:
     Analyzer() = default;
@@ -808,7 +810,8 @@ class Analyzer {
     std::optional<Location>
     definition_of_state(const DocumentState& state, const std::string& uri, int line, int col,
                         std::span<const ExtraFileInfo* const> ranked,
-                        const std::string* skip_extra_uri = nullptr) const;
+                        const std::string* skip_extra_uri = nullptr,
+                        DefinitionTreeQueries* tree_queries = nullptr) const;
 
     struct ExtraFileCacheEntry {
         std::string path;
