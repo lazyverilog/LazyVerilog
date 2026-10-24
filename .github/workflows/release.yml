@@ -357,3 +357,15 @@ jobs:
             dist-release/lazyverilog-${{ inputs.version }}.vsix
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
+
+      # lazyverilog-mcp downloads the latest server for its users, so run its tests against this release.
+      - name: Test lazyverilog-mcp against this release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.MCP_DISPATCH_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::MCP_DISPATCH_TOKEN is not set; lazyverilog-mcp CI was not started."
+            exit 0
+          fi
+          gh workflow run ci.yml -R lazyverilog/lazyverilog-mcp --ref main
