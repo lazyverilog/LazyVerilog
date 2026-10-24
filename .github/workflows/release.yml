@@ -101,12 +101,27 @@ jobs:
             cp "$binary" "$asset"
 
             # MSVC-produced Windows executables cannot be stripped with the Unix
-            # strip tool available in Git Bash.  Linux/macOS release binaries keep
-            # the existing strip behavior.
-            if [[ "${{ runner.os }}" != "Windows" ]]; then
+            # strip tool available in Git Bash.  On macOS a plain `strip` also
+            # removes global symbols, and the stripped lazyverilog-lsp then
+            # crashes on its first request (EXC_BAD_ACCESS in a worker thread);
+            # `-x` drops only local symbols and leaves a working binary.
+            if [[ "${{ runner.os }}" == "macOS" ]]; then
+              strip -x "$asset"
+            elif [[ "${{ runner.os }}" != "Windows" ]]; then
               strip "$asset"
             fi
           done
+
+      # CI tests the unstripped build, so check that the binary being shipped
+      # still answers a request.
+      - name: Smoke test stripped server
+        shell: bash
+        run: |
+          frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+          { frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}'
+            frame '{"jsonrpc":"2.0","method":"exit","params":null}'; } \
+            | "./lazyverilog-lsp-${{ inputs.version }}-${{ matrix.platform }}${{ matrix.executable_suffix }}" \
+            | grep -q '"serverInfo"'
 
       - name: Generate checksums
         shell: bash
