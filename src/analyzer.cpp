@@ -5638,22 +5638,26 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                     return std::nullopt; // guarded by target_kind_recoverable_from_shards()
                 }
             });
-    } else if (!target_def && target_info.kind == DefinitionTargetKind::ClassMember) {
+    } else if (target_info.kind == DefinitionTargetKind::ClassMember) {
+        // Even when the open-buffer lookup answered: with the declaring type out
+        // of view it settles for a same-named declaration in this file, so
+        // `cfg.PLEN` became the module's own `PLEN` parameter.
+        //
         // A member access whose declaring type lives in another file:
         // `handle.field`, `iface.sig`, `iface.task()`, `pkt.header`.  The
         // definition_of_state() call above deliberately ran with no extra files,
-        // so it could not leave the open buffers and left target_def null -- and
-        // without this recovery the request returns *nothing at all* from the use
-        // site, while the very same cursor position answers go-to-definition
+        // so it could not leave the open buffers and often left target_def null --
+        // and without this recovery the request returns *nothing at all* from the
+        // use site, while the very same cursor position answers go-to-definition
         // correctly and a search started from the declaration finds this use.
         //
-        // Miss path only, so a references request that already resolves keeps its
-        // current cost.  The snapshot is the shared immutable one go-to-definition
-        // itself uses: closed project files carry only their compact index shard
+        // The snapshot is the shared immutable one go-to-definition itself uses:
+        // closed project files carry only their compact index shard
         // (ExtraFileInfo::state is null for them), so this resolves through the
         // same index lookups and never walks a closed file's AST.
         const auto extra_full = ranked_extra_files(*state);
-        target_def = definition_of_state(*state, uri, line, col, *extra_full, &uri);
+        if (auto full = definition_of_state(*state, uri, line, col, *extra_full, &uri))
+            target_def = full;
     }
     if (!target_def) {
         // Last resort, still miss-path only: a hierarchical path such as

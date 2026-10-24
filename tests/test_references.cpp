@@ -161,6 +161,38 @@ endmodule
           std::set<int>{3, 6});
 }
 
+TEST_CASE("references: a struct field reached through a member access is not a same-named "
+          "parameter",
+          "[references]") {
+    const auto pkg_path = write_temp_sv("lv_refs_field_pkg.sv", R"(package cfg_pkg;
+    typedef struct packed {
+        int unsigned PLEN;
+    } cfg_t;
+endpackage
+)");
+    Analyzer analyzer;
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = "file:///tmp/references_field_vs_param.sv";
+    const std::string text = R"(
+module m #(
+    parameter cfg_pkg::cfg_t Cfg = '0,
+    parameter int unsigned PLEN = 56
+) (output logic [7:0] a, output logic [7:0] b);
+    assign a = Cfg.PLEN;
+    assign b = PLEN;
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto [line, col] = find_position_after(text, "PLEN", "Cfg.");
+    const auto def = analyzer.definition_of(uri, line, col);
+    REQUIRE(def);
+    CHECK(def->uri == uri_from_path(pkg_path));
+    for (const auto& r : analyzer.find_references(uri, line, col, true))
+        CHECK_FALSE((r.uri == uri && (r.line == 3 || r.line == 6)));
+}
+
 TEST_CASE("references: macro invocation resolves through macro SymbolID", "[references]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/references_macro_fixture.sv";
