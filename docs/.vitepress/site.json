@@ -1,5 +1,5 @@
 {
-  "srcExclude": ["dev/**", "releases/**", "i18n/**", "**/AGENTS.md", "README.md"],
+  "srcExclude": ["dev/**", "releases/**", "superpowers/**", "i18n/**", "**/AGENTS.md", "README.md"],
   "sidebar": [
     {
       "text": "Getting started",
@@ -74,6 +74,7 @@
         { "text": "RTL tree CLI", "link": "/rtl-tree/cli" },
         { "text": "Comparison", "link": "/comparison" },
         { "text": "Demos", "link": "/demos" },
+        { "text": "Roadmap", "link": "/roadmap" },
         { "text": "Contributing", "link": "/contributing" }
       ]
     }

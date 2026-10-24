@@ -62,6 +62,7 @@ export default defineConfig({
       { text: 'Configuration', link: '/configuration' },
       { text: 'Features', link: '/features' },
       { text: 'Demos', link: '/demos' },
+      { text: 'Roadmap', link: '/roadmap' },
       { text: 'Releases', link: 'https://github.com/lazyverilog/LazyVerilog/releases' },
       { text: 'Sponsor', link: 'https://github.com/sponsors/kjoonha' },
     ],

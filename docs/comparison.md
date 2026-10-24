@@ -14,6 +14,8 @@ and [svlangserver](https://github.com/imc-trading/svlangserver).
 | Go to definition | ✅ | ✅ | ✅ |
 | Find references | ✅ | ✅ | ❌ |
 | Rename | ✅ | ❌ | ❌ |
+| Document highlight | ✅ | ✅ | ❌ |
+| Selection range | ✅ | ❌ | ❌ |
 | Hover | ✅ | ⚠️ | ✅ |
 | Completion | ✅ | ❌ | ✅ |
 | Signature help | ✅ | ❌ | ✅ |

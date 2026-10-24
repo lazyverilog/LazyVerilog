@@ -21,7 +21,7 @@ features:
     link: /linter/options
   - icon: 🧭
     title: Navigation
-    details: Go to definition, find references, and rename across your project files.
+    details: Go to definition, find references, and rename across your project files; document highlight and smart selection within a file.
     link: /lsp/
   - icon: 💡
     title: Hover, completion, signature help
