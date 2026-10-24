@@ -1060,6 +1060,36 @@ inline bool ends_verbatim_line(const Tok& t) {
     return t.lex.is_format_on_marker || t.lex.is_format_off_marker || t.lex.is_disabled_region_body;
 }
 
+// The spaces SpacingPass puts at parens that compact_width() does not count:
+// `spacing.space_inside_parens` pads every non-empty pair, and
+// `function_call.space_*` a call's.  Left out, `f( a, b )` measured two
+// narrower than it prints and a call that fit by the estimate ran past the
+// line length.
+inline int paren_spacing_width(const TokenStream& tokens, size_t first, size_t end, const FormatOptions& opts) {
+    int w = 0;
+    end = std::min(end, tokens.size());
+    for (size_t i = first; i < end; ++i) {
+        const Tok& t = tokens[i];
+        if (!is_code_token(t))
+            continue;
+        size_t open = npos;
+        if (kind_is(t, TK::OpenParenthesis))
+            open = i;
+        else if (kind_is(t, TK::CloseParenthesis))
+            open = t.immutable.syntax.matching_token;
+        if (open == npos)
+            continue;
+        const size_t close = tokens[open].immutable.syntax.matching_token;
+        const bool call = tokens[open].immutable.topology.starts_argument_list;
+        if (i == open && call && opts.function_call.space_before_paren)
+            ++w;
+        const bool empty = close != npos && next_code(tokens, open + 1, close + 1) == close;
+        if (!empty && (opts.spacing.space_inside_parens || (call && opts.function_call.space_inside_paren)))
+            ++w;
+    }
+    return w;
+}
+
 // The padding AlignPass will put before the line's assignment operator, when
 // that operator stands before `token_idx`: `statement.align` pads a
 // statement's LHS to `lhs_min_width`, and `var_declaration.align` puts a
@@ -1124,6 +1154,16 @@ inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const 
             break;
         }
     }
+    // `) + compute(gamma, delta)` -- the `)` of a call broken one argument
+    // per line sits under the call's name, not at the scope's indent.
+    if (line_start < token_idx && kind_is(tokens[line_start], TK::CloseParenthesis)) {
+        const size_t open = tokens[line_start].immutable.syntax.matching_token;
+        const size_t name = open == npos ? npos : prev_code(tokens, open);
+        if (name != npos && name < line_start && tokens[open].immutable.topology.starts_argument_list)
+            return line_prefix_width(tokens, name, opts) + compact_width(tokens, line_start, token_idx) +
+                   paren_spacing_width(tokens, line_start, token_idx, opts) +
+                   statement_align_padding(tokens, line_start, token_idx, opts);
+    }
     int levels = 0;
     if (line_start < tokens.size()) {
         const auto& topo = tokens[line_start].immutable.topology;
@@ -1132,6 +1172,7 @@ inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const 
             ++levels;
     }
     return levels * opts.indent_size + compact_width(tokens, line_start, token_idx) +
+           paren_spacing_width(tokens, line_start, token_idx, opts) +
            statement_align_padding(tokens, line_start, token_idx, opts);
 }
 
@@ -3794,7 +3835,8 @@ public:
                     // past the callee for a block list.  A call already past
                     // the limit would only push them further right.
                     const int open_end = line_prefix_width(tokens, open, opts_) + 1;
-                    int approx = open_end + compact_width(tokens, open + 1, close) + 1;
+                    int approx = open_end + compact_width(tokens, open + 1, close) + 1 +
+                                 paren_spacing_width(tokens, open, close + 1, opts_);
                     const size_t callee = prev_code(tokens, open);
                     const int args_col = opts_.function_call.layout == "hanging" || callee == npos
                                              ? open_end
@@ -5486,7 +5528,13 @@ public:
             std::vector<int> type_width(decl_lines.size(), 0);
             int keyword_width = 0;
             for (size_t i = 0; i < decl_lines.size(); ++i) {
-                type_width[i] = default_type_width(decl_lines[i]);
+                // A clocking signal is never aligned below, so it does not
+                // widen the column of the lines that are: `output` in a
+                // clocking block left every `logic` in the interface a blank
+                // too far.
+                const Line& dl = decl_lines[i];
+                if (dl.first == npos || !tokens[dl.first].immutable.syntax.in_clocking_block)
+                    type_width[i] = default_type_width(dl);
                 if (type_width[i] == 0)
                     continue;
                 ++declaration_line_count;
@@ -5649,6 +5697,17 @@ public:
                     // line's own, so `int a;` and `logic b;` line up.
                     name_target = base + keyword_field + section2;
                 }
+                // A packed dimension wider than section2 (or a type wider
+                // than its field) pushes the name right; the name's column
+                // cannot sit inside the text before it.
+                if (!port_decl) {
+                    const bool dim_placed = dim != npos && tokens[dim].mutable_.align.enabled;
+                    name_target = std::max(
+                        name_target,
+                        dim_placed ? tokens[dim].mutable_.align.target_column +
+                                         option_width(rendered_width(tokens, dim, name) + 1, opts_)
+                                   : base + rendered_width(tokens, first, name + 1) - token_width(tokens[name]));
+                }
 
                 const bool align_name = declaration_line_count >= 2 || dim != npos ||
                                         opts_.var_declaration.section1_min_width > 0;
@@ -5657,9 +5716,14 @@ public:
                     tokens[name].mutable_.align.target_column = name_target;
                 }
 
+                // Where `k` lands right after the name: a name (or `x, y`)
+                // wider than section3 pushes the column right.
+                auto after_name = [&](size_t k) {
+                    return name_target + rendered_width(tokens, name, k + 1) - token_width(tokens[k]);
+                };
                 if (eq != npos) {
                     tokens[eq].mutable_.align.enabled = true;
-                    tokens[eq].mutable_.align.target_column = name_target + section3;
+                    tokens[eq].mutable_.align.target_column = std::max(name_target + section3, after_name(eq));
                     if (semi != npos) {
                         // The `;` column is section4 past the `=`; an
                         // initializer wider than that pushes it out, so only
@@ -5676,8 +5740,9 @@ public:
                 } else if (semi != npos) {
                     tokens[semi].mutable_.align.enabled = true;
                     tokens[semi].mutable_.align.target_column =
-                        align_name ? (name_target + section3 + section4)
-                                   : (base + rendered_width(tokens, first, semi) + section3 - 1);
+                        align_name ? std::max(name_target + section3 + section4, after_name(semi))
+                                   : std::max(base + rendered_width(tokens, first, semi) + section3 - 1,
+                                              base + rendered_width(tokens, first, semi + 1) - token_width(tokens[semi]));
                 }
             }
         }

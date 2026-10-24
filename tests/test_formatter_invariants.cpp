@@ -75,11 +75,13 @@ const std::vector<Knob>& knobs() {
         LV_VALUES(indent_size, Breaks | Indent | Space, 2, 3, 4),
         LV_VALUES(blank_lines_between_items, Blank, 0, 1, 2),
         LV_VALUES(default_indent_level_inside_outmost_block, Breaks | Indent | Space, 0, 1),
-        LV_BOOL(tab_align, Space | Indent),
+        LV_BOOL(tab_align, Breaks | Space | Indent),
 
-        LV_BOOL(statement.align, Space | Indent),
+        // WrapPass counts the padding statement and declaration alignment
+        // put before `=` (statement_align_padding), so these move breaks.
+        LV_BOOL(statement.align, Breaks | Space | Indent),
         LV_BOOL(statement.align_adaptive, Space | Indent),
-        LV_VALUES(statement.lhs_min_width, Space | Indent, 1, 8),
+        LV_VALUES(statement.lhs_min_width, Breaks | Space | Indent, 1, 8),
         LV_BOOL(statement.begin_newline, Breaks | Blank | Indent | Space),
         LV_BOOL(statement.wrap_end_else_clauses, Breaks | Blank | Indent | Space),
 
@@ -91,11 +93,11 @@ const std::vector<Knob>& knobs() {
         LV_VALUES(port_declaration.section4_min_width, Space | Indent, 0, 12),
         LV_VALUES(port_declaration.section5_min_width, Space | Indent, 0, 12),
 
-        LV_BOOL(var_declaration.align, Space | Indent),
+        LV_BOOL(var_declaration.align, Breaks | Space | Indent),
         LV_BOOL(var_declaration.align_adaptive, Space | Indent),
-        LV_VALUES(var_declaration.section1_min_width, Space | Indent, 0, 10),
-        LV_VALUES(var_declaration.section2_min_width, Space | Indent, 0, 30),
-        LV_VALUES(var_declaration.section3_min_width, Space | Indent, 0, 30),
+        LV_VALUES(var_declaration.section1_min_width, Breaks | Space | Indent, 0, 10),
+        LV_VALUES(var_declaration.section2_min_width, Breaks | Space | Indent, 0, 30),
+        LV_VALUES(var_declaration.section3_min_width, Breaks | Space | Indent, 0, 30),
         LV_VALUES(var_declaration.section4_min_width, Space | Indent, 0, 10),
 
         LV_BOOL(instance.align, Space | Indent),
@@ -133,7 +135,8 @@ const std::vector<Knob>& knobs() {
         LV_VALUES(modport.signal_min_width, Space | Indent, 0, 12),
 
         LV_BOOL(spacing.control_keyword_space, Space | Indent),
-        LV_BOOL(spacing.space_inside_parens, Space | Indent),
+        // WrapPass counts the spaces it puts inside parens (paren_spacing_width).
+        LV_BOOL(spacing.space_inside_parens, Breaks | Space | Indent),
         LV_BOOL(spacing.space_inside_dimension_brackets, Space | Indent),
         LV_BOOL(spacing.space_inside_event_control_parens, Space | Indent),
         LV_VALUES(spacing.binary_operator_spacing, Space | Indent, "both", "none", "before", "after"),
@@ -158,12 +161,14 @@ struct RunConfig {
 RunConfig random_config(unsigned seed) {
     std::mt19937 rng(seed);
     RunConfig c{FormatOptions{}, "random_config(" + std::to_string(seed) + ")"};
+    // mt19937's output is the same everywhere, but uniform_int_distribution
+    // is not: libc++ drew other configs than libstdc++ and MSVC, so a seed
+    // named in a failure did not rebuild the same config on another OS.
     for (const Knob& k : knobs()) {
-        if (std::uniform_int_distribution<int>(0, 2)(rng) != 0)
+        if (rng() % 3 != 0)
             continue;
-        const Variant& v = k.variants[std::uniform_int_distribution<size_t>(0, k.variants.size() - 1)(rng)];
+        const Variant& v = k.variants[rng() % k.variants.size()];
         v.apply(c.opts);
-
     }
     return c;
 }
@@ -267,15 +272,19 @@ void check_alignment(const Rendered& r, const CorpusFile& f, const RunConfig& c,
 // With no minimum widths, an aligned column on consecutive lines must touch
 // at least one of its members: padding every member is wasted width.
 void check_tightness(const Rendered& r, const CorpusFile& f, const RunConfig& c, Report& rep) {
-    // target column -> (last line seen, run start line, smallest slack in run)
-    struct Run { int last, start, slack; };
+    // target column -> (last line seen, run start line, smallest slack in
+    // run, distance of the column from the run's indent)
+    struct Run { int target, last, start, slack, field; };
     std::map<int, Run> runs;
-    auto close = [&](int target, const Run& run) {
-        if (run.slack > 0 && run.last > run.start)
-            rep.add("align-loose", f, c, run.start,
-                    "column " + std::to_string(target) + " padded by " + std::to_string(run.slack) +
-                        " on every line " + std::to_string(run.start + 1) + "-" + std::to_string(run.last + 1));
+    std::vector<Run> done;
+    auto indent_of = [&](int line) {
+        const size_t lead = r.lines[line].find_first_not_of(" \t");
+        return lead == std::string::npos ? 0 : static_cast<int>(lead);
     };
+    // var_declaration's type field is one width across the file, set by its
+    // widest keyword: a run padded on every line is still tight when the
+    // same field, as far from its own line's indent, is touched elsewhere.
+    std::map<int, int> field_slack;
     // A line holding only a comment does not end a run: `// .rst(rst),`
     // between two connections leaves them one column.
     std::vector<bool> code_line(r.lines.size(), false);
@@ -296,16 +305,26 @@ void check_tightness(const Rendered& r, const CorpusFile& f, const RunConfig& c,
         // (`.d (`, `clk ;`), whatever the token's own spacing asks for.
         const int slack = gap_before(r, i) - std::max(d.spaces_before, 1);
         const int line = r.trace.line[i];
+        const int field = a.target_column - indent_of(line);
+        const auto fs = field_slack.find(field);
+        field_slack[field] = fs == field_slack.end() ? slack : std::min(fs->second, slack);
         auto it = runs.find(a.target_column);
         if (it != runs.end() && adjacent(it->second.last, line)) {
             it->second.last = line;
             it->second.slack = std::min(it->second.slack, slack);
         } else {
-            if (it != runs.end()) close(it->first, it->second);
-            runs[a.target_column] = {line, line, slack};
+            if (it != runs.end()) done.push_back(it->second);
+            runs[a.target_column] = {a.target_column, line, line, slack, field};
         }
     }
-    for (const auto& [target, run] : runs) close(target, run);
+    for (const auto& [target, run] : runs) done.push_back(run);
+    for (const Run& run : done) {
+        if (run.slack <= 0 || run.last == run.start || field_slack[run.field] == 0)
+            continue;
+        rep.add("align-loose", f, c, run.start,
+                "column " + std::to_string(run.target) + " padded by " + std::to_string(run.slack) +
+                    " on every line " + std::to_string(run.start + 1) + "-" + std::to_string(run.last + 1));
+    }
 }
 
 // break_policy "auto": a call still on one line past the limit is a miss

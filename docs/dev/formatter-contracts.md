@@ -19,7 +19,10 @@ Add a file to `formatter_corpus/` when a bug needs a shape the corpus lacks.
 
 The default options, every aligner on, and 24 seeded random mixes drawn
 from the option table. A failure names its config as `random_config(N)`;
-rebuild it in a test with the same seed.
+rebuild it in a test with the same seed. The draw uses `std::mt19937`
+output directly, never `std::uniform_int_distribution`, whose results
+differ between standard libraries: macOS once ran other configs than
+Linux and Windows.
 
 ## Invariants
 
@@ -28,7 +31,7 @@ rebuild it in a test with the same seed.
 | throws | `format_source()` does not throw (token-stream safety) |
 | not-idempotent | formatting the output again changes nothing |
 | align-miss | every token AlignPass gave a `target_column` renders at that column, unless it starts its line |
-| align-loose | with all minimum widths 0 and not adaptive, an aligned column on consecutive code lines touches at least one member: some line has only one blank (or its own spacing) before it |
+| align-loose | with all minimum widths 0 and not adaptive, an aligned column on consecutive code lines touches at least one member: some line has only one blank (or its own spacing) before it. `var_declaration`'s type field is one width for the whole file, so a run also counts as touched when the same field (as far from its own line's indent) is touched on another line |
 | call-too-long | `break_policy = "auto"`: a call left on one line does not end past `line_length` when its `(` is inside the limit |
 
 `align-miss` makes AlignPass keep its promises: an aligner sets a column only
@@ -56,7 +59,8 @@ and nothing else:
 | Options | Own |
 | --- | --- |
 | `blank_lines_between_items` | blank |
-| every `align`, `align_adaptive`, `*_min_width`, `*_width`; `tab_align`; every `[format.spacing]` option | space, indent |
+| every `align`, `align_adaptive`, `*_min_width`, `*_width`; every `[format.spacing]` option | space, indent |
+| `statement.align`, `statement.lhs_min_width`, `var_declaration.align`, `var_declaration.section1..3_min_width`, `tab_align`, `spacing.space_inside_parens` | breaks, space, indent |
 | `instance.port_indent_level` | space, indent |
 | `indent_size`, `default_indent_level_inside_outmost_block` | breaks, indent, space |
 | `function_call.*`, `function_declaration.*`, `module.*` | breaks, indent, space |
@@ -66,8 +70,11 @@ Spacing and alignment options own indent only through hanging continuation
 lines, which sit under a column of the line above (`compute(alpha,` /
 `        beta)`). They never own breaks: WrapPass measures with
 `compact_width()`, which does not depend on spacing, so a spacing option
-cannot move a line break. Call spacing (`function_call.space_*`) is the
-exception and owns breaks, because it widens the call WrapPass measures.
+cannot move a line break. The exceptions widen what WrapPass measures, so
+they own breaks: call spacing (`function_call.space_*`) and
+`spacing.space_inside_parens` (`paren_spacing_width()`), and the padding
+statement and declaration alignment put before `=`
+(`statement_align_padding()`).
 
 The test flips every value of every option from eight base configs (default,
 all aligners on, six random mixes) and
