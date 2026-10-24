@@ -3654,7 +3654,9 @@ static bool range_starts_in_uri(const slang::SourceManager& sm, slang::SourceRan
 
 static bool contains_position_in_uri(const slang::SourceManager& sm, slang::SourceRange range,
                                      const std::string& uri, int line, int col) {
-    return range_starts_in_uri(sm, range, uri) && contains_position(sm, range, line, col);
+    // Position first: deriving a URI converts the buffer's path, which per
+    // visited token dominated identifier_at / references / definition.
+    return contains_position(sm, range, line, col) && range_starts_in_uri(sm, range, uri);
 }
 
 static bool token_contains_position_in_uri(const slang::SourceManager& sm,
