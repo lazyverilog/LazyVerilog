@@ -532,6 +532,25 @@ static void collect_token_folds(const std::vector<FoldToken>& tokens,
         active_decl_start = -1;
     };
 
+    auto follows_assertion_keyword = [&](size_t i) {
+        for (size_t j = i; j-- > 0;) {
+            const auto& p = tokens[j];
+            if (p.comment_kind != CommentKind::None || p.kind == TK::Directive)
+                continue;
+            switch (p.kind) {
+            case TK::AssertKeyword:
+            case TK::AssumeKeyword:
+            case TK::CoverKeyword:
+            case TK::RestrictKeyword:
+            case TK::ExpectKeyword:
+                return true;
+            default:
+                return false;
+            }
+        }
+        return false;
+    };
+
     for (size_t i = 0; i < tokens.size(); ++i) {
         const auto& t = tokens[i];
 
@@ -677,6 +696,11 @@ static void collect_token_folds(const std::vector<FoldToken>& tokens,
         case TK::ModuleKeyword:
         case TK::MacromoduleKeyword:
         case TK::ClockingKeyword: {
+            // `assert property (...)`, `cover sequence (...)`: a statement, not a
+            // declaration, so no `endproperty` / `endsequence` ever closes it.
+            if ((t.kind == TK::PropertyKeyword || t.kind == TK::SequenceKeyword) &&
+                follows_assertion_keyword(i))
+                break;
             int line = lt.line_of(t.start);
             if (line >= 0) keyword_region_stack.push_back(line);
             pending_control_start = -1;

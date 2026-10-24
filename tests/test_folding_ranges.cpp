@@ -161,6 +161,29 @@ endmodule
     CHECK(has_fold(folds, 2, 4));
 }
 
+// `assert property (...)` is a statement; only a `property` declaration has an
+// `endproperty`, so treating the keyword as an opener left a fold that ran on
+// to the next closer of any kind.
+TEST_CASE("foldingRange: a concurrent assertion opens no keyword region", "[folding]") {
+    Analyzer    analyzer;
+    std::string uri = "file:///tmp/fold_assert_property.sv";
+    analyzer.open(uri, R"(module top;
+    for (genvar i = 0; i < 4; i++) begin
+        assert property (
+            @(posedge clk) a |-> b)
+        else $error("bad");
+        cover sequence (
+            @(posedge clk) a ##1 b);
+    end
+endmodule
+)");
+    auto folds = provide_folding_range(analyzer, make_params(uri));
+    CHECK(has_fold(folds, 0, 8));
+    CHECK(has_fold(folds, 1, 7));
+    CHECK_FALSE(has_fold_starting_at_and_ending_after(folds, 2, 7));
+    CHECK_FALSE(has_fold_starting_at_and_ending_after(folds, 5, 7));
+}
+
 // ── block comment ─────────────────────────────────────────────────────────
 
 TEST_CASE("foldingRange: block comment folds", "[folding]") {
