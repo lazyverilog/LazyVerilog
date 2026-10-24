@@ -6494,3 +6494,42 @@ endmodule
         CHECK(out.substr(out.size() - expected_tail.size()) == expected_tail);
     }
 }
+
+TEST_CASE("formatter regression: merge conflict markers stay intact", "[formatter][regression]") {
+    // slang lexes `<<<<<<<` as `<<<` `<<<` `<`; formatted as code it became
+    // `<<< <<< < HEAD assign ...` and git no longer saw the conflict.  Each
+    // marker line is kept verbatim at column 0, and each side is formatted
+    // like an `ifdef branch: the side with the extra `begin` does not shift
+    // the side after it or the code after the conflict.
+    const std::string src =
+        "module m (input clk, output q);\n"
+        "  always_comb begin\n"
+        "<<<<<<< HEAD\n"
+        "    if (b) begin\n"
+        "      q = bar(a,c);\n"
+        "||||||| base\n"
+        "      q = 0;\n"
+        "=======\n"
+        "  q=foo(a);\n"
+        ">>>>>>> feature/foo\n"
+        "  end\n"
+        "  assign z = y;\n"
+        "endmodule\n";
+    CHECK(format_stable(src) ==
+          "module m(\n"
+          "  input clk,\n"
+          "  output q\n"
+          ");\n"
+          "  always_comb begin\n"
+          "<<<<<<< HEAD\n"
+          "    if (b) begin\n"
+          "      q = bar(a, c);\n"
+          "||||||| base\n"
+          "    q = 0;\n"
+          "=======\n"
+          "    q = foo(a);\n"
+          ">>>>>>> feature/foo\n"
+          "  end\n"
+          "  assign z = y;\n"
+          "endmodule\n");
+}
