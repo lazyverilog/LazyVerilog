@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # -I drops the script dir
@@ -64,6 +65,8 @@ def main() -> int:
     ap.add_argument("--stall-method", help="never answer this request method")
     ap.add_argument("--stderr-bytes", type=int, default=0, help="write N bytes to stderr first")
     ap.add_argument("--stderr-text", help="write this line to stderr after initialize")
+    ap.add_argument("--stderr-stack", action="store_true",
+                    help="after --stderr-text, write a stack 1 s later and exit, like ASan")
     ap.add_argument("--bad-utf8", help="answer this request method with invalid UTF-8")
     ap.add_argument("--flood-stdout", type=int, default=0,
                     help="after initialize, send N server requests and 64 KiB log "
@@ -122,6 +125,11 @@ def main() -> int:
         if method == "initialize" and args.stderr_text:
             sys.stderr.write(args.stderr_text + "\n")
             sys.stderr.flush()
+            if args.stderr_stack:
+                time.sleep(1)
+                sys.stderr.write("    #0 0x1 in frame_zero\n")
+                sys.stderr.flush()
+                return 1
         if method == "initialize":
             with lock:
                 for i in range(args.flood_stdout):

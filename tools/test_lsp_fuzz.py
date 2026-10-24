@@ -252,6 +252,13 @@ class Oracle(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("sanitizer", next(self.out.glob("fail-*.txt")).read_text())
 
+    def test_sanitizer_report_keeps_the_stack(self):
+        # ASan writes its stack after the first line; the report must wait for it.
+        code, _ = self.fuzz("--stderr-text 'ERROR: AddressSanitizer: heap-buffer-overflow' "
+                            "--stderr-stack")
+        self.assertEqual(code, 1)
+        self.assertIn("#0 0x1 in frame_zero", next(self.out.glob("fail-*.txt")).read_text())
+
     def test_replay_reproduces_crash(self):
         self.fuzz("--exit-after 5")
         session = next(self.out.glob("fail-*.jsonl"))

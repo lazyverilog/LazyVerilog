@@ -26,6 +26,7 @@ import os
 import random
 import shlex
 import string
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from lsp_client import Client  # noqa: E402
 
 MAX_PENDING = 8
 MAX_OPEN = 8
+SANITIZER_REPORT_WAIT_S = 30
 SOURCE_SUFFIXES = (".sv", ".svh", ".v")
 VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "*/", "//",
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
@@ -443,6 +445,14 @@ def write_failure(out: Path, header: dict, record: list[dict], failure: Failure,
         f.write(json.dumps(header) + "\n")
         for line in record:
             f.write(json.dumps(line) + "\n")
+    if failure.kind == "sanitizer":
+        # The marker is the report's first line; ASan writes the stack after it, then aborts.
+        try:
+            client.proc.wait(SANITIZER_REPORT_WAIT_S)
+        except subprocess.TimeoutExpired:
+            pass
+        if client.stderr_thread:
+            client.stderr_thread.join(5)
     tail = client.stderr_tail.decode("utf-8", errors="replace")
     (out / f"{name}.txt").write_text(
         f"{failure.kind}: {failure.detail}\nmessages sent: {len(record)}\n"
