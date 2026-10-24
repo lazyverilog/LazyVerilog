@@ -239,6 +239,10 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
                         // definition_of() answers for open buffers only.
                         if (r.uri != uri)
                             continue;
+                        // `.p,` means the instance's port *and* this module's p;
+                        // its definition is the port, so it cannot lead back here.
+                        if (r.form != RefForm::Plain)
+                            continue;
                         ++backlinks;
                         const auto back = analyzer.definition_of(r.uri, r.line, r.col);
                         INFO("invariant definition-backlink, file " << rel << ", position "
