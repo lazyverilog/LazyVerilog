@@ -1,0 +1,5 @@
+{"note": "connectInfo without \"lazy\" expanded a self-instantiating module forever (fix: build_hierarchy stops at a module that repeats an ancestor)"}
+{"send": {"jsonrpc": "2.0", "method": "initialize", "params": {"processId": null, "rootUri": null, "capabilities": {}}, "id": 0}}
+{"send": {"jsonrpc": "2.0", "method": "initialized", "params": {}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///fuzz/recursive_tree.sv", "languageId": "systemverilog", "version": 1, "text": "module tree #(parameter int N = 4);\n    if (N > 1) begin : g\n        tree #(.N(N / 2)) u_sub ();\n    end\nendmodule\nmodule top;\n    tree u_tree ();\nendmodule\n"}}}}
+{"send": {"jsonrpc": "2.0", "method": "workspace/executeCommand", "params": {"command": "lazyverilog.connectInfo", "arguments": ["file:///fuzz/recursive_tree.sv"]}, "id": 1}}
