@@ -4,8 +4,8 @@ std::vector<lsDocumentHighlight> provide_document_highlight(const Analyzer& anal
                                                            const lsTextDocumentPositionParams& params) {
     const auto& uri = params.textDocument.uri.raw_uri_;
     std::vector<lsDocumentHighlight> result;
-    for (const auto& ref :
-         analyzer.find_references(uri, params.position.line, params.position.character, true)) {
+    for (const auto& ref : analyzer.find_references(uri, params.position.line,
+                                                    params.position.character, true, true)) {
         if (ref.uri != uri)
             continue;
         lsDocumentHighlight highlight;

@@ -542,8 +542,10 @@ class Analyzer {
 
     /// Find references to the symbol under a position by walking SyntaxTrees and
     /// verifying candidate tokens resolve to the same definition.
+    /// @p this_file_only skips every other file's occurrences (documentHighlight).
     std::vector<Location> find_references(const std::string& uri, int line, int col,
-                                          bool include_declaration = true) const;
+                                          bool include_declaration = true,
+                                          bool this_file_only = false) const;
 
     /// Return all (0-based line, 0-based col) positions where `name` appears
     /// as a whole identifier in the document.

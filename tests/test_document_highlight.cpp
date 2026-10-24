@@ -2,8 +2,11 @@
 #include "features/document_highlight.hpp"
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 
 namespace {
 
@@ -74,4 +77,65 @@ TEST_CASE("document highlight: keyword returns nothing", "[document-highlight]")
     Analyzer analyzer;
     analyzer.open(uri, "module m;\n  logic a;\nendmodule\n");
     CHECK(provide_document_highlight(analyzer, at(uri, 0, 2)).empty());
+}
+
+namespace {
+
+/// Fastest of @p runs highlighting `leaf` in an open file, with @p closed
+/// closed project files that each instantiate it many times.  The minimum, for
+/// the reason the connect guard takes it.
+double fastest_highlight_ms(int closed, int runs) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("lazyverilog_highlight_scaling_" + std::to_string(closed));
+    std::filesystem::create_directories(dir);
+    std::vector<std::string> paths;
+    for (int i = 0; i < closed; ++i) {
+        const auto path = dir / ("user_" + std::to_string(i) + ".sv");
+        std::string text = "module user_" + std::to_string(i) + ";\n";
+        for (int k = 0; k < 40; ++k)
+            text += "    leaf u_" + std::to_string(k) + "();\n";
+        std::ofstream(path) << text + "endmodule\n";
+        paths.push_back(path.string());
+    }
+    const auto leaf_path = dir / "leaf.sv";
+    const std::string leaf = "module leaf;\nendmodule\nmodule wrap;\n  leaf u_a();\nendmodule\n";
+    std::ofstream(leaf_path) << leaf;
+    paths.push_back(leaf_path.string());
+
+    Analyzer analyzer;
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(leaf_path);
+    analyzer.open(uri, leaf);
+
+    std::vector<double> samples;
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = provide_document_highlight(analyzer, at(uri, 0, 7));
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        REQUIRE(result.size() == 2);
+    }
+    std::filesystem::remove_all(dir);
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+} // namespace
+
+TEST_CASE("document highlight: cost does not grow with closed project files",
+          "[document-highlight][scaling]") {
+    constexpr int kSmall = 25;
+    constexpr int kLarge = 400; // 16x the closed files and their uses
+    constexpr int kRuns = 7;
+
+    const double small_ms = fastest_highlight_ms(kSmall, kRuns);
+    const double large_ms = fastest_highlight_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[highlight scaling] closed files " << kSmall << " -> " << kLarge << ": "
+              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // Highlight answers for one file, so closed shards should not be scanned:
+    // ~1.  Scanning them all is ~16.
+    CHECK(ratio < 4.0);
 }

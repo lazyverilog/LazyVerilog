@@ -5525,7 +5525,8 @@ static bool target_kind_recoverable_from_shards(DefinitionTargetKind kind) {
 }
 
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
-                                                bool include_declaration) const {
+                                                bool include_declaration,
+                                                bool this_file_only) const {
     auto target = identifier_at(uri, line, col);
     // References/Rename must not walk closed project-file ASTs.  Current and
     // other open files are live SyntaxTrees; closed project files require a
@@ -6271,7 +6272,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     };
 
     for (const auto& [state_uri, state] : open_states) {
-        if (!state || !state->tree)
+        if (!state || !state->tree || (this_file_only && state_uri != uri))
             continue;
 
         // The SymbolID scan only.  visit_tree() below resolves every candidate
@@ -6327,7 +6328,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     // Closed project files are represented by compact reference-occurrence
     // shards.  We intentionally do not load or walk their full SyntaxTrees here.
     for (const auto& extra : *extra_idx) {
-        if (open_uris.contains(extra.uri))
+        if (this_file_only || open_uris.contains(extra.uri))
             continue;
         if (!target_symbol_id && !fallback_symbol_id && !include_bridge_name_id &&
             !import_bridge_name_id && !scoped_member_alias_id)
