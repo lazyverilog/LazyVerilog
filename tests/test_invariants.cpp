@@ -140,6 +140,12 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
         for (const auto& f : files)
             paths.push_back(f.string());
 
+        INFO("project " << project.string());
+        REQUIRE_FALSE(files.empty());
+        // What actually got checked: each check below is conditional, so without
+        // these a regression to "names nothing" would pass by checking nothing.
+        int positions = 0, renames_with_edits = 0, backlinks = 0;
+
         Analyzer analyzer;
         analyzer.set_extra_files(paths);
         analyzer.wait_for_background_index_idle();
@@ -195,6 +201,7 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
             if (skip("rename-references") && skip("definition-backlink"))
                 continue;
             for (const auto& [line, col] : identifier_positions(analyzer, uri, text)) {
+                ++positions;
                 const auto refs = analyzer.find_references(uri, line, col, true);
                 std::set<Span> ref_spans;
                 for (const auto& r : refs)
@@ -218,8 +225,10 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
                                                               << ":" << col << " (" << name << ")");
                     INFO("rename edits:\n" << show(edit_spans) << "references:\n"
                                            << show(ref_spans));
-                    if (!edit_spans.empty())
+                    if (!edit_spans.empty()) {
+                        ++renames_with_edits;
                         CHECK(edit_spans == ref_spans);
+                    }
                 }
 
                 if (!skip("definition-backlink")) {
@@ -230,6 +239,7 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
                         // definition_of() answers for open buffers only.
                         if (r.uri != uri)
                             continue;
+                        ++backlinks;
                         const auto back = analyzer.definition_of(r.uri, r.line, r.col);
                         INFO("invariant definition-backlink, file " << rel << ", position "
                                                                     << line << ":" << col);
@@ -240,5 +250,9 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
                 }
             }
         }
+        // shortcut: assumes no exclusion covers a whole project, revisit if one must.
+        CHECK(positions > 0);
+        CHECK(renames_with_edits > 0);
+        CHECK(backlinks > 0);
     }
 }
