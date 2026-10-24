@@ -979,6 +979,19 @@ inline int option_width(int value, const FormatOptions& opts) {
 // for its empty packed dimension.
 inline int empty_or_gap(int widest) { return widest > 0 ? widest + 1 : 0; }
 
+// One column of an aligned group.  Members are measured with
+// rendered_width(); the column is at least `min_width` and, unless adaptive,
+// as wide as the widest member, so every row shares it.  Grid snapping stays
+// with the caller: aligners snap different parts of a row.
+struct AlignField {
+    int min_width;
+    bool adaptive;
+    int widest;
+    AlignField(int min, bool adaptive_) : min_width(min), adaptive(adaptive_), widest(min) {}
+    void add(int w) { widest = std::max(widest, w); }
+    int width(int own) const { return adaptive ? std::max(min_width, own) : widest; }
+};
+
 // WrapPass's estimate of a width: it runs before SpacingPass, so it assumes
 // one space between tokens except around brackets and separators.  Later
 // passes measure with rendered_width().
@@ -6451,7 +6464,7 @@ public:
             if (close == npos) continue;
             auto items = top_level_list_items(tokens, open + 1, close);
             int max_namew = 0;
-            int max_sig = opts_.instance.instance_port_between_paren_width;
+            AlignField sig_field(opts_.instance.instance_port_between_paren_width, opts_.instance.align_adaptive);
             struct Conn { size_t name, op, cl; int namew, sigw; bool multiline; };
             std::vector<Conn> conns;
             for (const auto& item : items) {
@@ -6489,14 +6502,12 @@ public:
                                  tokens[k - 1].mutable_.wrap.must_break_after);
                 max_namew = std::max(max_namew, nw);
                 if (!multiline)
-                    max_sig = std::max(max_sig, sw);
+                    sig_field.add(sw);
                 conns.push_back({name, op, cl, nw, sw, multiline});
             }
             for (const auto& c : conns) {
                 int item_indent = tokens[prev_code(tokens, c.name)].mutable_.indent.base_indent;
-                int sig_width = opts_.instance.align_adaptive
-                    ? std::max(opts_.instance.instance_port_between_paren_width, c.sigw)
-                    : max_sig;
+                const int sig_width = sig_field.width(c.sigw);
                 tokens[c.op].mutable_.align.enabled = true;
                 tokens[c.op].mutable_.align.alignment_group = group;
                 // The field runs from `.` to `(`: the dot, the name and at
@@ -6528,8 +6539,9 @@ public:
                 opts_.enum_declaration.align) {
                 struct E { size_t first, last, eq, comma; int namew, valw; };
                 std::vector<E> es;
-                int namew = option_width(opts_.enum_declaration.enum_name_min_width, opts_);
-                int valw = option_width(opts_.enum_declaration.enum_value_min_width, opts_);
+                const bool adaptive = opts_.enum_declaration.align_adaptive;
+                AlignField namew(option_width(opts_.enum_declaration.enum_name_min_width, opts_), adaptive);
+                AlignField valw(option_width(opts_.enum_declaration.enum_value_min_width, opts_), adaptive);
                 for (const auto& item : items) {
                     size_t eq = npos;
                     for (size_t k = item.first; k <= item.last; ++k)
@@ -6537,8 +6549,8 @@ public:
                     int nw = eq == npos ? rendered_width(tokens, item.first, item.last + 1)
                                          : rendered_width(tokens, item.first, eq);
                     int vw = eq == npos ? 0 : rendered_width(tokens, eq + 1, item.last + 1);
-                    namew = std::max(namew, nw);
-                    valw = std::max(valw, vw);
+                    namew.add(nw);
+                    valw.add(vw);
                     es.push_back({item.first, item.last, eq, item.comma, nw, vw});
                 }
                 int base = tokens[items.front().first].mutable_.indent.base_indent;
@@ -6556,12 +6568,8 @@ public:
                     }
                 }
                 for (const auto& e : es) {
-                    int local_namew = opts_.enum_declaration.align_adaptive
-                        ? std::max(option_width(opts_.enum_declaration.enum_name_min_width, opts_), e.namew)
-                        : namew;
-                    int local_valw = opts_.enum_declaration.align_adaptive
-                        ? std::max(option_width(opts_.enum_declaration.enum_value_min_width, opts_), e.valw)
-                        : valw;
+                    const int local_namew = namew.width(e.namew);
+                    const int local_valw = valw.width(e.valw);
                     int eq_target = base + (opts_.tab_align ? snap_to_grid(local_namew + 1, opts_.indent_size)
                                                             : local_namew + eq_gap);
                     if (e.eq != npos) {
@@ -6602,7 +6610,7 @@ public:
                 struct M { size_t dir, sig, comma; int dirw, sigw; };
                 std::vector<M> ms;
                 int dirw = option_width(opts_.modport.direction_min_width, opts_);
-                int sigw = option_width(opts_.modport.signal_min_width, opts_);
+                AlignField sigw(option_width(opts_.modport.signal_min_width, opts_), opts_.modport.align_adaptive);
                 for (const auto& item : items) {
                     size_t sig = next_code(tokens, item.first + 1, item.last + 1);
                     if (sig == npos) continue;
@@ -6624,16 +6632,16 @@ public:
                         ms.push_back({item.first, sig, npos, dw, 0});
                         continue;
                     }
-                    sigw = std::max(sigw, sw);
+                    sigw.add(sw);
                     ms.push_back({item.first, sig, item.comma, dw, sw});
                 }
                 int base = tokens[items.front().first].mutable_.indent.base_indent;
                 dirw = option_width(dirw, opts_);
-                sigw = option_width(sigw, opts_);
+                // Only the shared column goes on the grid: an adaptive comma
+                // snapped per row would stand apart from its name (`a ,`).
+                sigw.widest = option_width(sigw.widest, opts_);
                 for (const auto& m : ms) {
-                    int local_sigw = opts_.modport.align_adaptive
-                        ? std::max(option_width(opts_.modport.signal_min_width, opts_), m.sigw)
-                        : sigw;
+                    const int local_sigw = sigw.width(m.sigw);
                     tokens[m.sig].mutable_.align.enabled = true;
                     tokens[m.sig].mutable_.align.target_column = base + dirw;
                     if (m.comma != npos) {
