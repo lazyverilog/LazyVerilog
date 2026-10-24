@@ -2147,30 +2147,44 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     const std::string& name;
     const std::string& preferred_module;
     const std::string& preferred_package;
+    // Innermost class the cursor sits in.  A class member is visible
+    // unqualified only inside its own class (and the classes extending it,
+    // which the caller resolves separately), so the same-class declaration
+    // answers over every other one; a generated register model declares the
+    // same `sample` in a hundred classes.
+    const std::string& preferred_class;
     const std::vector<ImportEntry>& visible_imports;
     int use_line_one_based{0};
     std::string current_module;
     std::string current_package;
+    std::string current_class;
     int aggregate_type_depth{0};
     std::optional<Location> first_result;
     std::optional<Location> scoped_result;
+    std::optional<Location> class_result;
     // How many enclosing lexical scopes each recorded candidate sat in.  A
     // declaration inside a generate block shadows a module-level one of the same
     // name, and the module-level declaration is visited first, so "first match
     // wins" would answer with the shadowed signal.
     int first_result_depth{-1};
     int scoped_result_depth{-1};
+    int class_result_depth{-1};
 
     GenericDefinitionVisitor(const slang::SourceManager& sm, const std::string& uri,
                              const std::string& name, const std::string& preferred_module,
                              const std::string& preferred_package,
+                             const std::string& preferred_class,
                              const std::vector<ImportEntry>& visible_imports,
                              int use_line_one_based)
         : sm(sm), uri(uri), name(name), preferred_module(preferred_module),
-          preferred_package(preferred_package), visible_imports(visible_imports),
-          use_line_one_based(use_line_one_based) {}
+          preferred_package(preferred_package), preferred_class(preferred_class),
+          visible_imports(visible_imports), use_line_one_based(use_line_one_based) {}
 
-    std::optional<Location> result() const { return scoped_result ? scoped_result : first_result; }
+    std::optional<Location> result() const {
+        if (class_result)
+            return class_result;
+        return scoped_result ? scoped_result : first_result;
+    }
 
     bool package_member_visible(std::string_view package_name, std::string_view symbol_name) const {
         if (package_name.empty())
@@ -2267,6 +2281,11 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             scoped_result = loc;
             scoped_result_depth = depth;
         }
+        if (scope_sensitive && !preferred_class.empty() && current_class == preferred_class &&
+            (!class_result || depth > class_result_depth)) {
+            class_result = loc;
+            class_result_depth = depth;
+        }
     }
 
     void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
@@ -2293,7 +2312,24 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         // token, but the definition search still needs to expose the class
         // declaration name as a generic definition candidate.
         maybe_set(node.name, false);
+        auto previous_class = std::move(current_class);
+        current_class = std::string(node.name.valueText());
         visitDefault(node);
+        current_class = std::move(previous_class);
+    }
+
+    // An embedded covergroup declares a member of the class, named like the
+    // group, and its `with function sample(...)` is the group's own method:
+    // visible inside the group only, never as the class's `sample`.
+    void handle(const slang::syntax::CovergroupDeclarationSyntax& node) {
+        maybe_set(node.name);
+        push_scope(node.sourceRange());
+        if (const auto* with = node.event
+                                   ? node.event->as_if<slang::syntax::WithFunctionSampleSyntax>()
+                                   : nullptr)
+            maybe_set(with->sample);
+        visitDefault(node);
+        scope_stack.pop_back();
     }
 
     void handle(const slang::syntax::ImplicitAnsiPortSyntax& node) {
@@ -2557,10 +2593,12 @@ static std::optional<Location> find_generic_definition(const slang::syntax::Synt
                                                        const std::string& name,
                                                        const std::string& preferred_module,
                                                        const std::string& preferred_package,
+                                                       const std::string& preferred_class,
                                                        const std::vector<ImportEntry>& visible_imports,
                                                        int use_line_one_based) {
     GenericDefinitionVisitor visitor(tree.sourceManager(), uri, name, preferred_module,
-                                     preferred_package, visible_imports, use_line_one_based);
+                                     preferred_package, preferred_class, visible_imports,
+                                     use_line_one_based);
     tree.root().visit(visitor);
     return visitor.result();
 }
@@ -2745,6 +2783,86 @@ static std::optional<Location> find_generate_block_member_in_tree(
     };
 
     Visitor visitor(tree.sourceManager(), uri, label, member_name);
+    tree.root().visit(visitor);
+    return visitor.result;
+}
+
+struct CovergroupMember {
+    bool group_found{false};
+    std::optional<Location> member;
+};
+
+/// @p member_name of the covergroup @p group embedded in @p scope (a class or
+/// module), when the scope embeds one.
+///
+/// `rd_cg.sample(data)` calls the group's own sample().  An embedded covergroup
+/// is both a type and the class member of that name, so the receiver has no
+/// declared type for the class lookups to follow, and answering from the
+/// enclosing scope instead finds the class's own `sample` -- which every class
+/// of a register model has.  A member the group does not declare (the built-in
+/// sample(), get_coverage()) has no source to answer with.
+static CovergroupMember find_covergroup_member_in_tree(const slang::syntax::SyntaxTree& tree,
+                                                       const std::string& uri,
+                                                       std::string_view scope,
+                                                       std::string_view group,
+                                                       std::string_view member_name) {
+    if (scope.empty() || group.empty() || member_name.empty())
+        return {};
+
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        std::string_view scope;
+        std::string_view group;
+        std::string_view member_name;
+        std::string current_scope;
+        CovergroupMember result;
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, std::string_view scope,
+                std::string_view group, std::string_view member_name)
+            : sm(sm), uri(uri), scope(scope), group(group), member_name(member_name) {}
+
+        void enter(std::string name, const slang::syntax::SyntaxNode& node) {
+            auto previous = std::exchange(current_scope, std::move(name));
+            visitDefault(node);
+            current_scope = std::move(previous);
+        }
+
+        void handle(const slang::syntax::ModuleDeclarationSyntax& node) {
+            enter(std::string(node.header->name.valueText()), node);
+        }
+
+        void handle(const slang::syntax::ClassDeclarationSyntax& node) {
+            enter(std::string(node.name.valueText()), node);
+        }
+
+        void handle(const slang::syntax::CovergroupDeclarationSyntax& node) {
+            if (result.group_found || current_scope != scope || node.name.valueText() != group)
+                return;
+            result.group_found = true;
+            const auto answer = [&](slang::parsing::Token token) {
+                if (token && token.valueText() == member_name)
+                    result.member = location_from_token_actual_uri(sm, uri, token);
+                return result.member.has_value();
+            };
+            if (const auto* with = node.event
+                                       ? node.event->as_if<slang::syntax::WithFunctionSampleSyntax>()
+                                       : nullptr;
+                with && answer(with->sample))
+                return;
+            for (const auto* item : node.members) {
+                const slang::syntax::NamedLabelSyntax* label = nullptr;
+                if (const auto* point = item->as_if<slang::syntax::CoverpointSyntax>())
+                    label = point->label;
+                else if (const auto* cross = item->as_if<slang::syntax::CoverCrossSyntax>())
+                    label = cross->label;
+                if (label && answer(label->name))
+                    return;
+            }
+        }
+    };
+
+    Visitor visitor(tree.sourceManager(), uri, scope, group, member_name);
     tree.root().visit(visitor);
     return visitor.result;
 }
@@ -5429,6 +5547,15 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
                 return loc;
         }
 
+        if (!class_type && target.object_path.size() == 1) {
+            const auto covergroup = find_covergroup_member_in_tree(
+                *state.tree, uri,
+                target.scope_class.empty() ? target.scope_module : target.scope_class,
+                base_receiver, target.name);
+            if (covergroup.group_found)
+                return covergroup.member;
+        }
+
         // Interface ports.  `AXI_BUS.Slave bus;` then `bus.aw_valid` — the
         // receiver's declared type names an interface, and the member is one of
         // that interface's signals.  Also covers a cursor on the modport of
@@ -5515,7 +5642,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         visible_imports = get_dynamic_index(state).imports;
 
     if (auto loc = find_generic_definition(*state.tree, uri, target.name, target.scope_module,
-                                           target.scope_package, visible_imports,
+                                           target.scope_package, target.scope_class,
+                                           visible_imports,
                                            use_line_one_based))
         return loc;
 

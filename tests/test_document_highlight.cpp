@@ -139,3 +139,48 @@ TEST_CASE("document highlight: cost does not grow with closed project files",
     // ~1.  Scanning them all is ~16.
     CHECK(ratio < 4.0);
 }
+
+namespace {
+
+/// @p classes register classes, each embedding a covergroup whose sample() it
+/// calls and declaring a sample() of its own -- the shape a generated UVM
+/// register model repeats a hundred times in one file.
+std::string register_classes(int classes) {
+    std::string text;
+    for (int i = 0; i < classes; ++i) {
+        text += "class reg_" + std::to_string(i) + ";\n";
+        text += "  covergroup rd_cg with function sample(int data);\n";
+        text += "  endgroup\n";
+        text += "  function new();\n";
+        text += "    rd_cg = new();\n";
+        text += "  endfunction\n";
+        text += "  virtual function void sample(int data);\n";
+        text += "    rd_cg.sample(data);\n";
+        text += "  endfunction\n";
+        text += "endclass\n";
+    }
+    return text;
+}
+
+constexpr int kRegisterClassLines = 10;
+
+} // namespace
+
+TEST_CASE("document highlight: an embedded covergroup's sample() stays in its class",
+          "[document-highlight][covergroup]") {
+    const std::string uri = "file:///tmp/lazyverilog_highlight_covergroup.sv";
+    const std::string text = register_classes(3);
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+
+    // `rd_cg.sample` in the second class: its covergroup's sample() and the call.
+    const int call_line = kRegisterClassLines + 7;
+    const auto result = provide_document_highlight(analyzer, at(uri, call_line, 10));
+    std::vector<int> lines;
+    for (const auto& highlight : result) {
+        CHECK(text_of(text, highlight.range) == "sample");
+        lines.push_back(highlight.range.start.line);
+    }
+    std::sort(lines.begin(), lines.end());
+    CHECK(lines == std::vector<int>{kRegisterClassLines + 1, call_line});
+}
