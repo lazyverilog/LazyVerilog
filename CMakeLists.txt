@@ -15,7 +15,9 @@ if(LAZYVERILOG_SANITIZE)
     if(MSVC)
         message(FATAL_ERROR "LAZYVERILOG_SANITIZE needs GCC or Clang")
     endif()
-    add_compile_options(-fsanitize=${LAZYVERILOG_SANITIZE} -fno-omit-frame-pointer)
+    # No recovery: a UBSan report must fail the test that hit it, not just print.
+    add_compile_options(-fsanitize=${LAZYVERILOG_SANITIZE} -fno-sanitize-recover=all
+                        -fno-omit-frame-pointer)
     add_link_options(-fsanitize=${LAZYVERILOG_SANITIZE})
 endif()
 
