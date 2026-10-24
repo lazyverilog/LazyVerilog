@@ -3971,7 +3971,10 @@ module m;
     return lo;
   endfunction
   initial begin
-    cg_inst = new(1, 2);
+    cg_inst = new(
+                1,
+                2
+              );
     foo(
       a,
       b

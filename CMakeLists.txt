@@ -379,6 +379,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_formatter.cpp
     tests/test_formatter_regressions.cpp
     tests/test_formatter_invariants.cpp
+    tests/test_formatter_cst_oracle.cpp
     tests/test_lint.cpp
     tests/test_lint_codes.cpp
     tests/test_autoff.cpp
