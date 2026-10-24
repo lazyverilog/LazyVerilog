@@ -30,6 +30,29 @@ endmodule
     CHECK(json.find("top.u_cons") != std::string::npos);
 }
 
+TEST_CASE("connect: info over a recursive module stops at the repeat", "[connect]") {
+    // Recursion ends on a generate condition the index cannot evaluate, so by
+    // name alone `tree` instantiates itself forever.  The eager hierarchy used
+    // to expand it until the process ran out of memory.
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/connect_recursive_fixture.sv";
+    analyzer.open(uri, R"(
+module tree #(parameter int N = 4);
+    if (N > 1) begin : g
+        tree #(.N(N / 2)) u_sub ();
+    end
+endmodule
+module top;
+    tree u_tree ();
+endmodule
+)");
+
+    const auto info = connect_info_json(analyzer, uri);
+    CHECK(info.find("\"top.u_tree\"") != std::string::npos);
+    CHECK(info.find("\"top.u_tree.u_sub\"") != std::string::npos);
+    CHECK(info.find("u_sub.u_sub") == std::string::npos);
+}
+
 TEST_CASE("connect: lazy info defers hierarchy expansion", "[connect]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/connect_lazy_hierarchy_fixture.sv";

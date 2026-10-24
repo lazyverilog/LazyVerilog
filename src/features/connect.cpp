@@ -281,6 +281,15 @@ build_hierarchy(const std::vector<FileView>& files) {
         const auto root = frontier[idx];
         if (!visited_roots.insert(root.path + "|" + root.module).second)
             continue;
+        // A module that is its own ancestor is listed but not expanded: by name
+        // alone a recursive module (ended by a generate condition the index
+        // cannot evaluate) instantiates itself forever.
+        bool repeats_ancestor = false;
+        for (auto it = resolved.find(root.path); it != resolved.end() && !repeats_ancestor;
+             it = resolved.find(it->second.parent_path))
+            repeats_ancestor = it->second.parent_module == root.module;
+        if (repeats_ancestor)
+            continue;
 
         auto children = by_parent_module.find(root.module);
         if (children == by_parent_module.end())
