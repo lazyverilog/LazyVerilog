@@ -131,6 +131,36 @@ endmodule
     CHECK(lines_of("g]", "assign a[") == std::set<int>{7, 8});
 }
 
+// `.p,` is shorthand for `.p(p)`; `.p()` leaves the port unconnected, so its
+// name refers to the port alone, never to the enclosing module's `p`.
+TEST_CASE("references: an empty named connection is not a use of the same-named signal",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_empty_connection.sv";
+    const std::string text = R"(
+module leaf(output logic res_o, output logic other_o);
+endmodule
+module top(output logic res_o, output logic other_o);
+    leaf u_leaf (
+        .res_o( /* unconnected */ ),
+        .other_o
+    );
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto lines_of = [&](std::string_view needle, std::string_view after) {
+        const auto [line, col] = find_position_after(text, needle, after);
+        std::set<int> lines;
+        for (const auto& r : analyzer.find_references(uri, line, col, true))
+            lines.insert(r.line);
+        return lines;
+    };
+    CHECK(lines_of("res_o", "module top(output logic ") == std::set<int>{3});
+    CHECK(lines_of("other_o", "module top(output logic res_o, output logic ") ==
+          std::set<int>{3, 6});
+}
+
 TEST_CASE("references: macro invocation resolves through macro SymbolID", "[references]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/references_macro_fixture.sv";
