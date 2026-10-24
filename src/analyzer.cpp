@@ -1763,6 +1763,50 @@ static std::optional<std::string> symbol_id_for_index_location(const SyntaxIndex
     return std::nullopt;
 }
 
+/// Whether @p loc is the variable a loop header declares: `for (genvar i ...)`,
+/// `for (int i ...)` or a `foreach` index.  Each one is scoped to its own loop,
+/// but the index records an inline genvar as a module value, so every
+/// same-named identifier in the module shares its SymbolID.
+static bool declares_loop_variable(const slang::syntax::SyntaxTree& tree, const std::string& uri,
+                                   const Location& loc) {
+    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
+        const slang::SourceManager& sm;
+        const std::string& uri;
+        const Location& loc;
+        bool found{false};
+
+        Visitor(const slang::SourceManager& sm, const std::string& uri, const Location& loc)
+            : sm(sm), uri(uri), loc(loc) {}
+
+        void check(const slang::parsing::Token& name) {
+            if (found || !name)
+                return;
+            const auto at = location_from_token_actual_uri(sm, uri, name);
+            found = at.uri == loc.uri && at.line == loc.line && at.col == loc.col;
+        }
+
+        void handle(const slang::syntax::LoopGenerateSyntax& node) {
+            if (node.genvar)
+                check(node.identifier);
+            visitDefault(node);
+        }
+        void handle(const slang::syntax::ForVariableDeclarationSyntax& node) {
+            if (node.declarator)
+                check(node.declarator->name);
+            visitDefault(node);
+        }
+        void handle(const slang::syntax::ForeachLoopListSyntax& node) {
+            for (const auto* item : node.loopVariables)
+                if (const auto* var = item ? item->as_if<slang::syntax::IdentifierNameSyntax>()
+                                           : nullptr)
+                    check(var->identifier);
+            visitDefault(node);
+        }
+    } visitor(tree.sourceManager(), uri, loc);
+    tree.root().visit(visitor);
+    return visitor.found;
+}
+
 static std::optional<Location>
 find_module_definition_in_tree(const slang::syntax::SyntaxTree& tree, const std::string& uri,
                                const std::string& name) {
@@ -2299,12 +2343,17 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
     }
 
     // The inline form `for (genvar i = 0; ...)` declares `i` on the loop header
-    // itself; the separate-declaration form leaves `genvar` empty and is
-    // covered by the handler above.
+    // itself, scoped to that loop like `for (int i ...)`; the separate-declaration
+    // form leaves `genvar` empty and is covered by the handler above.
     void handle(const slang::syntax::LoopGenerateSyntax& node) {
-        if (node.genvar)
-            maybe_set(node.identifier);
+        if (!node.genvar) {
+            visitDefault(node);
+            return;
+        }
+        push_scope(node.sourceRange());
+        maybe_set(node.identifier);
         visitDefault(node);
+        scope_stack.pop_back();
     }
 
     // `parameter type data_t = logic [7:0]` declares `data_t` through a
@@ -5742,6 +5791,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             }
         }
     }
+    // A loop variable is scoped to its loop, but its ID names the whole module:
+    // drop the ID so the AST path below verifies each same-named token instead.
+    if (target_symbol_debug.starts_with("module_signal::") && target_def->uri == uri &&
+        state->tree && declares_loop_variable(*state->tree, uri, *target_def))
+        target_symbol_debug.clear();
     std::string fallback_symbol_debug;
     if (target_symbol_debug.empty()) {
         // If the lightweight index cannot prove a scope-qualified identity, keep

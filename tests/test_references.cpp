@@ -89,6 +89,48 @@ endmodule
     CHECK(refs[0].range.start.line == 4);
 }
 
+// Every `i` in a module shares one index identity, so matching on it merged the
+// loop variables of separate loops; each loop's `i` is its own declaration.
+TEST_CASE("references: same-named loop variables in separate loops stay apart",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_loop_vars.sv";
+    const std::string text = R"(
+module top;
+    logic [3:0] a, b;
+    always_comb begin
+        for (int i = 0; i < 4; i++) a[i] = 1'b0;
+        for (int i = 0; i < 4; i++) b[i] = 1'b1;
+    end
+    for (genvar g = 0; g < 2; g++) begin : g_one
+        assign a[g] = 1'b0;
+    end
+    for (genvar g = 0; g < 2; g++) begin : g_two
+        assign b[g] = 1'b1;
+    end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto lines_of = [&](std::string_view needle, std::string_view after) {
+        const auto [line, col] = find_position_after(text, needle, after);
+        std::set<int> lines;
+        for (const auto& r : analyzer.find_references(uri, line, col, true))
+            lines.insert(r.line);
+        return lines;
+    };
+    {
+        const auto [line, col] = find_position_after(text, "g]", "assign b[");
+        const auto d = analyzer.definition_of(uri, line, col);
+        REQUIRE(d);
+        CHECK(d->line == 10);
+    }
+    CHECK(lines_of("i]", "b[") == std::set<int>{5});
+    CHECK(lines_of("i]", "a[") == std::set<int>{4});
+    CHECK(lines_of("g]", "assign b[") == std::set<int>{10, 11});
+    CHECK(lines_of("g]", "assign a[") == std::set<int>{7, 8});
+}
+
 TEST_CASE("references: macro invocation resolves through macro SymbolID", "[references]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/references_macro_fixture.sv";
