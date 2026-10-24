@@ -113,16 +113,7 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     svfmt::write_log(opts, "00_input.sv", source);
     svfmt::write_log(opts, "01_token_stream_collected.log", tokens);
 
-    // Required pass DAG.  Each pass has exclusive write ownership of one
-    // metadata family and may only read lexemes plus upstream metadata.
-    svfmt::SyntaxPass syntax; syntax.run(tokens);
-    svfmt::MacroPass macro(opts); macro.run(tokens);
-    svfmt::WrapPass wrap(opts); wrap.run(tokens);
-    svfmt::CommentPass comment; comment.run(tokens);
-    svfmt::SpacingPass spacing(opts); spacing.run(tokens);
-    svfmt::IndentPass indent(opts); indent.run(tokens);
-    svfmt::AlignPass align(opts); align.run(tokens);
-    svfmt::BlankLinePass blank(opts); blank.run(tokens);
+    svfmt::run_format_passes(tokens, opts);
 
     svfmt::write_log(opts, "98_token_stream_final.log", tokens);
     std::string out = svfmt::render_tokens(tokens);

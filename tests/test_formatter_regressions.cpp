@@ -2700,11 +2700,11 @@ logic valid, ready;
 endmodule
 )SV";
     const std::string expected = R"SV(module m;
-  int                                 a                             ;
-  logic                               b                             ;
-  int unsigned                        c                             ;
-  logic [3:0]                         d [N]                         ;
-  logic                               valid, ready                  ;
+  int                                        a                             ;
+  logic                                      b                             ;
+  int unsigned                               c                             ;
+  logic        [3:0]                         d [N]                         ;
+  logic                                      valid, ready                  ;
 endmodule
 )SV";
     CHECK(format_stable(input, opts) == expected);
@@ -4370,14 +4370,14 @@ endmodule
     opts.var_declaration.align = true;
     const std::string defaults = R"SV(
 module m;
-  logic [7:0]                         a                             ;
-  (* keep *) logic                    dbg                           ;
-  logic signed [3:0]                  bb                            ;
+  logic        [7:0]                         a                             ;
+  (* keep *) logic                           dbg                           ;
+  logic signed [3:0]                         bb                            ;
   (* ram_style = "block", very_long_attribute_name = "x" *) reg [7:0] mem [256];
   (* dont_touch *) sub u_s(
     .a(a)
   );
-  (* keep *) my_t [1:0]               ut                            = 0;
+  (* keep *) my_t [1:0]                      ut                            = 0;
   (* full_case *) case (x)
     1: y = 1;
   endcase
@@ -5998,10 +5998,10 @@ endmodule
 )SV";
     const std::string expected = R"SV(
 module m;
-    wire        [7:0]                           w                               ;
-    logic       [3:0]                           y                               ;
-    logic                                       z                               ;
-    shortint unsigned [1:0]                     s                               ;
+    wire                [7:0]                           w                               ;
+    logic               [3:0]                           y                               ;
+    logic                                               z                               ;
+    shortint unsigned   [1:0]                           s                               ;
 endmodule
 )SV";
     for (bool adaptive : {true, false}) {
@@ -6014,10 +6014,10 @@ endmodule
     opts.var_declaration.align_adaptive = true;
     const std::string plain = R"SV(
 module m;
-    wire     [7:0]                         w                             ;
-    logic    [3:0]                         y                             ;
-    logic                                  z                             ;
-    shortint unsigned [1:0]                s                             ;
+    wire              [7:0]                         w                             ;
+    logic             [3:0]                         y                             ;
+    logic                                           z                             ;
+    shortint unsigned [1:0]                         s                             ;
 endmodule
 )SV";
     CHECK(format_stable(input, opts) == plain.substr(1));

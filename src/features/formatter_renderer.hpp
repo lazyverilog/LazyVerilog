@@ -62,8 +62,29 @@ inline void trim_trailing_spaces(std::string& out) {
     while (!out.empty() && (out.back() == ' ' || out.back() == '\t')) out.pop_back();
 }
 
-inline std::string render_tokens(const TokenStream& tokens) {
+// Where each token landed in the rendered text: its 0-based line and column.
+// Filled only on request, for the invariant tests; -1 for a token that
+// starts no visible text of its own (a passthrough's later lines).
+struct RenderTrace {
+    std::vector<int> line;
+    std::vector<int> column;
+};
+
+inline std::string render_tokens(const TokenStream& tokens, RenderTrace* trace = nullptr) {
     std::string out;
+    size_t scanned = 0;
+    int line_no = 0;
+    auto record = [&](size_t i, int c) {
+        if (!trace) return;
+        for (; scanned < out.size(); ++scanned)
+            if (out[scanned] == '\n') ++line_no;
+        trace->line[i] = line_no;
+        trace->column[i] = c;
+    };
+    if (trace) {
+        trace->line.assign(tokens.size(), -1);
+        trace->column.assign(tokens.size(), -1);
+    }
     size_t token_text_bytes = 0;
     for (const Tok& tok : tokens)
         token_text_bytes += tok.lex.text.size();
@@ -100,6 +121,7 @@ inline std::string render_tokens(const TokenStream& tokens) {
         // regions and whitespace-sensitive macro bodies.  The renderer still
         // owns the surrounding newline decision.
         if (d.passthrough) {
+            record(i, col);
             std::string_view text(tok.lex.text);
             out.append(text.data(), text.size());
             size_t last_nl = last_newline_offset(text);
@@ -129,6 +151,7 @@ inline std::string render_tokens(const TokenStream& tokens) {
             out.append(spaces, ' ');
             col += spaces;
         }
+        record(i, col);
 
         // A block comment spanning lines: its later lines were written
         // relative to where the first one began, so they move with it.
@@ -162,6 +185,19 @@ inline std::string render_tokens(const TokenStream& tokens) {
     while (!out.empty() && out.back() == '\n') out.pop_back();
     out.push_back('\n');
     return out;
+}
+
+// The required pass DAG.  Each pass has exclusive write ownership of one
+// metadata family and may only read lexemes plus upstream metadata.
+inline void run_format_passes(TokenStream& tokens, const FormatOptions& opts) {
+    SyntaxPass syntax; syntax.run(tokens);
+    MacroPass macro(opts); macro.run(tokens);
+    WrapPass wrap(opts); wrap.run(tokens);
+    CommentPass comment; comment.run(tokens);
+    SpacingPass spacing(opts); spacing.run(tokens);
+    IndentPass indent(opts); indent.run(tokens);
+    AlignPass align(opts); align.run(tokens);
+    BlankLinePass blank(opts); blank.run(tokens);
 }
 
 // Non-allocating whitespace-ignoring equality check.

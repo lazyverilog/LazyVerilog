@@ -974,6 +974,11 @@ inline int option_width(int value, const FormatOptions& opts) {
     return opts.tab_align ? snap_to_grid(value, opts.indent_size) : value;
 }
 
+// A section's natural width: its widest text plus the blank after it.  A
+// section no line fills takes no blank either -- `input  logic  clk` got one
+// for its empty packed dimension.
+inline int empty_or_gap(int widest) { return widest > 0 ? widest + 1 : 0; }
+
 // WrapPass's estimate of a width: it runs before SpacingPass, so it assumes
 // one space between tokens except around brackets and separators.  Later
 // passes measure with rendered_width().
@@ -997,14 +1002,18 @@ inline int compact_width(const TokenStream& tokens, size_t first, size_t end) {
 // measures what will actually be emitted.  It used to measure with a private
 // copy of the spacing rules, which knew nothing of case-item colons or based
 // literals (`4'h12: yy` measured 10 wide and rendered 9) and so misplaced the
-// columns it was computing.
+// columns it was computing.  A block comment inside the range is printed
+// too: `#10 /* wait */ v = 1;` measured its LHS as `#10 v`.
 inline int rendered_width(const TokenStream& tokens, size_t first, size_t end) {
     int w = 0;
     bool first_code = true;
     end = std::min(end, tokens.size());
     for (size_t i = first; i < end; ++i) {
         const Tok& t = tokens[i];
-        if (!is_code_token(t)) continue;
+        const bool inline_comment = t.lex.comment_kind == CommentLexemeKind::Block && !is_passthrough(t) &&
+                                    !t.mutable_.comment.force_own_line && !t.mutable_.wrap.must_break_before &&
+                                    last_newline_offset(t.lex.text) == std::string_view::npos;
+        if (!is_code_token(t) && !inline_comment) continue;
         if (!first_code && !t.mutable_.space.suppress_space)
             w += t.mutable_.space.spaces_before;
         w += token_width(t);
@@ -5260,9 +5269,17 @@ public:
             auto default_type_width = [&](const Line& ln) {
                 if (ln.first == npos)
                     return 0;
-                if (is_type_keyword(tokens[ln.first].lex.kind) ||
-                    is_port_direction(tokens[ln.first].lex.kind))
+                if (is_port_direction(tokens[ln.first].lex.kind))
                     return token_width(tokens[ln.first]);
+                // `logic signed [7:0]`, `int unsigned` -- the signing is part
+                // of the type; without it the dimension overran the column.
+                if (is_type_keyword(tokens[ln.first].lex.kind)) {
+                    const size_t sign = next_code(tokens, ln.first + 1, ln.end);
+                    return token_width(tokens[ln.first]) +
+                           (sign != npos && (kind_is(tokens[sign], TK::SignedKeyword) ||
+                                             kind_is(tokens[sign], TK::UnsignedKeyword))
+                                ? 1 + token_width(tokens[sign]) : 0);
+                }
                 VarLine v;
                 if (!is_var_decl_line(ln, v))
                     return 0;
@@ -5467,8 +5484,13 @@ public:
                     tokens[eq].mutable_.align.enabled = true;
                     tokens[eq].mutable_.align.target_column = name_target + section3;
                     if (semi != npos) {
-                        int rhs_width = rendered_width(tokens, eq + 1, semi);
-                        if (!opts_.var_declaration.align_adaptive || rhs_width < section4) {
+                        // The `;` column is section4 past the `=`; an
+                        // initializer wider than that pushes it out, so only
+                        // a `;` that fits is placed (adaptive or not, the
+                        // output is the same, and the column is no promise
+                        // it cannot keep).
+                        const int to_semi = rendered_width(tokens, eq, semi + 1) - token_width(tokens[semi]);
+                        if (to_semi <= section4) {
                             tokens[semi].mutable_.align.enabled = true;
                             tokens[semi].mutable_.align.target_column =
                                 tokens[eq].mutable_.align.target_column + section4;
@@ -5561,12 +5583,12 @@ public:
                     opts_.var_declaration.align_adaptive
                         ? section1
                         : option_width(std::max(opts_.var_declaration.section1_min_width,
-                                                group_type_width + 1), opts_);
+                                                empty_or_gap(group_type_width)), opts_);
                 const int effective_section2 =
                     opts_.var_declaration.align_adaptive
                         ? section2
                         : option_width(std::max(opts_.var_declaration.section2_min_width,
-                                                group_packed_width + 1), opts_);
+                                                empty_or_gap(group_packed_width)), opts_);
                 const int effective_section3 =
                     opts_.var_declaration.align_adaptive
                         ? section3
@@ -5903,11 +5925,11 @@ public:
                 const int effective_s2 = opts_.port_declaration.align_adaptive
                                              ? s2
                                              : option_width(std::max(opts_.port_declaration.section2_min_width,
-                                                                     group_type_width + 1), opts_);
+                                                                     empty_or_gap(group_type_width)), opts_);
                 const int effective_s3 = opts_.port_declaration.align_adaptive
                                              ? s3
                                              : option_width(std::max(opts_.port_declaration.section3_min_width,
-                                                                     group_packed_width + 1), opts_);
+                                                                     empty_or_gap(group_packed_width)), opts_);
                 const int effective_s4 = opts_.port_declaration.align_adaptive
                                              ? s4
                                              : option_width(std::max(opts_.port_declaration.section4_min_width,
@@ -5958,8 +5980,11 @@ public:
 
                     int packed_col = preferred_packed_col;
                     if (pl.packed_dim != npos) {
-                        if (pl.type_first != npos)
-                            packed_col = std::max(packed_col, type_col + pl.type_width + 1);
+                        // `output [7:0] q` -- with no type the dimension
+                        // follows the direction itself.
+                        packed_col = pl.type_first != npos
+                                         ? std::max(packed_col, type_col + pl.type_width + 1)
+                                         : std::max(packed_col, base + pl.direction_width + 1);
                         tokens[pl.packed_dim].mutable_.align.enabled = true;
                         tokens[pl.packed_dim].mutable_.align.target_column = packed_col;
                     }
@@ -6283,12 +6308,12 @@ public:
                         // separating space when section2 is followed by an
                         // explicit packed-dimension section.
                         : option_width(std::max(opts_.port_declaration.section2_min_width,
-                                                group_type_width + 1), opts_);
+                                                empty_or_gap(group_type_width)), opts_);
                 const int effective_s3 =
                     opts_.port_declaration.align_adaptive
                         ? s3
                         : option_width(std::max(opts_.port_declaration.section3_min_width,
-                                                group_packed_width + 1), opts_);
+                                                empty_or_gap(group_packed_width)), opts_);
                 // A non-adaptive group widens for an interface type the way it
                 // widens for a long direction: the type section takes the rest.
                 const int undirected_extra =
@@ -6542,12 +6567,17 @@ public:
                         tokens[e.eq].mutable_.align.enabled = true;
                         tokens[e.eq].mutable_.align.target_column = eq_target;
                     }
+                    // `= 3'd4` is 1 + value_gap + the value wide.  tab_align
+                    // puts the comma just before a grid column, one indent
+                    // past the value -- but never inside `= 3'd4` itself,
+                    // where that rule left it at indent 2.
+                    const int value_span = (e.eq == npos && local_valw == 0) ? 0 : 1 + value_gap + local_valw;
                     const int comma_target =
-                        opts_.tab_align ? (eq_target + snap_to_grid(std::max(1, local_valw) + opts_.indent_size,
-                                                                     opts_.indent_size) - 1) :
-                        (e.eq == npos) ? (local_valw > 0 ? (eq_target + 1 + value_gap + local_valw)
-                                                         : eq_target)
-                                       : (eq_target + 1 + value_gap + local_valw);
+                        opts_.tab_align
+                            ? eq_target + std::max(snap_to_grid(std::max(1, local_valw) + opts_.indent_size,
+                                                                opts_.indent_size),
+                                                   snap_to_grid(value_span + 1, opts_.indent_size)) - 1
+                            : eq_target + value_span;
                     if (e.comma != npos) {
                         tokens[e.comma].mutable_.align.enabled = true;
                         tokens[e.comma].mutable_.align.target_column = comma_target;
