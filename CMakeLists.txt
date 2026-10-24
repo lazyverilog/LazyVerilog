@@ -8,6 +8,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 include(CTest)
 
+# -DLAZYVERILOG_SANITIZE=address,undefined: instrument every target, dependencies
+# included (set before FetchContent so they see it).  Used by the nightly fuzz job.
+set(LAZYVERILOG_SANITIZE "" CACHE STRING "Value for -fsanitize= on all targets (empty = off)")
+if(LAZYVERILOG_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "LAZYVERILOG_SANITIZE needs GCC or Clang")
+    endif()
+    add_compile_options(-fsanitize=${LAZYVERILOG_SANITIZE} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${LAZYVERILOG_SANITIZE})
+endif()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # LspCpp flags — MUST be set BEFORE FetchContent_MakeAvailable(LspCpp)
 # LSPCPP_STANDALONE_ASIO: use vendored asio (third_party/asio) instead of Boost
@@ -582,6 +593,14 @@ add_test(
 # split POSIX-style, so the binary path is single-quoted.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    # A sanitized server is several times slower: lazyverilog.lintAll compiles the
+    # whole project and outlasts the default 10 s reply timeout under ASan.
+    set(LAZYVERILOG_FUZZ_REPLY_TIMEOUT 10)
+    set(LAZYVERILOG_FUZZ_SMOKE_TIMEOUT 120)
+    if(LAZYVERILOG_SANITIZE)
+        set(LAZYVERILOG_FUZZ_REPLY_TIMEOUT 60)
+        set(LAZYVERILOG_FUZZ_SMOKE_TIMEOUT 300)
+    endif()
     add_test(
         NAME lsp-fuzz-unit
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lsp_fuzz.py
@@ -592,9 +611,10 @@ if(Python3_Interpreter_FOUND)
                 --server "'$<TARGET_FILE:lazyverilog-lsp>'"
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/hpc60
                 --seed 1 --seconds 60
+                --reply-timeout ${LAZYVERILOG_FUZZ_REPLY_TIMEOUT}
                 --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke
     )
-    set_tests_properties(lsp-fuzz-smoke PROPERTIES TIMEOUT 120)
+    set_tests_properties(lsp-fuzz-smoke PROPERTIES TIMEOUT ${LAZYVERILOG_FUZZ_SMOKE_TIMEOUT})
     file(GLOB LAZYVERILOG_FUZZ_SESSIONS CONFIGURE_DEPENDS
          ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_sessions/*.jsonl)
     add_test(
@@ -602,6 +622,7 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/lsp_fuzz.py
                 --server "'$<TARGET_FILE:lazyverilog-lsp>'"
                 --replay ${LAZYVERILOG_FUZZ_SESSIONS}
+                --reply-timeout ${LAZYVERILOG_FUZZ_REPLY_TIMEOUT}
                 --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay
     )
 endif()

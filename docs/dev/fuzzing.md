@@ -47,6 +47,12 @@ CTest runs three of these when a Python 3 interpreter is found:
 - `lsp-fuzz-smoke` -- 60 s with seed 1 on `tests/rtl/hpc60`.
 - `lsp-fuzz-replay` -- every session in `tests/fuzz_sessions/`.
 
+The nightly workflow (`.github/workflows/fuzz-nightly.yml`, also runnable by
+hand) builds with `-DLAZYVERILOG_SANITIZE=address,undefined`, fuzzes the rtl1k
+corpus (`tools/make_rtl1k.sh`: cva6 + ibex) for an hour, then runs
+`[invariants]` on their RTL. Failing sessions are uploaded as the
+`fuzz-out-<run id>` artifact. Any GCC or Clang build takes the same option.
+
 ## Reading a report
 
 A failure writes two files to `--out`:

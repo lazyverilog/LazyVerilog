@@ -1,0 +1,66 @@
+name: Fuzz (nightly)
+
+# An hour of LSP session fuzzing against an ASan/UBSan build on the rtl1k corpus
+# (cva6 + ibex), then the corpus invariants (tests/test_invariants.cpp) under the
+# same build.  A failing fuzz session is uploaded; replay it with
+#   tools/lsp_fuzz.py --server <lsp> --replay <session.jsonl>
+# See docs/dev/fuzzing.md.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      # Only the two designs the corpus uses; the other tests/rtl submodules are large.
+      - name: Fetch corpus submodules
+        run: git submodule update --init --depth 1 tests/rtl/cva6 tests/rtl/ibex
+
+      - name: Configure
+        run: cmake -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAZYVERILOG_SANITIZE=address,undefined
+
+      - name: Build
+        run: cmake --build build-asan --parallel 4
+
+      - name: Build corpus
+        run: tools/make_rtl1k.sh . /tmp/rtl1k
+
+      - name: Fuzz
+        timeout-minutes: 70
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1
+        # The server runs with the corpus as its cwd, so every path is absolute.
+        # The reply timeout is long because lazyverilog.lintAll compiles all ~950
+        # files, which under ASan takes minutes; a true hang still trips it.
+        run: >
+          python3 -I tools/lsp_fuzz.py --server "$PWD/build-asan/lazyverilog-lsp" --root /tmp/rtl1k
+          --src "$PWD/tests/rtl/cva6" --src "$PWD/tests/rtl/ibex"
+          --seed ${{ github.run_id }} --seconds 3600 --reply-timeout 600 --out "$PWD/fuzz-out"
+
+      # RTL only: the invariant pass costs about 1.5 s per file, so the whole of
+      # both repositories would not fit next to the fuzz hour.
+      - name: Invariants
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: |
+          mkdir -p /tmp/invariants
+          ln -s "$PWD/tests/rtl/cva6/core" /tmp/invariants/cva6
+          ln -s "$PWD/tests/rtl/ibex/rtl" /tmp/invariants/ibex
+          LAZYVERILOG_INVARIANT_CORPUS=/tmp/invariants build-asan/lazyverilog-tests "[invariants]"
+
+      - name: Upload failing sessions
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-out-${{ github.run_id }}
+          path: fuzz-out/
+          if-no-files-found: ignore
