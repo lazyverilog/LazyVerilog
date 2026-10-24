@@ -201,7 +201,9 @@ std::vector<lsSymbolInformation> provide_workspace_symbols(const Analyzer& analy
             append_index_symbols(get_structural_index(*state), uri, query, scored, seen);
     });
 
-    for (const auto& extra : *analyzer.extra_index_snapshot_ptr())
+    // Held in a local so the snapshot outlives the loop; see collect_files() in connect.cpp.
+    const auto extra_indexes = analyzer.extra_index_snapshot_ptr();
+    for (const auto& extra : *extra_indexes)
         append_index_symbols(extra.index_ref(), extra.uri, query, scored, seen);
 
     const size_t keep = std::min(scored.size(), kResultLimit);

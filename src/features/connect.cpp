@@ -200,7 +200,11 @@ static std::vector<FileView> collect_files(const Analyzer& analyzer, const std::
     // project files remain index-authoritative structurally.  Keep only their
     // path here; edit helpers call file_text() lazily for the small subset of
     // closed files that actually receive WorkspaceEdits.
-    for (const auto& extra : *analyzer.extra_file_snapshot_ptr()) {
+    // Held in a local: a range-for over `*ptr()` drops the temporary shared_ptr
+    // before the loop body runs (C++20), leaving the vector owned only by the
+    // analyzer's cache, which a parse worker may reset mid-loop.
+    const auto extra_files = analyzer.extra_file_snapshot_ptr();
+    for (const auto& extra : *extra_files) {
         if (!seen.insert(extra.uri).second)
             continue;
         if (extra.state) {
