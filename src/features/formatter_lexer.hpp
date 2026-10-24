@@ -592,6 +592,25 @@ private:
         size_t pos = token.location().valid() ? token.location().offset() : find_from_cursor(raw);
         consume_gap_to(pos);
 
+        // A merge conflict left in the file: `<<<<<<< HEAD`, `|||||||`,
+        // `=======`, `>>>>>>> topic`.  slang lexes the markers as shift and
+        // equality operators, and formatting them as code spread `<<<<<<<`
+        // into `<<< <<< <`, which git no longer recognizes.  As clang-format
+        // does, each marker line is one token and the sides are the branches
+        // of an `` `ifdef ``, so each side is formatted on its own and the
+        // markers stay at column 0.
+        if (const auto marker = conflict_marker_kind(pos); marker != slang::syntax::SyntaxKind::Unknown) {
+            size_t line_end = source_.find('\n', pos);
+            if (line_end == std::string::npos)
+                line_end = source_.size();
+            std::string_view marker_raw(source_.data() + pos, line_end - pos);
+            add_token(slang::parsing::TokenKind::Directive, marker_raw, pos, true, false,
+                      CommentLexemeKind::None, false, false, false, marker);
+            consume_text(marker_raw, false);
+            passthrough_end_ = line_end;
+            return;
+        }
+
         slang::parsing::TokenKind kind = token.kind;
         bool directive = (kind == slang::parsing::TokenKind::Directive);
 
@@ -641,6 +660,26 @@ private:
 
         add_token(kind, raw, pos, directive, false);
         consume_text(raw, false);
+    }
+
+    // The conditional-directive kind a conflict marker at `pos` stands for,
+    // or Unknown.  A marker is seven of its character at column 0, followed
+    // by a space or the end of the line, as git writes it.
+    slang::syntax::SyntaxKind conflict_marker_kind(size_t pos) const {
+        using SK = slang::syntax::SyntaxKind;
+        if (col_ != 0 || pos + 7 > source_.size())
+            return SK::Unknown;
+        const char c = source_[pos];
+        const SK kind = c == '<' ? SK::IfDefDirective :
+                        c == '|' || c == '=' ? SK::ElseDirective :
+                        c == '>' ? SK::EndIfDirective : SK::Unknown;
+        if (kind == SK::Unknown || source_.compare(pos, 7, std::string(7, c)) != 0)
+            return SK::Unknown;
+        const size_t after = pos + 7;
+        if (after < source_.size() && source_[after] != ' ' && source_[after] != '\r' &&
+            source_[after] != '\n')
+            return SK::Unknown;
+        return kind;
     }
 
     // A conditional directive ends with its own operand, not with the line:

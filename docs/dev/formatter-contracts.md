@@ -120,3 +120,9 @@ unit-level keyword drops unclosed braces too. IndentPass closes scopes by
 kind: `endfunction` also closes a `begin` left open inside the function, and
 an extra `end` with no `begin` to close dedents nothing. Guard:
 "broken code damages only its own lines" in `tests/test_formatter_regressions.cpp`.
+
+Merge conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at
+column 0, then a space or the end of the line) are lexed as one token per
+line and take the conditional-directive kinds, as in clang-format: the
+marker lines stay verbatim at column 0 and each side is formatted as an
+`` `ifdef `` branch. Guard: "merge conflict markers stay intact".
