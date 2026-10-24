@@ -76,3 +76,36 @@ their text with all whitespace removed; once those differ, the breaks
 changed and nothing finer is compared.
 
 A new option goes into the table in `knobs()` with the aspects it owns.
+
+## CST oracle
+
+The formatter never uses slang's parser: it must format code that does not
+parse, so SyntaxPass and WrapPass decide what a token is from the tokens
+around it. `tests/test_formatter_cst_oracle.cpp` keeps those heuristics
+honest on code that does parse. For every corpus file slang parses without
+errors, each formatter token is matched by source offset to the syntax node
+that owns it, and these facts are compared with the grammar:
+
+| Fact | Grammar |
+| --- | --- |
+| `opens_design_unit` | keyword of a module/interface/program/package header, class, checker, primitive or config |
+| `is_prototype` | `function`/`task` of a body-less prototype or DPI export; `class` of `typedef class` |
+| `starts_port_list` | `(` of a unit header's ANSI or non-ANSI port list (not a modport's) |
+| `is_case_item_colon` | `:` of a case, pattern-case or randcase item |
+| `is_replication_brace` | inner `{` of `{n{...}}` and `'{n{...}}` |
+| enum body (`WrapListKind::EnumBody`) | `{` of an enum type |
+| `is_block_name_colon` | `:` of a block name |
+| `starts_argument_list` | every `(` of an argument list is one (one way) |
+| `starts_parameter_list` | every `(` of a parameter port list or value assignment is one (one way) |
+
+"One way" facts are wider than the grammar node on purpose:
+`starts_argument_list` is any call-shaped `(`, instance ports and gate
+terminals included, and `starts_parameter_list` also opens a `#(` delay.
+Only a `(` the grammar calls an argument or parameter list and the
+formatter missed is a mismatch.
+
+Tokens with no syntax node of their own -- inactive `ifdef` branches, macro
+expansions, included files -- are skipped. The hpc60 blocks `include a
+header the test does not resolve, so only the style files are checked.
+
+A new topology fact gets a row here and in `facts()`.

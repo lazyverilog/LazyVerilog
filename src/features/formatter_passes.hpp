@@ -1941,9 +1941,10 @@ public:
                          (closes_control_header(tokens, prev_i) && !kind_is(tokens[before], TK::Hash))))
                         after_callee_paren = false;
                 }
+                // `super.new(name)`, `c = new(a, b)` -- a constructor call.
                 t.immutable.topology.starts_argument_list = prev &&
                     (kind_is(*prev, TK::Identifier) || kind_is(*prev, TK::SystemIdentifier) ||
-                     kind_is(*prev, TK::MacroUsage) || after_callee_paren);
+                     kind_is(*prev, TK::MacroUsage) || kind_is(*prev, TK::NewKeyword) || after_callee_paren);
                 t.immutable.topology.starts_port_list =
                     pd == 0 &&
                     find_header_keyword_before(tokens, i) != npos &&
