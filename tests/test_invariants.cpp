@@ -228,6 +228,25 @@ TEST_CASE("invariants: format, folding, rename/references, definition over a cor
                     if (!edit_spans.empty()) {
                         ++renames_with_edits;
                         CHECK(edit_spans == ref_spans);
+                        // The edits are built from find_references(), so the check
+                        // above holds by construction.  What can fail is the set
+                        // seen from another occurrence: renaming from any use must
+                        // rewrite the same spans.  Sampled (first, middle, last) in
+                        // the open buffer, the only file asked from here.
+                        std::vector<Location> local;
+                        for (const auto& r : refs)
+                            if (r.uri == uri && r.form == RefForm::Plain)
+                                local.push_back(r);
+                        for (size_t k : {size_t{0}, local.size() / 2, local.size() - 1}) {
+                            if (local.empty())
+                                break;
+                            const auto& r = local[k];
+                            std::set<Span> from_there;
+                            for (const auto& o : analyzer.find_references(r.uri, r.line, r.col, true))
+                                from_there.emplace(o.uri, o.line, o.col, o.end_line, o.end_col);
+                            INFO("seen from " << r.line << ":" << r.col << ":\n" << show(from_there));
+                            CHECK(from_there == edit_spans);
+                        }
                     }
                 }
 
