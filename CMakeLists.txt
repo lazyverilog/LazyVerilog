@@ -90,6 +90,35 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(slang)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Patch: slang v10.0 stringifies `"...`" through lexerStack.back(), which is
+# empty when a macro's argument list runs to the end of the input (`S(a<EOF>):
+# a read before the vector, and a crash on `define S(x) `"x`" followed by `S(a.
+# Upstream has since rewritten stringification to need no lexer.  Idempotent
+# after populate, like the LspCpp patches below; the helper is in cmake/slang/.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_pp_cpp "${slang_SOURCE_DIR}/source/parsing/Preprocessor_macros.cpp")
+set(_pp_call "Lexer::stringify(*lexerStack.back(), ")
+set(_pp_anchor "bool Preprocessor::applyMacroOps(")
+file(READ "${_pp_cpp}" _pp_content)
+string(FIND "${_pp_content}" "lazyverilogStringifyLexer" _pp_done)
+if(_pp_done EQUAL -1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/stringify_lexer.cpp.in" _pp_insert)
+    string(REPLACE "${_pp_anchor}" "${_pp_insert}${_pp_anchor}" _pp_content "${_pp_content}")
+    string(REPLACE "${_pp_call}"
+           "Lexer::stringify(lazyverilogStringifyLexer(lexerStack, alloc, diagnostics, sourceManager, lexerOptions), "
+           _pp_content "${_pp_content}")
+    file(WRITE "${_pp_cpp}" "${_pp_content}")
+endif()
+string(FIND "${_pp_content}" "${_pp_call}" _pp_left)
+string(FIND "${_pp_content}" "static Lexer& lazyverilogStringifyLexer" _pp_ok)
+if(NOT _pp_left EQUAL -1 OR _pp_ok EQUAL -1)
+    message(FATAL_ERROR
+        "Could not patch slang's Preprocessor_macros.cpp stringify calls. The pinned slang "
+        "revision has probably moved; re-derive the patch (or drop it if upstream no longer "
+        "stringifies through lexerStack) before bumping GIT_TAG.")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(
