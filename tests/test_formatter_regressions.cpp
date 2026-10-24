@@ -3150,9 +3150,9 @@ S_ERR = 2'b11 // error
 } st_t;
 )SV";
     const std::string expected = R"SV(typedef enum logic [1:0] {
-  S_IDLE = 2'b00 , // idle
-  S_RUN  = 2'b01 , // run
-  S_ERR  = 2'b11   // error
+  S_IDLE = 2'b00, // idle
+  S_RUN  = 2'b01, // run
+  S_ERR  = 2'b11  // error
 } st_t;
 )SV";
     FormatOptions opts;
@@ -4165,7 +4165,7 @@ endinterface
     plain.modport.align = true;
     const std::string out = format_stable(input, plain);
     INFO(out);
-    CHECK(out.find("    import task t(input int x) ,\n"
+    CHECK(out.find("    import task t(input int x),\n"
                    // Names sharing a row keep their commas (S-4).
                    "    output bbbbbbbbbbbbb, cc\n") != std::string::npos);
 }

@@ -5080,7 +5080,7 @@ TEST_CASE("formatter: a concatenation in an enum member value is not an enum bod
     opts.enum_declaration.align = true;
     formatted = format_source(input, opts);
     CHECK(formatted == "typedef enum logic [3:0] {\n"
-                       "  A = {2'b0, 2'b1}  ,\n"
+                       "  A = {2'b0, 2'b1},\n"
                        "  B = {2{2'b10}}\n"
                        "} e_t;\n");
     CHECK(format_source(formatted, opts) == formatted);
@@ -5308,5 +5308,67 @@ TEST_CASE("formatter: call wrapping counts the declaration alignment padding", "
     opts.function_call.line_length = 47;
     const std::string formatted = format_source(input, opts);
     CHECK(formatted.find(one_line) == std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: unpacked dimensions are measured as rendered", "[formatter][options]") {
+    FormatOptions opts;
+    opts.spacing.space_inside_dimension_brackets = true;
+    opts.port_declaration.align = true;
+    opts.port_declaration.align_adaptive = false;
+    opts.port_declaration.section5_min_width = 1;
+    std::string formatted = format_source("module m (\n"
+                                          "input logic a [3:0],\n"
+                                          "input logic bb [15:0],\n"
+                                          "output logic c\n"
+                                          ");\nendmodule\n",
+                                          opts);
+    INFO(formatted);
+    CHECK(formatted.find("a           [ 3:0 ] ,\n") != std::string::npos);
+    CHECK(formatted.find("bb          [ 15:0 ],\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+
+    formatted = format_source("module m (a, bb, c);\n"
+                              "input logic a [3:0];\n"
+                              "input logic bb [15:0];\n"
+                              "output logic c;\n"
+                              "endmodule\n",
+                              opts);
+    INFO(formatted);
+    CHECK(formatted.find("a           [ 3:0 ] ;\n") != std::string::npos);
+    CHECK(formatted.find("bb          [ 15:0 ];\n") != std::string::npos);
+    CHECK(formatted.find("c                   ;\n") != std::string::npos);
+    CHECK(format_source(formatted, opts) == formatted);
+}
+
+TEST_CASE("formatter: enum alignment measures values as rendered", "[formatter][options]") {
+    FormatOptions opts;
+    opts.enum_declaration.align = true;
+    const std::string input = "typedef enum logic [3:0] {\nA = 4'd1,\nBB = 4'hf,\nC = 1\n} e_t;\n";
+    const std::vector<std::pair<const char*, const char*>> cases = {
+        {"both", "  A  = 4'd1,\n  BB = 4'hf,\n  C  = 1\n"},
+        {"after", "  A = 4'd1,\n  BB= 4'hf,\n  C = 1\n"},
+        {"before", "  A  =4'd1,\n  BB =4'hf,\n  C  =1\n"},
+        {"none", "  A =4'd1,\n  BB=4'hf,\n  C =1\n"},
+    };
+    for (const auto& [spacing, body] : cases) {
+        opts.spacing.assignment_operator_spacing = spacing;
+        const std::string formatted = format_source(input, opts);
+        INFO(spacing);
+        CHECK(formatted == std::string("typedef enum logic [3:0] {\n") + body + "} e_t;\n");
+        CHECK(format_source(formatted, opts) == formatted);
+    }
+}
+
+TEST_CASE("formatter: modport alignment counts padded parens", "[formatter][options]") {
+    FormatOptions opts;
+    opts.spacing.space_inside_parens = true;
+    opts.modport.align = true;
+    const std::string formatted = format_source(
+        "interface i;\nlogic a, bb;\nmodport mp (input a, output bb, import task f(input int x));\nendinterface\n", opts);
+    INFO(formatted);
+    // The comma column is the end of the widest signal, `task f( input int x )`.
+    CHECK(formatted.find("    input  a                    ,\n") != std::string::npos);
+    CHECK(formatted.find("    import task f( input int x )\n") != std::string::npos);
     CHECK(format_source(formatted, opts) == formatted);
 }

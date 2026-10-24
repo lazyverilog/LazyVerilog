@@ -974,6 +974,9 @@ inline int option_width(int value, const FormatOptions& opts) {
     return opts.tab_align ? snap_to_grid(value, opts.indent_size) : value;
 }
 
+// WrapPass's estimate of a width: it runs before SpacingPass, so it assumes
+// one space between tokens except around brackets and separators.  Later
+// passes measure with rendered_width().
 inline int compact_width(const TokenStream& tokens, size_t first, size_t end) {
     int w = 0;
     bool need_space = false;
@@ -985,15 +988,6 @@ inline int compact_width(const TokenStream& tokens, size_t first, size_t end) {
             ++w;
         w += token_width(t);
         need_space = !no_space_after(t.lex.kind);
-    }
-    return w;
-}
-
-inline int token_text_width(const TokenStream& tokens, size_t first, size_t end) {
-    int w = 0;
-    for (size_t i = first; i < end && i < tokens.size(); ++i) {
-        if (is_code_token(tokens[i]))
-            w += token_width(tokens[i]);
     }
     return w;
 }
@@ -5927,7 +5921,7 @@ public:
                     const size_t close = tokens[open].immutable.syntax.matching_token;
                     if (close != npos)
                         group_unpacked_width = std::max(group_unpacked_width,
-                                                        token_text_width(tokens, open, close + 1));
+                                                        rendered_width(tokens, open, close + 1));
                 }
                 const int effective_s5 = opts_.port_declaration.align_adaptive
                                              ? s5
@@ -5998,7 +5992,7 @@ public:
                     if (pl.unpacked_dim != npos) {
                         const size_t close = tokens[pl.unpacked_dim].immutable.syntax.matching_token;
                         if (close != npos)
-                            text_end = unpacked_col + token_text_width(tokens, pl.unpacked_dim, close + 1);
+                            text_end = unpacked_col + rendered_width(tokens, pl.unpacked_dim, close + 1);
                     }
                     tokens[pl.first_delim].mutable_.align.enabled = true;
                     tokens[pl.first_delim].mutable_.align.target_column =
@@ -6325,7 +6319,7 @@ public:
                     const size_t close = tokens[d.unpacked_dim].immutable.syntax.matching_token;
                     if (close != npos)
                         group_unpacked_width = std::max(group_unpacked_width,
-                                                        token_text_width(tokens, d.unpacked_dim, close + 1));
+                                                        rendered_width(tokens, d.unpacked_dim, close + 1));
                 }
                 const int effective_s5 = opts_.port_declaration.align_adaptive
                                              ? s5
@@ -6376,7 +6370,7 @@ public:
                         size_t close = tokens[d.unpacked_dim].immutable.syntax.matching_token;
                         if (close == npos)
                             continue;
-                        text_end = trailing_start + token_text_width(tokens, d.unpacked_dim, close + 1);
+                        text_end = trailing_start + rendered_width(tokens, d.unpacked_dim, close + 1);
                     }
                     const int comma_target = std::max(preferred_comma_col, text_end);
 
@@ -6514,14 +6508,27 @@ public:
                     size_t eq = npos;
                     for (size_t k = item.first; k <= item.last; ++k)
                         if (kind_is(tokens[k], TK::Equals)) { eq = k; break; }
-                    int nw = eq == npos ? compact_width(tokens, item.first, item.last + 1)
-                                         : compact_width(tokens, item.first, eq);
-                    int vw = eq == npos ? 0 : compact_width(tokens, eq + 1, item.last + 1);
+                    int nw = eq == npos ? rendered_width(tokens, item.first, item.last + 1)
+                                         : rendered_width(tokens, item.first, eq);
+                    int vw = eq == npos ? 0 : rendered_width(tokens, eq + 1, item.last + 1);
                     namew = std::max(namew, nw);
                     valw = std::max(valw, vw);
                     es.push_back({item.first, item.last, eq, item.comma, nw, vw});
                 }
                 int base = tokens[items.front().first].mutable_.indent.base_indent;
+                // The gaps around `=` follow assignment_operator_spacing.
+                auto gap_before = [&](size_t k) {
+                    return tokens[k].mutable_.space.suppress_space ? 0 : tokens[k].mutable_.space.spaces_before;
+                };
+                int eq_gap = 1, value_gap = 1;
+                for (const auto& e : es) {
+                    const size_t value = e.eq == npos ? npos : next_code(tokens, e.eq + 1, e.last + 1);
+                    if (value != npos) {
+                        eq_gap = gap_before(e.eq);
+                        value_gap = gap_before(value);
+                        break;
+                    }
+                }
                 for (const auto& e : es) {
                     int local_namew = opts_.enum_declaration.align_adaptive
                         ? std::max(option_width(opts_.enum_declaration.enum_name_min_width, opts_), e.namew)
@@ -6530,7 +6537,7 @@ public:
                         ? std::max(option_width(opts_.enum_declaration.enum_value_min_width, opts_), e.valw)
                         : valw;
                     int eq_target = base + (opts_.tab_align ? snap_to_grid(local_namew + 1, opts_.indent_size)
-                                                            : local_namew + 1);
+                                                            : local_namew + eq_gap);
                     if (e.eq != npos) {
                         tokens[e.eq].mutable_.align.enabled = true;
                         tokens[e.eq].mutable_.align.target_column = eq_target;
@@ -6538,9 +6545,9 @@ public:
                     const int comma_target =
                         opts_.tab_align ? (eq_target + snap_to_grid(std::max(1, local_valw) + opts_.indent_size,
                                                                      opts_.indent_size) - 1) :
-                        (e.eq == npos) ? (local_valw > 0 ? (eq_target + 2 + local_valw)
+                        (e.eq == npos) ? (local_valw > 0 ? (eq_target + 1 + value_gap + local_valw)
                                                          : eq_target)
-                                       : (eq_target + 2 + local_valw);
+                                       : (eq_target + 1 + value_gap + local_valw);
                     if (e.comma != npos) {
                         tokens[e.comma].mutable_.align.enabled = true;
                         tokens[e.comma].mutable_.align.target_column = comma_target;
@@ -6569,7 +6576,7 @@ public:
                     size_t sig = next_code(tokens, item.first + 1, item.last + 1);
                     if (sig == npos) continue;
                     int dw = token_width(tokens[item.first]);
-                    int sw = compact_width(tokens, sig, item.last + 1);
+                    int sw = rendered_width(tokens, sig, item.last + 1);
                     dirw = std::max(dirw, dw + 1);
                     // `import task send(` ... `),` -- a prototype WrapPass
                     // broke over several lines has no width to put in the
