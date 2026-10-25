@@ -1015,6 +1015,56 @@ void LazyVerilogServer::show_warning(const std::string& message) {
     }
 }
 
+void LazyVerilogServer::register_file_watchers(bool replace) {
+    // Register file watchers so the client sends workspace/didChangeWatchedFiles
+    // when SV/V/header/filelist files change on disk (e.g. git revert, checkout).
+    //
+    // A client watches under the workspace folders it has when the
+    // registration arrives (Neovim's _watchfiles.lua reads them there, once),
+    // so a folder added later goes unwatched.  `replace` drops the old
+    // registration and makes a new one that covers every current folder.
+    std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
+    if (replace) {
+        try {
+            auto req =
+                impl_->remote_endpoint.createRequest<Req_ClientUnregisterCapability::request>();
+            Unregistration unreg;
+            unreg.id = "lazyverilog-file-watcher";
+            unreg.method = "workspace/didChangeWatchedFiles";
+            req.params.unregisterations = {std::move(unreg)};
+            (void)impl_->remote_endpoint.send(req);
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] unregisterCapability error: " << e.what() << "\n";
+        }
+    }
+    try {
+        auto req =
+            impl_->remote_endpoint.createRequest<Req_ClientRegisterFileWatchers::request>();
+        RegistrationWithOptions reg;
+        reg.id = "lazyverilog-file-watcher";
+        reg.method = "workspace/didChangeWatchedFiles";
+        // Built from the same list OpenParseHeaderCache caches by: an
+        // extension the client is not asked to watch is one nothing would
+        // ever report a change for.
+        for (const auto ext : kWatchedSourceExtensions)
+            reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
+        // The config itself.  ProjectRootResolver's freshness windows say
+        // they are a backstop and that "the client's watcher fires
+        // invalidate()" for a config that appears or moves -- but no
+        // watcher asked for one, so nothing ever did.  A lazyverilog.toml
+        // written by a git checkout, a branch switch or a terminal reached
+        // the server only once one of its buffers was saved from an editor
+        // that sends didChangeConfiguration, and until then every file
+        // under it kept the config it was resolved with.
+        reg.registerOptions.watchers.push_back(
+            {"**/" + std::string(ProjectRootResolver::kMarker)});
+        req.params.registrations = {std::move(reg)};
+        (void)impl_->remote_endpoint.send(req);
+    } catch (const std::exception& e) {
+        std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
+    }
+}
+
 void LazyVerilogServer::invalidate_config_cache() {
     if (root_resolver_)
         root_resolver_->invalidate();
@@ -1525,34 +1575,7 @@ void LazyVerilogServer::register_handlers() {
 
     // ── initialized ───────────────────────────────────────────────────────────
     ep.registerHandler([&](const Notify_InitializedNotification::notify&) {
-        // Register file watchers so the client sends workspace/didChangeWatchedFiles
-        // when SV/V/header/filelist files change on disk (e.g. git revert, checkout).
-        try {
-            auto req =
-                impl_->remote_endpoint.createRequest<Req_ClientRegisterFileWatchers::request>();
-            RegistrationWithOptions reg;
-            reg.id = "lazyverilog-file-watcher";
-            reg.method = "workspace/didChangeWatchedFiles";
-            // Built from the same list OpenParseHeaderCache caches by: an
-            // extension the client is not asked to watch is one nothing would
-            // ever report a change for.
-            for (const auto ext : kWatchedSourceExtensions)
-                reg.registerOptions.watchers.push_back({"**/*" + std::string(ext)});
-            // The config itself.  ProjectRootResolver's freshness windows say
-            // they are a backstop and that "the client's watcher fires
-            // invalidate()" for a config that appears or moves -- but no
-            // watcher asked for one, so nothing ever did.  A lazyverilog.toml
-            // written by a git checkout, a branch switch or a terminal reached
-            // the server only once one of its buffers was saved from an editor
-            // that sends didChangeConfiguration, and until then every file
-            // under it kept the config it was resolved with.
-            reg.registerOptions.watchers.push_back(
-                {"**/" + std::string(ProjectRootResolver::kMarker)});
-            req.params.registrations = {std::move(reg)};
-            (void)impl_->remote_endpoint.send(req);
-        } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] registerCapability error: " << e.what() << "\n";
-        }
+        register_file_watchers(false);
     });
 
     // ── shutdown ──────────────────────────────────────────────────────────────
@@ -1755,6 +1778,8 @@ void LazyVerilogServer::register_handlers() {
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChangeWorkspaceFolders error: " << e.what() << "\n";
         }
+        if (!note.params.event.added.empty())
+            register_file_watchers(true);
     });
 
     // ── textDocument/didOpen ──────────────────────────────────────────────────

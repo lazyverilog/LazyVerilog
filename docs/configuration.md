@@ -8,7 +8,8 @@ two projects open side by side each use their own.
 A file with no `lazyverilog.toml` above it still gets cross-file features. The server indexes the
 folder the file belongs to as an *implicit project*:
 
-- your editor's workspace folders, when it sends them (VS Code does), or
+- your editor's workspace folders, when it sends them: the folder VS Code opened, or the git
+  checkout of each file the Neovim plugin opens (never the directory nvim was started in), or
 - the nearest version-control checkout above the file (a `.git`, `.hg` or `.svn` directory).
 
 Every `.sv` and `.v` file under that folder is indexed, and every directory that holds a `.svh`,

@@ -169,6 +169,9 @@ class LazyVerilogServer {
     void fold_implicit_root(const std::string& root, const ImplicitScan& scan);
     /// window/showMessage at warning level, from any thread.
     void show_warning(const std::string& message);
+    /// client/registerCapability for workspace/didChangeWatchedFiles;
+    /// @p replace unregisters the previous one first.
+    void register_file_watchers(bool replace);
 
     /// Project roots already folded in by discover_project_for(), so a burst of
     /// didOpens in one project reloads its filelist once rather than per file.
