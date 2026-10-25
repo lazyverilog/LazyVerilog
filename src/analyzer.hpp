@@ -221,10 +221,14 @@ inline bool is_watched_source_path(std::string_view path) {
 ///
 /// The consequence is worth stating plainly: if the client does not deliver
 /// workspace/didChangeWatchedFiles, an externally edited header stays cached
-/// until the project configuration changes or the server restarts.  Both
-/// shipped clients (lua/, vscode/) register the watcher, and only the
-/// extensions in kWatchedSourceExtensions are cached, so a path nothing watches
-/// is simply re-read every keystroke as it was before this cache existed.
+/// until the project configuration changes or the server restarts.  VS Code
+/// always delivers it.  Neovim delivers it on Windows and macOS, and only
+/// because the plugin sends a workspace folder (Neovim drops the registration
+/// from a client with none); Neovim 0.10 on Linux does not offer dynamic
+/// registration for it at all, so there this caveat is the normal case.  Only
+/// the extensions in kWatchedSourceExtensions are cached, so a path nothing
+/// watches is simply re-read every keystroke as it was before this cache
+/// existed.
 struct OpenParseHeaderCache {
     /// Same budget as HeaderTextCache, for the same reason: a design whose
     /// headers exceed it keeps the ones seen first and the win is partial.
