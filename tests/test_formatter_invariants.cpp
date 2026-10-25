@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <cstdlib>
 #include <random>
 #include <sstream>
 #include <string>
@@ -163,7 +164,13 @@ struct RunConfig {
 constexpr unsigned kRandomConfigs = 200;
 constexpr unsigned kTightRandomConfigs = 8;
 
+unsigned seed_base() {
+    const char* e = std::getenv("LV_FORMAT_SEED_BASE");
+    return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0;
+}
+
 RunConfig random_config(unsigned seed) {
+    seed += seed_base();
     std::mt19937 rng(seed);
     RunConfig c{FormatOptions{}, "random_config(" + std::to_string(seed) + ")"};
     // mt19937's output is the same everywhere, but uniform_int_distribution
