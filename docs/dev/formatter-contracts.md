@@ -17,12 +17,14 @@ Add a file to `formatter_corpus/` when a bug needs a shape the corpus lacks.
 
 ## Configs
 
-The default options, every aligner on, and 24 seeded random mixes drawn
-from the option table. A failure names its config as `random_config(N)`;
-rebuild it in a test with the same seed. The draw uses `std::mt19937`
-output directly, never `std::uniform_int_distribution`, whose results
-differ between standard libraries: macOS once ran other configs than
-Linux and Windows.
+The default options, every aligner on, and 200 seeded random mixes drawn
+from the option table (`kRandomConfigs`; the invariants test case stays
+near 10 s in RelWithDebInfo). The tightness check runs its tight config
+alone and over 8 random mixes with every aligner forced tight. A failure
+names its config as `random_config(N)`; rebuild it in a test with the same
+seed. The draw uses `std::mt19937` output directly, never
+`std::uniform_int_distribution`, whose results differ between standard
+libraries: macOS once ran other configs than Linux and Windows.
 
 ## Invariants
 
@@ -31,18 +33,26 @@ Linux and Windows.
 | throws | `format_source()` does not throw (token-stream safety) |
 | not-idempotent | formatting the output again changes nothing |
 | align-miss | every token AlignPass gave a `target_column` renders at that column, unless it starts its line |
-| align-loose | with all minimum widths 0 and not adaptive, an aligned column on consecutive code lines touches at least one member: some line has only one blank (or its own spacing) before it. `var_declaration`'s type field is one width for the whole file, so a run also counts as touched when the same field (as far from its own line's indent) is touched on another line |
+| align-loose | with all minimum widths 0, not adaptive and `tab_align` off (tab stops pad by design), an aligned column on consecutive code lines touches at least one member: some line has only one blank (or its own spacing) before it. `var_declaration`'s type field is one width for the whole file, so a run also counts as touched when the same field (as far from its own line's indent) is touched on another line |
 | call-too-long | `break_policy = "auto"`: a call left on one line does not end past `line_length` when its `(` is inside the limit |
 
 `align-miss` makes AlignPass keep its promises: an aligner sets a column only
 where the renderer can reach it. A column a line's own text overruns (a long
 initializer before `;`) gets no target on that line.
 
+An adaptive `var_declaration` section keeps its configured width, so a
+name wider than section3 + section4 overruns the preferred `,`/`;` column;
+that column then moves to where the text ends instead of being promised
+inside the name.
+
 `call-too-long` mirrors WrapPass's exceptions: gate terminals, task and
-function formals (they follow `[format.function_declaration]`), and calls
-nested in another call or a bracket are never broken as calls. Alignment
-padding is subtracted, because WrapPass runs before AlignPass and cannot
-see it.
+function formals (they follow `[format.function_declaration]`), calls
+nested in another call or a bracket are never broken as calls; with
+`layout = "hanging"` a one-argument call has no break that shortens it
+(the argument stays after the `(`). Alignment padding is subtracted,
+because WrapPass runs before AlignPass and cannot see it, except the
+padding before the line's `=` that `statement_align_padding()` already
+counts.
 
 ## Option contracts
 

@@ -158,6 +158,11 @@ struct RunConfig {
     std::string label;
 };
 
+// Seeded random mixes per test.  The invariants test case is the one that
+// scales with them; keep it near 10 s in RelWithDebInfo.
+constexpr unsigned kRandomConfigs = 200;
+constexpr unsigned kTightRandomConfigs = 8;
+
 RunConfig random_config(unsigned seed) {
     std::mt19937 rng(seed);
     RunConfig c{FormatOptions{}, "random_config(" + std::to_string(seed) + ")"};
@@ -303,7 +308,10 @@ void check_tightness(const Rendered& r, const CorpusFile& f, const RunConfig& c,
         const auto d = svfmt::compose(r.tokens[i]);
         // An aligned column keeps at least one blank from what precedes it
         // (`.d (`, `clk ;`), whatever the token's own spacing asks for.
-        const int slack = gap_before(r, i) - std::max(d.spaces_before, 1);
+        // A token that hugs what precedes it (`S1 =3'd4,` with
+        // assignment_operator_spacing = "before") is touched too: clamp, or
+        // its -1 hides the 0 that marks a touched type field below.
+        const int slack = std::max(0, gap_before(r, i) - std::max(d.spaces_before, 1));
         const int line = r.trace.line[i];
         const int field = a.target_column - indent_of(line);
         const auto fs = field_slack.find(field);
@@ -372,10 +380,31 @@ void check_call_length(const Rendered& r, const CorpusFile& f, const RunConfig& 
         }
         if (is_decl)
             continue;
+        // A hanging list keeps its first argument after the `(` and hugs the
+        // `)`, so a one-argument call has no break that shortens its line.
+        if (fc.layout == "hanging") {
+            const auto& d = t.immutable.syntax;
+            bool comma = false;
+            for (size_t k = open + 1; k < close && !comma; ++k) {
+                const auto& s = r.tokens[k].immutable.syntax;
+                comma = r.tokens[k].lex.kind == svfmt::TK::Comma && s.paren_depth == d.paren_depth + 1 &&
+                        s.bracket_depth == d.bracket_depth && s.brace_depth == d.brace_depth;
+            }
+            if (!comma)
+                continue;
+        }
         int padding = 0;
-        for (size_t k = open; k-- > 0 && r.trace.line[k] == r.trace.line[open];)
+        size_t line_start = open;
+        for (size_t k = open; k-- > 0 && r.trace.line[k] == r.trace.line[open];) {
             if (r.tokens[k].mutable_.align.enabled && visible(r, k) && !at_line_start(r, k))
                 padding += std::max(0, gap_before(r, k) - svfmt::compose(r.tokens[k]).spaces_before);
+            if (visible(r, k))
+                line_start = k;
+        }
+        // WrapPass does count the padding statement alignment puts before
+        // the line's `=` (statement_align_padding), so a call whose `(` that
+        // padding pushes past the limit is left whole on purpose.
+        padding = std::max(0, padding - svfmt::statement_align_padding(r.tokens, line_start, open, c.opts));
         const int end = r.trace.column[close] + 1 - padding;
         if (end > fc.line_length && r.trace.column[open] + 1 - padding < fc.line_length)
             rep.add("call-too-long", f, c, r.trace.line[open],
@@ -389,7 +418,7 @@ void check_call_length(const Rendered& r, const CorpusFile& f, const RunConfig& 
 TEST_CASE("formatter invariants hold over the corpus", "[formatter][invariants]") {
     REQUIRE(corpus().size() >= 18);
     Report rep;
-    const std::vector<RunConfig> all = configs(24);
+    const std::vector<RunConfig> all = configs(kRandomConfigs);
     for (const RunConfig& c : all) {
         for (const CorpusFile& f : corpus()) {
             // A big generated file is slow and repeats itself: default only.
@@ -421,25 +450,34 @@ TEST_CASE("formatter invariants hold over the corpus", "[formatter][invariants]"
 
 TEST_CASE("aligned columns are no wider than needed", "[formatter][invariants]") {
     // Every minimum width off, so only the members set a column's width.
-    RunConfig tight{FormatOptions{}, "tight"};
-    auto& o = tight.opts;
-    o.statement.align = o.port_declaration.align = o.var_declaration.align = o.instance.align =
-        o.enum_declaration.align = o.modport.align = true;
-    o.statement.align_adaptive = o.port_declaration.align_adaptive = o.var_declaration.align_adaptive =
-        o.instance.align_adaptive = o.enum_declaration.align_adaptive = o.modport.align_adaptive = false;
-    o.statement.lhs_min_width = 0;
-    o.port_declaration.section1_min_width = o.port_declaration.section2_min_width =
-        o.port_declaration.section3_min_width = o.port_declaration.section4_min_width =
-            o.port_declaration.section5_min_width = 0;
-    o.var_declaration.section1_min_width = o.var_declaration.section2_min_width =
-        o.var_declaration.section3_min_width = o.var_declaration.section4_min_width = 0;
-    o.instance.instance_port_name_width = o.instance.instance_port_between_paren_width = 0;
-    o.enum_declaration.enum_name_min_width = o.enum_declaration.enum_value_min_width = 0;
-    o.modport.direction_min_width = o.modport.signal_min_width = 0;
-
+    // The other options come from the default and from random mixes: the
+    // mixes found a spacing option that hid a loose column from this check.
     Report rep;
-    for (const CorpusFile& f : corpus())
-        check_tightness(render(f.text, o), f, tight, rep);
+    std::vector<RunConfig> all{{FormatOptions{}, "tight"}};
+    for (unsigned s = 1; s <= kTightRandomConfigs; ++s)
+        all.push_back(random_config(s));
+    for (RunConfig& tight : all) {
+        auto& o = tight.opts;
+        o.statement.align = o.port_declaration.align = o.var_declaration.align = o.instance.align =
+            o.enum_declaration.align = o.modport.align = true;
+        o.statement.align_adaptive = o.port_declaration.align_adaptive = o.var_declaration.align_adaptive =
+            o.instance.align_adaptive = o.enum_declaration.align_adaptive = o.modport.align_adaptive = false;
+        o.statement.lhs_min_width = 0;
+        o.port_declaration.section1_min_width = o.port_declaration.section2_min_width =
+            o.port_declaration.section3_min_width = o.port_declaration.section4_min_width =
+                o.port_declaration.section5_min_width = 0;
+        o.var_declaration.section1_min_width = o.var_declaration.section2_min_width =
+            o.var_declaration.section3_min_width = o.var_declaration.section4_min_width = 0;
+        o.instance.instance_port_name_width = o.instance.instance_port_between_paren_width = 0;
+        o.enum_declaration.enum_name_min_width = o.enum_declaration.enum_value_min_width = 0;
+        o.modport.direction_min_width = o.modport.signal_min_width = 0;
+        // tab_align moves every column to a tab stop: padding by design.
+        o.tab_align = false;
+        if (tight.label != "tight")
+            tight.label = "tight " + tight.label;
+        for (const CorpusFile& f : corpus())
+            check_tightness(render(f.text, o), f, tight, rep);
+    }
     INFO(rep.text());
     CHECK(rep.items.empty());
 }

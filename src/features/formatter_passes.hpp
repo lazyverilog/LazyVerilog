@@ -5925,13 +5925,28 @@ public:
                         }
                     };
 
+                    // Where `k` renders after the last column placed before
+                    // it.  Adaptive sections keep their configured width, so
+                    // a name or unpacked dimension wider than section3 +
+                    // section4 overruns the preferred `,`/`;` column; the
+                    // column then moves right instead of promising a spot
+                    // the renderer cannot reach.
+                    auto landing = [&](size_t k) {
+                        for (size_t a = k; a-- > vl.first;)
+                            if (tokens[a].mutable_.align.enabled)
+                                return tokens[a].mutable_.align.target_column + rendered_width(tokens, a, k + 1) -
+                                       token_width(tokens[k]);
+                        return vl.indent + rendered_width(tokens, vl.first, k + 1) - token_width(tokens[k]);
+                    };
+
                     auto align_delim = [&](size_t name, size_t delim) {
                         if (delim != npos && delim < tokens.size()) {
-                            tokens[delim].mutable_.align.enabled = true;
-                            tokens[delim].mutable_.align.target_column =
+                            const int preferred =
                                 name == vl.first_name
                                     ? preferred_delim_col
                                     : tokens[name].mutable_.align.target_column + effective_section3 + effective_section4;
+                            tokens[delim].mutable_.align.enabled = true;
+                            tokens[delim].mutable_.align.target_column = std::max(preferred, landing(delim));
                         }
                     };
 
@@ -5944,8 +5959,8 @@ public:
                                 std::max(preferred_trailing_col,
                                          name_col + name_width + gap_before(vl.eq));
                         }
+                        tokens[vl.semi].mutable_.align.target_column = std::max(preferred_delim_col, landing(vl.semi));
                         tokens[vl.semi].mutable_.align.enabled = true;
-                        tokens[vl.semi].mutable_.align.target_column = preferred_delim_col;
                     } else {
                         if (unpacked_dim != npos)
                             align_unpacked_trailing(unpacked_dim, vl.first_delim);

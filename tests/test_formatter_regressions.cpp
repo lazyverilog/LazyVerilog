@@ -3,6 +3,8 @@
 // that formatting it again changes nothing; cases that once produced code
 // slang rejects also parse the output.
 #include "features/formatter.hpp"
+#include "features/formatter_lexer.hpp"
+#include "features/formatter_renderer.hpp"
 #include "config.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -6579,4 +6581,34 @@ TEST_CASE("formatter regression: var_declaration columns never sit inside the te
     o.var_declaration.section3_min_width = 0;
     CHECK(format_stable("module m;\n  logic signed [7:0] a = 1, b;\n  wire [3:0] c;\nendmodule\n", o) ==
           "module m;\n  logic signed [7:0] a = 1, b;\n  wire         [3:0] c;\nendmodule\n");
+}
+
+TEST_CASE("formatter regression: an adaptive var_declaration delimiter column is one the line can reach", "[formatter][regression]") {
+    // With section1_min_width set and adaptive section3/section4 narrower
+    // than a name, the `,` and `;` columns were promised at section1 +
+    // section2 + section3 + section4 past the indent, inside the name.  The
+    // renderer only pads, so the text came out right, but AlignPass broke
+    // its promise (align-miss in test_formatter_invariants.cpp).
+    FormatOptions o;
+    o.var_declaration.align = true;
+    o.var_declaration.align_adaptive = true;
+    o.var_declaration.section1_min_width = 10;
+    o.var_declaration.section2_min_width = 0;
+    o.var_declaration.section3_min_width = 0;
+    const std::string src =
+        "module m;\n  logic a;\n  logic valid, ready;\n  int q [$];\n  string s = \"abc\";\nendmodule\n";
+    CHECK(format_stable(src, o) ==
+          "module m;\n  logic     a;\n  logic     valid, ready;\n  int       q [$];\n  string    s = \"abc\";\nendmodule\n");
+
+    svfmt::TokenStream tokens = svfmt::TokenCollector(src, o).collect();
+    svfmt::run_format_passes(tokens, o);
+    svfmt::RenderTrace trace;
+    svfmt::render_tokens(tokens, &trace);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const auto& a = tokens[i].mutable_.align;
+        if (!a.enabled || a.target_column < 0 || trace.line[i] < 0 || svfmt::is_passthrough(tokens[i]))
+            continue;
+        INFO("`" << tokens[i].lex.text << "` on line " << trace.line[i] + 1);
+        CHECK(trace.column[i] == a.target_column);
+    }
 }
