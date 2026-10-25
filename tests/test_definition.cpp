@@ -153,6 +153,70 @@ TEST_CASE("definition: named port lookup uses vcode extra files", "[definition]"
     std::filesystem::remove(extra_path);
 }
 
+// Two buffers open with no filelist carrying either: no lazyverilog.toml, or
+// a new file not yet in the .f.  References between them always worked;
+// go-to-definition answered nothing, because it searched filelist shards only.
+static const std::string kOpenSubFixture =
+    "module sub #(parameter int W = 4) (input logic clk);\nendmodule\n";
+static const std::string kOpenTopFixture =
+    "module top(input logic clk);\n  sub #(.W(8)) u_sub(.clk(clk));\nendmodule\n";
+
+TEST_CASE("definition: a module declared only in another open buffer resolves", "[definition]") {
+    Analyzer analyzer;
+    const std::string sub_uri = "file:///tmp/lazyverilog_open_only/sub.sv";
+    const std::string top_uri = "file:///tmp/lazyverilog_open_only/top.sv";
+    analyzer.open(sub_uri, kOpenSubFixture);
+    analyzer.open(top_uri, kOpenTopFixture);
+
+    auto module = analyzer.definition_of(top_uri, 1, 3);
+    REQUIRE(module.has_value());
+    CHECK(module->uri == sub_uri);
+    CHECK(module->line == 0);
+    CHECK(module->col == 7);
+
+    auto port = analyzer.definition_of(top_uri, 1, 23);
+    REQUIRE(port.has_value());
+    CHECK(port->uri == sub_uri);
+    CHECK(port->line == 0);
+    CHECK(port->col == 47);
+}
+
+TEST_CASE("definition: a module open but not in the filelist resolves", "[definition]") {
+    Analyzer analyzer;
+    const auto top_path = write_temp_sv("lazyverilog_partial_top.sv", kOpenTopFixture);
+    const std::string top_uri = uri_from_path(top_path);
+    const std::string sub_uri = "file:///tmp/lazyverilog_partial/sub.sv";
+    analyzer.set_extra_files({top_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(top_uri, kOpenTopFixture);
+    analyzer.open(sub_uri, kOpenSubFixture);
+
+    auto loc = analyzer.definition_of(top_uri, 1, 3);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == sub_uri);
+    CHECK(loc->line == 0);
+
+    std::filesystem::remove(top_path);
+}
+
+TEST_CASE("definition: a filelist answer still wins over an unlisted open buffer", "[definition]") {
+    Analyzer analyzer;
+    const auto listed_path = write_temp_sv("lazyverilog_listed_sub.sv", kOpenSubFixture);
+    const std::string top_uri = "file:///tmp/lazyverilog_listed_wins/top.sv";
+    // Nearer to top.sv than the listed copy, and still met after it.
+    const std::string open_uri = "file:///tmp/lazyverilog_listed_wins/sub.sv";
+    analyzer.set_extra_files({listed_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(open_uri, kOpenSubFixture);
+    analyzer.open(top_uri, kOpenTopFixture);
+
+    auto loc = analyzer.definition_of(top_uri, 1, 3);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(listed_path));
+
+    std::filesystem::remove(listed_path);
+}
+
 TEST_CASE("definition: macro lookup resolves local define", "[definition]") {
     Analyzer analyzer;
     const auto top_path = find_repo_file("tests/definition_memory_top.sv");
