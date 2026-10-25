@@ -1,0 +1,104 @@
+{"note": "50 hovers, then a cancel for every one of them"}
+{"send": {"jsonrpc": "2.0", "method": "initialize", "params": {"processId": null, "rootUri": null, "capabilities": {}}, "id": 0}}
+{"send": {"jsonrpc": "2.0", "method": "initialized", "params": {}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv", "languageId": "systemverilog", "version": 1, "text": "module m;\n  logic a;\n  assign a = 1'b0;\nendmodule\n"}}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 1}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 2}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 3}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 4}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 5}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 6}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 7}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 8}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 9}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 10}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 11}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 12}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 13}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 14}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 15}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 16}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 17}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 18}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 19}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 20}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 21}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 22}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 23}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 24}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 25}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 26}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 27}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 28}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 29}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 30}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 31}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 32}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 33}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 34}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 35}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 36}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 37}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 38}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 39}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 40}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 41}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 42}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 43}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 44}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 45}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 46}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 47}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 48}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 49}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/hover", "params": {"textDocument": {"uri": "file:///fuzz_sessions/cancel_burst.sv"}, "position": {"line": 2, "character": 9}}, "id": 50}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 1}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 3}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 4}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 5}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 6}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 7}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 8}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 9}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 10}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 11}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 12}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 13}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 14}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 15}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 16}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 17}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 18}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 19}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 20}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 21}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 22}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 23}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 24}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 25}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 26}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 27}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 28}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 29}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 30}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 31}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 32}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 33}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 34}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 35}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 36}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 37}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 38}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 39}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 40}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 41}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 42}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 43}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 44}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 45}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 46}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 47}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 48}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 49}}}
+{"send": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 50}}}

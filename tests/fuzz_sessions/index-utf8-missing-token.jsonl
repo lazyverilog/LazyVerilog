@@ -1,0 +1,6 @@
+{"note": "documentSymbol detail cut a UTF-8 sequence in half after a missing `]` (fix: node_text_raw spans written tokens only)"}
+{"send": {"jsonrpc": "2.0", "method": "initialize", "params": {"processId": null, "rootUri": null, "capabilities": {}}, "id": 0}}
+{"send": {"jsonrpc": "2.0", "method": "initialized", "params": {}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///fuzz_sessions/utf8_port.sv", "languageId": "systemverilog", "version": 1, "text": "module top(\n    output logic [W-1\u00e9Ne9:0] data_o\n);\nendmodule\n"}}}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/formatting", "params": {"textDocument": {"uri": "file:///fuzz_sessions/utf8_port.sv"}, "options": {"tabSize": 4, "insertSpaces": true}}, "id": 1}}
+{"send": {"jsonrpc": "2.0", "method": "textDocument/documentSymbol", "params": {"textDocument": {"uri": "file:///fuzz_sessions/utf8_port.sv"}}, "id": 2}}

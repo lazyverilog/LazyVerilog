@@ -28,6 +28,14 @@ inline int lsp_column(const slang::SourceManager& sm, slang::SourceLocation loca
     if (!location.valid())
         return 0;
 
+    // A missing keyword token keeps its keyword as raw text, so the end of a
+    // range closed by one at EOF lies past the buffer; getColumnNumber() would
+    // read beyond it.  The end of the text (slang's trailing NUL) is where that
+    // range really ends.
+    const std::string_view buffer = sm.getSourceText(location.buffer());
+    if (!buffer.empty() && location.offset() >= buffer.size())
+        location = slang::SourceLocation(location.buffer(), buffer.size() - 1);
+
     const size_t byte_col = sm.getColumnNumber(location);
     if (byte_col <= 1)
         return 0;
@@ -44,7 +52,6 @@ inline int lsp_column(const slang::SourceManager& sm, slang::SourceLocation loca
     if (bytes_into_line > offset)
         return static_cast<int>(bytes_into_line);
 
-    const std::string_view buffer = sm.getSourceText(location.buffer());
     if (buffer.empty() || offset > buffer.size())
         return static_cast<int>(bytes_into_line);
 

@@ -21,103 +21,18 @@ Examples
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import statistics
 import subprocess
-import threading
+import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # -I drops the script dir
+from lsp_client import Client  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = REPO_ROOT / "build" / "lazyverilog-lsp"
-
-
-def frame(obj: dict) -> bytes:
-    body = json.dumps(obj).encode()
-    return b"Content-Length: %d\r\n\r\n" % len(body) + body
-
-
-class Client:
-    """Minimal LSP client: framed JSON-RPC over the server's stdio."""
-
-    def __init__(self, cmd: list[str], cwd: str):
-        self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE)
-        self.next_id = 0
-        self.write_lock = threading.Lock()
-        self.responses = {}
-        self.notifications = []          # (arrival_time, method, params)
-        self.last_message = time.monotonic()
-        self.cv = threading.Condition()
-        threading.Thread(target=self._read_loop, daemon=True).start()
-
-    def _read_loop(self):
-        out = self.proc.stdout
-        while True:
-            header = b""
-            while not header.endswith(b"\r\n\r\n"):
-                ch = out.read(1)
-                if not ch:
-                    return
-                header += ch
-            fields = dict(line.split(b": ", 1)
-                          for line in header.strip().split(b"\r\n"))
-            body = out.read(int(fields[b"Content-Length"]))
-            arrived = time.monotonic()
-            try:
-                msg = json.loads(body)
-            except ValueError:
-                continue
-            with self.cv:
-                self.last_message = arrived
-                if "id" in msg and "method" not in msg:
-                    self.responses[msg["id"]] = (arrived, msg)
-                elif "method" in msg:
-                    self.notifications.append((arrived, msg["method"], msg.get("params")))
-                    if "id" in msg:      # server->client request, e.g. inlayHint/refresh
-                        self.send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
-                self.cv.notify_all()
-
-    def send(self, obj: dict):
-        with self.write_lock:
-            self.proc.stdin.write(frame(obj))
-            self.proc.stdin.flush()
-
-    def notify(self, method: str, params: dict):
-        self.send({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def request(self, method: str, params: dict, timeout: float = 60.0):
-        self.next_id += 1
-        rid = self.next_id
-        start = time.monotonic()
-        self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        with self.cv:
-            while rid not in self.responses:
-                if not self.cv.wait(timeout):
-                    raise TimeoutError(method)
-            arrived, msg = self.responses.pop(rid)
-        return (arrived - start) * 1000.0, msg
-
-    def wait_quiet(self, quiet: float, cap: float = 600.0) -> float:
-        """Wait until the server has said nothing for `quiet` seconds."""
-        start = time.monotonic()
-        while True:
-            with self.cv:
-                idle = time.monotonic() - self.last_message
-                if idle >= quiet or time.monotonic() - start > cap:
-                    return time.monotonic() - start
-                self.cv.wait(quiet - idle)
-
-    def wait_diagnostics(self, uri: str, after: float, timeout: float = 30.0) -> float:
-        with self.cv:
-            while True:
-                for arrived, method, params in self.notifications:
-                    if (arrived > after and method == "textDocument/publishDiagnostics"
-                            and params and params.get("uri") == uri):
-                        return (arrived - after) * 1000.0
-                if not self.cv.wait(timeout):
-                    return float("nan")
 
 
 def summarize(name: str, samples: list[float]):

@@ -1813,7 +1813,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         // `.p,` -- no parenthesised expression -- is shorthand
                         // for `.p(p)`, so the token means the instantiated
                         // module's port *and* the enclosing module's signal.
-                        const bool implicit = named->expr == nullptr;
+                        // `.p()` has no expression either, but leaves p unconnected.
+                        const bool implicit = !named->openParen;
                         add_ref(named->name,
                                 symbol_canonical("module_port", module_name, port_name),
                                 implicit ? RefForm::ImplicitPortName : RefForm::Plain);

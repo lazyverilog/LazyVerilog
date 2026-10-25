@@ -189,6 +189,50 @@ bool autoarg_on_save_after_edit(const fs::path& server_bin, const fs::path& work
     return !contains(reply, "module aa();") && contains(reply, "i_clk,");
 }
 
+/// A didChange for a document that was never opened must not open it.
+///
+/// The handler applied the change to "" and parsed the result, which installed
+/// a buffer of whatever the change happened to carry: it shadowed the file's
+/// shard until the file was really opened.  documentSymbol answers from that
+/// buffer, and the file is not on disk, so a module named in the reply is the ghost.
+///
+/// Returns whether the documentSymbol reply is free of the ghost module.
+bool change_without_open_is_ignored(const fs::path& server_bin, const fs::path& work) {
+    const std::string root_uri  = "file://" + (work / "").generic_string();
+    const std::string ghost_uri = "file://" + (work / "ghost.sv").generic_string();
+
+    const fs::path input = work / "ghost.jsonrpc";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"rootUri":")" + root_uri + R"(","capabilities":{}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didChange","params":{)"
+                     R"("textDocument":{"uri":")" + ghost_uri + R"(","version":2},)"
+                     R"("contentChanges":[{"text":"module   ghost_buffer;endmodule\n"}]}})");
+        // Formatting first: it waits for the parse in flight, so the
+        // documentSymbol behind it sees a ghost if one was made.
+        out << frame(R"({"jsonrpc":"2.0","id":49,"method":"textDocument/formatting","params":{)"
+                     R"("textDocument":{"uri":")" + ghost_uri + R"("},)"
+                     R"("options":{"tabSize":4,"insertSpaces":true}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":50,"method":"textDocument/documentSymbol","params":{)"
+                     R"("textDocument":{"uri":")" + ghost_uri + R"("}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    fs::remove(input);
+    expect(result.exit_code == 0, "the server exits cleanly after a change to an unopened file");
+    const auto at = result.stdout_text.find(R"("id":50)");
+    expect(at != std::string::npos, "documentSymbol for an unopened file is answered");
+    if (at == std::string::npos)
+        return false;
+    const auto next = result.stdout_text.find("Content-Length", at);
+    return !contains(result.stdout_text.substr(at, next == std::string::npos ? std::string::npos
+                                                                             : next - at),
+                     "ghost_buffer");
+}
+
 struct Case {
     int         id;
     std::string method;
@@ -289,6 +333,9 @@ int main(int argc, char** argv) {
     // AutoArg.
     expect(autoarg_on_save_after_edit(server_bin, work),
            "autoarg_on_save fills the port list for a save behind an edit");
+
+    expect(change_without_open_is_ignored(server_bin, work),
+           "a didChange for an unopened file does not create a buffer");
 
     fs::remove_all(work);
 

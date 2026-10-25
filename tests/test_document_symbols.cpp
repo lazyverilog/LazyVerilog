@@ -336,6 +336,31 @@ TEST_CASE("documentSymbol: a named generate block nests what it declares",
     CHECK(find_child(block_children, "u_sub") != nullptr);
 }
 
+// A module left open inside a generate block swallows the next module.  The
+// inner module starts with no blocks of its own, so the outer block it sits
+// in must not be taken as one of them.
+TEST_CASE("documentSymbol: a module nested inside an open generate block",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_nested_in_generate.sv";
+    analyzer.open(uri, "module outer;\n"
+                       "    if (1) begin : g_first\n"
+                       "    end\n"
+                       "    if (1) begin : g_open\n"
+                       "        logic a;\n"
+                       "module inner;\n"
+                       "    logic b;\n"
+                       "    if (1) begin : g_inner\n"
+                       "        logic c;\n"
+                       "    end\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* outer = find_child(result, "outer");
+    REQUIRE(outer != nullptr);
+    CHECK(find_child(children_of(*outer), "g_open") != nullptr);
+}
+
 // LSP splits the two ranges: `range` is the whole declaration, which is what
 // clients fold and show in breadcrumbs; `selectionRange` is the name they
 // reveal.  Reporting the name span as both collapses the outline to points.
@@ -517,4 +542,42 @@ TEST_CASE("documentSymbol: a generate-block declaration is reported once",
     REQUIRE(sig != nullptr);
     REQUIRE(sig->detail.has_value());
     CHECK(sig->detail->find("logic") != std::string::npos);
+}
+
+static bool is_valid_utf8(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        const size_t len = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        if (len == 0 || i + len > s.size())
+            return false;
+        for (size_t k = 1; k < len; ++k)
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80)
+                return false;
+        i += len;
+    }
+    return true;
+}
+
+// Found by tools/lsp_fuzz.py: a non-ASCII character typed into a packed
+// dimension came back cut in half, and the client could not decode the response.
+TEST_CASE("documentSymbol: a non-ASCII character in a port type stays whole",
+          "[documentSymbol]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/docsym_utf8_port.sv";
+    analyzer.open(uri, "module top(\n"
+                       "    output logic [W-1\xc3\xa9Ne9:0] data_o\n"
+                       ");\n"
+                       "endmodule\n");
+
+    auto result = provide_document_symbols(analyzer, make_params(uri));
+    const auto* top = find_child(result, "top");
+    REQUIRE(top != nullptr);
+    const auto children = children_of(*top);
+    // Recovery drops `éNe9:0] data_o`: the port is the one left with no name,
+    // and `]` is a missing token the parser inserted.
+    REQUIRE(children.size() == 1);
+    REQUIRE(children[0].detail.has_value());
+    INFO("detail: " << *children[0].detail);
+    CHECK(is_valid_utf8(*children[0].detail));
+    CHECK(*children[0].detail == "output logic [W-1");
 }

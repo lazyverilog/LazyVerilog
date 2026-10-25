@@ -8,6 +8,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 include(CTest)
 
+# -DLAZYVERILOG_SANITIZE=address,undefined: instrument every target, dependencies
+# included (set before FetchContent so they see it).  Used by the nightly fuzz job.
+set(LAZYVERILOG_SANITIZE "" CACHE STRING "Value for -fsanitize= on all targets (empty = off)")
+if(LAZYVERILOG_SANITIZE)
+    if(MSVC)
+        message(FATAL_ERROR "LAZYVERILOG_SANITIZE needs GCC or Clang")
+    endif()
+    # No recovery: a UBSan report must fail the test that hit it, not just print.
+    add_compile_options(-fsanitize=${LAZYVERILOG_SANITIZE} -fno-sanitize-recover=all
+                        -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${LAZYVERILOG_SANITIZE})
+endif()
+
 # ──────────────────────────────────────────────────────────────────────────────
 # LspCpp flags — MUST be set BEFORE FetchContent_MakeAvailable(LspCpp)
 # LSPCPP_STANDALONE_ASIO: use vendored asio (third_party/asio) instead of Boost
@@ -75,6 +88,35 @@ FetchContent_Declare(
     GIT_TAG        v10.0
 )
 FetchContent_MakeAvailable(slang)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch: slang v10.0 stringifies `"...`" through lexerStack.back(), which is
+# empty when a macro's argument list runs to the end of the input (`S(a<EOF>):
+# a read before the vector, and a crash on `define S(x) `"x`" followed by `S(a.
+# Upstream has since rewritten stringification to need no lexer.  Idempotent
+# after populate, like the LspCpp patches below; the helper is in cmake/slang/.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_pp_cpp "${slang_SOURCE_DIR}/source/parsing/Preprocessor_macros.cpp")
+set(_pp_call "Lexer::stringify(*lexerStack.back(), ")
+set(_pp_anchor "bool Preprocessor::applyMacroOps(")
+file(READ "${_pp_cpp}" _pp_content)
+string(FIND "${_pp_content}" "lazyverilogStringifyLexer" _pp_done)
+if(_pp_done EQUAL -1)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/stringify_lexer.cpp.in" _pp_insert)
+    string(REPLACE "${_pp_anchor}" "${_pp_insert}${_pp_anchor}" _pp_content "${_pp_content}")
+    string(REPLACE "${_pp_call}"
+           "Lexer::stringify(lazyverilogStringifyLexer(lexerStack, alloc, diagnostics, sourceManager, lexerOptions), "
+           _pp_content "${_pp_content}")
+    file(WRITE "${_pp_cpp}" "${_pp_content}")
+endif()
+string(FIND "${_pp_content}" "${_pp_call}" _pp_left)
+string(FIND "${_pp_content}" "static Lexer& lazyverilogStringifyLexer" _pp_ok)
+if(NOT _pp_left EQUAL -1 OR _pp_ok EQUAL -1)
+    message(FATAL_ERROR
+        "Could not patch slang's Preprocessor_macros.cpp stringify calls. The pinned slang "
+        "revision has probably moved; re-derive the patch (or drop it if upstream no longer "
+        "stringifies through lexerStack) before bumping GIT_TAG.")
+endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
@@ -320,6 +362,8 @@ set(LAZYVERILOG_SOURCES
     src/features/hover.cpp
     src/features/definition.cpp
     src/features/references.cpp
+    src/features/document_highlight.cpp
+    src/features/selection_range.cpp
     src/features/rename.cpp
     src/features/completion.cpp
     src/features/signature_help.cpp
@@ -385,6 +429,8 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_autoff.cpp
     tests/test_connect.cpp
     tests/test_references.cpp
+    tests/test_document_highlight.cpp
+    tests/test_selection_range.cpp
     tests/test_rename.cpp
     tests/test_definition.cpp
     tests/test_inlay_hints.cpp
@@ -392,6 +438,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_completion.cpp
     tests/test_folding_ranges.cpp
     tests/test_document_symbols.cpp
+    tests/test_invariants.cpp
     tests/test_opentitan_benchmark.cpp
     # Feature sources needed by tests (no LSP protocol dependency)
     src/features/completion.cpp
@@ -420,6 +467,8 @@ set(LAZYVERILOG_TEST_SOURCES
     src/features/connect.cpp
     src/features/inlay_hints.cpp
     src/features/references.cpp
+    src/features/document_highlight.cpp
+    src/features/selection_range.cpp
     src/features/rename.cpp
     src/features/hover.cpp
     src/features/signature_help.cpp
@@ -429,6 +478,7 @@ set(LAZYVERILOG_TEST_SOURCES
 )
 
 add_executable(lazyverilog-tests ${LAZYVERILOG_TEST_SOURCES})
+target_compile_definitions(lazyverilog-tests PRIVATE LAZYVERILOG_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_include_directories(lazyverilog-tests PRIVATE
     src
     tests
@@ -571,3 +621,41 @@ add_test(
             $<TARGET_FILE:lazyverilog-rtltree>
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# LSP session fuzzer (tools/lsp_fuzz.py, docs/dev/fuzzing.md).  --server is
+# split POSIX-style, so the binary path is single-quoted.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    # A sanitized server is several times slower: lazyverilog.lintAll compiles the
+    # whole project and outlasts the default 10 s reply timeout under ASan.
+    set(LAZYVERILOG_FUZZ_REPLY_TIMEOUT 10)
+    set(LAZYVERILOG_FUZZ_SMOKE_TIMEOUT 120)
+    if(LAZYVERILOG_SANITIZE)
+        set(LAZYVERILOG_FUZZ_REPLY_TIMEOUT 60)
+        set(LAZYVERILOG_FUZZ_SMOKE_TIMEOUT 300)
+    endif()
+    add_test(
+        NAME lsp-fuzz-unit
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lsp_fuzz.py
+    )
+    add_test(
+        NAME lsp-fuzz-smoke
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/lsp_fuzz.py
+                --server "'$<TARGET_FILE:lazyverilog-lsp>'"
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/tests/rtl/hpc60
+                --seed 1 --seconds 60
+                --reply-timeout ${LAZYVERILOG_FUZZ_REPLY_TIMEOUT}
+                --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-smoke
+    )
+    set_tests_properties(lsp-fuzz-smoke PROPERTIES TIMEOUT ${LAZYVERILOG_FUZZ_SMOKE_TIMEOUT})
+    file(GLOB LAZYVERILOG_FUZZ_SESSIONS CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz_sessions/*.jsonl)
+    add_test(
+        NAME lsp-fuzz-replay
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/lsp_fuzz.py
+                --server "'$<TARGET_FILE:lazyverilog-lsp>'"
+                --replay ${LAZYVERILOG_FUZZ_SESSIONS}
+                --reply-timeout ${LAZYVERILOG_FUZZ_REPLY_TIMEOUT}
+                --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay
+    )
+endif()

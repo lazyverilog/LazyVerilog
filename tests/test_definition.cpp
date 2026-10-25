@@ -2338,3 +2338,49 @@ TEST_CASE("definition: hover during an edit in flight still answers", "[definiti
 
     analyzer.set_parse_paused(false);
 }
+
+// Two register classes in the shape a UVM register model is generated in: each
+// embeds a covergroup with a `sample` method, declares a `sample` of its own,
+// and calls `rd_cg.sample(data)`.
+static const std::string kEmbeddedCovergroupFixture =
+    "class a_reg;\n"                                       // 0
+    "  covergroup rd_cg with function sample(int data);\n" // 1
+    "  endgroup\n"                                         // 2
+    "  function new();\n"                                  // 3
+    "    rd_cg = new();\n"                                 // 4
+    "  endfunction\n"                                      // 5
+    "  virtual function void sample(int data);\n"          // 6
+    "    rd_cg.sample(data);\n"                            // 7
+    "  endfunction\n"                                      // 8
+    "endclass\n"                                           // 9
+    "class b_reg;\n"                                       // 10
+    "  covergroup rd_cg with function sample(int data);\n" // 11
+    "  endgroup\n"                                         // 12
+    "  function new();\n"                                  // 13
+    "    rd_cg = new();\n"                                 // 14
+    "  endfunction\n"                                      // 15
+    "  virtual function void sample(int data);\n"          // 16
+    "    rd_cg.sample(data);\n"                            // 17
+    "  endfunction\n"                                      // 18
+    "endclass\n";
+
+TEST_CASE("definition: an embedded covergroup's sample() is its own, per class",
+          "[definition][covergroup]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_embedded_covergroup.sv";
+    analyzer.open(uri, kEmbeddedCovergroupFixture);
+
+    const auto at = [&](int line, int col) {
+        auto loc = analyzer.definition_of(uri, line, col);
+        REQUIRE(loc.has_value());
+        return std::make_pair(loc->line, loc->col);
+    };
+    // `rd_cg.sample` calls the covergroup's sample(), not the class's own.
+    CHECK(at(7, 10) == std::make_pair(1, 33));
+    CHECK(at(17, 10) == std::make_pair(11, 33));
+    // The receiver is the covergroup the class embeds.
+    CHECK(at(17, 4) == std::make_pair(11, 13));
+    // A declaration is its own definition, not the first same-named one.
+    CHECK(at(11, 33) == std::make_pair(11, 33));
+    CHECK(at(16, 24) == std::make_pair(16, 24));
+}

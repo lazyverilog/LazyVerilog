@@ -2,6 +2,8 @@
 
 #include "banner.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -25,7 +27,18 @@ int main(int argc, char* argv[]) {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-    LazyVerilogServer server;
-    server.run();
-    return 0;
+    {
+        LazyVerilogServer server;
+        server.run();
+    }
+    // Not `return`: exit() flushes every stdio stream, stdin included, and the
+    // transport's detached reader thread holds stdin's lock while it blocks in
+    // read().  With glibc's locking _IO_flush_all that waits until the client
+    // closes the pipe, so `exit` never ends the process.  Everything that had
+    // to finish was joined by ~LazyVerilogServer; flush what we wrote and go.
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
 }

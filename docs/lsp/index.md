@@ -8,6 +8,8 @@ Standard Language Server Protocol features. None of these need configuration exc
 | Go to definition | Jumps to the declaration |
 | Find references | All uses of a symbol, including macros (`` `WIDTH `` at its `` `define `` or any use) |
 | Rename | Renames a symbol across all references. Keywords cannot be renamed |
+| Document highlight | Marks every occurrence of the symbol under the cursor in the current file |
+| Selection range | Expands the selection step by step to each enclosing piece of syntax (smart selection) |
 | Completion | Context-aware suggestions; see [Completion](completion.md) |
 | Signature help | Parameters while typing a call or a `#(...)` list; triggers on `(` and `,` |
 | Workspace symbols | Case-insensitive substring search over modules and classes. Needs `[design].vcode` |
