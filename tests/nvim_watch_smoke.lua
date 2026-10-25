@@ -1,5 +1,7 @@
--- Headless Neovim smoke: the server's didChangeWatchedFiles registration
--- reaches a running watcher when started through the shipped plugin.
+-- Headless Neovim smoke: the shipped plugin names the opened file's git
+-- checkout as the workspace folder (not the working directory), adds the
+-- checkout of a buffer opened later, and the server's didChangeWatchedFiles
+-- registration reaches a watcher on each of them.
 --
 --   LAZYVERILOG_REPO=<repo> LAZYVERILOG_LSP=<lazyverilog-lsp> \
 --     nvim --headless -u NONE -i NONE -c "luafile tests/nvim_watch_smoke.lua"
@@ -29,14 +31,20 @@ local function main()
 		return function() end
 	end
 
-	local dir = vim.fn.tempname()
-	vim.fn.mkdir(dir, "p")
-	vim.fn.writefile({ "module top;", "endmodule" }, dir .. "/top.sv")
-	vim.cmd("cd " .. vim.fn.fnameescape(dir))
+	-- Two checkouts, and nvim started in neither: the workspace folder is the
+	-- opened file's checkout, not the working directory.
+	local base = vim.fn.tempname()
+	local a, b, elsewhere = base .. "/a", base .. "/b", base .. "/elsewhere"
+	for _, d in ipairs({ a .. "/.git", a .. "/rtl", b .. "/.git", elsewhere }) do
+		vim.fn.mkdir(d, "p")
+	end
+	vim.fn.writefile({ "module top;", "endmodule" }, a .. "/rtl/top.sv")
+	vim.fn.writefile({ "module other;", "endmodule" }, b .. "/other.sv")
+	vim.cmd("cd " .. vim.fn.fnameescape(elsewhere))
 
 	vim.opt.rtp:prepend(repo)
 	require("lazyverilog").setup({ cmd = server, inlay_hints = false, folding = false })
-	vim.cmd("edit " .. vim.fn.fnameescape(dir .. "/top.sv"))
+	vim.cmd("edit " .. vim.fn.fnameescape(a .. "/rtl/top.sv"))
 
 	local client
 	if not vim.wait(10000, function()
@@ -46,21 +54,50 @@ local function main()
 		return fail("no initialized lazyverilog client")
 	end
 
-	local folders = client.workspace_folders or {}
-	if #folders ~= 1 or folders[1].uri ~= vim.uri_from_fname(vim.fn.getcwd()) then
-		return fail("expected the working directory as the one workspace folder, got "
-			.. vim.inspect(folders))
+	local function folder_names()
+		return vim.tbl_map(function(f)
+			return vim.fs.normalize(vim.uri_to_fname(f.uri)):lower()
+		end, client.workspace_folders or {})
+	end
+	local want_a = vim.fs.normalize(a):lower()
+	local want_b = vim.fs.normalize(b):lower()
+	if not vim.deep_equal(folder_names(), { want_a }) then
+		return fail("expected the file's git checkout as the one workspace folder, got "
+			.. vim.inspect(folder_names()))
 	end
 
 	local dynamic = vim.tbl_get(client.capabilities, "workspace", "didChangeWatchedFiles",
 		"dynamicRegistration")
-	if not dynamic then
-		print("nvim-watch-smoke: skipped (this Neovim offers no dynamic watcher registration)")
-		return vim.cmd("qa!")
+	local function watching(dir)
+		for _, path in ipairs(watched) do
+			if vim.fs.normalize(path):lower() == dir then
+				return true
+			end
+		end
+		return false
+	end
+	-- Let the first registration land before the second checkout opens, so
+	-- the second watcher can only come from the server registering again.
+	if dynamic and not vim.wait(10000, function() return watching(want_a) end, 50) then
+		return fail("the server's file watcher registration started no watcher")
 	end
 
-	if not vim.wait(10000, function() return #watched > 0 end, 50) then
-		return fail("the server's file watcher registration started no watcher")
+	-- A buffer from a second checkout adds that checkout.
+	vim.cmd("edit " .. vim.fn.fnameescape(b .. "/other.sv"))
+	if not vim.wait(5000, function() return #folder_names() == 2 end, 50) then
+		return fail("the second checkout was not added, got " .. vim.inspect(folder_names()))
+	end
+	if folder_names()[2] ~= want_b then
+		return fail("expected " .. want_b .. " as the second folder, got "
+			.. vim.inspect(folder_names()))
+	end
+
+	if not dynamic then
+		print("nvim-watch-smoke: skipped watchers (this Neovim offers no dynamic watcher registration)")
+		return vim.cmd("qa!")
+	end
+	if not vim.wait(10000, function() return watching(want_b) end, 50) then
+		return fail("the second checkout is not watched: " .. vim.inspect(watched))
 	end
 
 	print("nvim-watch-smoke: ok (" .. #watched .. " watcher(s))")

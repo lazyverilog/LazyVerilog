@@ -553,6 +553,55 @@ local function _default_on_attach(cfg, client, bufnr)
 	_configure_completion_options(bufnr)
 end
 
+-- The git checkout holding @bufnr, as an LSP workspace folder list, or nil.
+--
+-- Neovim drops a server's didChangeWatchedFiles registration from a client
+-- that has no workspace folders (runtime/lua/vim/lsp/_watchfiles.lua), so
+-- without one an externally edited header or filelist went unnoticed for the
+-- whole session.  The checkout rather than the working directory: the server's
+-- implicitProject = "auto" takes a workspace folder as the project to index
+-- when there is no lazyverilog.toml, and the checkout is what "auto" means --
+-- the working directory is only where nvim happened to start.  No checkout,
+-- no folder, and the server falls back to its own rules.
+local function git_workspace_folder(bufnr)
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	if name == "" then
+		return nil
+	end
+	local git = vim.fs.find(".git", { path = vim.fs.dirname(name), upward = true })[1]
+	if not git then
+		return nil
+	end
+	local root = vim.fs.dirname(git)
+	-- A dotfiles repo in the home directory is no design, and watching it
+	-- would watch everything the user keeps there.
+	local home = vim.fs.normalize(vim.loop.os_homedir() or "")
+	local r = root
+	if vim.fn.has("win32") == 1 then
+		home, r = home:lower(), r:lower()
+	end
+	if home ~= "" and (home .. "/"):sub(1, #r + 1) == r .. "/" then
+		return nil
+	end
+	return { { uri = vim.uri_from_fname(root), name = root } }
+end
+
+-- A buffer from another checkout than the client started in adds that
+-- checkout as a workspace folder; the server then indexes it and registers its
+-- file watchers again, so the new folder is watched too.
+local function attach_workspace_folder(client, bufnr)
+	local folder = git_workspace_folder(bufnr)
+	if not folder or not client._add_workspace_folder then
+		return
+	end
+	for _, existing in ipairs(client.workspace_folders or {}) do
+		if existing.name == folder[1].name then
+			return
+		end
+	end
+	client:_add_workspace_folder(folder[1].name)
+end
+
 local function start_lsp(cfg, cmd, bufnr)
 	local ok, err = validate_cmd(cmd)
 	if not ok then
@@ -565,6 +614,7 @@ local function start_lsp(cfg, cmd, bufnr)
 	-- Wrap user on_attach with our defaults
 	local user_on_attach = cfg.on_attach
 	local function combined_on_attach(client, buf)
+		attach_workspace_folder(client, buf)
 		_default_on_attach(cfg, client, buf)
 		if user_on_attach then
 			user_on_attach(client, buf)
@@ -587,16 +637,10 @@ local function start_lsp(cfg, cmd, bufnr)
 		-- client whose root_dir matches, so with no root_dir every buffer (and
 		-- every autocmd that calls start) got a server process of its own.
 		--
-		-- The working directory as the one workspace folder, the way VS Code's
-		-- "Open Folder" names one.  It is not a root -- the server still
-		-- resolves every file's project itself -- but Neovim drops a server's
-		-- didChangeWatchedFiles registration from a client that has no
-		-- workspace folders (runtime/lua/vim/lsp/_watchfiles.lua), so without
-		-- it an externally edited header or filelist went unnoticed for the
-		-- whole session.
-		workspace_folders = {
-			{ uri = vim.uri_from_fname(vim.fn.getcwd()), name = vim.fn.getcwd() },
-		},
+		-- The buffer's git checkout as a workspace folder; see
+		-- git_workspace_folder() for why, and attach_workspace_folder() for
+		-- the checkouts of buffers opened later.
+		workspace_folders = git_workspace_folder(bufnr),
 		filetypes    = cfg.filetypes,
 		capabilities = cfg.capabilities,
 		on_attach    = combined_on_attach,
