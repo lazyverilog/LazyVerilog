@@ -598,11 +598,14 @@ LazyVerilogServer::~LazyVerilogServer() {
     // Each is bounded by ImplicitScanLimits::max_time, and one finishing now
     // sees `stopping_` and applies nothing.
     stopping_ = true;
+    // The entries stay: a running worker looks its own up when it finishes.
     std::vector<std::thread> scans;
     {
         std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
-        scans.swap(scan_threads_);
+        for (auto& [root, worker] : scan_workers_)
+            scans.push_back(std::move(worker.thread));
     }
+    std::cerr << "[lazyverilog] joining " << scans.size() << " implicit scan workers\n";
     for (auto& scan : scans)
         if (scan.joinable())
             scan.join();
@@ -936,8 +939,33 @@ void LazyVerilogServer::consider_implicit_root(const std::filesystem::path& root
     }
     if (auto info = root_resolver_->project_info(normalized); info && !info->implicit)
         return; // a lazyverilog.toml at or above it already makes it a project
-    scan_threads_.emplace_back([this, key, exclude = implicit_exclude_] {
-        apply_implicit_scan(key, scan_implicit_root(key, exclude));
+    // Join the workers that finished.  Each set `done` as its last act under
+    // this lock, so the join does not wait on anything.
+    for (auto it = scan_workers_.begin(); it != scan_workers_.end();) {
+        if (!it->second.done) {
+            ++it;
+            continue;
+        }
+        if (it->second.thread.joinable())
+            it->second.thread.join();
+        it = scan_workers_.erase(it);
+    }
+    if (auto running = scan_workers_.find(key); running != scan_workers_.end()) {
+        running->second.again = true; // it scans once more when this pass ends
+        return;
+    }
+    auto& worker = scan_workers_[key];
+    worker.thread = std::thread([this, key, exclude = implicit_exclude_] {
+        for (;;) {
+            apply_implicit_scan(key, scan_implicit_root(key, exclude));
+            std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+            auto& self = scan_workers_.at(key);
+            if (!self.again || stopping_) {
+                self.done = true;
+                return;
+            }
+            self.again = false;
+        }
     });
 }
 
