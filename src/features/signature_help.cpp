@@ -397,12 +397,39 @@ struct CrossFileLayers {
 
 static std::optional<std::vector<ParamInfo>> find_module_params(const CrossFileLayers& layers,
                                                                 const SyntaxTree& current_tree,
+                                                                std::string_view from_path,
                                                                 const std::string& name) {
     if (auto found = module_params_from_tree(current_tree, name))
         return found;
-    if (layers.project)
-        return module_params_from_snapshot(*layers.project, name);
-    return std::nullopt;
+    if (layers.project) {
+        if (auto found = module_params_from_snapshot(*layers.project, name))
+            return found;
+    }
+    // Then the open buffers, for a module no filelist carries (no
+    // lazyverilog.toml, or a file not yet in the .f).  Nearest first, ties by
+    // path, because the shards arrive in hash order.
+    if (!layers.opened)
+        return std::nullopt;
+    const ModuleEntry* best = nullptr;
+    PathProximityScore best_score;
+    std::string_view best_path;
+    for (const auto& shard : *layers.opened) {
+        if (!shard.index || !shard.state)
+            continue;
+        const std::string_view path = shard.state->normalized_path;
+        for (const auto& module : shard.index->modules) {
+            if (module.name != name)
+                continue;
+            const auto score = path_proximity_score(from_path, path);
+            if (!best || score > best_score || (score == best_score && path < best_path)) {
+                best = &module;
+                best_score = score;
+                best_path = path;
+            }
+            break;
+        }
+    }
+    return best ? module_params_from_module(*best) : std::nullopt;
 }
 
 // ── Subroutines declared outside the current document ────────────────────────
@@ -809,7 +836,8 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
     const auto layers = CrossFileLayers::gather(analyzer, params.textDocument.uri.raw_uri_);
 
     if (ctx->is_module_param) {
-        auto params_info = find_module_params(layers, *state->tree, ctx->name);
+        auto params_info =
+            find_module_params(layers, *state->tree, state->normalized_path, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;
@@ -876,7 +904,8 @@ std::optional<lsSignatureHelp> provide_signature_help(const Analyzer& analyzer,
     }
 
     if (!subroutine) {
-        auto params_info = find_module_params(layers, *state->tree, ctx->name);
+        auto params_info =
+            find_module_params(layers, *state->tree, state->normalized_path, ctx->name);
         if (!params_info)
             return std::nullopt;
         std::vector<std::string> labels;

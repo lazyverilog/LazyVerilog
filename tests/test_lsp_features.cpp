@@ -82,6 +82,23 @@ endmodule
     CHECK(hover->contents.second->value.find("input logic [3:0]") != std::string::npos);
 }
 
+TEST_CASE("hover: a module declared only in another open buffer is described", "[hover]") {
+    Analyzer analyzer;
+    const std::string sub_uri = "file:///tmp/lazyverilog_hover_open/sub.sv";
+    const std::string top_uri = "file:///tmp/lazyverilog_hover_open/top.sv";
+    analyzer.open(sub_uri, "module sub #(parameter int W = 4) (input logic clk);\nendmodule\n");
+    analyzer.open(top_uri, "module top(input logic clk);\n  sub #(.W(8)) u_sub(.clk(clk));\nendmodule\n");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = top_uri;
+    params.position = lsPosition(1, 3);
+
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value.find("sub") != std::string::npos);
+}
+
 TEST_CASE("hover: includes unpacked dimensions on ports", "[hover]") {
     Analyzer analyzer;
     const std::string uri = "file:///tmp/hover_port_dimensions.sv";
@@ -876,6 +893,24 @@ endmodule
     REQUIRE(parameter_hover->contents.second.has_value());
     CHECK(parameter_hover->contents.second->value ==
           "**DEPTH** — *parameter*\n\n---\n\n```\nint = 8\n```");
+}
+
+TEST_CASE("signature help: module parameters come from another open buffer", "[signature]") {
+    Analyzer analyzer;
+    const std::string sub_uri = "file:///tmp/lazyverilog_sig_open/sub.sv";
+    const std::string top_uri = "file:///tmp/lazyverilog_sig_open/top.sv";
+    analyzer.open(sub_uri, "module sub #(parameter int W = 4) (input logic clk);\nendmodule\n");
+    analyzer.open(top_uri, "module top;\n  sub #(\nendmodule\n");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = top_uri;
+    params.position = lsPosition(1, 8);
+
+    auto help = provide_signature_help(analyzer, params);
+    REQUIRE(help.has_value());
+    REQUIRE(help->signatures.size() == 1);
+    CHECK(help->signatures[0].label.rfind("module sub #(", 0) == 0);
+    CHECK(help->signatures[0].label.find("W") != std::string::npos);
 }
 
 TEST_CASE("signature help: returns function argument labels and active parameter", "[signature]") {

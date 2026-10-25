@@ -1210,7 +1210,11 @@ void Analyzer::set_parse_paused(bool paused) {
 void Analyzer::parse_worker_loop() {
     // Live shards whose owning buffer has been reparsed but whose rebuild is
     // waiting for the typing to stop.  See the deferral note below.
-    std::unordered_map<std::string, std::shared_ptr<const DocumentState>> deferred_shards;
+    // Each committed state, and whether it is a filelist entry.  A listed file's
+    // shard replaces its filelist shard; an unlisted buffer's is built only so
+    // that ranked_extra_files() finds it already cached.
+    std::unordered_map<std::string, std::pair<std::shared_ptr<const DocumentState>, bool>>
+        deferred_shards;
     // Reparsed buffers whose includers still have to be told, waiting for the
     // same moment.  See the fanout note below.
     std::unordered_set<std::string> deferred_dependents;
@@ -1248,7 +1252,12 @@ void Analyzer::parse_worker_loop() {
         if (!have_job) {
             // The queue stayed empty for kLiveShardIdleDelay, so the user has
             // stopped typing and the deferred shards are worth building.
-            for (auto& [shard_uri, shard_state] : deferred_shards) {
+            for (auto& [shard_uri, deferred] : deferred_shards) {
+                const auto& [shard_state, listed] = deferred;
+                if (!listed) {
+                    get_dynamic_index(*shard_state);
+                    continue;
+                }
                 auto index = get_dynamic_index(*shard_state);
                 std::lock_guard<std::mutex> lock(map_mutex_);
                 if (const auto it = docs_.find(shard_uri);
@@ -1348,8 +1357,7 @@ void Analyzer::parse_worker_loop() {
             // instead of one per character.  The cost of that is a shard which
             // trails the buffer by up to one delay after the last keystroke;
             // nothing that answers for the current file reads it.
-            if (listed_extra)
-                deferred_shards[job.uri] = state;
+            deferred_shards[job.uri] = {state, listed_extra};
             deferred_dependents.insert(job.uri);
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
@@ -8188,7 +8196,58 @@ Analyzer::extra_file_snapshot_ptr() const {
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const DocumentState& state) const {
-    return ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state.normalized_path));
+    auto ranked =
+        ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state.normalized_path));
+
+    // Open buffers no filelist carries are candidates too, after every shard:
+    // with no lazyverilog.toml that is every buffer, and with one it is a new
+    // file not yet in the .f.  Without them go-to-definition between two open
+    // buffers answered nothing while references between the same two worked.
+    // Each one's index is the open-buffer shard its DocumentState caches (the
+    // one opened_file_index_shards() hands out, and the parse worker builds
+    // once typing stops), and the last parsed snapshot stands in for a buffer
+    // whose reparse is still running.
+    std::vector<std::shared_ptr<const DocumentState>> unlisted;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        for (const auto& [uri, doc] : docs_) {
+            if (!doc || uri == state.uri || extra_cache_.contains(uri) ||
+                background_header_shards_.contains(uri))
+                continue;
+            if (auto parsed = doc->tree ? doc : doc->previous_parsed)
+                unlisted.push_back(std::move(parsed));
+        }
+    }
+    if (unlisted.empty())
+        return ranked;
+
+    struct Candidates {
+        std::shared_ptr<const std::vector<const ExtraFileInfo*>> listed;
+        std::vector<ExtraFileInfo> open;
+        std::vector<const ExtraFileInfo*> ranked;
+    };
+    auto out = std::make_shared<Candidates>();
+    out->listed = ranked;
+    // By path first, because docs_ is unordered and by_path_proximity() keeps
+    // ties in arrival order.
+    std::sort(unlisted.begin(), unlisted.end(),
+              [](const auto& a, const auto& b) { return a->normalized_path < b->normalized_path; });
+    out->open.reserve(unlisted.size());
+    for (auto& doc : unlisted) {
+        const SyntaxIndex* index = &get_dynamic_index(*doc);
+        out->open.push_back(ExtraFileInfo{
+            .path = doc->normalized_path,
+            .uri = doc->uri,
+            .state = doc,
+            .index = std::shared_ptr<const SyntaxIndex>(doc, index),
+        });
+    }
+    out->ranked.reserve(ranked->size() + out->open.size());
+    out->ranked.assign(ranked->begin(), ranked->end());
+    for (const auto* info :
+         by_path_proximity(std::span<const ExtraFileInfo>(out->open), state.normalized_path))
+        out->ranked.push_back(info);
+    return std::shared_ptr<const std::vector<const ExtraFileInfo*>>(out, &out->ranked);
 }
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
