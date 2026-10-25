@@ -720,9 +720,11 @@ std::set<std::string> shard_classes(const Analyzer& analyzer, const std::string&
     return names;
 }
 
-// 512 classes either way, so the tree being walked is the same size in both
-// halves and only the fragment count differs.
-constexpr int kFragmentClasses = 512;
+// The same class count either way, so the tree being walked is the same size
+// in both halves and only the fragment count differs.  Large enough that the
+// shared walk dominates the per-fragment cost: at 512 the healthy ratio was
+// 1.84 and crossed 2.0 under full-suite load; at 2048 it is about 1.25.
+constexpr int kFragmentClasses = 2048;
 constexpr int kFewFragments = 8;
 constexpr int kManyFragments = 32;
 // Same reasoning as kProjectionRuns: both halves are reduced to their fastest
