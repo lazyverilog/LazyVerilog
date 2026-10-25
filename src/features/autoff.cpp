@@ -2,6 +2,8 @@
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <algorithm>
 
@@ -326,25 +328,33 @@ static std::pair<std::vector<AutoffEdit>, int> build_ff_edits(
 
 // ── Regex cache ───────────────────────────────────────────────────────────────
 
-// Cache the last compiled register regex per thread.  AutoFF commands are
-// invoked repeatedly with the same pattern; avoid recompiling on each call.
-static const std::regex* cached_register_regex(const std::string& pattern,
-                                                std::string& error_out) {
-    thread_local std::string cached_pattern;
-    thread_local std::optional<std::regex> cached_re;
-    if (pattern != cached_pattern) {
-        cached_pattern = pattern;
-        try {
-            cached_re = std::regex(pattern);
-        } catch (...) {
-            cached_re = std::nullopt;
+// Cache the last compiled register regex.  AutoFF commands are invoked
+// repeatedly with the same pattern; avoid recompiling on each call.
+//
+// Process-wide, not thread_local: MinGW's emulated TLS frees a thread's storage
+// before running its thread_local destructors, so a cached std::regex was
+// destroyed from freed memory whenever the thread that used it exited.
+static std::shared_ptr<const std::regex> cached_register_regex(const std::string& pattern,
+                                                               std::string& error_out) {
+    static std::mutex mutex;
+    static std::string cached_pattern;
+    static std::shared_ptr<const std::regex> cached_re;
+    std::shared_ptr<const std::regex> re;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pattern != cached_pattern) {
+            cached_pattern = pattern;
+            try {
+                cached_re = std::make_shared<const std::regex>(pattern);
+            } catch (...) {
+                cached_re = nullptr;
+            }
         }
+        re = cached_re;
     }
-    if (!cached_re) {
+    if (!re)
         error_out = "AutoFF: invalid register_pattern '" + pattern + "'";
-        return nullptr;
-    }
-    return &*cached_re;
+    return re;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -357,7 +367,7 @@ AutoffResult autoff(const DocumentState& state, int cursor_line, const std::stri
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    const auto reg_re_ptr = cached_register_regex(pat, result.error);
     if (!reg_re_ptr) {
         result.has_error = true;
         return result;
@@ -419,7 +429,7 @@ AutoffResult autoff_all(const DocumentState& state, const std::string& register_
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    const auto reg_re_ptr = cached_register_regex(pat, result.error);
     if (!reg_re_ptr) {
         result.has_error = true;
         return result;
@@ -478,7 +488,7 @@ AutoffResult preview_autoff(const DocumentState& state, int cursor_line, const s
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    const auto reg_re_ptr = cached_register_regex(pat, result.error);
     if (!reg_re_ptr) {
         result.has_error = true;
         return result;
@@ -546,7 +556,7 @@ AutoffResult preview_autoff_all(const DocumentState& state, const std::string& r
         return result;
     }
     std::string pat = register_pattern.empty() ? DEFAULT_REGISTER_PATTERN : register_pattern;
-    const std::regex* reg_re_ptr = cached_register_regex(pat, result.error);
+    const auto reg_re_ptr = cached_register_regex(pat, result.error);
     if (!reg_re_ptr) {
         result.has_error = true;
         return result;

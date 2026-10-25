@@ -40,6 +40,15 @@ void expect(bool condition, const std::string& what) {
     }
 }
 
+/// A nonzero exit says nothing on its own, so the code and the server's own
+/// stderr go into the failure.
+void expect_clean_exit(const cli_process::CommandResult& result, const std::string& what) {
+    expect(result.exit_code == 0, what);
+    if (result.exit_code != 0)
+        std::cerr << "  exit code " << result.exit_code << ", server stderr:\n"
+                  << result.stderr_text << "\n";
+}
+
 std::string frame(const std::string& body) {
     return "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
 }
@@ -69,7 +78,7 @@ std::string initialize_with_root(const fs::path& server_bin, const std::string& 
 
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
-    expect(result.exit_code == 0, "the server exits cleanly after an initialize");
+    expect_clean_exit(result, "the server exits cleanly after an initialize");
     return result.stdout_text;
 }
 
@@ -110,7 +119,7 @@ std::string folds_for_uri(const fs::path& server_bin, const std::string& root_ur
     // down under a worker still holding the reply dies here instead of merely
     // going quiet, which is how it stayed invisible on one runner while the
     // stdout checks below passed anyway.
-    expect(result.exit_code == 0, "the server exits cleanly after a deferred fold request");
+    expect_clean_exit(result, "the server exits cleanly after a deferred fold request");
     return result.stdout_text;
 }
 
@@ -163,7 +172,7 @@ std::string format_two_projects(const fs::path& server_bin, const std::string& u
     }
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
-    expect(result.exit_code == 0, "the server exits cleanly after two formatting requests");
+    expect_clean_exit(result, "the server exits cleanly after two formatting requests");
     return result.stdout_text;
 }
 
@@ -209,7 +218,7 @@ std::string lint_all_after_config_save(const fs::path& server_bin, const std::st
     }
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
-    expect(result.exit_code == 0, "the server exits cleanly after a project-wide lint");
+    expect_clean_exit(result, "the server exits cleanly after a project-wide lint");
     return result.stdout_text;
 }
 
@@ -253,7 +262,7 @@ std::string registered_file_watchers(const fs::path& server_bin) {
     }
     const auto result = run_command(server_bin, "< " + shell_quote(input));
     fs::remove(input);
-    expect(result.exit_code == 0, "the server exits cleanly after registering watchers");
+    expect_clean_exit(result, "the server exits cleanly after registering watchers");
     return result.stdout_text;
 }
 

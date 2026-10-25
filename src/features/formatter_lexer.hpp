@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string_view>
 #include <unordered_map>
@@ -34,14 +35,15 @@ inline FormatMarkerRegex cached_format_marker_regex(const std::string& pattern) 
     // compiled regexes and invalid/empty patterns (stored as nullptr) so repeated
     // calls with the common default patterns do not repeatedly recompile.
     //
-    // Keep the cache thread-local instead of guarding one process-wide map with
-    // a mutex.  Formatting is naturally per-request/per-buffer work, and cached
-    // regex values are immutable shared_ptr<const std::regex> after creation.
-    // A global mutex would serialize unrelated concurrent format requests even
-    // on pure cache hits.  The tradeoff here is intentional: each long-lived LSP
-    // worker thread may compile a pattern once, but after that it formats
-    // without cross-thread synchronization.
-    thread_local std::unordered_map<std::string, FormatMarkerRegex> cache;
+    // One process-wide map under a mutex, held only for the lookup: the cached
+    // regexes are immutable shared_ptr<const std::regex>, so matching runs
+    // unlocked.  It was thread_local, which MinGW's emulated TLS breaks: a
+    // thread's storage is freed before its thread_local destructors run, so
+    // every exiting worker destroyed this map from freed memory (heap
+    // corruption at server exit).
+    static std::mutex mutex;
+    static std::unordered_map<std::string, FormatMarkerRegex> cache;
+    std::lock_guard<std::mutex> lock(mutex);
 
     auto it = cache.find(pattern);
     if (it != cache.end())
