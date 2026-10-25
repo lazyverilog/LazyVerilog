@@ -621,7 +621,14 @@ double fastest_preview_ms(int declarations, int runs) {
 TEST_CASE("connect: preview cost is linear in declaration count", "[connect][scaling]") {
     constexpr int kSmall = 250;
     constexpr int kLarge = 1000; // 4x the declarations, and ~4x the file
-    constexpr int kRuns = 7;
+    // A sample is only 0.16 / 0.6 ms, so a loaded `ctest -j4` once measured
+    // 0.16 / 0.96 ms = 6.1 against the 8.0 limit: seven samples of the large
+    // half were not enough for one to dodge the stalls.  Twenty-one cost
+    // ~15 ms more.  Growing the input instead does not help here: at
+    // 1000 -> 4000 the healthy ratio rose to ~4.5 (cache) and a heavily loaded
+    // run reached 8.9, while 21 runs at this size stayed under 5.0 in the
+    // same 40 loaded runs.
+    constexpr int kRuns = 21;
 
     (void)fastest_preview_ms(kSmall, 2); // warm the allocator
 

@@ -1301,7 +1301,14 @@ static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
 
 TEST_CASE("foldingRange: cost grows with the file, not with its square",
           "[folding][scaling]") {
-    constexpr int kStages = 240;
+    // Linear is 2.0 at any size, so a larger input cannot lower the healthy
+    // ratio; what it lowers is the share of a sample one scheduler stall
+    // takes.  At 240 stages a sample was 5.5 / 11 ms, and under a loaded
+    // `ctest -j4` a stall of ~6.6 ms on the large half alone measured
+    // 5.8 / 17.5 ms = 3.01.  At 960 stages a sample is 21 / 43 ms: the same
+    // stall gives (43 + 6.6) / 21 = 2.3, while the quadratic term this guards
+    // against only grows with the input (3.5 at 240 stages, toward 4.0).
+    constexpr int kStages = 960;
     constexpr int kRuns   = 5;
 
     size_t small_folds = 0;
@@ -1331,8 +1338,8 @@ TEST_CASE("foldingRange: cost grows with the file, not with its square",
 }
 
 TEST_CASE("foldingRange: cost stays linear at large fold counts", "[folding][scaling]") {
-    // The guard above compares 3k folds against 6k, and a quadratic term can hide
-    // under a 3.0 threshold at that size: the header-partner pass measured 2.5 /
+    // The guard above compares 12k folds against 25k (3k against 6k when this
+    // was written), and a quadratic term can hide under a 3.0 threshold there: the header-partner pass measured 2.5 /
     // 2.9 / 2.8 across the first three doublings and only broke out on the fourth,
     // at 5.86x.  A file that large is not hypothetical -- a generated register
     // block reaches it -- and 903 ms landed on the one thread that answers
