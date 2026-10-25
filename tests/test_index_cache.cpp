@@ -406,6 +406,59 @@ TEST_CASE("index cache: store and load through the filesystem", "[index-cache]")
     CHECK(std::filesystem::exists(cache->directory() / ".gitignore"));
 }
 
+#ifdef _WIN32
+TEST_CASE("index cache: a project deeper than MAX_PATH still stores and loads shards",
+          "[index-cache]") {
+    // Without the long-path prefix every shard write in such a tree failed
+    // quietly and every launch reparsed the whole project.
+    namespace fs = std::filesystem;
+    // A root that can still be created the ordinary way, whose cache directory
+    // (25 characters deeper) and shards cannot.
+    const auto start = fs::absolute(fs::temp_directory_path() / "lazyverilog-cache-long-path");
+    REQUIRE(start.native().size() < 200);
+    const auto root = start / std::string(234 - start.native().size(), 'd');
+    REQUIRE(root.native().size() == 235);
+
+    // libstdc++'s remove_all() never returns on a tree past MAX_PATH, so the
+    // long directory is renamed short first -- before the test as well, in
+    // case an earlier run died part way.
+    struct ShortenOnExit {
+        fs::path root;
+        void operator()() const {
+            std::error_code ec;
+            fs::rename(root, root.parent_path() / "x", ec);
+        }
+        ~ShortenOnExit() { (*this)(); }
+    };
+    ShortenOnExit{root}();
+    TempDir base("long-path");
+    // Destroyed before `base`, whatever REQUIRE ends the test.
+    ShortenOnExit shorten{root};
+    REQUIRE(fs::absolute(base.path()) == start);
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    REQUIRE_FALSE(ec);
+    const auto file = base.write("design.sv", kSource);
+    const auto original = build_index(file);
+
+    auto cache = IndexCache::open(root);
+    REQUIRE(cache.has_value());
+    REQUIRE(cache->directory().native().size() >= 260);
+
+    const std::string uri = "file:///project/a_design_file_with_a_long_name.sv";
+    CHECK(!cache->load(uri).has_value());
+    cache->store(uri, some_key(), original);
+    const auto loaded = cache->load(uri);
+    REQUIRE(loaded.has_value());
+    require_same_index(original, loaded->index);
+
+    // Past MAX_PATH the directory cannot be listed reliably, so it is not
+    // swept at all rather than swept wrong.
+    CHECK(cache->prune_missing_sources({}) == 0);
+    CHECK(cache->load(uri).has_value());
+}
+#endif
+
 TEST_CASE("index cache: a rewritten shard replaces the previous one", "[index-cache]") {
     TempDir dir("rewrite");
     auto cache = IndexCache::open(dir.path());

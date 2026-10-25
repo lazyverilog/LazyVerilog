@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <random>
 #include <system_error>
 #include <unordered_map>
@@ -746,6 +747,70 @@ static_assert(sizeof(ReferenceEntry) == 104, "ReferenceEntry changed: update cod
 static_assert(sizeof(SyntaxIndex) == 800, "SyntaxIndex changed: update codec + kFormatVersion");
 #endif
 
+/// @p path in a spelling the OS will open even when it is long.
+///
+/// Windows refuses a path of MAX_PATH (260) characters or more unless it
+/// carries the `\\?\` prefix, and an RTL tree a few vendor directories deep
+/// gets there: the shard name alone is the basename plus 37 characters, and a
+/// write goes through a temporary 37 characters longer still.  @p reserve is
+/// what the caller will append.  Elsewhere the path is returned unchanged.
+fs::path openable_path(const fs::path& path, size_t reserve = 0) {
+#ifdef _WIN32
+    constexpr size_t kMaxPath = 260;
+    const auto& native = path.native();
+    if (native.size() + reserve < kMaxPath || native.starts_with(L"\\\\"))
+        return path; // shortcut: UNC paths keep the limit, upgrade if a user hits it
+    std::error_code ec;
+    auto absolute = fs::absolute(path, ec);
+    if (ec)
+        return path;
+    return fs::path(L"\\\\?\\" + absolute.lexically_normal().make_preferred().native());
+#else
+    (void)reserve;
+    return path;
+#endif
+}
+
+/// Said once per process: a cache that cannot write is not an error worth a
+/// line per file, but saying nothing left a project that reparsed itself on
+/// every launch with no hint why.
+void report_unwritable(std::string_view what, const fs::path& path) {
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true, std::memory_order_relaxed))
+        return;
+    std::cerr << "[lazyverilog] index cache: cannot " << what << ' ' << path.string()
+              << "; continuing without cached shards\n";
+}
+
+/// What a shard's temporary adds to its final path: '.', 32 hex digits, ".tmp".
+constexpr size_t kTempSuffixLength = 37;
+/// The longest name created inside a cache directory before the shard itself:
+/// ".gitignore".  Directory creation has its own, lower limit (248).
+constexpr size_t kDirectoryReserve = 12;
+
+/// fs::create_directories() for a directory that may be long.  libstdc++'s
+/// version stats every ancestor of a `\\?\` path, `\\?\C:` included, and that
+/// one fails, so on Windows each component is created on its own -- in a
+/// spelling openable_path() chose for that component's length.
+bool create_cache_directories(const fs::path& directory) {
+    std::error_code ec;
+#ifdef _WIN32
+    const auto absolute = fs::absolute(directory, ec);
+    if (ec)
+        return false;
+    fs::path built;
+    for (const auto& part : absolute) {
+        built /= part;
+        if (built == absolute.root_path() || built == absolute.root_name())
+            continue;
+        fs::create_directory(openable_path(built, kDirectoryReserve), ec);
+    }
+#else
+    fs::create_directories(directory, ec);
+#endif
+    return fs::is_directory(openable_path(directory, kDirectoryReserve), ec);
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -822,14 +887,15 @@ std::optional<IndexCache> IndexCache::open(const fs::path& project_root) {
         return std::nullopt;
 
     auto directory = directory_for(project_root);
-    std::error_code ec;
-    fs::create_directories(directory, ec);
-    if (ec || !fs::is_directory(directory, ec))
+    if (!create_cache_directories(directory)) {
+        report_unwritable("create", directory);
         return std::nullopt;
+    }
 
     // Same courtesy clangd extends: the cache lives inside the project, so it
     // would otherwise show up in `git status` for everyone who runs the server.
-    const auto ignore = directory / ".gitignore";
+    const auto ignore = openable_path(directory, kDirectoryReserve) / ".gitignore";
+    std::error_code ec;
     if (!fs::exists(ignore, ec)) {
         std::ofstream out(ignore, std::ios::binary);
         if (out)
@@ -844,10 +910,10 @@ std::optional<IndexCache> IndexCache::open_fallback() {
         return std::nullopt;
 
     auto directory = *base / "lazyverilog" / "index";
-    std::error_code ec;
-    fs::create_directories(directory, ec);
-    if (ec || !fs::is_directory(directory, ec))
+    if (!create_cache_directories(directory)) {
+        report_unwritable("create", directory);
         return std::nullopt;
+    }
 
     // No .gitignore here, unlike open(): this directory is the user's own cache
     // and is not inside anyone's repository.  Writing one would be litter in a
@@ -925,7 +991,8 @@ fs::path IndexCache::shard_path(std::string_view uri) const {
     std::snprintf(hex.data(), hex.size(), "%016llx%016llx",
                   static_cast<unsigned long long>(hash.lo),
                   static_cast<unsigned long long>(hash.hi));
-    return directory_ / (name + "." + std::string(hex.data()) + ".idx");
+    return openable_path(directory_ / (name + "." + std::string(hex.data()) + ".idx"),
+                         kTempSuffixLength);
 }
 
 std::optional<IndexCache::Loaded> IndexCache::load(std::string_view uri) const {
@@ -954,6 +1021,15 @@ size_t IndexCache::prune_missing_sources(const std::unordered_set<std::string>& 
     // removing the tree underneath -- threw std::filesystem_error out of a
     // thread function.  Advancing by hand keeps the whole sweep on the
     // "report, do not throw" side its every other step is already on.
+#ifdef _WIN32
+    // MinGW's directory iterator resolves its path into a MAX_PATH buffer and,
+    // past it, quietly lists the *current* directory instead -- `\\?\` or not.
+    // Sweeping that would be reading, and possibly deleting, the wrong files.
+    // shortcut: a cache this deep is never swept, upgrade to FindFirstFileW if
+    // stale shards there become a complaint.
+    if (openable_path(directory_, kDirectoryReserve) != directory_)
+        return 0;
+#endif
     std::error_code ec;
     size_t removed = 0;
     fs::directory_iterator it(directory_, ec);
@@ -1058,18 +1134,27 @@ void IndexCache::store(std::string_view uri, const Key& key, const SyntaxIndex& 
 
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-        if (!out)
+        if (!out) {
+            report_unwritable("write", temp_path);
             return;
+        }
         const auto bytes = serialize_index_shard(stored_key, index, stands_alone);
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-        if (!out)
+        if (!out) {
+            out.close();
+            std::error_code ec;
+            fs::remove(temp_path, ec);
+            report_unwritable("write", temp_path);
             return;
+        }
     }
 
     std::error_code ec;
     fs::rename(temp_path, final_path, ec);
-    if (ec)
+    if (ec) {
         fs::remove(temp_path, ec);
+        report_unwritable("publish", final_path);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
