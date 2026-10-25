@@ -224,7 +224,16 @@ class LazyVerilogServer {
     std::map<std::string, ImplicitScan> implicit_scans_;
     /// Directories whose VCS root `auto` mode has already looked for.
     std::set<std::string> vcs_checked_dirs_;
-    std::vector<std::thread> scan_threads_;
+    /// At most one scan worker per root.  A rescan that arrives while one runs
+    /// sets `again` instead of starting another; a finished worker sets `done`
+    /// and the next consider_implicit_root() joins and drops it, so repeated
+    /// `lazyverilog.rescan` does not pile up threads until shutdown.
+    struct ScanWorker {
+        std::thread thread;
+        bool again = false;
+        bool done = false;
+    };
+    std::map<std::string, ScanWorker> scan_workers_;
     std::atomic<bool> stopping_{false};
     /// Guards every project accumulator above.  They were the dispatch
     /// thread's alone until a scan worker started applying its result; the
