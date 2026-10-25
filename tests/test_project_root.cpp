@@ -1465,3 +1465,145 @@ TEST_CASE("a session with no registered project still compiles as one group",
     CHECK(snapshot.groups.front().files.size() == snapshot.files.size());
     CHECK(snapshot.files.size() >= 2);
 }
+
+// ── Implicit projects ────────────────────────────────────────────────────────
+//
+// A workspace folder or VCS checkout with no lazyverilog.toml, registered by
+// the server.  The resolver answers it only after the toml walk misses, so a
+// config anywhere at or above a file still decides.
+
+TEST_CASE("no implicit roots registered: no config anywhere above is still nullopt",
+          "[project-root]") {
+    TempTree tree("implicit-none");
+    auto source = tree.write("rtl/alu.sv", "module alu; endmodule\n");
+
+    ProjectRootResolver resolver;
+    resolver.set_implicit_roots({});
+    CHECK_FALSE(resolver.project_info(source).has_value());
+}
+
+TEST_CASE("an implicit root answers for a file with no config above it, marked implicit",
+          "[project-root]") {
+    TempTree tree("implicit-basic");
+    auto source = tree.write("rtl/core/alu.sv", "module alu; endmodule\n");
+    auto outside = fs::temp_directory_path() / "lazyverilog-project-root-implicit-elsewhere.sv";
+
+    ProjectRootResolver resolver;
+    resolver.set_implicit_roots({tree.root});
+
+    auto info = resolver.project_info(source, ProjectRootResolver::PathKind::File);
+    REQUIRE(info.has_value());
+    CHECK(info->source_root == tree.root);
+    CHECK(info->implicit);
+    CHECK_FALSE(resolver.project_info(outside, ProjectRootResolver::PathKind::File).has_value());
+}
+
+TEST_CASE("a lazyverilog.toml below an implicit root wins for files under it",
+          "[project-root]") {
+    TempTree tree("implicit-toml-below");
+    tree.write("chip/lazyverilog.toml", "[design]\n");
+    auto governed = tree.write("chip/rtl/a.sv", "module a; endmodule\n");
+    auto loose = tree.write("scratch/b.sv", "module b; endmodule\n");
+
+    ProjectRootResolver resolver;
+    resolver.set_implicit_roots({tree.root});
+
+    auto info = resolver.project_info(governed);
+    REQUIRE(info.has_value());
+    CHECK(info->source_root == tree.root / "chip");
+    CHECK_FALSE(info->implicit);
+
+    auto loose_info = resolver.project_info(loose);
+    REQUIRE(loose_info.has_value());
+    CHECK(loose_info->implicit);
+}
+
+TEST_CASE("the innermost of two nested workspace folders wins", "[project-root]") {
+    TempTree tree("implicit-nested");
+    auto inner_file = tree.write("ip/uart/rtl/uart.sv", "module uart; endmodule\n");
+    auto outer_file = tree.write("top/top.sv", "module top; endmodule\n");
+
+    ProjectRootResolver resolver;
+    // Given inner first: the answer must not depend on registration order.
+    resolver.set_implicit_roots({tree.root / "ip" / "uart", tree.root});
+
+    auto inner = resolver.project_info(inner_file);
+    REQUIRE(inner.has_value());
+    CHECK(inner->source_root == tree.root / "ip" / "uart");
+    auto outer = resolver.project_info(outer_file);
+    REQUIRE(outer.has_value());
+    CHECK(outer->source_root == tree.root);
+}
+
+TEST_CASE("the home directory and a filesystem root are refused as implicit roots",
+          "[project-root]") {
+    TempTree tree("implicit-refused");
+    CHECK(is_refused_implicit_root(tree.root.root_path()));
+    CHECK_FALSE(is_refused_implicit_root(tree.root));
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (home != nullptr && *home != '\0') {
+        CHECK(is_refused_implicit_root(home));
+        // Above the home directory holds everyone else's.
+        CHECK(is_refused_implicit_root(fs::path(home).parent_path()));
+    }
+    if (auto cache = user_cache_directory())
+        CHECK(is_refused_implicit_root(*cache / "lazyverilog" / "i"));
+}
+
+TEST_CASE("an implicit project's shards land in the user cache, never in the tree",
+          "[project-root][storage]") {
+    TempTree tree("implicit-storage");
+    auto source = tree.write("rtl/alu.sv", "module alu; endmodule\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    resolver->set_implicit_roots({tree.root});
+    IndexCacheStorage storage(resolver);
+    const IndexCache* cache = storage.for_uri(uri_from_path(source));
+
+    auto expected = IndexCache::implicit_directory_for(tree.root);
+    if (!expected) {
+        CHECK(cache == nullptr); // no user cache: uncached, as for no project
+        return;
+    }
+    REQUIRE(cache != nullptr);
+    CHECK(cache->directory() == *expected);
+    CHECK(expected->parent_path() == *user_cache_directory() / "lazyverilog" / "i");
+    CHECK(fs::is_regular_file(*expected / "root.txt"));
+    CHECK_FALSE(fs::exists(tree.root / ".cache"));
+    CHECK_FALSE(fs::exists(tree.root / "rtl" / ".cache"));
+    std::error_code ec;
+    fs::remove_all(*expected, ec);
+}
+
+TEST_CASE("a filelist entry inside an implicit root keeps the defaults",
+          "[project-root][parse-inputs]") {
+    // An explicit project elsewhere names a file that sits inside an implicit
+    // root.  It must keep parsing the way it did before implicit projects
+    // existed -- with the defaults, which carry the explicit project's define --
+    // and not with the implicit root's define-less inputs.
+    TempTree tree("implicit-explicit-entry");
+    tree.write("chip/lazyverilog.toml", "[design]\n");
+    auto listed = tree.write("shared/listed.sv",
+                             "`ifdef CHIP\nmodule m_listed; endmodule\n`endif\n");
+    auto unlisted = tree.write("shared/unlisted.sv",
+                               "`ifdef CHIP\nmodule m_unlisted; endmodule\n`endif\n");
+
+    auto resolver = std::make_shared<ProjectRootResolver>();
+    resolver->set_implicit_roots({tree.root / "shared"});
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(resolver);
+    analyzer.set_parse_inputs_for_root(tree.root / "shared", {}, {}, Analyzer::Reindex::Deferred);
+    analyzer.set_project_compilation_inputs({ProjectCompilationInputs{
+        .root = tree.root / "chip", .files = {listed.string()}, .background_compilation = false}});
+    analyzer.set_project_config({"CHIP"}, {}, {listed.string(), unlisted.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const auto names = indexed_module_names(analyzer);
+    CHECK(names.contains("m_listed"));
+    CHECK_FALSE(names.contains("m_unlisted"));
+}

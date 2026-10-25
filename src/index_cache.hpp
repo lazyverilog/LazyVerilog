@@ -126,6 +126,18 @@ public:
     /// directory is inside a repository.
     static std::optional<IndexCache> open_fallback();
 
+    /// Open the cache for the implicit project at @p root:
+    /// `user_cache_directory()/lazyverilog/i/<16 hex of the root>`, with the
+    /// root's path in a `root.txt` beside the shards for a human.  An implicit
+    /// project is a tree the user never configured, so nothing is written into
+    /// it; and one directory per root is what lets the server delete exactly
+    /// that root's shards once a lazyverilog.toml takes it over.  Short names,
+    /// because Windows paths stop at 260 characters.
+    static std::optional<IndexCache> open_implicit(const std::filesystem::path& root);
+    /// Where open_implicit() keeps @p root's shards, or nullopt with no user cache.
+    static std::optional<std::filesystem::path>
+    implicit_directory_for(const std::filesystem::path& root);
+
     /// Directory shards live in: `<project_root>/.cache/lazyverilog/index`.
     /// Mirrors clangd's `<project_root>/.cache/clangd/index`, including the
     /// `.gitignore` written beside them.

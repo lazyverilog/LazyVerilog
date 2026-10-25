@@ -2,6 +2,7 @@
 
 #include "string_utils.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 
 #ifdef _WIN32
@@ -41,12 +42,26 @@ std::optional<std::string> env_value(const char* name) {
 #endif
 }
 
+/// Whether @p path is @p root or lies under it.  Both normalized.
+bool path_is_within(const fs::path& path, const fs::path& root) {
+    return std::mismatch(root.begin(), root.end(), path.begin(), path.end()).first == root.end();
+}
+
 } // namespace
 
 void ProjectRootResolver::set_forced_root(fs::path directory) {
     std::lock_guard<std::mutex> lock(mutex_);
     forced_root_ = directory.empty() ? fs::path{} : normalize_filesystem_path(directory);
     directories_.clear();
+}
+
+void ProjectRootResolver::set_implicit_roots(std::vector<fs::path> roots) {
+    for (auto& root : roots)
+        root = normalize_filesystem_path(root);
+    std::sort(roots.begin(), roots.end());
+    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+    std::lock_guard<std::mutex> lock(mutex_);
+    implicit_roots_ = std::move(roots);
 }
 
 void ProjectRootResolver::invalidate() const {
@@ -123,6 +138,54 @@ std::optional<ProjectInfo> ProjectRootResolver::project_info(const fs::path& fil
     while (!dir.empty()) {
         if (directory_has_marker(dir))
             return ProjectInfo{dir};
+        auto parent = dir.parent_path();
+        if (parent == dir)
+            break;
+        dir = std::move(parent);
+    }
+
+    // No config anywhere above.  The innermost implicit root holding the file
+    // answers instead; sorted order puts a nested root after its parent.
+    std::lock_guard<std::mutex> lock(mutex_);
+    const fs::path* innermost = nullptr;
+    for (const auto& root : implicit_roots_) {
+        if (path_is_within(absolute, root))
+            innermost = &root;
+    }
+    if (innermost)
+        return ProjectInfo{*innermost, true};
+    return std::nullopt;
+}
+
+bool is_refused_implicit_root(const fs::path& root) {
+    const auto normalized = normalize_filesystem_path(root);
+    if (!normalized.has_relative_path())
+        return true;
+#ifdef _WIN32
+    const auto home = env_value("USERPROFILE");
+#else
+    const auto home = env_value("HOME");
+#endif
+    // The home directory and every directory above it: /home holds other
+    // people's homes, and C:\Users everyone's.
+    if (home && path_is_within(normalize_filesystem_path(*home), normalized))
+        return true;
+    // Our own shards.  Only that subdirectory, not the whole cache: on Windows
+    // the cache is %LOCALAPPDATA%, which also holds %TEMP%.
+    if (auto cache = user_cache_directory())
+        if (path_is_within(normalized, normalize_filesystem_path(*cache / "lazyverilog")))
+            return true;
+    return false;
+}
+
+std::optional<fs::path> find_vcs_root(const fs::path& directory) {
+    auto dir = normalize_filesystem_path(directory);
+    while (!dir.empty()) {
+        for (const char* marker : {".git", ".hg", ".svn"}) {
+            std::error_code ec;
+            if (fs::exists(dir / marker, ec) && !ec)
+                return dir;
+        }
         auto parent = dir.parent_path();
         if (parent == dir)
             break;

@@ -4,6 +4,7 @@
 #include <array>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 
 std::optional<PrepareRenameResult> prepare_rename(const Analyzer& analyzer,
@@ -74,12 +75,25 @@ std::optional<std::string_view> text_in_range(std::string_view text, const lsRan
 
 } // namespace
 
-lsWorkspaceEdit provide_rename(const Analyzer& analyzer, const TextDocumentRename::Params& params) {
+lsWorkspaceEdit provide_rename(const Analyzer& analyzer, const TextDocumentRename::Params& params,
+                               bool implicit_project) {
     lsWorkspaceEdit workspace_edit;
     auto ident = analyzer.identifier_at(params.textDocument.uri.raw_uri_, params.position.line,
                                         params.position.character);
     if (!ident || ident->name.empty())
         return workspace_edit;
+
+    // shortcut: keyed on the name alone, so a signal spelled like a duplicated
+    // module is refused too; resolve the declaration kind if users hit it.
+    if (implicit_project) {
+        if (auto index = analyzer.project_index_snapshot()) {
+            const auto dup = index->module_duplicates.find(ident->name);
+            if (dup != index->module_duplicates.end() && dup->second.size() > 1)
+                throw std::runtime_error(
+                    "`" + ident->name + "` is declared " + std::to_string(dup->second.size()) +
+                    " times in the implicit project; add a lazyverilog.toml to scope rename");
+        }
+    }
 
     auto refs = analyzer.find_references(params.textDocument.uri.raw_uri_, params.position.line,
                                          params.position.character, true);

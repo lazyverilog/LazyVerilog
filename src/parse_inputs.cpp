@@ -51,7 +51,8 @@ ProjectParseInputs::ProjectParseInputs(std::shared_ptr<const ProjectRootResolver
     : resolver_(std::move(resolver)) {}
 
 ProjectParseInputs::ProjectParseInputs(const ProjectParseInputs& other)
-    : resolver_(other.resolver_), defaults_(other.defaults_) {
+    : resolver_(other.resolver_), defaults_(other.defaults_),
+      explicit_files_(other.explicit_files_) {
     by_root_.reserve(other.by_root_.size());
     for (const auto& [root, inputs] : other.by_root_)
         by_root_.emplace(root, std::make_unique<ParseInputs>(*inputs));
@@ -67,9 +68,21 @@ void ProjectParseInputs::set_for_root(const fs::path& root, ParseInputs inputs) 
     by_root_[root.string()] = std::make_unique<ParseInputs>(std::move(inputs));
 }
 
+void ProjectParseInputs::set_explicit_files(
+    std::shared_ptr<const std::unordered_set<std::string>> files) {
+    explicit_files_ = std::move(files);
+}
+
 const ParseInputs& ProjectParseInputs::for_path(const fs::path& path) const {
     if (resolver_ && !by_root_.empty()) {
         if (auto info = resolver_->project_info(path, ProjectRootResolver::PathKind::File)) {
+            // A file some lazyverilog.toml's filelist names keeps parsing the way
+            // it did before implicit projects existed -- with the merged
+            // defaults, which carry that project's defines -- even when it sits
+            // inside an implicit root.
+            if (info->implicit && explicit_files_ &&
+                explicit_files_->contains(normalize_filesystem_path(path).string()))
+                return defaults_;
             auto it = by_root_.find(info->source_root.string());
             if (it != by_root_.end())
                 return *it->second;

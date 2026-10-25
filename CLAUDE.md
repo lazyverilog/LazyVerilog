@@ -29,7 +29,7 @@ ctest --test-dir build                     # all
 - Details: `docs/dev/startup-perf.md`, `docs/dev/edit-perf.md`, `PERF.md`.
 
 ## Project Roots (multi-project)
-- Server owns root resolution: `ProjectRootResolver` (`src/project_root.cpp`) walks up to nearest `lazyverilog.toml` (misses cached). No config ⇒ `nullopt`, never guess. Neovim plugin sends no `root_dir`/`root_markers`.
+- Server owns root resolution: `ProjectRootResolver` (`src/project_root.cpp`) walks up to nearest `lazyverilog.toml` (misses cached). No config and no implicit root ⇒ `nullopt`; implicit roots come only from client workspace folders / VCS root (`set_implicit_roots()`, consulted after the toml walk misses, innermost wins), never write into the tree (`IndexCache::open_implicit()` → user cache), never compile by default. Neovim plugin sends no `root_dir`/`root_markers`.
 - Per-file inputs: defines/incdirs via `ProjectParseInputs` (`src/parse_inputs.cpp`); every parse path asks per file. No flat `defines_`. One `Analyzer` for all projects.
 - Handlers with a URI use `config_for(uri)`, never `config_` (session eager-index config only). `root_` is just a prefetch hint; never repoint it.
 - Index filelist = union of all projects. `[compilation]` = one slang `Compilation` per project filelist (`CompilationSnapshot::groups`, `compile_group()`), compiled sequentially; `CompilationGroup::files` are indices into `CompilationSnapshot::files`. Gate on `config_for(uri)` (publish + `:LintAll`). Debounce is `kCompilationDebounce`; non-debounced callers use `compile_now()`.
@@ -38,7 +38,8 @@ ctest --test-dir build                     # all
 - Same-name modules: rank, don't filter. `find_module()` / `by_path_proximity()` share `path_proximity_score()` (shared prefix, then depth; ties by path via `Analyzer::sorted_by_path()`, headers first). Scans iterate an ordered list (`nearest_shard_answer()` etc.) — don't add per-scan ranking.
 - References/rename: `file_can_mean_target()` filters per file; files in no project and the asker's project are always admitted. Never put the project in `SymbolID`.
 - `normalize_filesystem_path()` memo: invalidate only on config invalidation and watcher create/delete, never on change.
-- Guards: `[module-proximity]` (assert both directions), `[parse-inputs]`, `[project-root]`.
+- Implicit projects (`src/implicit_project.cpp`): scan on its own thread, applied under `projects_mutex_` via `reload_all_projects()` (explicit first, implicit sorted after). Over a limit ⇒ give up, never truncate. Filelist entries inside an implicit root keep the defaults.
+- Guards: `[module-proximity]` (assert both directions), `[parse-inputs]`, `[project-root]`, `[implicit-project]`, `implicit-project-smoke`.
 
 ## Index Shard Cache
 - Shards in `<file's own project root>/.cache/lazyverilog/index`; no project ⇒ `user_cache_directory()/lazyverilog/index`. Header shard lives in the header's project. No on/off switch (`[index].cache` removed).

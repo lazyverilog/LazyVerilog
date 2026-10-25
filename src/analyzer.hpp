@@ -491,6 +491,13 @@ class Analyzer {
     /// installed here is the only copy the edit path makes.
     uint64_t enqueue_parse(const std::string& uri, std::string text);
 
+    /// Parse every open buffer under @p root (normalized) again, with the text
+    /// it has now.  For when the inputs those buffers parse with changed --
+    /// an implicit project registered their include path -- and no edit is
+    /// coming to reparse them.  Safe from any thread: a buffer edited
+    /// meanwhile keeps its edit.
+    void reparse_open_documents_under(const std::filesystem::path& root);
+
     /// Server registers this once.  Called on worker thread after a parse commits.
     void set_parse_complete_callback(
         std::function<void(const std::string& uri)> cb);
@@ -831,6 +838,10 @@ class Analyzer {
     /// bumps the generation and wakes the pool.
     bool queue_include_dependents_locked(const std::string& uri) const;
     void queue_background_file_locked(std::string path, bool front) const;
+    /// enqueue_parse(), skipped (returning 0) unless @p expected is null or
+    /// still the buffer's current snapshot.
+    uint64_t enqueue_parse_if_current(const std::string& uri, std::string text,
+                                      const DocumentState* expected);
     void start_background_indexer_locked() const;
     void schedule_background_reindex_locked() const;
     void schedule_background_project_publish_locked() const;

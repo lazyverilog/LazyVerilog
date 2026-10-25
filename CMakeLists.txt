@@ -356,6 +356,7 @@ set(LAZYVERILOG_SOURCES
     src/syntax_index_shared.cpp
     src/index_cache.cpp
     src/project_root.cpp
+    src/implicit_project.cpp
     src/parse_inputs.cpp
     src/edit_watermark.cpp
     src/position_encoding.cpp
@@ -417,6 +418,7 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_shared_header_scaling.cpp
     tests/test_index_cache.cpp
     tests/test_project_root.cpp
+    tests/test_implicit_project.cpp
     tests/test_cancelled_requests.cpp
     tests/test_edit_watermark.cpp
     tests/test_request_pool.cpp
@@ -455,6 +457,7 @@ set(LAZYVERILOG_TEST_SOURCES
     src/syntax_index_shared.cpp
     src/index_cache.cpp
     src/project_root.cpp
+    src/implicit_project.cpp
     src/parse_inputs.cpp
     src/edit_watermark.cpp
     src/position_encoding.cpp
@@ -516,6 +519,7 @@ add_executable(index-bench
     src/cpu_budget.cpp
     src/filelist.cpp
     src/dynamic_file_index.cpp
+    src/implicit_project.cpp
     src/syntax_index.cpp
     src/syntax_index_shared.cpp
     src/index_cache.cpp
@@ -677,4 +681,10 @@ if(Python3_Interpreter_FOUND)
                 --reply-timeout ${LAZYVERILOG_FUZZ_REPLY_TIMEOUT}
                 --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-replay
     )
+    add_test(
+        NAME implicit-project-smoke
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/implicit_project_smoke.py
+                --binary $<TARGET_FILE:lazyverilog-lsp>
+    )
+    set_tests_properties(implicit-project-smoke PROPERTIES TIMEOUT 120)
 endif()

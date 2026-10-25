@@ -921,6 +921,34 @@ std::optional<IndexCache> IndexCache::open_fallback() {
     return IndexCache(std::move(directory));
 }
 
+std::optional<fs::path> IndexCache::implicit_directory_for(const fs::path& root) {
+    auto base = user_cache_directory();
+    if (!base)
+        return std::nullopt;
+    std::array<char, 17> hex{};
+    std::snprintf(hex.data(), hex.size(), "%016llx",
+                  static_cast<unsigned long long>(digest_bytes(root.string()).lo));
+    return *base / "lazyverilog" / "i" / hex.data();
+}
+
+std::optional<IndexCache> IndexCache::open_implicit(const fs::path& root) {
+    auto directory = implicit_directory_for(root);
+    if (!directory)
+        return std::nullopt;
+    if (!create_cache_directories(*directory)) {
+        report_unwritable("create", *directory);
+        return std::nullopt;
+    }
+    const auto label = *directory / "root.txt";
+    std::error_code ec;
+    if (!fs::exists(label, ec)) {
+        std::ofstream out(label, std::ios::binary);
+        if (out)
+            out << root.string() << "\n";
+    }
+    return IndexCache(std::move(*directory));
+}
+
 IndexCacheStorage::IndexCacheStorage(std::shared_ptr<const ProjectRootResolver> resolver)
     : resolver_(std::move(resolver)) {}
 
@@ -943,8 +971,10 @@ const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
     } else if (resolver_) {
         info = resolver_->project_info(path_from_file_uri(std::string(uri)),
                                       ProjectRootResolver::PathKind::File);
+        // Implicit keyed apart: a toml written at an implicit root later makes
+        // the same directory an explicit project with its shards in the tree.
         if (info)
-            key = info->source_root.string();
+            key = (info->implicit ? "implicit:" : "") + info->source_root.string();
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -956,7 +986,9 @@ const IndexCache* IndexCacheStorage::for_uri(std::string_view uri) const {
         // has two workers create the same directory and one of them discard a
         // cache the other is already handing out.
         auto opened = std::make_unique<std::optional<IndexCache>>(
-            info ? IndexCache::open(info->source_root) : IndexCache::open_fallback());
+            !info            ? IndexCache::open_fallback()
+            : info->implicit ? IndexCache::open_implicit(info->source_root)
+                             : IndexCache::open(info->source_root));
         it = caches_.emplace(std::move(key), std::move(opened)).first;
     }
     return it->second->has_value() ? &it->second->value() : nullptr;

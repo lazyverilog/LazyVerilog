@@ -28,6 +28,7 @@
 #include "LibLsp/lsp/textDocument/did_open.h"
 #include "LibLsp/lsp/workspace/did_change_configuration.h"
 #include "LibLsp/lsp/workspace/did_change_watched_files.h"
+#include "LibLsp/lsp/workspace/didChangeWorkspaceFolders.h"
 // Feature handlers
 #include "LibLsp/JsonRpc/serializer.h"
 #include "LibLsp/lsp/textDocument/completion.h"
@@ -340,6 +341,50 @@ static std::string did_change_config_file(lsp::Any settings_any) {
     return config_file;
 }
 
+/// What a client's `initializationOptions` say about implicit projects:
+///   { "lazyverilog": { "implicitProject": "off" | "workspace" | "auto",
+///                      "implicitProjectExclude": ["glob", ...] } }
+/// Best effort, like did_change_config_file(): a malformed value is ignored.
+struct ImplicitProjectOptions {
+    std::optional<ImplicitProjectMode> mode;
+    std::optional<std::vector<std::string>> exclude;
+};
+
+static ImplicitProjectOptions implicit_project_options(lsp::Any options_any) {
+    ImplicitProjectOptions result;
+    std::map<std::string, lsp::Any> options;
+    std::map<std::string, lsp::Any> lazyverilog;
+    try {
+        options_any.Get(options);
+        auto lazy_it = options.find("lazyverilog");
+        if (lazy_it == options.end())
+            return result;
+        lazy_it->second.Get(lazyverilog);
+    } catch (...) {
+        return result;
+    }
+    if (auto it = lazyverilog.find("implicitProject"); it != lazyverilog.end()) {
+        std::string mode;
+        try {
+            it->second.GetForMapHelper(mode);
+            result.mode = parse_implicit_project_mode(mode);
+        } catch (...) {
+        }
+        if (!result.mode)
+            std::cerr << "[lazyverilog] ignoring implicitProject \"" << mode
+                      << "\": expected off, workspace or auto\n";
+    }
+    if (auto it = lazyverilog.find("implicitProjectExclude"); it != lazyverilog.end()) {
+        std::vector<std::string> exclude;
+        try {
+            if (it->second.GetForMapHelper(exclude))
+                result.exclude = std::move(exclude);
+        } catch (...) {
+        }
+    }
+    return result;
+}
+
 static std::string workspace_edit_json(const std::string& uri, const lsTextEdit& edit) {
     return "{\"changes\":{" + json_quoted(uri) +
            ":[{\"range\":{\"start\":{\"line\":" + std::to_string(edit.range.start.line) +
@@ -451,7 +496,8 @@ struct LazyVerilogServer::Impl {
 
 };
 
-LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
+LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
+    : implicit_mode_(implicit_mode), impl_(std::make_unique<Impl>()) {
     // Only a prefetch hint for initialize, and only when the client sends no
     // root of its own.  Nothing is read from here: a file's config comes from
     // config_for(), which resolves that file's own project.
@@ -548,6 +594,18 @@ LazyVerilogServer::~LazyVerilogServer() {
     // server torn down any other way (a test harness, stdin closing under a
     // client that never sends exit) gets the same guarantee from here.
     impl_->request_pool.shutdown();
+    // Implicit scans apply their result through the analyzer and the endpoint.
+    // Each is bounded by ImplicitScanLimits::max_time, and one finishing now
+    // sees `stopping_` and applies nothing.
+    stopping_ = true;
+    std::vector<std::thread> scans;
+    {
+        std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+        scans.swap(scan_threads_);
+    }
+    for (auto& scan : scans)
+        if (scan.joinable())
+            scan.join();
     // Then the threads that publish on their own initiative.  A parse worker
     // calls back into publish_diagnostics(), which writes through
     // impl_->remote_endpoint -- and impl_ is the last member declared, so it is
@@ -599,7 +657,10 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
         return config_for_root({});
     auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
                                              ProjectRootResolver::PathKind::File);
-    return config_for_root(info ? info->source_root : std::filesystem::path{});
+    // An implicit project has no config to read: built-in defaults, the same
+    // answer as a file in no project.
+    return config_for_root(info && !info->implicit ? info->source_root
+                                                   : std::filesystem::path{});
 }
 
 std::shared_ptr<const Config>
@@ -628,9 +689,14 @@ LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) con
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
     if (!root_resolver_)
         return false;
+    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
     auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
                                              ProjectRootResolver::PathKind::File);
-    if (!info)
+    if (!info) {
+        consider_vcs_root_for(uri);
+        return false;
+    }
+    if (info->implicit)
         return false;
     if (!fold_project_root(info->source_root))
         return false;
@@ -737,14 +803,21 @@ bool LazyVerilogServer::fold_project_root(const std::filesystem::path& source_ro
 }
 
 void LazyVerilogServer::apply_project_inputs() {
+    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+    any_project_compiles_ = std::any_of(
+        project_compilation_inputs_.begin(), project_compilation_inputs_.end(),
+        [](const ProjectCompilationInputs& project) { return project.background_compilation; });
+    // Compilation inputs first: they carry which files an explicit filelist
+    // names, which the reindex set_project_config() starts parses with.
+    analyzer_.set_project_compilation_inputs(project_compilation_inputs_);
     analyzer_.set_project_config(project_defines_, project_include_dirs_, project_files_,
                                  index_cache_storage_, project_file_sizes_);
-    analyzer_.set_project_compilation_inputs(project_compilation_inputs_);
     configure_background_compiler();
     schedule_background_compilation();
 }
 
 void LazyVerilogServer::reload_all_projects() {
+    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
     // Everything is re-derived, so the accumulators start empty.  Replacing
     // them with only the saved config's project is what this replaced: it
     // dropped every other open project's files from the index until one of its
@@ -764,7 +837,7 @@ void LazyVerilogServer::reload_all_projects() {
     // the merged defines and `+incdir+` below.  `root_` is fixed at initialize
     // and never moves, which is what makes this order the same on every reload.
     if (root_resolver_ && !root_.empty()) {
-        if (auto info = root_resolver_->project_info(root_))
+        if (auto info = root_resolver_->project_info(root_); info && !info->implicit)
             fold_project_root(info->source_root);
     }
     for (const auto& root : previously_known)
@@ -789,14 +862,127 @@ void LazyVerilogServer::reload_all_projects() {
             if (!doc)
                 return;
             if (auto info = root_resolver_->project_info(path_from_file_uri(open_uri),
-                                                        ProjectRootResolver::PathKind::File))
+                                                        ProjectRootResolver::PathKind::File);
+                info && !info->implicit)
                 open_roots.insert(info->source_root.string());
         });
         for (const auto& root : open_roots)
             fold_project_root(std::filesystem::path(root));
     }
 
+    // Implicit projects after every explicit one, so a file both name is
+    // indexed once, in the explicit project's place.  A root a toml now
+    // governs -- written at it or above it -- is released, and its shards in
+    // the user's cache with it.
+    if (root_resolver_) {
+        std::vector<std::filesystem::path> implicit_roots;
+        for (auto it = implicit_scans_.begin(); it != implicit_scans_.end();) {
+            const std::filesystem::path root(it->first);
+            auto info = root_resolver_->project_info(root);
+            if (info && !info->implicit) {
+                std::cerr << "[lazyverilog] implicit project " << it->first << " released: "
+                          << (info->source_root / ProjectRootResolver::kMarker).string()
+                          << " governs it\n";
+                if (auto shards = IndexCache::implicit_directory_for(root)) {
+                    std::error_code ec;
+                    std::filesystem::remove_all(*shards, ec);
+                }
+                it = implicit_scans_.erase(it);
+                continue;
+            }
+            fold_implicit_root(it->first, it->second);
+            implicit_roots.push_back(root);
+            ++it;
+        }
+        // Before the reindex apply_project_inputs() starts: its workers decide
+        // each file's project, and so its shard directory, through this.
+        root_resolver_->set_implicit_roots(std::move(implicit_roots));
+    }
+
     apply_project_inputs();
+}
+
+void LazyVerilogServer::fold_implicit_root(const std::string& root, const ImplicitScan& scan) {
+    project_file_set_.reserve(project_files_.size() + scan.files.size());
+    for (size_t i = 0; i < scan.files.size(); ++i) {
+        if (!project_file_set_.insert(scan.files[i]).second)
+            continue;
+        project_files_.push_back(scan.files[i]);
+        project_file_sizes_.push_back(scan.file_sizes[i]);
+    }
+    // Defines are never guessed: a wrong one flips an `ifdef and parses a
+    // different design.  The include path is every directory holding a header.
+    analyzer_.set_parse_inputs_for_root(root, {}, scan.include_dirs,
+                                        Analyzer::Reindex::Deferred);
+}
+
+void LazyVerilogServer::consider_implicit_root(const std::filesystem::path& root) {
+    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+    if (implicit_mode_ == ImplicitProjectMode::Off || !root_resolver_ || stopping_)
+        return;
+    std::error_code ec;
+    if (root.empty() || !std::filesystem::is_directory(root, ec))
+        return;
+    const auto normalized = normalize_filesystem_path(root);
+    const auto key = normalized.string();
+    if (!implicit_considered_.insert(key).second)
+        return;
+    if (is_refused_implicit_root(normalized)) {
+        // Logged, not shown: launching the editor in the home directory is
+        // ordinary, and a popup on every such session would be noise.
+        std::cerr << "[lazyverilog] not scanning " << key
+                  << " as an implicit project: a home directory, filesystem root or cache\n";
+        return;
+    }
+    if (auto info = root_resolver_->project_info(normalized); info && !info->implicit)
+        return; // a lazyverilog.toml at or above it already makes it a project
+    scan_threads_.emplace_back([this, key, exclude = implicit_exclude_] {
+        apply_implicit_scan(key, scan_implicit_root(key, exclude));
+    });
+}
+
+void LazyVerilogServer::consider_vcs_root_for(std::string_view uri) {
+    if (implicit_mode_ != ImplicitProjectMode::Auto)
+        return;
+    const auto dir = std::filesystem::path(path_from_file_uri(std::string(uri))).parent_path();
+    if (dir.empty() || !vcs_checked_dirs_.insert(dir.string()).second)
+        return;
+    if (auto vcs = find_vcs_root(dir))
+        consider_implicit_root(*vcs);
+}
+
+void LazyVerilogServer::apply_implicit_scan(const std::string& root, ImplicitScan scan) {
+    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+    if (stopping_)
+        return;
+    if (scan.over_limit) {
+        show_warning("lazyverilog: " + root + " is too large to index without a config (" +
+                     scan.over_limit_reason +
+                     "). Add a lazyverilog.toml, or narrow it with implicitProjectExclude.");
+        // A rescan that crossed a limit takes the earlier scan down with it.
+        if (implicit_scans_.erase(root))
+            reload_all_projects();
+        return;
+    }
+    std::cerr << "[lazyverilog] implicit project " << root << " (" << scan.files.size()
+              << " files, " << scan.include_dirs.size() << " include dirs)\n";
+    implicit_scans_[root] = std::move(scan);
+    reload_all_projects();
+    // Open buffers under the root parsed before its include path existed, and
+    // no edit is coming to parse them again.
+    analyzer_.reparse_open_documents_under(std::filesystem::path(root));
+}
+
+void LazyVerilogServer::show_warning(const std::string& message) {
+    std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
+    try {
+        Notify_ShowMessage::notify note;
+        note.params.type = lsMessageType::Warning;
+        note.params.message = message;
+        impl_->remote_endpoint.sendNotification(note);
+    } catch (const std::exception& e) {
+        std::cerr << "[lazyverilog] showMessage error: " << e.what() << "\n";
+    }
 }
 
 void LazyVerilogServer::invalidate_config_cache() {
@@ -846,10 +1032,10 @@ bool LazyVerilogServer::any_project_compiles() const {
     // here as well, read from whichever directory the server happened to be
     // launched in when the client sent no rootUri -- so the same tree compiled
     // or did not depending on where the editor was started from.
-    return std::any_of(project_compilation_inputs_.begin(), project_compilation_inputs_.end(),
-                       [](const ProjectCompilationInputs& project) {
-                           return project.background_compilation;
-                       });
+    //
+    // Read from the atomic apply_project_inputs() publishes: parse workers ask
+    // this after every parse, and the accumulators are not theirs to read.
+    return any_project_compiles_;
 }
 
 std::vector<ParseDiagInfo> LazyVerilogServer::semantic_diagnostics_for(const std::string& uri,
@@ -1163,6 +1349,7 @@ void LazyVerilogServer::register_handlers() {
             // restored VS Code tab in shared IP outside the workspace would
             // otherwise leave the workspace project unindexed, and
             // go-to-definition into it answering nothing.
+            std::lock_guard<std::recursive_mutex> projects_lock(projects_mutex_);
             auto initialize_workspace_root = [&](const std::filesystem::path& p) {
                 if (!std::filesystem::exists(p))
                     return;
@@ -1218,6 +1405,34 @@ void LazyVerilogServer::register_handlers() {
                 initialize_workspace_root(root_);
             }
 
+            // Implicit projects: the client's options, then the CLI flag the
+            // server was started with, then `auto`.
+            if (req.params.initializationOptions) {
+                auto options = implicit_project_options(*req.params.initializationOptions);
+                if (options.mode)
+                    implicit_mode_ = *options.mode;
+                if (options.exclude)
+                    implicit_exclude_ = std::move(*options.exclude);
+            }
+            std::cerr << "[lazyverilog] implicit projects: "
+                      << implicit_project_mode_name(implicit_mode_) << "\n";
+            // The folders the user opened, else the single root the client
+            // named.  Never the working directory: that is where the server
+            // was started, not something the user pointed at.
+            if (req.params.workspaceFolders && !req.params.workspaceFolders->empty()) {
+                for (const auto& folder : *req.params.workspaceFolders)
+                    consider_implicit_root(uri_to_path(folder.uri.raw_uri_));
+            } else if (req.params.rootUri && !req.params.rootUri->raw_uri_.empty()) {
+                consider_implicit_root(uri_to_path(req.params.rootUri->raw_uri_));
+            } else if (req.params.rootPath && !req.params.rootPath->empty()) {
+                consider_implicit_root(std::filesystem::path(*req.params.rootPath));
+            }
+            WorkspaceServerCapabilities workspace_caps;
+            workspace_caps.workspaceFolders.supported = true;
+            workspace_caps.workspaceFolders.changeNotifications =
+                std::make_pair(optional<std::string>{}, optional<bool>(true));
+            caps.workspace = std::move(workspace_caps);
+
             // Inlay hints and folding ranges are advertised unconditionally,
             // the way clangd does it:
             //
@@ -1269,6 +1484,7 @@ void LazyVerilogServer::register_handlers() {
                 "lazyverilog.singleInterface",
                 "lazyverilog.lint",
                 "lazyverilog.lintAll",
+                "lazyverilog.rescan",
             };
             caps.executeCommandProvider = exec_opts;
         } catch (const std::exception& e) {
@@ -1436,7 +1652,13 @@ void LazyVerilogServer::register_handlers() {
                 // path up as a project source, found nothing, and dropped it.
                 // A filelist rewritten by a branch switch or a generator was
                 // invisible for the rest of the session.
-                if (project_filelists_.contains(normalize_filesystem_path(path).string())) {
+                bool is_filelist = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+                    is_filelist =
+                        project_filelists_.contains(normalize_filesystem_path(path).string());
+                }
+                if (is_filelist) {
                     config_changed = true;
                     continue;
                 }
@@ -1482,6 +1704,26 @@ void LazyVerilogServer::register_handlers() {
             schedule_background_compilation();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] didChangeWatchedFiles error: " << e.what() << "\n";
+        }
+    });
+
+    // ── workspace/didChangeWorkspaceFolders ──────────────────────────────────
+    ep.registerHandler([&](const Notify_WorkspaceDidChangeWorkspaceFolders::notify& note) {
+        try {
+            std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+            bool removed_any = false;
+            for (const auto& folder : note.params.event.removed) {
+                const auto key =
+                    normalize_filesystem_path(path_from_file_uri(folder.uri.raw_uri_)).string();
+                implicit_considered_.erase(key);
+                removed_any |= implicit_scans_.erase(key) > 0;
+            }
+            if (removed_any)
+                reload_all_projects();
+            for (const auto& folder : note.params.event.added)
+                consider_implicit_root(path_from_file_uri(folder.uri.raw_uri_));
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] didChangeWorkspaceFolders error: " << e.what() << "\n";
         }
     });
 
@@ -1771,9 +2013,15 @@ void LazyVerilogServer::register_handlers() {
         td_rename::response rsp;
         rsp.id = req.id;
         try {
-            rsp.result = provide_rename(analyzer_, req.params);
+            const auto info = root_resolver_
+                                  ? root_resolver_->project_info(
+                                        path_from_file_uri(req.params.textDocument.uri.raw_uri_),
+                                        ProjectRootResolver::PathKind::File)
+                                  : std::nullopt;
+            rsp.result = provide_rename(analyzer_, req.params, info && info->implicit);
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] rename error: " << e.what() << "\n";
+            show_warning(e.what());
         }
         return rsp;
     });
@@ -2199,6 +2447,14 @@ void LazyVerilogServer::register_handlers() {
                 lint_result_json(states);
             } else if (cmd == "lazyverilog.lintAll") {
                 lint_result_json(analyzer_.project_file_states_sync());
+            } else if (cmd == "lazyverilog.rescan") {
+                // Scan every implicit root again: the way to pick up files
+                // created where no watcher reports them.  The previous scan
+                // stays in effect until the new one lands.
+                std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
+                const auto roots = std::exchange(implicit_considered_, {});
+                for (const auto& root : roots)
+                    consider_implicit_root(std::filesystem::path(root));
             } else if (cmd == "lazyverilog.format") {
                 std::string uri = get_string(0);
                 std::string mode = get_string(1);
