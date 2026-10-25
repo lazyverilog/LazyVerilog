@@ -586,6 +586,17 @@ local function start_lsp(cfg, cmd, bufnr)
 		-- That takes the reuse_client below: Neovim's default only reuses a
 		-- client whose root_dir matches, so with no root_dir every buffer (and
 		-- every autocmd that calls start) got a server process of its own.
+		--
+		-- The working directory as the one workspace folder, the way VS Code's
+		-- "Open Folder" names one.  It is not a root -- the server still
+		-- resolves every file's project itself -- but Neovim drops a server's
+		-- didChangeWatchedFiles registration from a client that has no
+		-- workspace folders (runtime/lua/vim/lsp/_watchfiles.lua), so without
+		-- it an externally edited header or filelist went unnoticed for the
+		-- whole session.
+		workspace_folders = {
+			{ uri = vim.uri_from_fname(vim.fn.getcwd()), name = vim.fn.getcwd() },
+		},
 		filetypes    = cfg.filetypes,
 		capabilities = cfg.capabilities,
 		on_attach    = combined_on_attach,
