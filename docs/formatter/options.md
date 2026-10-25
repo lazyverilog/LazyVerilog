@@ -108,6 +108,11 @@ output  logic            valid
 When `true`, the server formats the whole document on save. It does not stop other save-time
 generators such as `[autoarg].autoarg_on_save`.
 
+Saving goes through LSP `textDocument/willSaveWaitUntil`, which the Neovim plugin and the VS Code
+extension both send on every save, so no editor-side setting such as `editor.formatOnSave` is
+needed. This option only controls saving: an explicit "Format Document" (`:Format`,
+`vim.lsp.buf.format()`, `Shift+Alt+F`) always formats, whatever it is set to.
+
 ```toml
 [format]
 enable_format_on_save = true
@@ -1225,6 +1230,13 @@ signal_min_width = 0
 
 Controls how user-defined macros are classified for formatting purposes. Macro classification affects wrapping, indentation, and spacing decisions. See [`macros.md`](macros.md) for the full option reference, available role lists, and examples.
 
-By default, `whitespace_sensitive` contains `DV_CHECK_FATAL`. This preserves the exact argument spelling for that macro unless you override the list in `lazyverilog.toml`.
+The lists you set **extend** the built-in UVM defaults; they do not replace them. A built-in macro cannot be removed or moved to another role. See [Built-in defaults](macros.md#built-in-defaults) for the list.
+
+No macro is `whitespace_sensitive` by default. To keep a macro's arguments exactly as written, list it, for example OpenTitan's `DV_CHECK_FATAL`:
+
+```toml
+[format.macros]
+whitespace_sensitive = ["DV_CHECK_FATAL"]
+```
 
 ---

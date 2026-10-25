@@ -35,3 +35,12 @@ when the cursor is on a supported construct.
 | `:Interface <inst>` | Inspect one instance ([Interface](../interface.md)) |
 | `:Interface <inst1> <inst2>` | Inspect and edit connections between two instances |
 | `:Connect <module1> <module2>` | Connect two modules through the hierarchy ([Connect](../connect.md)) |
+
+## Formatting
+
+`:Format` and `vim.lsp.buf.format()` always format. Saving formats only when
+`[format].enable_format_on_save = true` is set in `lazyverilog.toml`: Neovim's LSP client sends
+`textDocument/willSaveWaitUntil` on every write, and the server returns edits only when the option
+is on. If your own config has a `BufWritePre` autocmd that calls `vim.lsp.buf.format()` for these
+files, remove it: `vim.lsp.buf.format()` now always formats, so that autocmd would format every
+save whatever the option says.

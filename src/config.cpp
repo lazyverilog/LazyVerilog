@@ -1,6 +1,7 @@
 #include "config.hpp"
 
 #include "string_utils.hpp"
+#include <algorithm>
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -172,26 +173,49 @@ static std::vector<std::string> validate_config(const Config& cfg) {
                "[format.spacing].assignment_operator_spacing",
                {"none", "before", "after", "both"});
 
+    // The lists extend the built-in defaults (append_string_array), so a
+    // built-in name listed under another role is a conflict the user cannot
+    // resolve by editing their own lists; say which role is built in.
+    const MacroOptions builtin;
     std::unordered_map<std::string, std::vector<std::string>> macro_roles;
-    auto add_macro_role = [&](const std::vector<std::string>& names, const char* role) {
-        for (const auto& name : names)
-            macro_roles[normalize_macro_config_name(name)].push_back(role);
+    std::unordered_map<std::string, std::string> builtin_role;
+    auto add_macro_role = [&](const std::vector<std::string>& names,
+                              const std::vector<std::string>& builtin_names, const char* role) {
+        for (const auto& name : builtin_names)
+            builtin_role.emplace(normalize_macro_config_name(name), role);
+        for (const auto& name : names) {
+            auto& roles = macro_roles[normalize_macro_config_name(name)];
+            // Repeating a name in the same role (a built-in one included) is harmless.
+            if (std::find(roles.begin(), roles.end(), role) == roles.end())
+                roles.push_back(role);
+        }
     };
-    add_macro_role(cfg.format.macros.object_like_expr, "object_like_expr");
-    add_macro_role(cfg.format.macros.function_like_expr, "function_like_expr");
-    add_macro_role(cfg.format.macros.statement_like, "statement_like");
-    add_macro_role(cfg.format.macros.declaration_like, "declaration_like");
-    add_macro_role(cfg.format.macros.control_flow_like, "control_flow_like");
-    add_macro_role(cfg.format.macros.statement_terminator_like, "statement_terminator_like");
-    add_macro_role(cfg.format.macros.block_begin_like, "block_begin_like");
-    add_macro_role(cfg.format.macros.block_end_like, "block_end_like");
+    const auto& m = cfg.format.macros;
+    add_macro_role(m.object_like_expr, builtin.object_like_expr, "object_like_expr");
+    add_macro_role(m.function_like_expr, builtin.function_like_expr, "function_like_expr");
+    add_macro_role(m.statement_like, builtin.statement_like, "statement_like");
+    add_macro_role(m.declaration_like, builtin.declaration_like, "declaration_like");
+    add_macro_role(m.control_flow_like, builtin.control_flow_like, "control_flow_like");
+    add_macro_role(m.statement_terminator_like, builtin.statement_terminator_like,
+                   "statement_terminator_like");
+    add_macro_role(m.block_begin_like, builtin.block_begin_like, "block_begin_like");
+    add_macro_role(m.block_end_like, builtin.block_end_like, "block_end_like");
     for (const auto& [name, roles] : macro_roles) {
         if (roles.size() <= 1)
             continue;
-        std::string msg = "[format.macros]: macro \"" + name +
-                          "\" appears in multiple role lists:";
-        for (const auto& role : roles)
-            msg += " " + role;
+        std::string msg;
+        if (const auto it = builtin_role.find(name); it != builtin_role.end()) {
+            msg = "[format.macros]: \"" + name + "\" is a built-in " + it->second +
+                  " macro; built-in roles cannot be changed (also listed under";
+            for (const auto& role : roles)
+                if (role != it->second)
+                    msg += " " + role;
+            msg += ")";
+        } else {
+            msg = "[format.macros]: macro \"" + name + "\" appears in multiple role lists:";
+            for (const auto& role : roles)
+                msg += " " + role;
+        }
         errors.push_back(msg);
     }
 

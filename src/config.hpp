@@ -156,7 +156,7 @@ struct MacroOptions {
     std::vector<std::string> block_end_like{
         "uvm_object_utils_end", "uvm_component_utils_end", "uvm_object_param_utils_end",
         "uvm_component_param_utils_end", "uvm_sequence_utils_end"};
-    std::vector<std::string> whitespace_sensitive{"DV_CHECK_FATAL"};
+    std::vector<std::string> whitespace_sensitive;
 };
 
 struct FormatOptions {

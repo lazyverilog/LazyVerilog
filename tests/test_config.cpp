@@ -367,6 +367,29 @@ declaration_like = ["MY_MACRO"]
     CHECK(warning.find("multiple role lists") != std::string::npos);
 }
 
+TEST_CASE("config: a built-in macro listed under another role says it is built in",
+          "[config]") {
+    auto dir = make_temp_toml(R"(
+[format.macros]
+statement_like = ["`uvm_object_utils"]
+declaration_like = ["uvm_object_utils"]
+)");
+    std::string warning;
+    ConfigWarning warning_detail;
+    Config cfg = load_config(dir, &warning, &warning_detail);
+    (void)cfg;
+    // Repeating it under its own built-in role is not a conflict; moving it is.
+    CHECK(warning.find("\"uvm_object_utils\" is a built-in declaration_like macro; "
+                       "built-in roles cannot be changed (also listed under statement_like)") !=
+          std::string::npos);
+    CHECK(warning.find("multiple role lists") == std::string::npos);
+}
+
+TEST_CASE("config: no macro is whitespace-sensitive by default", "[config]") {
+    // DV_CHECK_FATAL used to be; it is OpenTitan's, so projects list it themselves.
+    CHECK(MacroOptions{}.whitespace_sensitive.empty());
+}
+
 TEST_CASE("config: invalid value types and integer ranges are reported", "[config]") {
     auto dir = make_temp_toml(R"(
 [design]
