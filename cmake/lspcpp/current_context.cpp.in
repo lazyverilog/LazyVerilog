@@ -1,0 +1,14 @@
+    // ── LazyVerilog patch: no thread_local destructor ─────────────────────
+    //
+    // Was `static thread_local auto c = Context::empty();`.  Under MinGW's
+    // emulated TLS a thread's storage is freed before its thread_local
+    // destructors run, so the dispatch thread destroyed this Context -- a
+    // shared_ptr -- from freed memory when the server shut its pool down, and
+    // the process exited with heap corruption.  A trivially destructible
+    // pointer has no destructor to run; the one Context per thread it leaks is
+    // empty by then (WithContext restores it) and dies with the process.
+    static thread_local Context* c = nullptr;
+    if (!c)
+        c = new Context(Context::empty());
+    return *c;
+    // ── end LazyVerilog patch ─────────────────────────────────────────────

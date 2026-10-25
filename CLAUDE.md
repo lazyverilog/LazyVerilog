@@ -18,6 +18,7 @@ ctest --test-dir build                     # all
 ./build/lazyverilog-tests "[tag]"          # one feature / "test name"
 ```
 - Windows CI has no POSIX libc: guard POSIX-only calls (e.g. `setenv`) with `#ifdef _WIN32`, tests included.
+- No `thread_local` with a non-trivial destructor (patched deps included): MinGW's emulated TLS frees a thread's storage before running them, so thread exit corrupts the heap. Use a mutex-guarded `static` or a trivially destructible pointer.
 
 ## Performance
 - Startup: `tools/startup_bench.py [--cpus 0] [--trace] [--warm|--no-cache]`. Report index ms (full CPU and `--cpus 0`), user CPU, maxRSS; report cold/warm/no-cache separately. Compare commits via `index-bench` built in a worktree (`--binary`), same `CMAKE_BUILD_TYPE` both sides. Workers = CPU slice (`src/cpu_budget.cpp`), max 8.

@@ -447,7 +447,9 @@ struct LazyVerilogServer::Impl {
     std::shared_ptr<StdOutStream> output = std::make_shared<StdOutStream>();
     std::shared_ptr<StdInStream> input = std::make_shared<StdInStream>();
     Condition<bool> exit_event;
-
+    /// The last textDocument/selectionRange answer; see that handler.  Only
+    /// the dispatch thread touches it (max_workers=1 above).
+    SelectionRanges last_selection_answer;
 };
 
 LazyVerilogServer::LazyVerilogServer() : impl_(std::make_unique<Impl>()) {
@@ -1815,9 +1817,11 @@ void LazyVerilogServer::register_handlers() {
     ep.registerHandler([&](const td_selectionRange::request& req) {
         // The response holds raw pointers into the answer's parent list, and
         // LspCpp serializes it on this thread right after the handler returns.
-        // Keeping this thread's last answer alive until its next request is
-        // what makes those pointers valid at serialization time.
-        thread_local SelectionRanges last_answer;
+        // Keeping the last answer alive until the next request is what makes
+        // those pointers valid at serialization time.  A server member, not a
+        // thread_local: MinGW's emulated TLS frees a thread's storage before
+        // its thread_local destructors run.
+        auto& last_answer = impl_->last_selection_answer;
         td_selectionRange::response rsp;
         rsp.id = req.id;
         try {

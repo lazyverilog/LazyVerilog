@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <optional>
 #include <string_view>
@@ -134,15 +135,22 @@ static CachedRegex compile_re(const std::string& pat) {
     if (pat.empty())
         return nullptr;
 
-    // Naming lint runs on every diagnostics refresh.  Keep compilation
-    // thread-local and keyed by the exact config pattern so repeated didChange
-    // notifications pay only a hash lookup, while config edits naturally
-    // compile a new pattern the first time it is observed on this worker.
+    // Naming lint runs on every diagnostics refresh.  Cache compilation keyed by
+    // the exact config pattern so repeated didChange notifications pay only a
+    // hash lookup, while config edits naturally compile a new pattern the first
+    // time it is observed.
     //
     // Invalid patterns are cached as nullptr too.  That preserves the previous
     // "silently disable invalid naming rule" behavior without repeatedly
     // throwing std::regex_error on every keystroke.
-    thread_local std::unordered_map<std::string, CachedRegex> cache;
+    //
+    // One process-wide map, not thread_local: MinGW's emulated TLS frees a
+    // thread's storage before running its thread_local destructors, so a map
+    // here was torn down from freed memory whenever a thread that had used it
+    // exited (heap corruption, seen at server exit).
+    static std::mutex mutex;
+    static std::unordered_map<std::string, CachedRegex> cache;
+    std::lock_guard<std::mutex> lock(mutex);
     if (auto it = cache.find(pat); it != cache.end())
         return it->second;
 

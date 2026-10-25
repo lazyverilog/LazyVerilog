@@ -109,6 +109,18 @@ if(_pp_done EQUAL -1)
            _pp_content "${_pp_content}")
     file(WRITE "${_pp_cpp}" "${_pp_content}")
 endif()
+# A tree patched before the helper stopped keeping a thread_local Lexer: swap
+# the old helper (everything up to the anchor) for the current one.
+string(FIND "${_pp_content}" "thread_local std::optional<Lexer> empty;" _pp_stale)
+if(NOT _pp_stale EQUAL -1)
+    string(FIND "${_pp_content}" "// lazyverilog patch: a macro whose" _pp_from)
+    string(FIND "${_pp_content}" "${_pp_anchor}" _pp_to)
+    string(SUBSTRING "${_pp_content}" 0 ${_pp_from} _pp_head)
+    string(SUBSTRING "${_pp_content}" ${_pp_to} -1 _pp_tail)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/stringify_lexer.cpp.in" _pp_insert)
+    set(_pp_content "${_pp_head}${_pp_insert}${_pp_tail}")
+    file(WRITE "${_pp_cpp}" "${_pp_content}")
+endif()
 string(FIND "${_pp_content}" "${_pp_call}" _pp_left)
 string(FIND "${_pp_content}" "static Lexer& lazyverilogStringifyLexer" _pp_ok)
 if(NOT _pp_left EQUAL -1 OR _pp_ok EQUAL -1)
@@ -290,6 +302,33 @@ if(_rep_h_ok EQUAL -1 OR _rep_cpp_ok EQUAL -1)
         "Could not patch LspCpp's RemoteEndPoint with the incoming-message preview hook. "
         "The pinned LspCpp revision has probably moved and the anchors above no longer "
         "match its source. Re-derive them before bumping GIT_TAG.")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Patch: LspCpp's per-thread Context must not be a thread_local with a destructor.
+#
+# MinGW's emulated TLS frees a thread's storage before it runs that thread's
+# thread_local destructors, so the destructor runs on freed memory.  The
+# dispatch thread exits when the server shuts down, and its Context -- a
+# shared_ptr -- turned every such exit into heap corruption (0xC0000374).  The
+# server's own caches avoid thread_local for the same reason.  Idempotent, like
+# the patches above; the replacement is in cmake/lspcpp/.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_ctx_cpp "${lspcpp_SOURCE_DIR}/src/jsonrpc/Context.cpp")
+set(_ctx_anchor "    static thread_local auto c = Context::empty();\n    return c;\n")
+file(READ "${_ctx_cpp}" _ctx_content)
+string(FIND "${_ctx_content}" "LazyVerilog patch: no thread_local destructor" _ctx_done)
+if(_ctx_done EQUAL -1)
+    string(FIND "${_ctx_content}" "${_ctx_anchor}" _ctx_at)
+    if(_ctx_at EQUAL -1)
+        message(FATAL_ERROR
+            "Could not patch LspCpp's Context::current() thread_local. The pinned LspCpp "
+            "revision has probably moved and the anchor above no longer matches its source. "
+            "Re-derive it before bumping GIT_TAG.")
+    endif()
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lspcpp/current_context.cpp.in" _ctx_insert)
+    string(REPLACE "${_ctx_anchor}" "${_ctx_insert}" _ctx_content "${_ctx_content}")
+    file(WRITE "${_ctx_cpp}" "${_ctx_content}")
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────

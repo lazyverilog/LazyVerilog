@@ -8,9 +8,14 @@ static Lexer& lazyverilogStringifyLexer(SmallVectorBase<std::unique_ptr<Lexer>>&
                                         const LexerOptions& options) {
     if (!stack.empty())
         return *stack.back();
-    thread_local std::optional<Lexer> empty;
-    empty.emplace(SourceBuffer{std::string_view("", 1), nullptr, BufferID::getPlaceholder()},
-                  alloc, diagnostics, sourceManager, options);
+    // A pointer, not a thread_local std::optional<Lexer>: MinGW's emulated TLS
+    // frees a thread's storage before its thread_local destructors run, so the
+    // Lexer was destroyed from freed memory whenever a parse thread exited.
+    // At most one Lexer per thread outlives it.
+    thread_local Lexer* empty = nullptr;
+    delete empty;
+    empty = new Lexer(SourceBuffer{std::string_view("", 1), nullptr, BufferID::getPlaceholder()},
+                      alloc, diagnostics, sourceManager, options);
     return *empty;
 }
 
