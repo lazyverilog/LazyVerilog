@@ -1,10 +1,12 @@
 // Measures project-index startup: the work the LSP server does between loading
 // lazyverilog.toml and having a usable ProjectIndexSnapshot.
 //
-//   index-bench <project-root> [repeat] [--cache on|off]
+//   index-bench <project-root> [repeat] [--cache on|off] [--implicit]
 //
-// <project-root> must contain lazyverilog.toml.  Set LAZYVERILOG_TRACE_PERF=1
-// for per-file timings.
+// <project-root> must contain lazyverilog.toml, unless --implicit indexes it
+// the way the server indexes a folder with none: scan_implicit_root() for the
+// files and include path, no defines, shards in the user cache.  Set
+// LAZYVERILOG_TRACE_PERF=1 for per-file timings.
 //
 // The on-disk shard cache is on unless --cache
 // off is passed, and it persists between runs -- so with it on, only the first
@@ -17,7 +19,9 @@
 #include "index_cache.hpp"
 #include "config.hpp"
 #include "filelist.hpp"
+#include "implicit_project.hpp"
 #include "perf_trace.hpp"
+#include "project_root.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -40,9 +44,14 @@ int main(int argc, char** argv) {
     // no such switch, and caching is on there the way clangd's background index
     // is.
     std::optional<bool> cache_override;
+    bool implicit = false;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (arg == "--implicit") {
+            implicit = true;
+            continue;
+        }
         if (arg == "--cache" && i + 1 < argc) {
             const std::string value = argv[++i];
             if (value != "on" && value != "off") {
@@ -55,21 +64,48 @@ int main(int argc, char** argv) {
         positional.push_back(arg);
     }
     if (positional.empty()) {
-        std::cerr << "usage: index-bench <project-root> [repeat] [--cache on|off]\n";
+        std::cerr << "usage: index-bench <project-root> [repeat] [--cache on|off] [--implicit]\n";
         return 2;
     }
     const std::filesystem::path root = std::filesystem::absolute(positional[0]);
     const int repeat = positional.size() > 1 ? std::stoi(positional[1]) : 1;
 
     std::string warn;
-    Config config = load_config(root, &warn);
-    if (!warn.empty())
-        std::cerr << "[config] " << warn << "\n";
-    auto vcode = load_vcode(root, config);
+    Config config;
+    VcodeResult vcode;
+    if (implicit) {
+        const auto scan_start = std::chrono::steady_clock::now();
+        auto scan = scan_implicit_root(root);
+        std::cout << "scan: "
+                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               scan_start)
+                         .count()
+                  << " ms\n";
+        if (scan.over_limit) {
+            std::cerr << "index-bench: " << root.string() << ": " << scan.over_limit_reason << "\n";
+            return 1;
+        }
+        vcode.files = std::move(scan.files);
+        vcode.file_sizes = std::move(scan.file_sizes);
+        vcode.include_dirs = std::move(scan.include_dirs);
+    } else {
+        config = load_config(root, &warn);
+        if (!warn.empty())
+            std::cerr << "[config] " << warn << "\n";
+        vcode = load_vcode(root, config);
+    }
     const bool cache_enabled = cache_override.value_or(true);
     // Empty root is what runs the analyzer uncached, the same way server.cpp
     // spells it.
     const std::string cache_root = cache_enabled ? root.string() : std::string{};
+    // An implicit project's shards go where the server puts them: the user
+    // cache, keyed by the root.
+    std::shared_ptr<IndexCacheStorage> implicit_storage;
+    if (implicit && cache_enabled) {
+        auto resolver = std::make_shared<ProjectRootResolver>();
+        resolver->set_implicit_roots({root});
+        implicit_storage = std::make_shared<IndexCacheStorage>(resolver);
+    }
 
     std::cout << "files=" << vcode.files.size() << " incdirs=" << vcode.include_dirs.size()
               << " defines=" << config.design.define.size()
@@ -80,7 +116,8 @@ int main(int argc, char** argv) {
         analyzer.set_project_index_publish_debounce_ms(0);
         const auto start = std::chrono::steady_clock::now();
         analyzer.set_project_config(config.design.define, vcode.include_dirs, vcode.files,
-                                    cache_root.empty()
+                                    implicit_storage ? implicit_storage
+                                    : cache_root.empty()
                                         ? nullptr
                                         : IndexCacheStorage::for_root(cache_root),
                                     vcode.file_sizes);

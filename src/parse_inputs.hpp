@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /// Everything a parse of one file needs from its project's configuration.
@@ -78,6 +79,11 @@ public:
     /// Register @p inputs for files under @p root.
     void set_for_root(const std::filesystem::path& root, ParseInputs inputs);
 
+    /// Files some lazyverilog.toml's filelist names, normalized.  One of them
+    /// inside an implicit root is still parsed with the defaults: an explicit
+    /// project's file keeps that project's defines.
+    void set_explicit_files(std::shared_ptr<const std::unordered_set<std::string>> files);
+
     /// The inputs @p path is parsed with.  Never null, and stable for the
     /// lifetime of this object.
     const ParseInputs& for_path(const std::filesystem::path& path) const;
@@ -121,6 +127,7 @@ private:
     ParseInputs defaults_;
     /// Stable addresses: for_path() hands out a reference held across a parse.
     std::unordered_map<std::string, std::unique_ptr<ParseInputs>> by_root_;
+    std::shared_ptr<const std::unordered_set<std::string>> explicit_files_;
 };
 
 /// Resolve configured include-directory patterns to existing directories, once.

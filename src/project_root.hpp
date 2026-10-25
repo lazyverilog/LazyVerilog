@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 /// Which project a file belongs to, decided by the server rather than by the
 /// editor.
@@ -26,8 +27,14 @@
 /// config the user wrote is never read.  The file itself is the only input that
 /// cannot be wrong about which project it is in.
 struct ProjectInfo {
-    /// Directory containing the `lazyverilog.toml` that governs the file.
+    /// Directory containing the `lazyverilog.toml` that governs the file, or
+    /// the implicit root it belongs to.
     std::filesystem::path source_root;
+    /// The root is an implicit project: a workspace folder or VCS checkout with
+    /// no lazyverilog.toml, registered through set_implicit_roots().  It is
+    /// served built-in defaults, keeps its shards in the user's cache, and is
+    /// never compiled.
+    bool implicit = false;
 
     bool operator==(const ProjectInfo&) const = default;
 };
@@ -49,6 +56,10 @@ public:
     /// restores searching.
     void set_forced_root(std::filesystem::path directory);
 
+    /// The implicit project roots.  A file no lazyverilog.toml governs belongs
+    /// to the innermost of these that contains it.  A forced root ignores them.
+    void set_implicit_roots(std::vector<std::filesystem::path> roots);
+
     /// What @p path is, when the caller already knows.
     ///
     /// Deciding it here costs an `is_directory()` that the per-directory cache
@@ -62,7 +73,8 @@ public:
     };
 
     /// The project @p path belongs to, or nullopt when no `lazyverilog.toml`
-    /// exists in it or any ancestor.
+    /// exists in it or any ancestor and no implicit root contains it.  A toml
+    /// always wins over an implicit root, wherever the two sit.
     ///
     /// Callers must handle nullopt rather than substituting a root of their
     /// own: "this file is in no project" is a real answer, and the shard cache
@@ -106,7 +118,19 @@ private:
     mutable std::mutex mutex_;
     mutable std::unordered_map<std::string, DirectoryCache> directories_;
     std::filesystem::path forced_root_;
+    /// Normalized and sorted; a handful of entries.
+    std::vector<std::filesystem::path> implicit_roots_;
 };
+
+/// Whether @p root must never become an implicit project: a filesystem or
+/// drive root, the user's home directory or anything above it, or our own
+/// cache.  Scanning any of those indexes whatever the user keeps there rather
+/// than a design.
+bool is_refused_implicit_root(const std::filesystem::path& root);
+
+/// The nearest directory at or above @p directory holding `.git` (a directory,
+/// or the file a worktree has), `.hg` or `.svn`; nullopt when there is none.
+std::optional<std::filesystem::path> find_vcs_root(const std::filesystem::path& directory);
 
 /// Base directory for caches that do not belong to any project, following the
 /// platform's own convention the way LLVM's `llvm::sys::path::cache_directory()`

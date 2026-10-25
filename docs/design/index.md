@@ -49,3 +49,20 @@ is left as written.
 **UVM library.** List the package file and put the headers on an include path. `uvm_pkg.sv` is
 indexed, and its `` `include `` lines resolve through the include directory, so you do not list every
 `.svh`.
+
+## No filelist yet
+
+Without a `lazyverilog.toml`, the server indexes the workspace folder or version-control checkout
+instead. See [Without a lazyverilog.toml](../configuration.md#without-a-lazyverilog-toml).
+
+| | Filelist (`vcode`) | Implicit project |
+|---|---|---|
+| Files | Exactly the listed ones | Every `.sv` and `.v` under the folder, minus tool output |
+| Include directories | `+incdir+` entries | Every directory holding a header, sorted |
+| Defines | `define` | None |
+| Two modules with one name | Only if you list both | Both indexed; rename refuses the name |
+| Whole-design compilation | `[compilation]` | Off |
+| Shards | `.cache/lazyverilog` in the project | The user cache, never the tree |
+
+Write a filelist once go to definition lands in the wrong copy of a module, or an `` `ifdef `` hides
+code you work on.

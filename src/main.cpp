@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <iostream>
 
 #ifdef _WIN32
@@ -15,10 +16,23 @@
 int main(int argc, char* argv[]) {
     print_startup_banner("lazyverilog-lsp", argc, argv);
 
+    // What a folder with no lazyverilog.toml is indexed as; a client's
+    // initializationOptions override it.  For a site wrapper that wants
+    // implicit projects off, or limited to workspace folders, for everyone.
+    ImplicitProjectMode implicit_mode = ImplicitProjectMode::Auto;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "lazyverilog-lsp " << LAZYVERILOG_VERSION << "\n";
             return 0;
+        }
+        constexpr std::string_view kImplicit = "--implicit-project=";
+        if (std::string_view arg = argv[i]; arg.starts_with(kImplicit)) {
+            auto mode = parse_implicit_project_mode(arg.substr(kImplicit.size()));
+            if (!mode) {
+                std::cerr << "lazyverilog-lsp: " << arg << ": expected off, workspace or auto\n";
+                return 2;
+            }
+            implicit_mode = *mode;
         }
     }
 
@@ -28,7 +42,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     {
-        LazyVerilogServer server;
+        LazyVerilogServer server(implicit_mode);
         server.run();
     }
     // Not `return`: exit() flushes every stdio stream, stdin included, and the

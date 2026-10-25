@@ -30,9 +30,13 @@ require("lazyverilog").setup({
 | Option | Default | Effect |
 |--------|---------|--------|
 | `cmd` | auto | Use this server binary instead of `PATH` or the managed download |
+| `cmd_args` | `{}` | Extra server arguments, e.g. `{ "--implicit-project=off" }` |
 | `folding` | `true` | Fold from the server's folding ranges |
 | `inlay_hints` | `true` | Show inlay hints |
 
 Set `folding` or `inlay_hints` to `false` for very large files or a slow machine.
+
+Without a `lazyverilog.toml`, the server indexes the git checkout around the file. See
+[Without a lazyverilog.toml](../configuration.md#without-a-lazyverilog-toml).
 
 Next: [Usage in Neovim](../usage/neovim.md).

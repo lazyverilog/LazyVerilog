@@ -1156,6 +1156,69 @@ TEST_CASE("index cache: an unchanged project is served from the shards", "[index
     CHECK(warm.count("sig_a") == 1);
 }
 
+TEST_CASE("index cache: an unchanged implicit project is served from the user cache",
+          "[index-cache]") {
+    // The implicit project's version of the test above, through the storage
+    // the server builds: the resolver marks the root implicit, so the shards
+    // go to the user cache.  The same sentinel tells a hit from a reparse.
+    CacheProject project("analyzer-implicit-served");
+    project.write("a.sv", "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+    const auto root = project.root();
+    const auto directory = IndexCache::implicit_directory_for(root);
+    if (!directory)
+        return; // no user cache: implicit projects run uncached
+    std::error_code stale;
+    std::filesystem::remove_all(*directory, stale); // a crashed earlier run's shards
+
+    const auto index = [&](Analyzer& analyzer) {
+        auto resolver = std::make_shared<ProjectRootResolver>();
+        resolver->set_implicit_roots({root});
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_project_root_resolver(resolver);
+        analyzer.set_parse_inputs_for_root(root, {}, {}, Analyzer::Reindex::Deferred);
+        analyzer.set_project_config({}, {}, {(root / "a.sv").string()},
+                                    std::make_shared<IndexCacheStorage>(resolver));
+        analyzer.wait_for_background_index_idle();
+        analyzer.wait_for_index_cache_writes_idle();
+        return analyzer.project_index_snapshot();
+    };
+    {
+        Analyzer analyzer;
+        index(analyzer);
+    }
+    CHECK_FALSE(std::filesystem::exists(IndexCache::directory_for(root)));
+
+    size_t edited = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(*directory)) {
+        if (entry.path().extension() != ".idx")
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        in.close();
+        auto loaded = deserialize_index_shard(bytes);
+        REQUIRE(loaded);
+        ValueEntry sentinel;
+        sentinel.name = "only_an_implicit_shard_has_this";
+        sentinel.kind = "variable";
+        sentinel.file_id = kInvalidSourceFileID;
+        loaded->index.values.push_back(sentinel);
+        const auto rewritten =
+            serialize_index_shard(loaded->key, loaded->index, loaded->stands_alone);
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(rewritten.data(), static_cast<std::streamsize>(rewritten.size()));
+        ++edited;
+    }
+    CHECK(edited == 1);
+
+    Analyzer analyzer;
+    const auto warm = snapshot_values(index(analyzer));
+    CHECK(warm.count("only_an_implicit_shard_has_this") == 1);
+    CHECK(warm.count("sig_a") == 1);
+    std::error_code ec;
+    std::filesystem::remove_all(*directory, ec);
+}
+
 TEST_CASE("index cache: the filelist's order does not change the index", "[index-cache]") {
     // The background queue is filled largest-file-first rather than in filelist
     // order, so that one worker is not left on a generated register block while

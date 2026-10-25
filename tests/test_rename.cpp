@@ -1,6 +1,11 @@
 #include "analyzer.hpp"
 #include "features/rename.hpp"
+#include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <set>
 
 TEST_CASE("rename: prepares identifier range and edits all resolved references", "[rename]") {
@@ -429,4 +434,78 @@ endmodule
     // never be rewritten.
     REQUIRE(edits.size() == 1);
     CHECK(edits[0].range.start.line == 1);
+}
+
+namespace {
+
+/// a/dup.sv and b/dup.sv both declare `dup`; a/top_a.sv instantiates it.  The
+/// shape an implicit project scans up from a checkout holding two copies of
+/// one IP, which nobody's filelist chose between.
+struct DuplicateModuleTree {
+    std::filesystem::path root;
+    std::filesystem::path top;
+    std::filesystem::path dup_a;
+    std::filesystem::path dup_b;
+
+    explicit DuplicateModuleTree(const std::string& name) {
+        root = std::filesystem::temp_directory_path() / ("lazyverilog-rename-" + name);
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root / "a");
+        std::filesystem::create_directories(root / "b");
+        root = std::filesystem::canonical(root);
+        top = write("a/top_a.sv", "module top_a;\n  dup u_dup ();\nendmodule\n");
+        dup_a = write("a/dup.sv", "module dup;\nendmodule\n");
+        dup_b = write("b/dup.sv", "module dup;\nendmodule\n");
+    }
+    ~DuplicateModuleTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+
+    std::filesystem::path write(const std::string& relative, const std::string& text) const {
+        auto path = root / relative;
+        std::ofstream(path, std::ios::binary) << text;
+        return path;
+    }
+
+    /// Index all three files, open top_a.sv, and return rename params with the
+    /// cursor on its `dup`.
+    TextDocumentRename::Params open_and_aim(Analyzer& analyzer) const {
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_project_config({}, {}, {top.string(), dup_a.string(), dup_b.string()});
+        analyzer.wait_for_background_index_idle();
+        const auto uri = uri_from_path(top);
+        std::ifstream in(top, std::ios::binary);
+        analyzer.open(uri, std::string(std::istreambuf_iterator<char>(in), {}));
+
+        TextDocumentRename::Params params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.position = lsPosition(1, 3);
+        params.newName = "dup2";
+        return params;
+    }
+};
+
+} // namespace
+
+TEST_CASE("rename refuses a module declared twice in an implicit project", "[rename]") {
+    DuplicateModuleTree tree("implicit-dup");
+    Analyzer analyzer;
+    const auto params = tree.open_and_aim(analyzer);
+
+    CHECK_THROWS_WITH(provide_rename(analyzer, params, /*implicit_project=*/true),
+                      Catch::Matchers::ContainsSubstring("declared 2 times"));
+}
+
+TEST_CASE("rename of a module declared twice is allowed in an explicit project", "[rename]") {
+    // The filelist is the user's own choice of files, so renaming through both
+    // declarations is what they asked for.  Current behaviour, held still.
+    DuplicateModuleTree tree("explicit-dup");
+    Analyzer analyzer;
+    const auto params = tree.open_and_aim(analyzer);
+
+    auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    CHECK(edit.changes->contains(uri_from_path(tree.dup_a)));
+    CHECK(edit.changes->contains(uri_from_path(tree.dup_b)));
 }

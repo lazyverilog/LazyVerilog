@@ -4,6 +4,9 @@ Install LazyVerilog from the
 [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=lazyverilog.lazyverilog-vscode),
 then open a `.sv`, `.svh`, `.v`, or `.vh` file. The extension downloads the server on first use.
 
+Without a `lazyverilog.toml`, the server indexes the workspace folder. See
+[Without a lazyverilog.toml](../configuration.md#without-a-lazyverilog-toml).
+
 ## Use your own server binary
 
 ```json

@@ -298,6 +298,29 @@ rather than a reason to guess: `IndexCache::open_fallback()` puts its shards in
 LLVM's `llvm::sys::path::cache_directory()`.  Guessing the file's own directory
 instead is what used to create `.cache/` beside whatever file was opened.
 
+The one exception is an *implicit project*: a folder the client named (a
+workspace folder) or the nearest VCS checkout, registered by the server with
+`ProjectRootResolver::set_implicit_roots()`.  The resolver consults it only after
+the toml walk misses, innermost root first, and answers with
+`ProjectInfo::implicit` set.  That answer changes three things and nothing else:
+
+- storage: `IndexCache::open_implicit()` puts the shards in
+  `user_cache_directory()/lazyverilog/i/<hash of the root>`, with a `root.txt`
+  naming the folder.  An implicit project never writes into the tree;
+- parse inputs: the folder's include path is every directory holding a header
+  (`scan_implicit_root()`, `src/implicit_project.cpp`), with no defines.  A file
+  that an explicit project's filelist names keeps the defaults, so it parses
+  exactly as it did before implicit projects existed;
+- compilation: none.  `config_for()` gives an implicit file the session
+  defaults, and no `CompilationGroup` is made for the folder.
+
+The scan runs on its own thread and is applied under `projects_mutex_` through
+`reload_all_projects()`, which folds explicit projects first and implicit roots
+after, in sorted order.  A folder past the scan's limits is given up rather
+than truncated: half a design indexes as a design with dangling instances.
+When a `lazyverilog.toml` appears at or above an implicit root, the next
+`reload_all_projects()` drops the root and deletes its `i/<hash>` directory.
+
 A shard is reused only when everything it was built from still holds:
 
 - the file's own contents;

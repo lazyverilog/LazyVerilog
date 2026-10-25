@@ -18,6 +18,10 @@ Examples
     tools/startup_bench.py --cpus 0                 # emulate a 1-CPU slice
     tools/startup_bench.py --trace                  # per-file timing summary
     tools/startup_bench.py --json                   # machine-readable output
+    tools/startup_bench.py --implicit path/to/dir   # a folder with no toml
+
+On Windows, user/sys CPU and peak working set come from the child's process
+handle; --cpus (taskset) is Linux only.
 """
 from __future__ import annotations
 
@@ -25,16 +29,21 @@ import argparse
 import json
 import os
 import re
-import resource
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
+try:
+    import resource
+except ImportError:          # Windows
+    resource = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_BINARY = REPO_ROOT / "build" / "index-bench"
+DEFAULT_BINARY = REPO_ROOT / "build" / ("index-bench.exe" if os.name == "nt" else "index-bench")
 DEFAULT_PROJECT = REPO_ROOT / "tests" / "rtl" / "opentitan"
 
 # index-bench prints: "run 0: 1234.5 ms, shards=1082, modules=816"
@@ -42,6 +51,36 @@ RUN_LINE = re.compile(r"run\s+\d+:\s+([0-9.]+)\s+ms,\s+shards=(\d+),\s+modules=(
 # LAZYVERILOG_TRACE_PERF=1 prints:
 #   "[lazyverilog][perf] make_file_state_with_options file:///x: 12345us"
 TRACE_LINE = re.compile(r"^\[lazyverilog\]\[perf\]\s+(.*):\s+(\d+)us$")
+# index-bench --implicit prints: "scan: 12.3 ms"
+SCAN_LINE = re.compile(r"^scan:\s+([0-9.]+)\s+ms")
+
+
+def run_windows(cmd: list[str], env: dict[str, str]):
+    """Run @p cmd; return (proc, wall_ms, user_s, sys_s, peak_mb) from its handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t)] + \
+                   [(name, ctypes.c_size_t) for name in (
+                       "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                       "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                       "PagefileUsage", "PeakPagefileUsage")]
+
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    proc.stdout_text, proc.stderr_text = proc.communicate()
+    wall_ms = (time.monotonic() - start) * 1000.0
+    handle = wintypes.HANDLE(int(proc._handle))
+    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+    ctypes.windll.kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                           ctypes.byref(kernel), ctypes.byref(user))
+    counters = Counters(cb=ctypes.sizeof(Counters))
+    ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+    seconds = lambda t: ((t.dwHighDateTime << 32) | t.dwLowDateTime) / 1e7  # noqa: E731
+    return proc, wall_ms, seconds(user), seconds(kernel), counters.PeakWorkingSetSize / 2**20
 
 
 def run_once(cmd: list[str], env: dict[str, str]) -> dict:
@@ -50,37 +89,49 @@ def run_once(cmd: list[str], env: dict[str, str]) -> dict:
     getrusage(RUSAGE_CHILDREN) is cumulative over all reaped children, so the
     deltas around this call are what belong to this run.
     """
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    start = time.monotonic()
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    wall_ms = (time.monotonic() - start) * 1000.0
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if resource is None:
+        proc, wall_ms, user_s, sys_s, max_rss_mb = run_windows(cmd, env)
+        stdout, stderr = proc.stdout_text, proc.stderr_text
+    else:
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        start = time.monotonic()
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        wall_ms = (time.monotonic() - start) * 1000.0
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        stdout, stderr = proc.stdout, proc.stderr
+        user_s = after.ru_utime - before.ru_utime
+        sys_s = after.ru_stime - before.ru_stime
+        # ru_maxrss is a high-water mark across all children, not a delta, so
+        # report it as-is rather than subtracting.
+        max_rss_mb = after.ru_maxrss / 1024.0
 
     if proc.returncode != 0:
-        sys.stderr.write(proc.stdout + proc.stderr)
+        sys.stderr.write(stdout + stderr)
         raise SystemExit(f"index-bench exited {proc.returncode}")
 
     shards = modules = 0
     reported_ms = None
-    for line in proc.stdout.splitlines():
+    scan_ms = None
+    for line in stdout.splitlines():
         if match := RUN_LINE.search(line):
             reported_ms = float(match.group(1))
             shards = int(match.group(2))
             modules = int(match.group(3))
+        elif match := SCAN_LINE.search(line):
+            scan_ms = float(match.group(1))
 
     return {
         # index-bench times set_project_config + wait_for_idle; the wall figure
         # here also includes process start-up and config load.
         "index_ms": reported_ms if reported_ms is not None else wall_ms,
+        "scan_ms": scan_ms,
         "wall_ms": wall_ms,
-        "user_s": after.ru_utime - before.ru_utime,
-        "sys_s": after.ru_stime - before.ru_stime,
-        # ru_maxrss is a high-water mark across all children, not a delta, so
-        # report it as-is rather than subtracting.
-        "max_rss_mb": after.ru_maxrss / 1024.0,
+        "user_s": user_s,
+        "sys_s": sys_s,
+        "max_rss_mb": max_rss_mb,
         "shards": shards,
         "modules": modules,
-        "stderr": proc.stderr,
+        "stderr": stderr,
     }
 
 
@@ -137,6 +188,10 @@ def main() -> int:
                         help="run with the shard cache disabled entirely, measuring the "
                              "parse with nothing written or read.  A bench-only knob: "
                              "the server always caches.")
+    parser.add_argument("--implicit", action="store_true",
+                        help="index the project directory as a folder with no "
+                             "lazyverilog.toml (an implicit project): scan time is reported, "
+                             "and shards go to a temporary user cache")
     parser.add_argument("--label", default="", help="tag printed with the results")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args()
@@ -145,7 +200,7 @@ def main() -> int:
     if not binary.is_file():
         raise SystemExit(f"{binary} not found — build first: cmake --build build -j$(nproc)")
     project = Path(args.project)
-    if not (project / "lazyverilog.toml").is_file():
+    if not args.implicit and not (project / "lazyverilog.toml").is_file():
         raise SystemExit(f"{project}/lazyverilog.toml not found")
 
     if args.warm and args.no_cache:
@@ -154,6 +209,8 @@ def main() -> int:
     cmd = [str(binary), str(project), "1"]
     if args.no_cache:
         cmd += ["--cache", "off"]
+    if args.implicit:
+        cmd += ["--implicit"]
     if args.cpus:
         if not shutil.which("taskset"):
             raise SystemExit("--cpus needs taskset (Linux only)")
@@ -170,15 +227,32 @@ def main() -> int:
     # unless something clears it, and the median of that mixture is a warm
     # number wearing a cold label.
     shard_cache = project / ".cache" / "lazyverilog" / "index"
+    user_cache = None
+    if args.implicit:
+        # An implicit project's shards live in the user cache; point that at a
+        # directory this run owns, so clearing it touches nothing real.
+        user_cache = Path(tempfile.mkdtemp(prefix="lazyverilog-startup-bench-"))
+        env["LOCALAPPDATA"] = env["XDG_CACHE_HOME"] = str(user_cache)
+        if sys.platform == "darwin":
+            env["HOME"] = str(user_cache)
+            shard_cache = user_cache / "Library" / "Caches" / "lazyverilog"
+        else:
+            shard_cache = user_cache / "lazyverilog"
 
     def clear_shard_cache() -> None:
         shutil.rmtree(shard_cache, ignore_errors=True)
 
     runs = []
-    for _ in range(args.repeat):
-        if not args.warm and not args.no_cache:
-            clear_shard_cache()
-        runs.append(run_once(cmd, env))
+    try:
+        if args.implicit and args.warm:
+            run_once(cmd, env)   # the cache starts empty: fill it, untimed
+        for _ in range(args.repeat):
+            if not args.warm and not args.no_cache:
+                clear_shard_cache()
+            runs.append(run_once(cmd, env))
+    finally:
+        if user_cache:
+            shutil.rmtree(user_cache, ignore_errors=True)
 
     if args.warm:
         mode = "warm"
@@ -206,6 +280,8 @@ def main() -> int:
         "sys_s_median": statistics.median(r["sys_s"] for r in runs),
         "max_rss_mb": max(r["max_rss_mb"] for r in runs),
     }
+    if args.implicit:
+        result["scan_ms_median"] = statistics.median(r["scan_ms"] or 0.0 for r in runs)
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -215,6 +291,8 @@ def main() -> int:
             head += f" [{args.label}]"
         print(f"{head}  cpus={result['cpus']}  runs={args.repeat}  {mode}")
         print(f"  shards={result['shards']} modules={result['modules']}")
+        if args.implicit:
+            print(f"  scan    {result['scan_ms_median']:8.1f} ms median")
         print(f"  index   {result['index_ms_median']:8.1f} ms median "
               f"({result['index_ms_min']:.1f}–{result['index_ms_max']:.1f})")
         print(f"  user    {result['user_s_median']:8.2f} s")

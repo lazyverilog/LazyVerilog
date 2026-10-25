@@ -1150,6 +1150,28 @@ void Analyzer::change(const std::string& uri, const std::string& text) {
 }
 
 uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
+    return enqueue_parse_if_current(uri, std::move(text), nullptr);
+}
+
+void Analyzer::reparse_open_documents_under(const std::filesystem::path& root) {
+    std::vector<std::shared_ptr<const DocumentState>> picked;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        for (const auto& [uri, state] : docs_) {
+            if (!state)
+                continue;
+            const std::filesystem::path path(state->normalized_path);
+            if (std::mismatch(root.begin(), root.end(), path.begin(), path.end()).first ==
+                root.end())
+                picked.push_back(state);
+        }
+    }
+    for (const auto& state : picked)
+        enqueue_parse_if_current(state->uri, state->text, state.get());
+}
+
+uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string text,
+                                            const DocumentState* expected) {
     uint64_t version = ++version_counter_;
 
     std::string path = path_from_file_uri(uri);
@@ -1160,6 +1182,13 @@ uint64_t Analyzer::enqueue_parse(const std::string& uri, std::string text) {
 
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
+        // A reparse of the text a buffer already has must not overwrite an edit
+        // that landed since that text was read.
+        if (expected) {
+            const auto it = docs_.find(uri);
+            if (it == docs_.end() || it->second.get() != expected)
+                return 0;
+        }
         // This placeholder replaces the parsed snapshot before the worker has
         // produced a new one, so carry its `include list forward.  What a file
         // included one keystroke ago is the best available answer until the
@@ -6968,13 +6997,22 @@ void Analyzer::set_project_compilation_inputs(std::vector<ProjectCompilationInpu
     // `root` is left as given: it arrives from ProjectRootResolver, which
     // already normalizes, and it is the key ProjectParseInputs::by_root_ was
     // populated under -- rewriting it here would make for_root() miss.
+    auto explicit_files = std::make_shared<std::unordered_set<std::string>>();
     for (auto& project : inputs)
-        for (auto& file : project.files)
+        for (auto& file : project.files) {
             file = normalize_filesystem_path(file).string();
+            explicit_files->insert(file);
+        }
 
     auto shared = std::make_shared<const std::vector<ProjectCompilationInputs>>(std::move(inputs));
     std::lock_guard<std::mutex> lock(map_mutex_);
     project_compilation_inputs_ = std::move(shared);
+    // Every explicit project registers here, and only explicit ones do, so this
+    // is also the set ProjectParseInputs needs to keep a filelist entry inside
+    // an implicit root on the defaults.
+    auto next = std::make_shared<ProjectParseInputs>(*parse_inputs_);
+    next->set_explicit_files(std::move(explicit_files));
+    parse_inputs_ = std::move(next);
 }
 
 void Analyzer::set_project_root_resolver(std::shared_ptr<const ProjectRootResolver> resolver) {

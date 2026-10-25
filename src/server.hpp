@@ -3,15 +3,19 @@
 #include "config.hpp"
 #include "cancelled_requests.hpp"
 #include "edit_watermark.hpp"
+#include "implicit_project.hpp"
 #include "index_cache.hpp"
 #include "project_root.hpp"
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // Forward declarations to avoid pulling in LspCpp headers here
 class RemoteEndPoint;
@@ -19,7 +23,9 @@ class BackgroundCompiler;
 
 class LazyVerilogServer {
   public:
-    explicit LazyVerilogServer();
+    /// @p implicit_mode is the `--implicit-project=` flag; the client's
+    /// `initializationOptions` override it.
+    explicit LazyVerilogServer(ImplicitProjectMode implicit_mode = ImplicitProjectMode::Auto);
     ~LazyVerilogServer();
 
     /// Block until server exits (stdin closed or exit notification received).
@@ -147,6 +153,23 @@ class LazyVerilogServer {
     /// which project files *under* it belong to, including files already open.
     void reload_all_projects();
 
+    /// Scan @p root as an implicit project on a worker thread, unless it was
+    /// considered before, is refused (home, filesystem root, our cache), or a
+    /// lazyverilog.toml governs it.  The result is applied by
+    /// apply_implicit_scan().
+    void consider_implicit_root(const std::filesystem::path& root);
+    /// `auto` mode: consider the VCS root above @p uri's file, which no toml
+    /// and no implicit root governs.
+    void consider_vcs_root_for(std::string_view uri);
+    /// Register a finished scan and rebuild the projects.  Runs on the scan
+    /// worker; over the limits it warns once and registers nothing.
+    void apply_implicit_scan(const std::string& root, ImplicitScan scan);
+    /// The implicit half of reload_all_projects(): add each scan's files to the
+    /// index and register its include path.  No defines, no compilation.
+    void fold_implicit_root(const std::string& root, const ImplicitScan& scan);
+    /// window/showMessage at warning level, from any thread.
+    void show_warning(const std::string& message);
+
     /// Project roots already folded in by discover_project_for(), so a burst of
     /// didOpens in one project reloads its filelist once rather than per file.
     ///
@@ -188,6 +211,29 @@ class LazyVerilogServer {
     /// included, as normalized absolute paths.  What
     /// workspace/didChangeWatchedFiles compares a reported `.f` against.
     std::set<std::string> project_filelists_;
+
+    /// Implicit projects; see implicit_project.hpp.  Mode and excludes are
+    /// settled at initialize.
+    ImplicitProjectMode implicit_mode_;
+    std::vector<std::string> implicit_exclude_;
+    /// Every root considered for an implicit project, scanned or not, so each
+    /// is decided once per session.  `lazyverilog.rescan` clears it.
+    std::set<std::string> implicit_considered_;
+    /// The scans that succeeded, by root.  Ordered: reload folds them in this
+    /// order, after every explicit project.
+    std::map<std::string, ImplicitScan> implicit_scans_;
+    /// Directories whose VCS root `auto` mode has already looked for.
+    std::set<std::string> vcs_checked_dirs_;
+    std::vector<std::thread> scan_threads_;
+    std::atomic<bool> stopping_{false};
+    /// Guards every project accumulator above.  They were the dispatch
+    /// thread's alone until a scan worker started applying its result; the
+    /// dispatch thread cannot be posted to, so both lock.  Recursive because
+    /// discover/reload/apply nest.
+    std::recursive_mutex projects_mutex_;
+    /// any_project_compiles(), published for the parse workers that ask it
+    /// without the lock.
+    std::atomic<bool> any_project_compiles_{false};
 
     mutable std::mutex config_cache_mutex_;
     /// Keyed by project root; the empty key is "no project", served defaults.
