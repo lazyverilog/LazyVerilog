@@ -622,6 +622,22 @@ add_test(
             ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+# The shipped Neovim plugin against the real server.  Skipped (not
+# registered) where nvim is not installed.
+find_program(LAZYVERILOG_NVIM nvim)
+if(LAZYVERILOG_NVIM)
+    add_test(
+        NAME nvim-client-smoke
+        COMMAND ${LAZYVERILOG_NVIM} --headless -u NONE -i NONE
+                -c "luafile ${CMAKE_CURRENT_SOURCE_DIR}/tests/nvim_client_smoke.lua"
+    )
+    set_tests_properties(nvim-client-smoke PROPERTIES
+        TIMEOUT 60
+        ENVIRONMENT "LAZYVERILOG_REPO=${CMAKE_CURRENT_SOURCE_DIR};LAZYVERILOG_LSP=$<TARGET_FILE:lazyverilog-lsp>")
+else()
+    message(STATUS "nvim not found: nvim-client-smoke not registered")
+endif()
+
 # LSP session fuzzer (tools/lsp_fuzz.py, docs/dev/fuzzing.md).  --server is
 # split POSIX-style, so the binary path is single-quoted.
 find_package(Python3 COMPONENTS Interpreter)

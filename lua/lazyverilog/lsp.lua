@@ -581,9 +581,11 @@ local function start_lsp(cfg, cmd, bufnr)
 		-- a monorepo outranking the lazyverilog.toml next to the file.  The
 		-- server now walks up from each file itself.
 		--
-		-- Leaving it nil also means one client for every SystemVerilog buffer in
-		-- the session rather than one per guessed root, which is what lets a
-		-- single server serve files from several projects at once.
+		-- One client serves every SystemVerilog buffer in the session, which is
+		-- what lets a single server serve files from several projects at once.
+		-- That takes the reuse_client below: Neovim's default only reuses a
+		-- client whose root_dir matches, so with no root_dir every buffer (and
+		-- every autocmd that calls start) got a server process of its own.
 		filetypes    = cfg.filetypes,
 		capabilities = cfg.capabilities,
 		on_attach    = combined_on_attach,
@@ -612,7 +614,10 @@ local function start_lsp(cfg, cmd, bufnr)
 			debounce_text_changes = 150,
 		},
 	}, {
-		bufnr = bufnr,
+		bufnr        = bufnr,
+		reuse_client = function(client, config)
+			return client.name == config.name
+		end,
 	})
 end
 
