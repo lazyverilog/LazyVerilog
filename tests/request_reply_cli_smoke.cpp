@@ -117,7 +117,7 @@ int cancelled_request_errors(const fs::path& server_bin, const fs::path& work) {
 
 /// AutoArg-on-save must not depend on whether the parse has landed.
 ///
-/// Format-on-save arrives from BufWritePre, right behind the didChange that
+/// Format-on-save arrives as willSaveWaitUntil, right behind the didChange that
 /// carried the last keystroke, so the snapshot the handler finds is routinely
 /// the text-only placeholder `enqueue_parse()` installed.  Testing `state->tree`
 /// there made AutoArg run or not run depending on that race, which a user
@@ -168,9 +168,8 @@ bool autoarg_on_save_after_edit(const fs::path& server_bin, const fs::path& work
                      R"("textDocument":{"uri":")" + doc_uri + R"(","version":2},)"
                      R"("contentChanges":[{"range":{"start":{"line":0,"character":0},)"
                      R"("end":{"line":0,"character":0}},"text":"// edit\n"}]}})");
-        out << frame(R"({"jsonrpc":"2.0","id":40,"method":"textDocument/formatting","params":{)"
-                     R"("textDocument":{"uri":")" + doc_uri + R"("},)"
-                     R"("options":{"tabSize":4,"insertSpaces":true}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":40,"method":"textDocument/willSaveWaitUntil",)"
+                     R"("params":{"textDocument":{"uri":")" + doc_uri + R"("},"reason":1}})");
         out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
     }
 
@@ -187,6 +186,62 @@ bool autoarg_on_save_after_edit(const fs::path& server_bin, const fs::path& work
     // -- in place of the empty `module aa();` the source has.
     const auto reply = result.stdout_text.substr(at, 400);
     return !contains(reply, "module aa();") && contains(reply, "i_clk,");
+}
+
+/// The text of the reply to request `id`, up to the next message.
+std::string reply_for(const std::string& out, int id) {
+    const auto at = out.find(R"("id":)" + std::to_string(id));
+    if (at == std::string::npos)
+        return {};
+    const auto next = out.find("Content-Length", at);
+    return out.substr(at, next == std::string::npos ? std::string::npos : next - at);
+}
+
+struct SaveReplies {
+    bool advertised       = false; // initialize says willSaveWaitUntil
+    bool formatting_edits = false; // textDocument/formatting returned an edit
+    bool save_edits       = false; // textDocument/willSaveWaitUntil returned an edit
+};
+
+/// Format Document and save are separate paths: textDocument/formatting always
+/// formats, and willSaveWaitUntil formats only when enable_format_on_save is
+/// set.  Formatting used to double as the save hook, so with the option off a
+/// manual "Format Document" silently did nothing.
+SaveReplies save_and_format(const fs::path& server_bin, const fs::path& work, bool on_save) {
+    const fs::path project = work / (on_save ? "save_on" : "save_off");
+    fs::create_directories(project);
+    {
+        std::ofstream toml(project / "lazyverilog.toml");
+        toml << "[design]\nvcode = \"lv.f\"\n"
+             << "[format]\nenable_format_on_save = " << (on_save ? "true" : "false") << "\n";
+        std::ofstream flist(project / "lv.f");
+    }
+    const std::string root_uri = "file://" + (project / "").generic_string();
+    const std::string doc_uri  = "file://" + (project / "f.sv").generic_string();
+    const fs::path input = project / "save.jsonrpc";
+    {
+        std::ofstream out(input, std::ios::binary);
+        out << frame(R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{)"
+                     R"("processId":1,"rootUri":")" + root_uri + R"(","capabilities":{}}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"initialized","params":{}})");
+        // Unindented body: any formatting pass rewrites it.
+        out << frame(R"({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{)"
+                     R"("uri":")" + doc_uri + R"(","languageId":"systemverilog","version":1,)"
+                     R"("text":"module f;\nlogic x;\nendmodule\n"}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":60,"method":"textDocument/formatting","params":{)"
+                     R"("textDocument":{"uri":")" + doc_uri + R"("},)"
+                     R"("options":{"tabSize":4,"insertSpaces":true}}})");
+        out << frame(R"({"jsonrpc":"2.0","id":61,"method":"textDocument/willSaveWaitUntil",)"
+                     R"("params":{"textDocument":{"uri":")" + doc_uri + R"("},"reason":1}})");
+        out << frame(R"({"jsonrpc":"2.0","method":"exit","params":{}})");
+    }
+    const auto result = run_command(server_bin, "< " + shell_quote(input));
+    expect(result.exit_code == 0, "the server exits cleanly after formatting and a save");
+    const auto fmt  = reply_for(result.stdout_text, 60);
+    const auto save = reply_for(result.stdout_text, 61);
+    expect(!save.empty(), "willSaveWaitUntil is answered");
+    return {contains(result.stdout_text, R"("willSaveWaitUntil":true)"), contains(fmt, "newText"),
+            contains(save, "newText")};
 }
 
 /// A didChange for a document that was never opened must not open it.
@@ -333,6 +388,15 @@ int main(int argc, char** argv) {
     // AutoArg.
     expect(autoarg_on_save_after_edit(server_bin, work),
            "autoarg_on_save fills the port list for a save behind an edit");
+
+    const auto off = save_and_format(server_bin, work, false);
+    expect(off.advertised, "initialize advertises willSaveWaitUntil");
+    expect(off.formatting_edits,
+           "textDocument/formatting formats with enable_format_on_save off");
+    expect(!off.save_edits, "willSaveWaitUntil leaves the file alone with the option off");
+    const auto on = save_and_format(server_bin, work, true);
+    expect(on.formatting_edits, "textDocument/formatting formats with enable_format_on_save on");
+    expect(on.save_edits, "willSaveWaitUntil formats with enable_format_on_save on");
 
     expect(change_without_open_is_ignored(server_bin, work),
            "a didChange for an unopened file does not create a buffer");

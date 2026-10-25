@@ -226,8 +226,9 @@ private:
         }
     }
 
-    // `` `DV_CHECK_FATAL(a   ==   b ,  "msg" ) `` -- a macro listed under
-    // `[format.macros] whitespace_sensitive` may stringify or paste what it is
+    // `` `DV_CHECK_FATAL(a   ==   b ,  "msg" ) `` -- a macro a project lists
+    // under `[format.macros] whitespace_sensitive` (no macro is listed by
+    // default; OpenTitan lists this one) may stringify or paste what it is
     // given, so the text between its parentheses is part of what the source
     // says.  Freeze it here as one verbatim token, the way a multi-line
     // `` `define `` and a format-off region are: a pass can only reproduce a

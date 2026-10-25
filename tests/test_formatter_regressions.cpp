@@ -6416,7 +6416,8 @@ endmodule
 // itself is still placed, indented and ended like any other macro.
 TEST_CASE("formatter regression: whitespace_sensitive macro arguments are verbatim",
           "[formatter][regression]") {
-    FormatOptions opts; // DV_CHECK_FATAL is whitespace-sensitive by default
+    FormatOptions opts;
+    opts.macros.whitespace_sensitive = {"DV_CHECK_FATAL"};
     const std::string input = R"SV(
 module m;
   initial begin

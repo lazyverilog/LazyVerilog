@@ -33,6 +33,7 @@
 #include "LibLsp/lsp/textDocument/completion.h"
 #include "LibLsp/lsp/textDocument/declaration_definition.h"
 #include "LibLsp/lsp/textDocument/formatting.h"
+#include "LibLsp/lsp/textDocument/willSave.h"
 #include "LibLsp/lsp/textDocument/hover.h"
 #include "LibLsp/lsp/textDocument/inlayHint.h"
 #include "LibLsp/lsp/textDocument/prepareRename.h"
@@ -1068,10 +1069,14 @@ void LazyVerilogServer::register_handlers() {
             caps.positionEncoding =
                 std::string(position_encoding_name(negotiated_position_encoding()));
 
-            // Text document sync: incremental + open/close notifications
+            // Text document sync: incremental + open/close notifications, and
+            // willSaveWaitUntil, which is the only save path: format-on-save and
+            // AutoArg-on-save run there, so textDocument/formatting can always
+            // format and the client needs no save hook of its own.
             lsTextDocumentSyncOptions sync_opts;
             sync_opts.openClose = true;
             sync_opts.change = lsTextDocumentSyncKind::Incremental;
+            sync_opts.willSaveWaitUntil = true;
             caps.textDocumentSync = std::make_pair(optional<lsTextDocumentSyncKind>{},
                                                    optional<lsTextDocumentSyncOptions>(sync_opts));
 
@@ -1557,8 +1562,32 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── textDocument/formatting ───────────────────────────────────────────────
+    // Always formats: this is the user's explicit "Format Document".  What
+    // happens on save -- [format].enable_format_on_save, AutoArg-on-save -- is
+    // willSaveWaitUntil's job below.
     ep.registerHandler([&, show_warning](const td_formatting::request& req) {
         td_formatting::response rsp;
+        rsp.id = req.id;
+        try {
+            const auto& uri = req.params.textDocument.uri.raw_uri_;
+            auto state = analyzer_.get_state(uri);
+            if (state) {
+                // This file's project's formatter options, not the session's.
+                std::string text = format_source(state->text, config_for(uri)->format);
+                if (text != state->text)
+                    rsp.result.push_back(whole_document_edit(*state, text));
+            }
+        } catch (const SafeModeError& e) {
+            show_warning(e.what());
+        } catch (const std::exception& e) {
+            std::cerr << "[lazyverilog] formatting error: " << e.what() << "\n";
+        }
+        return rsp;
+    });
+
+    // ── textDocument/willSaveWaitUntil ────────────────────────────────────────
+    ep.registerHandler([&, show_warning](const td_willSaveWaitUntil::request& req) {
+        td_willSaveWaitUntil::response rsp;
         rsp.id = req.id;
         try {
             const auto& uri = req.params.textDocument.uri.raw_uri_;
@@ -1571,8 +1600,8 @@ void LazyVerilogServer::register_handlers() {
                 // for.
                 const auto file_config = config_for(uri);
                 FormatOptions save_format = file_config->format;
-                // AutoArg needs a tree for *this* text, and format-on-save
-                // arrives from BufWritePre -- right behind the didChange that
+                // AutoArg needs a tree for *this* text, and willSaveWaitUntil
+                // arrives right on save -- right behind the didChange that
                 // carried the last keystroke -- so `state` is routinely the
                 // text-only placeholder and `state->tree` is null.  Testing it
                 // there made AutoArg-on-save run or not run depending on
@@ -1593,15 +1622,19 @@ void LazyVerilogServer::register_handlers() {
                 // stale one; this is a save, the user is not typing, and the
                 // client is blocking on the reply anyway.  150 ms is also less
                 // than a 12k-line file's parse, which is exactly the size where
-                // AutoArg-on-save was dropping out.  Still bounded, so a file
-                // that never parses costs one formatting pass without AutoArg
-                // rather than the dispatch thread.
-                const auto parsed =
-                    analyzer_.get_parsed_state(uri, std::chrono::seconds(2));
+                // AutoArg-on-save was dropping out.  But clients drop a late
+                // willSaveWaitUntil reply whole (Neovim after 1000 ms, VS Code
+                // after 1500 ms), formatting included, so stay under both: a
+                // parse that misses costs AutoArg for this save, not the save.
+                // Only AutoArg needs the tree; a save that does not run it
+                // never waits.
+                std::shared_ptr<const DocumentState> parsed;
+                if (file_config->autoarg.autoarg_on_save)
+                    parsed = analyzer_.get_parsed_state(uri, std::chrono::milliseconds(800));
                 const DocumentState* ast =
                     parsed && parsed->tree && parsed->text == state->text ? parsed.get()
                                                                           : nullptr;
-                if (file_config->autoarg.autoarg_on_save && ast) {
+                if (ast) {
                     auto results = autoarg_all_modules(*ast);
                     // apply back-to-front so earlier offsets stay valid
                     std::sort(results.begin(), results.end(),
@@ -1636,7 +1669,7 @@ void LazyVerilogServer::register_handlers() {
         } catch (const SafeModeError& e) {
             show_warning(e.what());
         } catch (const std::exception& e) {
-            std::cerr << "[lazyverilog] formatting error: " << e.what() << "\n";
+            std::cerr << "[lazyverilog] willSaveWaitUntil error: " << e.what() << "\n";
         }
         return rsp;
     });

@@ -21,3 +21,11 @@ Open the Command Palette with `Ctrl+Shift+P`:
 | `LazyVerilog: Show RTL Hierarchy (Reverse)` | Open the reverse hierarchy from the current module |
 | `LazyVerilog: Interface` | Inspect and edit instance connections ([Interface](../interface.md)) |
 | `LazyVerilog: Connect` | Connect two modules through the hierarchy ([Connect](../connect.md)) |
+
+## Formatting
+
+`Format Document` (`Shift+Alt+F`) and `LazyVerilog: Format Document` always format. Saving formats
+only when `[format].enable_format_on_save = true` is set in `lazyverilog.toml`: the server formats
+in `textDocument/willSaveWaitUntil`, which VS Code sends on every save, so `editor.formatOnSave`
+is not needed. If you also turn on `editor.formatOnSave` for these files, a save formats twice
+(the second pass changes nothing).
