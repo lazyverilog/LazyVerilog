@@ -102,7 +102,7 @@ def main() -> int:
         os.environ["LOCALAPPDATA"] = str(cache)
         os.environ["XDG_CACHE_HOME"] = str(cache)
         if sys.platform == "darwin":
-            os.environ["HOME"] = str(tmp / "home")
+            os.environ["HOME"] = str(cache)  # user cache: $HOME/Library/Caches
 
         failures = []
         reached, messages = run(args.binary, ws, None, args.timeout)
