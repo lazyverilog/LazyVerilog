@@ -895,6 +895,12 @@ class Analyzer {
     /// Narrower counterpart for a change to docs_ rather than to the shards.
     /// Requires map_mutex_.
     void invalidate_open_file_snapshot_locked(const std::string& uri) const;
+    /// Whether anything make_state() looks through includes @p uri.  Requires
+    /// map_mutex_.
+    bool has_includer_locked(const std::string& uri, const std::string& normalized_path) const;
+    /// Bumps include_graph_generation_ when @p uri's committed `include list
+    /// differs from the last one seen.  Requires map_mutex_.
+    void note_open_include_graph_locked(const std::string& uri) const;
     std::shared_ptr<const std::vector<ExtraFileInfo>> build_extra_file_snapshot_locked() const;
     /// The current ExtraFileInfo snapshot, built or brought up to date.
     /// Requires map_mutex_.
@@ -996,6 +1002,12 @@ class Analyzer {
     /// dependency list the caller already holds.
     mutable std::unordered_map<std::string, std::unordered_set<std::string>>
         extra_cache_includers_;
+    /// Changes whenever a file could have started or stopped including another:
+    /// a shard with a new `include list, or an open buffer's.  A header with no
+    /// includer is looked for again only after it moves.  Guarded by map_mutex_.
+    mutable uint64_t include_graph_generation_{1};
+    mutable uint64_t includer_scan_generation_{0};
+    mutable std::unordered_map<std::string, std::vector<std::string>> open_include_graph_;
     mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_cache_;
     // Numbers the full build extra_file_snapshot_cache_ was patched from (same
     // entries, same order); every build takes a new one.  A number, not the
