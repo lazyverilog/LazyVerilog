@@ -498,6 +498,11 @@ class Analyzer {
     /// meanwhile keeps its edit.
     void reparse_open_documents_under(const std::filesystem::path& root);
 
+    /// Parse again every open buffer that was parsed with no includer known and
+    /// now has one -- the includer was opened, or its shard arrived -- so a
+    /// header opened first still gets its includer's macros.
+    void reparse_open_headers_missing_includer();
+
     /// Server registers this once.  Called on worker thread after a parse commits.
     void set_parse_complete_callback(
         std::function<void(const std::string& uri)> cb);
