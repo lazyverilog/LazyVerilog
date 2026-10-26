@@ -3,8 +3,10 @@
 `lazyverilog-fmt` formats one SystemVerilog file. See [CLI tools](../cli.md) to build it.
 
 ```bash
-lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>
+lazyverilog-fmt [-i|--in-place] [--log <log-dir>] [--] <file>
 ```
+
+One file per run. `--` ends the options, for a file whose name starts with `-`.
 
 | Flag | Description |
 |------|-------------|

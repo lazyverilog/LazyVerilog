@@ -4,10 +4,11 @@
 diagnostics. See [CLI tools](../cli.md) to build it.
 
 ```bash
-lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] [--maxerror <n>] [--nowarn <code>]... [<file>]
+lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] [--maxerror <n>] [--nowarn <code>]... [--] [<file>]
 ```
 
-Give at least `-f <filelist>` or `<file>`.
+Give at least `-f <filelist>` or `<file>`, and at most one `<file>` (use `-f` for more). `--` ends
+the options, for a file whose name starts with `-`.
 
 | Flag | Description |
 |------|-------------|
