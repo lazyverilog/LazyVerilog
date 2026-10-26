@@ -39,7 +39,7 @@ std::string macro_body_text(const DefineDirectiveSyntax& def) {
 
 MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
                                    const slang::SourceManager& sm,
-                                   const DefineDirectiveSyntax& def) {
+                                   const DefineDirectiveSyntax& def, bool with_body) {
     MacroEntry mac;
     mac.name = std::string(def.name.valueText());
     mac.file_id = resolver.for_declaration_token(index, sm, def.name);
@@ -51,7 +51,8 @@ MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& res
         }
     }
     std::tie(mac.line, mac.col) = token_pos_line1_col0(sm, def.name);
-    mac.body = macro_body_text(def);
+    if (with_body)
+        mac.body = macro_body_text(def);
     return mac;
 }
 

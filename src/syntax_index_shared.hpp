@@ -218,11 +218,12 @@ member_subroutine_prototype(const slang::syntax::MemberSyntax& member);
 /// their trivia, trimmed.  Shared by the live-tree hover and the shard entry.
 std::string macro_body_text(const slang::syntax::DefineDirectiveSyntax& def);
 
-/// MacroEntry for @p def, body included.  Used by the shard and the
-/// open-buffer index alike.
+/// MacroEntry for @p def.  Used by the shard and the open-buffer index alike;
+/// @p with_body false skips the body text (see collect_macros()).
 MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
                                    const slang::SourceManager& sm,
-                                   const slang::syntax::DefineDirectiveSyntax& def);
+                                   const slang::syntax::DefineDirectiveSyntax& def,
+                                   bool with_body = true);
 
 /// Index a named clocking block declared in @p scope (an interface or module).
 ///

@@ -5050,8 +5050,11 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
                     return find_macro_info(extra.index_ref(), extra.uri, macro_name);
                 }))
             return info;
-        return SymbolInfo{
-            .name = macro_name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
+        // A backticked name nobody defines is a directive (`timescale, `ifdef,
+        // ...) or a typo: fall through so hover stays quiet on it.
+        if (target.kind == DefinitionTargetKind::Macro)
+            return SymbolInfo{
+                .name = macro_name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
     }
 
     // Reuse the extra-file snapshot already collected for hover.  Calling
