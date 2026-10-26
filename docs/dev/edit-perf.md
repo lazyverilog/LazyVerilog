@@ -353,3 +353,31 @@ The 1750 ms outlier is not the wait: it is completion on a parsed 24k-line tree.
 Context detection, the snapshot's dynamic index and the member-item pass each
 walk the whole tree (about 90, 0-100 and 50 ms unloaded).  Completion pays the
 same on main whenever the parse has already landed.
+
+## Round 5: inlayHint stops waiting for the parse
+
+`provide_inlay_hints()` used to wait up to 150 ms in `get_parsed_state()` for the
+reparse its own `didChange` started.  Requests are answered one at a time, and
+Neovim sends `foldingRange` right behind `inlayHint`, so on a file that parses
+slower than that the fold waited too, and on a one-core slice the queue fell
+further behind with every keystroke.
+
+It now answers at once from the last tree that parsed (`previous_parsed`, one
+keystroke old) and remembers that it did.  When that file's parse commits, the
+server sends `workspace/inlayHint/refresh` once, and the client re-requests
+against the new tree.  Neovim does not re-ask on its own after a reply, so the
+refresh is what keeps the final hints right after typing stops.  The cost is one
+extra `inlayHint` per parse that a stale answer preceded, served from a tree
+that is already there.
+
+Measured with a pipelined variant of `edit_latency_bench.py` (`inlayHint` and
+`foldingRange` sent back to back, as Neovim does), 42k-line
+`pinmux_reg_top.sv` with 14241 hints, 30 keystrokes, machine under concurrent
+build load:
+
+| CPUs | build | inlayHint p50 / p95 | queued foldingRange p50 / p95 |
+|---|---|---|---|
+| all | wait 150 ms | 220 / 316 ms | 42 / 47 ms |
+| all | no wait | 47 / 366 ms | 45 / 76 ms |
+| 1 | wait 150 ms | 418 / 2616 ms | 569 / 2856 ms |
+| 1 | no wait | 122 / 176 ms | 136 / 250 ms |

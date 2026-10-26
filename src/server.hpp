@@ -55,6 +55,8 @@ class LazyVerilogServer {
     void clear_published_diagnostics_for_owner(const std::string& owner_uri);
     void publish_config_diagnostic(const ConfigWarning* warning);
     void request_inlay_hint_refresh();
+    /// Refresh if @p uri's hints were last answered from a stale tree.
+    void refresh_stale_inlay_hints(const std::string& uri);
     /// Whether any open project asks for semantic compilation.
     bool any_project_compiles() const;
     /// @p uri's semantic diagnostics, or none when @p config -- that file's own,
@@ -307,6 +309,11 @@ class LazyVerilogServer {
     // endpoint sends and diagnostic ownership bookkeeping are not treated as
     // concurrently mutable server state, so serialize those outbound paths here.
     std::mutex outbound_mutex_;
+
+    // Buffers whose inlayHint reply came from the tree before an in-flight
+    // parse; that parse's commit sends workspace/inlayHint/refresh once.
+    std::mutex stale_inlay_hint_mutex_;
+    std::unordered_set<std::string> stale_inlay_hint_uris_;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -376,6 +376,34 @@ TEST_CASE("inlay hints: a text-only snapshot keeps the parse it replaced", "[inl
     analyzer.set_parse_paused(false);
 }
 
+TEST_CASE("inlay hints: an edit in flight is answered without waiting for its parse",
+          "[inlay]") {
+    // Requests are answered one at a time, and Neovim queues a foldingRange
+    // behind every inlayHint, so a wait here was a wait for both.  The answer
+    // comes from the previous tree, flagged stale so the server can ask the
+    // client to re-request once the parse lands.
+    const std::string uri = "file:///tmp/inlay_no_wait.sv";
+
+    Analyzer analyzer;
+    analyzer.open(uri, kInlaySource);
+    bool stale = true;
+    REQUIRE(provide_inlay_hints(analyzer, uri, 0, 20, &stale).size() == 4);
+    CHECK_FALSE(stale);
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, kInlaySource + "\n// edit\n");
+
+    // The held parse never lands, so the old 150 ms wait ran out every time.
+    const auto start = std::chrono::steady_clock::now();
+    const auto hints = provide_inlay_hints(analyzer, uri, 0, 20, &stale);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    CHECK(hints.size() == 4);
+    CHECK(stale);
+    CHECK(elapsed < std::chrono::milliseconds(150));
+
+    analyzer.set_parse_paused(false);
+}
+
 TEST_CASE("inlay hints: a burst of edits keeps the chain exactly one deep", "[inlay]") {
     // enqueue_parse() takes the predecessor's own predecessor when the
     // predecessor is itself a placeholder.  With the worker held, every edit in
