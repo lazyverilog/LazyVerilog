@@ -759,6 +759,9 @@ class Analyzer {
     /// any indexing starts; production never sets it.
     void set_background_index_hook_for_testing(
         std::function<void(const std::string& path, bool headers_built)> hook);
+    /// Test seam: whether @p uri has its filelist shard (not just a header
+    /// shard built because another file `include`s it).
+    bool has_filelist_shard_for_testing(const std::string& uri) const;
 
     /// Return dynamic/file indexes for other open buffers as per-file shards.
     ///

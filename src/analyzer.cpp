@@ -8728,6 +8728,11 @@ void Analyzer::set_background_index_hook_for_testing(
     background_index_hook_ = std::move(hook);
 }
 
+bool Analyzer::has_filelist_shard_for_testing(const std::string& uri) const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    return extra_cache_.contains(uri);
+}
+
 std::shared_ptr<const std::vector<OpenIndexShard>>
 Analyzer::opened_file_index_shards(const std::string& current_uri) const {
     std::vector<std::shared_ptr<const DocumentState>> states;
