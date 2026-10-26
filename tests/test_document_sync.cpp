@@ -274,3 +274,107 @@ TEST_CASE("diagnostics: dedup keeps distinct positions, severities and messages"
     CHECK(diags[3].col == 9);
     CHECK(diags[4].line == 9);
 }
+
+namespace {
+
+/// A package that `include`s its macros and then a class file using them: the
+/// shape of every UVM agent, where the class file means nothing on its own.
+struct IncluderTree {
+    std::filesystem::path root;
+
+    explicit IncluderTree(const std::string& tag) {
+        root = std::filesystem::temp_directory_path() / ("lazyverilog-includer-" + tag);
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root / "inc");
+        std::filesystem::create_directories(root / "rtl");
+        root = std::filesystem::canonical(root);
+        write(root / "inc" / "defs.svh",
+              "`define ITEM_W 8\n`define ITEM_LOG(msg) $display(msg)\n");
+        write(item(), item_text());
+        write(root / "inc" / "orphan.svh", item_text());
+        write(pkg(), pkg_text());
+    }
+    ~IncluderTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+
+    static void write(const std::filesystem::path& path, const std::string& text) {
+        std::ofstream(path, std::ios::binary) << text;
+    }
+    std::filesystem::path item() const { return root / "inc" / "item.svh"; }
+    std::filesystem::path pkg() const { return root / "rtl" / "pkg.sv"; }
+    static std::string item_text() {
+        return "class item;\n"
+               "  logic [`ITEM_W-1:0] data;\n"
+               "  function void show();\n"
+               "    `ITEM_LOG(\"x\");\n"
+               "  endfunction\n"
+               "endclass\n";
+    }
+    static std::string pkg_text() {
+        return "package pkg;\n`include \"defs.svh\"\n`include \"item.svh\"\nendpackage\n";
+    }
+};
+
+long unknown_macro_count(const DocumentState& state) {
+    return std::count_if(state.parse_diagnostics.begin(), state.parse_diagnostics.end(),
+                         [](const ParseDiagInfo& d) {
+                             return d.message.find("unknown macro") != std::string::npos;
+                         });
+}
+
+} // namespace
+
+TEST_CASE("an open header parses with the macros its includer defined first",
+          "[sync][includer-context]") {
+    IncluderTree tree("indexed");
+    Analyzer a;
+    a.set_project_index_publish_debounce_ms(0);
+    a.set_include_dirs({(tree.root / "inc").string()});
+    a.set_extra_files({tree.pkg().string()});
+    a.wait_for_background_index_idle();
+
+    const auto item_uri = uri_from_path(tree.item());
+    a.open(item_uri, IncluderTree::item_text());
+    const auto state = a.get_state(item_uri);
+    REQUIRE(state != nullptr);
+    CHECK(unknown_macro_count(*state) == 0);
+    CHECK(std::none_of(state->parse_diagnostics.begin(), state->parse_diagnostics.end(),
+                       [](const ParseDiagInfo& d) { return d.severity == 1; }));
+
+    // The same text with nothing including it still reports the macros, so this
+    // is the includer's context and not a blanket suppression.
+    const auto orphan_uri = uri_from_path(tree.root / "inc" / "orphan.svh");
+    a.open(orphan_uri, IncluderTree::item_text());
+    const auto orphan = a.get_state(orphan_uri);
+    REQUIRE(orphan != nullptr);
+    CHECK(unknown_macro_count(*orphan) == 2);
+}
+
+TEST_CASE("a header opened before its includer gets the includer's macros once it parses",
+          "[sync][includer-context]") {
+    // An editor restoring a session opens the class file and the package in
+    // whatever order, before any index exists.
+    IncluderTree tree("open-order");
+    Analyzer a;
+    a.set_include_dirs({(tree.root / "inc").string()});
+
+    const auto item_uri = uri_from_path(tree.item());
+    a.enqueue_parse(item_uri, IncluderTree::item_text());
+    const auto first = a.get_parsed_state(item_uri, std::chrono::seconds(10));
+    REQUIRE(first != nullptr);
+    REQUIRE(unknown_macro_count(*first) == 2);
+
+    a.enqueue_parse(uri_from_path(tree.pkg()), IncluderTree::pkg_text());
+    std::shared_ptr<const DocumentState> now;
+    for (int i = 0; i < 500; ++i) {
+        now = a.get_state(item_uri);
+        if (now && now->tree && unknown_macro_count(*now) == 0)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE(now != nullptr);
+    CHECK(now->tree != nullptr);
+    CHECK(unknown_macro_count(*now) == 0);
+}

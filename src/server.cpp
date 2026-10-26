@@ -530,6 +530,8 @@ LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
     // declarations.
     analyzer_.set_project_index_publish_callback([this] {
         request_inlay_hint_refresh();
+        // The shard of an open header's includer may be what just arrived.
+        analyzer_.reparse_open_headers_missing_includer();
 
         // A project-index publish can change lint results in already-open
         // documents even when the edited file is a different open/filelist

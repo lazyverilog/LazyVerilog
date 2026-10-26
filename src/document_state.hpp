@@ -238,6 +238,11 @@ struct DocumentState {
     // exactly one extra snapshot per open buffer and only while a reparse is in
     // flight.  Null once the parse lands, since `tree` is then this snapshot's own.
     std::shared_ptr<const DocumentState> previous_parsed;
+    // The macros the file that `include`s this one has defined where it does,
+    // as one predefine (see includer_macro_context()).  Null: no includer was
+    // known when this was parsed.  Empty: one was, and it defines nothing.
+    // Carried across edits so a keystroke does not re-preprocess the includer.
+    std::shared_ptr<const std::string> includer_macro_context;
     uint64_t doc_version{0};
     DocumentState() = default;
     DocumentState(std::string uri, std::string text,

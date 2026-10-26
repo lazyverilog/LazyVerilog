@@ -1023,6 +1023,130 @@ void Analyzer::stop() {
     }
 }
 
+/// A file that `include`s the buffer being parsed.
+struct IncluderCandidate {
+    std::string path;
+    /// Its open buffer, or null to read it from disk.
+    std::shared_ptr<const DocumentState> open_state;
+};
+
+/// Offset of the `include in @p text that resolves to @p header_path, or npos.
+/// A text scan: nothing has parsed the includer at this point.
+static size_t include_offset_of(std::string_view text, const std::string& includer_path,
+                                const std::string& header_path,
+                                const std::vector<std::filesystem::path>& include_dirs) {
+    namespace fs = std::filesystem;
+    const auto header_name = fs::path(header_path).filename();
+    const auto includer_dir = fs::path(includer_path).parent_path();
+    constexpr std::string_view directive = "`include";
+    for (auto at = text.find(directive); at != std::string_view::npos;
+         at = text.find(directive, at + 1)) {
+        const auto open = text.find_first_not_of(" \t", at + directive.size());
+        if (open == std::string_view::npos || (text[open] != '"' && text[open] != '<'))
+            continue;
+        const auto close = text.find_first_of(text[open] == '"' ? "\"\n" : ">\n", open + 1);
+        if (close == std::string_view::npos || text[close] == '\n')
+            continue;
+        const fs::path spelled(text.substr(open + 1, close - open - 1));
+        if (spelled.filename() != header_name)
+            continue;
+        // slang's search order; the first directory that has the name decides.
+        std::vector<fs::path> search{includer_dir / spelled};
+        for (const auto& dir : include_dirs)
+            search.push_back(dir / spelled);
+        for (const auto& candidate : search) {
+            const auto normalized = normalize_filesystem_path(candidate);
+            if (normalized.string() == header_path)
+                return at;
+            std::error_code ec;
+            if (fs::exists(normalized, ec))
+                break;
+        }
+    }
+    return std::string_view::npos;
+}
+
+/// The macros @p includer_path has defined where it `include`s @p header_path,
+/// as one slang predefine; nullopt when it does not include the header itself.
+///
+/// One predefine rather than one per macro: slang copies its whole macro table
+/// per predefine, which for UVM's few hundred macros is quadratic.
+static std::optional<std::string>
+includer_macro_context(const std::string& header_path, const std::string& includer_path,
+                       std::string_view includer_text, const ParseInputs& inputs,
+                       const std::vector<OpenTextOverlay>& overlays) {
+    const auto at = include_offset_of(includer_text, includer_path, header_path,
+                                      inputs.include_dir_paths);
+    if (at == std::string_view::npos)
+        return std::nullopt;
+
+    auto sm = make_lsp_source_manager();
+    preload_open_text_overlays(*sm, overlays, includer_path);
+    slang::parsing::PreprocessorOptions ppo;
+    ppo.predefines = inputs.defines;
+    ppo.additionalIncludePaths = inputs.include_dir_paths;
+    slang::Bag bag;
+    bag.set(std::move(ppo));
+    const auto tree = slang::syntax::SyntaxTree::fromText(
+        includer_text.substr(0, at), *sm, std::string_view(includer_path),
+        std::string_view(includer_path), bag);
+
+    // predefine() prepends "`define " and makes the first '=' the separator, so
+    // the text leads with a sentinel and `undef's it at the end.
+    constexpr std::string_view sentinel = "__lazyverilog_includer_context__";
+    std::string context;
+    const auto own_buffers = tree->getSourceBufferIds();
+    for (const auto* def : tree->getDefinedMacros()) {
+        const auto start = def->directive.location();
+        const auto end = def->sourceRange().end();
+        if (!start.valid() || !sm->isFileLoc(start) || end.buffer() != start.buffer())
+            continue;
+        // What the includer and its headers wrote.  Predefines are the header's
+        // own to add, and built-ins slang's.
+        if (!sm->getIncludedFrom(start.buffer()).valid() &&
+            std::ranges::find(own_buffers, start.buffer()) == own_buffers.end())
+            continue;
+        // A `line naming the file and an indent to the same column, so go to
+        // definition, hover and anything declared by an expansion land where the
+        // macro is really written rather than in this buffer.
+        context.append("\n`line ")
+            .append(std::to_string(sm->getLineNumber(start)))
+            .append(" \"")
+            .append(uri_from_path(sm->getFullPath(start.buffer())))
+            .append("\" 0\n")
+            .append(sm->getColumnNumber(start) - 1, ' ')
+            .append(sm->getSourceText(start.buffer()).substr(start.offset(), end.offset() - start.offset()));
+    }
+    if (context.empty())
+        return context;
+    return std::string(sentinel) + "=1" + context + "\n`undef " + std::string(sentinel);
+}
+
+/// The context of the first of @p includers that `include`s @p header_path
+/// itself, nearest first and then by path -- the order find_module() ranks
+/// same-name modules in, so the choice is the same on every run.  Empty, not
+/// null, when none does: the caller keeps it so it is not looked for again.
+static std::shared_ptr<const std::string>
+find_includer_macro_context(const std::string& header_path, std::vector<IncluderCandidate> includers,
+                            const ProjectParseInputs& inputs,
+                            const std::vector<OpenTextOverlay>& overlays) {
+    std::ranges::sort(includers, [&](const IncluderCandidate& a, const IncluderCandidate& b) {
+        const auto score_a = path_proximity_score(header_path, a.path);
+        const auto score_b = path_proximity_score(header_path, b.path);
+        return score_a == score_b ? a.path < b.path : score_a > score_b;
+    });
+    for (const auto& includer : includers) {
+        std::optional<std::string> disk;
+        if (!includer.open_state && !(disk = read_file_text_optional(includer.path)))
+            continue;
+        const std::string_view text = includer.open_state ? includer.open_state->text : *disk;
+        if (auto context = includer_macro_context(header_path, includer.path, text,
+                                                  inputs.for_path(includer.path), overlays))
+            return std::make_shared<const std::string>(std::move(*context));
+    }
+    return std::make_shared<const std::string>();
+}
+
 std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                                                     const std::string& text) const {
     const auto start = Clock::now();
@@ -1038,6 +1162,9 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::vector<OpenTextOverlay> open_overlays;
     std::vector<std::string> previous_dependencies;
     std::unordered_set<std::string> standalone_headers;
+    std::shared_ptr<const std::string> includer_context;
+    std::vector<IncluderCandidate> includers;
+    bool has_includer = false;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     std::shared_ptr<const ProjectParseInputs> parse_inputs;
     {
@@ -1051,8 +1178,23 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         // What this buffer included last time is the candidate set for header
         // seeding below.  On didOpen there is no previous snapshot, so the first
         // parse reads from disk and every keystroke after it does not.
-        if (const auto it = docs_.find(uri); it != docs_.end() && it->second)
+        if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
             previous_dependencies = it->second->include_dependencies;
+            includer_context = it->second->includer_macro_context;
+        }
+        if (!includer_context) {
+            // Open includers are in the loop below; closed ones are their shards.
+            if (const auto it = extra_cache_includers_.find(uri); it != extra_cache_includers_.end()) {
+                // Looked for even if every shard is open, so the answer is
+                // never left null for reparse_open_headers_missing_includer().
+                has_includer = true;
+                for (const auto& includer_uri : it->second) {
+                    const auto entry = extra_cache_.find(includer_uri);
+                    if (!docs_.contains(includer_uri) && entry != extra_cache_.end())
+                        includers.push_back({entry->second.path, nullptr});
+                }
+            }
+        }
         // Only the ones this buffer includes: the set is project-wide, and
         // copying all of it per keystroke would grow with the design.
         for (const auto& dependency_uri : previous_dependencies) {
@@ -1065,6 +1207,8 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                 continue;
             if (open_state->normalized_path == normalized_current_path)
                 continue;
+            if (!includer_context && open_state->include_dependency_set.contains(uri))
+                includers.push_back({open_state->normalized_path, open_state});
             open_overlays.push_back(OpenTextOverlay{
                 .uri = open_uri,
                 .path = open_state->normalized_path,
@@ -1081,6 +1225,17 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         defines = inputs.defines;
         include_dirs = inputs.include_dir_paths;
     }
+    // A header is only meaningful where it is included: UVM class files use the
+    // macros their package `include`d first.  Parsed alone, every one of those
+    // is an "unknown macro" error and the code in its arguments is never parsed.
+    // shortcut: computed once per open, not when the includer or its headers are
+    // edited later; recompute on their change if that staleness matters.
+    if (!includer_context && (has_includer || !includers.empty()))
+        includer_context = find_includer_macro_context(normalized_current_path,
+                                                       std::move(includers), *parse_inputs,
+                                                       open_overlays);
+    if (includer_context && !includer_context->empty())
+        defines.push_back(*includer_context);
 
     auto sm = make_lsp_source_manager();
     const auto header_cache_excluded =
@@ -1113,6 +1268,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         bag);
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalized_current_path;
+    state->includer_macro_context = std::move(includer_context);
     cache_document_end_position(*state);
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
@@ -1210,6 +1366,24 @@ void Analyzer::reparse_open_documents_under(const std::filesystem::path& root) {
         enqueue_parse_if_current(state->uri, state->text, state.get());
 }
 
+void Analyzer::reparse_open_headers_missing_includer() {
+    std::vector<std::shared_ptr<const DocumentState>> picked;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        for (const auto& [uri, state] : docs_) {
+            if (!state || !state->tree || state->includer_macro_context)
+                continue;
+            bool has_includer = extra_cache_includers_.contains(uri);
+            for (auto it = docs_.begin(); !has_includer && it != docs_.end(); ++it)
+                has_includer = it->second && it->second->include_dependency_set.contains(uri);
+            if (has_includer)
+                picked.push_back(state);
+        }
+    }
+    for (const auto& state : picked)
+        enqueue_parse_if_current(state->uri, state->text, state.get());
+}
+
 uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string text,
                                             const DocumentState* expected) {
     uint64_t version = ++version_counter_;
@@ -1239,6 +1413,10 @@ uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string 
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
             state->include_dependencies = it->second->include_dependencies;
             state->include_dependency_set = it->second->include_dependency_set;
+            // An edit keeps it; a reparse of unchanged text is asked for when
+            // the inputs changed, so it looks again.
+            if (!expected)
+                state->includer_macro_context = it->second->includer_macro_context;
             // Keep the last snapshot that actually parsed, so an AST-shaped
             // request arriving in this window has something true to answer
             // from.  Taking the predecessor's own predecessor when it is
@@ -1438,6 +1616,8 @@ void Analyzer::parse_worker_loop() {
             deferred_dependents.insert(job.uri);
             if (parse_complete_cb_)
                 parse_complete_cb_(job.uri);
+            // This parse may be the includer of a header opened before it.
+            reparse_open_headers_missing_includer();
         }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] parse worker error: " << e.what() << "\n";
