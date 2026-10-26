@@ -3742,13 +3742,13 @@ endmodule
 
 TEST_CASE("formatter regression: the call length check counts the line's indentation", "[formatter][regression]") {
     // P-4: WrapPass measured a line from its first token, so a call was only
-    // broken at `line_length` plus its own indent.  The first call ends at
-    // column 101 and is broken; the second ends at column 100 and is not.
+    // broken at `line_length` plus its own indent.  The first line is 101
+    // columns wide with its `;` and is broken; the second is 100 and is not.
     {
         const std::string input = R"SV(module m;
 function automatic int f();
-return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argument);
 return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argumen);
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argume);
 endfunction
 endmodule
 )SV";
@@ -3758,9 +3758,9 @@ endmodule
              argument_one_long,
              argument_two_long,
              argument_three_long_xyz,
-             argument
+             argumen
            );
-    return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argumen);
+    return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argume);
   endfunction
 endmodule
 )SV";
@@ -3770,8 +3770,8 @@ endmodule
         const std::string input = R"SV(package p;
 function automatic int f();
 if (a) begin
-return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argume);
 return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argum);
+return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argu);
 end
 endfunction
 endpackage
@@ -3783,9 +3783,9 @@ endpackage
                argument_one_long,
                argument_two_long,
                argument_three_long_xyz,
-               argume
+               argum
              );
-      return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argum);
+      return compute_something(argument_one_long, argument_two_long, argument_three_long_xyz, argu);
     end
   endfunction
 endpackage
@@ -6864,6 +6864,142 @@ TEST_CASE("formatter regression: a define body in a format-off region opens no s
                   "  assign g = h;\n"
                   "endmodule\n");
     }
+}
+
+TEST_CASE("formatter regression: a format-off region that opens or closes a unit keeps later indent", "[formatter][regression]") {
+    // W-4 for every scope pair, not only `begin`/`end`: a `module`,
+    // `function` or `class` the region opens indents what follows it, and an
+    // `endmodule` or `endclass` it holds ends the unit for what follows.
+    CHECK(format_stable("// verilog_format: off\n"
+                        "module m(input a);\n"
+                        "// verilog_format: on\n"
+                        "assign g=h;\n"
+                        "endmodule\n"
+                        "module n;\n"
+                        "assign x=y;\n"
+                        "endmodule\n") ==
+          "// verilog_format: off\n"
+          "module m(input a);\n"
+          "// verilog_format: on\n"
+          "  assign g = h;\n"
+          "endmodule\n"
+          "module n;\n"
+          "  assign x = y;\n"
+          "endmodule\n");
+    CHECK(format_stable("module m;\n"
+                        "assign a=b;\n"
+                        "// verilog_format: off\n"
+                        "endmodule\n"
+                        "// verilog_format: on\n"
+                        "module n;\n"
+                        "assign x=y;\n"
+                        "endmodule\n") ==
+          "module m;\n"
+          "  assign a = b;\n"
+          "// verilog_format: off\n"
+          "endmodule\n"
+          "// verilog_format: on\n"
+          "module n;\n"
+          "  assign x = y;\n"
+          "endmodule\n");
+    CHECK(format_stable("module m;\n"
+                        "  // verilog_format: off\n"
+                        "  function int f(int a);\n"
+                        "  // verilog_format: on\n"
+                        "  return a;\n"
+                        "  endfunction\n"
+                        "  assign g=h;\n"
+                        "endmodule\n") ==
+          "module m;\n"
+          "  // verilog_format: off\n"
+          "  function int f(int a);\n"
+          "  // verilog_format: on\n"
+          "    return a;\n"
+          "  endfunction\n"
+          "  assign g = h;\n"
+          "endmodule\n");
+    CHECK(format_stable("class c;\n"
+                        "  int x;\n"
+                        "  // verilog_format: off\n"
+                        "  endclass\n"
+                        "  // verilog_format: on\n"
+                        "class d;\n"
+                        "int y;\n"
+                        "endclass\n") ==
+          "class c;\n"
+          "  int x;\n"
+          "  // verilog_format: off\n"
+          "  endclass\n"
+          "  // verilog_format: on\n"
+          "class d;\n"
+          "  int y;\n"
+          "endclass\n");
+    // Prototypes and references open nothing: `extern`/`pure virtual`/DPI
+    // methods, `typedef class`, a covergroup's `with function sample`, an
+    // assertion's `property` and `default clocking cb;`.
+    CHECK(format_stable("class c;\n"
+                        "  // verilog_format: off\n"
+                        "  extern function void f();\n"
+                        "  pure virtual task t();\n"
+                        "  import \"DPI-C\" function int g();\n"
+                        "  typedef class q;\n"
+                        "  covergroup cg with function sample(int v);\n"
+                        "  endgroup\n"
+                        "  assert property (a);\n"
+                        "  default clocking cb;\n"
+                        "  // verilog_format: on\n"
+                        "  int y;\n"
+                        "endclass\n") ==
+          "class c;\n"
+          "  // verilog_format: off\n"
+          "  extern function void f();\n"
+          "  pure virtual task t();\n"
+          "  import \"DPI-C\" function int g();\n"
+          "  typedef class q;\n"
+          "  covergroup cg with function sample(int v);\n"
+          "  endgroup\n"
+          "  assert property (a);\n"
+          "  default clocking cb;\n"
+          "  // verilog_format: on\n"
+          "  int y;\n"
+          "endclass\n");
+}
+
+TEST_CASE("formatter regression: a call's line length counts its semicolon", "[formatter][regression]") {
+    // W-7: the check stopped at the `)`, so a line one column past the limit
+    // stayed whole.
+    FormatOptions o;
+    o.function_call.line_length = 27;
+    o.function_call.arg_count = -1;
+    CHECK(format_stable("module m;\n  assign r = fn(aaaa, bbb);\n  assign r = fn(aaaa, bbbb);\nendmodule\n", o) ==
+          "module m;\n"
+          "  assign r = fn(aaaa, bbb);\n"
+          "  assign r = fn(\n"
+          "               aaaa,\n"
+          "               bbbb\n"
+          "             );\n"
+          "endmodule\n");
+    // The estimate is the printed width: no gap in `[3:0]`, `][`, `8'hFF`
+    // or `-c` (it used to count `[3 : 0]`, `] [`, `8 'hFF`, `- c`), nor
+    // before a label's `:`; one after the `,` of `, .k(`; and the `));` a
+    // call inside a cast carries.
+    for (const std::string fits : {"  assign r = fn(a[3:0], b[1][2], 8'hFF, -c);\n",
+                                   "  a_l: assert property (p(aa, bb));\n",
+                                   "  assign r = int'(o.f(.v(e), .k(K)));\n"}) {
+        CAPTURE(fits);
+        o.function_call.line_length = static_cast<int>(fits.size()) - 1;
+        CHECK(format_stable("module m;\n" + fits + "endmodule\n", o) == "module m;\n" + fits + "endmodule\n");
+        o.function_call.line_length -= 1;
+        CHECK(format_stable("module m;\n" + fits + "endmodule\n", o).find(fits) == std::string::npos);
+    }
+
+    FormatOptions d;
+    const std::string header = "  function logic [15:0] f(logic [7:0] a);\n";
+    d.function_declaration.line_length = static_cast<int>(header.size()) - 1;
+    const std::string src = "module m;\n" + header + "  endfunction\nendmodule\n";
+    CHECK(format_stable(src, d) == src);
+    d.function_declaration.line_length -= 1;
+    CHECK(format_stable(src, d).find(header) == std::string::npos);
 }
 
 TEST_CASE("formatter regression: a range edit on CRLF lines keeps the line ends", "[formatter][regression]") {

@@ -141,9 +141,10 @@ const std::vector<Knob>& knobs() {
         LV_BOOL(spacing.space_inside_dimension_brackets, Space | Indent),
         LV_BOOL(spacing.space_inside_event_control_parens, Space | Indent),
         LV_VALUES(spacing.binary_operator_spacing, Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.dimension_binary_operator_spacing, Space | Indent, "both", "none", "before", "after"),
+        // WrapPass counts the gaps these put in a dimension (compact_gap).
+        LV_VALUES(spacing.dimension_binary_operator_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.semicolon_spacing, Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.range_colon_spacing, Space | Indent, "both", "none", "before", "after"),
+        LV_VALUES(spacing.range_colon_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.indexed_part_select_spacing, Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.procedural_event_control_at_spacing, Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.assignment_operator_spacing, Space | Indent, "both", "none", "before", "after"),

@@ -1008,20 +1008,78 @@ struct AlignField {
     int width(int own) const { return adaptive ? std::max(min_width, own) : widest; }
 };
 
+// The gap WrapPass assumes between code tokens `l` and `t`: one space except
+// where SpacingPass always closes it up, and the range colons and dimension
+// operators its options space.  An estimate over the gap SpacingPass prints
+// made a list break that fit (`[15 : 0]`, `a [i] [j]`, `8 'hFF`, `- 1`).
+// The space before a call's `(` is paren_spacing_width()'s to count.
+inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open);
+inline int compact_gap(const TokenStream& tokens, size_t l, size_t t_idx, const FormatOptions& opts) {
+    const Tok& L = tokens[l];
+    const Tok& t = tokens[t_idx];
+    const TK lk = L.lex.kind;
+    const TK tk = t.lex.kind;
+    // `f(.a(x), .b(y))`: a named item's `.` takes the comma's space.
+    if (lk == TK::Comma && tk == TK::Dot)
+        return 1;
+    if (no_space_before(tk) || no_space_after(lk))
+        return 0;
+    // `lbl: assert ...`, `S_A: x = 1;`, `end: blk`
+    if (tk == TK::Colon && (t.immutable.topology.is_item_label_colon || t.immutable.topology.is_case_item_colon ||
+                            t.immutable.topology.is_block_name_colon))
+        return 0;
+    // `a[i]` binds; `my_t [3:0] x` and a declarator's `q [$]` do not.
+    if (tk == TK::OpenBracket && is_identifier_like(L)) {
+        const size_t close = t.immutable.syntax.matching_token;
+        const size_t after = close == npos ? npos : next_code(tokens, close + 1, tokens.size());
+        return (after != npos && is_identifier_like(tokens[after])) ||
+                       is_var_declaration_trailing_dimension_open(tokens, t_idx)
+                   ? 1 : 0;
+    }
+    if ((tk == TK::OpenParenthesis && t.immutable.topology.starts_argument_list) ||
+        tk == TK::Apostrophe || lk == TK::Apostrophe ||
+        (tk == TK::IntegerBase && lk == TK::IntegerLiteral) || t.lex.continues_vector_literal ||
+        (tk == TK::OpenBracket &&
+         (lk == TK::CloseBracket || (lk == TK::CloseParenthesis && !closes_strength(tokens, l)))))
+        return 0;
+    const bool l_unary = (is_unary_op(lk) || is_sign_or_reduction_op(lk)) &&
+                         (lk == TK::Tilde || lk == TK::Exclamation || in_prefix_position(tokens, l));
+    if (l_unary)
+        return unary_pair_merges(lk, tk) ? 1 : 0;
+    if ((tk == TK::DoublePlus || tk == TK::DoubleMinus) &&
+        (is_identifier_like(L) || lk == TK::CloseBracket || lk == TK::CloseParenthesis))
+        return 0;
+    const bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
+                        (L.immutable.syntax.bracket_depth > 0 && lk != TK::CloseBracket);
+    if (tk == TK::Colon && (in_dim || t.immutable.topology.is_min_typ_max_colon))
+        return wants_before(opts.spacing.range_colon_spacing) ? 1 : 0;
+    if (lk == TK::Colon && (in_dim || L.immutable.topology.is_min_typ_max_colon))
+        return wants_after(opts.spacing.range_colon_spacing) ? 1 : 0;
+    if (in_dim) {
+        const std::string& mode = opts.spacing.dimension_binary_operator_spacing;
+        const bool t_bin = is_binary_op(tk) && !is_assignment_op(tk) &&
+                           !(is_sign_or_reduction_op(tk) && in_prefix_position(tokens, t_idx));
+        if (is_binary_op(lk) && !is_assignment_op(lk))
+            return can_begin_unary_expression(tk) || wants_after(mode) ? 1 : 0;
+        if (t_bin)
+            return wants_before(mode) ? 1 : 0;
+    }
+    return 1;
+}
+
 // WrapPass's estimate of a width: it runs before SpacingPass, so it assumes
-// one space between tokens except around brackets and separators.  Later
-// passes measure with rendered_width().
-inline int compact_width(const TokenStream& tokens, size_t first, size_t end) {
+// the gaps compact_gap() gives.  Later passes measure with rendered_width().
+inline int compact_width(const TokenStream& tokens, size_t first, size_t end, const FormatOptions& opts) {
     int w = 0;
-    bool need_space = false;
+    size_t prev = npos;
     end = std::min(end, tokens.size());
     for (size_t i = first; i < end; ++i) {
         const Tok& t = tokens[i];
         if (!is_code_token(t)) continue;
-        if (need_space && !no_space_before(t.lex.kind))
-            ++w;
+        if (prev != npos)
+            w += compact_gap(tokens, prev, i, opts);
         w += token_width(t);
-        need_space = !no_space_after(t.lex.kind);
+        prev = i;
     }
     return w;
 }
@@ -1124,11 +1182,11 @@ inline int statement_align_padding(const TokenStream& tokens, size_t line_start,
                                      option_width(opts.var_declaration.section2_min_width, opts) +
                                      option_width(opts.var_declaration.section3_min_width, opts);
                 // The compact layout puts one space before the `=`.
-                return std::max(0, sections - compact_width(tokens, line_start, k) - 1);
+                return std::max(0, sections - compact_width(tokens, line_start, k, opts) - 1);
             }
             if (names >= 2 || !opts.statement.align || opts.statement.lhs_min_width <= 0)
                 return 0;
-            return std::max(0, opts.statement.lhs_min_width - compact_width(tokens, line_start, k));
+            return std::max(0, opts.statement.lhs_min_width - compact_width(tokens, line_start, k, opts));
         }
         if (is_identifier_like(t)) {
             const size_t p = prev_code(tokens, k);
@@ -1160,7 +1218,7 @@ inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const 
         const size_t open = tokens[line_start].immutable.syntax.matching_token;
         const size_t name = open == npos ? npos : prev_code(tokens, open);
         if (name != npos && name < line_start && tokens[open].immutable.topology.starts_argument_list)
-            return line_prefix_width(tokens, name, opts) + compact_width(tokens, line_start, token_idx) +
+            return line_prefix_width(tokens, name, opts) + compact_width(tokens, line_start, token_idx, opts) +
                    paren_spacing_width(tokens, line_start, token_idx, opts) +
                    statement_align_padding(tokens, line_start, token_idx, opts);
     }
@@ -1171,9 +1229,34 @@ inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const 
         if (topo.in_outermost_unit && opts.default_indent_level_inside_outmost_block > 0)
             ++levels;
     }
-    return levels * opts.indent_size + compact_width(tokens, line_start, token_idx) +
+    return levels * opts.indent_size + compact_width(tokens, line_start, token_idx, opts) +
            paren_spacing_width(tokens, line_start, token_idx, opts) +
            statement_align_padding(tokens, line_start, token_idx, opts);
+}
+
+// The width a list's `)` carries after it that no break can move off its
+// line: the `));` of `f(g(a, b));`, the ` u_x (` of `sub #(.W(8)) u_x (`,
+// the `::type_id::create(` of `c #(.W(8))::type_id::create(`.  Closers,
+// names, `.` and `::`, through a `;` or the next `(`; anything else (an
+// operator, `=`, `with`) is a place the line can break, so it ends there,
+// as it does before a comment or a break already decided.
+inline int close_tail_width(const TokenStream& tokens, size_t close, const FormatOptions& opts) {
+    int w = 0;
+    size_t prev = close;
+    for (size_t k = close + 1; k < tokens.size(); ++k) {
+        const Tok& t = tokens[k];
+        const TK tk = t.lex.kind;
+        if (!is_code_token(t) || t.mutable_.wrap.must_break_before || tokens[prev].mutable_.wrap.must_break_after)
+            break;
+        if (tk != TK::CloseParenthesis && tk != TK::CloseBracket && tk != TK::CloseBrace && tk != TK::Dot &&
+            tk != TK::DoubleColon && tk != TK::Identifier && tk != TK::Semicolon && tk != TK::OpenParenthesis)
+            break;
+        w += compact_gap(tokens, prev, k, opts) + token_width(t);
+        prev = k;
+        if (tk == TK::Semicolon || tk == TK::OpenParenthesis)
+            break;
+    }
+    return w;
 }
 
 struct ListItem {
@@ -2366,8 +2449,19 @@ public:
                 auto& t = tokens[i];
                 if (is_passthrough(t)) {
                     // A format-off region's own `end`s and `begin`s.
-                    for (const TK k : t.lex.disabled_region_scope_keywords)
-                        depth = is_open_block(k) ? depth + 1 : std::max(0, depth - 1);
+                    for (const TK k : t.lex.disabled_region_scope_keywords) {
+                        if (is_outer_open(k) || is_block_design_unit_open(k)) {
+                            const bool nested = !units.empty();
+                            units.push_back({depth});
+                            if (nested)
+                                ++depth;
+                        } else if (closes_design_unit(k) && !units.empty()) {
+                            depth = units.back().depth;
+                            units.pop_back();
+                        } else {
+                            depth = is_open_block(k) ? depth + 1 : std::max(0, depth - 1);
+                        }
+                    }
                     continue;
                 }
                 if (is_conditional_preprocessor_directive(t)) {
@@ -3484,7 +3578,7 @@ public:
                 int line_width = opts_.indent_size;
                 std::vector<bool> keep_with_prev(items.size(), false);
                 for (size_t n = 0; n < items.size(); ++n) {
-                    int item_width = compact_width(tokens, items[n].first, items[n].last + 1);
+                    int item_width = compact_width(tokens, items[n].first, items[n].last + 1, opts_);
                     bool keep = n > 0 && line_count < per_line;
                     // Both limits apply.  `line_width` holds the previous
                     // item's comma, so a kept item adds a space and itself.
@@ -3698,8 +3792,9 @@ public:
                     open + 1 < close && tokens[open + 1].lex.comment_kind != CommentLexemeKind::None &&
                     !is_passthrough(tokens[open + 1]);
                 bool block = opts_.module.parameter_layout != "hanging" || comment_after_open;
-                const int one_line = line_prefix_width(tokens, open, opts_) + 1 +
-                                     compact_width(tokens, open + 1, close) + 1;
+                const int one_line =
+                    line_prefix_width(tokens, open, opts_) + 1 + compact_width(tokens, open + 1, close, opts_) + 1 +
+                    close_tail_width(tokens, close, opts_);
                 const bool directive = parameter_list_contains_directive(tokens, open, close);
                 bool breaks_inside = directive;
                 for (size_t k = open + 1; k < close && !breaks_inside; ++k)
@@ -3778,7 +3873,8 @@ public:
                                          kind_is(tokens[kw], TK::CheckerKeyword));
             }
             if (is_decl) {
-                int approx = line_prefix_width(tokens, open, opts_) + 1 + compact_width(tokens, open + 1, close) + 1;
+                int approx = line_prefix_width(tokens, open, opts_) + 1 + compact_width(tokens, open + 1, close, opts_) + 1 +
+                             close_tail_width(tokens, close, opts_);
                 // `function int f( // why` -- a comment right after the `(`
                 // ends that line, so the arguments cannot hang from it: the
                 // list is laid out as a block whatever its length.
@@ -3839,8 +3935,9 @@ public:
                     // past the callee for a block list.  A call already past
                     // the limit would only push them further right.
                     const int open_end = line_prefix_width(tokens, open, opts_) + 1;
-                    int approx = open_end + compact_width(tokens, open + 1, close) + 1 +
-                                 paren_spacing_width(tokens, open, close + 1, opts_);
+                    int approx = open_end + compact_width(tokens, open + 1, close, opts_) + 1 +
+                                 paren_spacing_width(tokens, open, close + 1, opts_) +
+                                 close_tail_width(tokens, close, opts_);
                     const size_t callee = prev_code(tokens, open);
                     const int args_col = opts_.function_call.layout == "hanging" || callee == npos
                                              ? open_end
@@ -4569,6 +4666,25 @@ public:
                 // leaves unmatched still close and open scopes, as the
                 // same keywords outside it would.
                 for (const TK k : t.lex.disabled_region_scope_keywords) {
+                    // A design unit, as the main loop below opens and
+                    // closes one.
+                    if (is_outer_open(k) || is_block_design_unit_open(k)) {
+                        const bool nested = !outer_units.empty();
+                        outer_units.push_back({level, open_bodies.size(), i, scopes.size()});
+                        if (opts_.default_indent_level_inside_outmost_block > 0 || nested) {
+                            ++level;
+                            ++scope_net;
+                        }
+                        continue;
+                    }
+                    if (closes_design_unit(k) && !outer_units.empty()) {
+                        level = outer_units.back().level;
+                        open_bodies.resize(std::min(open_bodies.size(), outer_units.back().open_bodies));
+                        scopes.resize(std::min(scopes.size(), outer_units.back().scopes));
+                        --scope_net;
+                        outer_units.pop_back();
+                        continue;
+                    }
                     if (is_open_block(k)) {
                         ++level;
                         ++scope_net;
@@ -4665,9 +4781,12 @@ public:
                 if (size_t hdr = find_header_keyword_before(tokens, i); hdr != npos)
                     t.mutable_.indent.base_indent = tokens[hdr].mutable_.indent.base_indent;
             const bool nested_unit = t.immutable.topology.opens_design_unit && !outer_units.empty();
+            // A unit a format-off region opened has no indent of its own:
+            // its level is the one just restored.
             if (closes_design_unit(t.lex.kind))
-                t.mutable_.indent.base_indent = closed_unit_opener == npos
-                    ? 0 : tokens[closed_unit_opener].mutable_.indent.base_indent;
+                t.mutable_.indent.base_indent = closed_unit_opener == npos ? 0
+                    : is_passthrough(tokens[closed_unit_opener]) ? level * opts_.indent_size
+                    : tokens[closed_unit_opener].mutable_.indent.base_indent;
             else if (t.immutable.topology.opens_design_unit && !nested_unit &&
                      opts_.default_indent_level_inside_outmost_block == 0)
                 t.mutable_.indent.base_indent = 0; // OuterOpen itself is at outer level

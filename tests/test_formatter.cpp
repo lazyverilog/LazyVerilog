@@ -5114,11 +5114,11 @@ TEST_CASE("formatter: call wrapping counts the statement alignment padding", "[f
                               "    x = foo(aaaaaaaa, bbbbbbbbb);\n"
                               "  end\n"
                               "endmodule\n";
-    // The aligned call ends at column 51 (its `)`).
+    // The aligned line is 52 columns wide, its `;` included.
     const std::string one_line = "    x                    = foo(aaaaaaaa, bbbbbbbbb);\n";
-    opts.function_call.line_length = 51;
+    opts.function_call.line_length = 52;
     CHECK(format_source(input, opts).find(one_line) != std::string::npos);
-    opts.function_call.line_length = 50;
+    opts.function_call.line_length = 51;
     const std::string formatted = format_source(input, opts);
     CHECK(formatted.find(one_line) == std::string::npos);
     CHECK(format_source(formatted, opts) == formatted);
@@ -5301,11 +5301,11 @@ TEST_CASE("formatter: call wrapping counts the declaration alignment padding", "
     opts.function_call.break_policy = "auto";
     opts.function_call.arg_count = -1;
     const std::string input = "module m;\nlogic x = foo(aaaaaaaa, bbbbbbbbb);\nendmodule\n";
-    // The aligned line is 49 columns wide; the call ends at column 48.
+    // The aligned line is 49 columns wide, its `;` included.
     const std::string one_line = "  logic       x       = foo(aaaaaaaa, bbbbbbbbb);\n";
-    opts.function_call.line_length = 48;
+    opts.function_call.line_length = 49;
     CHECK(format_source(input, opts).find(one_line) != std::string::npos);
-    opts.function_call.line_length = 47;
+    opts.function_call.line_length = 48;
     const std::string formatted = format_source(input, opts);
     CHECK(formatted.find(one_line) == std::string::npos);
     CHECK(format_source(formatted, opts) == formatted);
