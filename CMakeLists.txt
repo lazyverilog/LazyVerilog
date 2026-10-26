@@ -726,4 +726,10 @@ if(Python3_Interpreter_FOUND)
                 --binary $<TARGET_FILE:lazyverilog-lsp>
     )
     set_tests_properties(implicit-project-smoke PROPERTIES TIMEOUT 120)
+    add_test(
+        NAME rename-smoke
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/rename_smoke.py
+                --binary $<TARGET_FILE:lazyverilog-lsp>
+    )
+    set_tests_properties(rename-smoke PROPERTIES TIMEOUT 120)
 endif()
