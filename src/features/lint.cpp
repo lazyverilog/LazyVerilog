@@ -166,7 +166,7 @@ static CachedRegex compile_re(const std::string& pat) {
 
 static int severity_from(const std::string& severity) {
     if (severity == "error") return 1;
-    if (severity == "hint") return 3;
+    if (severity == "hint") return 4;
     return 2;
 }
 
@@ -198,17 +198,80 @@ static std::string file_stem_from_uri(const std::string& uri) {
     return std::filesystem::path(path).stem().string();
 }
 
-/// Recursively check if a syntax subtree contains an if-without-else (latch risk).
-static bool has_latch_risk(const SyntaxNode& node) {
-    if (const auto* cond = node.as_if<ConditionalStatementSyntax>())
-        if (!cond->elseClause)
+using SignalSet = std::unordered_set<std::string>;
+
+/// Base names written by an assignment's left-hand side (`a`, `a[3]`, `s.f`, `{a, b}`).
+static void collect_lhs_names(const SyntaxNode& lhs, SignalSet& out) {
+    if (const auto* id = lhs.as_if<IdentifierNameSyntax>())
+        out.insert(std::string(id->identifier.valueText()));
+    else if (const auto* sel = lhs.as_if<IdentifierSelectNameSyntax>())
+        out.insert(std::string(sel->identifier.valueText()));
+    else if (const auto* elem = lhs.as_if<ElementSelectExpressionSyntax>())
+        collect_lhs_names(*elem->left, out);
+    else if (const auto* member = lhs.as_if<MemberAccessExpressionSyntax>())
+        collect_lhs_names(*member->left, out);
+    else if (const auto* concat = lhs.as_if<ConcatenationExpressionSyntax>())
+        for (const auto* expr : concat->expressions)
+            if (expr)
+                collect_lhs_names(*expr, out);
+}
+
+/// Every signal assigned anywhere under `node`.
+static void collect_assigned(const SyntaxNode& node, SignalSet& out) {
+    if (const auto* bin = node.as_if<BinaryExpressionSyntax>())
+        if (is_blocking_assignment(bin->kind) ||
+            bin->kind == SyntaxKind::NonblockingAssignmentExpression)
+            collect_lhs_names(*bin->left, out);
+    for (uint32_t i = 0; i < node.getChildCount(); ++i)
+        if (const SyntaxNode* child = node.childNode(i))
+            collect_assigned(*child, out);
+}
+
+/// True if `node` holds an if-without-else that assigns a signal not yet in
+/// `covered`, the signals already assigned on every path before it (the
+/// default-assignment pattern: `o = '0; if (en) o = d;` is no latch).  Grows
+/// `covered` with what `node` assigns on every path.
+static bool has_latch_risk(const SyntaxNode& node, SignalSet& covered) {
+    if (const auto* block = node.as_if<BlockStatementSyntax>()) {
+        for (const auto* item : block->items)
+            if (item && has_latch_risk(*item, covered))
+                return true;
+        return false;
+    }
+    if (const auto* cond = node.as_if<ConditionalStatementSyntax>()) {
+        if (!cond->elseClause) {
+            SignalSet assigned;
+            collect_assigned(*cond->statement, assigned);
+            return std::any_of(assigned.begin(), assigned.end(),
+                               [&](const std::string& name) { return !covered.count(name); });
+        }
+        SignalSet then_covered = covered, else_covered = covered;
+        if (has_latch_risk(*cond->statement, then_covered) ||
+            has_latch_risk(*cond->elseClause->clause, else_covered))
             return true;
+        for (const auto& name : then_covered)
+            if (else_covered.count(name))
+                covered.insert(name);
+        return false;
+    }
+    if (const auto* stmt = node.as_if<ExpressionStatementSyntax>()) {
+        collect_assigned(*stmt->expr, covered);
+        return false;
+    }
+    // case, loops, timing controls: what they assign is conditional, so it
+    // covers nothing after them.
     for (uint32_t i = 0; i < node.getChildCount(); ++i) {
+        SignalSet scoped = covered;
         const SyntaxNode* child = node.childNode(i);
-        if (child && has_latch_risk(*child))
+        if (child && has_latch_risk(*child, scoped))
             return true;
     }
     return false;
+}
+
+static bool has_latch_risk(const SyntaxNode& node) {
+    SignalSet covered;
+    return has_latch_risk(node, covered);
 }
 
 struct CurrentModulePorts {
@@ -377,6 +440,8 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     // section switch cannot be a single early return the way it is for
     // functions.  Gate each rule instead.
     bool statement_rules_on() const { return cfg.statement.enable; }
+    bool module_rules_on() const { return cfg.module.enable; }
+    bool instance_rules_on() const { return cfg.instance.enable; }
 
     void chk_name(const std::string& name, SourceLocation loc,
                   const CachedRegex& re,
@@ -511,19 +576,19 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     continue;
                 std::string port = std::string(named->name.valueText());
                 if (!seen.insert(port).second)
-                    push_diag(diags, sm, named->name.location(), module_sev(),
+                    push_diag(diags, sm, named->name.location(), instance_sev(),
                         LintCode::InstanceDuplicateConnection,
-                        "[module] duplicate autoinst connection for port '" + port + "'");
+                        "[instance] duplicate autoinst connection for port '" + port + "'");
                 else if (!has_port(port))
-                    push_diag(diags, sm, named->name.location(), module_sev(),
+                    push_diag(diags, sm, named->name.location(), instance_sev(),
                         LintCode::InstanceStaleConnection,
-                        "[module] stale autoinst connection for unknown port '" + port + "'");
+                        "[instance] stale autoinst connection for unknown port '" + port + "'");
             }
             for_each_port([&](const std::string& port_name) {
                 if (!seen.count(port_name) && inst->decl)
-                    push_diag(diags, sm, inst->decl->name.location(), module_sev(),
+                    push_diag(diags, sm, inst->decl->name.location(), instance_sev(),
                         LintCode::InstanceMissingConnection,
-                        "[module] autoinst connection missing port '" + port_name + "'");
+                        "[instance] autoinst connection missing port '" + port_name + "'");
             });
         }
     }
@@ -531,7 +596,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
     // ── module_instantiation_style: "named" | "positional" | "both" ─────────
     void handle(const HierarchyInstantiationSyntax& node) {
         const auto& style = cfg.instance.module_instantiation_style;
-        if (!style.empty()) {
+        if (instance_rules_on() && !style.empty()) {
             for (uint32_t i = 0; i < node.instances.size(); ++i) {
                 const auto* inst = node.instances[i];
                 if (!inst) continue;
@@ -545,20 +610,20 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     }
                 }
                 if (style == "named" && has_positional)
-                    push_diag(diags, sm, node.type.location(), module_sev(),
+                    push_diag(diags, sm, node.type.location(), instance_sev(),
                         LintCode::InstanceStyle,
-                        "[module] instance uses positional port connections; named connections required");
+                        "[instance] instance uses positional port connections; named connections required");
                 else if (style == "positional" && has_named)
-                    push_diag(diags, sm, node.type.location(), module_sev(),
+                    push_diag(diags, sm, node.type.location(), instance_sev(),
                         LintCode::InstanceStyle,
-                        "[module] instance uses named port connections; positional connections required");
+                        "[instance] instance uses named port connections; positional connections required");
                 else if (style == "both" && has_positional && has_named)
-                    push_diag(diags, sm, node.type.location(), module_sev(),
+                    push_diag(diags, sm, node.type.location(), instance_sev(),
                         LintCode::InstanceStyle,
-                        "[module] instance mixes positional and named port connections");
+                        "[instance] instance mixes positional and named port connections");
             }
         }
-        if (cfg.instance.stale_instance_diagnostic) {
+        if (instance_rules_on() && cfg.instance.stale_instance_diagnostic) {
             const auto module_name = std::string_view(node.type.valueText());
             if (const auto* current = find_current_module_ports(module_name)) {
                 // Current/open-file facts come from the live AST.  They win over
@@ -594,7 +659,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         auto name = std::string(node.header->name.valueText());
         if (node.kind == SyntaxKind::ModuleDeclaration) {
             ++module_count_;
-            if (cfg.module.one_module_per_file && module_count_ > 1)
+            if (module_rules_on() && cfg.module.one_module_per_file && module_count_ > 1)
                 push_diag(diags, sm, node.header->name.location(), module_sev(),
                     LintCode::ModuleOnePerFile,
                     "[module] more than one module declared in this file");
@@ -835,11 +900,13 @@ static std::vector<ParseDiagInfo> run_lint_impl(const DocumentState& state, cons
         !config.naming.localparam_pattern.empty() ||
         config.naming.check_module_filename ||
         config.naming.check_package_filename);
+    const bool instance_lint_active = config.instance.enable &&
+        (!config.instance.module_instantiation_style.empty() || config.instance.stale_instance_diagnostic);
     if (!config.statement.case_missing_default && !config.function.functions_automatic &&
         !config.function.explicit_function_lifetime && !config.function.explicit_task_lifetime &&
-        config.instance.module_instantiation_style.empty() && config.function.function_call_style.empty() &&
-        !config.module.one_module_per_file &&
-        !config.instance.stale_instance_diagnostic && !config.statement.latch_inference_detection &&
+        !instance_lint_active && config.function.function_call_style.empty() &&
+        !(config.module.enable && config.module.one_module_per_file) &&
+        !config.statement.latch_inference_detection &&
         !config.statement.explicit_begin && !config.statement.no_raw_always &&
         !config.statement.blocking_nonblocking_assignments && config.naming.register_pattern.empty() &&
         !naming_active)
@@ -852,7 +919,7 @@ static std::vector<ParseDiagInfo> run_lint_impl(const DocumentState& state, cons
     // declarations, but current/open-file facts are derived from the live AST
     // below while closed/project facts are read from project_index.
     CurrentModulePortMap current_modules;
-    if (config.instance.stale_instance_diagnostic) {
+    if (config.instance.enable && config.instance.stale_instance_diagnostic) {
         CurrentModulePortCollector collector;
         state.tree->root().visit(collector);
         current_modules = std::move(collector.modules);

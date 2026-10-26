@@ -23,13 +23,16 @@ enable = true
 
 ## Severity levels
 
-Every rule category exposes a `severity` field. The value controls how the LSP reports violations.
+Every rule category (`[lint.naming]`, `[lint.module]`, `[lint.instance]`, `[lint.statement]`,
+`[lint.function]`) has its own `enable` and `severity`. `enable` defaults to `false`: a category's
+rules run only when its `enable = true`, and its `severity` applies to every rule in it. The value
+controls how the LSP reports violations.
 
 | Value | LSP severity | Editor appearance |
 |-------|-------------|-------------------|
 | `"error"` | 1 | red squiggly |
 | `"warning"` | 2 | yellow squiggly |
-| `"hint"` | 3 | subtle / grey |
+| `"hint"` | 4 | subtle / grey |
 
 ---
 
@@ -508,7 +511,11 @@ end
 
 ### `latch_inference_detection`
 
-Flags incomplete `if` statements inside `always_comb` that may infer a latch because not all paths assign the output.
+Flags an `if` without `else` inside `always_comb` that assigns a signal not already assigned on every
+path before it, so that signal may hold its value and infer a latch. A default assignment earlier in
+the same block (`s_out = '0;` before the `if`, or both branches of an earlier `if`/`else`) covers the
+signal. Assignments inside a `case` or a loop cover nothing after them. `case` statements without a
+`default` are [`case_missing_default`](#case-missing-default)'s job, not this rule's.
 
 ```toml
 [lint.statement]
@@ -529,6 +536,14 @@ always_comb begin
         s_out = i_data;
     end else begin
         s_out = '0;
+    end
+end
+
+// good — default assignment first
+always_comb begin
+    s_out = '0;
+    if (i_en) begin
+        s_out = i_data;
     end
 end
 ```

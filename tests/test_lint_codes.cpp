@@ -145,6 +145,7 @@ TEST_CASE("every lint diagnostic carries a code", "[lint][lint-codes]") {
     cfg.naming.input_port_pattern = "^i_.*$";
     cfg.naming.signal_pattern = "^s_.*$";
     cfg.style.trailing_whitespace = true;
+    cfg.module.enable = true;
     cfg.module.one_module_per_file = true;
     cfg.statement.enable = true;
     cfg.statement.case_missing_default = true;

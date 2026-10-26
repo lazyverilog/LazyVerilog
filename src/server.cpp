@@ -1208,7 +1208,8 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
             // synchronously parse, copy, or merge the full design filelist on
             // every edit.
             std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-            if (file_config->lint.instance.stale_instance_diagnostic)
+            if (file_config->lint.instance.enable &&
+                file_config->lint.instance.stale_instance_diagnostic)
                 project_lint_index = analyzer_.project_index_snapshot();
 
             auto lint_diags = run_lint(*state, file_config->lint, project_lint_index.get());
@@ -2359,7 +2360,8 @@ void LazyVerilogServer::register_handlers() {
                     // multi-project session spans projects that can disagree
                     // about which rules are enabled and at what severity.
                     const auto file_config = config_for(uri);
-                    if (file_config->lint.instance.stale_instance_diagnostic &&
+                    if (file_config->lint.instance.enable &&
+                        file_config->lint.instance.stale_instance_diagnostic &&
                         !project_lint_index)
                         project_lint_index = analyzer_.project_index_snapshot();
 

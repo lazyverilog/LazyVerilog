@@ -328,7 +328,8 @@ int main(int argc, char* argv[]) {
         run_synchronous_semantic_compile(analyzer, error_limit);
 
     std::shared_ptr<const ProjectIndexSnapshot> project_lint_index;
-    if (!compile_only && project.config.lint.instance.stale_instance_diagnostic)
+    if (!compile_only && project.config.lint.instance.enable &&
+        project.config.lint.instance.stale_instance_diagnostic)
         project_lint_index = analyzer.project_index_snapshot();
 
     std::vector<std::shared_ptr<const DocumentState>> states;

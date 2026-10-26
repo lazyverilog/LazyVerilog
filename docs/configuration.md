@@ -73,6 +73,15 @@ indent_size = 4
 enable = true
 ```
 
+## Mistakes in the file
+
+A value of the wrong type or out of range, an unknown key, and an unknown section such as a misspelled
+`[fromat]` are reported, all in one message. The server shows it as a warning
+(`window/showMessage`) and as a diagnostic on `lazyverilog.toml`, and the command-line tools print it
+to stderr. The rest of the file still applies: a bad value keeps its default, and an unknown key or
+section is ignored. A TOML syntax error is different: then the whole file is ignored and every option
+keeps its default.
+
 ## Complete example
 
 The `lazyverilog.toml` from the repository root, imported here so it cannot drift from the file the

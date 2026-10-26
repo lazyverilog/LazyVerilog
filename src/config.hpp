@@ -300,7 +300,7 @@ struct Config {
 };
 
 /// Load lazyverilog.toml from root directory. Returns defaults if not found.
-/// Unknown keys are silently ignored. On TOML syntax error, returns defaults
+/// Unknown keys and sections are ignored and reported as validation errors. On TOML syntax error, returns defaults
 /// and sets *warning to a human-readable message (if warning != nullptr).
 /// If warning_detail is provided, it receives the TOML source position when available.
 Config load_config(const std::filesystem::path& root, std::string* warning = nullptr,
