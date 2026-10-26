@@ -9191,10 +9191,15 @@ void Analyzer::background_index_loop() const {
         // Put it back -- unless it has left the project meanwhile -- so it is
         // redone under the new generation.  The header claims this parse took
         // go too, or the redo would find them claimed and never build the
-        // shards that were just dropped.  Called with map_mutex_ held.
+        // shards that were just dropped -- unless a full reindex since this
+        // parse began already cleared them, in which case a claim held now
+        // belongs to a newer worker.  Called with map_mutex_ held.
         const auto requeue_discarded_locked = [&](const std::vector<std::string>& claims) {
-            for (const auto& header_uri : claims)
-                background_header_claims_.erase(header_uri);
+            const auto reindexed = background_full_reindex_generation_;
+            if (reindexed == std::numeric_limits<uint64_t>::max() || reindexed <= generation) {
+                for (const auto& header_uri : claims)
+                    background_header_claims_.erase(header_uri);
+            }
             if (extra_file_set_.contains(path_string) || docs_.contains(uri))
                 queue_background_file_locked(path_string, /*front=*/true);
         };
