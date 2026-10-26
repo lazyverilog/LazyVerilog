@@ -567,7 +567,8 @@ end
 
 ### `explicit_begin`
 
-Requires `begin`/`end` blocks for `if`, `else`, `for`, `while`, and `foreach` bodies.
+Requires `begin`/`end` blocks for `if`, `else`, `for`, `while`, `foreach`, `repeat`, `forever`, and
+`do ... while` bodies.
 
 ```toml
 [lint.statement]

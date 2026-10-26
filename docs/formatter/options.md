@@ -36,7 +36,8 @@ endmodule
 ### `blank_lines_between_items`
 
 Number of blank lines kept wherever the source has at least one. `0` removes them. A gap that has no
-blank line is never given one. Blank lines inside parentheses or braces are not touched. Range 0 to 100.
+blank line is never given one. Blank lines inside parentheses or braces (a port list, a
+concatenation) are always removed, whatever this value is. Range 0 to 100.
 
 ```toml
 [format]
@@ -59,7 +60,8 @@ assign c = d;
 
 ### `default_indent_level_inside_outmost_block`
 
-How many indent levels to add inside the outermost design unit: `module`, `macromodule`, `interface`, `package`, `program`, `class`, `checker`, `primitive`, or `config`. Set to `0` to keep its body at column 0. A unit nested inside another (a `class` in a `package`) always indents its body.
+Indent levels to add inside the outermost design unit, `0` or `1` (other values are rejected with a
+warning and the default `1` is used): `module`, `macromodule`, `interface`, `package`, `program`, `class`, `checker`, `primitive`, or `config`. Set to `0` to keep its body at column 0. A unit nested inside another (a `class` in a `package`) always indents its body.
 
 ```toml
 [format]
@@ -82,23 +84,35 @@ endmodule
 
 ### `tab_align`
 
-When `true`, alignment column widths are snapped to the nearest multiple of `indent_size`. Produces cleaner tab-stop-aligned columns across port declarations, variable declarations, instances, enums, and modports.
+When `true`, alignment column widths are rounded up to the next multiple of `indent_size`. Produces cleaner tab-stop-aligned columns across port declarations, variable declarations, instances, enums, and modports.
 
 ```toml
 [format]
 tab_align = true
 indent_size = 4
+
+# the example below also uses
+[format.port_declaration]
+align = true
+align_adaptive = false
+section1_min_width = 1
+section2_min_width = 1
+section3_min_width = 1
+section4_min_width = 1
+section5_min_width = 0
 ```
 
 ```systemverilog
 // tab_align = false, indent_size = 4
-input  logic [7:0] data,
-output logic       valid
+    input  logic [7:0] data,
+    output logic       valid
 
-// tab_align = true, indent_size = 4  (columns snap to multiples of 4)
-input   logic   [7:0]   data,
-output  logic            valid
+// tab_align = true, indent_size = 4  (each column width rounded up to a multiple of 4)
+    input   logic   [7:0]   data,
+    output  logic           valid
 ```
+
+With the default port widths (`12`, already a multiple of 4) the two settings give the same output.
 
 ---
 
@@ -422,7 +436,9 @@ result = 3;
 
 ### `align_adaptive`
 
-When `true`, each line computes its own alignment width (minimum of `lhs_min_width` or the line's LHS width). When `false`, all consecutive lines in a group share the same column.
+When `true`, the operators line up at `lhs_min_width` and a longer left-hand side widens only its own
+line, which keeps one space before its operator. When `false`, all consecutive lines in a group share the
+column of the widest left-hand side.
 
 ```toml
 [format.statement]
@@ -432,17 +448,18 @@ align_adaptive = false
 ```systemverilog
 // align = true
 // align_adaptive = false
-a               = 1;
-data            = 2;
-result          = 3;
-very_long_text  = 4;
+a              = 1;
+data           = 2;
+result         = 3;
+very_long_text = 4;
 
 // align = true
 // align_adaptive = true
-a           = 1;
-data        = 2;
-result      = 3;
-very_long_text  = 4;
+// lhs_min_width = 6
+a      = 1;
+data   = 2;
+result = 3;
+very_long_text = 4;
 ```
 
 ---
@@ -580,9 +597,14 @@ align = true
 ```
 
 ```systemverilog
-// align = true
-input  logic [7:0]  data,
-output logic        valid
+// align = true, default widths (align_adaptive = true, every section 12)
+input       logic       [7:0]       data                    ,
+output      logic                   valid
+
+// align = true, align_adaptive = false,
+// section1..4_min_width = 1, section5_min_width = 0
+input  logic [7:0] data,
+output logic       valid
 
 // align = false
 input logic [7:0] data,
@@ -656,9 +678,13 @@ align = true
 ```
 
 ```systemverilog
-// align = true
-logic [7:0]  data;
-logic        valid;
+// align = true, default widths (section1 0, section2 30, section3 30, section4 0)
+logic [7:0]                         data                          ;
+logic                               valid                         ;
+
+// align = true, section1..3_min_width = 1, section4_min_width = 0
+logic [7:0] data  ;
+logic       valid ;
 
 // align = false
 logic [7:0] data;
@@ -670,6 +696,26 @@ logic valid;
 ### `section1_min_width` .. `section4_min_width`
 
 Minimum character width for each section.
+
+`section1_min_width = 0` (the default) selects a simpler mode. Only the type column is lined up across
+the group. The dimension and name sections are each padded to their own minimum width, line by line, so
+names and `=` line up only when every dimension and name fits in that width. A section whose width is
+`0` gets no padding at all, and the `;` is not aligned. Set `section1_min_width` to `1` or more to line
+up every section, the `=` and the `;` across the group.
+
+```systemverilog
+// align = true, section1_min_width = 0, section2_min_width = 8, section3_min_width = 8
+logic    [7:0]   data    = 1;
+logic            valid   ;
+int      [15:0]  a_very_long_name_x = 0;
+packet_t         p       ;
+
+// align = true, section1_min_width = 1, section2_min_width = 8, section3_min_width = 8
+logic    [7:0]   data               = 1;
+logic            valid                 ;
+int      [15:0]  a_very_long_name_x = 0;
+packet_t         p                     ;
+```
 
 ```toml
 [format.var_declaration]
@@ -788,22 +834,25 @@ When `true`, each port line computes its own gap. When `false`, all ports in the
 
 ```toml
 [format.instance]
+align_adaptive = false
 ```
 
 ```systemverilog
-// align_adaptive = false
+// align = true, align_adaptive = false
 m_fifo u_fifo (
-    .clk            (clk           ),
-    .data           (data          ),
-    .very_long_text (              ),
-    .din            (very_long_text)
+  .clk            (clk           ),
+  .data           (data          ),
+  .very_long_text (              ),
+  .din            (very_long_text)
 );
-// align_adaptive = true
+
+// align = true, align_adaptive = true,
+// instance_port_name_width = 6, instance_port_between_paren_width = 10
 m_fifo u_fifo (
-    .clk   (clk       ),
-    .data  (data      ),
-    .very_long_text (data      ),
-    .din   (very_long_text)
+  .clk  (clk       ),
+  .data (data      ),
+  .very_long_text (          ),
+  .din  (very_long_text)
 );
 ```
 
@@ -840,15 +889,25 @@ A brace-less body (`if (a) call(...);` on two lines) is measured one indent shor
 line_length = 100
 ```
 
+The width is measured up to the call's closing `)`; a `;` or `,` after it is not counted. The
+single-line call below ends at column 30.
+
 ```systemverilog
 // break_policy = auto
-// line_length = 10
-    sum(.i_a(i_a2),
-        .i_b(i_b));
+// line_length = 40
+    sum(.i_a(i_a2), .i_b(i_b));
+
 // break_policy = auto
 // line_length = 20
-    sum(.i_a(i_a2), .i_b(i_b));
+    sum(
+      .i_a(i_a2),
+      .i_b(i_b)
+    );
 ```
+
+A call is not broken when that would not help: when the arguments would still start past the limit
+after the break (after the `(` for `layout = "hanging"`, one indent past the call's name for
+`"block"`).
 
 ---
 
@@ -1187,7 +1246,14 @@ align = true
 ```
 
 ```systemverilog
-// align = true
+// align = true (align_adaptive = false: the `,` lines up after the widest signal)
+modport master (
+  input  clk  ,
+  input  rst_n,
+  output valid
+);
+
+// align = true, align_adaptive = true
 modport master (
   input  clk,
   input  rst_n,
