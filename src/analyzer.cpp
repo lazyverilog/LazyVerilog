@@ -1159,9 +1159,8 @@ static std::string includer_predefine_text(const Macros& macros) {
 }
 
 /// Adds to @p table the macros @p prefix (the start of @p path, up to an
-/// `include) defines, preprocessed after the ones already in the table.
-/// shortcut: a macro the prefix `undef's stays in the table; track undefs if a
-/// header ever depends on that.
+/// `include) defines, preprocessed after the ones already in the table.  One the
+/// prefix `undef's leaves the table.
 static void collect_prefix_macros(std::string_view prefix, const std::string& path,
                                   const ParseInputs& inputs,
                                   const std::vector<OpenTextOverlay>& overlays,
@@ -1182,7 +1181,14 @@ static void collect_prefix_macros(std::string_view prefix, const std::string& pa
     const auto tree = slang::syntax::SyntaxTree::fromText(prefix, *sm, std::string_view(path),
                                                           std::string_view(path), bag);
     const auto own_buffers = tree->getSourceBufferIds();
-    for (const auto* def : tree->getDefinedMacros()) {
+    // Sorted by name; an inherited macro missing from it was `undef'd.
+    const auto defined = tree->getDefinedMacros();
+    std::erase_if(table, [&](const auto& entry) {
+        return !std::ranges::binary_search(
+            defined, std::string_view(entry.first), {},
+            [](const slang::syntax::DefineDirectiveSyntax* def) { return def->name.valueText(); });
+    });
+    for (const auto* def : defined) {
         const auto start = def->directive.location();
         const auto end = def->sourceRange().end();
         if (!start.valid() || !sm->isFileLoc(start) || end.buffer() != start.buffer())

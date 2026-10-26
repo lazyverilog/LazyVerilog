@@ -467,6 +467,43 @@ TEST_CASE("a header included only through another header gets the package's macr
     CHECK(unknown_macro_count(*state) == 0);
 }
 
+namespace {
+
+/// The body of @p name as the open header's tree sees it; empty when undefined.
+std::string macro_seen(const DocumentState& state, std::string_view name) {
+    for (const auto* def : state.tree->getDefinedMacros()) {
+        if (def->name.valueText() == name)
+            return def->toString();
+    }
+    return {};
+}
+
+} // namespace
+
+TEST_CASE("a macro the includer `undef's before the `include is not handed to the header",
+          "[sync][includer-context]") {
+    // pkg.sv defines W and U, then agent.svh -- before it reaches drv.svh --
+    // `undef's U and redefines W.  The table carried into agent.svh's prefix
+    // kept U, so drv.svh parsed with a macro no includer has at that point.
+    HeaderTree tree("undef");
+    tree.write("inc/macros.svh", "`define W 4\n`define U 1\n");
+    tree.write("inc/agent.svh", "`undef U\n`undef W\n`define W 16\n`include \"drv.svh\"\n");
+    const auto drv = tree.write("inc/drv.svh", "class drv;\n"
+                                               "  logic [`W-1:0] d;\n"
+                                               "`ifdef U\n  int u_seen;\n`endif\n"
+                                               "endclass\n");
+    tree.write("src/pkg.sv",
+               "package pkg;\n`include \"macros.svh\"\n`include \"agent.svh\"\nendpackage\n");
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/drv.svh"), drv);
+    const auto state = a.get_state(tree.uri("inc/drv.svh"));
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    CHECK(macro_seen(*state, "U").empty());
+    CHECK(macro_seen(*state, "W").find("16") != std::string::npos);
+}
+
 TEST_CASE("a header's own `define wins over the includer's", "[sync][includer-context]") {
     // slang gives a predefine precedence over a later `define of the same name,
     // so passing the includer's W would silently replace the header's.
