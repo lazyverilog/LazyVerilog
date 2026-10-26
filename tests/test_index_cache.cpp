@@ -693,6 +693,7 @@ TEST_CASE("index cache: a file that cannot be read has no digest", "[index-cache
 #include "analyzer.hpp"
 #include "config.hpp"
 
+#include <atomic>
 #include <set>
 
 namespace {
@@ -1605,4 +1606,51 @@ TEST_CASE("index cache: an unreadable path has no digest", "[index-cache]") {
     // And the ordinary case still works, so the guard has not swallowed it.
     const auto file = dir.write("real.sv", "module m; endmodule\n");
     CHECK(IndexCache::digest_file(file).has_value());
+}
+
+// ── Work an edit elsewhere discarded mid-parse ──────────────────────────────
+//
+// The cold start that left a whole UVM library unindexed: a worker had already
+// taken uvm_pkg.sv off the queue when opening a header bumped the generation.
+// The result is rightly not committed -- it may be stale -- but the bump only
+// re-queues what it changed, so the file was never parsed again.  The hook
+// makes the bump land inside the parse every time, at either point the worker
+// checks the generation.
+namespace {
+
+std::shared_ptr<const ProjectIndexSnapshot> index_with_bump_mid_parse(const CacheProject& project,
+                                                                      bool headers_built) {
+    // LIB_VAL lives only in the header's own shard, so it is there only if
+    // the header was built under the current generation.
+    project.write("lib.svh", "localparam int LIB_VAL = 1;\n");
+    project.write("lib.sv", "`include \"lib.svh\"\nmodule lib; endmodule\n");
+    project.write("other.sv", "module other; endmodule\n");
+
+    Analyzer analyzer;
+    std::atomic<bool> bumped{false};
+    const auto other_uri = uri_from_path((project.root() / "other.sv").string());
+    analyzer.set_background_index_hook_for_testing([&](const std::string& path, bool stage) {
+        if (stage == headers_built && path.ends_with("lib.sv") && !bumped.exchange(true))
+            analyzer.refresh_changed_extra_files({other_uri});
+    });
+    auto snapshot = project.index(analyzer, {"lib.sv", "other.sv"});
+    REQUIRE(bumped);
+    return snapshot;
+}
+
+} // namespace
+
+TEST_CASE("index cache: a parse discarded by a generation bump is redone", "[index-cache]") {
+    CacheProject project("requeue-file");
+    const auto snapshot = index_with_bump_mid_parse(project, /*headers_built=*/false);
+    CHECK(snapshot_modules(snapshot) == std::set<std::string>{"lib", "other"});
+    CHECK(snapshot_values(snapshot).count("LIB_VAL") == 1);
+}
+
+TEST_CASE("index cache: header shards discarded by a generation bump are rebuilt",
+          "[index-cache]") {
+    CacheProject project("requeue-headers");
+    const auto snapshot = index_with_bump_mid_parse(project, /*headers_built=*/true);
+    CHECK(snapshot_modules(snapshot) == std::set<std::string>{"lib", "other"});
+    CHECK(snapshot_values(snapshot).count("LIB_VAL") == 1);
 }

@@ -8334,6 +8334,11 @@ void Analyzer::set_project_index_publish_callback(std::function<void()> callback
     project_index_publish_callback_ = std::move(callback);
 }
 
+void Analyzer::set_background_index_hook_for_testing(
+    std::function<void(const std::string& path, bool headers_built)> hook) {
+    background_index_hook_ = std::move(hook);
+}
+
 std::shared_ptr<const std::vector<OpenIndexShard>>
 Analyzer::opened_file_index_shards(const std::string& current_uri) const {
     std::vector<std::shared_ptr<const DocumentState>> states;
@@ -9180,6 +9185,20 @@ void Analyzer::background_index_loop() const {
             background_warmup_generation_ = generation;
         };
 
+        // A generation bump means this parse's result must not be committed,
+        // but this file was popped from the queue before the bump, so nothing
+        // else will parse it again: the bump only re-queues what it changed.
+        // Put it back -- unless it has left the project meanwhile -- so it is
+        // redone under the new generation.  The header claims this parse took
+        // go too, or the redo would find them claimed and never build the
+        // shards that were just dropped.  Called with map_mutex_ held.
+        const auto requeue_discarded_locked = [&](const std::vector<std::string>& claims) {
+            for (const auto& header_uri : claims)
+                background_header_claims_.erase(header_uri);
+            if (extra_file_set_.contains(path_string) || docs_.contains(uri))
+                queue_background_file_locked(path_string, /*front=*/true);
+        };
+
         // Everything from here on parses.  slang can throw, an allocation for a
         // generated register block can throw, and a filesystem that goes away
         // under the shard cache can throw -- and this is a thread function, so
@@ -9233,6 +9252,8 @@ void Analyzer::background_index_loop() const {
                         if (background_header_claims_.insert(dependency).second)
                             headers_to_build.push_back(dependency);
                     }
+                } else {
+                    requeue_discarded_locked({});
                 }
             }
 
@@ -9255,6 +9276,8 @@ void Analyzer::background_index_loop() const {
                     }
                     invalidate_extra_snapshots_locked();
                 }
+                if (generation != background_generation_ && !headers_to_build.empty())
+                    requeue_discarded_locked(headers_to_build);
                 release_warmup_locked();
                 release_active_locked();
                 if (background_pending_files_.empty() && background_index_active_ == 0)
@@ -9289,6 +9312,9 @@ void Analyzer::background_index_loop() const {
         // map in the index while all workers and request handlers waited.
         auto committed_index = std::make_shared<SyntaxIndex>(std::move(state->index));
 
+        if (background_index_hook_)
+            background_index_hook_(path_string, /*headers_built=*/false);
+
         std::vector<std::string> headers_to_build;
         // Shards to write to the on-disk cache once map_mutex_ is released:
         // storing hashes every file the shard depends on, which must not happen
@@ -9299,6 +9325,7 @@ void Analyzer::background_index_loop() const {
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_) {
+                requeue_discarded_locked({});
                 release_warmup_locked();
                 release_active_locked();
                 background_cv_.notify_all();
@@ -9350,8 +9377,13 @@ void Analyzer::background_index_loop() const {
         // Again, for the headers build_header_shards() parsed on their own.
         remember_parsed_digests(*state, generation);
 
+        if (background_index_hook_)
+            background_index_hook_(path_string, /*headers_built=*/true);
+
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
+            if (generation != background_generation_ && !headers_to_build.empty())
+                requeue_discarded_locked(headers_to_build);
             if (generation == background_generation_ && !built_headers.empty()) {
                 for (auto& header : built_headers) {
                     if (header.stands_alone)

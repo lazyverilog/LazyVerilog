@@ -752,6 +752,14 @@ class Analyzer {
     /// it must be non-blocking and must not call back into Analyzer.
     void set_project_index_publish_callback(std::function<void()> callback);
 
+    /// Test seam.  Runs on an index worker after it parsed a closed project file
+    /// (`headers_built` false) and again after that file's header shards were
+    /// built (true), each time before the result is checked against the current
+    /// generation -- the window an edit elsewhere can land in.  Set it before
+    /// any indexing starts; production never sets it.
+    void set_background_index_hook_for_testing(
+        std::function<void(const std::string& path, bool headers_built)> hook);
+
     /// Return dynamic/file indexes for other open buffers as per-file shards.
     ///
     /// This is the clangd-style dynamic layer: files that have been
@@ -1213,6 +1221,7 @@ private:
     };
 
     std::function<void(const std::string&)> parse_complete_cb_;
+    std::function<void(const std::string&, bool)> background_index_hook_;
 
     // Version tracking — under map_mutex_
     std::unordered_map<std::string, uint64_t> latest_version_;
