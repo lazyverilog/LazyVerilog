@@ -19,6 +19,7 @@
 namespace slang {
 class SourceManager;
 namespace syntax {
+class ClassDeclarationSyntax;
 class ClockingDeclarationSyntax;
 class DefineDirectiveSyntax;
 class ExpressionSyntax;
@@ -248,6 +249,10 @@ std::string make_subroutine_signature(const slang::syntax::FunctionPrototypeSynt
 /// package qualifier and parameter overrides (`extends cfg_pkg::base_cfg #(8)`)
 /// that no index is keyed by.
 std::string base_class_lookup_name(std::string_view base_class);
+
+/// Fill ClassEntry::params and ::base_args from @p cls.
+void index_class_params(const slang::syntax::ClassDeclarationSyntax& cls,
+                        const slang::SourceManager& sm, ClassEntry& entry);
 
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name);
 bool is_module_value_kind(std::string_view kind);

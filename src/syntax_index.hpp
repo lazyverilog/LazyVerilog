@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <memory>
+#include <mutex>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -168,6 +169,13 @@ struct MethodEntry {
     int col{0};
 };
 
+/// One `#(...)` slot of a class: a declared parameter (`value` its default) or
+/// an argument of the `extends` clause (`name` empty when it is positional).
+struct ClassParamEntry {
+    std::string name;
+    std::string value;
+};
+
 struct ClassEntry {
     std::string name;
     SourceFileID file_id{kInvalidSourceFileID};
@@ -177,6 +185,12 @@ struct ClassEntry {
     std::vector<MethodEntry> methods;
     int line{0};
     int col{0};
+    /// `class C #(type REQ = item, int N = 4)`, in declaration order.  A closed
+    /// base class keeps no tree, so this is where `REQ` is mapped back to the
+    /// argument a subclass's `extends C #(...)` gave it.
+    std::vector<ClassParamEntry> params;
+    /// The arguments of this class's own `extends X #(...)`, in order.
+    std::vector<ClassParamEntry> base_args;
 };
 
 struct EnumMemberEntry {
@@ -469,6 +483,16 @@ struct ProjectIndexModuleRef {
     size_t shard_slot{0};
 };
 
+/// A member a class inherits, as completion offers it.  `depth` counts the
+/// `extends` hops from the class that was asked about (its own base is 1).
+struct InheritedMember {
+    std::string name;
+    std::string detail;
+    int depth{1};
+    bool is_method{false};
+    bool is_task{false};
+};
+
 struct ProjectIndexSnapshot {
     struct Shard {
         std::string path;
@@ -485,6 +509,14 @@ struct ProjectIndexSnapshot {
     /// project of thousands of modules would otherwise pay a heap allocation
     /// per name to express "there is exactly one of these".
     std::unordered_map<std::string, std::vector<ProjectIndexModuleRef>> module_duplicates;
+
+    /// Every class declaration by name, as (shard slot, index into its classes).
+    /// Filled at publish like module_by_name: a listed file's edit republishes
+    /// per keystroke, so a map built on first use would be rebuilt by the
+    /// request thread every time.
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>> class_slots;
+    /// The slots of the shards that define a macro, in shard order.
+    std::vector<size_t> macro_shard_slots;
 
     /// The declaration of @p name that best answers for @p from_path, or null.
     ///
@@ -507,6 +539,33 @@ struct ProjectIndexSnapshot {
 
     /// The file @p ref was declared in, or an empty string if its slot is stale.
     const std::string& module_path(const ProjectIndexModuleRef& ref) const;
+
+    /// The declaration of class @p name nearest @p from_path, or null.  Ranked
+    /// like find_module(), never filtered: the name a class's `extends` gives
+    /// can be declared by two projects at once.
+    const ClassEntry* find_class(const std::string& name, std::string_view from_path) const;
+
+    /// Fields and methods class @p base_name and its bases declare, nearest
+    /// level first, a name only once (the nearest declaration wins).  Every
+    /// level is resolved with find_class() against @p from_path.  Computed on
+    /// first use and kept for the life of this snapshot -- a publish replaces
+    /// the snapshot, and with it the answer -- so a completion per identifier
+    /// keystroke costs a map lookup, not a climb.
+    std::shared_ptr<const std::vector<InheritedMember>>
+    inherited_members(const std::string& base_name, std::string_view from_path) const;
+
+    /// Every macro defined in a shard whose project root (per @p project_of,
+    /// given a shard's path) is @p root.  Cached per root like the above.
+    std::shared_ptr<const std::vector<const MacroEntry*>>
+    project_macros(const std::string& root,
+                   const std::function<std::string(const std::string&)>& project_of) const;
+
+  private:
+    struct DerivedCache;
+    /// Answers built on first use and kept for this snapshot's life.
+    mutable std::once_flag derived_once_;
+    mutable std::shared_ptr<DerivedCache> derived_;
+    DerivedCache& derived() const;
 };
 
 /// How many leading path components @p a and @p b agree on.  Accepts either

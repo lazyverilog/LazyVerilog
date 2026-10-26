@@ -295,7 +295,19 @@ decides whether waiting for the reparse can help:
   `DocumentState::parse_time` is the time from the edit to the commit for a
   reparse, `make_state()` alone for `didOpen`.
 * **It never answers from `previous_parsed`.**  That text is one keystroke old
-  and does not contain the `.` just typed.
+  and does not contain the `.` just typed.  The identifier path does read the
+  *declarations* of `previous_parsed` (locals, and which class the cursor is in,
+  for inherited members), never its context, and only when that parse took
+  50 ms or less: reading them walks the tree.
+
+Inherited members of a bare identifier and the project's macros after `` ` ``
+come from the published snapshot: `class_slots` and `macro_shard_slots` are
+filled at publish, and `ProjectIndexSnapshot::inherited_members()` /
+`project_macros()` cache their answer for the snapshot's life.  A listed file's
+edit republishes per keystroke, so the first request after each publish rebuilds
+the answer: one `extends` climb by map lookups, or one pass over the macro
+shards with a directory -> project memo kept across snapshots.  Both contexts
+send at most 200 items with `isIncomplete`.
 
 The trade-off: in a file that parses inside the budget, member access after `.`
 costs up to the parse time plus the completion itself on a real tree, where it

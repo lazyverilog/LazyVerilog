@@ -7,11 +7,12 @@ ahead of the filelist, and enum literals and matching signals first on the right
 |-------|---------|----------|
 | Module, procedural, class, covergroup body | any identifier position | Keywords valid there, plus snippets such as `always_ff` |
 | Expressions | any identifier position | Visible symbols. Module names appear only where an instantiation can start |
+| Class methods | any identifier position | Also the class's members and every member it inherits through `extends`, own and nearest base first |
 | Instance ports | `.` inside `(...)` | Ports of the instantiated module not yet connected |
 | Instance parameters | `.` inside `#(...)` | Parameters not yet assigned, with type and default |
 | Members | `.` after a name | Class fields and methods, struct fields, module or interface ports and modports |
 | Package scope | `::` | Members of that package only |
-| Macros | `` ` `` | Macros visible in the current file. Function-like ones insert a snippet |
+| Macros | `` ` `` | Macros visible in the current file, and every macro defined in its project. Function-like ones insert a snippet |
 | Includes | manual completion (`<C-x><C-o>`, `Ctrl+Space`) inside `` `include "..." `` | `.svh` and `.vh` files from the filelist |
 
 ```systemverilog
@@ -35,7 +36,9 @@ uvm_pkg::                   // scope completion lists the package
 ## Known gaps
 
 - Typedef chains resolve one step only.
-- Members of parameterized classes (`my_class #(T)`) are not offered.
+- Members of parameterized classes (`my_class #(T)`) are not offered. A handle typed by a type parameter
+  (`REQ req;` in `uvm_driver #(type REQ = ...)`) is resolved through the direct `extends X #(...)` of the
+  class you are in, or the parameter's default; deeper parameter chains are not followed.
 - Hierarchical references (`top.dut.signal`) resolve one `.` hop.
 - Fields of anonymous `struct { ... }` types are not indexed. Named `typedef struct` types are.
 - With syntax errors in the file, keyword context falls back to plain identifiers.

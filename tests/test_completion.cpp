@@ -1,11 +1,13 @@
 #include "analyzer.hpp"
 #include "features/completion.hpp"
+#include "project_root.hpp"
 #include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <thread>
 #include <vector>
 
@@ -2671,4 +2673,265 @@ TEST_CASE("completion: member access survives an include above the first declara
     CHECK(has_label(result, "q"));
 
     std::filesystem::remove_all(dir);
+}
+
+// ── Class scope: inherited names, type parameters, project macros ─────────────
+
+namespace {
+
+/// A scratch tree under the temp directory, removed again on scope exit.
+struct ScratchTree {
+    std::filesystem::path root;
+    explicit ScratchTree(const std::string& name)
+        : root(std::filesystem::temp_directory_path() / name) {
+        std::filesystem::remove_all(root);
+    }
+    ~ScratchTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    std::string write(const std::string& relative, const std::string& text) const {
+        const auto path = root / relative;
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary) << text;
+        return std::filesystem::canonical(path).string();
+    }
+};
+
+/// Index @p files as the project and wait for the snapshot.
+void index_project(Analyzer& analyzer, const std::vector<std::string>& files) {
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files(files);
+    analyzer.wait_for_background_index_idle();
+}
+
+// An out-of-block method of a class whose bases live in closed project files.
+const std::string kSplitUser = "class user_c extends mid_c;\n"
+                               "  int own_field;\n"
+                               "  extern function void f();\n"
+                               "endclass\n"
+                               "function void user_c::f();\n"
+                               "  int local_v;\n"
+                               "  \n"
+                               "endfunction\n";
+
+} // namespace
+
+TEST_CASE("completion: a bare identifier in a method offers inherited members",
+          "[completion][inherited]") {
+    ScratchTree tree("lazyverilog-completion-bare-inherited");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("root.sv", "class root_c;\n  int root_field;\n"
+                              "  function string get_name(); endfunction\nendclass\n"),
+        tree.write("mid.sv", "class mid_c extends root_c;\n  int mid_field;\nendclass\n")};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+    const auto uri = uri_from_path(tree.write("user.sv", kSplitUser));
+    analyzer.open(uri, kSplitUser);
+
+    auto [line, col] = pos_after(kSplitUser, "  int local_v;\n  ");
+    auto all = complete_at(engine, analyzer, uri, line, col);
+    for (const char* name : {"own_field", "local_v", "mid_field", "root_field", "get_name"})
+        CHECK(has_label(all, name));
+    // Own names and locals first, then each base level, nearest first.
+    CHECK(index_of_label(all, "own_field") < index_of_label(all, "mid_field"));
+    CHECK(index_of_label(all, "local_v") < index_of_label(all, "mid_field"));
+    CHECK(index_of_label(all, "mid_field") < index_of_label(all, "root_field"));
+
+    // Typed after the last parse: answered from the placeholder, which has no
+    // tree, so the previous parse supplies the class the cursor is in.
+    std::string typed = kSplitUser;
+    typed.insert(typed.find("  \nendfunction") + 2, "get_n");
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, typed);
+    REQUIRE(analyzer.get_state(uri)->tree == nullptr);
+    auto [tl, tc] = pos_after(typed, "  get_n");
+    auto partial = complete_at(engine, analyzer, uri, tl, tc);
+    analyzer.set_parse_paused(false);
+    CHECK(has_label(partial, "get_name"));
+}
+
+TEST_CASE("completion: a bare identifier climbs the asking project's same-name base",
+          "[completion][inherited][module-proximity]") {
+    ScratchTree tree("lazyverilog-completion-bare-rank");
+    std::vector<std::string> files;
+    for (const std::string chip : {"a", "b"}) {
+        tree.write("chip_" + chip + "/lazyverilog.toml", "[design]\n");
+        files.push_back(tree.write("chip_" + chip + "/mid.sv",
+                                   "class mid_c extends root_" + chip + ";\nendclass\n"));
+        files.push_back(tree.write("chip_" + chip + "/root.sv", "class root_" + chip +
+                                                                    ";\n  int " + chip +
+                                                                    "_field;\nendclass\n"));
+    }
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+    auto [line, col] = pos_after(kSplitUser, "  int local_v;\n  ");
+    for (const std::string chip : {"a", "b"}) {
+        const auto uri = uri_from_path(tree.write("chip_" + chip + "/user.sv", kSplitUser));
+        analyzer.open(uri, kSplitUser);
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        INFO("asking from chip_" << chip);
+        CHECK(has_label(result, chip + "_field"));
+        CHECK_FALSE(has_label(result, (chip == "a" ? "b" : "a") + std::string("_field")));
+        analyzer.close(uri);
+    }
+}
+
+TEST_CASE("completion: an inherited handle typed by a base parameter takes the actual",
+          "[completion][inherited]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.open("file:///tmp/completion_param_base.sv",
+                  "class drv_base #(type REQ = int, type RSP = REQ);\n"
+                  "  REQ req;\n  RSP rsp;\nendclass\n");
+    analyzer.open("file:///tmp/completion_param_items.sv",
+                  "class item_c;\n  int addr;\nendclass\n"
+                  "class other_c;\n  int other_f;\nendclass\n");
+
+    const auto complete_in = [&](const std::string& uri, const std::string& extends,
+                                 const std::string& receiver) {
+        const std::string text = "class my_drv extends " + extends + ";\n"
+                                 "  function void f();\n    " + receiver + "\n"
+                                 "  endfunction\nendclass\n";
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "    " + receiver);
+        return complete_at(engine, analyzer, uri, line, col);
+    };
+    // Positional: REQ is item_c, and RSP's default `REQ` follows it.
+    CHECK(has_label(complete_in("file:///tmp/completion_param_pos.sv",
+                                "drv_base #(item_c)", "req."), "addr"));
+    CHECK(has_label(complete_in("file:///tmp/completion_param_pos2.sv",
+                                "drv_base #(item_c)", "rsp."), "addr"));
+    // Named: only RSP is set; REQ keeps its default.
+    auto named = "drv_base #(.RSP(other_c))";
+    CHECK(has_label(complete_in("file:///tmp/completion_param_named.sv", named, "rsp."),
+                    "other_f"));
+    CHECK_FALSE(has_label(complete_in("file:///tmp/completion_param_named2.sv", named, "req."),
+                          "addr"));
+    // No actuals: the defaults.
+    analyzer.open("file:///tmp/completion_param_dflt_base.sv",
+                  "class seq_base #(type T = item_c);\n  T item;\nendclass\n");
+    CHECK(has_label(complete_in("file:///tmp/completion_param_dflt.sv", "seq_base", "item."),
+                    "addr"));
+}
+
+TEST_CASE("completion: backtick offers the asking project's macros only",
+          "[completion][macro]") {
+    ScratchTree tree("lazyverilog-completion-project-macros");
+    tree.write("chip_a/lazyverilog.toml", "[design]\n");
+    tree.write("chip_b/lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("chip_a/inc/a_defs.svh", "`define A_MACRO 1\n`define A_FN(x) (x)\n"),
+        tree.write("chip_b/b_defs.svh", "`define B_MACRO 1\n"),
+        tree.write("loose/loose_defs.svh", "`define LOOSE_MACRO 1\n")};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    const std::string text = "module m;\n  initial x = `\nendmodule\n";
+    auto [line, col] = pos_after(text, "x = `");
+    const auto uri = uri_from_path(tree.write("chip_a/rtl/m.sv", text));
+    analyzer.open(uri, text);
+    auto result = complete_at(engine, analyzer, uri, line, col);
+    CHECK(has_label(result, "A_MACRO"));
+    CHECK(has_label(result, "A_FN"));
+    CHECK_FALSE(has_label(result, "B_MACRO"));
+    CHECK_FALSE(has_label(result, "LOOSE_MACRO"));
+
+    // A file in no project keeps only what its own includes reach.
+    const auto loose = uri_from_path(tree.write("loose/m.sv", text));
+    analyzer.open(loose, text);
+    auto alone = complete_at(engine, analyzer, loose, line, col);
+    CHECK_FALSE(has_label(alone, "A_MACRO"));
+    CHECK_FALSE(has_label(alone, "LOOSE_MACRO"));
+}
+
+TEST_CASE("completion: a project with many macros sends the best and says it is incomplete",
+          "[completion][macro]") {
+    ScratchTree tree("lazyverilog-completion-macro-cap");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::string defs;
+    for (int i = 0; i < 500; ++i)
+        defs += "`define GEN_MACRO_" + std::to_string(i) + " " + std::to_string(i) + "\n";
+    std::vector<std::string> files{tree.write("inc/defs.svh", defs)};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    const std::string text = "module m;\n  initial x = `GEN_MACRO_42\nendmodule\n";
+    const auto uri = uri_from_path(tree.write("m.sv", text));
+    analyzer.open(uri, text);
+    auto [bl, bc] = pos_after(text, "x = `");
+    auto all = complete_at(engine, analyzer, uri, bl, bc);
+    CHECK(all.isIncomplete);
+    CHECK(all.items.size() <= 200);
+    // A longer prefix narrows it to what fits, best match first.
+    auto [nl, nc] = pos_after(text, "x = `GEN_MACRO_42");
+    auto narrow = complete_at(engine, analyzer, uri, nl, nc);
+    CHECK_FALSE(narrow.isIncomplete);
+    REQUIRE(!narrow.items.empty());
+    CHECK(narrow.items.front().label == "GEN_MACRO_42");
+}
+
+namespace {
+
+/// Fastest of @p runs completing a bare identifier in a method of a class five
+/// levels deep, in a project of @p classes unrelated closed class files.
+double fastest_inherited_completion_ms(int classes, int runs) {
+    ScratchTree tree("lazyverilog-completion-inherited-scaling-" + std::to_string(classes));
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files;
+    files.push_back(tree.write("lvl0.sv", "class lvl0;\n  int f0;\nendclass\n"));
+    for (int i = 1; i < 5; ++i)
+        files.push_back(tree.write("lvl" + std::to_string(i) + ".sv",
+                                   "class lvl" + std::to_string(i) + " extends lvl" +
+                                       std::to_string(i - 1) + ";\n  int f" +
+                                       std::to_string(i) + ";\nendclass\n"));
+    for (int i = 0; i < classes; ++i)
+        files.push_back(tree.write("other/c" + std::to_string(i) + ".sv",
+                                   "class other_" + std::to_string(i) + ";\n  int g" +
+                                       std::to_string(i) + ";\nendclass\n"));
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+    const std::string text = "class user_c extends lvl4;\n  function void f();\n    f\n"
+                             "  endfunction\nendclass\n";
+    const auto uri = uri_from_path(tree.write("user.sv", text));
+    analyzer.open(uri, text);
+    auto [line, col] = pos_after(text, "    f");
+
+    std::vector<double> samples;
+    for (int i = 0; i < runs; ++i) {
+        // Twenty completions per sample: one is too short for the clock.
+        const auto start = std::chrono::steady_clock::now();
+        CompletionList result;
+        for (int k = 0; k < 20; ++k)
+            result = complete_at(engine, analyzer, uri, line, col);
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        REQUIRE(has_label(result, "f0"));
+    }
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+} // namespace
+
+TEST_CASE("completion: inherited identifier cost does not grow with project size",
+          "[completion][inherited][scaling]") {
+    constexpr int kSmall = 20;
+    constexpr int kLarge = 320; // 16x the closed class files
+    constexpr int kRuns = 7;
+    const double small_ms = fastest_inherited_completion_ms(kSmall, kRuns);
+    const double large_ms = fastest_inherited_completion_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[inherited completion scaling] classes " << kSmall << " -> " << kLarge
+              << ": " << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+    // The chain is answered from the snapshot's class map and its per-snapshot
+    // cache: ~1.  Scanning every shard per level is ~16.
+    CHECK(ratio < 4.0);
 }

@@ -67,6 +67,8 @@ class Client:
                           for line in header.strip().split(b"\r\n"))
             body = out.read(int(fields[b"Content-Length"]))
             arrived = time.monotonic()
+            # perf_counter: monotonic() ticks every ~16 ms on Windows.
+            arrived_precise = time.perf_counter()
             try:
                 msg = json.loads(body)
             except ValueError:
@@ -77,7 +79,7 @@ class Client:
             with self.cv:
                 self.last_message = arrived
                 if "id" in msg and "method" not in msg:
-                    self.responses[msg["id"]] = (arrived, msg)
+                    self.responses[msg["id"]] = (arrived_precise, msg)
                 elif "method" in msg:
                     self.notifications.append((arrived, msg["method"], msg.get("params")))
                     if "id" in msg:      # server->client request, e.g. inlayHint/refresh
@@ -112,7 +114,7 @@ class Client:
     def request(self, method: str, params: dict, timeout: float = 60.0):
         self.next_id += 1
         rid = self.next_id
-        start = time.monotonic()
+        start = time.perf_counter()
         self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
         with self.cv:
             while rid not in self.responses:
