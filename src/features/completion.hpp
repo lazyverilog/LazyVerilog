@@ -120,3 +120,15 @@ class CompletionEngine {
                        const std::unordered_set<std::string>& expected_names,
                        const std::unordered_set<std::string>& same_type_names) const;
 };
+
+/// The snapshot completion should answer from for @p uri.
+///
+/// The editor sends completion right behind the didChange that typed the
+/// trigger character, so `get_state()` is usually the text-only placeholder:
+/// with no tree, `p_sequencer.` cannot be seen as member access and the
+/// generic identifier list comes back instead.  Waits for that parse like the
+/// other AST-shaped requests do, but never answers from the one-keystroke-old
+/// fallback: completion reads the cursor's surroundings out of the snapshot's
+/// own text, and the old text does not have the `.` the user just typed.
+std::shared_ptr<const DocumentState> completion_document_state(const Analyzer& analyzer,
+                                                               const std::string& uri);

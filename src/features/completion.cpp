@@ -915,6 +915,15 @@ static std::string infer_current_scope(const DocumentState& state, const SyntaxI
             consider(node, std::string(node.name.valueText()));
             visitDefault(node);
         }
+
+        // `function void C::m(...)` outside the class: its body is C's scope.
+        void handle(const FunctionDeclarationSyntax& node) {
+            const auto* scoped = node.prototype && node.prototype->name
+                                     ? node.prototype->name->as_if<ScopedNameSyntax>()
+                                     : nullptr;
+            if (scoped && scoped->left && scoped->left->getLastToken())
+                consider(node, std::string(scoped->left->getLastToken().valueText()));
+        }
     };
 
     Visitor visitor(offset);
@@ -1646,21 +1655,27 @@ current_file_package_scope_items_from_ast(const DocumentState& state, std::strin
 // `uvm_object_utils(T)` expands to `typedef uvm_object_registry #(T, "T")
 // type_id;`, and `T::type_id::create(...)` is the most-typed line in a UVM
 // testbench.  Without resolving the typedef, that scope has no members at all.
+///
+/// `named_only` admits only a typedef of a named type (a class handle alias),
+/// so a `typedef struct {...} t;` keeps `t` as the scope its fields live in.
 static std::string current_file_typedef_target_from_ast(const DocumentState& state,
-                                                        std::string_view name) {
+                                                        std::string_view name,
+                                                        bool named_only = false) {
     if (!state.tree || name.empty())
         return {};
     using namespace slang::syntax;
     struct Visitor : SyntaxVisitor<Visitor> {
         std::string_view name;
+        bool named_only;
         std::string result;
-        explicit Visitor(std::string_view name) : name(name) {}
+        Visitor(std::string_view name, bool named_only) : name(name), named_only(named_only) {}
         void handle(const TypedefDeclarationSyntax& node) {
-            if (result.empty() && std::string_view(node.name.valueText()) == name)
+            if (result.empty() && std::string_view(node.name.valueText()) == name &&
+                (!named_only || node.type->kind == SyntaxKind::NamedType))
                 result = completion_base_type_name(current_ast_decl_text(*node.type));
             visitDefault(node);
         }
-    } visitor(name);
+    } visitor(name, named_only);
     state.tree->root().visit(visitor);
     return visitor.result;
 }
@@ -1942,6 +1957,9 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
         }
         target = completion_base_type_name(*next);
     }
+    if (auto aliased = current_file_typedef_target_from_ast(state, target, true);
+        !aliased.empty())
+        target = std::move(aliased);
     if (target.empty())
         return items;
     using namespace slang::syntax;
@@ -1981,6 +1999,13 @@ current_file_member_access_items_from_ast(const DocumentState& state, const Comp
                         push_unique_item(items, seen,
                                          completion_ast_text(*method->declaration->prototype->name),
                                          lsCompletionItemKind::Method);
+                    } else if (const auto* proto =
+                                   item ? item->as_if<ClassMethodPrototypeSyntax>() : nullptr) {
+                        // `extern` methods: the body lives outside the class.
+                        if (proto->prototype && proto->prototype->name)
+                            push_unique_item(items, seen,
+                                             completion_ast_text(*proto->prototype->name),
+                                             lsCompletionItemKind::Method);
                     }
                 }
             }
@@ -2480,7 +2505,8 @@ class MemberProvider : public CompletionProvider {
             }
             if (!td.resolved.empty() && td.resolved != name) {
                 CompletionContext inner = ctx;
-                inner.scope_name = td.resolved;
+                // `typedef scoreboard #(item, 8) sb_t;` names class `scoreboard`.
+                inner.scope_name = completion_base_type_name(td.resolved);
                 // Depth-limit prevents infinite recursion on mutually-aliased typedefs.
                 // Keep the counter exception-safe even though completion providers
                 // normally return errors as empty lists: a future throwing provider
@@ -2964,6 +2990,13 @@ class FileProvider : public CompletionProvider {
     }
 };
 
+std::shared_ptr<const DocumentState> completion_document_state(const Analyzer& analyzer,
+                                                               const std::string& uri) {
+    auto parsed = analyzer.get_parsed_state(uri);
+    auto latest = analyzer.get_state(uri);
+    return parsed && latest && parsed->text == latest->text ? parsed : latest;
+}
+
 // ── CompletionEngine ──────────────────────────────────────────────────────────
 
 CompletionEngine::CompletionEngine() {
@@ -3438,7 +3471,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
 
     try {
         CompletionContext indexed_ctx = ctx;
-        std::string inherited_scope;
+        std::vector<std::string> inherited_scopes;
         if (ctx.kind == CompletionContextKind::MemberAccess && !ctx.scope_name.empty()) {
             // Member access is inherently layered:
             //
@@ -3555,20 +3588,62 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                 }
             }
             if (value_type) {
-                const std::string base = completion_base_type_name(*value_type);
+                std::string base = completion_base_type_name(*value_type);
+                // `bus_sb_t sb;` -- the handle's type is a typedef in this
+                // buffer, which no shard layer below can see.
+                if (auto target = current_file_typedef_target_from_ast(state, base, true);
+                    !target.empty())
+                    base = std::move(target);
                 if (!base.empty())
                     indexed_ctx.scope_name = base;
             } else if (!clocking_scope.empty()) {
                 indexed_ctx.scope_name = clocking_scope;
             }
-            // The receiver's class may be declared in this buffer while its
-            // base class is not.  The AST pass emitted what it could see; the
-            // shard layer has to be asked for the rest of the chain by name.
-            inherited_scope = current_file_unresolved_base_class(state, indexed_ctx.scope_name);
+            // Each shard's MemberProvider climbs only the bases that shard
+            // declares, and UVM puts every level of a hierarchy in its own file
+            // (`bus_item` -> `uvm_sequence_item` -> ... -> `uvm_object`), so
+            // climb across the layers here and ask the shards for every level.
+            // The AST pass already emitted the levels this buffer declares.
+            const auto shard_base_of = [&](const std::string& cls) -> std::optional<std::string> {
+                const auto lookup = [&](const SyntaxIndex& index) -> std::optional<std::string> {
+                    const auto it = index.class_by_name.find(cls);
+                    if (it == index.class_by_name.end() || it->second >= index.classes.size())
+                        return std::nullopt;
+                    return base_class_lookup_name(index.classes[it->second].base_class);
+                };
+                for (const auto& shard : *opened_shards)
+                    if (shard.index)
+                        if (auto base = lookup(*shard.index))
+                            return base;
+                for (const auto* shard : project_shards)
+                    if (shard)
+                        if (auto base = lookup(*shard))
+                            return base;
+                return std::nullopt;
+            };
+            constexpr size_t kMaxInheritedScopes = 16;
+            std::unordered_set<std::string> visited{indexed_ctx.scope_name};
+            std::string cls = indexed_ctx.scope_name;
+            bool in_this_file = true;
+            while (!cls.empty() && inherited_scopes.size() < kMaxInheritedScopes) {
+                std::string base;
+                if (in_this_file) {
+                    const auto here = current_file_class_base(state, cls);
+                    in_this_file = here.declared_here;
+                    base = here.base;
+                }
+                if (!in_this_file)
+                    base = shard_base_of(cls).value_or(std::string{});
+                if (base.empty() || !visited.insert(base).second)
+                    break;
+                inherited_scopes.push_back(base);
+                cls = std::move(base);
+            }
         }
 
         std::vector<CompletionContext> shard_contexts{indexed_ctx};
-        for (const auto& alias : {inherited_scope, aliased_scope_name}) {
+        inherited_scopes.push_back(aliased_scope_name);
+        for (const auto& alias : inherited_scopes) {
             if (alias.empty())
                 continue;
             CompletionContext alias_ctx = indexed_ctx;

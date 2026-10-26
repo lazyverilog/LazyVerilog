@@ -2153,6 +2153,74 @@ TEST_CASE("definition: super.new resolves to the base class constructor",
     CHECK(loc->col == 17);
 }
 
+// An out-of-body method body (`function void d2::build`) is the class's scope,
+// so `super.build` there means the base's `build`, not the first `build` the
+// file happens to declare.  Both shapes are asserted: each base must win in its
+// own derived class.
+TEST_CASE("definition: super.m in an out-of-body method resolves in the base",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_oob_super.sv";
+    analyzer.open(uri, "class base_a;\n"                              // 0
+                       "  virtual function void build(int a);\n"      // 1
+                       "  endfunction\n"                              // 2
+                       "endclass\n"                                   // 3
+                       "class base_b;\n"                              // 4
+                       "  int pfield;\n"                              // 5
+                       "  virtual function void build(int a);\n"      // 6
+                       "  endfunction\n"                              // 7
+                       "endclass\n"                                   // 8
+                       "class d1 extends base_a;\n"                   // 9
+                       "  extern virtual function void build(int a);\n" // 10
+                       "endclass\n"                                   // 11
+                       "class d2 extends base_b;\n"                   // 12
+                       "  extern virtual function void build(int a);\n" // 13
+                       "endclass\n"                                   // 14
+                       "function void d1::build(int a);\n"            // 15
+                       "  super.build(a);\n"                          // 16
+                       "endfunction\n"                                // 17
+                       "function void d2::build(int a);\n"            // 18
+                       "  super.build(a);\n"                          // 19
+                       "endfunction\n");                              // 20
+
+    auto in_d1 = analyzer.definition_of(uri, 16, 8);
+    REQUIRE(in_d1.has_value());
+    CHECK(in_d1->line == 1);
+    auto in_d2 = analyzer.definition_of(uri, 19, 8);
+    REQUIRE(in_d2.has_value());
+    CHECK(in_d2->line == 6);
+}
+
+// `agent_t::type_id::create` -- the qualifier is a typedef declared in the
+// enclosing class (every UVMF environment declares its agents this way), so the
+// members belong to the class it names.
+TEST_CASE("definition: a typedef'd class qualifier resolves through the alias",
+          "[definition][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/definition_typedef_qualifier.sv";
+    analyzer.open(uri, "class agent_reg;\n"                           // 0
+                       "  static function int create();\n"            // 1
+                       "  endfunction\n"                              // 2
+                       "endclass\n"                                   // 3
+                       "class agent;\n"                               // 4
+                       "  typedef agent_reg type_id;\n"               // 5
+                       "endclass\n"                                   // 6
+                       "class env;\n"                                 // 7
+                       "  typedef agent agent_t;\n"                   // 8
+                       "  function void build();\n"                   // 9
+                       "    void'(agent_t::type_id::create());\n"     // 10
+                       "  endfunction\n"                              // 11
+                       "endclass\n");                                 // 12
+
+    const std::string line10 = "    void'(agent_t::type_id::create());";
+    auto type_id = analyzer.definition_of(uri, 10, (int)line10.find("type_id"));
+    REQUIRE(type_id.has_value());
+    CHECK(type_id->line == 5);
+    auto create = analyzer.definition_of(uri, 10, (int)line10.find("create"));
+    REQUIRE(create.has_value());
+    CHECK(create->line == 1);
+}
+
 // `arr[0].field` reaches its member through an element select.  The receiver
 // chain already treated the select as transparent, but the *type* text did not:
 // canonical_type_name_from_text() recovers a type name by scanning backwards for
