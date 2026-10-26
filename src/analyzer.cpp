@@ -4043,16 +4043,25 @@ static std::pair<size_t, size_t> cursor_span(const slang::SourceManager& sm,
 /// ordinary tokens of one buffer can be skipped when that span holds no cursor.
 /// Ends that are macro tokens, or in different buffers, prove nothing: such a
 /// subtree is entered, and its children are asked again.
+///
+/// The exception is a cursor inside a `define of this file: a literal argument
+/// to a nested macro, or a default argument value, is visible at its spelling
+/// in the `define text, outside the subtree that expands it.  Such walks set
+/// @c enabled to false (see cursors_in_define()) and visit everything.
 class CursorSubtreeFilter {
 public:
     CursorSubtreeFilter(const slang::SourceManager& sm, const std::string& uri)
         : sm(sm), uri(uri) {}
+
+    bool enabled = true;
 
     /// Whether some cursor of the sorted @p cursors for which @p wanted(index)
     /// holds may be visible at a token under @p node.
     template <typename Wanted>
     bool may_hold(const slang::syntax::SyntaxNode& node,
                   const std::vector<std::pair<int, int>>& cursors, Wanted&& wanted) {
+        if (!enabled)
+            return true;
         const auto first = node.getFirstToken();
         const auto last = node.getLastToken();
         if (!first || !last)
@@ -4080,6 +4089,51 @@ private:
     const slang::SourceManager& sm;
     const std::string& uri;
 };
+
+/// Whether any of the sorted @p cursors is on a logical line of @p tree's text
+/// that holds a `define -- the directive's own line or one it continues with a
+/// trailing `\`.  From the text only, so a `define in a comment counts too;
+/// that just costs the full walk.  Lines are found through the source
+/// manager's line table, so the cost does not grow with the file.
+static bool cursors_in_define(const slang::syntax::SyntaxTree& tree,
+                              const std::vector<std::pair<int, int>>& cursors) {
+    const auto& sm = tree.sourceManager();
+    for (const auto buffer : tree.getSourceBufferIds()) {
+        const std::string_view text = sm.getSourceText(buffer);
+        for (const auto& [line, col] : cursors) {
+            if (line < 0)
+                continue;
+            // First offset on (1-based) line `line + 1`.
+            size_t start = 0;
+            size_t past = text.size();
+            while (start < past) {
+                const size_t mid = start + (past - start) / 2;
+                if (sm.getLineNumber(slang::SourceLocation(buffer, mid)) < size_t(line) + 1)
+                    start = mid + 1;
+                else
+                    past = mid;
+            }
+            if (start >= text.size())
+                continue;
+            size_t end = text.find('\n', start);
+            if (end == std::string_view::npos)
+                end = text.size();
+            // Back over the lines this one continues.
+            while (start > 0) {
+                size_t previous_end = start - 1; // its '\n'
+                if (previous_end > 0 && text[previous_end - 1] == '\r')
+                    --previous_end;
+                if (previous_end == 0 || text[previous_end - 1] != '\\')
+                    break;
+                const size_t newline = text.rfind('\n', previous_end - 1);
+                start = newline == std::string_view::npos ? 0 : newline + 1;
+            }
+            if (text.substr(start, end - start).find("`define") != std::string_view::npos)
+                return true;
+        }
+    }
+    return false;
+}
 
 static bool token_contains_position_in_uri(const slang::SourceManager& sm,
                                            const slang::parsing::Token& token,
@@ -4653,6 +4707,7 @@ static std::vector<std::pair<int, int>> sorted_cursors(std::vector<std::pair<int
 static DefinitionTarget definition_target_at(const slang::syntax::SyntaxTree& tree,
                                              const std::string& uri, int line, int col) {
     DefinitionTargetVisitor visitor(tree.sourceManager(), uri, {{line, col}});
+    visitor.filter.enabled = !cursors_in_define(tree, visitor.cursors);
     tree.root().visit(visitor);
     return visitor.result(0);
 }
@@ -5268,6 +5323,7 @@ static std::vector<std::optional<IdentifierAtPosition>>
 identifier_tokens_at(const slang::syntax::SyntaxTree& tree, const std::string& uri,
                      const std::vector<std::pair<int, int>>& cursors) {
     IdentifierTokenVisitor visitor(tree.sourceManager(), uri, cursors);
+    visitor.filter.enabled = !cursors_in_define(tree, cursors);
     tree.root().visit(visitor);
     return std::move(visitor.results);
 }
@@ -5642,6 +5698,7 @@ struct DefinitionTreeQueries {
     void prefetch(std::vector<std::pair<int, int>> positions) {
         cursors = sorted_cursors(std::move(positions));
         DefinitionTargetVisitor visitor(state.tree->sourceManager(), uri, cursors);
+        visitor.filter.enabled = !cursors_in_define(*state.tree, cursors);
         state.tree->root().visit(visitor);
         targets.clear();
         for (size_t i = 0; i < cursors.size(); ++i)
@@ -8261,7 +8318,6 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
     // background_header_shards_, so both go.  Must only be called while
     // map_mutex_ is held by the mutating path.
     extra_file_snapshot_cache_.reset();
-    extra_file_snapshot_layout_.reset();
     extra_file_snapshot_stale_.clear();
     extra_index_snapshot_cache_.reset();
 }
@@ -8322,7 +8378,7 @@ std::shared_ptr<const std::vector<ExtraFileInfo>> Analyzer::extra_file_snapshot_
     }
     if (!extra_file_snapshot_cache_) {
         extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
-        extra_file_snapshot_layout_ = extra_file_snapshot_cache_;
+        ++extra_file_snapshot_layout_;
         extra_file_snapshot_stale_.clear();
     }
     return extra_file_snapshot_cache_;
@@ -8429,7 +8485,7 @@ Analyzer::extra_file_snapshot_ptr() const {
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const DocumentState& state) const {
     std::shared_ptr<const std::vector<ExtraFileInfo>> files;
-    std::shared_ptr<const std::vector<ExtraFileInfo>> layout;
+    uint64_t layout = 0;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
         files = extra_file_snapshot_locked();
@@ -8490,8 +8546,7 @@ Analyzer::ranked_extra_files(const DocumentState& state) const {
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
-                             const std::shared_ptr<const std::vector<ExtraFileInfo>>& layout,
-                             std::string_view from_path) const {
+                             uint64_t layout, std::string_view from_path) const {
     if (!files)
         return std::make_shared<std::vector<const ExtraFileInfo*>>();
 
@@ -8503,7 +8558,7 @@ Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileIn
         return ranked_extra_cache_;
 
     auto ranked = std::make_shared<std::vector<const ExtraFileInfo*>>();
-    if (layout && ranked_extra_layout_ == layout && ranked_extra_from_ == from_path &&
+    if (layout != 0 && ranked_extra_layout_ == layout && ranked_extra_from_ == from_path &&
         ranked_extra_order_.size() == files->size()) {
         // A patched snapshot of the layout already ranked: same paths, same
         // order, so the same answer without sorting again.

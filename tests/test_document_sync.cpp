@@ -178,6 +178,42 @@ TEST_CASE("doc sync: a deferred live shard reaches the extra file snapshot", "[s
     std::filesystem::remove_all(dir, ec);
 }
 
+// Patching the snapshot must not keep the parse it was first built from: that
+// pins a whole SyntaxTree per listed open file for as long as the user types.
+TEST_CASE("doc sync: edits to a listed file release its old parse", "[sync]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-snapshot-release";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "blk.sv";
+    const std::string text = "module blk;\n  logic sig;\n  assign sig = 1'b0;\nendmodule\n";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << text;
+    }
+    const auto uri = uri_from_path(path);
+
+    Analyzer a;
+    a.set_project_config({}, {dir.string()}, {path.string()});
+    a.wait_for_background_index_idle();
+    a.open(uri, text);
+    std::weak_ptr<const DocumentState> first = a.get_state(uri);
+    REQUIRE(!first.expired());
+    a.symbol_at(uri, 2, 9); // builds and ranks the snapshot
+
+    for (int edit = 1; edit <= 3; ++edit) {
+        a.enqueue_parse(uri, text + "// edit " + std::to_string(edit) + "\n");
+        const auto parsed = a.get_parsed_state(uri, std::chrono::seconds(10));
+        REQUIRE(parsed != nullptr);
+        REQUIRE(parsed->tree != nullptr);
+        a.symbol_at(uri, 2, 9);
+    }
+
+    CHECK(first.expired());
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // ── Diagnostic deduplication ────────────────────────────────────────────────
 // A macro body is expanded once per invocation, and slang reports a problem
 // inside that body once per expansion — every copy mapped back to the same

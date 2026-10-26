@@ -817,14 +817,13 @@ class Analyzer {
     /// cache key; without that a freed snapshot could be replaced by a new one
     /// at the same address and this would hand back pointers into it.
     ///
-    /// @p layout is the full build @p files was patched from (the same entries
-    /// in the same order; see extra_file_snapshot_locked()).  The order depends
-    /// on paths only, so it is computed once per layout and reapplied to each
-    /// patched snapshot instead of re-sorted per keystroke.
+    /// @p layout numbers the full build @p files was patched from (the same
+    /// entries in the same order; see extra_file_snapshot_locked()).  The order
+    /// depends on paths only, so it is computed once per layout and reapplied
+    /// to each patched snapshot instead of re-sorted per keystroke.
     std::shared_ptr<const std::vector<const ExtraFileInfo*>>
     ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
-                       const std::shared_ptr<const std::vector<ExtraFileInfo>>& layout,
-                       std::string_view from_path) const;
+                       uint64_t layout, std::string_view from_path) const;
 
     /// @p ranked is the candidate files **in the order they should be tried**.
     /// Every search below takes the first that can answer, so that order is
@@ -919,7 +918,7 @@ class Analyzer {
     mutable std::shared_ptr<const std::vector<const ExtraFileInfo*>> ranked_extra_cache_;
     // The proximity order for (ranked_extra_layout_, ranked_extra_from_), as
     // indices, so a patched snapshot of the same layout reuses it.
-    mutable std::shared_ptr<const std::vector<ExtraFileInfo>> ranked_extra_layout_;
+    mutable uint64_t ranked_extra_layout_ = 0; // 0: none; layouts start at 1
     mutable std::vector<uint32_t> ranked_extra_order_;
     /// Install @p inputs as the defaults, keeping every registered project's.
     /// Requires map_mutex_.
@@ -993,9 +992,10 @@ class Analyzer {
     mutable std::unordered_map<std::string, std::unordered_set<std::string>>
         extra_cache_includers_;
     mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_cache_;
-    // The full build extra_file_snapshot_cache_ was patched from: same entries,
-    // same order.  Only invalidate_extra_snapshots_locked() changes the layout.
-    mutable std::shared_ptr<const std::vector<ExtraFileInfo>> extra_file_snapshot_layout_;
+    // Numbers the full build extra_file_snapshot_cache_ was patched from (same
+    // entries, same order); every build takes a new one.  A number, not the
+    // build, so the build's DocumentStates are not kept alive while patched.
+    mutable uint64_t extra_file_snapshot_layout_ = 0;
     // Open entries whose `state` the cached snapshot no longer matches.
     mutable std::unordered_set<std::string> extra_file_snapshot_stale_;
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
