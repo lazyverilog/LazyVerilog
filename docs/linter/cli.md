@@ -4,7 +4,7 @@
 diagnostics. See [CLI tools](../cli.md) to build it.
 
 ```bash
-lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] [--maxerror <n>] [--nowarn <code>]... [<file>]
+lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] [--maxerror <n>] [--nowarn <code>]... [<file>]
 ```
 
 Give at least `-f <filelist>` or `<file>`.
@@ -13,13 +13,15 @@ Give at least `-f <filelist>` or `<file>`.
 |------|-------------|
 | `-f <filelist>` | With no `<file>`, lint every listed file. With `<file>`, use the filelist for context and report only that file. Overrides `[design].vcode` |
 | `--lint-only` | Lint rules only; skip compilation |
-| `--compile-only` | Compilation diagnostics only; skip lint rules |
+| `--compile-only` | Compilation diagnostics only; skip lint rules. Cannot be combined with `--lint-only` |
 | `--maxerror <n>` | Stop elaborating after `<n>` errors. Default `64`, `0` for no limit |
 | `--nowarn <code>` | Hide diagnostics with this code. Repeatable |
+| `-h`, `--help` | Print usage and the list of diagnostic codes |
 | `--version` | Print the version |
 
-Options come from the nearest `lazyverilog.toml`: `[design]`, `[compilation]`, and `[lint]` (see
-[Linter options](options.md)).
+Options come from the nearest `lazyverilog.toml`: `[design]` and `[lint]` (see
+[Linter options](options.md)). `[compilation]` has no effect: the CLI always compiles unless
+`--lint-only` is given.
 
 ```bash
 ./build/lazyverilog-lint rtl/top.sv

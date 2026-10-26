@@ -10,6 +10,10 @@
 #include "features/formatter.hpp"
 #include "config.hpp"
 
+static void print_usage(std::ostream& out) {
+    out << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n";
+}
+
 int main(int argc, char* argv[]) {
     print_startup_banner("lazyverilog-fmt", argc, argv);
 
@@ -20,7 +24,7 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--log") {
             if (i + 1 >= argc) {
-                std::cerr << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n";
+                print_usage(std::cerr);
                 return 1;
             }
             log_path = argv[++i];
@@ -32,10 +36,24 @@ int main(int argc, char* argv[]) {
             std::cout << "lazyverilog-fmt " << LAZYVERILOG_VERSION << "\n";
             return 0;
         }
+        else if (arg == "-h" || arg == "--help") {
+            print_usage(std::cout);
+            return 0;
+        }
+        else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_usage(std::cerr);
+            return 1;
+        }
+        else if (path) {
+            std::cerr << "Only one file can be formatted per run: " << arg << "\n";
+            print_usage(std::cerr);
+            return 1;
+        }
         else
             path = argv[i];
     }
-    if (!path) { std::cerr << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n"; return 1; }
+    if (!path) { print_usage(std::cerr); return 1; }
     // Binary on both ends: text mode on Windows turns every LF written into
     // CRLF, and turns a CRLF file into LF before the formatter ever sees it.
     std::ifstream f(path, std::ios::binary);

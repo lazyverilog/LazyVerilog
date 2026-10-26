@@ -12,7 +12,7 @@ ahead of the filelist, and enum literals and matching signals first on the right
 | Members | `.` after a name | Class fields and methods, struct fields, module or interface ports and modports |
 | Package scope | `::` | Members of that package only |
 | Macros | `` ` `` | Macros visible in the current file. Function-like ones insert a snippet |
-| Includes | `"` after `` `include `` | `.svh` and `.vh` files from the filelist |
+| Includes | manual completion (`<C-x><C-o>`, `Ctrl+Space`) inside `` `include "..." `` | `.svh` and `.vh` files from the filelist |
 
 ```systemverilog
 m_fifo u_fifo (

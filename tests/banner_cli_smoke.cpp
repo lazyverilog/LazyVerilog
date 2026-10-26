@@ -223,6 +223,26 @@ int main(int argc, char** argv) {
                "lazyverilog-fmt's banner went to stderr");
     }
 
+    // lazyverilog-fmt's arguments: --help is usage, not a file to open, and an
+    // unknown flag or a second file is a usage error instead of being ignored.
+    {
+        auto help = run_command(fmt_bin, "--help");
+        expect(help.exit_code == 0, "lazyverilog-fmt --help exits 0");
+        expect(contains(help.stdout_text, "Usage: lazyverilog-fmt"),
+               "lazyverilog-fmt --help prints usage on stdout");
+        expect(run_command(fmt_bin, "-h").exit_code == 0, "lazyverilog-fmt -h exits 0");
+
+        auto bogus = run_command(fmt_bin, "--bogus " + shell_quote(source));
+        expect(bogus.exit_code == 1, "lazyverilog-fmt rejects an unknown option (exit 1)");
+        expect(bogus.stdout_text.empty(), "an unknown option formats nothing");
+        expect(contains(bogus.stderr_text, "Unknown option: --bogus"),
+               "an unknown option is named on stderr");
+
+        auto two = run_command(fmt_bin, shell_quote(source) + " " + shell_quote(source));
+        expect(two.exit_code == 1, "lazyverilog-fmt rejects a second file (exit 1)");
+        expect(two.stdout_text.empty(), "a second file formats nothing");
+    }
+
     std::cerr << "banner-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run
               << " checks passed\n";
     return checks_failed == 0 ? 0 : 1;

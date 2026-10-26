@@ -10,6 +10,7 @@ lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>
 |------|-------------|
 | `-i`, `--in-place` | Write the result back to the file instead of stdout |
 | `--log <log-dir>` | Write per-pass logs to `<log-dir>`, for debugging |
+| `-h`, `--help` | Print usage |
 | `--version` | Print the version |
 
 It reads `[format]` from the nearest `lazyverilog.toml` above the file, and uses defaults if there is
@@ -25,5 +26,5 @@ none. See [Formatter options](options.md).
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | File not found, or cannot be read or written |
+| `1` | Usage error (unknown option, no file, or more than one file), or file not found, or cannot be read or written |
 | `2` | Safety check failed: formatting would have changed more than whitespace |

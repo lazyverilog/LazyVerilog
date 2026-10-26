@@ -92,6 +92,13 @@ int main(int argc, char** argv) {
               "--compile-only drops the lint diagnostic");
     }
 
+    // Both together would skip both halves and report a clean run.
+    {
+        auto result = run_command(lint_bin, "--lint-only --compile-only " + shell_quote(top));
+        expect(result.exit_code == 1, "--lint-only with --compile-only is a usage error (exit 1)");
+        expect(result.stdout_text.empty(), "--lint-only with --compile-only prints no diagnostics");
+    }
+
     // Single-file mode: reports a real semantic (not just parse) diagnostic
     // for the target file, regardless of the [compilation] background_compilation
     // toml setting — regression coverage for a bug where Analyzer::open()'s
