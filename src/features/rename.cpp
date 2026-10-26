@@ -100,8 +100,11 @@ lsWorkspaceEdit provide_rename(const Analyzer& analyzer, const TextDocumentRenam
         }
     }
 
+    std::string refusal;
     auto refs = analyzer.find_references(params.textDocument.uri.raw_uri_, params.position.line,
-                                         params.position.character, true);
+                                         params.position.character, true, false, &refusal);
+    if (!refusal.empty())
+        throw RenameRefused(refusal);
     std::map<std::string, std::vector<lsTextEdit>> changes;
     std::unordered_map<std::string, std::string> texts;
     for (const auto& ref : refs) {

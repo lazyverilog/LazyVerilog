@@ -75,6 +75,9 @@ public:
     /// published, which is how the Analyzer swaps inputs without a worker ever
     /// seeing a half-built table.
     void set_resolver(std::shared_ptr<const ProjectRootResolver> resolver);
+    /// Whether project_root_for() can answer at all.  Without a resolver every
+    /// file reads as "no project", which says nothing about who owns it.
+    bool has_resolver() const { return resolver_ != nullptr; }
 
     /// Register @p inputs for files under @p root.
     void set_for_root(const std::filesystem::path& root, ParseInputs inputs);
