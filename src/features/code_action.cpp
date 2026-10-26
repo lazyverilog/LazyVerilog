@@ -373,6 +373,21 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
         case_stmt = locator.case_stmt;
     }
 
+    // Replace an existing lifetime (`function static`) rather than add a second one.
+    auto lifetime_edit = [&](const FunctionDeclarationSyntax& decl) {
+        const auto& sm = state->tree->sourceManager();
+        const auto& proto = *decl.prototype;
+        if (proto.lifetime && !proto.lifetime.isMissing()) {
+            int col = token_col(sm, proto.lifetime);
+            int ln = token_line(sm, proto.lifetime);
+            return make_range_edit(uri, ln, col, ln, col + (int)proto.lifetime.rawText().size(),
+                                   "automatic");
+        }
+        int col = token_col(sm, proto.keyword) + (int)proto.keyword.rawText().size();
+        int ln = token_line(sm, proto.keyword);
+        return make_range_edit(uri, ln, col, ln, col, " automatic");
+    };
+
     for (const auto& diag : params.context.diagnostics) {
         try {
             const std::string& msg = diag.message;
@@ -409,11 +424,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                     QuickFixLocator locator(state->tree->sourceManager(), diag_line);
                     state->tree->root().visit(locator);
                     if (locator.function_decl) {
-                        int insert_col = token_col(state->tree->sourceManager(),
-                                                   locator.function_decl->getFirstToken()) +
-                                         8;
-                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col,
-                                                  " automatic");
+                        auto we = lifetime_edit(*locator.function_decl);
                         CodeAction action;
                         action.title = "Add 'automatic' lifetime";
                         action.kind = optional<std::string>(std::string("quickfix"));
@@ -430,11 +441,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                     QuickFixLocator locator(state->tree->sourceManager(), diag_line);
                     state->tree->root().visit(locator);
                     if (locator.task_decl) {
-                        int insert_col = token_col(state->tree->sourceManager(),
-                                                   locator.task_decl->getFirstToken()) +
-                                         4;
-                        auto we = make_range_edit(uri, diag_line, insert_col, diag_line, insert_col,
-                                                  " automatic");
+                        auto we = lifetime_edit(*locator.task_decl);
                         CodeAction action;
                         action.title = "Add 'automatic' lifetime to task";
                         action.kind = optional<std::string>(std::string("quickfix"));
