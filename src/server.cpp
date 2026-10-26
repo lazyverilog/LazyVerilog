@@ -552,6 +552,7 @@ LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
     // completions without exposing a knob most users never tune.
     analyzer_.set_project_index_publish_debounce_ms(250);
     analyzer_.set_parse_complete_callback([this](const std::string& uri) {
+        refresh_stale_inlay_hints(uri);
         publish_diagnostics(uri);
         schedule_background_compilation();
     });
@@ -1118,6 +1119,15 @@ void LazyVerilogServer::request_inlay_hint_refresh() {
     } catch (const std::exception& e) {
         std::cerr << "[lazyverilog] inlayHint refresh error: " << e.what() << "\n";
     }
+}
+
+void LazyVerilogServer::refresh_stale_inlay_hints(const std::string& uri) {
+    {
+        std::lock_guard<std::mutex> lock(stale_inlay_hint_mutex_);
+        if (stale_inlay_hint_uris_.erase(uri) == 0)
+            return;
+    }
+    request_inlay_hint_refresh();
 }
 
 bool LazyVerilogServer::any_project_compiles() const {
@@ -2240,8 +2250,18 @@ void LazyVerilogServer::register_handlers() {
             const auto& uri = req.params.textDocument.uri.raw_uri_;
             if (!config_for(uri)->inlay_hint.enable)
                 return rsp;
+            bool stale = false;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
-                                             req.params.range.end.line);
+                                             req.params.range.end.line, &stale);
+            if (stale) {
+                {
+                    std::lock_guard<std::mutex> lock(stale_inlay_hint_mutex_);
+                    stale_inlay_hint_uris_.insert(uri);
+                }
+                // The parse may have committed meanwhile, finding nothing to refresh.
+                if (const auto now = analyzer_.get_state(uri); now && now->tree)
+                    refresh_stale_inlay_hints(uri);
+            }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] inlayHint error: " << e.what() << "\n";
         }

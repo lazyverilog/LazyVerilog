@@ -164,7 +164,8 @@ static std::string display_port_direction(const std::string& direction) {
 } // namespace
 
 std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std::string& uri,
-                                             int range_start_line, int range_end_line) {
+                                             int range_start_line, int range_end_line,
+                                             bool* answered_stale) {
     // Not get_state(): Neovim issues this request from the didChange
     // notification itself, so it lands while the parse that notification
     // started is still running and the current snapshot is text-only.  Giving
@@ -172,7 +173,13 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
     // the client renders that -- hints measurably blinked out for the whole
     // duration of a burst on a large file and came back only when an unrelated
     // project-index publish happened to fire a refresh.
-    auto state = analyzer.get_parsed_state(uri);
+    //
+    // No wait either: requests are answered one at a time, so waiting for the
+    // parse held the foldingRange queued behind this request just as long.  The
+    // previous tree answers now; the server refreshes once the parse lands.
+    auto state = analyzer.get_parsed_state(uri, std::chrono::milliseconds(0));
+    if (answered_stale)
+        *answered_stale = state && (!state->tree || state != analyzer.get_state(uri));
     if (!state || !state->tree)
         return {};
 

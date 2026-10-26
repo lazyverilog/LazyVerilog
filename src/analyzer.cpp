@@ -6015,7 +6015,7 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // get_parsed_state() waits for the reparse first, so the ordinary answer is
     // the current one; only a file that parses slower than the wait falls back
     // to the snapshot one keystroke old, which is what the user was looking at
-    // a moment ago.  Same trade, and the same call, as inlay hints.
+    // a moment ago.  Inlay hints, sent on every keystroke, skip the wait.
     auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
@@ -6530,7 +6530,7 @@ std::optional<Location> Analyzer::definition_of(const std::string& uri, int line
     // get_parsed_state() waits for the reparse first, so the ordinary answer is
     // the current one; only a file that parses slower than the wait falls back
     // to the snapshot one keystroke old, which is what the user was looking at
-    // a moment ago.  Same trade, and the same call, as inlay hints.
+    // a moment ago.  Inlay hints, sent on every keystroke, skip the wait.
     auto state = get_parsed_state(uri);
     if (!state || !state->tree)
         return std::nullopt;
