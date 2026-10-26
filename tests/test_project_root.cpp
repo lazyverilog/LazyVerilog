@@ -1611,16 +1611,19 @@ TEST_CASE("a filelist entry inside an implicit root keeps the defaults",
 TEST_CASE("a warning inside another project's macro body is not reported",
           "[project-root][macro-warnings]") {
     // `uvm_field_int expands to ten warnings about UVM's own code, all landing
-    // on the user's line.  The same truncation three ways, each its own width so
-    // the message says which one survived: written inside a library macro,
-    // inside the user's own macro, and inline.
+    // on the user's line.  The same truncation five ways, each its own width so
+    // the message says which one survived: written inside a library macro, on
+    // the user's argument to a library macro, inside the user's own macro, on
+    // the user's argument to it, and inline.
     TempTree tree("foreign-macro-warning");
     tree.write("lib/lazyverilog.toml", "[design]\n");
     tree.write("chip/lazyverilog.toml", "[design]\n");
     tree.write("lib/lib_macros.svh",
-               "`define LIB_DECL logic [2:0] lib_n; int lib_w; assign lib_n = lib_w; assign lib_w = undeclared_lib_thing;\n");
+               "`define LIB_DECL logic [2:0] lib_n; int lib_w; assign lib_n = lib_w; assign lib_w = undeclared_lib_thing;\n"
+               "`define LIB_SET(v) logic [1:0] lib_q; assign lib_q = v;\n");
     tree.write("chip/rtl/own_macros.svh",
-               "`define OWN_DECL logic [4:0] own_n; int own_w; assign own_n = own_w;\n");
+               "`define OWN_DECL logic [4:0] own_n; int own_w; assign own_n = own_w;\n"
+               "`define OWN_SET(v) logic [5:0] own_q; assign own_q = v;\n");
     auto top = tree.write("chip/rtl/top.sv", "`include \"../../lib/lib_macros.svh\"\n"
                                              "`include \"own_macros.svh\"\n"
                                              "module top;\n"
@@ -1629,6 +1632,8 @@ TEST_CASE("a warning inside another project's macro body is not reported",
                                              "    logic [3:0] n;\n"
                                              "    int w;\n"
                                              "    assign n = w;\n"
+                                             "    `LIB_SET(w)\n"
+                                             "    `OWN_SET(w)\n"
                                              "endmodule\n");
 
     Analyzer analyzer;
@@ -1642,6 +1647,8 @@ TEST_CASE("a warning inside another project's macro body is not reported",
     // The library macro did expand: its error is still the user's to see.
     CHECK(all_messages.find("undeclared_lib_thing") != std::string::npos);
     CHECK(all_messages.find("truncates from 32 to 3 bits") == std::string::npos);
+    CHECK(all_messages.find("truncates from 32 to 2 bits") == std::string::npos);
     CHECK(all_messages.find("truncates from 32 to 5 bits") != std::string::npos);
+    CHECK(all_messages.find("truncates from 32 to 6 bits") != std::string::npos);
     CHECK(all_messages.find("truncates from 32 to 4 bits") != std::string::npos);
 }
