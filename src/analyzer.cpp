@@ -4217,6 +4217,8 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     std::string current_module;
     std::string current_package;
     std::string current_class;
+    // Inside `function ... C::m(...)` written outside C (current_class is C).
+    bool in_out_of_block = false;
     CursorSubtreeFilter filter;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri,
@@ -4392,7 +4394,9 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
         }
         current_class = std::string(scoped->left->getLastToken().valueText());
+        in_out_of_block = true;
         visitDefault(node);
+        in_out_of_block = false;
         current_class.clear();
     }
 
@@ -4714,6 +4718,11 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         // does for unqualified names.
         target->scope_class = current_class;
         if (object_path.empty()) {
+            // A bare name in an out-of-block body may be a formal or local
+            // shadowing a field; that body's names resolve as they did before
+            // it had a class, and only `this.`/`super.`/handle access uses it.
+            if (in_out_of_block)
+                target->scope_class.clear();
             target->kind = DefinitionTargetKind::Generic;
             return;
         }
