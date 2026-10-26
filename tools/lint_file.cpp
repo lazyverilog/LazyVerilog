@@ -24,7 +24,7 @@
 namespace {
 
 void print_usage() {
-    std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only] [--compile-only] "
+    std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] "
                  "[--maxerror <n>] [--nowarn <code>] [--version] [<file>]\n"
                  "Run lazyverilog-lint --help for the list of diagnostic codes.\n";
 }
@@ -293,6 +293,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (filelist_arg.empty() && file_arg.empty()) {
+        print_usage();
+        return 1;
+    }
+    if (lint_only && compile_only) {
+        // Together they would skip both halves and report a clean run.
+        std::cerr << "--lint-only and --compile-only cannot be used together\n";
         print_usage();
         return 1;
     }
