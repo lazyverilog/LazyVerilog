@@ -22,3 +22,16 @@ It can be slow on a weak machine, so enable it where you have the CPU and memory
   The setting is read per project.
 - Results appear for open files only. Requests such as hover never wait for it.
 - The worker runs at low priority on Linux. Worker count and the 1.5 second delay are fixed.
+
+## Warnings from another project's macros
+
+A warning that slang raises while expanding a macro written in another project is not shown. One
+example is UVM's `` `uvm_field_int `` (implicit conversions inside UVM code). "Another project" means
+the macro's file belongs to a different `lazyverilog.toml` than the file the warning lands in, or to
+none at all. This includes a warning on your own argument when the outermost macro is the library's.
+The conversion it reports is one that the library body applies, and you cannot change it.
+
+- Errors from such macros are always shown.
+- A sibling project's macros count as foreign. A library vendored under your own `lazyverilog.toml`,
+  such as a copy of UVM inside the project tree, does not, and its warnings are still shown.
+  Give the library its own `lazyverilog.toml`, or keep it outside the project, to treat it as foreign.

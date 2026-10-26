@@ -81,24 +81,41 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
     return info;
 }
 
-/// A warning about code written in a macro body from another project than the
+/// A warning raised while expanding a macro from another project than the
 /// file it lands in -- `uvm_field_int expands to UVM code the user cannot fix.
-/// slang's --suppress-macro-warnings, with "another project" as the path set.
-/// Code passed in as a macro argument is the user's and stays reported.
+/// slang's --suppress-macro-warnings, with "another project" as the path set,
+/// and one step further: a warning on the user's own argument still counts
+/// when the outermost macro is foreign, since the conversion it reports is the
+/// one the library's body applies to that argument.  Errors are never dropped.
 static bool is_foreign_macro_warning(const slang::SourceManager& sm,
                                      const slang::Diagnostic& diagnostic,
                                      const ProjectParseInputs& inputs) {
     if (slang::getDefaultSeverity(diagnostic.code) != slang::DiagnosticSeverity::Warning)
         return false;
-    auto loc = diagnostic.location;
-    while (loc.valid() && sm.isMacroArgLoc(loc))
-        loc = sm.getOriginalLoc(loc);
-    if (!loc.valid() || !sm.isMacroLoc(loc))
+    const auto location = diagnostic.location;
+    if (!location.valid() || !sm.isMacroLoc(location))
         return false;
-    const auto& written = sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer());
-    const auto& reported = sm.getFullPath(sm.getFullyExpandedLoc(loc).buffer());
-    return !written.empty() && !reported.empty() &&
-           inputs.project_root_for(written) != inputs.project_root_for(reported);
+    const auto& reported = sm.getFullPath(sm.getFullyExpandedLoc(location).buffer());
+    if (reported.empty())
+        return false;
+    const auto reported_root = inputs.project_root_for(reported);
+    const auto foreign = [&](slang::SourceLocation loc) {
+        const auto& written = sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer());
+        return !written.empty() && inputs.project_root_for(written) != reported_root;
+    };
+    // Code written in a macro body.
+    auto body = location;
+    while (body.valid() && sm.isMacroArgLoc(body))
+        body = sm.getOriginalLoc(body);
+    if (body.valid() && sm.isMacroLoc(body) && foreign(body))
+        return true;
+    // The outermost macro, by where its body starts.
+    slang::SourceLocation outermost;
+    for (auto loc = location; loc.valid() && sm.isMacroLoc(loc); loc = sm.getExpansionLoc(loc)) {
+        if (!sm.isMacroArgLoc(loc))
+            outermost = loc;
+    }
+    return outermost.valid() && foreign(slang::SourceLocation(outermost.buffer(), 0));
 }
 
 } // namespace
