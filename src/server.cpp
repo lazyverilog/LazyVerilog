@@ -2050,13 +2050,27 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── textDocument/prepareRename ────────────────────────────────────────────
-    ep.registerHandler([&](const td_prepareRename::request& req) {
+    ep.registerHandler([&](const td_prepareRename::request& req)
+                           -> lsp::ResponseOrError<td_prepareRename::response> {
         td_prepareRename::response rsp;
         rsp.id = req.id;
         try {
-            if (auto prepared = prepare_rename(analyzer_, req.params))
+            // Symbols declared outside the asking file's project are refused.
+            const auto info = root_resolver_
+                                  ? root_resolver_->project_info(
+                                        path_from_file_uri(req.params.textDocument.uri.raw_uri_),
+                                        ProjectRootResolver::PathKind::File)
+                                  : std::nullopt;
+            if (auto prepared = prepare_rename(analyzer_, req.params,
+                                               info ? info->source_root : std::filesystem::path{}))
                 rsp.result = std::make_pair(optional<lsRange>{},
                                             optional<PrepareRenameResult>(std::move(*prepared)));
+        } catch (const RenameRefused& e) {
+            // An error, not a null result, so the client shows why.
+            Rsp_Error refused;
+            refused.error.code = static_cast<lsErrorCodes>(-32803); // LSP RequestFailed
+            refused.error.message = e.what();
+            return refused;
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] prepareRename error: " << e.what() << "\n";
         }
@@ -2073,7 +2087,8 @@ void LazyVerilogServer::register_handlers() {
                                         path_from_file_uri(req.params.textDocument.uri.raw_uri_),
                                         ProjectRootResolver::PathKind::File)
                                   : std::nullopt;
-            rsp.result = provide_rename(analyzer_, req.params, info && info->implicit);
+            rsp.result = provide_rename(analyzer_, req.params, info && info->implicit,
+                                        info ? info->source_root : std::filesystem::path{});
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] rename error: " << e.what() << "\n";
             show_warning(e.what());

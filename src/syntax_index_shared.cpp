@@ -1091,6 +1091,16 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // not one of these.
         std::unordered_set<std::string> subroutine_locals;
         bool in_subroutine_{false};
+        // Declared type of a receiver written inside a class, so `it.addr` and
+        // `t.op` resolve like a module-scope `p.data` instead of decaying to
+        // `name:`: formals and locals of the subroutine being walked, and the
+        // properties of each class ("<bare class>\n<name>").
+        std::unordered_map<std::string, std::string> subroutine_value_types;
+        std::unordered_map<std::string, std::string> class_property_types;
+        // The identifier a NamedTypeSyntax spells, while that type is walked.
+        // A type position never names a class field, even one sharing the
+        // name: `typedef agent agent_t; agent_t agent;`.
+        std::optional<uint64_t> type_name_token_;
 
         // Declarations written inside a generate block are separate signals from
         // module-level ones that share the name:
@@ -1175,6 +1185,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             slang::parsing::Token name_token;
             std::string rendered_name;
             std::string class_ctx;
+            std::string class_bare_ctx;
             std::string module_ctx;
             SubroutineOwnerKind module_kind_ctx{SubroutineOwnerKind::Module};
             std::string package_ctx;
@@ -1362,9 +1373,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
 
         std::optional<std::string> subroutine_id_for_unqualified_name(std::string_view name) const {
             if (!current_class.empty()) {
-                const auto key = subroutine_scope_key(SubroutineOwnerKind::Class, current_class, name);
+                // Methods are keyed on the bare class name (see the declaration
+                // handlers), not on `pkg::cls`.
+                const std::string_view owner = current_class_bare.empty()
+                                                   ? std::string_view(current_class)
+                                                   : std::string_view(current_class_bare);
+                const auto key = subroutine_scope_key(SubroutineOwnerKind::Class, owner, name);
                 if (declared_subroutines.contains(key))
-                    return subroutine_symbol_id(SubroutineOwnerKind::Class, current_class, name);
+                    return subroutine_symbol_id(SubroutineOwnerKind::Class, owner, name);
             }
             if (!current_module.empty()) {
                 const auto key = subroutine_scope_key(current_module_kind, current_module, name);
@@ -1397,6 +1413,10 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         void handle(const FunctionDeclarationSyntax& node) {
+            // `task drv::run(); ... endtask` is outside the class body, but its
+            // body is in the class's scope: a bare `one(2)` is drv's method and
+            // a bare `n` drv's field.  Walk it with drv as the current class.
+            std::optional<std::string> out_of_block_class;
             if (node.prototype && node.prototype->name) {
                 const auto qualified_name = render_syntax_node_text(sm, *node.prototype->name);
                 const auto name_token = last_identifier_token(*node.prototype->name);
@@ -1427,18 +1447,52 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         subroutine_scope_key(owner_kind, owner_name, name),
                         file_ids.for_token(index, sm, name_token));
                     add_ref(name_token, subroutine_symbol_id(owner_kind, owner_name, name));
+                    if (owner_kind == SubroutineOwnerKind::Class && current_class.empty())
+                        out_of_block_class = owner_name;
+                }
+            }
+
+            auto previous_class = current_class;
+            auto previous_class_bare = current_class_bare;
+            const bool previous_has_base = current_class_has_base;
+            auto previous_class_base = current_class_base;
+            if (out_of_block_class) {
+                current_class_bare = *out_of_block_class;
+                // Same scoped spelling the class body is walked with, so
+                // class_fields lookups agree.
+                current_class = current_package.empty()
+                                    ? *out_of_block_class
+                                    : current_package + "::" + *out_of_block_class;
+                current_class_has_base = false;
+                current_class_base.clear();
+                for (const auto& cls : index.classes) {
+                    if (cls.name != *out_of_block_class)
+                        continue;
+                    if (!cls.parent_scope.empty())
+                        current_class = cls.parent_scope + "::" + cls.name;
+                    current_class_has_base = !cls.base_class.empty();
+                    current_class_base = base_class_lookup_name(
+                        cls.base_class.substr(0, cls.base_class.find('#')));
+                    break;
                 }
             }
 
             auto previous_locals = std::move(subroutine_locals);
+            auto previous_value_types = std::move(subroutine_value_types);
             const bool previously_in_subroutine = in_subroutine_;
             subroutine_locals.clear();
+            subroutine_value_types.clear();
             in_subroutine_ = true;
             push_declaring_scope(subroutine_scope_label(node));
             visitDefault(node);
             generate_scopes.pop_back();
             in_subroutine_ = previously_in_subroutine;
             subroutine_locals = std::move(previous_locals);
+            subroutine_value_types = std::move(previous_value_types);
+            current_class = std::move(previous_class);
+            current_class_bare = std::move(previous_class_bare);
+            current_class_has_base = previous_has_base;
+            current_class_base = std::move(previous_class_base);
         }
 
         /// Stable label for a subroutine's lexical scope.
@@ -1581,7 +1635,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                                       current_module_kind, *id);
                     } else {
                         deferred_invocations.push_back({name_token, std::move(rendered_name),
-                                                        current_class, current_module,
+                                                        current_class, current_class_bare,
+                                                        current_module,
                                                         current_module_kind, current_package});
                     }
                 }
@@ -1592,6 +1647,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         void resolve_deferred_invocations() {
             for (auto& inv : deferred_invocations) {
                 current_class = inv.class_ctx;
+                current_class_bare = inv.class_bare_ctx;
                 current_module = inv.module_ctx;
                 current_module_kind = inv.module_kind_ctx;
                 current_package = inv.package_ctx;
@@ -1834,8 +1890,71 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             visitDefault(node);
         }
 
+        /// The class or typedef a declaration's type names, bare: `bus_item`,
+        /// `pkg::bus_item`, `uvm_analysis_port #(bus_item)` -> the last scope
+        /// segment without parameters.  Empty for any other type.
+        static std::string named_type_name(const slang::syntax::DataTypeSyntax* type) {
+            const auto* named = type ? type->as_if<NamedTypeSyntax>() : nullptr;
+            if (!named)
+                return {};
+            const NameSyntax* name = named->name;
+            while (const auto* scoped = name->as_if<ScopedNameSyntax>())
+                name = scoped->right;
+            if (const auto* id = name->as_if<IdentifierNameSyntax>())
+                return std::string(id->identifier.valueText());
+            if (const auto* cls = name->as_if<ClassNameSyntax>())
+                return std::string(cls->identifier.valueText());
+            return {};
+        }
+
+        void remember_class_scope_value_type(const slang::syntax::DataTypeSyntax* type,
+                                             const DeclaratorSyntax& decl) {
+            if (current_class_bare.empty() || decl.name.valueText().empty())
+                return;
+            auto type_name = named_type_name(type);
+            if (type_name.empty())
+                return;
+            std::string name(decl.name.valueText());
+            if (in_subroutine_)
+                subroutine_value_types[std::move(name)] = std::move(type_name);
+            else
+                class_property_types[current_class_bare + "\n" + name] = std::move(type_name);
+        }
+
+        void handle(const NamedTypeSyntax& node) {
+            const auto previous = type_name_token_;
+            type_name_token_.reset();
+            if (const auto* id = node.name->as_if<IdentifierNameSyntax>())
+                type_name_token_ = token_key(id->identifier);
+            else if (const auto* cls = node.name->as_if<ClassNameSyntax>())
+                type_name_token_ = token_key(cls->identifier);
+            visitDefault(node);
+            type_name_token_ = previous;
+        }
+
+        // A DPI import's formals name nothing outside the prototype; left as
+        // `name:` they reached a same-named field through the include bridge.
+        void handle(const DPIImportSyntax& node) {
+            if (node.method->portList) {
+                for (const auto* port : node.method->portList->ports)
+                    if (const auto* p = port ? port->as_if<FunctionPortSyntax>() : nullptr)
+                        classified_tokens.insert(token_key(p->declarator->name));
+            }
+            visitDefault(node);
+        }
+
+        void handle(const FunctionPortSyntax& node) {
+            remember_class_scope_value_type(node.dataType, *node.declarator);
+            visitDefault(node);
+        }
+
         void remember_current_module_value_type(const slang::syntax::DataTypeSyntax* type,
                                                 const slang::syntax::SeparatedSyntaxList<slang::syntax::DeclaratorSyntax>& declarators) {
+            if (type && !current_class_bare.empty()) {
+                for (const auto* decl : declarators)
+                    if (decl)
+                        remember_class_scope_value_type(type, *decl);
+            }
             if (!type || current_module.empty() || !current_class.empty())
                 return;
             const std::string canonical_type =
@@ -1863,7 +1982,20 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         }
 
         std::optional<std::string> current_module_object_type(std::string_view object_name) {
-            if (current_module.empty() || object_name.empty())
+            if (object_name.empty())
+                return std::nullopt;
+            if (!current_class_bare.empty()) {
+                if (const auto it = subroutine_value_types.find(std::string(object_name));
+                    it != subroutine_value_types.end())
+                    return it->second;
+                scope_key = current_class_bare;
+                scope_key += '\n';
+                scope_key.append(object_name);
+                if (const auto it = class_property_types.find(scope_key);
+                    it != class_property_types.end())
+                    return it->second;
+            }
+            if (current_module.empty())
                 return std::nullopt;
             scope_key = current_module;
             scope_key += '\n';
@@ -2610,10 +2742,20 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 // include and import bridges keep working on this token.
                 scope_key = "name:";
                 scope_key += name;
-                add_ref(token, scope_key);
+                // `vif.drv_cb.addr`: the head is a virtual interface handle, so
+                // this is an interface item.  Say so, or the include bridge
+                // hands it to a same-named class field.
+                RefForm form = RefForm::Plain;
+                if (!current_class_bare.empty()) {
+                    const auto chain = receiver_chain_before_member_dot(token);
+                    if (chain.size() >= 2 &&
+                        interface_type_for_receiver(current_class_bare, chain.front()))
+                        form = RefForm::ViaInterface;
+                }
+                add_ref(token, scope_key, form);
                 return;
             }
-            if (!current_class.empty()) {
+            if (!current_class.empty() && type_name_token_ != token_key(token)) {
                 scope_key = current_class;
                 scope_key += '\n';
                 scope_key += name;
