@@ -2202,8 +2202,7 @@ void LazyVerilogServer::register_handlers() {
         td_completion::response rsp;
         rsp.id = req.id;
         try {
-            const auto& uri = req.params.textDocument.uri.raw_uri_;
-            auto state = completion_document_state(analyzer_, uri);
+            auto state = completion_document_state(analyzer_, req.params);
             if (!state) {
                 rsp.result = CompletionList{};
                 return rsp;

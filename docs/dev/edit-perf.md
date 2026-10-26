@@ -271,3 +271,53 @@ One asymmetry worth knowing: registering tells the client it *may* ask, not that
 should.  Neovim re-requests hints on the next `didChange`, so a file nobody is
 typing in would sit without hints until touched.  `sync_inlay_hint_registration()`
 follows a fresh registration with `workspace/inlayHint/refresh` to prompt it.
+
+## Round 4: completion right behind the keystroke
+
+Completion is the one request the editor sends for the character just typed, and
+it reads the cursor's surroundings out of the snapshot it is handed.  Answered
+from the text-only placeholder, `p_sequencer.` cannot be recognised as member
+access and the identifier list comes back instead (13 of 20 runs on a UVM
+sequence).  `completion_document_state()` (`src/features/completion.cpp`)
+decides whether waiting for the reparse can help:
+
+* **Only a `.`, `::` or `` ` `` context waits.**  Those are the contexts that
+  read the tree.  Plain identifier typing answers from the placeholder at once,
+  as it always did: nvim-cmp asks on every identifier keystroke, and requests
+  are served one at a time, so a wait there delays the queued `foldingRange` and
+  `inlayHint` as well.
+* **The budget is 150 ms from the oldest edit still unparsed**, not from the
+  request.  A placeholder inherits `DocumentState::enqueued_at` from the
+  placeholder it replaces, so a worker that keeps falling behind (a file that
+  parses slower than the user types) is visible as a clock already past the
+  budget, and the request does not wait at all.
+* **A file whose last parse took longer than the budget does not wait either.**
+  `DocumentState::parse_time` is the time from the edit to the commit for a
+  reparse, `make_state()` alone for `didOpen`.
+* **It never answers from `previous_parsed`.**  That text is one keystroke old
+  and does not contain the `.` just typed.
+
+The trade-off: in a file that parses inside the budget, member access after `.`
+costs up to the parse time plus the completion itself on a real tree, where it
+used to cost nothing and answer wrongly.  In a file that does not, it costs what
+it did before, including the wrong answer; the first keystroke after a pause can
+still spend up to 150 ms finding that out.
+
+Measured with `c12bench.py` (didChange, then completion and a pipelined
+`foldingRange`; 10 runs, machine under concurrent build load, so read the
+medians):
+
+| file | build | completion median / max | member hits | queued foldingRange median |
+|---|---|---|---|---|
+| 1.2k lines | main | 0 / 0 ms | 0/10 | 0 ms |
+| 1.2k lines | wait only after `.` | 31 / 31 ms | 10/10 | 31 ms |
+| 24k lines | main | 0 / 0 ms | 0/10 | 40 ms |
+| 24k lines | first cut (always wait 150 ms) | 280-500 ms (reviewer) | | 335-547 ms |
+| 24k lines | wait only after `.` | 0 / 1750 ms | 1/10 | 47 ms |
+| 72k lines | main | 16 / 16 ms | 0/10 | 118 ms |
+| 72k lines | wait only after `.` | 16 / 172 ms | 0/10 | 125 ms |
+
+The 1750 ms outlier is not the wait: it is completion on a parsed 24k-line tree.
+Context detection, the snapshot's dynamic index and the member-item pass each
+walk the whole tree (about 90, 0-100 and 50 ms unloaded).  Completion pays the
+same on main whenever the parse has already landed.

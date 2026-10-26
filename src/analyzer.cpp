@@ -1089,6 +1089,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // narrow AST facts on demand, and project/background files keep the indexed
     // shard representation.
     collect_parse_diagnostics(*state, uri);
+    state->parse_time = Clock::now() - start;
     log_perf("make_state " + uri, start);
     return state;
 }
@@ -1179,6 +1180,7 @@ uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string 
     state->normalized_path = normalize_filesystem_path(path).string();
     cache_document_end_position(*state);
     state->doc_version = version;
+    state->enqueued_at = Clock::now();
 
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
@@ -1205,6 +1207,10 @@ uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string 
             // many keystrokes arrive before a parse commits.
             state->previous_parsed =
                 it->second->tree ? it->second : it->second->previous_parsed;
+            // Likewise the clock: it starts at the oldest edit no parse has
+            // caught up with, so a worker that keeps falling behind shows.
+            if (!it->second->tree && it->second->enqueued_at != Clock::time_point{})
+                state->enqueued_at = it->second->enqueued_at;
         }
         docs_[uri] = state;
         latest_version_[uri] = version;
@@ -1332,6 +1338,9 @@ void Analyzer::parse_worker_loop() {
 
         auto state = make_state(job.uri, job.pending->text); // outside all locks
         state->doc_version = job.version;
+        // What a request waiting on this edit would have waited: queueing and
+        // the worker's other jobs included, not just make_state().
+        state->parse_time = Clock::now() - job.pending->enqueued_at;
 
         // One keystroke produces two snapshots of the same text: the text-only
         // placeholder enqueue_parse() installed, and this one.  Folds are

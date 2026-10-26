@@ -1633,10 +1633,67 @@ TEST_CASE("completion: member access climbs a hierarchy split across files",
     CHECK(has_label(aliased, "root_field"));
 }
 
+// Two projects each declare `mid_c`, with different bases.  The climb takes the
+// `mid_c` nearest the asking file -- ranked, not filtered -- in both directions.
+TEST_CASE("completion: a split hierarchy climbs the asking project's same-name class",
+          "[completion][handle][module-proximity]") {
+    namespace fs = std::filesystem;
+    auto root = fs::temp_directory_path() / "lazyverilog-completion-split-rank";
+    fs::remove_all(root);
+    const auto write = [&](const std::string& relative, const std::string& text) {
+        const auto path = root / relative;
+        fs::create_directories(path.parent_path());
+        std::ofstream(path, std::ios::binary) << text;
+        return fs::canonical(path);
+    };
+    write("chip_a/lazyverilog.toml", "[design]\n");
+    write("chip_b/lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files;
+    for (const std::string chip : {"a", "b"}) {
+        files.push_back(write("chip_" + chip + "/mid.sv",
+                              "class mid_c extends root_" + chip + ";\nendclass\n").string());
+        files.push_back(write("chip_" + chip + "/root.sv",
+                              "class root_" + chip + ";\n  int " + chip + "_field;\nendclass\n")
+                            .string());
+    }
+
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files(files);
+    analyzer.wait_for_background_index_idle();
+
+    const std::string text = "class user_c;\n  mid_c h;\n  function void f();\n    h.\n"
+                             "  endfunction\nendclass\n";
+    auto [line, col] = pos_after(text, "    h.");
+    for (const std::string chip : {"a", "b"}) {
+        const auto uri = uri_from_path(write("chip_" + chip + "/user.sv", text));
+        analyzer.open(uri, text);
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        INFO("asking from chip_" << chip);
+        CHECK(has_label(result, chip + "_field"));
+        CHECK_FALSE(has_label(result, (chip == "a" ? "b" : "a") + std::string("_field")));
+        analyzer.close(uri);
+    }
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
 // The editor sends completion right behind the didChange that typed the `.`,
 // while the reparse that change started is still running.  The parse worker is
-// held so the request really lands in that window, then released shortly after,
-// the way a parse finishes while the request waits.
+// held so the request really lands in that window, then released while the
+// request waits.  The budget is far longer than the release delay, so the
+// outcome does not depend on scheduling.
+static lsTextDocumentPositionParams completion_params_after(const std::string& uri,
+                                                            const std::string& text,
+                                                            const std::string& needle) {
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    auto [line, col] = pos_after(text, needle);
+    params.position = lsPosition(line, col);
+    return params;
+}
+
 TEST_CASE("completion: a member access typed just now waits for its parse",
           "[completion][handle]") {
     CompletionEngine engine;
@@ -1647,6 +1704,7 @@ TEST_CASE("completion: a member access typed just now waits for its parse",
     analyzer.open(uri, before);
     std::string after = before;
     after.insert(after.find("  end\n"), "    p.\n");
+    const auto params = completion_params_after(uri, after, "    p.");
 
     analyzer.set_parse_paused(true);
     analyzer.enqueue_parse(uri, after);
@@ -1656,19 +1714,41 @@ TEST_CASE("completion: a member access typed just now waits for its parse",
         analyzer.set_parse_paused(false);
     });
 
-    auto state = completion_document_state(analyzer, uri);
+    auto state = completion_document_state(analyzer, params, std::chrono::seconds(30));
     release.join();
     REQUIRE(state != nullptr);
+    CHECK(state->tree != nullptr);
     CHECK(state->text == after);
 
-    lsTextDocumentPositionParams params;
-    params.textDocument.uri.raw_uri_ = uri;
-    auto [line, col] = pos_after(after, "    p.");
-    params.position = lsPosition(line, col);
     CancellationToken tok;
     auto result = engine.complete(params, *state, analyzer, tok);
     CHECK(has_label(result, "max_len"));
     CHECK_FALSE(has_label(result, "module"));
+}
+
+// nvim-cmp asks on every identifier keystroke and requests are answered one at
+// a time: an identifier context must answer from the placeholder at once.  The
+// parse stays held for the whole call, so a wait would sit out the budget.
+TEST_CASE("completion: plain identifier typing does not wait for the parse",
+          "[completion][handle]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_edit_identifier.sv";
+    const std::string before = "module top;\n  int max_len;\nendmodule\n";
+    analyzer.open(uri, before);
+    std::string after = before;
+    after.insert(after.find("endmodule"), "  ma\n");
+    const auto params = completion_params_after(uri, after, "  ma");
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, after);
+    const auto start = std::chrono::steady_clock::now();
+    auto state = completion_document_state(analyzer, params, std::chrono::seconds(30));
+    const auto waited = std::chrono::steady_clock::now() - start;
+    analyzer.set_parse_paused(false);
+    REQUIRE(state != nullptr);
+    CHECK(state->tree == nullptr);
+    CHECK(state->text == after);
+    CHECK(waited < std::chrono::seconds(10));
 }
 
 // A parse that does not land in time must not answer from the previous text:
@@ -1678,12 +1758,14 @@ TEST_CASE("completion: an edit whose parse is late answers from the current text
     Analyzer analyzer;
     const std::string uri = "file:///tmp/completion_edit_late_parse.sv";
     analyzer.open(uri, "module top;\nendmodule\n");
+    const std::string after = "module top;\n  x.\nendmodule\n";
     analyzer.set_parse_paused(true);
-    analyzer.enqueue_parse(uri, "module top;\n  x.\nendmodule\n");
-    auto state = completion_document_state(analyzer, uri);
+    analyzer.enqueue_parse(uri, after);
+    auto state = completion_document_state(analyzer, completion_params_after(uri, after, "  x."),
+                                           std::chrono::milliseconds(10));
     analyzer.set_parse_paused(false);
     REQUIRE(state != nullptr);
-    CHECK(state->text == "module top;\n  x.\nendmodule\n");
+    CHECK(state->text == after);
 }
 
 TEST_CASE("completion: MemberAccess resolves typedef struct variable type", "[completion]") {
