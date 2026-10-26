@@ -26,7 +26,8 @@ enable = true
 Every rule category (`[lint.naming]`, `[lint.module]`, `[lint.instance]`, `[lint.statement]`,
 `[lint.function]`) has its own `enable` and `severity`. `enable` defaults to `false`: a category's
 rules run only when its `enable = true`, and its `severity` applies to every rule in it. The value
-controls how the LSP reports violations.
+controls how the LSP reports violations. `[lint.style]` has neither key: its one rule runs when
+set to `true` and always reports a warning.
 
 | Value | LSP severity | Editor appearance |
 |-------|-------------|-------------------|

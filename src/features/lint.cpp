@@ -200,37 +200,79 @@ static std::string file_stem_from_uri(const std::string& uri) {
 
 using SignalSet = std::unordered_set<std::string>;
 
-/// Base names written by an assignment's left-hand side (`a`, `a[3]`, `s.f`, `{a, b}`).
-static void collect_lhs_names(const SyntaxNode& lhs, SignalSet& out) {
-    if (const auto* id = lhs.as_if<IdentifierNameSyntax>())
-        out.insert(std::string(id->identifier.valueText()));
-    else if (const auto* sel = lhs.as_if<IdentifierSelectNameSyntax>())
-        out.insert(std::string(sel->identifier.valueText()));
-    else if (const auto* elem = lhs.as_if<ElementSelectExpressionSyntax>())
-        collect_lhs_names(*elem->left, out);
-    else if (const auto* member = lhs.as_if<MemberAccessExpressionSyntax>())
-        collect_lhs_names(*member->left, out);
-    else if (const auto* concat = lhs.as_if<ConcatenationExpressionSyntax>())
+/// What a statement writes.  Only `whole` names cover a later if-without-else:
+/// `o[0] = 0;` or `s.a = 0;` leaves the rest of `o` / `s` unassigned.
+struct Assigned {
+    SignalSet whole;     // `a = ...`, `{a, b} = ...`
+    SignalSet partial;   // `a[i] = ...`, `s.f = ...`, `a++`
+    bool unknown{false}; // a target with no plain base name: assume uncovered
+};
+
+/// The leftmost plain name of a select / member / scoped target, or empty.
+static std::string_view base_name(const SyntaxNode& node) {
+    if (const auto* id = node.as_if<IdentifierNameSyntax>())
+        return id->identifier.valueText();
+    if (const auto* sel = node.as_if<IdentifierSelectNameSyntax>())
+        return sel->identifier.valueText();
+    if (const auto* elem = node.as_if<ElementSelectExpressionSyntax>())
+        return base_name(*elem->left);
+    if (const auto* member = node.as_if<MemberAccessExpressionSyntax>())
+        return base_name(*member->left);
+    if (const auto* scoped = node.as_if<ScopedNameSyntax>())
+        return base_name(*scoped->left);
+    return {};
+}
+
+static void collect_lhs_names(const SyntaxNode& lhs, Assigned& out) {
+    if (const auto* id = lhs.as_if<IdentifierNameSyntax>()) {
+        out.whole.insert(std::string(id->identifier.valueText()));
+    } else if (const auto* concat = lhs.as_if<ConcatenationExpressionSyntax>()) {
         for (const auto* expr : concat->expressions)
             if (expr)
                 collect_lhs_names(*expr, out);
+    } else if (const auto name = base_name(lhs); !name.empty()) {
+        out.partial.insert(std::string(name));
+    } else {
+        out.unknown = true;
+    }
+}
+
+static bool is_increment_or_decrement(SyntaxKind kind) {
+    return kind == SyntaxKind::UnaryPreincrementExpression ||
+           kind == SyntaxKind::UnaryPredecrementExpression ||
+           kind == SyntaxKind::PostincrementExpression ||
+           kind == SyntaxKind::PostdecrementExpression;
 }
 
 /// Every signal assigned anywhere under `node`.
-static void collect_assigned(const SyntaxNode& node, SignalSet& out) {
-    if (const auto* bin = node.as_if<BinaryExpressionSyntax>())
+static void collect_assigned(const SyntaxNode& node, Assigned& out) {
+    if (const auto* bin = node.as_if<BinaryExpressionSyntax>()) {
         if (is_blocking_assignment(bin->kind) ||
             bin->kind == SyntaxKind::NonblockingAssignmentExpression)
             collect_lhs_names(*bin->left, out);
+    } else if (is_increment_or_decrement(node.kind)) {
+        // `q++` reads q, so it never covers it.
+        const SyntaxNode* operand = nullptr;
+        if (const auto* pre = node.as_if<PrefixUnaryExpressionSyntax>())
+            operand = pre->operand;
+        else if (const auto* post = node.as_if<PostfixUnaryExpressionSyntax>())
+            operand = post->operand;
+        Assigned target;
+        if (operand)
+            collect_lhs_names(*operand, target);
+        out.partial.insert(target.whole.begin(), target.whole.end());
+        out.partial.insert(target.partial.begin(), target.partial.end());
+        out.unknown = out.unknown || target.unknown || !operand;
+    }
     for (uint32_t i = 0; i < node.getChildCount(); ++i)
         if (const SyntaxNode* child = node.childNode(i))
             collect_assigned(*child, out);
 }
 
 /// True if `node` holds an if-without-else that assigns a signal not yet in
-/// `covered`, the signals already assigned on every path before it (the
+/// `covered`, the signals already assigned whole on every path before it (the
 /// default-assignment pattern: `o = '0; if (en) o = d;` is no latch).  Grows
-/// `covered` with what `node` assigns on every path.
+/// `covered` with what `node` assigns whole on every path.
 static bool has_latch_risk(const SyntaxNode& node, SignalSet& covered) {
     if (const auto* block = node.as_if<BlockStatementSyntax>()) {
         for (const auto* item : block->items)
@@ -240,10 +282,12 @@ static bool has_latch_risk(const SyntaxNode& node, SignalSet& covered) {
     }
     if (const auto* cond = node.as_if<ConditionalStatementSyntax>()) {
         if (!cond->elseClause) {
-            SignalSet assigned;
+            Assigned assigned;
             collect_assigned(*cond->statement, assigned);
-            return std::any_of(assigned.begin(), assigned.end(),
-                               [&](const std::string& name) { return !covered.count(name); });
+            const auto uncovered = [&](const std::string& name) { return !covered.count(name); };
+            return assigned.unknown ||
+                   std::any_of(assigned.whole.begin(), assigned.whole.end(), uncovered) ||
+                   std::any_of(assigned.partial.begin(), assigned.partial.end(), uncovered);
         }
         SignalSet then_covered = covered, else_covered = covered;
         if (has_latch_risk(*cond->statement, then_covered) ||
@@ -255,7 +299,9 @@ static bool has_latch_risk(const SyntaxNode& node, SignalSet& covered) {
         return false;
     }
     if (const auto* stmt = node.as_if<ExpressionStatementSyntax>()) {
-        collect_assigned(*stmt->expr, covered);
+        Assigned assigned;
+        collect_assigned(*stmt->expr, assigned);
+        covered.insert(assigned.whole.begin(), assigned.whole.end());
         return false;
     }
     // case, loops, timing controls: what they assign is conditional, so it

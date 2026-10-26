@@ -745,7 +745,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
             std::string msg = "lazyverilog.toml value error(s):";
             for (const auto& e : value_errors)
                 msg += "\n  " + e;
-            std::cerr << msg << "\n";
+            // Not printed here: the server loads every project's config on each
+            // reload and cache miss.  Callers that want it ask via `warning`.
             if (warning)
                 *warning = msg;
             if (warning_detail) {

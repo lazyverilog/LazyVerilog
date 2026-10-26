@@ -57,7 +57,10 @@ int main(int argc, char* argv[]) {
     FormatOptions opts;
     for (auto d = dir; !d.empty() && d != d.parent_path(); d = d.parent_path()) {
         if (std::filesystem::exists(d / "lazyverilog.toml")) {
-            Config cfg = load_config(d, nullptr, nullptr);
+            std::string warning;
+            Config cfg = load_config(d, &warning);
+            if (!warning.empty())
+                std::cerr << warning << "\n";
             opts = cfg.format;
             break;
         }

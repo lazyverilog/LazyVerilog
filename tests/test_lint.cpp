@@ -482,6 +482,21 @@ TEST_CASE("lint: latch_inference_detection still flags an uncovered if without e
     CHECK(latch_flagged("    if (sel) o = 1'b0; else begin if (en) o = d; end\n"));
 }
 
+TEST_CASE("lint: latch_inference_detection flags partial and member targets",
+          "[lint][statement][latch]") {
+    // A member target (`s.a`, a ScopedName) is still an assignment.
+    CHECK(latch_flagged("    if (en) s.a = d;\n"));
+    // Setting one bit does not cover another bit of the same signal.
+    CHECK(latch_flagged("    o[0] = 1'b0;\n    if (en) o[1] = d;\n"));
+    CHECK(latch_flagged("    s.a = 1'b0;\n    if (en) s.b = d;\n"));
+    // `q++` writes q.
+    CHECK(latch_flagged("    if (en) q++;\n"));
+    CHECK(latch_flagged("    if (en) --q;\n"));
+    // A whole default still covers a later partial write.
+    CHECK_FALSE(latch_flagged("    o = '0;\n    if (en) o[1] = d;\n"));
+    CHECK_FALSE(latch_flagged("    q = '0;\n    if (en) q++;\n"));
+}
+
 TEST_CASE("lint: [lint.module] enable=false turns off one_module_per_file", "[lint][module]") {
     const char* source = "module a;\nendmodule\nmodule b;\nendmodule\n";
     LintConfig cfg;
