@@ -25,6 +25,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -391,8 +393,21 @@ int main(int argc, char** argv) {
     for (int id : {20, 21, 22, 23})
         expect(contains(reply_for(result.stdout_text, id), "-32601"),
                "request " + std::to_string(id) + " for an unhandled method is MethodNotFound");
-    expect(!contains(result.stdout_text, "noSuchNotification"),
-           "an unknown $/ notification gets no reply");
+    // A reply to the unknown notification would carry no method name, only
+    // "id":null, so count responses instead: one per request id sent, and none
+    // with a null id.  Server-to-client requests carry "method", not
+    // "result"/"error", after the id.
+    {
+        const std::regex response(R"re("id":[^,{}]*,"(result|error)")re");
+        const auto replies = std::distance(
+            std::sregex_iterator(result.stdout_text.begin(), result.stdout_text.end(), response),
+            std::sregex_iterator());
+        expect(replies == static_cast<long>(cases.size()) + 1,
+               "exactly one response per request (initialize + cases), got " +
+                   std::to_string(replies));
+        expect(!contains(result.stdout_text, R"("id":null)"),
+               "an unknown $/ notification gets no reply");
+    }
 
     // A withdrawn request is answered with RequestCancelled rather than run.
     expect(cancelled_request_errors(server_bin, work) > 0,
