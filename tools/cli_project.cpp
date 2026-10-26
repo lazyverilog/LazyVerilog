@@ -2,6 +2,7 @@
 #include "filelist.hpp"
 
 #include <condition_variable>
+#include <iostream>
 #include <mutex>
 
 CliProject resolve_cli_project(const std::filesystem::path& start,
@@ -11,7 +12,10 @@ CliProject resolve_cli_project(const std::filesystem::path& start,
     if (project.root.empty())
         project.root = std::filesystem::is_directory(start) ? start : start.parent_path();
 
-    project.config = load_config(project.root);
+    std::string warning;
+    project.config = load_config(project.root, &warning);
+    if (!warning.empty())
+        std::cerr << warning << "\n";
 
     if (!filelist_override.empty()) {
         // Resolve against the current directory (not `project.root`) and store
