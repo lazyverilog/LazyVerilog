@@ -1720,6 +1720,70 @@ TEST_CASE("code action: lifetime quick fix replaces an existing 'static'", "[cod
           "  task automatic t(); endtask");
 }
 
+TEST_CASE("code action: default case lands before an endcase that shares its line",
+          "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_default_case.sv";
+    const std::string text = "module top(input logic [1:0] x, output logic y);\n"
+                             "  always_comb case (x) 0: y = 1; endcase\n"
+                             "  always_comb begin\n"
+                             "    case (x)\n"
+                             "      0: begin y = 1; end endcase\n"
+                             "  end\n"
+                             "  always_comb begin\n"
+                             "    case (x)\n"
+                             "      0: y = 1;\n"
+                             "    endcase\n"
+                             "  end\n"
+                             "endmodule\n";
+    analyzer.open(uri, text);
+
+    // Apply the "Add default case" fix requested on `line`; return the whole edited text.
+    auto fixed = [&](int line) -> std::string {
+        lsDiagnostic diag;
+        diag.range.start = lsPosition(line, 0);
+        diag.range.end = lsPosition(line, 0);
+        diag.message = "[statement] case statement missing default item";
+        lsCodeActionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.range.start = lsPosition(line, 0);
+        params.range.end = lsPosition(line, 0);
+        params.context.diagnostics = {diag};
+        for (const auto& a : provide_code_actions(analyzer, config, params)) {
+            if (a.title != "Add default case")
+                continue;
+            REQUIRE(a.edit.has_value());
+            REQUIRE(a.edit->changes.has_value());
+            const auto& edits = a.edit->changes->at(uri);
+            REQUIRE(edits.size() == 1);
+            const auto& e = edits[0];
+            REQUIRE(e.range.start == e.range.end);
+            size_t off = 0;
+            for (int l = 0; l < e.range.start.line; ++l)
+                off = text.find('\n', off) + 1;
+            std::string out = text;
+            out.insert(off + e.range.start.character, e.newText);
+            return out;
+        }
+        return "<no quick fix>";
+    };
+
+    auto with_line = [&](int line, const std::string& replacement) {
+        std::string out = text;
+        size_t off = 0;
+        for (int l = 0; l < line; ++l)
+            off = out.find('\n', off) + 1;
+        out.replace(off, out.find('\n', off) - off, replacement);
+        return out;
+    };
+
+    CHECK(fixed(1) == with_line(1, "  always_comb case (x) 0: y = 1; default: ; endcase"));
+    CHECK(fixed(3) == with_line(4, "      0: begin y = 1; end default: ; endcase"));
+    // endcase on its own line keeps the indented line before it.
+    CHECK(fixed(7) == with_line(9, "      default: ;\n    endcase"));
+}
+
 TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
     // UVM's `uvm_component_utils(T) reaches the typedef through a second macro:
     //
