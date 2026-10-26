@@ -11,7 +11,7 @@
 #include "config.hpp"
 
 static void print_usage(std::ostream& out) {
-    out << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] <file>\n";
+    out << "Usage: lazyverilog-fmt [-i|--in-place] [--log <log-dir>] [--] <file>\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -20,8 +20,22 @@ int main(int argc, char* argv[]) {
     const char* log_path = nullptr;
     const char* path = nullptr;
     bool in_place = false;
+    bool end_of_options = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg == "--" && !end_of_options) {
+            end_of_options = true;
+            continue;
+        }
+        if (end_of_options || arg.empty() || arg[0] != '-') {
+            if (path) {
+                std::cerr << "Only one file can be formatted per run: " << arg << "\n";
+                print_usage(std::cerr);
+                return 1;
+            }
+            path = argv[i];
+            continue;
+        }
         if (arg == "--log") {
             if (i + 1 >= argc) {
                 print_usage(std::cerr);
@@ -40,18 +54,11 @@ int main(int argc, char* argv[]) {
             print_usage(std::cout);
             return 0;
         }
-        else if (!arg.empty() && arg[0] == '-') {
+        else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage(std::cerr);
             return 1;
         }
-        else if (path) {
-            std::cerr << "Only one file can be formatted per run: " << arg << "\n";
-            print_usage(std::cerr);
-            return 1;
-        }
-        else
-            path = argv[i];
     }
     if (!path) { print_usage(std::cerr); return 1; }
     // Binary on both ends: text mode on Windows turns every LF written into

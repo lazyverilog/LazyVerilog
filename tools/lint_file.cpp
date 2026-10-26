@@ -25,7 +25,7 @@ namespace {
 
 void print_usage() {
     std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] "
-                 "[--maxerror <n>] [--nowarn <code>] [--version] [<file>]\n"
+                 "[--maxerror <n>] [--nowarn <code>] [--version] [--] [<file>]\n"
                  "Run lazyverilog-lint --help for the list of diagnostic codes.\n";
 }
 
@@ -245,8 +245,22 @@ int main(int argc, char* argv[]) {
     uint32_t error_limit = kDefaultCompilationErrorLimit;
     NowarnFilter nowarn;
 
+    bool end_of_options = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
+        if (arg == "--" && !end_of_options) {
+            end_of_options = true;
+            continue;
+        }
+        if (end_of_options || arg.empty() || arg[0] != '-') {
+            if (!file_arg.empty()) {
+                std::cerr << "Only one file can be linted per run (use -f for more): " << arg << "\n";
+                print_usage();
+                return 1;
+            }
+            file_arg = arg;
+            continue;
+        }
         if (arg == "-f" || arg == "--filelist") {
             if (i + 1 >= argc) {
                 print_usage();
@@ -283,12 +297,10 @@ int main(int argc, char* argv[]) {
         } else if (arg == "-h" || arg == "--help") {
             print_help(nowarn_engine);
             return 0;
-        } else if (!arg.empty() && arg[0] == '-') {
+        } else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_usage();
             return 1;
-        } else {
-            file_arg = arg;
         }
     }
 

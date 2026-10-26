@@ -226,6 +226,7 @@ int main(int argc, char** argv) {
     // lazyverilog-fmt's arguments: --help is usage, not a file to open, and an
     // unknown flag or a second file is a usage error instead of being ignored.
     {
+        auto plain_fmt = run_command(fmt_bin, shell_quote(source));
         auto help = run_command(fmt_bin, "--help");
         expect(help.exit_code == 0, "lazyverilog-fmt --help exits 0");
         expect(contains(help.stdout_text, "Usage: lazyverilog-fmt"),
@@ -241,6 +242,22 @@ int main(int argc, char** argv) {
         auto two = run_command(fmt_bin, shell_quote(source) + " " + shell_quote(source));
         expect(two.exit_code == 1, "lazyverilog-fmt rejects a second file (exit 1)");
         expect(two.stdout_text.empty(), "a second file formats nothing");
+
+        // `--` ends the options, so a file named like a flag can still be formatted.
+        const fs::path dir = fs::temp_directory_path() /
+                             ("lazyverilog-fmt-dash-" +
+                              std::to_string(cli_process::current_process_id()));
+        fs::create_directories(dir);
+        fs::copy_file(source, dir / "-dash.sv", fs::copy_options::overwrite_existing);
+        const fs::path cwd = fs::current_path();
+        fs::current_path(dir);
+        auto dashed = run_command(fmt_bin, "-- -dash.sv");
+        auto flag = run_command(fmt_bin, "-dash.sv");
+        fs::current_path(cwd);
+        fs::remove_all(dir);
+        expect(dashed.exit_code == 0 && dashed.stdout_text == plain_fmt.stdout_text,
+               "lazyverilog-fmt -- -dash.sv formats the file");
+        expect(flag.exit_code == 1, "lazyverilog-fmt -dash.sv without -- is an unknown option");
     }
 
     std::cerr << "banner-cli-smoke: " << (checks_run - checks_failed) << "/" << checks_run

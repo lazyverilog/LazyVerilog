@@ -99,6 +99,31 @@ int main(int argc, char** argv) {
         expect(result.stdout_text.empty(), "--lint-only with --compile-only prints no diagnostics");
     }
 
+    // A second file used to replace the first silently; -f is the way to lint several.
+    {
+        auto result = run_command(lint_bin, shell_quote(top) + " " + shell_quote(top));
+        expect(result.exit_code == 1, "a second file argument is a usage error (exit 1)");
+        expect(result.stdout_text.empty(), "a second file argument lints nothing");
+    }
+
+    // `--` ends the options, so a file named like a flag can still be linted.
+    {
+        const fs::path dir = fs::temp_directory_path() /
+                             ("lazyverilog-lint-dash-" +
+                              std::to_string(cli_process::current_process_id()));
+        fs::create_directories(dir);
+        fs::copy_file(top, dir / "-dash.sv", fs::copy_options::overwrite_existing);
+        const fs::path cwd = fs::current_path();
+        fs::current_path(dir);
+        auto dashed = run_command(lint_bin, "-- -dash.sv");
+        auto flag = run_command(lint_bin, "-dash.sv");
+        fs::current_path(cwd);
+        fs::remove_all(dir);
+        expect(dashed.exit_code == 2 && contains(dashed.stdout_text, "-dash.sv:"),
+               "-- -dash.sv lints the file");
+        expect(flag.exit_code == 1, "-dash.sv without -- is an unknown option");
+    }
+
     // Single-file mode: reports a real semantic (not just parse) diagnostic
     // for the target file, regardless of the [compilation] background_compilation
     // toml setting — regression coverage for a bug where Analyzer::open()'s
