@@ -1,0 +1,13 @@
+// ── LazyVerilog patch: unknown request => MethodNotFound ──────────────────
+// JSON-RPC answers every request.  LspCpp logged a request no handler takes
+// and dropped it, so the client kept it pending until its own timeout.
+static void lazyverilogMethodNotFound(RemoteEndPoint& endpoint, lsRequestId const& id, std::string const& method)
+{
+    Rsp_Error error;
+    error.id = id;
+    error.error.code = lsErrorCodes::MethodNotFound;
+    error.error.message = "Unhandled method " + method;
+    endpoint.send(error);
+}
+// ── end LazyVerilog patch ─────────────────────────────────────────────────
+
