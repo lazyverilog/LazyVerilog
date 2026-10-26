@@ -65,6 +65,18 @@ inline void dedup_parse_diagnostics(std::vector<ParseDiagInfo>& diags) {
     diags.swap(unique);
 }
 
+/// A macro an includer defined before it `include`d a header.
+struct IncluderMacro {
+    std::string name;
+    /// Its `define, behind a `line naming the file it is written in.
+    std::string definition;
+    /// Macros its body uses, by name and by `name`` paste prefix.
+    std::vector<std::string> uses;
+    std::vector<std::string> prefix_uses;
+};
+/// Sorted by name.
+using IncluderMacros = std::vector<IncluderMacro>;
+
 /// Immutable snapshot of a single open document.
 /// Handlers receive a shared_ptr<const DocumentState>; didChange atomically
 /// swaps in a new instance. No per-document locking needed on the read path.
@@ -238,11 +250,18 @@ struct DocumentState {
     // exactly one extra snapshot per open buffer and only while a reparse is in
     // flight.  Null once the parse lands, since `tree` is then this snapshot's own.
     std::shared_ptr<const DocumentState> previous_parsed;
-    // The macros the file that `include`s this one has defined where it does,
-    // as one predefine (see includer_macro_context()).  Null: no includer was
-    // known when this was parsed.  Empty: one was, and it defines nothing.
+    // The macros the file that `include`s this one has defined where it does
+    // (see find_includer_macros()).  Null: not looked for.  Empty: no includer
+    // defines any, as of include graph generation includer_graph_generation.
     // Carried across edits so a keystroke does not re-preprocess the includer.
-    std::shared_ptr<const std::string> includer_macro_context;
+    std::shared_ptr<const IncluderMacros> includer_macros;
+    uint64_t includer_graph_generation{0};
+    // The ones this text uses, by name, and the predefine slang got for them.
+    // Rebuilt only when the names change.  The extras are names recovered from
+    // an "unknown macro" a body built by token pasting asked for.
+    std::vector<std::string> includer_macro_names;
+    std::vector<std::string> includer_macro_extras;
+    std::shared_ptr<const std::string> includer_predefine;
     uint64_t doc_version{0};
     DocumentState() = default;
     DocumentState(std::string uri, std::string text,

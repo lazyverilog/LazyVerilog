@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include "analyzer.hpp"
 #include "string_utils.hpp"
+#include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
 #include <algorithm>
 #include <thread>
 #include <vector>
@@ -377,4 +379,171 @@ TEST_CASE("a header opened before its includer gets the includer's macros once i
     REQUIRE(now != nullptr);
     CHECK(now->tree != nullptr);
     CHECK(unknown_macro_count(*now) == 0);
+}
+
+namespace {
+
+/// Files under a fresh temp root, indexed from one package the way a `.f`
+/// names it.
+struct HeaderTree {
+    std::filesystem::path root;
+
+    explicit HeaderTree(const std::string& tag) {
+        root = std::filesystem::temp_directory_path() / ("lazyverilog-hdr-" + tag);
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root / "inc");
+        std::filesystem::create_directories(root / "src");
+        root = std::filesystem::canonical(root);
+    }
+    ~HeaderTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    std::string write(const std::string& relative, const std::string& text) const {
+        IncluderTree::write(root / relative, text);
+        return text;
+    }
+    std::string uri(const std::string& relative) const { return uri_from_path(root / relative); }
+    void index(Analyzer& a) const {
+        a.set_project_index_publish_debounce_ms(0);
+        a.set_include_dirs({(root / "inc").string()});
+        a.set_extra_files({(root / "src" / "pkg.sv").string()});
+        a.wait_for_background_index_idle();
+    }
+};
+
+/// An inactive file -- every line skipped by a false `ifndef -- parses to an
+/// end-of-file token and nothing else.
+bool parses_active(const DocumentState& state) {
+    return state.tree && state.tree->root().getFirstToken().kind != slang::parsing::TokenKind::EndOfFile;
+}
+
+const std::string kDrvText = "`ifndef DRV_SVH\n"
+                             "`define DRV_SVH\n"
+                             "class drv;\n"
+                             "  logic [`M_W-1:0] x;\n"
+                             "  function void f();\n"
+                             "    `LOG(\"x\");\n"
+                             "  endfunction\n"
+                             "endclass\n"
+                             "`endif\n";
+
+void write_agent_tree(const HeaderTree& tree, bool direct_too) {
+    tree.write("inc/macros.svh", "`define M_W 8\n`define LOG(x) $display(x)\n");
+    tree.write("inc/agent.svh", "`ifndef AGENT_SVH\n`define AGENT_SVH\n`include \"drv.svh\"\n"
+                                "class agent;\n  drv d;\nendclass\n`endif\n");
+    tree.write("inc/drv.svh", kDrvText);
+    tree.write("src/pkg.sv", std::string("package pkg;\n`include \"macros.svh\"\n`include \"agent.svh\"\n") +
+                                 (direct_too ? "`include \"drv.svh\"\n" : "") + "endpackage\n");
+}
+
+} // namespace
+
+TEST_CASE("a guarded header included through another header and then directly stays active",
+          "[sync][includer-context]") {
+    // By its direct `include the package has already defined DRV_SVH, through
+    // agent.svh.  Handing that to the header would skip all of it.
+    HeaderTree tree("guard");
+    write_agent_tree(tree, true);
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/drv.svh"), kDrvText);
+    const auto state = a.get_state(tree.uri("inc/drv.svh"));
+    REQUIRE(state != nullptr);
+    CHECK(parses_active(*state));
+    CHECK(unknown_macro_count(*state) == 0);
+}
+
+TEST_CASE("a header included only through another header gets the package's macros",
+          "[sync][includer-context]") {
+    HeaderTree tree("nested");
+    write_agent_tree(tree, false);
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/drv.svh"), kDrvText);
+    const auto state = a.get_state(tree.uri("inc/drv.svh"));
+    REQUIRE(state != nullptr);
+    CHECK(parses_active(*state));
+    CHECK(unknown_macro_count(*state) == 0);
+}
+
+TEST_CASE("a header's own `define wins over the includer's", "[sync][includer-context]") {
+    // slang gives a predefine precedence over a later `define of the same name,
+    // so passing the includer's W would silently replace the header's.
+    HeaderTree tree("redef");
+    tree.write("inc/defs.svh", "`define W 4\n");
+    const auto item = tree.write("inc/item.svh", "`define W 16\nclass item;\n  logic [`W-1:0] d;\nendclass\n");
+    tree.write("src/pkg.sv", "package pkg;\n`include \"defs.svh\"\n`include \"item.svh\"\nendpackage\n");
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/item.svh"), item);
+    const auto state = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    std::string w;
+    for (const auto* def : state->tree->getDefinedMacros()) {
+        if (def->name.valueText() == "W")
+            w = def->toString();
+    }
+    CHECK(w.find("16") != std::string::npos);
+}
+
+TEST_CASE("an open header is handed only the includer macros it uses",
+          "[sync][includer-context]") {
+    // All of UVM is ~280 KB of `define to lex on every keystroke; a class file
+    // uses a few of them, and whatever those use in turn.
+    HeaderTree tree("filter");
+    tree.write("inc/defs.svh", "`define WIDTH 8\n"
+                               "`define DECL(n) logic [`WIDTH-1:0] n;\n"
+                               "`define UNUSED_ONE 1\n"
+                               "`define RUN(F) `F(x)\n"
+                               "`define ITEM_ADD(v) v = v + 1;\n");
+    const auto item = tree.write("inc/item.svh", "class item;\n"
+                                                 "  `DECL(a)\n"
+                                                 "  logic [7:0] x;\n"
+                                                 "  function void f();\n"
+                                                 "    `RUN(ITEM_ADD)\n"
+                                                 "  endfunction\n"
+                                                 "endclass\n");
+    tree.write("src/pkg.sv", "package pkg;\n`include \"defs.svh\"\n`include \"item.svh\"\nendpackage\n");
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/item.svh"), item);
+    const auto state = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(state != nullptr);
+    REQUIRE(state->includer_predefine != nullptr);
+    const auto& predefine = *state->includer_predefine;
+    CHECK(predefine.find("`define DECL") != std::string::npos);
+    // Used only by DECL's body.
+    CHECK(predefine.find("`define WIDTH") != std::string::npos);
+    CHECK(predefine.find("UNUSED_ONE") == std::string::npos);
+    // Named only by RUN's argument: slang asks for it, and gets it.
+    CHECK(predefine.find("`define ITEM_ADD") != std::string::npos);
+    CHECK(unknown_macro_count(*state) == 0);
+
+    // A keystroke that uses no new macro keeps the same predefine.
+    a.change(tree.uri("inc/item.svh"), item + "\n");
+    const auto edited = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(edited != nullptr);
+    CHECK(edited->includer_predefine == state->includer_predefine);
+}
+
+TEST_CASE("a header that includes itself is not reparsed forever", "[sync][includer-context]") {
+    // It is in its own include list, which made it look like a header with an
+    // includer nobody had looked at -- after every parse, its own included.
+    HeaderTree tree("self");
+    const std::string text = "`ifndef SELF_SVH\n`define SELF_SVH\n`include \"self.svh\"\n"
+                             "class self_c;\nendclass\n`endif\n";
+    tree.write("inc/self.svh", text);
+    Analyzer a;
+    a.set_include_dirs({(tree.root / "inc").string()});
+    const auto uri = tree.uri("inc/self.svh");
+    a.enqueue_parse(uri, text);
+    REQUIRE(a.get_parsed_state(uri, std::chrono::seconds(10)) != nullptr);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const auto before = a.get_state(uri);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const auto after = a.get_state(uri);
+    REQUIRE(before != nullptr);
+    CHECK(after == before);
 }

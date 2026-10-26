@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <map>
 #include <set>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/PreprocessorDiags.h>
@@ -1030,14 +1031,157 @@ struct IncluderCandidate {
     std::shared_ptr<const DocumentState> open_state;
 };
 
-/// Offset of the `include in @p text that resolves to @p header_path, or npos.
-/// A text scan: nothing has parsed the includer at this point.
-static size_t include_offset_of(std::string_view text, const std::string& includer_path,
-                                const std::string& header_path,
-                                const std::vector<std::filesystem::path>& include_dirs) {
+/// The macro names @p text uses and defines, by a token scan with no parse:
+/// `name, `ifdef/`ifndef/`elsif name, and `name`` (a paste, whose full name is
+/// only known at expansion) as a prefix.  Comments are not skipped; a name
+/// written in one only costs an extra macro.
+struct MacroNameScan {
+    std::set<std::string, std::less<>> uses;
+    std::set<std::string, std::less<>> prefixes;
+    std::set<std::string, std::less<>> defines;
+};
+
+static void scan_macro_names(std::string_view text, MacroNameScan& scan) {
+    const auto ident_at = [&](size_t at) {
+        size_t end = at;
+        while (end < text.size() &&
+               (std::isalnum(static_cast<unsigned char>(text[end])) || text[end] == '_' ||
+                (end > at && text[end] == '$')))
+            ++end;
+        if (end == at || std::isdigit(static_cast<unsigned char>(text[at])))
+            return std::string_view{};
+        return text.substr(at, end - at);
+    };
+    for (auto at = text.find('`'); at != std::string_view::npos; at = text.find('`', at + 1)) {
+        const auto name = ident_at(at + 1);
+        if (name.empty())
+            continue;
+        const size_t end = at + 1 + name.size();
+        if (name == "define" || name == "undef" || name == "ifdef" || name == "ifndef" ||
+            name == "elsif") {
+            const auto arg_at = text.find_first_not_of(" \t", end);
+            const auto arg = arg_at == std::string_view::npos ? std::string_view{} : ident_at(arg_at);
+            if (!arg.empty())
+                (name == "define" || name == "undef" ? scan.defines : scan.uses).emplace(arg);
+        } else if (text.substr(end, 2) == "``") {
+            scan.prefixes.emplace(name);
+        } else {
+            scan.uses.emplace(name);
+        }
+        at = end - 1;
+    }
+}
+
+/// Where the `include at @p spelled from @p includer_path resolves: slang's
+/// search order, the first directory that has the name.  Empty when none does.
+static std::string resolve_include_text_path(const std::filesystem::path& spelled,
+                                             const std::string& includer_path,
+                                             const std::vector<std::filesystem::path>& include_dirs) {
     namespace fs = std::filesystem;
-    const auto header_name = fs::path(header_path).filename();
-    const auto includer_dir = fs::path(includer_path).parent_path();
+    std::vector<fs::path> search{fs::path(includer_path).parent_path() / spelled};
+    for (const auto& dir : include_dirs)
+        search.push_back(dir / spelled);
+    for (const auto& candidate : search) {
+        const auto normalized = normalize_filesystem_path(candidate);
+        std::error_code ec;
+        if (fs::exists(normalized, ec))
+            return normalized.string();
+    }
+    return {};
+}
+
+static std::optional<std::string> overlay_or_disk_text(const std::string& path,
+                                                       const std::vector<OpenTextOverlay>& overlays) {
+    for (const auto& overlay : overlays) {
+        if (overlay.path == path && overlay.state)
+            return overlay.state->text;
+    }
+    return read_file_text_optional(path);
+}
+
+using IncluderMacroTable = std::map<std::string, IncluderMacro, std::less<>>;
+
+/// One slang predefine holding @p macros.  One rather than one per macro:
+/// slang copies its whole macro table per predefine, which for UVM's few
+/// hundred macros is quadratic.  predefine() prepends "`define " and makes the
+/// first '=' the separator, so the text leads with a sentinel it `undef's.
+template <typename Macros>
+static std::string includer_predefine_text(const Macros& macros) {
+    constexpr std::string_view sentinel = "__lazyverilog_includer_context__";
+    std::string text = std::string(sentinel) + "=1";
+    for (const IncluderMacro* macro : macros)
+        text.append(macro->definition);
+    return text.append("\n`undef ").append(sentinel);
+}
+
+/// Adds to @p table the macros @p prefix (the start of @p path, up to an
+/// `include) defines, preprocessed after the ones already in the table.
+/// shortcut: a macro the prefix `undef's stays in the table; track undefs if a
+/// header ever depends on that.
+static void collect_prefix_macros(std::string_view prefix, const std::string& path,
+                                  const ParseInputs& inputs,
+                                  const std::vector<OpenTextOverlay>& overlays,
+                                  IncluderMacroTable& table) {
+    auto sm = make_lsp_source_manager();
+    preload_open_text_overlays(*sm, overlays, path);
+    slang::parsing::PreprocessorOptions ppo;
+    ppo.predefines = inputs.defines;
+    if (!table.empty()) {
+        std::vector<const IncluderMacro*> inherited;
+        for (const auto& [name, macro] : table)
+            inherited.push_back(&macro);
+        ppo.predefines.push_back(includer_predefine_text(inherited));
+    }
+    ppo.additionalIncludePaths = inputs.include_dir_paths;
+    slang::Bag bag;
+    bag.set(std::move(ppo));
+    const auto tree = slang::syntax::SyntaxTree::fromText(prefix, *sm, std::string_view(path),
+                                                          std::string_view(path), bag);
+    const auto own_buffers = tree->getSourceBufferIds();
+    for (const auto* def : tree->getDefinedMacros()) {
+        const auto start = def->directive.location();
+        const auto end = def->sourceRange().end();
+        if (!start.valid() || !sm->isFileLoc(start) || end.buffer() != start.buffer())
+            continue;
+        // What the includer and its headers wrote.  Predefines -- the table
+        // itself among them -- and built-ins are not.
+        if (!sm->getIncludedFrom(start.buffer()).valid() &&
+            std::ranges::find(own_buffers, start.buffer()) == own_buffers.end())
+            continue;
+        IncluderMacro macro;
+        macro.name = std::string(def->name.valueText());
+        const auto body =
+            sm->getSourceText(start.buffer()).substr(start.offset(), end.offset() - start.offset());
+        // A `line naming the file and an indent to the same column, so go to
+        // definition, hover and anything declared by an expansion land where the
+        // macro is really written rather than in the predefine buffer.
+        macro.definition.append("\n`line ")
+            .append(std::to_string(sm->getLineNumber(start)))
+            .append(" \"")
+            .append(uri_from_path(sm->getFullPath(start.buffer())))
+            .append("\" 0\n")
+            .append(sm->getColumnNumber(start) - 1, ' ')
+            .append(body);
+        MacroNameScan scan;
+        scan_macro_names(body, scan);
+        scan.uses.erase(macro.name);
+        macro.uses.assign(scan.uses.begin(), scan.uses.end());
+        macro.prefix_uses.assign(scan.prefixes.begin(), scan.prefixes.end());
+        table.insert_or_assign(macro.name, std::move(macro));
+    }
+}
+
+/// Fills @p table with the macros defined where @p text (the file at @p path)
+/// first reaches @p header_path: directly, or through up to @p depth levels of
+/// headers it includes (pkg.sv -> agent.svh -> drv.svh).  False when it never
+/// does.  Include order decides, so the first inclusion -- the one a guard
+/// lets through -- is the one that counts.
+static bool macros_where_included(const std::string& header_path, const std::string& path,
+                                  std::string_view text, const ParseInputs& inputs,
+                                  const std::vector<OpenTextOverlay>& overlays,
+                                  IncluderMacroTable& table, int depth) {
+    namespace fs = std::filesystem;
+    const auto header_name = fs::path(header_path).filename().string();
     constexpr std::string_view directive = "`include";
     for (auto at = text.find(directive); at != std::string_view::npos;
          at = text.find(directive, at + 1)) {
@@ -1048,88 +1192,43 @@ static size_t include_offset_of(std::string_view text, const std::string& includ
         if (close == std::string_view::npos || text[close] == '\n')
             continue;
         const fs::path spelled(text.substr(open + 1, close - open - 1));
-        if (spelled.filename() != header_name)
+        const bool direct = spelled.filename() == header_name;
+        if (!direct && depth == 0)
             continue;
-        // slang's search order; the first directory that has the name decides.
-        std::vector<fs::path> search{includer_dir / spelled};
-        for (const auto& dir : include_dirs)
-            search.push_back(dir / spelled);
-        for (const auto& candidate : search) {
-            const auto normalized = normalize_filesystem_path(candidate);
-            if (normalized.string() == header_path)
-                return at;
-            std::error_code ec;
-            if (fs::exists(normalized, ec))
-                break;
+        const auto resolved = resolve_include_text_path(spelled, path, inputs.include_dir_paths);
+        if (resolved.empty() || resolved == path)
+            continue;
+        if (resolved == header_path) {
+            collect_prefix_macros(text.substr(0, at), path, inputs, overlays, table);
+            return true;
+        }
+        if (depth == 0)
+            continue;
+        const auto nested = overlay_or_disk_text(resolved, overlays);
+        if (!nested || nested->find(header_name) == std::string::npos)
+            continue;
+        IncluderMacroTable inner = table;
+        collect_prefix_macros(text.substr(0, at), path, inputs, overlays, inner);
+        if (macros_where_included(header_path, resolved, *nested, inputs, overlays, inner,
+                                  depth - 1)) {
+            table = std::move(inner);
+            return true;
         }
     }
-    return std::string_view::npos;
+    return false;
 }
 
-/// The macros @p includer_path has defined where it `include`s @p header_path,
-/// as one slang predefine; nullopt when it does not include the header itself.
-///
-/// One predefine rather than one per macro: slang copies its whole macro table
-/// per predefine, which for UVM's few hundred macros is quadratic.
-static std::optional<std::string>
-includer_macro_context(const std::string& header_path, const std::string& includer_path,
-                       std::string_view includer_text, const ParseInputs& inputs,
-                       const std::vector<OpenTextOverlay>& overlays) {
-    const auto at = include_offset_of(includer_text, includer_path, header_path,
-                                      inputs.include_dir_paths);
-    if (at == std::string_view::npos)
-        return std::nullopt;
+/// How many headers deep an includer is followed.  UVM agents are one or two.
+constexpr int kIncluderNestingDepth = 3;
 
-    auto sm = make_lsp_source_manager();
-    preload_open_text_overlays(*sm, overlays, includer_path);
-    slang::parsing::PreprocessorOptions ppo;
-    ppo.predefines = inputs.defines;
-    ppo.additionalIncludePaths = inputs.include_dir_paths;
-    slang::Bag bag;
-    bag.set(std::move(ppo));
-    const auto tree = slang::syntax::SyntaxTree::fromText(
-        includer_text.substr(0, at), *sm, std::string_view(includer_path),
-        std::string_view(includer_path), bag);
-
-    // predefine() prepends "`define " and makes the first '=' the separator, so
-    // the text leads with a sentinel and `undef's it at the end.
-    constexpr std::string_view sentinel = "__lazyverilog_includer_context__";
-    std::string context;
-    const auto own_buffers = tree->getSourceBufferIds();
-    for (const auto* def : tree->getDefinedMacros()) {
-        const auto start = def->directive.location();
-        const auto end = def->sourceRange().end();
-        if (!start.valid() || !sm->isFileLoc(start) || end.buffer() != start.buffer())
-            continue;
-        // What the includer and its headers wrote.  Predefines are the header's
-        // own to add, and built-ins slang's.
-        if (!sm->getIncludedFrom(start.buffer()).valid() &&
-            std::ranges::find(own_buffers, start.buffer()) == own_buffers.end())
-            continue;
-        // A `line naming the file and an indent to the same column, so go to
-        // definition, hover and anything declared by an expansion land where the
-        // macro is really written rather than in this buffer.
-        context.append("\n`line ")
-            .append(std::to_string(sm->getLineNumber(start)))
-            .append(" \"")
-            .append(uri_from_path(sm->getFullPath(start.buffer())))
-            .append("\" 0\n")
-            .append(sm->getColumnNumber(start) - 1, ' ')
-            .append(sm->getSourceText(start.buffer()).substr(start.offset(), end.offset() - start.offset()));
-    }
-    if (context.empty())
-        return context;
-    return std::string(sentinel) + "=1" + context + "\n`undef " + std::string(sentinel);
-}
-
-/// The context of the first of @p includers that `include`s @p header_path
-/// itself, nearest first and then by path -- the order find_module() ranks
-/// same-name modules in, so the choice is the same on every run.  Empty, not
-/// null, when none does: the caller keeps it so it is not looked for again.
-static std::shared_ptr<const std::string>
-find_includer_macro_context(const std::string& header_path, std::vector<IncluderCandidate> includers,
-                            const ProjectParseInputs& inputs,
-                            const std::vector<OpenTextOverlay>& overlays) {
+/// The macros of the first of @p includers that reaches @p header_path, nearest
+/// first and then by path -- the order find_module() ranks same-name modules
+/// in, so the choice is the same on every run.  Empty, not null, when none
+/// does: the caller keeps it so it is not looked for again.
+static std::shared_ptr<const IncluderMacros>
+find_includer_macros(const std::string& header_path, std::vector<IncluderCandidate> includers,
+                     const ProjectParseInputs& inputs,
+                     const std::vector<OpenTextOverlay>& overlays) {
     std::ranges::sort(includers, [&](const IncluderCandidate& a, const IncluderCandidate& b) {
         const auto score_a = path_proximity_score(header_path, a.path);
         const auto score_b = path_proximity_score(header_path, b.path);
@@ -1140,11 +1239,67 @@ find_includer_macro_context(const std::string& header_path, std::vector<Includer
         if (!includer.open_state && !(disk = read_file_text_optional(includer.path)))
             continue;
         const std::string_view text = includer.open_state ? includer.open_state->text : *disk;
-        if (auto context = includer_macro_context(header_path, includer.path, text,
-                                                  inputs.for_path(includer.path), overlays))
-            return std::make_shared<const std::string>(std::move(*context));
+        IncluderMacroTable table;
+        if (macros_where_included(header_path, includer.path, text, inputs.for_path(includer.path),
+                                  overlays, table, kIncluderNestingDepth)) {
+            IncluderMacros macros;
+            macros.reserve(table.size());
+            for (auto& [name, macro] : table)
+                macros.push_back(std::move(macro));
+            return std::make_shared<const IncluderMacros>(std::move(macros));
+        }
     }
-    return std::make_shared<const std::string>();
+    return std::make_shared<const IncluderMacros>();
+}
+
+/// The names of the macros in @p all that @p text uses, directly or through
+/// the bodies of the ones it uses, plus @p extras; sorted.  A macro @p text
+/// defines itself is never one -- its include guard, or a redefinition slang
+/// would otherwise lose to the predefine.
+static std::vector<std::string> used_includer_macros(const IncluderMacros& all, std::string_view text,
+                                                     const std::vector<std::string>& extras) {
+    MacroNameScan scan;
+    scan_macro_names(text, scan);
+    std::vector<std::string_view> pending(scan.uses.begin(), scan.uses.end());
+    pending.insert(pending.end(), extras.begin(), extras.end());
+    const auto by_name = [](const IncluderMacro& macro, std::string_view name) {
+        return macro.name < name;
+    };
+    const auto add_prefix = [&](std::string_view prefix) {
+        for (auto it = std::ranges::lower_bound(all, prefix, {}, &IncluderMacro::name);
+             it != all.end() && it->name.starts_with(prefix); ++it)
+            pending.push_back(it->name);
+    };
+    for (const auto& prefix : scan.prefixes)
+        add_prefix(prefix);
+    std::set<std::string_view> picked;
+    while (!pending.empty()) {
+        const auto name = pending.back();
+        pending.pop_back();
+        if (scan.defines.contains(name) || picked.contains(name))
+            continue;
+        const auto it = std::lower_bound(all.begin(), all.end(), name, by_name);
+        if (it == all.end() || it->name != name)
+            continue;
+        picked.insert(it->name);
+        pending.insert(pending.end(), it->uses.begin(), it->uses.end());
+        for (const auto& prefix : it->prefix_uses)
+            add_prefix(prefix);
+    }
+    return {picked.begin(), picked.end()};
+}
+
+static std::shared_ptr<const std::string> includer_predefine_for(const IncluderMacros& all,
+                                                                const std::vector<std::string>& names) {
+    if (names.empty())
+        return nullptr;
+    std::vector<const IncluderMacro*> macros;
+    for (const auto& name : names) {
+        const auto it = std::ranges::lower_bound(all, name, {}, &IncluderMacro::name);
+        if (it != all.end() && it->name == name)
+            macros.push_back(&*it);
+    }
+    return std::make_shared<const std::string>(includer_predefine_text(macros));
 }
 
 std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
@@ -1162,9 +1317,12 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::vector<OpenTextOverlay> open_overlays;
     std::vector<std::string> previous_dependencies;
     std::unordered_set<std::string> standalone_headers;
-    std::shared_ptr<const std::string> includer_context;
+    std::shared_ptr<const IncluderMacros> includer_macros;
+    std::vector<std::string> previous_macro_names;
+    std::vector<std::string> macro_extras;
+    std::shared_ptr<const std::string> includer_predefine;
+    uint64_t graph_generation = 0;
     std::vector<IncluderCandidate> includers;
-    bool has_includer = false;
     const auto normalized_current_path = normalize_filesystem_path(path).string();
     std::shared_ptr<const ProjectParseInputs> parse_inputs;
     {
@@ -1178,19 +1336,26 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
         // What this buffer included last time is the candidate set for header
         // seeding below.  On didOpen there is no previous snapshot, so the first
         // parse reads from disk and every keystroke after it does not.
+        graph_generation = include_graph_generation_;
         if (const auto it = docs_.find(uri); it != docs_.end() && it->second) {
-            previous_dependencies = it->second->include_dependencies;
-            includer_context = it->second->includer_macro_context;
+            const auto& previous = *it->second;
+            previous_dependencies = previous.include_dependencies;
+            // "No includer" holds until the include graph changes.
+            if (previous.includer_macros && (!previous.includer_macros->empty() ||
+                                             previous.includer_graph_generation == graph_generation)) {
+                includer_macros = previous.includer_macros;
+                previous_macro_names = previous.includer_macro_names;
+                macro_extras = previous.includer_macro_extras;
+                includer_predefine = previous.includer_predefine;
+            }
         }
-        if (!includer_context) {
+        if (!includer_macros) {
             // Open includers are in the loop below; closed ones are their shards.
             if (const auto it = extra_cache_includers_.find(uri); it != extra_cache_includers_.end()) {
-                // Looked for even if every shard is open, so the answer is
-                // never left null for reparse_open_headers_missing_includer().
-                has_includer = true;
                 for (const auto& includer_uri : it->second) {
                     const auto entry = extra_cache_.find(includer_uri);
-                    if (!docs_.contains(includer_uri) && entry != extra_cache_.end())
+                    if (includer_uri != uri && !docs_.contains(includer_uri) &&
+                        entry != extra_cache_.end() && entry->second.path != normalized_current_path)
                         includers.push_back({entry->second.path, nullptr});
                 }
             }
@@ -1207,7 +1372,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                 continue;
             if (open_state->normalized_path == normalized_current_path)
                 continue;
-            if (!includer_context && open_state->include_dependency_set.contains(uri))
+            if (!includer_macros && open_state->include_dependency_set.contains(uri))
                 includers.push_back({open_state->normalized_path, open_state});
             open_overlays.push_back(OpenTextOverlay{
                 .uri = open_uri,
@@ -1228,47 +1393,87 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // A header is only meaningful where it is included: UVM class files use the
     // macros their package `include`d first.  Parsed alone, every one of those
     // is an "unknown macro" error and the code in its arguments is never parsed.
-    // shortcut: computed once per open, not when the includer or its headers are
-    // edited later; recompute on their change if that staleness matters.
-    if (!includer_context && (has_includer || !includers.empty()))
-        includer_context = find_includer_macro_context(normalized_current_path,
-                                                       std::move(includers), *parse_inputs,
-                                                       open_overlays);
-    if (includer_context && !includer_context->empty())
-        defines.push_back(*includer_context);
+    // shortcut: looked for once per open, not when the includer or its headers
+    // are edited later; recompute on their change if that staleness matters.
+    if (!includer_macros)
+        includer_macros = includers.empty()
+                              ? std::make_shared<const IncluderMacros>()
+                              : find_includer_macros(normalized_current_path, std::move(includers),
+                                                     *parse_inputs, open_overlays);
+    // Only the ones this text uses: all of UVM is ~280 KB to lex per keystroke.
+    std::vector<std::string> macro_names;
+    if (!includer_macros->empty())
+        macro_names = used_includer_macros(*includer_macros, text, macro_extras);
+    if (macro_names != previous_macro_names || (!macro_names.empty() && !includer_predefine))
+        includer_predefine = includer_predefine_for(*includer_macros, macro_names);
 
-    auto sm = make_lsp_source_manager();
     const auto header_cache_excluded =
         header_cache_excluded_paths(open_overlays, normalized_current_path);
-    preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
-                               header_cache_excluded, standalone_headers);
-    preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
-    slang::parsing::PreprocessorOptions ppo;
-    ppo.predefines = defines;
-    ppo.additionalIncludePaths = std::move(include_dirs);
-    slang::Bag bag;
-    // Moved in, not copied.  `Bag::set` takes its argument by const reference
-    // when it can, and stores it in a `std::any` by value -- so binding an
-    // lvalue here made a second copy of PreprocessorOptions, which carries the
-    // whole `+incdir+` list and the define list.  A design with a few hundred
-    // include directories therefore paid two vector copies per parse: per
-    // keystroke on the edit path, and per file during an indexing burst.
-    // Nothing reads `ppo` afterwards.
-    bag.set(std::move(ppo));
-    // Pass the normalized path, not the raw one path_from_file_uri() produced:
-    // this SourceManager has disableProximatePaths set, so it resolves a
-    // relative `include against this path verbatim, with no canonicalization
-    // of its own.  If this were the raw path, an include's resolved full path
-    // would carry whatever symlink or short (8.3) name the client's spelling
-    // had, which does not match the normalized path preload/store_open_parse_headers()
-    // key their cache with — a permanent cache miss on any filesystem where
-    // that spelling differs (macOS /tmp, Windows short names).
-    auto tree = slang::syntax::SyntaxTree::fromText(
-        std::string_view(text), *sm, std::string_view(uri), std::string_view(normalized_current_path),
-        bag);
+    std::unique_ptr<slang::SourceManager> sm;
+    const auto parse = [&] {
+        sm = make_lsp_source_manager();
+        preload_open_parse_headers(*sm, open_parse_header_texts_, previous_dependencies,
+                                   header_cache_excluded, standalone_headers);
+        preload_open_text_overlays(*sm, open_overlays, normalized_current_path);
+        slang::parsing::PreprocessorOptions ppo;
+        ppo.predefines = defines;
+        if (includer_predefine)
+            ppo.predefines.push_back(*includer_predefine);
+        ppo.additionalIncludePaths = std::move(include_dirs);
+        slang::Bag bag;
+        // Moved in, not copied.  `Bag::set` takes its argument by const reference
+        // when it can, and stores it in a `std::any` by value -- so binding an
+        // lvalue here made a second copy of PreprocessorOptions, which carries the
+        // whole `+incdir+` list and the define list.  A design with a few hundred
+        // include directories therefore paid two vector copies per parse: per
+        // keystroke on the edit path, and per file during an indexing burst.
+        // Nothing reads `ppo` afterwards.
+        bag.set(std::move(ppo));
+        // Pass the normalized path, not the raw one path_from_file_uri() produced:
+        // this SourceManager has disableProximatePaths set, so it resolves a
+        // relative `include against this path verbatim, with no canonicalization
+        // of its own.  If this were the raw path, an include's resolved full path
+        // would carry whatever symlink or short (8.3) name the client's spelling
+        // had, which does not match the normalized path preload/store_open_parse_headers()
+        // key their cache with — a permanent cache miss on any filesystem where
+        // that spelling differs (macOS /tmp, Windows short names).
+        return slang::syntax::SyntaxTree::fromText(std::string_view(text), *sm, std::string_view(uri),
+                                                   std::string_view(normalized_current_path), bag);
+    };
+    auto tree = parse();
+    if (!includer_macros->empty()) {
+        // A body that builds a macro name by pasting (`FUNCTION``_op) asks for
+        // macros no scan can name.  slang names them: add those and parse once
+        // more.  Kept as extras, so later keystrokes include them from the start.
+        std::vector<std::string> missing;
+        for (const auto& diagnostic : tree->diagnostics()) {
+            if (diagnostic.code != slang::diag::UnknownDirective || diagnostic.args.empty())
+                continue;
+            const auto* spelled = std::get_if<std::string>(&diagnostic.args[0]);
+            if (!spelled)
+                continue;
+            std::string name = spelled->starts_with('`') ? spelled->substr(1) : *spelled;
+            if (!std::ranges::binary_search(macro_names, name) &&
+                std::ranges::binary_search(*includer_macros, name, {}, &IncluderMacro::name))
+                missing.push_back(std::move(name));
+        }
+        if (!missing.empty()) {
+            macro_extras.insert(macro_extras.end(), missing.begin(), missing.end());
+            std::ranges::sort(macro_extras);
+            macro_extras.erase(std::unique(macro_extras.begin(), macro_extras.end()), macro_extras.end());
+            macro_names = used_includer_macros(*includer_macros, text, macro_extras);
+            includer_predefine = includer_predefine_for(*includer_macros, macro_names);
+            include_dirs = parse_inputs->for_path(normalized_current_path).include_dir_paths;
+            tree = parse();
+        }
+    }
     auto state = std::make_shared<DocumentState>(uri, text, nullptr);
     state->normalized_path = normalized_current_path;
-    state->includer_macro_context = std::move(includer_context);
+    state->includer_macros = std::move(includer_macros);
+    state->includer_graph_generation = graph_generation;
+    state->includer_macro_names = std::move(macro_names);
+    state->includer_macro_extras = std::move(macro_extras);
+    state->includer_predefine = std::move(includer_predefine);
     cache_document_end_position(*state);
     state->source_manager = std::move(sm);
     state->tree = std::move(tree);
@@ -1366,17 +1571,52 @@ void Analyzer::reparse_open_documents_under(const std::filesystem::path& root) {
         enqueue_parse_if_current(state->uri, state->text, state.get());
 }
 
+bool Analyzer::has_includer_locked(const std::string& uri, const std::string& normalized_path) const {
+    // The same candidates make_state() looks through, so a file this calls
+    // "included" is one make_state() can find an includer for.
+    if (const auto it = extra_cache_includers_.find(uri); it != extra_cache_includers_.end()) {
+        for (const auto& includer_uri : it->second) {
+            const auto entry = extra_cache_.find(includer_uri);
+            if (includer_uri != uri && entry != extra_cache_.end() &&
+                entry->second.path != normalized_path)
+                return true;
+        }
+    }
+    return std::ranges::any_of(docs_, [&](const auto& open) {
+        return open.second && open.first != uri && open.second->normalized_path != normalized_path &&
+               open.second->include_dependency_set.contains(uri);
+    });
+}
+
+void Analyzer::note_open_include_graph_locked(const std::string& uri) const {
+    const auto doc = docs_.find(uri);
+    if (doc == docs_.end() || !doc->second) {
+        if (open_include_graph_.erase(uri))
+            ++include_graph_generation_;
+        return;
+    }
+    auto& known = open_include_graph_[uri];
+    if (known != doc->second->include_dependencies) {
+        known = doc->second->include_dependencies;
+        ++include_graph_generation_;
+    }
+}
+
 void Analyzer::reparse_open_headers_missing_includer() {
     std::vector<std::shared_ptr<const DocumentState>> picked;
     {
         std::lock_guard<std::mutex> lock(map_mutex_);
+        // Once per include graph change, not per parse: a file nothing includes
+        // is looked at again only when something could have started to.
+        if (includer_scan_generation_ == include_graph_generation_)
+            return;
+        includer_scan_generation_ = include_graph_generation_;
         for (const auto& [uri, state] : docs_) {
-            if (!state || !state->tree || state->includer_macro_context)
+            if (!state || (state->includer_macros &&
+                           (!state->includer_macros->empty() ||
+                            state->includer_graph_generation == include_graph_generation_)))
                 continue;
-            bool has_includer = extra_cache_includers_.contains(uri);
-            for (auto it = docs_.begin(); !has_includer && it != docs_.end(); ++it)
-                has_includer = it->second && it->second->include_dependency_set.contains(uri);
-            if (has_includer)
+            if (has_includer_locked(uri, state->normalized_path))
                 picked.push_back(state);
         }
     }
@@ -1415,8 +1655,14 @@ uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string 
             state->include_dependency_set = it->second->include_dependency_set;
             // An edit keeps it; a reparse of unchanged text is asked for when
             // the inputs changed, so it looks again.
-            if (!expected)
-                state->includer_macro_context = it->second->includer_macro_context;
+            if (!expected) {
+                const auto& previous = *it->second;
+                state->includer_macros = previous.includer_macros;
+                state->includer_graph_generation = previous.includer_graph_generation;
+                state->includer_macro_names = previous.includer_macro_names;
+                state->includer_macro_extras = previous.includer_macro_extras;
+                state->includer_predefine = previous.includer_predefine;
+            }
             // Keep the last snapshot that actually parsed, so an AST-shaped
             // request arriving in this window has something true to answer
             // from.  Taking the predecessor's own predecessor when it is
@@ -8622,6 +8868,9 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
 }
 
 void Analyzer::invalidate_open_file_snapshot_locked(const std::string& uri) const {
+    // Every change to docs_ comes through here, which is what the include graph
+    // generation needs to see.
+    note_open_include_graph_locked(uri);
     // For a change to docs_, which is a much narrower thing.
     //
     // Only the ExtraFileInfo snapshot consults docs_ at all -- it attaches the
@@ -10267,8 +10516,19 @@ void Analyzer::clear_project_index_snapshot_locked() const {
 }
 
 void Analyzer::put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const {
+    // A shard rebuilt with the includes it had changes no includer.
+    const auto previous = extra_cache_.find(uri);
+    const bool same_includes = previous != extra_cache_.end() && previous->second.index &&
+                               entry.index &&
+                               previous->second.index->include_dependencies ==
+                                   entry.index->include_dependencies;
+    const auto generation = include_graph_generation_;
     erase_extra_cache_locked(uri);
+    if (same_includes)
+        include_graph_generation_ = generation;
     if (entry.index) {
+        if (!same_includes && !entry.index->include_dependencies.empty())
+            ++include_graph_generation_;
         for (const auto& dependency : entry.index->include_dependencies)
             extra_cache_includers_[dependency].insert(uri);
     }
@@ -10280,6 +10540,8 @@ void Analyzer::erase_extra_cache_locked(const std::string& uri) const {
     if (it == extra_cache_.end())
         return;
     if (it->second.index) {
+        if (!it->second.index->include_dependencies.empty())
+            ++include_graph_generation_;
         for (const auto& dependency : it->second.index->include_dependencies) {
             const auto includers = extra_cache_includers_.find(dependency);
             if (includers == extra_cache_includers_.end())
@@ -10293,6 +10555,7 @@ void Analyzer::erase_extra_cache_locked(const std::string& uri) const {
 }
 
 void Analyzer::clear_extra_cache_locked() const {
+    ++include_graph_generation_;
     extra_cache_.clear();
     extra_cache_includers_.clear();
 }
