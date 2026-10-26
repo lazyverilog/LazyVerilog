@@ -632,6 +632,16 @@ static std::string header_directives_only(std::string_view text) {
     return projected;
 }
 
+/// Serve the rest of the burst @p header_uri's directives alone, now that a
+/// shard records its declarations.  @p includer_sm is a parse that read it.
+static void project_standalone_header(HeaderTextCache& header_texts,
+                                      const slang::SourceManager& includer_sm,
+                                      const std::string& header_uri, uint64_t generation) {
+    if (const auto key = header_cache_key(includer_sm, header_uri); !key.empty())
+        header_texts.project(generation, key,
+                             header_directives_only(header_source_text(includer_sm, header_uri)));
+}
+
 struct BuiltHeaderShard {
     std::string uri;
     std::shared_ptr<const SyntaxIndex> index;
@@ -648,6 +658,20 @@ struct BuiltHeaderShard {
     /// key is a hit that is wrong on every future launch, which is the one
     /// failure mode the cache has no way to detect.
     bool from_open_buffer{false};
+    /// The header's parse on its own, kept when the header is also a filelist
+    /// entry this burst adopted (ListedHeader::Adopted): that parse is the one
+    /// the filelist queue would have made, so it serves as the file's shard too.
+    std::shared_ptr<const SyntaxIndex> own_index;
+};
+
+/// How a claimed header that is also a filelist entry, parsed with the same
+/// inputs, is built.  Either way the file is parsed once per burst, not twice.
+enum class ListedHeader {
+    /// Taken off the queue: the header's own parse is the file's parse.
+    Adopted,
+    /// The file's own parse already found it does not stand alone, so the
+    /// standalone parse would only fail again; go straight to the includer.
+    KnownFragment,
 };
 
 static std::vector<BuiltHeaderShard>
@@ -656,7 +680,8 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
                     const std::vector<std::filesystem::path>& include_dirs,
                     const std::vector<OpenTextOverlay>& open_overlays,
                     HeaderTextCache& header_texts, uint64_t generation,
-                    DocumentState* parsed_digest_sink = nullptr);
+                    DocumentState* parsed_digest_sink = nullptr,
+                    const std::unordered_map<std::string, ListedHeader>* listed = nullptr);
 
 static std::shared_ptr<DocumentState>
 make_file_state_with_options(const std::filesystem::path& path,
@@ -762,7 +787,8 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
                     const std::vector<std::filesystem::path>& include_dirs,
                     const std::vector<OpenTextOverlay>& open_overlays,
                     HeaderTextCache& header_texts, uint64_t generation,
-                    DocumentState* parsed_digest_sink) {
+                    DocumentState* parsed_digest_sink,
+                    const std::unordered_map<std::string, ListedHeader>* listed) {
     std::vector<BuiltHeaderShard> built;
     built.reserve(headers_to_build.size());
     // Headers that did not parse standalone, in the order they were claimed.
@@ -837,6 +863,18 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
             continue;
         }
 
+        std::optional<ListedHeader> role;
+        if (listed) {
+            if (const auto it = listed->find(header_uri); it != listed->end())
+                role = it->second;
+        }
+        const bool adopted = role == ListedHeader::Adopted;
+        if (role == ListedHeader::KnownFragment) {
+            derived_uris.push_back(header_uri);
+            built.push_back(BuiltHeaderShard{.uri = header_uri, .stands_alone = false});
+            continue;
+        }
+
         auto header_state = make_file_state_with_options(
             path_from_file_uri(header_uri), defines, include_dirs, open_overlays,
             /*retain_text=*/false, &header_texts, generation,
@@ -869,8 +907,13 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
             std::none_of(header_state->parse_diagnostics.begin(),
                          header_state->parse_diagnostics.end(),
                          [](const ParseDiagInfo& diag) { return diag.severity == 1; });
+        std::shared_ptr<const SyntaxIndex> own_index;
+        if (adopted && header_state && header_state->tree && !stands_alone)
+            own_index = std::make_shared<const SyntaxIndex>(std::move(header_state->index));
         if (stands_alone) {
             header_index = std::make_shared<SyntaxIndex>(std::move(header_state->index));
+            if (adopted)
+                own_index = header_index;
 
             // Its declarations are now recorded, so the rest of the burst
             // only needs its directives.  Serving the projection through the
@@ -879,13 +922,8 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
             // already be reading the header when this runs, and every file
             // after them is seeded from here.  A header open in the editor
             // was never stored, so it is never projected.
-            if (const auto key = header_cache_key(*includer.source_manager, header_uri);
-                !key.empty()) {
-                header_texts.project(
-                    generation, key,
-                    header_directives_only(header_source_text(*includer.source_manager,
-                                                              header_uri)));
-            }
+            project_standalone_header(header_texts, *includer.source_manager, header_uri,
+                                      generation);
         } else {
             // A header that is a textual fragment — a port list, a module
             // opened in one file and closed in another, a class body a package
@@ -898,6 +936,7 @@ build_header_shards(const std::vector<std::string>& headers_to_build, const Docu
             .uri = header_uri,
             .index = std::move(header_index),
             .stands_alone = stands_alone,
+            .own_index = std::move(own_index),
         });
     }
 
@@ -7945,6 +7984,10 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         std::string uri;
         std::shared_ptr<const SyntaxIndex> index;
         std::vector<std::tuple<std::string, std::shared_ptr<const SyntaxIndex>, bool>> headers;
+        bool stands_alone{false};
+        /// Per entry of `headers`: a filelist entry hit itself, standing alone
+        /// and parsed with this file's inputs, so its own shard is the header's.
+        std::vector<bool> header_is_own_shard;
     };
     struct HeaderHit {
         std::shared_ptr<const SyntaxIndex> index;
@@ -7973,14 +8016,38 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     // includer claims a shared header vary run to run.
     std::vector<std::optional<Hit>> results(files.size());
 
+    // A shard read and validated once, whichever role asks first.  A filelist
+    // entry that another file `include`s has one shard file serving both as
+    // its own shard and as the header's, and reading it twice per launch was
+    // a third of a warm start's shard opens on a glob-built filelist.
+    const auto load_valid = [&](const std::string& uri) -> std::optional<HeaderHit> {
+        {
+            std::lock_guard<std::mutex> header_lock(header_mutex);
+            if (header_misses.count(uri))
+                return std::nullopt;
+            if (const auto known = header_hits.find(uri); known != header_hits.end())
+                return known->second;
+        }
+        // Read and validate with the map unlocked; see the header loop below.
+        const IndexCache* cache = storage->for_uri(uri);
+        auto loaded = cache ? cache->load(uri) : std::optional<IndexCache::Loaded>{};
+        const bool usable = loaded && still_valid(uri, loaded->key);
+        std::lock_guard<std::mutex> header_lock(header_mutex);
+        if (!usable) {
+            header_misses.insert(uri);
+            return std::nullopt;
+        }
+        return header_hits
+            .try_emplace(uri, HeaderHit{std::make_shared<const SyntaxIndex>(std::move(loaded->index)),
+                                        loaded->stands_alone})
+            .first->second;
+    };
+
     const auto check_one = [&](size_t index) {
         const auto& path = files[index];
         const auto  uri  = uri_from_path(path);
-        const IndexCache* cache = storage->for_uri(uri);
-        if (cache == nullptr)
-            return;
-        auto loaded = cache->load(uri);
-        if (!loaded || !still_valid(uri, loaded->key))
+        const auto own = load_valid(uri);
+        if (!own)
             return;
 
         // A file's shard is only usable together with shards for the headers it
@@ -7988,51 +8055,24 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
         // built them.  If any header shard is missing or stale, this file has to
         // be parsed after all -- that parse is what produces them.
         Hit hit{.path = path, .uri = uri};
-        bool headers_ok = true;
-        for (const auto& dependency : loaded->index.include_dependencies) {
-            {
-                std::lock_guard<std::mutex> header_lock(header_mutex);
-                if (header_misses.count(dependency)) {
-                    headers_ok = false;
-                    break;
-                }
-                if (const auto known = header_hits.find(dependency); known != header_hits.end()) {
-                    hit.headers.emplace_back(dependency, known->second.index,
-                                             known->second.stands_alone);
-                    continue;
-                }
-            }
-            // Read and validate with the map unlocked.  Two threads reaching
-            // the same header both do the work, which is cheaper than either
-            // waiting for the other -- the same trade cached_file_digest()
-            // makes -- and the insert below keeps whichever arrives first, so
-            // every includer still ends up pointing at one shared index.
-            // A header's shard lives beside *its* project's config, which need
-            // not be the includer's: a shared verification header included from
-            // two designs is one file in one project, and looking for its shard
-            // under the includer's root would miss it from one side and write a
-            // second copy from the other.
-            const IndexCache* header_cache = storage->for_uri(dependency);
-            auto header = header_cache ? header_cache->load(dependency)
-                                       : std::optional<IndexCache::Loaded>{};
-            const bool usable = header && still_valid(dependency, header->key);
-
-            std::lock_guard<std::mutex> header_lock(header_mutex);
-            if (!usable) {
-                header_misses.insert(dependency);
-                headers_ok = false;
-                break;
-            }
-            auto [entry, inserted] = header_hits.try_emplace(
-                dependency,
-                HeaderHit{std::make_shared<const SyntaxIndex>(std::move(header->index)),
-                          header->stands_alone});
-            hit.headers.emplace_back(dependency, entry->second.index, entry->second.stands_alone);
+        for (const auto& dependency : own->index->include_dependencies) {
+            // Two threads reaching the same header both read it, which is
+            // cheaper than either waiting for the other -- the same trade
+            // cached_file_digest() makes -- and the memo keeps whichever arrives
+            // first, so every includer still ends up pointing at one shared
+            // index.  A header's shard lives beside *its* project's config,
+            // which need not be the includer's: a shared verification header
+            // included from two designs is one file in one project, and looking
+            // for its shard under the includer's root would miss it from one
+            // side and write a second copy from the other.
+            const auto header = load_valid(dependency);
+            if (!header)
+                return;
+            hit.headers.emplace_back(dependency, header->index, header->stands_alone);
         }
-        if (!headers_ok)
-            return;
 
-        hit.index      = std::make_shared<const SyntaxIndex>(std::move(loaded->index));
+        hit.index      = own->index;
+        hit.stands_alone = own->stands_alone;
         results[index] = std::move(hit);
     };
 
@@ -8131,6 +8171,28 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
     if (hits.empty())
         return;
 
+    // The parse path keeps one shard for a standalone filelist entry that is
+    // also `include`d (see ListedHeader); so does a warm start.  The stored
+    // flag is trusted only when set: a shard written by an older build's
+    // filelist path says "not standalone" either way.
+    {
+        std::unordered_map<std::string_view, const Hit*> by_uri;
+        for (const auto& hit : hits)
+            by_uri.emplace(hit.uri, &hit);
+        for (auto& hit : hits) {
+            hit.header_is_own_shard.assign(hit.headers.size(), false);
+            for (size_t i = 0; i < hit.headers.size(); ++i) {
+                const auto& [header_uri, header_index, stands_alone] = hit.headers[i];
+                const auto own = by_uri.find(header_uri);
+                hit.header_is_own_shard[i] =
+                    stands_alone && own != by_uri.end() && own->second->stands_alone &&
+                    own->second->index == header_index &&
+                    parse_inputs->for_uri(header_uri).config_digest ==
+                        parse_inputs->for_uri(hit.uri).config_digest;
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (generation != background_generation_)
         return;
@@ -8146,7 +8208,14 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
                                              .uri = hit.uri,
                                              .index = hit.index,
                                          });
-        for (auto& [header_uri, header_index, stands_alone] : hit.headers) {
+        if (hit.stands_alone)
+            listed_parse_stands_alone_[hit.uri] = {generation, true};
+        for (size_t i = 0; i < hit.headers.size(); ++i) {
+            auto& [header_uri, header_index, stands_alone] = hit.headers[i];
+            if (hit.header_is_own_shard[i] && !docs_.contains(header_uri)) {
+                standalone_header_uris_.insert(header_uri);
+                continue;
+            }
             // Claimed as well as committed.  The claim is what stops a worker
             // that parses some other includer from rebuilding a header this
             // pass already has.
@@ -9238,6 +9307,7 @@ void Analyzer::schedule_background_reindex_locked() const {
     background_header_shards_.clear();
     background_header_claims_.clear();
     standalone_header_uris_.clear();
+    listed_parse_stands_alone_.clear();
     // This burst carries the whole filelist, so its preload is in a position to
     // say which shards are still referenced.  Only such a burst may sweep the
     // shard directory; see background_full_reindex_generation_.
@@ -9279,6 +9349,10 @@ void Analyzer::background_index_loop() const {
         bool warmup_owner = false;
         // Whether this worker is still counted in background_index_active_.
         bool counted_active = false;
+        // Filelist entries this worker took off the queue to parse as headers;
+        // see ListedHeader::Adopted.  Emptied once they are committed, so any
+        // left at the end were discarded and go back on the queue.
+        std::vector<std::string> adopted_paths;
 
         {
             std::unique_lock<std::mutex> lock(map_mutex_);
@@ -9469,6 +9543,13 @@ void Analyzer::background_index_loop() const {
             if (extra_file_set_.contains(path_string) || docs_.contains(uri))
                 queue_background_file_locked(path_string, /*front=*/true);
         };
+        const auto requeue_adopted_locked = [&] {
+            for (auto& path : adopted_paths) {
+                if (extra_file_set_.contains(path))
+                    queue_background_file_locked(std::move(path), /*front=*/true);
+            }
+            adopted_paths.clear();
+        };
 
         // Everything from here on parses.  slang can throw, an allocation for a
         // generated register block can throw, and a filesystem that goes away
@@ -9578,6 +9659,17 @@ void Analyzer::background_index_loop() const {
         // their digests already there and can key its own shard on them.
         remember_parsed_digests(*state, generation);
 
+        // The same test build_header_shards() applies to a header parsed on its
+        // own, without formatting the diagnostics: this parse is exactly that
+        // one when another file `include`s this one.
+        const bool own_stands_alone = std::none_of(
+            state->tree->diagnostics().begin(), state->tree->diagnostics().end(),
+            [](const slang::Diagnostic& diag) {
+                const auto severity = slang::getDefaultSeverity(diag.code);
+                return severity == slang::DiagnosticSeverity::Error ||
+                       severity == slang::DiagnosticSeverity::Fatal;
+            });
+
         // Take the shard out of the dying DocumentState and wrap it before
         // locking.  Copying it under map_mutex_ deep-copied every vector and
         // map in the index while all workers and request handlers waited.
@@ -9585,6 +9677,23 @@ void Analyzer::background_index_loop() const {
 
         if (background_index_hook_)
             background_index_hook_(path_string, /*headers_built=*/false);
+
+        // Which `include`d files are filelist entries parsed with this file's
+        // inputs -- the ones a claim must not parse a second time.  Resolved
+        // before locking: normalizing and finding a file's project both stat.
+        std::vector<std::pair<std::string, std::string>> listed_dependencies; // uri, path
+        for (const auto& dependency : state->include_dependencies) {
+            auto dependency_path = normalize_filesystem_path(path_from_file_uri(dependency)).string();
+            // Same URI spelling too, or the adopted shard would land under a
+            // second name for the same file.
+            if (uri_from_path(dependency_path) == dependency &&
+                parse_inputs->for_path(dependency_path).config_digest == inputs.config_digest)
+                listed_dependencies.emplace_back(dependency, std::move(dependency_path));
+        }
+        // Listed headers whose own shard already carries their declarations, so
+        // nothing is built for them; only their projection is installed below.
+        std::vector<std::string> served_by_own_shard;
+        std::unordered_map<std::string, ListedHeader> listed_headers;
 
         std::vector<std::string> headers_to_build;
         // Shards to write to the on-disk cache once map_mutex_ is released:
@@ -9620,6 +9729,7 @@ void Analyzer::background_index_loop() const {
                 invalidate_extra_snapshots_locked();
                 shard_to_cache = std::move(committed_index);
             }
+            listed_parse_stands_alone_[uri] = {generation, own_stands_alone};
 
             // Claim the headers this parse pulled in.  Claiming inside the same
             // critical section that commits the shard is what keeps two workers
@@ -9631,11 +9741,45 @@ void Analyzer::background_index_loop() const {
             // whose text pulled it in does not matter.  Dropping the claim there
             // left a header nothing else includes without a shard at all, since
             // nothing re-queues a file that is now open.
+            //
+            // A closed filelist entry parsed with this file's inputs is the
+            // exception: its queued parse and a standalone header parse are the
+            // same parse, so one of them serves both.  If its own parse already
+            // ran and stood alone, its filelist shard is the header's shard and
+            // nothing is claimed.  If it ran and did not, the header is derived
+            // from this file without retrying.  If it is still queued, it is
+            // taken off the queue and the header build's parse becomes its own.
             for (const auto& dependency : state->include_dependencies) {
-                if (background_header_claims_.insert(dependency).second)
-                    headers_to_build.push_back(dependency);
+                if (background_header_claims_.contains(dependency))
+                    continue;
+                const auto listed = std::find_if(
+                    listed_dependencies.begin(), listed_dependencies.end(),
+                    [&](const auto& entry) { return entry.first == dependency; });
+                if (listed != listed_dependencies.end() &&
+                    extra_file_set_.contains(listed->second) && !docs_.contains(dependency)) {
+                    const auto known = listed_parse_stands_alone_.find(dependency);
+                    if (known != listed_parse_stands_alone_.end() &&
+                        known->second.first == generation) {
+                        if (known->second.second) {
+                            standalone_header_uris_.insert(dependency);
+                            served_by_own_shard.push_back(dependency);
+                            continue;
+                        }
+                        listed_headers.emplace(dependency, ListedHeader::KnownFragment);
+                    } else if (background_pending_set_.erase(listed->second) > 0) {
+                        std::erase(background_pending_files_, listed->second);
+                        listed_headers.emplace(dependency, ListedHeader::Adopted);
+                        adopted_paths.push_back(listed->second);
+                    }
+                }
+                background_header_claims_.insert(dependency);
+                headers_to_build.push_back(dependency);
             }
         }
+
+        for (const auto& header_uri : served_by_own_shard)
+            project_standalone_header(background_header_texts_, *state->source_manager,
+                                      header_uri, generation);
 
         // Build the claimed headers outside map_mutex_ for the same reason the
         // file's own shard is built outside it.  This worker stays counted as
@@ -9644,21 +9788,59 @@ void Analyzer::background_index_loop() const {
         auto built_headers = build_header_shards(headers_to_build, *state, inputs.defines,
                                                  inputs.include_dir_paths,
                                                  open_overlays, background_header_texts_,
-                                                 generation, state.get());
+                                                 generation, state.get(), &listed_headers);
         // Again, for the headers build_header_shards() parsed on their own.
         remember_parsed_digests(*state, generation);
 
         if (background_index_hook_)
             background_index_hook_(path_string, /*headers_built=*/true);
 
+        // Adopted filelist entries' own shards, to write once the lock is gone:
+        // uri, index, stands alone.
+        std::vector<std::tuple<std::string, std::shared_ptr<const SyntaxIndex>, bool>>
+            adopted_to_cache;
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
             if (generation != background_generation_ && !headers_to_build.empty())
                 requeue_discarded_locked(headers_to_build);
+            // Committed below, or discarded and so put back on the queue.
+            if (generation != background_generation_)
+                requeue_adopted_locked();
+            adopted_paths.clear();
             if (generation == background_generation_ && !built_headers.empty()) {
                 for (auto& header : built_headers) {
                     if (header.stands_alone)
                         standalone_header_uris_.insert(header.uri);
+                    if (header.own_index) {
+                        // An adopted filelist entry: commit what its queued parse
+                        // would have, unless it was opened meanwhile -- then the
+                        // live buffer's shard wins, as in the parse path above.
+                        const auto listed = std::find_if(
+                            listed_dependencies.begin(), listed_dependencies.end(),
+                            [&](const auto& entry) { return entry.first == header.uri; });
+                        const bool committed =
+                            listed != listed_dependencies.end() && !docs_.contains(header.uri);
+                        if (committed) {
+                            put_extra_cache_locked(header.uri, ExtraFileCacheEntry{
+                                                                   .path = listed->second,
+                                                                   .uri = header.uri,
+                                                                   .index = header.own_index,
+                                                               });
+                            // A fragment's derived header shard below goes to
+                            // the same cache file, queued after this one, so
+                            // writing this one too would only be overwritten.
+                            if (header.stands_alone)
+                                adopted_to_cache.emplace_back(header.uri, header.own_index,
+                                                              header.stands_alone);
+                        }
+                        listed_parse_stands_alone_[header.uri] = {generation, header.stands_alone};
+                        // Standing alone, the file's shard *is* the header's
+                        // shard; a second copy is what this path exists to drop.
+                        if (committed && header.stands_alone) {
+                            invalidate_extra_snapshots_locked();
+                            continue;
+                        }
+                    }
                     // Never a shard built from unsaved text; see
                     // BuiltHeaderShard::from_open_buffer.  It still goes into
                     // the in-memory index below -- that is the point of it --
@@ -9685,7 +9867,7 @@ void Analyzer::background_index_loop() const {
             // writes have to be countable before it, or the drain wait after it
             // sees an empty queue and reports a cache that is not written yet.
             {
-                size_t reserved = shard_to_cache ? 1 : 0;
+                size_t reserved = (shard_to_cache ? 1 : 0) + adopted_to_cache.size();
                 for (const auto& [header_uri, header_index, stands_alone] : headers_to_cache) {
                     (void)header_uri;
                     (void)stands_alone;
@@ -9717,6 +9899,21 @@ void Analyzer::background_index_loop() const {
                 .uri = uri,
                 .index = std::move(shard_to_cache),
                 .include_resolutions = resolutions_written_in(state->include_resolutions, uri),
+                // Read back only when another file `include`s this one; see
+                // preload_cached_shards().
+                .stands_alone = own_stands_alone,
+                .generation = generation,
+            });
+        }
+        for (auto& [adopted_uri, adopted_index, stands_alone] : adopted_to_cache) {
+            // Its own parse ran inside this file's header build, so this file's
+            // tree recorded the resolutions written in it.
+            queue_shard_write(PendingShardWrite{
+                .uri = adopted_uri,
+                .index = std::move(adopted_index),
+                .include_resolutions =
+                    resolutions_written_in(state->include_resolutions, adopted_uri),
+                .stands_alone = stands_alone,
                 .generation = generation,
             });
         }
@@ -9743,8 +9940,9 @@ void Analyzer::background_index_loop() const {
             std::cerr << "[lazyverilog] background index of " << path_string << " failed\n";
         }
 
-        if (counted_active || warmup_owner) {
+        if (counted_active || warmup_owner || !adopted_paths.empty()) {
             std::lock_guard<std::mutex> lock(map_mutex_);
+            requeue_adopted_locked();
             release_warmup_locked();
             release_active_locked();
             if (background_pending_files_.empty() && background_index_active_ == 0)

@@ -1735,3 +1735,136 @@ TEST_CASE("index cache: header shards discarded by a generation bump are rebuilt
     CHECK(snapshot_modules(snapshot) == std::set<std::string>{"lib", "other"});
     CHECK(snapshot_values(snapshot).count("LIB_VAL") == 1);
 }
+
+// ── A filelist entry that another file also `include`s ──────────────────────
+//
+// A glob-built filelist (`find -name '*.sv'`) lists every UVM sequence a
+// package `include`s.  Each such file used to be parsed twice per burst -- once
+// from the queue, once as a claimed header -- and to get two shards, one per
+// role, written to the same cache file.  On opentitan that was 1964 of 5995
+// parses.  One parse now serves both roles, whichever reaches the file first.
+namespace {
+
+/// pkg.sv `include`s cls.sv (a class that parses on its own) and frag.sv (a
+/// fragment: it uses a macro only the package defines).  @p pkg_first decides
+/// which is larger, and so which the largest-first queue reaches first.
+void write_listed_include_project(const CacheProject& project, bool pkg_first) {
+    std::string pad;
+    for (int i = 0; i < 200; ++i)
+        pad += "  localparam int pad_" + std::to_string(i) + " = " + std::to_string(i) + ";\n";
+    project.write("pkg.sv", "`define FRAG_DECL(n) int n;\npackage listed_pkg;\n"
+                            "`include \"cls.sv\"\n`include \"frag.sv\"\n" +
+                                (pkg_first ? pad : std::string{}) + "endpackage\n");
+    project.write("cls.sv", "class listed_cls;\n  int listed_field;\nendclass\n" +
+                                (pkg_first ? std::string{} : "/*" + pad + "*/\n"));
+    project.write("frag.sv", "`FRAG_DECL(frag_var)\n" +
+                                 (pkg_first ? std::string{} : "/*" + pad + pad + "*/\n"));
+}
+
+size_t shards_for(const std::shared_ptr<const ProjectIndexSnapshot>& snapshot,
+                  const std::string& uri) {
+    size_t count = 0;
+    for (const auto& shard : snapshot->shards)
+        count += shard.uri == uri && shard.index;
+    return count;
+}
+
+} // namespace
+
+TEST_CASE("index cache: a listed file that is also `include`d is parsed once", "[index-cache]") {
+    for (const bool pkg_first : {true, false}) {
+        CAPTURE(pkg_first);
+        CacheProject project(pkg_first ? "listed-include-pkg-first" : "listed-include-cls-first");
+        write_listed_include_project(project, pkg_first);
+        const auto cls_uri = uri_from_path((project.root() / "cls.sv").string());
+
+        Analyzer analyzer;
+        std::atomic<int> queued_parses{0};
+        analyzer.set_background_index_hook_for_testing([&](const std::string& path, bool built) {
+            if (!built && (path.ends_with("cls.sv") || path.ends_with("frag.sv")))
+                ++queued_parses;
+        });
+        const auto snapshot = project.index(analyzer, {"pkg.sv", "cls.sv", "frag.sv"});
+        REQUIRE(snapshot);
+
+        // A standalone file's own shard is the header's: one entry, not two.
+        CHECK(shards_for(snapshot, cls_uri) == 1);
+        // The package reaches both first, so the header build's parse is the
+        // files' parse and the queue never parses them again.
+        if (pkg_first)
+            CHECK(queued_parses == 0);
+
+        // And the index says what it said before: the class is declared, and
+        // the fragment's variable comes from the package that expands it.
+        const auto values = snapshot_values(snapshot);
+        CHECK(values.count("frag_var") == 1);
+        bool cls_declared = false;
+        for (const auto& shard : snapshot->shards) {
+            if (shard.uri == cls_uri && shard.index) {
+                for (const auto& cls : shard.index->classes)
+                    cls_declared |= cls.name == "listed_cls";
+            }
+        }
+        CHECK(cls_declared);
+    }
+}
+
+TEST_CASE("index cache: a listed `include`d file is one shard on a warm start too",
+          "[index-cache]") {
+    CacheProject project("listed-include-warm");
+    write_listed_include_project(project, /*pkg_first=*/true);
+    const auto cls_uri = uri_from_path((project.root() / "cls.sv").string());
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"pkg.sv", "cls.sv", "frag.sv"});
+    }
+
+    // A sentinel in cls.sv's shard tells a hit from a reparse.
+    const IndexCache cache = *IndexCache::open(project.root());
+    auto loaded = cache.load(cls_uri);
+    REQUIRE(loaded);
+    CHECK(loaded->stands_alone);
+    ValueEntry sentinel;
+    sentinel.name = "only_the_cached_cls_shard_has_this";
+    sentinel.kind = "variable";
+    sentinel.file_id = kInvalidSourceFileID;
+    loaded->index.values.push_back(sentinel);
+    cache.store(cls_uri, loaded->key, loaded->index, loaded->stands_alone);
+
+    Analyzer analyzer;
+    const auto snapshot = project.index(analyzer, {"pkg.sv", "cls.sv", "frag.sv"});
+    REQUIRE(snapshot);
+    CHECK(shards_for(snapshot, cls_uri) == 1);
+    size_t sentinels = 0;
+    for (const auto& shard : snapshot->shards) {
+        if (!shard.index)
+            continue;
+        for (const auto& value : shard.index->values)
+            sentinels += value.name == sentinel.name;
+    }
+    CHECK(sentinels == 1);
+    CHECK(snapshot_values(snapshot).count("frag_var") == 1);
+}
+
+TEST_CASE("index cache: a listed file adopted by a discarded header build is redone",
+          "[index-cache]") {
+    // The package's header build takes cls.sv off the queue; a generation bump
+    // then discards that build, so the file has to go back on the queue.
+    CacheProject project("listed-include-requeue");
+    write_listed_include_project(project, /*pkg_first=*/true);
+    project.write("other.sv", "module other; endmodule\n");
+    const auto other_uri = uri_from_path((project.root() / "other.sv").string());
+
+    Analyzer analyzer;
+    std::atomic<bool> bumped{false};
+    analyzer.set_background_index_hook_for_testing([&](const std::string& path, bool built) {
+        if (built && path.ends_with("pkg.sv") && !bumped.exchange(true))
+            analyzer.refresh_changed_extra_files({other_uri});
+    });
+    const auto snapshot = project.index(analyzer, {"pkg.sv", "cls.sv", "frag.sv", "other.sv"});
+    REQUIRE(bumped);
+    REQUIRE(snapshot);
+    const auto values = snapshot_values(snapshot);
+    CHECK(values.count("frag_var") == 1);
+    CHECK(shards_for(snapshot, uri_from_path((project.root() / "cls.sv").string())) == 1);
+}
