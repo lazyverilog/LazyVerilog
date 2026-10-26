@@ -745,6 +745,10 @@ class Analyzer {
     /// SyntaxIndex entries on every live-file edit.
     std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot() const;
 
+    /// The per-file parse inputs in force, whose project_root_for() is the one
+    /// answer to "which project is this file in".
+    std::shared_ptr<const ProjectParseInputs> parse_inputs() const;
+
     /// Definition for a hierarchical path such as `tb.u_dut.u_sub.sig`, resolved
     /// by walking instance names through published index snapshots.  Returns
     /// nothing when any segment is unresolved.

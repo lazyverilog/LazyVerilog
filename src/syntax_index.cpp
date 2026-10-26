@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -971,6 +972,7 @@ static void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
 
     if (cls.extendsClause)
         entry.base_class = render_syntax_node_text(sm, *cls.extendsClause->baseName);
+    index_class_params(cls, sm, entry);
 
     // A class declared inside another class body is a member of it and is
     // reached as `outer::inner`.  Collected before the member loop so the outer
@@ -1844,6 +1846,107 @@ size_t path_component_count(std::string_view path) {
 const std::string& ProjectIndexSnapshot::module_path(const ProjectIndexModuleRef& ref) const {
     static const std::string kNone;
     return ref.shard_slot < shards.size() ? shards[ref.shard_slot].path : kNone;
+}
+
+struct ProjectIndexSnapshot::DerivedCache {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<InheritedMember>>> inherited;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<const MacroEntry*>>> macros;
+};
+
+ProjectIndexSnapshot::DerivedCache& ProjectIndexSnapshot::derived() const {
+    std::call_once(derived_once_, [this] { derived_ = std::make_shared<DerivedCache>(); });
+    return *derived_;
+}
+
+const ClassEntry* ProjectIndexSnapshot::find_class(const std::string& name,
+                                                   std::string_view from_path) const {
+    const auto it = class_slots.find(name);
+    if (it == class_slots.end())
+        return nullptr;
+    // Shards are in path order, headers first, so the strictly-nearer test keeps
+    // the same tie-break find_module() has.
+    const ClassEntry* best = nullptr;
+    PathProximityScore best_score;
+    for (const auto& [slot, i] : it->second) {
+        const auto score = path_proximity_score(from_path, shards[slot].path);
+        if (!best || score > best_score) {
+            best = &shards[slot].index->classes[i];
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+std::shared_ptr<const std::vector<InheritedMember>>
+ProjectIndexSnapshot::inherited_members(const std::string& base_name,
+                                        std::string_view from_path) const {
+    auto& cache = derived();
+    std::string key(from_path);
+    key += '\x1f';
+    key += base_name;
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (auto it = cache.inherited.find(key); it != cache.inherited.end())
+            return it->second;
+    }
+
+    // Built outside the lock; two requests racing on a miss both build it and
+    // the first insert wins, which is the same answer.
+    auto members = std::make_shared<std::vector<InheritedMember>>();
+    std::unordered_set<std::string> seen;
+    std::unordered_set<std::string> visited;
+    constexpr int kMaxDepth = 16; // the member-access climb's limit
+    std::string name = base_name;
+    for (int depth = 1; depth <= kMaxDepth && !name.empty() && visited.insert(name).second;
+         ++depth) {
+        const ClassEntry* cls = find_class(name, from_path);
+        if (!cls)
+            break;
+        for (const auto& f : cls->fields)
+            if (seen.insert(f.name).second)
+                members->push_back({.name = f.name, .detail = f.type, .depth = depth});
+        for (const auto& m : cls->methods)
+            if (seen.insert(m.name).second)
+                members->push_back({.name = m.name,
+                                    .detail = m.return_type,
+                                    .depth = depth,
+                                    .is_method = true,
+                                    .is_task = m.is_task});
+        name = base_class_lookup_name(cls->base_class);
+    }
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return cache.inherited.try_emplace(std::move(key), std::move(members)).first->second;
+}
+
+std::shared_ptr<const std::vector<const MacroEntry*>>
+ProjectIndexSnapshot::project_macros(
+    const std::string& root, const std::function<std::string(const std::string&)>& project_of) const {
+    auto& cache = derived();
+    {
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (auto it = cache.macros.find(root); it != cache.macros.end())
+            return it->second;
+    }
+    auto macros = std::make_shared<std::vector<const MacroEntry*>>();
+    // The project is a fact about the directory, and a project's files come in
+    // directories of tens or hundreds, so ask once per directory.
+    std::unordered_map<std::string, bool> in_project_by_dir;
+    for (const size_t slot : macro_shard_slots) {
+        const auto& shard = shards[slot];
+        const auto slash = shard.path.find_last_of("/\\");
+        const std::string dir = slash == std::string::npos ? std::string{} : shard.path.substr(0, slash);
+        auto [it, inserted] = in_project_by_dir.try_emplace(dir, false);
+        if (inserted)
+            it->second = project_of(shard.path) == root;
+        if (!it->second)
+            continue;
+        for (const auto& mac : shard.index->macros)
+            macros->push_back(&mac);
+    }
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    return cache.macros.try_emplace(root, std::move(macros)).first->second;
 }
 
 const ProjectIndexModuleRef* ProjectIndexSnapshot::find_module(const std::string& name,

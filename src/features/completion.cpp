@@ -1261,6 +1261,7 @@ current_file_identifier_items_from_ast(const DocumentState& state, const Complet
         std::vector<lsCompletionItem>& items;
         std::unordered_set<std::string>& seen;
         bool in_current_module{false};
+        bool in_subroutine{false};
         int package_depth{0};
         std::vector<bool> block_contains_cursor;
 
@@ -1299,10 +1300,36 @@ current_file_identifier_items_from_ast(const DocumentState& state, const Complet
         }
 
         void handle(const ClassDeclarationSyntax& node) {
-            if (package_depth > 0)
+            if (package_depth == 0)
+                push_unique_item(items, seen, std::string(node.name.valueText()),
+                                 lsCompletionItemKind::Class);
+            // The class the cursor is in contributes its properties and the
+            // enclosing method's locals, like a module does.
+            if (!contains(node))
                 return;
-            push_unique_item(items, seen, std::string(node.name.valueText()),
-                             lsCompletionItemKind::Class);
+            const bool old = in_current_module;
+            in_current_module = true;
+            visitDefault(node);
+            in_current_module = old;
+        }
+
+        // Another subroutine's locals are not in scope; the one the cursor is
+        // in -- `task cls::m` outside its class included -- is.
+        void handle(const FunctionDeclarationSyntax& node) {
+            if (!contains(node))
+                return;
+            const bool old = in_current_module;
+            in_current_module = in_subroutine = true;
+            visitDefault(node);
+            in_current_module = old;
+            in_subroutine = false;
+        }
+
+        void handle(const FunctionPortSyntax& node) {
+            if (in_subroutine && node.declarator)
+                push_unique_item(items, seen, std::string(node.declarator->name.valueText()),
+                                 lsCompletionItemKind::Variable,
+                                 node.dataType ? completion_ast_text(*node.dataType) : "");
         }
 
         void handle(const TypedefDeclarationSyntax& node) {
@@ -1714,7 +1741,8 @@ current_file_class_name_items_from_ast(const DocumentState& state) {
 
 static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxIndex& index,
                                                                 std::string class_name,
-                                                                const std::string& field_name);
+                                                                const std::string& field_name,
+                                                                std::string* declarer = nullptr);
 
 // Type of `field_name` inside `type_name`, as declared in the buffer being
 // edited.  The current file contributes to completion only through its AST --
@@ -2353,7 +2381,8 @@ class IdentifierProvider : public CompletionProvider {
 // `seq_item_port` declared by `uvm_driver` and used from a subclass.
 static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxIndex& index,
                                                                 std::string class_name,
-                                                                const std::string& field_name) {
+                                                                const std::string& field_name,
+                                                                std::string* declarer) {
     std::unordered_set<std::string> visited;
     while (!class_name.empty() && visited.insert(class_name).second) {
         const auto it = index.class_by_name.find(class_name);
@@ -2361,8 +2390,11 @@ static std::optional<std::string> field_type_in_shard_hierarchy(const SyntaxInde
             return std::nullopt;
         const auto& cls = index.classes[it->second];
         for (const auto& f : cls.fields) {
-            if (f.name == field_name && !f.type.empty())
+            if (f.name == field_name && !f.type.empty()) {
+                if (declarer)
+                    *declarer = cls.name;
                 return f.type;
+            }
         }
         class_name = base_class_lookup_name(cls.base_class);
     }
@@ -2770,6 +2802,22 @@ class PackageScopeProvider : public CompletionProvider {
     }
 };
 
+static lsCompletionItem macro_item(const MacroEntry& mac) {
+    auto item = make_item(mac.name, mac.is_function_like ? lsCompletionItemKind::Function
+                                                         : lsCompletionItemKind::Constant);
+    if (mac.is_function_like && !mac.params.empty()) {
+        std::string snip = mac.name + "(";
+        for (size_t i = 0; i < mac.params.size(); ++i) {
+            if (i) snip += ", ";
+            snip += "${" + std::to_string(i + 1) + ":" + mac.params[i] + "}";
+        }
+        snip += ")";
+        item.insertText = optional<std::string>(std::move(snip));
+        item.insertTextFormat = optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
+    }
+    return item;
+}
+
 // MacroProvider: `define macro names (Macro trigger context).
 class MacroProvider : public CompletionProvider {
   public:
@@ -2787,21 +2835,7 @@ class MacroProvider : public CompletionProvider {
                 continue;
             if (!seen_macros.insert(mac.name).second)
                 continue;
-            auto item = make_item(mac.name,
-                                   mac.is_function_like ? lsCompletionItemKind::Function
-                                                        : lsCompletionItemKind::Constant);
-            if (mac.is_function_like && !mac.params.empty()) {
-                std::string snip = mac.name + "(";
-                for (size_t i = 0; i < mac.params.size(); ++i) {
-                    if (i) snip += ", ";
-                    snip += "${" + std::to_string(i + 1) + ":" + mac.params[i] + "}";
-                }
-                snip += ")";
-                item.insertText = optional<std::string>(std::move(snip));
-                item.insertTextFormat =
-                    optional<lsInsertTextFormat>(lsInsertTextFormat::Snippet);
-            }
-            items.push_back(std::move(item));
+            items.push_back(macro_item(mac));
         }
         return items;
     }
@@ -3030,6 +3064,191 @@ completion_document_state(const Analyzer& analyzer, const lsTextDocumentPosition
     auto parsed = analyzer.get_parsed_state(uri, remaining);
     latest = analyzer.get_state(uri);
     return parsed && latest && parsed->text == latest->text ? parsed : latest;
+}
+
+// ── Class scope and project layers ────────────────────────────────────────────
+
+/// A bare identifier in a uvm_component method inherits hundreds of names, and
+/// a project can define thousands of macros: those contexts send the best this
+/// many with `isIncomplete`, and the client asks again as the prefix grows.
+static constexpr size_t kMaxCompletionItems = 200;
+
+/// Class @p name as a request sees it: the live buffer first (newer than any
+/// shard), then the published snapshot ranked by proximity, then the open
+/// buffers the snapshot has not caught up with.
+static const ClassEntry* find_class_for_request(const std::string& name, const SyntaxIndex& here,
+                                                const ProjectIndexSnapshot* snapshot,
+                                                std::string_view from_path,
+                                                const std::vector<OpenIndexShard>& opened) {
+    const auto in = [&](const SyntaxIndex& index) -> const ClassEntry* {
+        const auto it = index.class_by_name.find(name);
+        return it != index.class_by_name.end() && it->second < index.classes.size()
+                   ? &index.classes[it->second]
+                   : nullptr;
+    };
+    if (name.empty())
+        return nullptr;
+    if (const auto* cls = in(here))
+        return cls;
+    if (const auto* cls = snapshot ? snapshot->find_class(name, from_path) : nullptr)
+        return cls;
+    for (const auto& shard : opened)
+        if (const auto* cls = shard.index ? in(*shard.index) : nullptr)
+            return cls;
+    return nullptr;
+}
+
+/// A bare identifier in a method of @p class_name: what the class declares and
+/// inherits, filtered by the typed prefix.  @p depth receives each offered
+/// name's distance from the class (0 = its own); a name already in it is
+/// declared nearer and is skipped.
+///
+/// Levels the live buffer declares are read from it on every keystroke; from
+/// the first level it does not, the published snapshot answers the rest of the
+/// chain from its per-snapshot cache.
+static void append_class_member_items(const std::string& class_name, const CompletionContext& ctx,
+                                      const SyntaxIndex& here, const ProjectIndexSnapshot* snapshot,
+                                      std::string_view from_path,
+                                      const std::vector<OpenIndexShard>& opened,
+                                      std::vector<lsCompletionItem>& items,
+                                      std::unordered_map<std::string, int>& depth) {
+    const auto add = [&](const std::string& name, const std::string& detail, bool is_method,
+                         int level) {
+        if (!ctx.prefix.empty() && prefix_score(name, ctx.prefix) == 0)
+            return;
+        if (!depth.try_emplace(name, level).second)
+            return;
+        auto item = make_item(name, is_method ? lsCompletionItemKind::Method
+                                              : lsCompletionItemKind::Field);
+        if (!detail.empty())
+            item.detail = optional<std::string>(detail);
+        items.push_back(std::move(item));
+    };
+    constexpr int kMaxLevels = 16; // the member-access climb's limit
+    std::unordered_set<std::string> visited;
+    std::string name = class_name;
+    for (int level = 0; level <= kMaxLevels && !name.empty() && visited.insert(name).second;
+         ++level) {
+        const auto here_it = here.class_by_name.find(name);
+        const ClassEntry* cls = here_it != here.class_by_name.end() &&
+                                        here_it->second < here.classes.size()
+                                    ? &here.classes[here_it->second]
+                                    : nullptr;
+        if (!cls && level > 0 && snapshot && snapshot->find_class(name, from_path)) {
+            for (const auto& m : *snapshot->inherited_members(name, from_path))
+                add(m.name, m.detail, m.is_method, level - 1 + m.depth);
+            return;
+        }
+        if (!cls)
+            cls = find_class_for_request(name, here, snapshot, from_path, opened);
+        if (!cls)
+            return;
+        for (const auto& f : cls->fields)
+            add(f.name, f.type, false, level);
+        for (const auto& m : cls->methods)
+            add(m.name, m.return_type, true, level);
+        name = base_class_lookup_name(cls->base_class);
+    }
+}
+
+/// What the type parameter @p type stands for inside class @p owner.
+///
+/// `class bus_driver extends uvm_driver #(bus_item)` inherits `REQ req;`, and
+/// REQ is uvm_driver's parameter.  Only @p owner's direct `extends X #(...)` is
+/// consulted, its arguments matched by position or name against @p base's
+/// (X's) parameter list.  A parameter no argument sets takes its default --
+/// @p owner's own, or @p declarer's (the class that declares the handle) when
+/// neither X nor @p owner has one.  @p type itself when it is no parameter.
+static std::string resolve_type_parameter(const std::string& type, const ClassEntry* owner,
+                                          const ClassEntry* base, const ClassEntry* declarer,
+                                          int hops = 0) {
+    const auto resolved = [&](const std::string& value) {
+        const std::string next = completion_base_type_name(value);
+        // `type RSP = REQ`: a default may name another parameter of the same list.
+        return next.empty() || next == type || hops >= 4
+                   ? next.empty() ? type : next
+                   : resolve_type_parameter(next, owner, base, declarer, hops + 1);
+    };
+    if (owner && base) {
+        for (size_t i = 0; i < base->params.size(); ++i) {
+            if (base->params[i].name != type)
+                continue;
+            for (size_t a = 0; a < owner->base_args.size(); ++a) {
+                const auto& arg = owner->base_args[a];
+                if (arg.name.empty() ? a == i : arg.name == type)
+                    return resolved(arg.value);
+            }
+            return resolved(base->params[i].value);
+        }
+    }
+    for (const auto* cls : {owner, declarer}) {
+        if (!cls)
+            continue;
+        for (const auto& p : cls->params)
+            if (p.name == type)
+                return resolved(p.value);
+    }
+    return type;
+}
+
+/// Every macro the asking file's project defines, in any of its files.  A file
+/// in no project gets none: it keeps only what its own includes reach, which
+/// the AST pass already offers.
+///
+/// At most @p limit are offered, best prefix match first; returns whether any
+/// were left out.
+static bool append_project_macro_items(const DocumentState& state, const CompletionContext& ctx,
+                                       const Analyzer& analyzer, size_t limit,
+                                       std::vector<lsCompletionItem>& items) {
+    const auto inputs = analyzer.parse_inputs();
+    if (!inputs || state.normalized_path.empty())
+        return false;
+    const std::string root = inputs->project_root_for(state.normalized_path).string();
+    const auto snapshot = analyzer.project_index_snapshot();
+    if (root.empty() || !snapshot)
+        return false;
+    // An edit to a listed file republishes the snapshot, and with it the macro
+    // list, per keystroke.  Which project a directory is in does not change
+    // with it -- only with the project inputs, which are replaced whenever a
+    // config appears, goes or changes -- so remember it across snapshots: the
+    // resolver re-stats every ancestor of a directory with no config every few
+    // seconds, and on a network filesystem those are round trips.
+    static std::mutex memo_mutex;
+    static std::shared_ptr<const ProjectParseInputs> memo_inputs;
+    static std::unordered_map<std::string, std::string> memo_roots; // directory -> root
+    const auto macros = snapshot->project_macros(root, [&](const std::string& path) {
+        const std::string dir = std::filesystem::path(path).parent_path().string();
+        {
+            std::lock_guard<std::mutex> lock(memo_mutex);
+            if (memo_inputs != inputs) {
+                memo_inputs = inputs;
+                memo_roots.clear();
+            }
+            if (const auto it = memo_roots.find(dir); it != memo_roots.end())
+                return it->second;
+        }
+        std::string found = inputs->project_root_for(path).string();
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        if (memo_inputs == inputs)
+            memo_roots.emplace(dir, found);
+        return found;
+    });
+    std::vector<std::pair<int, const MacroEntry*>> matches;
+    for (const auto* mac : *macros)
+        if (const int score = prefix_score(mac->name, ctx.prefix); score > 0)
+            matches.emplace_back(score, mac);
+    const bool truncated = matches.size() > limit;
+    if (truncated) {
+        std::partial_sort(matches.begin(), matches.begin() + limit, matches.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first != b.first ? a.first > b.first
+                                                        : a.second->name < b.second->name;
+                          });
+        matches.resize(limit);
+    }
+    for (const auto& match : matches)
+        items.push_back(macro_item(*match.second));
+    return truncated;
 }
 
 // ── CompletionEngine ──────────────────────────────────────────────────────────
@@ -3266,7 +3485,8 @@ void CompletionEngine::rank_and_sort(std::vector<lsCompletionItem>& items,
                                       const CompletionContext& ctx,
                                       const std::unordered_set<std::string>& local_names,
                                       const std::unordered_set<std::string>& expected_names,
-                                      const std::unordered_set<std::string>& same_type_names) const {
+                                      const std::unordered_set<std::string>& same_type_names,
+                                      const std::unordered_map<std::string, int>& member_depth) const {
     // Compute scores using a parallel index array — items stay in place during
     // scoring and sorting so each item is moved only once into the output.
     std::vector<std::pair<int, size_t>> scored; // (score, original index)
@@ -3283,7 +3503,17 @@ void CompletionEngine::rank_and_sort(std::vector<lsCompletionItem>& items,
             const int scope     = local_names.count(item.label)      ? 30   : 0;
             const int expected  = expected_names.count(item.label)   ? 1000 : 0;
             const int same_type = same_type_names.count(item.label)  ? 500  : 0;
-            scored.push_back({s + scope + expected + same_type, i});
+            int score = s + scope + expected + same_type;
+            if (!member_depth.empty()) {
+                // In a class method: a real prefix match first, then the class's
+                // own names and locals, then each base level nearest first.
+                const auto it = member_depth.find(item.label);
+                const int depth_rank = it == member_depth.end() ? 0 : 9 - std::min(it->second, 8);
+                // Each band outweighs everything below it (s + scope <= 130).
+                score = (expected + same_type) * 10 + (s >= 50 ? 3000 : 0) + depth_rank * 150 +
+                        s + scope;
+            }
+            scored.push_back({score, i});
         }
     }
 
@@ -3410,13 +3640,49 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
     // A second name the shard layer should also be asked about, when the typed
     // scope only aliases the type that actually owns the members.
     std::string aliased_scope_name;
+    // Inside a class method: each offered name's distance from that class.
+    std::unordered_map<std::string, int> member_depth;
 
     switch (ctx.kind) {
     case CompletionContextKind::Identifier:
     case CompletionContextKind::Unknown:
     case CompletionContextKind::EventControl: {
-        auto items = current_file_identifier_items_from_ast(state, ctx);
+        // Identifier typing answers from the text-only placeholder
+        // (completion_document_state()); the last parse of this buffer still
+        // knows its declarations and which class the cursor is in.  Only the
+        // declarations: the context was detected on the current text.  Reading
+        // them walks that tree, which costs a fraction of its parse, so a file
+        // that parses slowly keeps the placeholder's instant answer.
+        constexpr auto kPreviousParseWalkBudget = std::chrono::milliseconds(50);
+        const DocumentState& parsed =
+            !state.tree && state.previous_parsed && state.previous_parsed->tree &&
+                    state.previous_parsed->parse_time <= kPreviousParseWalkBudget
+                ? *state.previous_parsed
+                : state;
+        if (&parsed != &state)
+            ctx.current_scope_name = infer_current_scope(
+                parsed, context_index, position_to_offset(parsed.text, line, col), line);
+        auto items = current_file_identifier_items_from_ast(parsed, ctx);
         auto macros = current_file_macro_items_from_ast(state, true);
+        if (!ctx.current_scope_name.empty()) {
+            const auto snapshot = analyzer.project_index_snapshot();
+            // The previous parse's own index is built once per parse, a full
+            // pass over the file: ask the published shards first, which carry
+            // this file's classes as of its last publish when it is listed.
+            const SyntaxIndex* here = &current_file_index;
+            if (&parsed != &state &&
+                !find_class_for_request(ctx.current_scope_name, *here, snapshot.get(),
+                                        state.normalized_path, *opened_shards))
+                here = &get_dynamic_index(parsed);
+            if (find_class_for_request(ctx.current_scope_name, *here, snapshot.get(),
+                                       state.normalized_path, *opened_shards)) {
+                for (const auto& item : items)
+                    member_depth.emplace(item.label, 0);
+                append_class_member_items(ctx.current_scope_name, ctx, *here, snapshot.get(),
+                                          state.normalized_path, *opened_shards, items,
+                                          member_depth);
+            }
+        }
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
         all_items.insert(all_items.end(), std::make_move_iterator(macros.begin()),
@@ -3441,6 +3707,8 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         auto items = current_file_macro_items_from_ast(state, false);
         all_items.insert(all_items.end(), std::make_move_iterator(items.begin()),
                          std::make_move_iterator(items.end()));
+        if (append_project_macro_items(state, ctx, analyzer, kMaxCompletionItems, all_items))
+            result.isIncomplete = true;
         break;
     }
     case CompletionContextKind::PackageScope: {
@@ -3551,18 +3819,33 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         break;
                 }
             }
+            // `class bus_driver extends uvm_driver #(bus_item)`: an inherited
+            // `REQ req;` is a bus_item here (resolve_type_parameter()).
+            const auto class_named = [&](const std::string& name) {
+                return find_class_for_request(name, current_file_index, project_index.get(),
+                                              state.normalized_path, *opened_shards);
+            };
+            const auto bind_parameter = [&](const std::string& type, const ClassEntry* owner,
+                                            const std::string& declarer) {
+                if (!owner || type.empty() || class_named(type))
+                    return type;
+                return resolve_type_parameter(type, owner,
+                                              class_named(base_class_lookup_name(owner->base_class)),
+                                              declarer.empty() ? owner : class_named(declarer));
+            };
             if (!value_type && !ctx.current_scope_name.empty()) {
                 // The receiver can also be a field the enclosing class only
                 // inherits, so its declaration is in whichever shard holds the
                 // base class.
                 const std::string base =
                     current_file_unresolved_base_class(state, ctx.current_scope_name);
+                std::string declarer;
                 if (!base.empty()) {
                     for (const auto& shard : *opened_shards) {
                         if (!shard.index)
                             continue;
-                        value_type =
-                            field_type_in_shard_hierarchy(*shard.index, base, ctx.scope_name);
+                        value_type = field_type_in_shard_hierarchy(*shard.index, base,
+                                                                   ctx.scope_name, &declarer);
                         if (value_type)
                             break;
                     }
@@ -3570,10 +3853,17 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         if (value_type)
                             break;
                         if (shard)
-                            value_type =
-                                field_type_in_shard_hierarchy(*shard, base, ctx.scope_name);
+                            value_type = field_type_in_shard_hierarchy(*shard, base,
+                                                                       ctx.scope_name, &declarer);
                     }
                 }
+                if (value_type)
+                    value_type = bind_parameter(completion_base_type_name(*value_type),
+                                                class_named(ctx.current_scope_name), declarer);
+            } else if (value_type && ctx.receiver_type.empty() && !ctx.current_scope_name.empty()) {
+                // `T item;` in this class: T's default.
+                value_type = bind_parameter(completion_base_type_name(*value_type),
+                                            class_named(ctx.current_scope_name), {});
             }
             // `a.b.c.` — the steps above resolved the receiver `a`.  Each
             // remaining hop is a field of the type resolved so far, and
@@ -3601,6 +3891,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     if (shard)
                         value_type = field_type_in_shard(*shard, owner, hop);
                 }
+                // A field typed by its own class's parameter: that parameter's default.
+                if (value_type)
+                    if (const auto* owner_class = class_named(owner))
+                        value_type = resolve_type_parameter(completion_base_type_name(*value_type),
+                                                            nullptr, nullptr, owner_class);
                 // `vif.drv_cb.`: a last hop that is no field may name a clocking
                 // block of the interface; its clockvars are filed under
                 // `<interface>.<block>` (index_clocking_block()).
@@ -3752,7 +4047,12 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
         append_set(same_type_names, value_names_for_type(*shard, ctx));
     }
     dedupe_completion_items(all_items);
-    rank_and_sort(all_items, ctx, local_names, expected_names, same_type_names);
+    rank_and_sort(all_items, ctx, local_names, expected_names, same_type_names, member_depth);
+    if (all_items.size() > kMaxCompletionItems &&
+        (!member_depth.empty() || ctx.kind == CompletionContextKind::Macro)) {
+        all_items.erase(all_items.begin() + kMaxCompletionItems, all_items.end());
+        result.isIncomplete = true;
+    }
     result.items = std::move(all_items);
     return result;
 }

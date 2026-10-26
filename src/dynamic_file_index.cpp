@@ -425,6 +425,7 @@ void process_class(const ClassDeclarationSyntax& cls, SyntaxIndex& index,
     entry.col = col;
     if (cls.extendsClause)
         entry.base_class = node_text_raw(sm, *cls.extendsClause->baseName);
+    index_class_params(cls, sm, entry);
 
     // A class declared inside another class body, collected first so the outer
     // entry's own index is not shifted by the nested ones.

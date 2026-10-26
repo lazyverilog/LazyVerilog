@@ -7,6 +7,7 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -119,7 +120,8 @@ class CompletionEngine {
     void rank_and_sort(std::vector<lsCompletionItem>& items, const CompletionContext& ctx,
                        const std::unordered_set<std::string>& local_names,
                        const std::unordered_set<std::string>& expected_names,
-                       const std::unordered_set<std::string>& same_type_names) const;
+                       const std::unordered_set<std::string>& same_type_names,
+                       const std::unordered_map<std::string, int>& member_depth) const;
 };
 
 /// The snapshot completion should answer from for @p params.

@@ -498,6 +498,50 @@ std::string base_class_lookup_name(std::string_view base_class) {
     return trim_copy(std::string(name));
 }
 
+void index_class_params(const slang::syntax::ClassDeclarationSyntax& cls,
+                        const slang::SourceManager& sm, ClassEntry& entry) {
+    using namespace slang::syntax;
+    if (cls.parameters) {
+        for (const auto* param_base : cls.parameters->declarations) {
+            if (const auto* type_param =
+                    param_base ? param_base->as_if<TypeParameterDeclarationSyntax>() : nullptr) {
+                for (const auto* decl : type_param->declarators)
+                    if (decl)
+                        entry.params.push_back(
+                            {token_value_text(decl->name),
+                             decl->assignment
+                                 ? render_syntax_node_text(sm, *decl->assignment->type)
+                                 : std::string{}});
+            } else if (const auto* param =
+                           param_base ? param_base->as_if<ParameterDeclarationSyntax>() : nullptr) {
+                for (const auto* decl : param->declarators)
+                    if (decl)
+                        entry.params.push_back(
+                            {token_value_text(decl->name),
+                             decl->initializer
+                                 ? render_syntax_node_text(sm, *decl->initializer->expr)
+                                 : std::string{}});
+            }
+        }
+    }
+    if (!cls.extendsClause)
+        return;
+    const NameSyntax* base = cls.extendsClause->baseName;
+    if (const auto* scoped = base->as_if<ScopedNameSyntax>())
+        base = scoped->right;
+    const auto* class_name = base->as_if<ClassNameSyntax>();
+    if (!class_name)
+        return;
+    for (const auto* arg : class_name->parameters->parameters) {
+        if (const auto* ordered = arg ? arg->as_if<OrderedParamAssignmentSyntax>() : nullptr)
+            entry.base_args.push_back({{}, render_syntax_node_text(sm, *ordered->expr)});
+        else if (const auto* named = arg ? arg->as_if<NamedParamAssignmentSyntax>() : nullptr)
+            entry.base_args.push_back(
+                {token_value_text(named->name),
+                 named->expr ? render_syntax_node_text(sm, *named->expr) : std::string{}});
+    }
+}
+
 std::string symbol_canonical(std::string_view kind, std::string_view scope, std::string_view name) {
     std::string result;
     if (scope.empty()) {

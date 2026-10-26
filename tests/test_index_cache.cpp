@@ -80,6 +80,10 @@ package cfg_pkg;
             return doubled(id);
         endfunction
     endclass
+
+    class request_queue #(type T = request, int N = 4) extends queue_base #(T, .DEPTH(N));
+        T head;
+    endclass
 endpackage
 
 interface bus_if (input logic clk);
@@ -219,6 +223,16 @@ void require_same_index(const SyntaxIndex& a, const SyntaxIndex& b) {
         CHECK(x.parent_scope == y.parent_scope);
         CHECK(x.line == y.line);
         CHECK(x.col == y.col);
+        const auto same_params = [](const std::vector<ClassParamEntry>& p,
+                                    const std::vector<ClassParamEntry>& q) {
+            REQUIRE(p.size() == q.size());
+            for (size_t k = 0; k < p.size(); ++k) {
+                CHECK(p[k].name == q[k].name);
+                CHECK(p[k].value == q[k].value);
+            }
+        };
+        same_params(x.params, y.params);
+        same_params(x.base_args, y.base_args);
         REQUIRE(x.fields.size() == y.fields.size());
         for (size_t f = 0; f < x.fields.size(); ++f) {
             CHECK(x.fields[f].name == y.fields[f].name);
@@ -354,6 +368,18 @@ TEST_CASE("index cache: a parsed shard survives a round trip unchanged", "[index
     // comparison passes by describing two empty indexes.
     REQUIRE(original.modules.size() >= 3);
     REQUIRE(!original.classes.empty());
+    const auto queue = original.class_by_name.find("request_queue");
+    REQUIRE(queue != original.class_by_name.end());
+    const auto& queue_class = original.classes[queue->second];
+    REQUIRE(queue_class.params.size() == 2);
+    CHECK(queue_class.params[0].name == "T");
+    CHECK(queue_class.params[0].value == "request");
+    CHECK(queue_class.params[1].value == "4");
+    REQUIRE(queue_class.base_args.size() == 2);
+    CHECK(queue_class.base_args[0].name.empty());
+    CHECK(queue_class.base_args[0].value == "T");
+    CHECK(queue_class.base_args[1].name == "DEPTH");
+    CHECK(queue_class.base_args[1].value == "N");
     REQUIRE(!original.typedefs.empty());
     REQUIRE(!original.values.empty());
     REQUIRE(!original.instances.empty());

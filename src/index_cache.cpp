@@ -26,7 +26,8 @@ namespace {
 // compile until someone has decided whether it is serialized and bumped this.
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
 // 10: an includer's shard no longer carries a file-scope class from its headers.
-constexpr uint32_t kFormatVersion = 10;
+// 11: classes carry their parameters and their extends arguments.
+constexpr uint32_t kFormatVersion = 11;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is
@@ -521,6 +522,12 @@ void write_class(Writer& w, const ClassEntry& c) {
     w.seq(c.methods, [&](const MethodEntry& m) { write_method(w, m); });
     w.i32(c.line);
     w.i32(c.col);
+    const auto write_param = [&](const ClassParamEntry& p) {
+        w.str(p.name);
+        w.str(p.value);
+    };
+    w.seq(c.params, write_param);
+    w.seq(c.base_args, write_param);
 }
 
 ClassEntry read_class(Reader& r) {
@@ -533,6 +540,14 @@ ClassEntry read_class(Reader& r) {
     c.methods = r.seq<MethodEntry>([&] { return read_method(r); });
     c.line = r.i32();
     c.col = r.i32();
+    const auto read_param = [&] {
+        ClassParamEntry p;
+        p.name = r.str();
+        p.value = r.str();
+        return p;
+    };
+    c.params = r.seq<ClassParamEntry>(read_param);
+    c.base_args = r.seq<ClassParamEntry>(read_param);
     return c;
 }
 
@@ -738,7 +753,8 @@ static_assert(sizeof(NamedPortConn) == 80, "NamedPortConn changed: update codec 
 static_assert(sizeof(InstanceEntry) == 136, "InstanceEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(FieldEntry) == 80, "FieldEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(MethodEntry) == 112, "MethodEntry changed: update codec + kFormatVersion");
-static_assert(sizeof(ClassEntry) == 160, "ClassEntry changed: update codec + kFormatVersion");
+static_assert(sizeof(ClassParamEntry) == 64, "ClassParamEntry changed: update codec + kFormatVersion");
+static_assert(sizeof(ClassEntry) == 208, "ClassEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(EnumMemberEntry) == 48, "EnumMemberEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(TypedefEntry) == 160, "TypedefEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(MacroEntry) == 104, "MacroEntry changed: update codec + kFormatVersion");

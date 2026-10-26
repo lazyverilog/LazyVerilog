@@ -9201,6 +9201,11 @@ Analyzer::extra_index_snapshot_ptr() const {
     return extra_index_snapshot_cache_;
 }
 
+std::shared_ptr<const ProjectParseInputs> Analyzer::parse_inputs() const {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    return parse_inputs_;
+}
+
 std::shared_ptr<const ProjectIndexSnapshot> Analyzer::project_index_snapshot() const {
     const auto start = Clock::now();
     std::lock_guard<std::mutex> lock(map_mutex_);
@@ -10517,6 +10522,10 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
             .uri = entry.uri,
             .index = entry.index,
         });
+        for (size_t i = 0; i < entry.index->classes.size(); ++i)
+            snapshot->class_slots[entry.index->classes[i].name].emplace_back(shard_slot, i);
+        if (!entry.index->macros.empty())
+            snapshot->macro_shard_slots.push_back(shard_slot);
 
         // Lightweight global module lookup.  First definition still wins here,
         // but it is no longer the whole answer: a name declared in more than
