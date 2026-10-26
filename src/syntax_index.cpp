@@ -1210,7 +1210,10 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         // carries no enclosing scope name or end line.
         add_package_imports(*import_decl, index, resolver, sm, {}, 0);
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
-        process_class(*cls, index, resolver, sm);
+        // A file-scope class from an `include`d header lives in the header's
+        // shard; a restricted build that kept it was one more copy per includer.
+        if (resolver.accepts(index, sm, cls->name))
+            process_class(*cls, index, resolver, sm);
     } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>()) {
         process_typedef(*td, index, resolver, sm);
     } else if (const auto* ps = member.as_if<ParameterDeclarationStatementSyntax>()) {
