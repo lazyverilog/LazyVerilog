@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include "analyzer.hpp"
+#include "string_utils.hpp"
 #include <algorithm>
 #include <thread>
 #include <vector>
@@ -127,6 +128,51 @@ TEST_CASE("doc sync: a deferred live shard still reaches the project index", "[s
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     CHECK(shard_has_module("blk_renamed"));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// The ExtraFileInfo snapshot (hover, definition) is patched, not rebuilt, when
+// a listed file's live shard replaces its filelist shard.  The patched entry
+// must carry the new shard and the new parse.
+TEST_CASE("doc sync: a deferred live shard reaches the extra file snapshot", "[sync]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-deferred-file-shard";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const auto path = dir / "blk.sv";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "module blk;\nendmodule\n";
+    }
+    // The URI the filelist entry is keyed by, so the edit replaces its shard.
+    const auto uri = uri_from_path(path);
+
+    Analyzer a;
+    a.set_project_config({}, {dir.string()}, {path.string()});
+    a.wait_for_background_index_idle();
+    REQUIRE(a.extra_file_snapshot_ptr()->size() == 1); // cached before the edit
+
+    a.enqueue_parse(uri, "module blk_renamed;\nendmodule\n");
+
+    auto entry_has_module = [&](const std::string& name) {
+        auto snapshot = a.extra_file_snapshot_ptr();
+        for (const auto& entry : *snapshot) {
+            if (entry.uri != uri || entry.state != a.get_state(uri))
+                continue;
+            for (const auto& module : entry.index_ref().modules) {
+                if (module.name == name)
+                    return true;
+            }
+        }
+        return false;
+    };
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline && !entry_has_module("blk_renamed"))
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    CHECK(entry_has_module("blk_renamed"));
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

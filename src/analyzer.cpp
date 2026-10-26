@@ -4031,6 +4031,56 @@ static std::pair<size_t, size_t> cursor_span(const slang::SourceManager& sm,
     return {size_t(first - cursors.begin()), size_t(last - cursors.begin())};
 }
 
+/// Which subtrees a walk for the tokens at some cursors has to enter.
+///
+/// A cursor walk used to visit every node of the file to classify one token,
+/// so hover and go-to-definition cost grew with the file: 40-120 ms on a
+/// 42k-line register block.  Every token whose visible range
+/// (visible_range_for_token()) can contain a cursor in @p uri lies, in source
+/// order, between its subtree's first and last token -- a macro argument or
+/// body maps into the invocation the subtree spells, and an `include`d file's
+/// tokens sit in a buffer of their own.  So a subtree whose two ends are
+/// ordinary tokens of one buffer can be skipped when that span holds no cursor.
+/// Ends that are macro tokens, or in different buffers, prove nothing: such a
+/// subtree is entered, and its children are asked again.
+class CursorSubtreeFilter {
+public:
+    CursorSubtreeFilter(const slang::SourceManager& sm, const std::string& uri)
+        : sm(sm), uri(uri) {}
+
+    /// Whether some cursor of the sorted @p cursors for which @p wanted(index)
+    /// holds may be visible at a token under @p node.
+    template <typename Wanted>
+    bool may_hold(const slang::syntax::SyntaxNode& node,
+                  const std::vector<std::pair<int, int>>& cursors, Wanted&& wanted) {
+        const auto first = node.getFirstToken();
+        const auto last = node.getLastToken();
+        if (!first || !last)
+            return false; // no tokens, nothing to find
+        const auto start = first.location();
+        const auto end = last.range().end();
+        if (!start.valid() || !end.valid() || sm.isMacroLoc(start) || sm.isMacroLoc(end) ||
+            start.buffer() != end.buffer())
+            return true;
+        // The containment cursor_span() tests: start <= cursor < end.
+        const std::pair<int, int> from{to_lsp_line((int)sm.getLineNumber(start)),
+                                       lsp_column(sm, start)};
+        const std::pair<int, int> to{to_lsp_line((int)sm.getLineNumber(end)), lsp_column(sm, end)};
+        const auto first_cursor = std::lower_bound(cursors.begin(), cursors.end(), from);
+        const auto last_cursor = std::lower_bound(first_cursor, cursors.end(), to);
+        bool any = false;
+        for (auto it = first_cursor; it != last_cursor && !any; ++it)
+            any = wanted(size_t(it - cursors.begin()));
+        // Position first, as cursor_span() does: deriving a URI converts a
+        // path.  A subtree of another file's buffer cannot hold a match.
+        return any && range_starts_in_uri(sm, slang::SourceRange(start, end), uri);
+    }
+
+private:
+    const slang::SourceManager& sm;
+    const std::string& uri;
+};
+
 static bool token_contains_position_in_uri(const slang::SourceManager& sm,
                                            const slang::parsing::Token& token,
                                            const std::string& uri, int line, int col) {
@@ -4104,11 +4154,23 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
     std::string current_module;
     std::string current_package;
     std::string current_class;
+    CursorSubtreeFilter filter;
 
     DefinitionTargetVisitor(const slang::SourceManager& sm, const std::string& uri,
                             std::vector<std::pair<int, int>> sorted_cursors)
         : sm(sm), uri(uri), cursors(std::move(sorted_cursors)), targets(cursors.size()),
-          macro_targets(cursors.size()), unclaimed(cursors.size()) {}
+          macro_targets(cursors.size()), unclaimed(cursors.size()), filter(sm, uri) {}
+
+    /// Enters only subtrees an unclaimed cursor can be in; the context
+    /// (current_module and the rest) comes from ancestors, which are entered.
+    template <typename T>
+    void visit(const T& node) {
+        if (unclaimed == 0 || !filter.may_hold(node, cursors, [this](size_t i) {
+                return targets[i].kind == DefinitionTargetKind::None;
+            }))
+            return;
+        SyntaxVisitor<DefinitionTargetVisitor>::visit(node);
+    }
 
     DefinitionTarget result(size_t i) const {
         return targets[i].kind != DefinitionTargetKind::None ? targets[i] : macro_targets[i];
@@ -5148,54 +5210,64 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     return SymbolInfo{.name = ident, .kind = "unknown", .line = line, .col = col};
 }
 
+/// The Identifier token under each of a set of cursors; see identifier_tokens_at().
+struct IdentifierTokenVisitor : public slang::syntax::SyntaxVisitor<IdentifierTokenVisitor> {
+    const slang::SourceManager& sm;
+    const std::string& uri;
+    const std::vector<std::pair<int, int>>& cursors;
+    std::vector<std::optional<IdentifierAtPosition>> results;
+    size_t unanswered;
+    CursorSubtreeFilter filter;
+
+    IdentifierTokenVisitor(const slang::SourceManager& sm, const std::string& uri,
+                           const std::vector<std::pair<int, int>>& cursors)
+        : sm(sm), uri(uri), cursors(cursors), results(cursors.size()),
+          unanswered(cursors.size()), filter(sm, uri) {}
+
+    template <typename T>
+    void visit(const T& node) {
+        if (unanswered == 0 ||
+            !filter.may_hold(node, cursors, [this](size_t i) { return !results[i]; }))
+            return;
+        SyntaxVisitor<IdentifierTokenVisitor>::visit(node);
+    }
+
+    void visitToken(slang::parsing::Token token) {
+        if (unanswered == 0 || !token || token.kind != slang::parsing::TokenKind::Identifier)
+            return;
+        // A macro body token is preprocessor output with no position of its
+        // own in the file, so the cursor can never really be on it.  Its
+        // visible range is the whole invocation, which would otherwise make
+        // the first identifier the body happens to contain answer for every
+        // column of the call -- naming that instead of what the user wrote.
+        // Arguments are typed at the call site and are hit normally.
+        if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
+            return;
+        const auto range = visible_range_for_token(sm, token);
+        const auto [first, last] = cursor_span(sm, cursors, range, uri);
+        for (size_t i = first; i < last; ++i) {
+            if (results[i])
+                continue;
+            const int token_line = to_lsp_line((int)sm.getLineNumber(range.start()));
+            const int token_col = lsp_column(sm, range.start());
+            const std::string name(token.valueText());
+            results[i] = IdentifierAtPosition{
+                .name = name,
+                .line = token_line,
+                .col = token_col,
+                .end_col = token_col + lsp_column_width(name),
+            };
+            --unanswered;
+        }
+    }
+};
+
 /// The Identifier token under each of @p cursors (sorted and unique), in one
 /// walk.
 static std::vector<std::optional<IdentifierAtPosition>>
 identifier_tokens_at(const slang::syntax::SyntaxTree& tree, const std::string& uri,
                      const std::vector<std::pair<int, int>>& cursors) {
-    struct Visitor : public slang::syntax::SyntaxVisitor<Visitor> {
-        const slang::SourceManager& sm;
-        const std::string& uri;
-        const std::vector<std::pair<int, int>>& cursors;
-        std::vector<std::optional<IdentifierAtPosition>> results;
-        size_t unanswered;
-
-        Visitor(const slang::SourceManager& sm, const std::string& uri,
-                const std::vector<std::pair<int, int>>& cursors)
-            : sm(sm), uri(uri), cursors(cursors), results(cursors.size()),
-              unanswered(cursors.size()) {}
-
-        void visitToken(slang::parsing::Token token) {
-            if (unanswered == 0 || !token || token.kind != slang::parsing::TokenKind::Identifier)
-                return;
-            // A macro body token is preprocessor output with no position of its
-            // own in the file, so the cursor can never really be on it.  Its
-            // visible range is the whole invocation, which would otherwise make
-            // the first identifier the body happens to contain answer for every
-            // column of the call -- naming that instead of what the user wrote.
-            // Arguments are typed at the call site and are hit normally.
-            if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location()))
-                return;
-            const auto range = visible_range_for_token(sm, token);
-            const auto [first, last] = cursor_span(sm, cursors, range, uri);
-            for (size_t i = first; i < last; ++i) {
-                if (results[i])
-                    continue;
-                const int token_line = to_lsp_line((int)sm.getLineNumber(range.start()));
-                const int token_col = lsp_column(sm, range.start());
-                const std::string name(token.valueText());
-                results[i] = IdentifierAtPosition{
-                    .name = name,
-                    .line = token_line,
-                    .col = token_col,
-                    .end_col = token_col + lsp_column_width(name),
-                };
-                --unanswered;
-            }
-        }
-    };
-
-    Visitor visitor(tree.sourceManager(), uri, cursors);
+    IdentifierTokenVisitor visitor(tree.sourceManager(), uri, cursors);
     tree.root().visit(visitor);
     return std::move(visitor.results);
 }
@@ -8189,6 +8261,8 @@ void Analyzer::invalidate_extra_snapshots_locked() const {
     // background_header_shards_, so both go.  Must only be called while
     // map_mutex_ is held by the mutating path.
     extra_file_snapshot_cache_.reset();
+    extra_file_snapshot_layout_.reset();
+    extra_file_snapshot_stale_.clear();
     extra_index_snapshot_cache_.reset();
 }
 
@@ -8207,9 +8281,51 @@ void Analyzer::invalidate_open_file_snapshot_locked(const std::string& uri) cons
     // workspace-symbol request after any keystroke anywhere paid 2N string
     // copies while holding the lock every request handler and index worker
     // contends for -- for a buffer the snapshots do not mention.
+    //
+    // Even for a file the snapshot does mention, only that entry's `state`
+    // changed, and every keystroke in a listed file lands here twice (the
+    // placeholder, then the parse).  Rebuilding re-sorted all N paths and
+    // re-copied them, and the new snapshot pointer then made
+    // ranked_extra_files() re-sort by proximity: 5-6 ms per keystroke on
+    // OpenTitan's 4031 files, under map_mutex_.  Record the entry instead;
+    // extra_file_snapshot_locked() patches just it on the next read.
     if (!extra_cache_.contains(uri) && !background_header_shards_.contains(uri))
         return;
-    extra_file_snapshot_cache_.reset();
+    if (extra_file_snapshot_cache_)
+        extra_file_snapshot_stale_.insert(uri);
+}
+
+std::shared_ptr<const std::vector<ExtraFileInfo>> Analyzer::extra_file_snapshot_locked() const {
+    if (extra_file_snapshot_cache_ && !extra_file_snapshot_stale_.empty()) {
+        // Same entries in the same order, so the layout -- and the proximity
+        // order ranked_extra_files() keeps for it -- carries over.
+        auto patched = std::make_shared<std::vector<ExtraFileInfo>>(*extra_file_snapshot_cache_);
+        size_t found = 0;
+        for (auto& info : *patched) {
+            if (!extra_file_snapshot_stale_.contains(info.uri))
+                continue;
+            ++found;
+            const auto doc = docs_.find(info.uri);
+            info.state = doc != docs_.end() ? doc->second : nullptr;
+            // What build_extra_file_snapshot_locked() would read for it.
+            if (const auto it = extra_cache_.find(info.uri); it != extra_cache_.end())
+                info.index = it->second.index;
+            else if (const auto header = background_header_shards_.find(info.uri);
+                     header != background_header_shards_.end())
+                info.index = header->second.index;
+        }
+        // Every stale entry is one the snapshot holds (only a shard change
+        // adds or drops entries, and that resets the snapshot); rebuild if not.
+        extra_file_snapshot_cache_ =
+            found == extra_file_snapshot_stale_.size() ? std::move(patched) : nullptr;
+        extra_file_snapshot_stale_.clear();
+    }
+    if (!extra_file_snapshot_cache_) {
+        extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
+        extra_file_snapshot_layout_ = extra_file_snapshot_cache_;
+        extra_file_snapshot_stale_.clear();
+    }
+    return extra_file_snapshot_cache_;
 }
 
 std::shared_ptr<const std::vector<ExtraFileInfo>>
@@ -8305,16 +8421,21 @@ Analyzer::extra_file_snapshot_ptr() const {
     // cache is still warming or some configured files failed to parse, return
     // the shards currently available instead of synchronously parsing missing
     // files under map_mutex_.
-    if (!extra_file_snapshot_cache_)
-        extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
-    log_perf("extra_file_snapshot_ptr files=" + std::to_string(extra_file_snapshot_cache_->size()), start);
-    return extra_file_snapshot_cache_;
+    auto snapshot = extra_file_snapshot_locked();
+    log_perf("extra_file_snapshot_ptr files=" + std::to_string(snapshot->size()), start);
+    return snapshot;
 }
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const DocumentState& state) const {
-    auto ranked =
-        ranked_extra_files(extra_file_snapshot_ptr(), std::string_view(state.normalized_path));
+    std::shared_ptr<const std::vector<ExtraFileInfo>> files;
+    std::shared_ptr<const std::vector<ExtraFileInfo>> layout;
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        files = extra_file_snapshot_locked();
+        layout = extra_file_snapshot_layout_;
+    }
+    auto ranked = ranked_extra_files(files, layout, std::string_view(state.normalized_path));
 
     // Open buffers no filelist carries are candidates too, after every shard:
     // with no lazyverilog.toml that is every buffer, and with one it is a new
@@ -8369,6 +8490,7 @@ Analyzer::ranked_extra_files(const DocumentState& state) const {
 
 std::shared_ptr<const std::vector<const ExtraFileInfo*>>
 Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileInfo>>& files,
+                             const std::shared_ptr<const std::vector<ExtraFileInfo>>& layout,
                              std::string_view from_path) const {
     if (!files)
         return std::make_shared<std::vector<const ExtraFileInfo*>>();
@@ -8380,8 +8502,22 @@ Analyzer::ranked_extra_files(const std::shared_ptr<const std::vector<ExtraFileIn
     if (ranked_extra_cache_ && ranked_extra_source_ == files && ranked_extra_from_ == from_path)
         return ranked_extra_cache_;
 
-    auto ranked = std::make_shared<std::vector<const ExtraFileInfo*>>(
-        by_path_proximity(std::span<const ExtraFileInfo>(*files), from_path));
+    auto ranked = std::make_shared<std::vector<const ExtraFileInfo*>>();
+    if (layout && ranked_extra_layout_ == layout && ranked_extra_from_ == from_path &&
+        ranked_extra_order_.size() == files->size()) {
+        // A patched snapshot of the layout already ranked: same paths, same
+        // order, so the same answer without sorting again.
+        ranked->reserve(ranked_extra_order_.size());
+        for (const auto i : ranked_extra_order_)
+            ranked->push_back(&(*files)[i]);
+    } else {
+        *ranked = by_path_proximity(std::span<const ExtraFileInfo>(*files), from_path);
+        ranked_extra_order_.clear();
+        ranked_extra_order_.reserve(ranked->size());
+        for (const auto* info : *ranked)
+            ranked_extra_order_.push_back(static_cast<uint32_t>(info - files->data()));
+        ranked_extra_layout_ = layout;
+    }
     ranked_extra_source_ = files;
     ranked_extra_from_.assign(from_path);
     ranked_extra_cache_ = ranked;
@@ -8768,9 +8904,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree(const std::string& uri) const {
         open_states.reserve(docs_.size());
         for (const auto& [state_uri, state_snapshot] : docs_)
             open_states.emplace_back(state_uri, state_snapshot);
-        if (!extra_file_snapshot_cache_)
-            extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
-        extra_snapshot = extra_file_snapshot_cache_;
+        extra_snapshot = extra_file_snapshot_locked();
     }
 
     RtlIndexView view;
@@ -8847,9 +8981,7 @@ std::optional<RtlTreeNode> Analyzer::rtl_tree_reverse(const std::string& uri) co
         open_states.reserve(docs_.size());
         for (const auto& [state_uri, state_snapshot] : docs_)
             open_states.emplace_back(state_uri, state_snapshot);
-        if (!extra_file_snapshot_cache_)
-            extra_file_snapshot_cache_ = build_extra_file_snapshot_locked();
-        extra_snapshot = extra_file_snapshot_cache_;
+        extra_snapshot = extra_file_snapshot_locked();
     }
 
     RtlIndexView view;
@@ -9691,12 +9823,22 @@ void Analyzer::update_extra_cache_for_live_state_locked(
     if (!extra_file_set_.contains(path_string))
         return;
 
+    // Replacing the shard of an entry the snapshot already lists changes that
+    // entry only -- this runs once per typing burst in a listed file -- so it
+    // is patched like a state change instead of rebuilt (4-8 ms on OpenTitan).
+    const auto previous = extra_cache_.find(uri);
+    const bool same_entry = previous != extra_cache_.end() && previous->second.path == path_string;
     put_extra_cache_locked(uri, ExtraFileCacheEntry{
                                     .path = path_string,
                                     .uri = uri,
                                     .index = std::make_shared<SyntaxIndex>(std::move(index)),
                                 });
-    invalidate_extra_snapshots_locked();
+    if (same_entry && extra_file_snapshot_cache_) {
+        extra_index_snapshot_cache_.reset();
+        extra_file_snapshot_stale_.insert(uri);
+    } else {
+        invalidate_extra_snapshots_locked();
+    }
 
     // The per-file shard changed, so the published merged project snapshot is
     // stale until the background indexer republishes it.  Publish asynchronously

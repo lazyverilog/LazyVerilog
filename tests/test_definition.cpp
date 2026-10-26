@@ -2,9 +2,11 @@
 #include "features/hover.hpp"
 #include "string_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <vector>
 
 static const std::string kDefinitionFixture = R"(
@@ -456,6 +458,39 @@ TEST_CASE("definition: macro lookup uses open extra file AST", "[definition]") {
     CHECK(loc->line == 0);
     CHECK(loc->col == 8);
     CHECK(loc->end_col == 19);
+
+    std::filesystem::remove(extra_path);
+}
+
+// A keystroke in a listed open file no longer rebuilds the whole snapshot of
+// project files; it patches that file's entry.  The patch must carry the new
+// syntax tree, or a macro moved by the edit resolves to where it used to be
+// until the file's shard is rebuilt.
+TEST_CASE("definition: macro lookup follows an edit to an open extra file", "[definition]") {
+    Analyzer analyzer;
+    const auto extra_path =
+        write_temp_sv("lazyverilog_definition_extra_macro_edit.sv", kExtraDefinitionFixture);
+    const std::string extra_uri = uri_from_path(extra_path);
+    const std::string top_uri = "file:///tmp/lazyverilog_definition_top_macro_edit.sv";
+    analyzer.set_extra_files({extra_path.string()});
+    analyzer.wait_for_background_index_idle();
+    analyzer.open(extra_uri, kExtraDefinitionFixture);
+    analyzer.open(top_uri, kTopUsingExtraFixture);
+
+    auto before = analyzer.definition_of(top_uri, 9, 13);
+    REQUIRE(before.has_value());
+    CHECK(before->line == 0);
+
+    analyzer.enqueue_parse(extra_uri, "// one\n// two\n" + kExtraDefinitionFixture);
+    const auto parsed = analyzer.get_parsed_state(extra_uri, std::chrono::seconds(10));
+    REQUIRE(parsed != nullptr);
+    REQUIRE(parsed->tree != nullptr);
+
+    auto after = analyzer.definition_of(top_uri, 9, 13);
+    REQUIRE(after.has_value());
+    CHECK(after->uri == extra_uri);
+    CHECK(after->line == 2);
+    CHECK(after->col == 8);
 
     std::filesystem::remove(extra_path);
 }
@@ -2509,4 +2544,61 @@ TEST_CASE("definition: clocking blocks, clockvars and DPI imports resolve",
     CHECK(dpi->doc.find("c_model") != std::string::npos);
 
     std::filesystem::remove(path);
+}
+
+namespace {
+
+/// Fastest of @p runs finding the identifier in a tiny last module, after four
+/// modules of @p statements assignments each.  Last, so that stopping once the
+/// cursor is answered does not skip the bulk too.
+double fastest_identifier_at_ms(int statements, int runs) {
+    std::string text;
+    for (int m = 0; m < 4; ++m) {
+        text += "module bulk" + std::to_string(m) + ";\n  logic [7:0] acc;\n";
+        for (int i = 0; i < statements; ++i)
+            text += "  assign acc[" + std::to_string(i % 8) + "] = acc[" +
+                    std::to_string((i + 1) % 8) + "] ^ 1'b1;\n";
+        text += "endmodule\n";
+    }
+    const int line = int(std::count(text.begin(), text.end(), '\n')) + 2;
+    text += "module last;\n  logic probe;\n  assign probe = 1'b0;\nendmodule\n";
+    const std::string uri = "file:///tmp/lazyverilog_identifier_at_scaling.sv";
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+
+    std::vector<double> samples;
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int repeat = 0; repeat < 20; ++repeat) {
+            const auto found = analyzer.identifier_at(uri, line, 10);
+            REQUIRE(found.has_value());
+            REQUIRE(found->name == "probe");
+        }
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+    }
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+} // namespace
+
+// Classifying the token under the cursor walked every node of the file, so
+// hover and go-to-definition in a large register block paid for the whole
+// file on every request.  The walk now skips subtrees that cannot hold the
+// cursor, so code far from it costs nothing.
+TEST_CASE("definition: the cursor lookup does not walk code away from the cursor",
+          "[definition][scaling]") {
+    constexpr int kSmall = 250;
+    constexpr int kLarge = 4000; // 16x the code outside the cursor's module
+    constexpr int kRuns = 5;
+
+    const double small_ms = fastest_identifier_at_ms(kSmall, kRuns);
+    const double large_ms = fastest_identifier_at_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[identifier_at scaling] statements " << kSmall << " -> " << kLarge << ": "
+              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // A whole-file walk is ~16; skipping the other modules is ~1.
+    CHECK(ratio < 4.0);
 }
