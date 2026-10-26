@@ -250,6 +250,10 @@ enum class RefForm : uint8_t {
     Plain,
     ImplicitPortName,  ///< `.p,` reached as the instantiated module's port
     ImplicitPortValue, ///< `.p,` reached as the enclosing module's signal
+    /// A `name:` member reached through a virtual interface handle
+    /// (`vif.cb.addr`): an interface item, never a class member.  Spelled like
+    /// Plain in the source; find_references() reports it as Plain.
+    ViaInterface,
 };
 
 struct ReferenceEntry {

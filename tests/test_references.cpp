@@ -3459,3 +3459,184 @@ TEST_CASE("rename: a non-ASCII line is rewritten in place, not past its end",
     }
     CHECK(checked);
 }
+
+static std::vector<int> reference_lines(const std::vector<Location>& refs,
+                                        const std::string& uri) {
+    std::vector<int> lines;
+    for (const auto& ref : refs)
+        if (ref.uri == uri)
+            lines.push_back(ref.line);
+    std::sort(lines.begin(), lines.end());
+    return lines;
+}
+
+// UVMF writes `typedef agent_c agent_c_t; agent_c_t agent_c;` in every
+// environment.  The typedef's target is the class, not the same-named field,
+// so renaming the field must leave it alone and the class must keep it.
+TEST_CASE("references: a field named like a class does not claim the typedef target",
+          "[references][class]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_field_named_like_class.sv";
+    const std::string text = R"(class agent;
+  int x;
+endclass
+
+class env;
+  typedef agent agent_t;
+  agent_t agent;
+  function void build();
+    agent = new();
+    agent.x = 1;
+  endfunction
+endclass
+)";
+    analyzer.open(uri, text);
+
+    const auto [field_line, field_col] = find_position_after(text, "agent;", "agent_t ");
+    CHECK(reference_lines(analyzer.find_references(uri, field_line, field_col, true), uri) ==
+          std::vector<int>{6, 8, 9});
+
+    CHECK(reference_lines(analyzer.find_references(uri, 0, 6, true), uri) ==
+          std::vector<int>{0, 5});
+}
+
+// A bare call inside an out-of-block method body is the class's own method:
+// leaving it out made rename rewrite the prototype and body but not the call.
+TEST_CASE("references: a bare method call in an out-of-block body", "[references][class]") {
+    const std::string text = R"(class drv;
+  int n;
+  extern task run();
+  extern protected task one(int x);
+  task inbody();
+    one(1);
+  endtask
+endclass
+
+task drv::run();
+  one(2);
+  n++;
+endtask
+
+task drv::one(int x);
+  n = x;
+endtask
+)";
+    const std::string packaged = "package p;\n" + text + "endpackage\n";
+    for (const auto& [name, source, offset] :
+         {std::tuple{"plain", text, 0}, std::tuple{"in a package", packaged, 1}}) {
+        DYNAMIC_SECTION(name) {
+            Analyzer analyzer;
+            const std::string uri = "file:///tmp/references_oob_bare_call.sv";
+            analyzer.open(uri, source);
+            const std::vector<int> want{3 + offset, 5 + offset, 10 + offset, 14 + offset};
+            const auto [proto_line, proto_col] = find_position(source, "one(int x);");
+            CHECK(reference_lines(analyzer.find_references(uri, proto_line, proto_col, true),
+                                  uri) == want);
+            const auto [call_line, call_col] = find_position(source, "one(2)");
+            CHECK(reference_lines(analyzer.find_references(uri, call_line, call_col, true),
+                                  uri) == want);
+            const auto [n_line, n_col] = find_position(source, "n;");
+            CHECK(reference_lines(analyzer.find_references(uri, n_line, n_col, true), uri) ==
+                  std::vector<int>{1 + offset, 11 + offset, 15 + offset});
+        }
+    }
+}
+
+// A class field declared in a header that is opened on its own: the package
+// that includes it also holds other `addr`s -- an interface clocking signal, a
+// DPI formal -- which the include bridge used to hand to references and rename.
+TEST_CASE("references: a header class field skips same-named names in the includer",
+          "[references][class]") {
+    const auto dir =
+        std::filesystem::temp_directory_path() / "lazyverilog_refs_header_field_bridge";
+    std::filesystem::create_directories(dir);
+    const auto item_path = dir / "item.svh";
+    const auto drv_path = dir / "drv.svh";
+    const auto pkg_path = dir / "pkg.sv";
+    const std::string item = R"(class item;
+  rand bit [7:0] addr;
+  function bit low();
+    return addr[0];
+  endfunction
+endclass
+)";
+    const std::string drv = R"(class drv;
+  virtual bus_if vif;
+  extern task drive(item it);
+endclass
+
+task drv::drive(item it);
+  vif.cb.addr <= it.addr;
+endtask
+)";
+    const std::string pkg = R"(package pkg;
+  import "DPI-C" function int golden(input int addr);
+  `include "item.svh"
+  `include "drv.svh"
+endpackage
+)";
+    for (const auto& [path, text] :
+         {std::pair{item_path, item}, std::pair{drv_path, drv}, std::pair{pkg_path, pkg}}) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string item_uri = uri_from_path(item_path);
+    const std::string drv_uri = uri_from_path(drv_path);
+    const std::string pkg_uri = uri_from_path(pkg_path);
+    analyzer.open(item_uri, item);
+
+    const auto [line, col] = find_position(item, "addr;");
+    const auto refs = analyzer.find_references(item_uri, line, col, true);
+    CAPTURE(refs.size());
+    CHECK(reference_lines(refs, item_uri) == std::vector<int>{1, 3});
+    CHECK(reference_lines(refs, pkg_uri).empty());
+    const auto [use_line, use_col] = find_position(drv, "addr;");
+    const auto [cb_line, cb_col] = find_position(drv, "addr <=");
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == drv_uri && ref.line == use_line && ref.col == use_col;
+    }));
+    CHECK_FALSE(std::any_of(refs.begin(), refs.end(), [&](const Location& ref) {
+        return ref.uri == drv_uri && ref.line == cb_line && ref.col == cb_col;
+    }));
+
+    std::filesystem::remove_all(dir);
+}
+
+// `t.op` in another open buffer, where `t` is a formal of an out-of-block
+// method: go-to-definition found the field, references did not.
+TEST_CASE("references: a class field reaches handle.field in another open buffer",
+          "[references][class]") {
+    Analyzer analyzer;
+    const std::string txn_uri = "file:///tmp/references_open_txn.svh";
+    const std::string pred_uri = "file:///tmp/references_open_pred.svh";
+    const std::string txn = R"(class txn;
+  int op;
+endclass
+)";
+    const std::string pred = R"(class pred;
+  int seen;
+  extern function void write(txn t);
+  function void inline_write(txn u);
+    seen = u.op;
+  endfunction
+endclass
+
+function void pred::write(txn t);
+  if (t.op == 1)
+    seen = t.op;
+endfunction
+)";
+    analyzer.open(txn_uri, txn);
+    analyzer.open(pred_uri, pred);
+
+    const auto refs = analyzer.find_references(txn_uri, 1, 6, true);
+    CHECK(reference_lines(refs, txn_uri) == std::vector<int>{1});
+    CHECK(reference_lines(refs, pred_uri) == std::vector<int>{4, 9, 10});
+}

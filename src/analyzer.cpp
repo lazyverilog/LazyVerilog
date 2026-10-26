@@ -6344,6 +6344,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     const bool allow_include_name_bridge =
         target && target_info.scope_package.empty() &&
         !target_symbol_debug.starts_with("class_method::");
+    // `vif.drv_cb.addr` is an interface item whatever it is called.
+    const bool bridge_skips_interface_items = target_symbol_debug.starts_with("class_field::");
     const SymbolID include_bridge_name_id =
         allow_include_name_bridge ? SymbolID::from_canonical("name:" + target->name) : SymbolID{};
 
@@ -6597,6 +6599,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         if (fallback_symbol_id && ref.symbol_id == fallback_symbol_id)
             return true;
         if (include_bridge_name_id && ref.symbol_id == include_bridge_name_id &&
+            !(bridge_skips_interface_items && ref.form == RefForm::ViaInterface) &&
             index_includes_target_source(index))
             return true;
         if (import_bridge_name_id && ref.symbol_id == import_bridge_name_id &&
@@ -6828,7 +6831,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             .col = ref.col,
             .end_line = ref_line,
             .end_col = ref.end_col,
-            .form = ref.form,
+            .form = ref.form == RefForm::ViaInterface ? RefForm::Plain : ref.form,
         });
     };
 
