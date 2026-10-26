@@ -6816,3 +6816,82 @@ TEST_CASE("formatter regression: a range edit replaces the lines asked for", "[f
     // Nothing but blank lines: no edit.
     CHECK_FALSE(formatted_span("a;\n\n\nb;\n", "a;\n\nb;\n", 3, 5));
 }
+
+TEST_CASE("formatter regression: disable fork in a format-off region opens no scope", "[formatter][regression]") {
+    // `fork` after `disable` / `wait` names the forks to stop or wait for;
+    // counted as an opener, it put every later line one level deeper.
+    for (const char* stmt : {"disable   fork;", "wait   fork;"}) {
+        INFO(stmt);
+        const std::string src = std::string("module m;\n"
+                                            "  initial begin\n"
+                                            "    // verilog_format: off\n"
+                                            "    ") + stmt + "\n"
+                                "    // verilog_format: on\n"
+                                "    x=1;\n"
+                                "  end\n"
+                                "endmodule\n";
+        const std::string want = std::string("module m;\n"
+                                             "  initial begin\n"
+                                             "    // verilog_format: off\n"
+                                             "    ") + stmt + "\n"
+                                 "    // verilog_format: on\n"
+                                 "    x = 1;\n"
+                                 "  end\n"
+                                 "endmodule\n";
+        CHECK(format_stable(src) == want);
+        std::string crlf;
+        for (char c : src)
+            crlf += c == '\n' ? std::string("\r\n") : std::string(1, c);
+        CHECK(format_stable(crlf).find("\n    x = 1;\n") != std::string::npos);
+    }
+}
+
+TEST_CASE("formatter regression: a define body in a format-off region opens no scope", "[formatter][regression]") {
+    // `` `define START begin `` writes a `begin` into the macro, not into the
+    // code around it, whether the body fits one line or continues.
+    for (const char* def : {"  `define START begin\n", "  `define START \\\n     begin\n"}) {
+        INFO(def);
+        CHECK(format_stable(std::string("module m;\n"
+                                        "  // verilog_format: off\n") +
+                            def +
+                            "  // verilog_format: on\n"
+                            "  assign g=h;\n"
+                            "endmodule\n") ==
+              std::string("module m;\n"
+                          "  // verilog_format: off\n") +
+                  def +
+                  "  // verilog_format: on\n"
+                  "  assign g = h;\n"
+                  "endmodule\n");
+    }
+}
+
+TEST_CASE("formatter regression: a range edit on CRLF lines keeps the line ends", "[formatter][regression]") {
+    // The span ended past the last line's `\r`, so applying the edit deleted
+    // it and joined the line's CRLF into a bare LF.
+    const std::string src = "module m;\r\nassign  a=b;\r\nassign c  =d;\r\nendmodule\r\n";
+    const std::string formatted = format_source(src, FormatOptions{});
+    const size_t begin = src.find("assign");
+    const size_t end = src.find("endmodule");
+    const auto span = formatted_span(src, formatted, begin, end);
+    REQUIRE(span);
+    CHECK(src.compare(span->source_end, 2, "\r\n") == 0);
+    CHECK(formatted[span->formatted_end] == '\n');
+    const std::string edited = src.substr(0, span->source_begin) +
+                               formatted.substr(span->formatted_begin, span->formatted_end - span->formatted_begin) +
+                               src.substr(span->source_end);
+    const std::string tail = "  assign c = d;\r\nendmodule\r\n";
+    CHECK(edited.compare(edited.size() - tail.size(), tail.size(), tail) == 0);
+}
+
+TEST_CASE("formatter regression: a line continuation after an ifdef stays on its line", "[formatter][regression]") {
+    // The `\` was a token of its own after the `` `ifdef `` and moved to the
+    // next line; the safety check then refused to format the file.
+    const std::string src = "module m;\n"
+                            "`ifdef X \\\n"
+                            "  `dv_fatal(\"x\")\n"
+                            "`endif\n"
+                            "endmodule\n";
+    const std::string once = format_stable(src);
+    CHECK(once.find("`ifdef X \\\n") != std::string::npos);
+}
