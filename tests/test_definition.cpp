@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <tuple>
 #include <vector>
 
 static const std::string kDefinitionFixture = R"(
@@ -460,6 +461,35 @@ TEST_CASE("definition: macro lookup uses open extra file AST", "[definition]") {
     CHECK(loc->end_col == 19);
 
     std::filesystem::remove(extra_path);
+}
+
+// A literal argument to a nested macro, and a default argument value, are
+// visible at their spelling inside the `define -- outside the subtree of the
+// module that expands them.  The cursor walk must not skip that subtree.
+TEST_CASE("definition: an identifier inside a same-file define body resolves", "[definition]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_define_body_edge.sv";
+    const std::string module_line = "module edge_m; logic sig_lit; logic sig_dflt; assign sig_a = "
+                                    "`LIT; assign sig_b = `DFLT(); endmodule\n";
+    analyzer.open(uri, "`define INNER(x) x\n"
+                       "`define LIT `INNER(sig_lit)\n"
+                       "`define DFLT(a=sig_dflt) a\n" +
+                           module_line);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    for (const auto& [line, col, name] :
+         {std::tuple{1, 19, std::string("sig_lit")}, std::tuple{2, 15, std::string("sig_dflt")}}) {
+        INFO(name);
+        const auto loc = analyzer.definition_of(uri, line, col);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == uri);
+        CHECK(loc->line == 3);
+        CHECK(loc->col == int(module_line.find(name + ";")));
+
+        params.position = lsPosition(line, col);
+        CHECK(provide_hover(analyzer, params).has_value());
+    }
 }
 
 // A keystroke in a listed open file no longer rebuilds the whole snapshot of
