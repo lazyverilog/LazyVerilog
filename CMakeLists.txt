@@ -131,6 +131,34 @@ if(NOT _pp_left EQUAL -1 OR _pp_ok EQUAL -1)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Patch (MinGW only): slang's SourceManager locks a std::shared_mutex on every
+# lookup, and MinGW's is a winpthreads rwlock that serializes across threads;
+# swap it for an SRWLOCK.  See cmake/slang/SourceManagerMutex.h.  MSVC and the
+# other platforms keep std::shared_mutex and an unpatched tree.
+# ──────────────────────────────────────────────────────────────────────────────
+if(MINGW)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/SourceManagerMutex.h"
+                   "${slang_SOURCE_DIR}/include/slang/text/SourceManagerMutex.h" COPYONLY)
+    foreach(_sm_file include/slang/text/SourceManager.h source/text/SourceManager.cpp)
+        file(READ "${slang_SOURCE_DIR}/${_sm_file}" _sm_content)
+        string(FIND "${_sm_content}" "SourceManagerMutex" _sm_done)
+        if(_sm_done EQUAL -1)
+            string(REPLACE "std::shared_mutex" "SourceManagerMutex" _sm_content "${_sm_content}")
+            string(REPLACE "#include <shared_mutex>"
+                   "#include <shared_mutex>\n#include \"slang/text/SourceManagerMutex.h\""
+                   _sm_content "${_sm_content}")
+            file(WRITE "${slang_SOURCE_DIR}/${_sm_file}" "${_sm_content}")
+        endif()
+    endforeach()
+    file(READ "${slang_SOURCE_DIR}/include/slang/text/SourceManager.h" _sm_content)
+    string(FIND "${_sm_content}" "slang/text/SourceManagerMutex.h" _sm_ok)
+    if(_sm_ok EQUAL -1)
+        message(FATAL_ERROR "Could not patch slang's SourceManager mutex; re-derive the patch.")
+    endif()
+    target_sources(slang_slang PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/SourceManagerMutex.cpp")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(
