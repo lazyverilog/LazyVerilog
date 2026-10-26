@@ -1218,6 +1218,13 @@ private:
     /// header_directives_only() and preload_open_parse_headers().  Cleared with
     /// the two maps above, so a re-indexed header re-earns its place.
     mutable std::unordered_set<std::string> standalone_header_uris_;
+    /// Filelist entries whose own parse this generation stood alone (true) or
+    /// did not (false), keyed by URI and tagged with that generation.  A listed
+    /// file another file `include`s is otherwise parsed twice per burst: once
+    /// from the queue and once as a claimed header.  With this, an includer
+    /// leaves a standalone one to its own shard and skips the standalone parse
+    /// of a fragment; see background_index_loop().  Cleared with the maps above.
+    mutable std::unordered_map<std::string, std::pair<uint64_t, bool>> listed_parse_stands_alone_;
     mutable std::vector<std::thread> background_indexers_;
     mutable std::atomic<bool> background_stop_{false};
 
