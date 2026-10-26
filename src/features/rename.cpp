@@ -7,46 +7,18 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace {
-
-/// Throws RenameRefused when the symbol at the position is declared outside
-/// @p project_root, in a file this rename does not own, or -- with
-/// @p require_declaration -- has no declaration this server can find (an
-/// inherited library member it cannot see, say).  Either way the rename could
-/// only ever be partial or empty.
-void refuse_unrenamable(const Analyzer& analyzer, const std::string& uri, int line, int col,
-                        const std::string& name, const std::filesystem::path& project_root,
-                        bool require_declaration) {
-    if (project_root.empty() && !require_declaration)
-        return;
-    const auto def = analyzer.definition_of(uri, line, col);
-    if (!def && require_declaration)
-        throw RenameRefused("cannot find the declaration of `" + name + "`; not renaming it");
-    if (!def)
-        return;
-    if (project_root.empty() || def->uri == uri)
-        return;
-    const auto root = normalize_filesystem_path(project_root).string();
-    const auto path = normalize_filesystem_path(path_from_file_uri(def->uri)).string();
-    if (path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
-        (path[root.size()] == '/' || path[root.size()] == '\\'))
-        return;
-    throw RenameRefused("`" + name + "` is declared outside this project, in " +
-                        path_from_file_uri(def->uri) +
-                        "; it cannot be renamed from here");
-}
-
-} // namespace
-
 std::optional<PrepareRenameResult> prepare_rename(const Analyzer& analyzer,
-                                                  const lsTextDocumentPositionParams& params,
-                                                  const std::filesystem::path& project_root) {
+                                                  const lsTextDocumentPositionParams& params) {
     auto ident = analyzer.identifier_at(params.textDocument.uri.raw_uri_, params.position.line,
                                         params.position.character);
     if (!ident || ident->name.empty())
         return std::nullopt;
-    refuse_unrenamable(analyzer, params.textDocument.uri.raw_uri_, params.position.line,
-                       params.position.character, ident->name, project_root, true);
+    // No declaration (an inherited member of a library class the server never
+    // indexed): rename would touch only the uses, so refuse it up front.
+    if (!analyzer.definition_of(params.textDocument.uri.raw_uri_, params.position.line,
+                                params.position.character))
+        throw RenameRefused("cannot find the declaration of `" + ident->name +
+                            "`; not renaming it");
 
     PrepareRenameResult result;
     result.range.start = lsPosition(ident->line, ident->col);
@@ -110,17 +82,12 @@ std::optional<std::string_view> text_in_range(std::string_view text, const lsRan
 } // namespace
 
 lsWorkspaceEdit provide_rename(const Analyzer& analyzer, const TextDocumentRename::Params& params,
-                               bool implicit_project, const std::filesystem::path& project_root) {
+                               bool implicit_project) {
     lsWorkspaceEdit workspace_edit;
     auto ident = analyzer.identifier_at(params.textDocument.uri.raw_uri_, params.position.line,
                                         params.position.character);
     if (!ident || ident->name.empty())
         return workspace_edit;
-    // A missing declaration is refused in prepare_rename(); here it just
-    // yields no references and so no edit.
-    refuse_unrenamable(analyzer, params.textDocument.uri.raw_uri_, params.position.line,
-                       params.position.character, ident->name, project_root, false);
-
     // shortcut: keyed on the name alone, so a signal spelled like a duplicated
     // module is refused too; resolve the declaration kind if users hit it.
     if (implicit_project) {

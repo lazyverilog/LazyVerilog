@@ -3640,3 +3640,64 @@ endfunction
     CHECK(reference_lines(refs, txn_uri) == std::vector<int>{1});
     CHECK(reference_lines(refs, pred_uri) == std::vector<int>{4, 9, 10});
 }
+
+// A method's formal or local spelled like a field of its class is its own
+// name.  Classifying it as the field made renaming `cfg::set`'s formal `n`
+// rewrite the field and every field use, and renaming the field rewrite the
+// formal but not `this.n` -- broken code either way.
+TEST_CASE("references: a method formal or local is not the same-named field",
+          "[references][class]") {
+    const std::string text = R"(package cpkg;
+  class base;
+    int bf;
+    virtual function void hook(); endfunction
+  endclass
+  class cfg extends base;
+    int n;
+    int addr;
+    rand bit [3:0] len;
+    constraint c_len { len < 8; }
+    extern function void set(int n);
+    extern function void set2(int addr);
+    function void set3(int addr);
+      this.addr = addr;
+    endfunction
+    function void hook(); bf = n; endfunction
+    covergroup cg; coverpoint len; endgroup
+  endclass
+  function void cfg::set(int n);
+    this.n = n;
+  endfunction
+  function void cfg::set2(int addr);
+    int len;
+    len = addr;
+    this.addr = addr + len;
+  endfunction
+endpackage
+)";
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_formal_vs_field.sv";
+    analyzer.open(uri, text);
+    const auto lines = [&](int line, int col) {
+        return reference_lines(analyzer.find_references(uri, line, col, true), uri);
+    };
+    // 0-based lines: field n 6, hook 15, set formal 18, this.n 19.
+    CHECK(lines(18, 29) == std::vector<int>{18, 19});
+    CHECK(lines(6, 8) == std::vector<int>{6, 15, 19});
+    // local len 22 vs field len 8, constraint 9, coverpoint 16.
+    CHECK(lines(22, 8) == std::vector<int>{22, 23, 24});
+    CHECK(lines(8, 19) == std::vector<int>{8, 9, 16});
+    // field addr: this.addr in set3 (13) and in the out-of-block set2 (24).
+    CHECK(lines(7, 8) == std::vector<int>{7, 13, 24});
+
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(6, 8);
+    params.newName = "count";
+    const auto edit = provide_rename(analyzer, params);
+    REQUIRE(edit.changes.has_value());
+    std::set<std::pair<int, int>> sites;
+    for (const auto& change : edit.changes->at(uri))
+        sites.emplace(change.range.start.line, change.range.start.character);
+    CHECK(sites == std::set<std::pair<int, int>>{{6, 8}, {15, 31}, {19, 9}});
+}

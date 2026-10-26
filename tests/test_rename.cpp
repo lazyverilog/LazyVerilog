@@ -510,22 +510,26 @@ TEST_CASE("rename of a module declared twice is allowed in an explicit project",
     CHECK(edit.changes->contains(uri_from_path(tree.dup_b)));
 }
 
-// A symbol declared in library code outside the project (uvm-core, vendor IP)
-// cannot be renamed from the project: prepareRename used to offer it and then
-// rename returned an empty edit, which reads as success.
-TEST_CASE("rename: refuses a symbol declared outside the asking project", "[rename]") {
+// prepareRename used to offer a symbol it could not find the declaration of
+// (an inherited uvm-core member the server never indexed), and rename then
+// returned an empty edit, which reads as success.  A module declared in a
+// filelist file outside the toml directory (`../rtl/leaf.sv`) is still the
+// project's own and renames everywhere.
+TEST_CASE("rename: refuses a symbol with no declaration, not one in another directory",
+          "[rename]") {
     const auto base = std::filesystem::temp_directory_path() / "lazyverilog_rename_outside";
-    const auto proj = base / "proj";
-    const auto lib = base / "lib";
-    std::filesystem::create_directories(proj);
-    std::filesystem::create_directories(lib);
-    const auto lib_path = lib / "fifo.sv";
-    const auto top_path = proj / "top.sv";
+    const auto sim = base / "sim";
+    const auto rtl = base / "rtl";
+    std::filesystem::create_directories(sim);
+    std::filesystem::create_directories(rtl);
+    const auto lib_path = rtl / "leaf.sv";
+    const auto top_path = sim / "tb.sv";
     const std::string lib_text = "module fifo;\nendmodule\n";
     const std::string top_text =
         "module top;\n  logic a;\n  fifo u_fifo();\n  assign a = nowhere;\nendmodule\n";
     std::ofstream(lib_path) << lib_text;
     std::ofstream(top_path) << top_text;
+    std::ofstream(sim / "lazyverilog.toml") << "";
 
     Analyzer analyzer;
     analyzer.set_extra_files({lib_path.string(), top_path.string()});
@@ -536,23 +540,15 @@ TEST_CASE("rename: refuses a symbol declared outside the asking project", "[rena
     lsTextDocumentPositionParams at_fifo;
     at_fifo.textDocument.uri.raw_uri_ = top_uri;
     at_fifo.position = lsPosition(2, 3);
-    REQUIRE(analyzer.definition_of(top_uri, 2, 3).has_value());
-
-    CHECK_THROWS_AS(prepare_rename(analyzer, at_fifo, proj), RenameRefused);
+    CHECK(prepare_rename(analyzer, at_fifo).has_value());
     TextDocumentRename::Params rename_fifo;
     rename_fifo.textDocument.uri.raw_uri_ = top_uri;
     rename_fifo.position = at_fifo.position;
     rename_fifo.newName = "fifo2";
-    CHECK_THROWS_AS(provide_rename(analyzer, rename_fifo, false, proj), RenameRefused);
-
-    // No project to judge by: offered as before.
-    CHECK(prepare_rename(analyzer, at_fifo).has_value());
-
-    // The project's own symbols still rename.
-    lsTextDocumentPositionParams at_a;
-    at_a.textDocument.uri.raw_uri_ = top_uri;
-    at_a.position = lsPosition(1, 8);
-    CHECK(prepare_rename(analyzer, at_a, proj).has_value());
+    const auto edit = provide_rename(analyzer, rename_fifo);
+    REQUIRE(edit.changes.has_value());
+    CHECK(edit.changes->contains(uri_from_path(lib_path)));
+    CHECK(edit.changes->contains(top_uri));
 
     // Nothing declares it, so a rename would be an empty edit that looks like success.
     lsTextDocumentPositionParams at_nowhere;
