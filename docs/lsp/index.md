@@ -6,8 +6,8 @@ Standard Language Server Protocol features. None of these need configuration exc
 |---------|--------------|
 | Hover | Kind, type, and documentation of the symbol under the cursor |
 | Go to definition | Jumps to the declaration |
-| Find references | All uses of a symbol, including macros (`` `WIDTH `` at its `` `define `` or any use) |
-| Rename | Renames a symbol across all references. Keywords cannot be renamed. Refused with a message when the server cannot find the symbol's declaration (for example a member inherited from a library class that is not in the filelist) or when a module declared more than once in an implicit project would be renamed. Overriding a library virtual method renames only your own declarations |
+| Find references | All uses of a symbol, including macros (`` `WIDTH `` at its `` `define `` or any use). A class method reports its whole override chain, the same set rename edits |
+| Rename | Renames a symbol across all references. Keywords cannot be renamed. Refused with a message when the server cannot find the symbol's declaration (for example a member inherited from a library class that is not in the filelist) or when a module declared more than once in an implicit project would be renamed. A class method renames its whole override chain: the base declaration, every override, `extern` and out-of-block bodies, `super.` calls and calls through any handle. The rename is refused, naming the declaration, when that chain reaches a file outside your project (a library such as uvm-core, or another project), or a base class that is not indexed |
 | Document highlight | Marks every occurrence of the symbol under the cursor in the current file |
 | Selection range | Expands the selection step by step to each enclosing piece of syntax (smart selection) |
 | Completion | Context-aware suggestions; see [Completion](completion.md) |

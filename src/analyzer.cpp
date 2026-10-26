@@ -4019,6 +4019,124 @@ static bool class_derives_from(std::span<const ClassLookupShard> shards, std::st
     return false;
 }
 
+/// The methods one virtual method stands for: renaming any of them without the
+/// rest silently turns an override into an unrelated method.
+struct OverrideChain {
+    struct Declaration {
+        std::string class_name;
+        Location location;
+    };
+    std::vector<std::string> classes;      ///< bare names, the root's subtree
+    std::vector<Declaration> declarations; ///< the root's first
+    std::string unseen_base;               ///< an ancestor no shard declares
+    std::string unseen_from;               ///< the class that extends it
+};
+
+/// Walk up from @p owner to the topmost ancestor declaring @p method, then down
+/// to every class deriving from that one.
+///
+/// Index facts only: one pass over the classes of @p shards, never a tree.
+/// Same-named classes resolve nearest-first to the file that names them, the
+/// rule find_module() uses.
+///
+/// shortcut: the index has no `virtual` flag, so a same-named non-virtual
+/// method in a subclass (hiding rather than overriding) joins the chain too.
+/// Renaming both keeps every binding as it was; add MethodEntry::is_virtual if
+/// users want them kept apart.
+static OverrideChain override_chain(std::span<const ClassLookupShard> shards,
+                                    std::string_view owner, std::string_view method,
+                                    std::string_view from_path) {
+    struct Seen {
+        const ClassEntry* cls;
+        const SyntaxIndex* index;
+        std::string uri;
+        std::string path;
+    };
+    std::vector<Seen> seen;
+    std::unordered_map<std::string, std::vector<size_t>> by_name;
+    for (const auto& shard : shards) {
+        for (const auto& cls : shard.index->classes) {
+            auto cls_uri = shard.index->source_uri(cls.file_id);
+            if (cls_uri.empty())
+                cls_uri = *shard.uri;
+            by_name[cls.name].push_back(seen.size());
+            auto cls_path = path_from_file_uri(cls_uri);
+            seen.push_back({&cls, shard.index, std::move(cls_uri), std::move(cls_path)});
+        }
+    }
+    const auto resolve = [&](const std::string& name,
+                             std::string_view from) -> std::optional<size_t> {
+        const auto it = by_name.find(name);
+        if (it == by_name.end())
+            return std::nullopt;
+        size_t best = it->second.front();
+        for (const size_t i : it->second)
+            if (path_proximity_score(from, seen[i].path) >
+                path_proximity_score(from, seen[best].path))
+                best = i;
+        return best;
+    };
+    // An open includer and the header's own shard can both carry one class.
+    const auto key = [&](size_t i) { return seen[i].uri + '\n' + seen[i].cls->name; };
+
+    OverrideChain chain;
+    const auto start = resolve(base_class_lookup_name(owner), from_path);
+    if (!start)
+        return chain;
+    size_t root = *start;
+    std::unordered_set<std::string> walked;
+    for (size_t cur = *start; walked.insert(key(cur)).second;) {
+        const auto& methods = seen[cur].cls->methods;
+        if (std::any_of(methods.begin(), methods.end(),
+                        [&](const MethodEntry& m) { return m.name == method; }))
+            root = cur;
+        const auto base = base_class_lookup_name(seen[cur].cls->base_class);
+        if (base.empty())
+            break;
+        const auto next = resolve(base, seen[cur].path);
+        if (!next) {
+            chain.unseen_base = base;
+            chain.unseen_from = seen[cur].cls->name;
+            break;
+        }
+        cur = *next;
+    }
+
+    std::unordered_map<std::string, std::vector<size_t>> children;
+    for (size_t i = 0; i < seen.size(); ++i) {
+        const auto base = base_class_lookup_name(seen[i].cls->base_class);
+        if (base.empty())
+            continue;
+        if (const auto parent = resolve(base, seen[i].path))
+            children[key(*parent)].push_back(i);
+    }
+
+    std::vector<size_t> queue{root};
+    std::unordered_set<std::string> visited{key(root)};
+    std::set<std::tuple<std::string, int, int>> declared;
+    for (size_t q = 0; q < queue.size(); ++q) {
+        const auto& c = seen[queue[q]];
+        chain.classes.push_back(c.cls->name);
+        for (const auto& m : c.cls->methods) {
+            if (m.name != method || m.line <= 0)
+                continue;
+            auto m_uri = c.index->source_uri(m.file_id);
+            if (m_uri.empty())
+                m_uri = c.uri;
+            const int m_line = to_lsp_line(m.line);
+            if (declared.emplace(m_uri, m_line, m.col).second)
+                chain.declarations.push_back(
+                    {c.cls->name, Location{m_uri, m_line, m.col, m_line,
+                                           m.col + lsp_column_width(m.name)}});
+        }
+        if (const auto it = children.find(key(queue[q])); it != children.end())
+            for (const size_t child : it->second)
+                if (visited.insert(key(child)).second)
+                    queue.push_back(child);
+    }
+    return chain;
+}
+
 /// Class that @p class_name extends, searched across shards.
 ///
 /// `super.member` names a member of the base class specifically.  Letting it
@@ -6839,7 +6957,8 @@ static bool target_kind_recoverable_from_shards(DefinitionTargetKind kind) {
 
 std::vector<Location> Analyzer::find_references(const std::string& uri, int line, int col,
                                                 bool include_declaration,
-                                                bool this_file_only) const {
+                                                bool this_file_only,
+                                                std::string* rename_refusal) const {
     auto target = identifier_at(uri, line, col);
     // References/Rename must not walk closed project-file ASTs.  Current and
     // other open files are live SyntaxTrees; closed project files require a
@@ -7373,9 +7492,15 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                          target_def->uri) != index.include_dependencies.end();
     };
 
+    // Filled below once the open buffers are known: every class in a method's
+    // override chain, under both spellings a use of it can take.
+    std::unordered_set<SymbolID, SymbolIDHash> override_chain_ids;
+
     auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref,
                                         const std::vector<ImportEntry>& imports) {
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
+            return true;
+        if (!override_chain_ids.empty() && override_chain_ids.contains(ref.symbol_id))
             return true;
         if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
             alias_symbol_ids.end())
@@ -7563,6 +7688,64 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // raw string mismatch here would fail to skip the file's own closed
         // shard, double-counting every reference in it.
         open_uris.insert(state ? uri_from_path(state->normalized_path) : state_uri);
+    }
+
+    // A class method is one link of an override chain: the base declaration,
+    // every override, `super.m()` and every call that can dispatch to any of
+    // them.  Renaming one link alone silently breaks the override.  Not for
+    // documentHighlight, which is asked on every cursor move and shows one file.
+    if (!this_file_only && target_symbol_debug.starts_with("class_method::")) {
+        const std::string_view rest =
+            std::string_view(target_symbol_debug).substr(std::string_view("class_method::").size());
+        if (const auto sep = rest.rfind("::"); sep != std::string_view::npos) {
+            const std::string member(rest.substr(sep + 2));
+            // Open buffers' live indexes, then the closed shards; never a tree.
+            std::vector<ClassLookupShard> class_shards;
+            class_shards.reserve(open_states.size() + extra_idx->size());
+            for (const auto& [state_uri, open] : open_states)
+                if (open)
+                    class_shards.push_back({&get_structural_index(*open), &state_uri});
+            for (const auto& extra : *extra_idx)
+                if (!open_uris.contains(extra.uri))
+                    class_shards.push_back({&extra.index_ref(), &extra.uri});
+            const auto chain = override_chain(class_shards, rest.substr(0, sep), member,
+                                              path_from_file_uri(target_def->uri));
+            for (const auto& name : chain.classes) {
+                override_chain_ids.insert(
+                    SymbolID::from_canonical(symbol_canonical("class_method", name, member)));
+                override_chain_ids.insert(
+                    SymbolID::from_canonical(symbol_canonical("class_member", name, member)));
+            }
+
+            // Who may edit a declaration: the asking file's own project, or the
+            // asking file itself.  Another project, a file under no project and
+            // a library outside the root all fail.  Without a resolver nothing
+            // knows who owns a file, so nothing is refused on that ground.
+            const bool knows_projects = parse_inputs && parse_inputs->has_resolver();
+            const auto editable = [&](const std::string& decl_uri) {
+                const auto path = normalize_filesystem_path(path_from_file_uri(decl_uri)).string();
+                if (!knows_projects || path == state->normalized_path)
+                    return true;
+                return !asking_project.empty() && project_of(path) == asking_project;
+            };
+            if (rename_refusal) {
+                for (const auto& decl : chain.declarations) {
+                    if (editable(decl.location.uri))
+                        continue;
+                    *rename_refusal =
+                        "`" + member + "` is one link of an override chain that includes `" +
+                        decl.class_name + "::" + member + "`, declared outside this project at " +
+                        path_from_file_uri(decl.location.uri) + ":" +
+                        std::to_string(decl.location.line + 1) +
+                        "; renaming it here would break the override, so it is not renamed";
+                    break;
+                }
+                if (rename_refusal->empty() && !chain.unseen_base.empty())
+                    *rename_refusal = "`" + chain.unseen_from + "` extends `" + chain.unseen_base +
+                                      "`, which is not indexed, so `" + member +
+                                      "` may override a method declared there; not renaming it";
+            }
+        }
     }
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,

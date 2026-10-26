@@ -1657,3 +1657,117 @@ TEST_CASE("a warning inside another project's macro body is not reported",
     CHECK(all_messages.find("truncates from 32 to 6 bits") != std::string::npos);
     CHECK(all_messages.find("truncates from 32 to 4 bits") != std::string::npos);
 }
+
+namespace {
+
+// base_c::run is virtual; derived_c overrides it with an extern prototype and an
+// out-of-block body that calls super.run(); top calls it through a base handle.
+// other_c::run is an unrelated non-virtual method of the same name.
+constexpr std::string_view kOverrideBase =
+    "class base_c;\n"                       // 0
+    "  virtual function void run(int x);\n" // 1
+    "  endfunction\n"                       // 2
+    "endclass\n"                            // 3
+    "class other_c;\n"                      // 4
+    "  function void run(int x);\n"         // 5
+    "  endfunction\n"                       // 6
+    "endclass\n";                           // 7
+constexpr std::string_view kOverrideDerived =
+    "class derived_c extends base_c;\n"            // 0
+    "  extern virtual function void run(int x);\n" // 1
+    "endclass\n"                                   // 2
+    "function void derived_c::run(int x);\n"       // 3
+    "  super.run(x);\n"                            // 4
+    "endfunction\n"                                // 5
+    "module top;\n"                                // 6
+    "  base_c b;\n"                                // 7
+    "  other_c o;\n"                               // 8
+    "  initial begin\n"                            // 9
+    "    b.run(1);\n"                              // 10
+    "    o.run(2);\n"                              // 11
+    "  end\n"                                      // 12
+    "endmodule\n";                                 // 13
+
+/// The derived file open, the base closed, both indexed; returns the derived URI.
+std::string open_override_chain(Analyzer& analyzer, const fs::path& base,
+                                const fs::path& derived) {
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({base.string(), derived.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(derived);
+    analyzer.open(uri, std::string(kOverrideDerived));
+    return uri;
+}
+
+TextDocumentRename::Params rename_run_at(const std::string& uri, int line, int col) {
+    TextDocumentRename::Params params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(line, col);
+    params.newName = "go";
+    return params;
+}
+
+std::set<std::pair<int, int>> edit_starts(const lsWorkspaceEdit& edit, const std::string& uri) {
+    std::set<std::pair<int, int>> starts;
+    if (edit.changes && edit.changes->contains(uri))
+        for (const auto& e : edit.changes->at(uri))
+            starts.emplace(e.range.start.line, e.range.start.character);
+    return starts;
+}
+
+} // namespace
+
+TEST_CASE("rename: a method renames its whole override chain inside the project",
+          "[rename][override-chain]") {
+    TempTree tree("override-chain");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto base = tree.write("proj/base.sv", kOverrideBase);
+    const auto derived = tree.write("proj/derived.sv", kOverrideDerived);
+    Analyzer analyzer;
+    const std::string uri = open_override_chain(analyzer, base, derived);
+    const std::string base_uri = uri_from_path(base);
+
+    const std::set<std::pair<int, int>> want_derived = {{1, 31}, {3, 25}, {4, 8}, {10, 6}};
+    const std::set<std::pair<int, int>> want_base = {{1, 24}};
+    // From the override's prototype, and from a call through the base handle.
+    for (const auto& [line, col] : {std::pair{1, 33}, std::pair{10, 7}}) {
+        CAPTURE(line, col);
+        const auto edit = provide_rename(analyzer, rename_run_at(uri, line, col));
+        CHECK(edit_starts(edit, uri) == want_derived);
+        CHECK(edit_starts(edit, base_uri) == want_base); // other_c::run untouched
+    }
+
+    // References answer for the same chain.
+    std::set<std::pair<std::string, int>> refs;
+    for (const auto& ref : analyzer.find_references(uri, 4, 9, true))
+        refs.emplace(ref.uri, ref.line);
+    CHECK(refs == std::set<std::pair<std::string, int>>{
+                      {base_uri, 1}, {uri, 1}, {uri, 3}, {uri, 4}, {uri, 10}});
+}
+
+TEST_CASE("rename: an override chain reaching outside the project is refused",
+          "[rename][override-chain]") {
+    // A library outside every root (uvm-core beside the project), and another
+    // project's file: neither is the user's to edit.
+    for (const std::string base_dir : {"lib", "other"}) {
+        CAPTURE(base_dir);
+        TempTree tree("override-chain-outside-" + base_dir);
+        tree.write("proj/lazyverilog.toml", "[design]\n");
+        if (base_dir == "other")
+            tree.write("other/lazyverilog.toml", "[design]\n");
+        const auto base = tree.write(base_dir + "/base.sv", kOverrideBase);
+        const auto derived = tree.write("proj/derived.sv", kOverrideDerived);
+        Analyzer analyzer;
+        const std::string uri = open_override_chain(analyzer, base, derived);
+
+        try {
+            provide_rename(analyzer, rename_run_at(uri, 1, 33));
+            FAIL("rename was not refused");
+        } catch (const RenameRefused& e) {
+            const std::string message = e.what();
+            CHECK(message.find("base_c::run") != std::string::npos);
+            CHECK(message.find("base.sv:2") != std::string::npos);
+        }
+    }
+}
