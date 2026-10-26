@@ -257,10 +257,12 @@ struct DocumentState {
     std::shared_ptr<const IncluderMacros> includer_macros;
     uint64_t includer_graph_generation{0};
     // The ones this text uses, by name, and the predefine slang got for them.
-    // Rebuilt only when the names change.  The extras are names recovered from
-    // an "unknown macro" a body built by token pasting asked for.
+    // Rebuilt only when the names change.  The extras are names the files this
+    // text includes use, or an "unknown macro" a pasting body asked for; the
+    // hidden ones are names those files define, which stay out.
     std::vector<std::string> includer_macro_names;
     std::vector<std::string> includer_macro_extras;
+    std::vector<std::string> includer_macro_hidden;
     std::shared_ptr<const std::string> includer_predefine;
     uint64_t doc_version{0};
     DocumentState() = default;
