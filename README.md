@@ -32,18 +32,6 @@
   <b>English</b>
   ·
   <a href="docs/i18n/README.ko.md">한국어</a>
-  ·
-  <a href="docs/i18n/README.zh-CN.md">简体中文</a>
-  ·
-  <a href="docs/i18n/README.ja.md">日本語</a>
-  ·
-  <a href="docs/i18n/README.de.md">Deutsch</a>
-  ·
-  <a href="docs/i18n/README.es.md">Español</a>
-  ·
-  <a href="docs/i18n/README.fr.md">Français</a>
-  ·
-  <a href="docs/i18n/README.pt.md">Português</a>
 </p>
 
 <p align="center">
@@ -209,7 +197,7 @@ Comparison of LazyVerilog and the two most commonly used open-source SystemVeril
 | Signature help | ✅ | ❌ | ✅ |
 | Inlay hints | ✅ | ❌ | ❌ |
 | Symbols | ✅ | ✅ | ✅ |
-| Lint autofix | ❌ | ✅ | ❌ |
+| Lint autofix | ⚠️ | ✅ | ❌ |
 | RTL code generation | ✅ | ❌ | ❌ |
 | RTL hierarchy view | ✅ | ❌ | ✅ |
 | Interface and connect | ✅ | ❌ | ❌ |
@@ -226,6 +214,7 @@ What LazyVerilog currently supports:
 |---------|--------|-------|
 | Formatting | ✅ | Configurable via `lazyverilog.toml` |
 | Lint diagnostics | ✅ | Parse diagnostics, optional semantic diagnostics, and configurable lint/style rules |
+| Lint quick fixes | ⚠️ | Add a missing `default`, add an `automatic` lifetime |
 | Go to definition | ✅ | Modules, instances, ports, named arguments, symbols, and macros |
 | Find references | ✅ | Symbols and macros across open files and configured project files |
 | Rename symbol | ✅ | Best-effort across project files |
@@ -233,7 +222,8 @@ What LazyVerilog currently supports:
 | Completion | ✅ | Context-aware auto-completions |
 | Signature help | ✅ | Functions and tasks |
 | Inlay hints | ✅ | Port directions on instantiation |
-| Workspace symbols | ✅ | Modules and classes from indexed design files |
+| Document symbols | ✅ | Outline of the current file |
+| Workspace symbols | ✅ | Modules, interfaces, packages, classes and methods; functions, tasks and typedefs; `pkg::name` queries |
 | RTL tree | ✅ | Module instantiation hierarchy |
 | Auto-instantiation / Auto-wire / Auto-arg / Auto-function / Auto-FF | ✅ | Various Code Actions for RTL generation |
 | Project-local config | ✅ | Full customization available by `lazyverilog.toml` at project root |

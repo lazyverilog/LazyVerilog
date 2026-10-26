@@ -12,12 +12,33 @@ Standard Language Server Protocol features. None of these need configuration exc
 | Selection range | Expands the selection step by step to each enclosing piece of syntax (smart selection) |
 | Completion | Context-aware suggestions; see [Completion](completion.md) |
 | Signature help | Parameters while typing a call or a `#(...)` list; triggers on `(` and `,` |
-| Workspace symbols | Case-insensitive substring search over modules and classes. Needs `[design].vcode` |
+| Document symbols | Outline of the current file; see below |
+| Workspace symbols | Search across the project; see below |
 | Inlay hints | See below |
 | Folding ranges | See [Folding](../folding/index.md) |
 
 Cross-file features need the project indexed through a filelist. See
 [Design & filelist](../design/index.md).
+
+## Document symbols
+
+The outline of the current file: modules, interfaces and packages with their ports, parameters,
+signals, functions, tasks, instances, modports and generate blocks; classes with their properties and
+methods; typedefs with their enum members and struct fields.
+
+## Workspace symbols
+
+A case-insensitive substring search over the open files and the indexed project files (the filelist,
+or the [implicit project](../configuration.md#without-a-lazyverilog-toml)):
+
+- modules, interfaces, packages and classes, and each class's methods, always;
+- functions and tasks of packages and modules, and typedefs (struct, enum, other), once the query is
+  not empty.
+
+`scope::name` matches `name` inside a package, class or module whose name contains `scope`, and
+`::scope::name` needs the scope to match exactly. An exact name ranks first, then a prefix, then a
+match at the start of a `_`-separated word, then anything else; at equal rank, modules, interfaces and
+packages come before classes, and classes before their members. At most 100 results are returned.
 
 ## Inlay hints
 

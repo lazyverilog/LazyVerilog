@@ -21,7 +21,9 @@ vim.keymap.set({ "n", "v" }, "<leader>ca", vim.lsp.buf.code_action)
 
 The code action menu offers [AutoInst](../autoinst/index.md), [AutoWire](../autowire/index.md),
 [AutoArg](../autoarg/index.md), [AutoFunc](../autofunc/index.md), and [AutoFF](../autoff/index.md)
-when the cursor is on a supported construct.
+when the cursor is on a supported construct, and [quick fixes](../linter/options.md#quick-fixes) for
+some lint diagnostics. Outside a class, it also offers `Insert always_ff block` and
+`Insert always_comb block`, which insert an empty template at the cursor line.
 
 ## Commands
 

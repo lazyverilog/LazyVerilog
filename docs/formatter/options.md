@@ -103,6 +103,20 @@ output  logic            valid
 ---
 
 
+### `log_path`
+
+A directory for the formatter's per-pass debug logs, for reporting a formatter bug. Empty (the default)
+writes nothing. A relative path is relative to the working directory of the server or
+`lazyverilog-fmt` process, not to `lazyverilog.toml`. The directory is created when needed, and every
+format, including format-on-save, writes to it, so leave it empty in normal use.
+
+```toml
+[format]
+log_path = "/tmp/lazyverilog-fmt-log"
+```
+
+---
+
 ### `enable_format_on_save`
 
 When `true`, the server formats the whole document on save. It does not stop other save-time
