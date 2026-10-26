@@ -585,6 +585,8 @@ void write_macro(Writer& w, const MacroEntry& m) {
     w.boolean(m.is_function_like);
     w.seq(m.params, [&](const std::string& p) { w.str(p); });
     w.i32(m.line);
+    w.i32(m.col);
+    w.str(m.body);
 }
 
 MacroEntry read_macro(Reader& r) {
@@ -594,6 +596,8 @@ MacroEntry read_macro(Reader& r) {
     m.is_function_like = r.boolean();
     m.params = r.seq<std::string>([&] { return std::string(r.str()); });
     m.line = r.i32();
+    m.col = r.i32();
+    m.body = r.str();
     return m;
 }
 
@@ -736,7 +740,7 @@ static_assert(sizeof(MethodEntry) == 112, "MethodEntry changed: update codec + k
 static_assert(sizeof(ClassEntry) == 160, "ClassEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(EnumMemberEntry) == 48, "EnumMemberEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(TypedefEntry) == 160, "TypedefEntry changed: update codec + kFormatVersion");
-static_assert(sizeof(MacroEntry) == 72, "MacroEntry changed: update codec + kFormatVersion");
+static_assert(sizeof(MacroEntry) == 104, "MacroEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ValueEntry) == 248, "ValueEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ImportEntry) == 120, "ImportEntry changed: update codec + kFormatVersion");
 // ReferenceEntry::form fits in the padding that already followed end_col, so

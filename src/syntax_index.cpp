@@ -39,23 +39,6 @@ static bool index_macro_has_user_source_location(const slang::SourceManager& sm,
     return name && name.location().valid() && sm.isFileLoc(name.location());
 }
 
-static MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
-                                          const slang::SourceManager& sm,
-                                          const DefineDirectiveSyntax& def) {
-    MacroEntry mac;
-    mac.name = std::string(def.name.valueText());
-    mac.file_id = resolver.for_declaration_token(index, sm, def.name);
-    if (def.formalArguments) {
-        mac.is_function_like = true;
-        for (const auto* arg : def.formalArguments->args) {
-            if (arg)
-                mac.params.push_back(std::string(arg->name.valueText()));
-        }
-    }
-    mac.line = token_pos_line1_col0(sm, def.name).first;
-    return mac;
-}
-
 /// See render_declaration_type_text(): a declaration a macro body created
 /// reports the tokens the macro produced; a hand-written one keeps the macro
 /// spelling the user typed.
@@ -702,8 +685,10 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                     .col = gc,
                 });
             }
-        } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            const auto& proto = *fn->prototype;
+        } else if (const auto* clocking = member->as_if<ClockingDeclarationSyntax>()) {
+            index_clocking_block(*clocking, index, resolver, sm, entry.name);
+        } else if (const auto* proto_ptr = member_subroutine_prototype(*member)) {
+            const auto& proto = *proto_ptr;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
             const auto name_tok = subroutine_name_token(proto);
             const auto fn_name = id_name ? std::string(id_name->identifier.valueText())
@@ -1180,8 +1165,8 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
             }
         } else if (const auto* cls = member->as_if<ClassDeclarationSyntax>()) {
             symbols.push_back(token_value_text(cls->name));
-        } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            const auto& proto = *fn->prototype;
+        } else if (const auto* proto_ptr = member_subroutine_prototype(*member)) {
+            const auto& proto = *proto_ptr;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
             symbols.push_back(id_name ? std::string(id_name->identifier.valueText())
                                       : render_syntax_node_text(sm, *proto.name));
@@ -1385,10 +1370,10 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         index.include_dependencies = collect_include_dependency_uris(sm, index.source_files.front());
     }
 
-    // Macros are queried from the live current-file layer.  Extra-file macro
-    // entries are intentionally skipped by Declarations depth to avoid both
-    // project-wide noise and the iteration cost on every .f background parse.
-    if (depth == IndexDepth::Full) {
+    // Macros defined in a closed file are only reachable through its shard, so
+    // a Declarations build keeps the ones written in the file it owns (a
+    // restricted build would otherwise repeat every included header's macros).
+    {
         // Note that slang also reports its built-in preprocessor macros here.
         // Those built-ins have no source location, so indexing them would leak
         // parser internals into completion and would make go-to-definition jump
@@ -1398,6 +1383,8 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
                 continue;
 
             if (!index_macro_has_user_source_location(sm, def->name))
+                continue;
+            if (depth != IndexDepth::Full && !resolver.accepts(index, sm, def->name))
                 continue;
 
             MacroEntry mac = macro_entry_from_define(index, resolver, sm, *def);

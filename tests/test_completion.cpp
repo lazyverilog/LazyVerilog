@@ -1705,6 +1705,50 @@ TEST_CASE("completion: MemberAccess resolves a virtual-interface class field",
     CHECK(has_label(result, "ready"));
 }
 
+TEST_CASE("completion: clocking block and its clockvars through a closed interface",
+          "[completion][clocking]") {
+    // The interface lives in a closed file, so only its shard can say that
+    // `drv_cb` is a clocking block and which signals it declares.
+    const auto iface = write_temp_sv_file("completion_clocking_iface.sv",
+                                          "interface cb_bus_if (input logic clk);\n"
+                                          "  logic valid;\n"
+                                          "  logic ready;\n"
+                                          "  clocking drv_cb @(posedge clk);\n"
+                                          "    output valid;\n"
+                                          "    input  ready;\n"
+                                          "  endclocking\n"
+                                          "endinterface\n");
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.set_extra_files({iface.string()});
+    analyzer.wait_for_background_index_idle();
+
+    // One incomplete access per buffer: a bare `vif.` line would parse
+    // together with the next one.
+    const auto user = [](const std::string& access) {
+        return "class cb_driver;\n"
+               "  virtual cb_bus_if vif;\n"
+               "  task run();\n"
+               "    " + access + "\n"
+               "  endtask\n"
+               "endclass\n";
+    };
+    const std::string uri = "file:///tmp/completion_clocking_user.sv";
+    analyzer.open(uri, user("vif."));
+    auto members = complete_at(engine, analyzer, uri, 3, 8);
+    CHECK(has_label(members, "drv_cb"));
+    CHECK(has_label(members, "valid"));
+
+    const std::string uri2 = "file:///tmp/completion_clocking_user2.sv";
+    analyzer.open(uri2, user("vif.drv_cb."));
+    auto clockvars = complete_at(engine, analyzer, uri2, 3, 15);
+    CHECK(has_label(clockvars, "ready"));
+    CHECK(has_label(clockvars, "valid"));
+    CHECK_FALSE(has_label(clockvars, "drv_cb"));
+
+    std::filesystem::remove(iface);
+}
+
 TEST_CASE("completion: EventControl suggests local signals", "[completion]") {
     CompletionEngine engine;
     Analyzer analyzer;

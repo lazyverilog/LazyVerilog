@@ -2120,11 +2120,7 @@ static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree
         if (!macro_has_user_source_location(sm, macro->name))
             continue;
 
-        std::string body;
-        for (const auto& token : macro->body)
-            body += token.toString();
-        body = trim_copy(body);
-
+        const auto body = macro_body_text(*macro);
         auto loc = location_from_token_actual_uri(sm, uri, macro->name);
         return SymbolInfo{.name = name,
                           .kind = "macro",
@@ -2133,6 +2129,41 @@ static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree
                           .col = loc.col};
     }
     return std::nullopt;
+}
+
+/// `` `define `` of @p name recorded in a shard: the closed-file half of
+/// find_macro_definition() / find_macro_info(), which need a live tree.
+static const MacroEntry* find_macro_entry(const SyntaxIndex& index, const std::string& name) {
+    for (const auto& mac : index.macros) {
+        if (mac.name == name && mac.line > 0)
+            return &mac;
+    }
+    return nullptr;
+}
+
+static std::optional<Location> find_macro_definition(const SyntaxIndex& index,
+                                                     const std::string& uri,
+                                                     const std::string& name) {
+    const auto* mac = find_macro_entry(index, name);
+    if (!mac)
+        return std::nullopt;
+    const auto actual_uri = index.source_uri(mac->file_id);
+    const int line = to_lsp_line(mac->line);
+    return Location{actual_uri.empty() ? uri : actual_uri, line, mac->col, line,
+                    mac->col + lsp_column_width(mac->name)};
+}
+
+static std::optional<SymbolInfo> find_macro_info(const SyntaxIndex& index, const std::string& uri,
+                                                 const std::string& name) {
+    const auto loc = find_macro_definition(index, uri, name);
+    if (!loc)
+        return std::nullopt;
+    const auto& body = find_macro_entry(index, name)->body;
+    return SymbolInfo{.name = name,
+                      .kind = "macro",
+                      .detail = body.empty() ? "(empty)" : body,
+                      .line = loc->line,
+                      .col = loc->col};
 }
 
 static std::optional<Location>
@@ -2762,7 +2793,8 @@ static std::string interface_name_from_type_text(std::string_view type_text) {
 static std::optional<Location> find_interface_member_definition(const SyntaxIndex& index,
                                                                 const std::string& uri,
                                                                 std::string_view interface_name,
-                                                                std::string_view member_name) {
+                                                                std::string_view member_name,
+                                                                std::string_view clocking = {}) {
     if (interface_name.empty() || member_name.empty())
         return std::nullopt;
     if (!index.interface_names.contains(std::string(interface_name)))
@@ -2782,6 +2814,15 @@ static std::optional<Location> find_interface_member_definition(const SyntaxInde
         return Location{actual_uri.empty() ? uri : actual_uri, lsp_line, col, lsp_line,
                         col + (int)name_size};
     };
+
+    if (!clocking.empty()) {
+        const auto scope = std::string(interface_name) + "." + std::string(clocking);
+        for (const auto& value : index.values) {
+            if (value.kind == "clockvar" && value.parent_scope == scope && value.name == member_name)
+                return locate(value.file_id, value.line, value.col, lsp_column_width(value.name));
+        }
+        return std::nullopt;
+    }
 
     for (const auto& modport : iface.modports) {
         if (modport.name == member_name)
@@ -4986,17 +5027,31 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     // other is the disagreement this ordering exists to prevent.
     auto extra_files = ranked_extra_files(*state);
 
-    if (target.kind == DefinitionTargetKind::Macro) {
-        if (auto info = find_macro_info(*state->tree, uri, target.name))
+    // A macro this file's own parse never saw defined (it comes from an earlier
+    // file of the compilation unit) is no Macro target; spot it by its
+    // backtick, as definition_of_state() does.
+    std::string macro_name = target.kind == DefinitionTargetKind::Macro ? target.name : "";
+    if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
+        if (auto span = extract_ident_span(state->text, line, col);
+            span && is_backtick_identifier(state->text, line, span->start_col))
+            macro_name = span->text;
+    }
+    if (!macro_name.empty()) {
+        if (auto info = find_macro_info(*state->tree, uri, macro_name))
             return info;
         if (auto info = first_ranked_tree_answer(
                 *extra_files, &uri,
                 [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
-                    return find_macro_info(tree, tree_uri, target.name);
+                    return find_macro_info(tree, tree_uri, macro_name);
+                }))
+            return info;
+        if (auto info = first_ranked_answer<ExtraFileInfo>(
+                *extra_files, &uri, [&](const ExtraFileInfo& extra) {
+                    return find_macro_info(extra.index_ref(), extra.uri, macro_name);
                 }))
             return info;
         return SymbolInfo{
-            .name = target.name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
+            .name = macro_name, .kind = "macro", .detail = "(empty)", .line = line, .col = col};
     }
 
     // Reuse the extra-file snapshot already collected for hover.  Calling
@@ -5655,30 +5710,32 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     auto target = queries ? queries->target_at(line, col)
                           : definition_target_at(*state.tree, uri, line, col);
 
+    // This tree, then open buffers, then shards: a macro defined in a closed
+    // file is known only to that file's shard.
+    const auto find_macro = [&](const std::string& name) -> std::optional<Location> {
+        if (auto loc = this_tree({"macro", name},
+                                 [&] { return find_macro_definition(*state.tree, uri, name); }))
+            return loc;
+        if (auto loc = nearest_open_buffer_answer(
+                [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
+                    return find_macro_definition(tree, tree_uri, name);
+                }))
+            return loc;
+        return nearest_shard_answer([&](const ExtraFileInfo& extra) {
+            return find_macro_definition(extra.index_ref(), extra.uri, name);
+        });
+    };
+
     if (target.kind == DefinitionTargetKind::None || target.name.empty()) {
         auto ident = extract_ident_span(state.text, line, col);
         if (!ident || (!is_backtick_identifier(state.text, line, ident->start_col) &&
                        !is_define_identifier(state.text, line, ident->start_col)))
             return std::nullopt;
-
-        if (auto loc = this_tree({"macro", ident->text},
-                                 [&] { return find_macro_definition(*state.tree, uri, ident->text); }))
-            return loc;
-        return nearest_open_buffer_answer(
-            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
-                return find_macro_definition(tree, tree_uri, ident->text);
-            });
+        return find_macro(ident->text);
     }
 
-    if (target.kind == DefinitionTargetKind::Macro) {
-        if (auto loc = this_tree({"macro", target.name},
-                                 [&] { return find_macro_definition(*state.tree, uri, target.name); }))
-            return loc;
-        return nearest_open_buffer_answer(
-            [&](const slang::syntax::SyntaxTree& tree, const std::string& tree_uri) {
-                return find_macro_definition(tree, tree_uri, target.name);
-            });
-    }
+    if (target.kind == DefinitionTargetKind::Macro)
+        return find_macro(target.name);
 
     // One branch for both.  `.name(...)` at an instantiation is spelled the same
     // way whether it connects a port or overrides a parameter, and either way
@@ -5861,6 +5918,7 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         };
 
         class_type = resolve_alias_chain(std::move(class_type));
+        const auto receiver_type = class_type;
 
         // Follow the rest of the chain one field at a time: the type of `a.b` is
         // the type of field `b` inside `a`'s type.  Bounded by the number of
@@ -5913,7 +5971,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // receiver's declared type names an interface, and the member is one of
         // that interface's signals.  Also covers a cursor on the modport of
         // `AXI_BUS.Slave`, where the receiver is the interface name itself.
-        if (target.object_path.size() <= 1) {
+        // `vif.drv_cb.ready` is one hop longer: the middle segment names a
+        // clocking block of the interface and the member is one of its clockvars.
+        if (target.object_path.size() <= 2) {
+            const std::string clocking =
+                target.object_path.size() == 2 ? target.object_path[1] : std::string{};
             std::string interface_name;
             if (auto type_text = declared_type_text_for_object_reference(
                     current_index, target.scope_module, base_receiver, use_line_one_based))
@@ -5923,17 +5985,17 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             // receiver type already resolved for the class path is the answer
             // there: `virtual bus_if #(.W_ADDR(8)) vif;` reduces to `bus_if`,
             // whose members live where an instance's do.
-            if (interface_name.empty() && class_type)
-                interface_name = interface_name_from_type_text(*class_type);
+            if (interface_name.empty() && receiver_type)
+                interface_name = interface_name_from_type_text(*receiver_type);
             if (interface_name.empty())
                 interface_name = base_receiver;
 
             if (auto loc = find_interface_member_definition(current_index, uri, interface_name,
-                                                            target.name))
+                                                            target.name, clocking))
                 return loc;
             if (auto loc = nearest_shard_answer([&](const ExtraFileInfo& extra) {
                     return find_interface_member_definition(extra.index_ref(), extra.uri,
-                                                            interface_name, target.name);
+                                                            interface_name, target.name, clocking);
                 }))
                 return loc;
         }

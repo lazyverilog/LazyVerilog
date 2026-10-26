@@ -668,11 +668,13 @@ void process_module(const ModuleDeclarationSyntax& node, SyntaxIndex& index,
                 add_value(index, resolver, sm, decl->name, with_dims(sm, *type, *decl), "variable",
                           module.name);
             }
-        } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
-            if (auto* value = add_value(index, resolver, sm, fn->prototype->keyword,
-                                        node_text_raw(sm, *fn->prototype->returnType), "function",
+        } else if (const auto* clocking = member->as_if<ClockingDeclarationSyntax>()) {
+            index_clocking_block(*clocking, index, resolver, sm, module.name);
+        } else if (const auto* proto = member_subroutine_prototype(*member)) {
+            if (auto* value = add_value(index, resolver, sm, proto->keyword,
+                                        node_text_raw(sm, *proto->returnType), "function",
                                         module.name))
-                value->name = node_text_raw(sm, *fn->prototype->name);
+                value->name = node_text_raw(sm, *proto->name);
         } else if (const auto* ps = member->as_if<ParameterDeclarationStatementSyntax>()) {
             // Body parameters (`localparam DEPTH = 1;`), as opposed to header
             // `#(...)` parameters handled above.  Mirrors the same branch in
@@ -789,14 +791,14 @@ void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& index,
                     index.package_symbols[module.name].push_back(token_value_text(decl->name));
                 }
             }
-        } else if (const auto* fn = member->as_if<FunctionDeclarationSyntax>()) {
+        } else if (const auto* proto_ptr = member_subroutine_prototype(*member)) {
             // Mirrors the package branch in syntax_index.cpp.  The entry must
             // carry the declaration position: without it go-to-definition on an
             // imported package subroutine lands on line 0 / column 0 whenever
             // the package file happens to be open in the editor, because the
             // open buffer is answered from this shard instead of the
             // disk-backed one.
-            const auto& proto = *fn->prototype;
+            const auto& proto = *proto_ptr;
             const auto* id_name = proto.name->as_if<IdentifierNameSyntax>();
             const auto name_tok = subroutine_name_token(proto);
             const auto name = id_name ? std::string(id_name->identifier.valueText())
@@ -872,19 +874,7 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
     for (const auto* def : tree.getDefinedMacros()) {
         if (!def || !def->name || !def->name.location().valid() || !sm.isFileLoc(def->name.location()))
             continue;
-        auto [line, _] = token_pos_line1_col0(sm, def->name);
-        MacroEntry mac;
-        mac.name = token_value_text(def->name);
-        mac.file_id = resolver.for_declaration_token(index, sm, def->name);
-        mac.line = line;
-        if (def->formalArguments) {
-            mac.is_function_like = true;
-            for (const auto* arg : def->formalArguments->args) {
-                if (arg)
-                    mac.params.push_back(token_value_text(arg->name));
-            }
-        }
-        index.macros.push_back(std::move(mac));
+        index.macros.push_back(macro_entry_from_define(index, resolver, sm, *def));
     }
 }
 
