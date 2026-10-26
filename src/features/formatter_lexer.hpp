@@ -916,41 +916,158 @@ private:
     // in a comment or a string is no keyword.
     static std::vector<slang::parsing::TokenKind> unmatched_block_keywords(std::string_view body) {
         using TKind = slang::parsing::TokenKind;
-        auto opens = [](TKind k) {
-            return k == TKind::BeginKeyword || k == TKind::ForkKeyword || k == TKind::CaseKeyword ||
-                   k == TKind::CaseXKeyword || k == TKind::CaseZKeyword || k == TKind::RandCaseKeyword;
-        };
-        auto closes = [](TKind k) {
-            return k == TKind::EndKeyword || k == TKind::JoinKeyword || k == TKind::JoinAnyKeyword ||
-                   k == TKind::JoinNoneKeyword || k == TKind::EndCaseKeyword;
-        };
-        std::vector<TKind> closers, openers;
-        SourceTextLexer lexer(body);
-        TKind prev = TKind::Unknown;
-        bool in_directive = false;
-        for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; prev = token.kind, token = lexer.lex()) {
-            bool new_line = false;
-            for (const auto& trivia : token.trivia())
-                new_line = new_line || trivia.kind == slang::parsing::TriviaKind::EndOfLine;
-            if (new_line && prev != TKind::LineContinuation)
-                in_directive = false;
-            // `` `define START begin `` -- a directive line, a macro body
-            // included, opens nothing where it is written.
-            if (token.kind == TKind::Directive && token.directiveKind() != slang::syntax::SyntaxKind::MacroUsage)
-                in_directive = true;
-            // `disable fork;` / `wait fork;` name the forks; they open none.
-            if (in_directive || (token.kind == TKind::ForkKeyword &&
-                                 (prev == TKind::DisableKeyword || prev == TKind::WaitKeyword)))
-                continue;
-            if (opens(token.kind))
-                openers.push_back(token.kind);
-            else if (closes(token.kind) && !openers.empty())
-                openers.pop_back();
-            else if (closes(token.kind))
-                closers.push_back(token.kind);
+        // The body's code tokens; a directive line, a macro body included,
+        // opens nothing where it is written (`` `define START begin ``).
+        std::vector<TKind> ks;
+        {
+            SourceTextLexer lexer(body);
+            TKind prev = TKind::Unknown;
+            bool in_directive = false;
+            for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; prev = token.kind, token = lexer.lex()) {
+                bool new_line = false;
+                for (const auto& trivia : token.trivia())
+                    new_line = new_line || trivia.kind == slang::parsing::TriviaKind::EndOfLine;
+                if (new_line && prev != TKind::LineContinuation)
+                    in_directive = false;
+                if (token.kind == TKind::Directive && token.directiveKind() != slang::syntax::SyntaxKind::MacroUsage)
+                    in_directive = true;
+                if (!in_directive)
+                    ks.push_back(token.kind);
+            }
         }
-        closers.insert(closers.end(), openers.begin(), openers.end());
-        return closers;
+        auto at = [&](size_t i) { return i < ks.size() ? ks[i] : TKind::Unknown; };
+        // Which closer ends which opener, as IndentPass pairs them.
+        auto pairs = [](TKind closer, TKind opener) {
+            switch (closer) {
+            case TKind::EndKeyword: return opener == TKind::BeginKeyword;
+            case TKind::JoinKeyword: case TKind::JoinAnyKeyword: case TKind::JoinNoneKeyword:
+                return opener == TKind::ForkKeyword;
+            case TKind::EndCaseKeyword:
+                return opener == TKind::CaseKeyword || opener == TKind::CaseXKeyword ||
+                       opener == TKind::CaseZKeyword || opener == TKind::RandCaseKeyword;
+            case TKind::EndFunctionKeyword: return opener == TKind::FunctionKeyword;
+            case TKind::EndTaskKeyword: return opener == TKind::TaskKeyword;
+            case TKind::EndClassKeyword: return opener == TKind::ClassKeyword;
+            case TKind::EndGenerateKeyword: return opener == TKind::GenerateKeyword;
+            case TKind::EndGroupKeyword: return opener == TKind::CoverGroupKeyword;
+            case TKind::EndPropertyKeyword: return opener == TKind::PropertyKeyword;
+            case TKind::EndSequenceKeyword:
+                return opener == TKind::SequenceKeyword || opener == TKind::RandSequenceKeyword;
+            case TKind::EndClockingKeyword: return opener == TKind::ClockingKeyword;
+            case TKind::EndSpecifyKeyword: return opener == TKind::SpecifyKeyword;
+            case TKind::EndTableKeyword: return opener == TKind::TableKeyword;
+            case TKind::EndCheckerKeyword: return opener == TKind::CheckerKeyword;
+            case TKind::EndConfigKeyword: return opener == TKind::ConfigKeyword;
+            case TKind::EndPrimitiveKeyword: return opener == TKind::PrimitiveKeyword;
+            case TKind::EndModuleKeyword:
+                return opener == TKind::ModuleKeyword || opener == TKind::MacromoduleKeyword;
+            case TKind::EndInterfaceKeyword: return opener == TKind::InterfaceKeyword;
+            case TKind::EndPackageKeyword: return opener == TKind::PackageKeyword;
+            case TKind::EndProgramKeyword: return opener == TKind::ProgramKeyword;
+            default: return false;
+            }
+        };
+        static constexpr TKind kOpeners[] = {
+            TKind::BeginKeyword, TKind::ForkKeyword, TKind::CaseKeyword, TKind::FunctionKeyword,
+            TKind::TaskKeyword, TKind::ClassKeyword, TKind::GenerateKeyword, TKind::CoverGroupKeyword,
+            TKind::PropertyKeyword, TKind::SequenceKeyword, TKind::ClockingKeyword, TKind::SpecifyKeyword,
+            TKind::TableKeyword, TKind::CheckerKeyword, TKind::ConfigKeyword, TKind::PrimitiveKeyword,
+            TKind::ModuleKeyword, TKind::InterfaceKeyword, TKind::PackageKeyword, TKind::ProgramKeyword};
+        auto is_closer = [&](TKind k) {
+            return std::any_of(std::begin(kOpeners), std::end(kOpeners), [&](TKind o) { return pairs(k, o); });
+        };
+        // The keywords that open a scope where they stand, read from their
+        // neighbours as SyntaxPass reads them (is_prototype_at(),
+        // opens_design_unit_at(), opens_indent_scope_at()).  `prototype`
+        // says the keyword follows `extern`, `pure`, `import` or `export`
+        // and only qualifiers since.
+        auto opens = [&](size_t i, bool prototype) {
+            const TKind p = i > 0 ? ks[i - 1] : TKind::Unknown;
+            switch (ks[i]) {
+            case TKind::BeginKeyword: case TKind::CaseKeyword: case TKind::CaseXKeyword:
+            case TKind::CaseZKeyword: case TKind::RandCaseKeyword: case TKind::RandSequenceKeyword:
+            case TKind::GenerateKeyword: case TKind::CoverGroupKeyword: case TKind::SpecifyKeyword:
+            case TKind::TableKeyword: case TKind::CheckerKeyword: case TKind::ConfigKeyword:
+            case TKind::PrimitiveKeyword: case TKind::PackageKeyword: case TKind::ProgramKeyword:
+                return true;
+            // `disable fork;` / `wait fork;` name the forks.
+            case TKind::ForkKeyword: return p != TKind::DisableKeyword && p != TKind::WaitKeyword;
+            // `covergroup cg with function sample(...)` has no body.
+            case TKind::FunctionKeyword: case TKind::TaskKeyword: return !prototype && p != TKind::WithKeyword;
+            case TKind::ClassKeyword:
+                return p != TKind::TypedefKeyword &&
+                       !(p == TKind::InterfaceKeyword && i > 1 && ks[i - 2] == TKind::TypedefKeyword);
+            case TKind::PropertyKeyword: case TKind::SequenceKeyword:
+                return p != TKind::AssertKeyword && p != TKind::AssumeKeyword && p != TKind::CoverKeyword &&
+                       p != TKind::RestrictKeyword && p != TKind::ExpectKeyword;
+            case TKind::ClockingKeyword:
+                return at(i + 1) == TKind::At || (at(i + 1) == TKind::Identifier && at(i + 2) == TKind::At);
+            case TKind::ModuleKeyword: case TKind::MacromoduleKeyword: return p != TKind::ExternKeyword;
+            case TKind::InterfaceKeyword:
+                return p != TKind::ExternKeyword && p != TKind::VirtualKeyword &&
+                       p != TKind::OpenParenthesis && p != TKind::Comma && at(i + 1) != TKind::ClassKeyword &&
+                       at(i + 1) != TKind::Dot;
+            default: return false;
+            }
+        };
+        // A plain `end` never reaches past one of these to find its `begin`
+        // (is_declaration_scope()), nor past a design unit.
+        auto walls_generic_closer = [](TKind opener) {
+            return opener == TKind::FunctionKeyword || opener == TKind::TaskKeyword ||
+                   opener == TKind::GenerateKeyword || opener == TKind::CoverGroupKeyword ||
+                   opener == TKind::PropertyKeyword || opener == TKind::SequenceKeyword ||
+                   opener == TKind::ClockingKeyword || opener == TKind::SpecifyKeyword ||
+                   opener == TKind::TableKeyword || opener == TKind::ClassKeyword ||
+                   opener == TKind::ModuleKeyword || opener == TKind::MacromoduleKeyword ||
+                   opener == TKind::InterfaceKeyword || opener == TKind::PackageKeyword ||
+                   opener == TKind::ProgramKeyword || opener == TKind::CheckerKeyword ||
+                   opener == TKind::ConfigKeyword || opener == TKind::PrimitiveKeyword;
+        };
+        // The keywords left unmatched, in order.  A pair closed inside the
+        // body drops out (IndentPass would undo it), so `open` holds the
+        // body's still-open openers as indices into `out`.
+        std::vector<TKind> out;
+        std::vector<size_t> open;
+        bool prototype = false;
+        for (size_t i = 0; i < ks.size(); ++i) {
+            const TKind k = ks[i];
+            const bool proto_before = prototype;
+            switch (k) {
+            case TKind::ExternKeyword: case TKind::PureKeyword: case TKind::ImportKeyword:
+            case TKind::ExportKeyword:
+                prototype = true;
+                break;
+            case TKind::VirtualKeyword: case TKind::StaticKeyword: case TKind::ProtectedKeyword:
+            case TKind::LocalKeyword: case TKind::ContextKeyword: case TKind::ForkJoinKeyword:
+            case TKind::StringLiteral: case TKind::Identifier: case TKind::Equals:
+                break;
+            default:
+                prototype = false;
+            }
+            if (opens(i, proto_before)) {
+                open.push_back(out.size());
+                out.push_back(k);
+                continue;
+            }
+            if (!is_closer(k))
+                continue;
+            const bool generic = k == TKind::EndKeyword || k == TKind::JoinKeyword ||
+                                 k == TKind::JoinAnyKeyword || k == TKind::JoinNoneKeyword ||
+                                 k == TKind::EndCaseKeyword;
+            size_t n = open.size();
+            while (n > 0 && !pairs(k, out[open[n - 1]]) && !(generic && walls_generic_closer(out[open[n - 1]])))
+                --n;
+            if (n > 0 && pairs(k, out[open[n - 1]])) {
+                out.resize(open[n - 1]);
+                open.resize(n - 1);
+            } else {
+                // It closes something before the region, and with it
+                // whatever the body left open inside that.
+                out.push_back(k);
+                open.clear();
+            }
+        }
+        return out;
     }
 
     void collect_disabled_region_body() {

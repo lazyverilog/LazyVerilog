@@ -101,9 +101,11 @@ struct LexemeFacts {
 
     // The block keywords a disabled region body leaves unmatched, in source
     // order: the `end` of a `begin` opened before the region, then a `begin`
-    // it leaves open for code after it (`begin`/`end`, `fork`/`join*`,
-    // `case`/`endcase`).  The body is one verbatim token, so without this the
-    // scope depth after it was the depth before it.
+    // it leaves open for code after it: every scope keyword pair IndentPass
+    // knows (`begin`/`end`, `fork`/`join*`, `case`/`endcase`,
+    // `function`/`endfunction`, `class`/`endclass`, `module`/`endmodule`,
+    // ...).  The body is one verbatim token, so without this the scope depth
+    // after it was the depth before it.
     std::vector<slang::parsing::TokenKind> disabled_region_scope_keywords;
 };
 
