@@ -236,8 +236,19 @@ static std::optional<SubroutineInfo> subroutine_from_tree(const SyntaxTree& tree
             if (ambiguous || name_text(*node.prototype->name) != name)
                 return;
 
-            SubroutineInfo info = subroutine_info_from_declaration(node);
+            consider(subroutine_info_from_declaration(node));
+        }
 
+        // `extern task one(int x);` -- its out-of-body definition is spelled
+        // `k::one`, so the prototype is the declaration the bare name matches.
+        void handle(const ClassMethodPrototypeSyntax& node) {
+            if (ambiguous || !node.prototype || !node.prototype->name ||
+                name_text(*node.prototype->name) != name)
+                return;
+            consider(subroutine_info_from_prototype(*node.prototype));
+        }
+
+        void consider(SubroutineInfo info) {
             if (result && !same_signature(*result, info)) {
                 ambiguous = true;
                 result.reset();

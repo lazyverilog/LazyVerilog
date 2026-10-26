@@ -487,6 +487,75 @@ TEST_CASE("signature help: an unambiguous constructor still resolves", "[signatu
     CHECK(help->signatures[0].label.find("only_arg") != std::string::npos);
 }
 
+// The formals of an extern method are on its prototype; the out-of-body
+// definition is spelled `k::one`, which a bare `one(` never matches.
+TEST_CASE("signature help: a bare call to an extern method shows its prototype", "[signature]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_sig_extern.sv";
+    const std::string text = "class k;\n"
+                             "  extern task one(int x);\n"
+                             "  extern function int two(int y);\n"
+                             "  task t();\n"
+                             "    one(2);\n"
+                             "    void'(two(3));\n"
+                             "  endtask\n"
+                             "endclass\n"
+                             "task k::one(int x);\n"
+                             "endtask\n"
+                             "function int k::two(int y);\n"
+                             "  return y;\n"
+                             "endfunction\n";
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(4, (int)std::string("    one(").size());
+    auto task_help = provide_signature_help(analyzer, params);
+    REQUIRE(task_help.has_value());
+    REQUIRE(!task_help->signatures.empty());
+    CHECK(task_help->signatures[0].label == "task one(int x)");
+
+    params.position = lsPosition(5, (int)std::string("    void'(two(").size());
+    auto function_help = provide_signature_help(analyzer, params);
+    REQUIRE(function_help.has_value());
+    REQUIRE(!function_help->signatures.empty());
+    CHECK(function_help->signatures[0].label == "function int two(int y)");
+}
+
+TEST_CASE("hover: a class method shows its arguments", "[hover]") {
+    const auto path = std::filesystem::temp_directory_path() / "lazyverilog_hover_method_args.sv";
+    const std::string text = R"SV(class drv;
+  int n;
+  extern task run();
+  extern protected task one(int x);
+endclass
+task drv::run();
+  one(2);
+endtask
+task drv::one(int x);
+  n = x;
+endtask
+)SV";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << text;
+    }
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(path);
+    analyzer.open(uri, text);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(6, 2);
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    INFO(hover->contents.second->value);
+    CHECK(hover->contents.second->value.find("task one(int x)") != std::string::npos);
+}
+
 TEST_CASE("hover: a macro-declared member resolves to the named owner class", "[hover]") {
     const auto header = std::filesystem::temp_directory_path() / "lazyverilog_hover_utils.svh";
     {

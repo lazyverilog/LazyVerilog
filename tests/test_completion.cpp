@@ -3,8 +3,10 @@
 #include "string_utils.hpp"
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1555,6 +1557,133 @@ TEST_CASE("completion: this. returns the enclosing class members including inher
     CHECK(has_label(result, "derived_field"));
     CHECK(has_label(result, "run"));
     CHECK(has_label(result, "base_field"));
+}
+
+// An out-of-body method (`function void d::build`) sits outside the class
+// declaration, but its body is still the class's scope.
+TEST_CASE("completion: this. and super. inside an out-of-body method", "[completion][handle]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_oob_this_super.sv";
+    const std::string text = "class plain_base;\n"
+                             "  int pfield;\n"
+                             "  virtual function void build(int a);\n"
+                             "  endfunction\n"
+                             "endclass\n"
+                             "class d2 extends plain_base;\n"
+                             "  int own;\n"
+                             "  extern virtual function void build(int a);\n"
+                             "  extern task run();\n"
+                             "endclass\n"
+                             "function void d2::build(int a);\n"
+                             "  this.\n"
+                             "  super.\n"
+                             "endfunction\n";
+    analyzer.open(uri, text);
+
+    auto [tl, tc] = pos_after(text, "  this.");
+    auto with_this = complete_at(engine, analyzer, uri, tl, tc);
+    CHECK(has_label(with_this, "own"));
+    CHECK(has_label(with_this, "run")); // extern prototype
+    CHECK(has_label(with_this, "pfield"));
+
+    auto [sl, sc] = pos_after(text, "  super.");
+    auto with_super = complete_at(engine, analyzer, uri, sl, sc);
+    CHECK(has_label(with_super, "pfield"));
+    CHECK(has_label(with_super, "build"));
+    CHECK_FALSE(has_label(with_super, "own"));
+}
+
+// UVM declares every level of a class hierarchy in its own file, so the
+// receiver's class, its base and the base's base are three different shards.
+// A shard can only climb the bases it declares itself.
+TEST_CASE("completion: member access climbs a hierarchy split across files",
+          "[completion][handle]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.open("file:///tmp/completion_split_root.sv",
+                  "class root_c;\n  int root_field;\n  function string get_name(); endfunction\n"
+                  "endclass\n");
+    analyzer.open("file:///tmp/completion_split_mid.sv",
+                  "class mid_c extends root_c;\n  int mid_field;\nendclass\n");
+    const std::string uri = "file:///tmp/completion_split_user.sv";
+    const std::string text = "class user_c;\n"
+                             "  typedef mid_c mid_t;\n"
+                             "  mid_c h;\n"
+                             "  mid_t alias_h;\n"
+                             "  function void f();\n"
+                             "    h.\n"
+                             "  endfunction\n"
+                             "  function void g();\n"
+                             "    alias_h.\n"
+                             "  endfunction\n"
+                             "endclass\n";
+    analyzer.open(uri, text);
+
+    auto [hl, hc] = pos_after(text, "    h.");
+    auto direct = complete_at(engine, analyzer, uri, hl, hc);
+    CHECK(has_label(direct, "mid_field"));
+    CHECK(has_label(direct, "root_field"));
+    CHECK(has_label(direct, "get_name"));
+
+    // The handle's type is a typedef in this buffer.
+    auto [al, ac] = pos_after(text, "    alias_h.");
+    auto aliased = complete_at(engine, analyzer, uri, al, ac);
+    CHECK(has_label(aliased, "mid_field"));
+    CHECK(has_label(aliased, "root_field"));
+}
+
+// The editor sends completion right behind the didChange that typed the `.`,
+// while the reparse that change started is still running.  The parse worker is
+// held so the request really lands in that window, then released shortly after,
+// the way a parse finishes while the request waits.
+TEST_CASE("completion: a member access typed just now waits for its parse",
+          "[completion][handle]") {
+    CompletionEngine engine;
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_edit_in_flight.sv";
+    const std::string before = "class item_c;\n  int max_len;\nendclass\n"
+                               "module top;\n  item_c p;\n  initial begin\n  end\nendmodule\n";
+    analyzer.open(uri, before);
+    std::string after = before;
+    after.insert(after.find("  end\n"), "    p.\n");
+
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, after);
+    REQUIRE(analyzer.get_state(uri)->tree == nullptr);
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        analyzer.set_parse_paused(false);
+    });
+
+    auto state = completion_document_state(analyzer, uri);
+    release.join();
+    REQUIRE(state != nullptr);
+    CHECK(state->text == after);
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    auto [line, col] = pos_after(after, "    p.");
+    params.position = lsPosition(line, col);
+    CancellationToken tok;
+    auto result = engine.complete(params, *state, analyzer, tok);
+    CHECK(has_label(result, "max_len"));
+    CHECK_FALSE(has_label(result, "module"));
+}
+
+// A parse that does not land in time must not answer from the previous text:
+// it does not have the `.` the user just typed.
+TEST_CASE("completion: an edit whose parse is late answers from the current text",
+          "[completion][handle]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/completion_edit_late_parse.sv";
+    analyzer.open(uri, "module top;\nendmodule\n");
+    analyzer.set_parse_paused(true);
+    analyzer.enqueue_parse(uri, "module top;\n  x.\nendmodule\n");
+    auto state = completion_document_state(analyzer, uri);
+    analyzer.set_parse_paused(false);
+    REQUIRE(state != nullptr);
+    CHECK(state->text == "module top;\n  x.\nendmodule\n");
 }
 
 TEST_CASE("completion: MemberAccess resolves typedef struct variable type", "[completion]") {

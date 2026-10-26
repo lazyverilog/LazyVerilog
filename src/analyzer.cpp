@@ -4371,6 +4371,22 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
         current_class = std::move(previous_class);
     }
 
+    // `function void C::m(...)` written outside the class body: its body
+    // resolves names (`super.m`, inherited members) against C, as if inside it.
+    void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
+        const auto* scoped =
+            current_class.empty() && node.prototype && node.prototype->name
+                ? node.prototype->name->as_if<slang::syntax::ScopedNameSyntax>()
+                : nullptr;
+        if (!scoped || !scoped->left || !scoped->left->getLastToken()) {
+            visitDefault(node);
+            return;
+        }
+        current_class = std::string(scoped->left->getLastToken().valueText());
+        visitDefault(node);
+        current_class.clear();
+    }
+
     void handle(const slang::syntax::HierarchyInstantiationSyntax& node) {
         if (auto* target = claim(node.type)) {
             target->kind = DefinitionTargetKind::Instance;
@@ -4549,6 +4565,7 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
                 target->qualifier_scope = std::move(left_owner);
                 target->scope_module = current_module;
                 target->scope_package = current_package;
+                target->scope_class = current_class;
             }
         }
 
@@ -4788,6 +4805,13 @@ static SymbolInfo symbol_info_for_typedef_entry(const TypedefEntry& td, const st
                       .col = definition.col};
 }
 
+static std::string method_entry_hover_doc(const MethodEntry& method) {
+    const std::string params = method.params.empty() ? "()" : method.params;
+    return method.is_task ? ("```\ntask " + method.name + params + "\n```")
+                          : ("```\nfunction " + method.return_type + " " + method.name + params +
+                             "\n```");
+}
+
 static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                                                         const DefinitionTarget& target,
                                                         const Location& definition) {
@@ -4881,10 +4905,7 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                 return SymbolInfo{.name = method.name,
                                   .kind = method.is_task ? "task" : "function",
                                   .detail = method.is_task ? "task" : "function",
-                                  .doc = method.is_task
-                                             ? ("```\ntask " + method.name + "()\n```")
-                                             : ("```\nfunction " + method.return_type + " " +
-                                                method.name + "()\n```"),
+                                  .doc = method_entry_hover_doc(method),
                                   .line = definition.line,
                                   .col = definition.col};
         }
@@ -4950,9 +4971,7 @@ static std::optional<SymbolInfo> symbol_info_from_index(const SyntaxIndex& idx,
                         .name = target.name,
                         .kind = m.is_task ? "task" : "function",
                         .detail = m.is_task ? "task" : "function",
-                        .doc = m.is_task
-                                   ? ("```\ntask " + m.name + "()\n```")
-                                   : ("```\nfunction " + m.return_type + " " + m.name + "()\n```"),
+                        .doc = method_entry_hover_doc(m),
                         .line = definition.line,
                         .col = definition.col};
             }
@@ -5929,18 +5948,31 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         // `my_item::type_id::create` — the qualifier is a type alias, so the
         // member lives in the type it names, not under the alias.  Substitute
         // before any lookup below; nothing is keyed by the alias name.
-        std::string qualifier = target.package_qualifier;
-        if (!target.qualifier_scope.empty()) {
-            auto aliased =
-                scoped_typedef_base_type(current_index, target.qualifier_scope, qualifier);
+        const auto typedef_target = [&](const std::string& owner, const std::string& alias) {
+            auto aliased = scoped_typedef_base_type(current_index, owner, alias);
             if (!aliased) {
                 aliased = nearest_shard_answer([&](const ExtraFileInfo& extra) {
-                    return scoped_typedef_base_type(extra.index_ref(), target.qualifier_scope,
-                                                    qualifier);
+                    return scoped_typedef_base_type(extra.index_ref(), owner, alias);
                 });
             }
-            if (aliased)
+            return aliased;
+        };
+        // `agent_t::type_id` -- the alias itself is a typedef written in the
+        // enclosing class or package, the way UVMF declares every agent.
+        const auto visible_typedef_target = [&](const std::string& alias) {
+            auto aliased = typedef_target(target.scope_class, alias);
+            if (!aliased)
+                aliased = typedef_target(target.scope_package, alias);
+            return aliased;
+        };
+        std::string qualifier = target.package_qualifier;
+        if (!target.qualifier_scope.empty()) {
+            const std::string owner =
+                visible_typedef_target(target.qualifier_scope).value_or(target.qualifier_scope);
+            if (auto aliased = typedef_target(owner, qualifier))
                 qualifier = *aliased;
+        } else if (auto aliased = visible_typedef_target(qualifier)) {
+            qualifier = *aliased;
         }
 
         if (auto loc = find_package_member(current_index, uri, qualifier, target.name))
