@@ -41,11 +41,11 @@ class RtlTreeItem extends vscode.TreeItem {
       this.label = `${node.name} (${node.inst})`;
     }
 
+    // `node.file` is a file URI ("file:///c%3A/..."); parse it, don't strip it.
+    const fileUri = node.file ? vscode.Uri.parse(node.file) : undefined;
     const description: string[] = [];
-    if (options.showFile && node.file) {
-      description.push(
-        vscode.workspace.asRelativePath(node.file.replace(/^file:\/\//, "")),
-      );
+    if (options.showFile && fileUri) {
+      description.push(vscode.workspace.asRelativePath(fileUri));
     }
     if (node.recursive) {
       description.push("<recursive>");
@@ -54,8 +54,8 @@ class RtlTreeItem extends vscode.TreeItem {
     }
     if (description.length > 0) this.description = description.join("  ");
 
-    if (node.file) {
-      const filePath = node.file.replace(/^file:\/\//, "");
+    if (fileUri) {
+      const filePath = fileUri.fsPath;
       this.tooltip = filePath;
       if (node.line && node.line > 0) {
         this.command = {
@@ -137,7 +137,7 @@ class RtlTreeDataProvider
     if (
       this.activeFilePath &&
       element.node.file &&
-      element.node.file.replace(/^file:\/\//, "") === this.activeFilePath
+      vscode.Uri.parse(element.node.file).fsPath === this.activeFilePath
     ) {
       element.iconPath = new vscode.ThemeIcon(
         "circle-filled",
