@@ -772,6 +772,18 @@ private:
             ++p;
         if (p == name || std::isdigit(static_cast<unsigned char>(source_[name])))
             return std::string::npos;
+        // `` `ifdef X \ `` -- the `\` continues the directive's line, so it
+        // stays in the directive's token, on that line.
+        size_t q = p;
+        while (q < source_.size() && (source_[q] == ' ' || source_[q] == '\t'))
+            ++q;
+        if (q < source_.size() && source_[q] == '\\') {
+            size_t r = q + 1;
+            while (r < source_.size() && (source_[r] == ' ' || source_[r] == '\t' || source_[r] == '\r'))
+                ++r;
+            if (r == source_.size() || source_[r] == '\n')
+                return std::string::npos;
+        }
         return p;
     }
 
@@ -914,7 +926,22 @@ private:
         };
         std::vector<TKind> closers, openers;
         SourceTextLexer lexer(body);
-        for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; token = lexer.lex()) {
+        TKind prev = TKind::Unknown;
+        bool in_directive = false;
+        for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; prev = token.kind, token = lexer.lex()) {
+            bool new_line = false;
+            for (const auto& trivia : token.trivia())
+                new_line = new_line || trivia.kind == slang::parsing::TriviaKind::EndOfLine;
+            if (new_line && prev != TKind::LineContinuation)
+                in_directive = false;
+            // `` `define START begin `` -- a directive line, a macro body
+            // included, opens nothing where it is written.
+            if (token.kind == TKind::Directive && token.directiveKind() != slang::syntax::SyntaxKind::MacroUsage)
+                in_directive = true;
+            // `disable fork;` / `wait fork;` name the forks; they open none.
+            if (in_directive || (token.kind == TKind::ForkKeyword &&
+                                 (prev == TKind::DisableKeyword || prev == TKind::WaitKeyword)))
+                continue;
             if (opens(token.kind))
                 openers.push_back(token.kind);
             else if (closes(token.kind) && !openers.empty())

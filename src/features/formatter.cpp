@@ -148,10 +148,14 @@ std::optional<FormattedSpan> formatted_span(const std::string& source, const std
                 return i;
         return std::string::npos;
     };
+    // Stops before a CRLF's `\r`: an edit ending past it would delete it.
     auto past_trailing_blanks = [](const std::string& s, size_t at) {
-        while (at < s.size() && (s[at] == ' ' || s[at] == '\t' || s[at] == '\r'))
+        while (at < s.size() && (s[at] == ' ' || s[at] == '\t' || (s[at] == '\r' && s.compare(at, 2, "\r\n") != 0)))
             ++at;
         return at;
+    };
+    auto at_line_end = [](const std::string& s, size_t at) {
+        return at == s.size() || s[at] == '\n' || s.compare(at, 2, "\r\n") == 0;
     };
     // Whole lines: from the first one's start to the last one's end.
     end = std::min(end, source.size());
@@ -182,7 +186,7 @@ std::optional<FormattedSpan> formatted_span(const std::string& source, const std
     // Likewise the last line's trailing blanks, unless the next line was
     // joined onto it.
     const size_t f_tail = past_trailing_blanks(formatted, f_last + 1);
-    if (f_tail == formatted.size() || formatted[f_tail] == '\n') {
+    if (at_line_end(formatted, f_tail)) {
         span.source_end = past_trailing_blanks(source, s_last + 1);
         span.formatted_end = f_tail;
     }
