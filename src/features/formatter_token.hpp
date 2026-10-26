@@ -98,6 +98,13 @@ struct LexemeFacts {
     // formatter must not interpret comments, directives, macro calls, or blank
     // lines inside this region at all.  The renderer emits this token verbatim.
     bool is_disabled_region_body{false};
+
+    // The block keywords a disabled region body leaves unmatched, in source
+    // order: the `end` of a `begin` opened before the region, then a `begin`
+    // it leaves open for code after it (`begin`/`end`, `fork`/`join*`,
+    // `case`/`endcase`).  The body is one verbatim token, so without this the
+    // scope depth after it was the depth before it.
+    std::vector<slang::parsing::TokenKind> disabled_region_scope_keywords;
 };
 
 // 2. SyntaxFacts: parser-ish truth.  These are not formatting policy; matching

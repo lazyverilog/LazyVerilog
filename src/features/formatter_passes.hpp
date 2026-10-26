@@ -2364,8 +2364,12 @@ public:
             int depth = 0;
             for (size_t i = 0; i < tokens.size(); ++i) {
                 auto& t = tokens[i];
-                if (is_passthrough(t))
+                if (is_passthrough(t)) {
+                    // A format-off region's own `end`s and `begin`s.
+                    for (const TK k : t.lex.disabled_region_scope_keywords)
+                        depth = is_open_block(k) ? depth + 1 : std::max(0, depth - 1);
                     continue;
+                }
                 if (is_conditional_preprocessor_directive(t)) {
                     using SK = slang::syntax::SyntaxKind;
                     switch (t.lex.directive_kind) {
@@ -4391,6 +4395,12 @@ inline std::unordered_map<size_t, std::vector<size_t>> controlled_body_extents(c
         if (closes_indent_scope_at(tokens, body) || is_outer_close(b.lex.kind) ||
             b.mutable_.macro.closes_indent_scope)
             return;
+        // `always_comb` / format-off `begin` / format-on -- the body is the
+        // block the region opened, which indents its own contents.
+        for (size_t k = prev_code(tokens, body) == npos ? 0 : prev_code(tokens, body) + 1; k < body; ++k)
+            for (const TK kw : tokens[k].lex.disabled_region_scope_keywords)
+                if (is_open_block(kw))
+                    return;
         const size_t extent_end = extend_over_conditional_branches(tokens, body, end);
         // `if (a)` / `// c` / `x = 1;` -- an own-line comment between a
         // control and its body belongs to the body and takes its level.
@@ -4554,7 +4564,27 @@ public:
 
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
-            if (is_passthrough(t)) continue;
+            if (is_passthrough(t)) {
+                // A format-off region is one token; the block keywords it
+                // leaves unmatched still close and open scopes, as the
+                // same keywords outside it would.
+                for (const TK k : t.lex.disabled_region_scope_keywords) {
+                    if (is_open_block(k)) {
+                        ++level;
+                        ++scope_net;
+                        scopes.push_back({k, false});
+                        continue;
+                    }
+                    Tok closer;
+                    closer.lex.kind = k;
+                    const size_t floor = outer_units.empty() ? 0 : outer_units.back().scopes;
+                    const int popped = static_cast<int>(scopes_closed_by(scopes, floor, closer));
+                    scopes.resize(scopes.size() - static_cast<size_t>(popped));
+                    level = std::max(0, level - popped);
+                    scope_net -= popped;
+                }
+                continue;
+            }
 
             if (is_conditional_preprocessor_directive(t)) {
                 using SK = slang::syntax::SyntaxKind;
@@ -5238,6 +5268,9 @@ public:
             // Last token of the name: a macro call's `)` when the name is
             // `` `CAT(foo, _q) ``, else first_name itself.
             size_t name_end{npos};
+            // `logic a = fn(` -- the statement goes on past this line, which
+            // WrapPass broke; `semi` is then the line's end, not a `;`.
+            bool continued{false};
         };
 
         auto find_statement_semicolon = [&](const Line& ln, size_t& eq_out) {
@@ -5313,7 +5346,9 @@ public:
             return tokens[k].mutable_.space.suppress_space ? 0 : tokens[k].mutable_.space.spaces_before;
         };
 
-        auto is_var_decl_line = [&](const Line& ln, VarLine& out) {
+        // `continued_ok` also takes the first line of a declaration whose
+        // initializer WrapPass broke onto later lines.
+        auto is_var_decl_line = [&](const Line& ln, VarLine& out, bool continued_ok = false) {
             if (ln.first == npos || ln.end <= ln.first)
                 return false;
             if (is_port_direction(tokens[ln.first].lex.kind))
@@ -5322,8 +5357,11 @@ public:
                 return false;
             size_t eq = npos;
             size_t semi = find_statement_semicolon(ln, eq);
-            if (semi == npos)
+            const bool continued = semi == npos;
+            if (continued && (!continued_ok || eq == npos))
                 return false;
+            if (continued)
+                semi = ln.end;
 
             // `tri0 t;`, `genvar g;`, `local int b;`, `virtual my_if vif;`.
             // These are accepted here and not in is_var_decl_leading_keyword,
@@ -5459,7 +5497,7 @@ public:
                     return false;
             }
             out = {ln.first, ln.end, semi, eq, first_name, first_delim,
-                   packed_dim, packed_dim != npos, ln.indent, name_end};
+                   packed_dim, packed_dim != npos, ln.indent, name_end, continued};
             return true;
         };
 
@@ -5752,7 +5790,9 @@ public:
             std::vector<VarLine> vlines(decl_lines.size());
             std::vector<bool> is_vline(decl_lines.size(), false);
             for (size_t i = 0; i < decl_lines.size(); ++i)
-                is_vline[i] = is_var_decl_line(decl_lines[i], vlines[i]);
+                // A declaration WrapPass broke still has its header aligned:
+                // WrapPass counted that padding (statement_align_padding()).
+                is_vline[i] = is_var_decl_line(decl_lines[i], vlines[i], true);
 
             for (size_t i = 0; i < decl_lines.size();) {
                 if (!is_vline[i]) {
@@ -5810,7 +5850,7 @@ public:
                             break;
                         }
                     }
-                    if (trailing_first != npos)
+                    if (trailing_first != npos && !vlines[j].continued)
                         group_trailing_width = std::max(
                             group_trailing_width,
                             var_trailing_render_width(trailing_first, vlines[j].semi));
@@ -5845,7 +5885,7 @@ public:
                 for (size_t li = i; li < j; ++li) {
                     if (!is_vline[li]) continue; // comment line, no alignment tokens
                     const auto& vl = vlines[li];
-                    for (size_t k = vl.first; k <= vl.semi && k < tokens.size(); ++k) {
+                    for (size_t k = vl.first; k < (vl.continued ? vl.end : vl.semi + 1) && k < tokens.size(); ++k) {
                         tokens[k].mutable_.align.enabled = false;
                         tokens[k].mutable_.align.target_column = -1;
                     }
@@ -5959,8 +5999,11 @@ public:
                                 std::max(preferred_trailing_col,
                                          name_col + name_width + gap_before(vl.eq));
                         }
-                        tokens[vl.semi].mutable_.align.target_column = std::max(preferred_delim_col, landing(vl.semi));
-                        tokens[vl.semi].mutable_.align.enabled = true;
+                        if (!vl.continued) {
+                            tokens[vl.semi].mutable_.align.target_column =
+                                std::max(preferred_delim_col, landing(vl.semi));
+                            tokens[vl.semi].mutable_.align.enabled = true;
+                        }
                     } else {
                         if (unpacked_dim != npos)
                             align_unpacked_trailing(unpacked_dim, vl.first_delim);
@@ -7022,6 +7065,16 @@ public:
                 continue;
             }
 
+            // `` `DV_CHECK_FATAL(a == b, "msg") `` with a listed macro: the
+            // lexer froze everything between the parentheses, the gap before
+            // `)` included, so the `)` binds to it as the `(` side already
+            // does.  Padding it grew the gap by one on every format.
+            if (L.lex.is_whitespace_sensitive && kind_is(t, TK::CloseParenthesis)) {
+                t.mutable_.space.spaces_before = 0;
+                t.mutable_.space.suppress_space = true;
+                continue;
+            }
+
             // `(*` and `*)` are single lexemes in the LRM.  Letting the ordinary
             // paren rules put a space between the halves turns an attribute into
             // a parenthesised expression, so keep them closed up.  The text
@@ -7183,10 +7236,12 @@ public:
             }
 
             // # hash: no space before next token.  `##` is the cycle delay
-            // (`a ##1 b`, `##[1:3]`) and binds the same way.
+            // (`a ##1 b`, `##[1:3]`) and binds the same way.  A comment
+            // after it is no operand and keeps its space: `# /* d */ 5`.
             if (kind_is(L, TK::Hash) || kind_is(L, TK::DoubleHash)) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
+                const bool comment = t.lex.comment_kind != CommentLexemeKind::None;
+                t.mutable_.space.spaces_before = comment ? 1 : 0;
+                t.mutable_.space.suppress_space = !comment;
                 continue;
             }
 
@@ -7300,10 +7355,13 @@ public:
             // cast's type (`pkt_t'{...}`) and an opening delimiter bind to the
             // pattern; after a comma, a pattern key's `:` or a `?` it is an
             // operand like any other (`data : '{raw : 0}`, `c ? '{1} : '{2}`).
+            // A padded `(` or `[` keeps its pad before a pattern as before
+            // any other first token: `fn( '{1, 2}, x )`.
             if (kind_is(t, TK::ApostropheOpenBrace) &&
                 (is_identifier_like(L) || is_type_keyword(L.lex.kind) ||
                  kind_is(L, TK::CloseParenthesis) || kind_is(L, TK::CloseBracket) ||
-                 kind_is(L, TK::OpenParenthesis) || kind_is(L, TK::OpenBracket) ||
+                 (kind_is(L, TK::OpenParenthesis) && !padded_open) ||
+                 (kind_is(L, TK::OpenBracket) && !opts_.spacing.space_inside_dimension_brackets) ||
                  kind_is(L, TK::OpenBrace) || kind_is(L, TK::ApostropheOpenBrace)))
                 spaces = 0;
             // `tagged Pair '{.a, .b}` -- the name is a union member's tag and

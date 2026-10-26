@@ -286,13 +286,30 @@ static std::string slice_lsp_range(const std::string& text, const lsRange& range
     return text.substr(start, end - start);
 }
 
-static lsTextEdit range_format_edit(const std::string& old_text, const std::string& formatted_text,
-                                    lsRange range) {
-    if (range.end < range.start)
-        std::swap(range.start, range.end);
+static lsPosition lsp_position_at(const std::string& text, size_t offset) {
+    offset = std::min(offset, text.size());
+    const size_t nl = offset == 0 ? std::string::npos : text.rfind('\n', offset - 1);
+    const size_t line_begin = nl == std::string::npos ? 0 : nl + 1;
+    const int line = static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(line_begin), '\n'));
+    return lsPosition(line, lsp_column_width(std::string_view(text).substr(line_begin, offset - line_begin)));
+}
+
+// The edit formatting `range` makes, from the whole-document `formatted_text`
+// (see formatted_span()), or nothing when the range is already formatted.
+static optional<lsTextEdit> range_format_edit(const std::string& old_text, const std::string& formatted_text,
+                                              const lsRange& range) {
+    auto [begin, end] = lsp_offset_pair(old_text, range.start.line, range.start.character,
+                                        range.end.line, range.end.character);
+    if (begin > end)
+        std::swap(begin, end);
+    const auto span = formatted_span(old_text, formatted_text, begin, end);
+    if (!span)
+        return {};
     lsTextEdit edit;
-    edit.range = range;
-    edit.newText = slice_lsp_range(formatted_text, range);
+    edit.range = lsRange(lsp_position_at(old_text, span->source_begin), lsp_position_at(old_text, span->source_end));
+    edit.newText = formatted_text.substr(span->formatted_begin, span->formatted_end - span->formatted_begin);
+    if (edit.newText == old_text.substr(span->source_begin, span->source_end - span->source_begin))
+        return {};
     return edit;
 }
 
@@ -1983,9 +2000,8 @@ void LazyVerilogServer::register_handlers() {
                 // an edit restricted to the requested range.
                 std::string formatted =
                     format_source(state->text, config_for(uri)->format);
-                auto edit = range_format_edit(state->text, formatted, req.params.range);
-                if (edit.newText != slice_lsp_range(state->text, edit.range))
-                    rsp.result.push_back(std::move(edit));
+                if (auto edit = range_format_edit(state->text, formatted, req.params.range))
+                    rsp.result.push_back(std::move(*edit));
             }
         } catch (const SafeModeError& e) {
             show_warning(e.what());
@@ -2524,9 +2540,7 @@ void LazyVerilogServer::register_handlers() {
                         int start_line = get_int(2);
                         int end_line = get_int(3);
                         lsRange range(lsPosition(start_line, 0), lsPosition(end_line, 0));
-                        auto range_edit = range_format_edit(state->text, formatted, range);
-                        if (range_edit.newText != slice_lsp_range(state->text, range_edit.range))
-                            edit = std::move(range_edit);
+                        edit = range_format_edit(state->text, formatted, range);
                     } else if (formatted != state->text) {
                         edit = whole_document_edit(*state, formatted);
                     }
