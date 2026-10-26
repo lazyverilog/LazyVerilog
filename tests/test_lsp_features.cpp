@@ -1666,6 +1666,60 @@ TEST_CASE("code action: RTL generators are not offered inside a class body", "[c
     CHECK(has(in_module, "always_comb"));
 }
 
+TEST_CASE("code action: lifetime quick fix replaces an existing 'static'", "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_lifetime.sv";
+    const std::vector<std::string> lines = {
+        "module top;",
+        "  function static int f(); return 0; endfunction",
+        "  function int g(); return 0; endfunction",
+        "  (* keep *) function static int h(); return 0; endfunction",
+        "  task t(); endtask",
+        "endmodule",
+    };
+    std::string text;
+    for (const auto& l : lines)
+        text += l + "\n";
+    analyzer.open(uri, text);
+
+    // Apply the quick fix offered for `message` on `line`; return the edited line.
+    auto fixed = [&](int line, const std::string& message) -> std::string {
+        lsDiagnostic diag;
+        diag.range.start = lsPosition(line, 0);
+        diag.range.end = lsPosition(line, 0);
+        diag.message = message;
+        lsCodeActionParams params;
+        params.textDocument.uri.raw_uri_ = uri;
+        params.range.start = lsPosition(line, 0);
+        params.range.end = lsPosition(line, 0);
+        params.context.diagnostics = {diag};
+        for (const auto& a : provide_code_actions(analyzer, config, params)) {
+            if (a.title.find("'automatic' lifetime") == std::string::npos)
+                continue;
+            REQUIRE(a.edit.has_value());
+            REQUIRE(a.edit->changes.has_value());
+            const auto& edits = a.edit->changes->at(uri);
+            REQUIRE(edits.size() == 1);
+            const auto& e = edits[0];
+            REQUIRE(e.range.start.line == line);
+            REQUIRE(e.range.end.line == line);
+            std::string out = lines[line];
+            out.replace(e.range.start.character, e.range.end.character - e.range.start.character,
+                        e.newText);
+            return out;
+        }
+        return "<no quick fix>";
+    };
+
+    const std::string fn_msg = "[function] function declaration should use 'automatic' lifetime";
+    CHECK(fixed(1, fn_msg) == "  function automatic int f(); return 0; endfunction");
+    CHECK(fixed(2, fn_msg) == "  function automatic int g(); return 0; endfunction");
+    CHECK(fixed(3, fn_msg) == "  (* keep *) function automatic int h(); return 0; endfunction");
+    CHECK(fixed(4, "[task] task declaration missing explicit lifetime (automatic/static)") ==
+          "  task automatic t(); endtask");
+}
+
 TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
     // UVM's `uvm_component_utils(T) reaches the typedef through a second macro:
     //
