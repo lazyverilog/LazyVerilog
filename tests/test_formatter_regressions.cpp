@@ -6613,3 +6613,206 @@ TEST_CASE("formatter regression: an adaptive var_declaration delimiter column is
         CHECK(trace.column[i] == a.target_column);
     }
 }
+
+TEST_CASE("formatter regression: a define whose formals span lines stays frozen", "[formatter][regression]") {
+    // Only the define's first line was checked for a `\`, so a formal list
+    // broken over lines left the body to the passes: `begin` lost its `\`
+    // and a blank line ended the macro early.
+    const std::string src = "`define M(a,\n"
+                            "          b) \\\n"
+                            "  begin \\\n"
+                            "    x = a; \\\n"
+                            "  end\n"
+                            "`define S(a,\n"
+                            "          b)   `\"a   b`\"\n"
+                            "module m;\n"
+                            "endmodule\n";
+    CHECK(format_stable(src) == src);
+}
+
+TEST_CASE("formatter regression: the safety check sees a broken line continuation", "[formatter][regression]") {
+    // A `;` in the formals is no formal list, so this body is not frozen.
+    // Moving a `\` off its line, or a blank line after one, ends the macro
+    // there; the token stream itself does not change, so only the
+    // continuation's line facts can tell.
+    const std::string src = "`define M(a;\n"
+                            "          b) \\\n"
+                            "  begin \\\n"
+                            "    x = a; \\\n"
+                            "  end\n";
+    CHECK_THROWS_AS(format_source(src, FormatOptions{}), SafeModeError);
+}
+
+TEST_CASE("formatter regression: a whitespace-sensitive macro call is stable with paren padding", "[formatter][regression]") {
+    // The frozen arguments hold the gap before `)`; padding the `)` as
+    // well added one space per format.
+    for (int option = 0; option < 2; ++option) {
+        FormatOptions o;
+        o.macros.whitespace_sensitive = {"DV_CHECK_FATAL"};
+        if (option == 0)
+            o.spacing.space_inside_parens = true;
+        else
+            o.function_call.space_inside_paren = true;
+        INFO("option " << option);
+        const std::string once = format_stable("module m;\n  initial `DV_CHECK_FATAL(a == b, \"msg\")\nendmodule\n", o);
+        CHECK(once.find("`DV_CHECK_FATAL(a == b, \"msg\")\n") != std::string::npos);
+        CHECK(format_source(format_source(once, o), o) == once);
+    }
+}
+
+TEST_CASE("formatter regression: paren padding applies before an assignment pattern", "[formatter][regression]") {
+    FormatOptions parens;
+    parens.spacing.space_inside_parens = true;
+    CHECK(format_stable("assign z = fn('{1, 2}, {a, b});\n", parens) == "assign z = fn( '{1, 2}, {a, b} );\n");
+    FormatOptions call;
+    call.function_call.space_inside_paren = true;
+    CHECK(format_stable("assign z = fn('{1, 2}, x);\n", call) == "assign z = fn( '{1, 2}, x );\n");
+    FormatOptions dims;
+    dims.spacing.space_inside_dimension_brackets = true;
+    CHECK(format_stable("assign z = b['{1}];\n", dims) == "assign z = b[ '{1} ];\n");
+    // Unpadded, the pattern still binds to its delimiter.
+    CHECK(format_stable("assign z = fn('{1, 2}, b['{1}]);\n") == "assign z = fn('{1, 2}, b['{1}]);\n");
+}
+
+TEST_CASE("formatter regression: a comment after a delay hash keeps its space", "[formatter][regression]") {
+    CHECK(format_stable("module m;\n  initial # /* d */ 5 q = 1;\n  sub # /* p */ (1) u ();\nendmodule\n") ==
+          "module m;\n  initial # /* d */ 5\n    q = 1;\n  sub # /* p */ (1) u();\nendmodule\n");
+    CHECK(format_stable("module m;\n  initial #5 q = 1;\nendmodule\n") == "module m;\n  initial #5\n    q = 1;\nendmodule\n");
+}
+
+TEST_CASE("formatter regression: a stray format-on marker is indented like a comment", "[formatter][regression]") {
+    CHECK(format_stable("module m;\n  assign a=b;\n// verilog_format:on\n  assign c=d;\nendmodule\n") ==
+          "module m;\n  assign a = b;\n  // verilog_format:on\n  assign c = d;\nendmodule\n");
+}
+
+TEST_CASE("formatter regression: a format-off region that closes a block keeps later indent", "[formatter][regression]") {
+    // The region is one verbatim token; the `end` inside it closed nothing,
+    // and every line after it sat one level too deep.
+    CHECK(format_stable("module m;\n"
+                        "  always_comb begin\n"
+                        "    // verilog_format: off\n"
+                        "    if(x)y=1;\n"
+                        "  end\n"
+                        "  // verilog_format: on\n"
+                        "  assign g=h;\n"
+                        "endmodule\n") ==
+          "module m;\n"
+          "  always_comb begin\n"
+          "    // verilog_format: off\n"
+          "    if(x)y=1;\n"
+          "  end\n"
+          "  // verilog_format: on\n"
+          "  assign g = h;\n"
+          "endmodule\n");
+    // A region that opens the block: what follows is inside it.
+    CHECK(format_stable("module m;\n"
+                        "  // verilog_format: off\n"
+                        "  always_comb begin\n"
+                        "  // verilog_format: on\n"
+                        "  x=1;\n"
+                        "  end\n"
+                        "  always_comb\n"
+                        "    // verilog_format: off\n"
+                        "    begin\n"
+                        "    // verilog_format: on\n"
+                        "  w=1;\n"
+                        "  end\n"
+                        "  assign g=h;\n"
+                        "endmodule\n") ==
+          "module m;\n"
+          "  // verilog_format: off\n"
+          "  always_comb begin\n"
+          "  // verilog_format: on\n"
+          "    x = 1;\n"
+          "  end\n"
+          "  always_comb\n"
+          "    // verilog_format: off\n"
+          "    begin\n"
+          "    // verilog_format: on\n"
+          "    w = 1;\n"
+          "  end\n"
+          "  assign g = h;\n"
+          "endmodule\n");
+    // A balanced region changes nothing, nor do keywords in its comments.
+    CHECK(format_stable("module m;\n"
+                        "  always_comb begin\n"
+                        "    // verilog_format: off\n"
+                        "    if(x) begin y=1; end // end\n"
+                        "    // verilog_format: on\n"
+                        "    z=2;\n"
+                        "  end\n"
+                        "endmodule\n") ==
+          "module m;\n"
+          "  always_comb begin\n"
+          "    // verilog_format: off\n"
+          "    if(x) begin y=1; end // end\n"
+          "    // verilog_format: on\n"
+          "    z = 2;\n"
+          "  end\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter regression: a var declaration broken by alignment padding is still aligned", "[formatter][regression]") {
+    // WrapPass counts the padding before the initializer's `=` and breaks
+    // the call; AlignPass then skipped the line, whose `;` was further down,
+    // so the call broke for padding that never came.
+    FormatOptions o;
+    o.function_call.line_length = 40;
+    o.function_call.arg_count = -1;
+    o.var_declaration.align = true;
+    o.var_declaration.section1_min_width = 12;
+    o.var_declaration.section2_min_width = 8;
+    o.var_declaration.section3_min_width = 10;
+    CHECK(format_stable("module m;\n  logic a = fn(aaaa, bbbb, ccc);\n  logic [3:0] b;\nendmodule\n", o) ==
+          "module m;\n"
+          "  logic               a         = fn(\n"
+          "                                    aaaa,\n"
+          "                                    bbbb,\n"
+          "                                    ccc\n"
+          "                                  );\n"
+          "  logic       [3:0]   b         ;\n"
+          "endmodule\n");
+    o.var_declaration.align_adaptive = true;
+    CHECK(format_stable("module m;\n  logic a = fn(aaaa, bbbb, ccc);\nendmodule\n", o) ==
+          "module m;\n"
+          "  logic               a         = fn(\n"
+          "                                    aaaa,\n"
+          "                                    bbbb,\n"
+          "                                    ccc\n"
+          "                                  );\n"
+          "endmodule\n");
+}
+
+TEST_CASE("formatter regression: a range edit replaces the lines asked for", "[formatter][regression]") {
+    // The class header breaks over three more lines.  Slicing the formatted
+    // text at the range's own line numbers dropped the range's last lines.
+    const std::string src = "package p;\n"
+                            "  class c #(type T = int, int D = 4) extends b;\n"
+                            "    int n;\n"
+                            "    function void f();\n"
+                            "      if (x) n++;\n"
+                            "    endfunction\n"
+                            "  endclass\n"
+                            "endpackage\n";
+    const std::string formatted = format_source(src, FormatOptions{});
+    const size_t begin = src.find("  class");
+    const size_t end = src.find("endpackage");
+    const auto span = formatted_span(src, formatted, begin, end);
+    REQUIRE(span);
+    CHECK(span->source_begin == begin);
+    CHECK(span->source_end == end - 1);
+    const std::string edited = src.substr(0, span->source_begin) +
+                               formatted.substr(span->formatted_begin, span->formatted_end - span->formatted_begin) +
+                               src.substr(span->source_end);
+    CHECK(edited == formatted);
+
+    // A range of one line inside: only that line changes.
+    const size_t line = src.find("      if");
+    const auto one = formatted_span(src, formatted, line, src.find("    endfunction"));
+    REQUIRE(one);
+    CHECK(src.substr(one->source_begin, one->source_end - one->source_begin) == "      if (x) n++;");
+    CHECK(formatted.substr(one->formatted_begin, one->formatted_end - one->formatted_begin) ==
+          "      if (x)\n        n++;");
+    // Nothing but blank lines: no edit.
+    CHECK_FALSE(formatted_span("a;\n\n\nb;\n", "a;\n\nb;\n", 3, 5));
+}

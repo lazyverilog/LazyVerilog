@@ -92,6 +92,18 @@ static bool token_stream_same(const TokenStream& a, const TokenStream& b) {
             return false;
         if (x.lex.is_table_row != y.lex.is_table_row)
             return false;
+        // slang lexes `\` and the newline after it as one token.  One the
+        // lexer did not freeze inside a `` `define `` must still end the line
+        // it ended, with the next line right after it: a break before the
+        // `\` or a blank line after it ends the macro there, and the token
+        // stream above cannot tell.
+        if (x.lex.kind == slang::parsing::TokenKind::LineContinuation) {
+            if (x.immutable.input_trivia.starts_original_line != y.immutable.input_trivia.starts_original_line)
+                return false;
+            if (i + 1 < a.size() && a[i + 1].immutable.input_trivia.original_newlines_before !=
+                                        b[i + 1].immutable.input_trivia.original_newlines_before)
+                return false;
+        }
     }
     return true;
 }
@@ -120,4 +132,59 @@ std::string format_source(const std::string& source, const FormatOptions& opts) 
     svfmt::write_log(opts, "99_output.sv", out);
     svfmt::verify_token_stream_safety_unchanged(before_tokens, out, opts);
     return out;
+}
+
+std::optional<FormattedSpan> formatted_span(const std::string& source, const std::string& formatted,
+                                            size_t begin, size_t end) {
+    auto blank = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    auto line_start = [](const std::string& s, size_t at) {
+        const size_t nl = at == 0 ? std::string::npos : s.rfind('\n', at - 1);
+        return nl == std::string::npos ? size_t{0} : nl + 1;
+    };
+    // Offset of the `n`th non-blank character, counted from 0, or npos.
+    auto nth = [&](const std::string& s, size_t n) {
+        for (size_t i = 0; i < s.size(); ++i)
+            if (!blank(s[i]) && n-- == 0)
+                return i;
+        return std::string::npos;
+    };
+    auto past_trailing_blanks = [](const std::string& s, size_t at) {
+        while (at < s.size() && (s[at] == ' ' || s[at] == '\t' || s[at] == '\r'))
+            ++at;
+        return at;
+    };
+    // Whole lines: from the first one's start to the last one's end.
+    end = std::min(end, source.size());
+    begin = line_start(source, std::min(begin, end));
+    if (line_start(source, end) != end) {
+        const size_t nl = source.find('\n', end);
+        end = nl == std::string::npos ? source.size() : nl + 1;
+    }
+    size_t before = 0, inside = 0;
+    for (size_t i = 0; i < end; ++i)
+        if (!blank(source[i]))
+            ++(i < begin ? before : inside);
+    if (inside == 0)
+        return std::nullopt;
+    const size_t s_first = nth(source, before), f_first = nth(formatted, before);
+    const size_t s_last = nth(source, before + inside - 1), f_last = nth(formatted, before + inside - 1);
+    if (f_first == std::string::npos || f_last == std::string::npos)
+        return std::nullopt;
+    FormattedSpan span{s_first, s_last + 1, f_first, f_last + 1};
+    // The first line's indent is the range's too, unless formatting joined
+    // that line onto the one before it, which the range leaves alone.
+    const size_t f_line = line_start(formatted, f_first);
+    if (std::all_of(formatted.begin() + static_cast<std::ptrdiff_t>(f_line),
+                    formatted.begin() + static_cast<std::ptrdiff_t>(f_first), blank)) {
+        span.source_begin = line_start(source, s_first);
+        span.formatted_begin = f_line;
+    }
+    // Likewise the last line's trailing blanks, unless the next line was
+    // joined onto it.
+    const size_t f_tail = past_trailing_blanks(formatted, f_last + 1);
+    if (f_tail == formatted.size() || formatted[f_tail] == '\n') {
+        span.source_end = past_trailing_blanks(source, s_last + 1);
+        span.formatted_end = f_tail;
+    }
+    return span;
 }

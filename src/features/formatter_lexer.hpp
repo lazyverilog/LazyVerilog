@@ -536,9 +536,13 @@ private:
             // code.  The region it opens starts on the next line all the same.
             const bool trailing_off = format_off && !starts_line &&
                                       comment_kind == CommentLexemeKind::Line;
+            // A format-on marker that closes a region is part of the region's
+            // body (collect_disabled_region_body()), so one reaching here
+            // closes nothing: it is an ordinary comment, indented like one.
+            // As a passthrough it rendered at column 0.
             add_token(TK::Unknown, marker, marker_pos, false,
-                      !trailing_off && (disabled_ || format_off || format_on),
-                      comment_kind, format_off && !trailing_off, format_on);
+                      !trailing_off && format_off,
+                      comment_kind, format_off && !trailing_off, false);
             if (format_off) {
                 disabled_ = true;
                 just_entered_disabled_region_ = true;
@@ -560,20 +564,76 @@ private:
         consume_text(raw, true);
     }
 
+    // One past the `)` closing the formal list of the `` `define `` at
+    // `start`, or npos when it has none.  The list follows the name with no
+    // gap (IEEE 1800 22.5.1); a `;` before its `)` means it is not one.
+    size_t define_formals_end(size_t start) const {
+        const size_t n = source_.size();
+        size_t p = start + std::string_view("`define").size();
+        while (p < n && (source_[p] == ' ' || source_[p] == '\t'))
+            ++p;
+        if (p < n && source_[p] == '\\') {
+            while (p < n && !std::isspace(static_cast<unsigned char>(source_[p])))
+                ++p;
+        } else {
+            while (p < n && (std::isalnum(static_cast<unsigned char>(source_[p])) || source_[p] == '_' ||
+                             source_[p] == '$'))
+                ++p;
+        }
+        if (p >= n || source_[p] != '(')
+            return std::string::npos;
+        int depth = 0;
+        for (; p < n; ++p) {
+            const char c = source_[p];
+            if (c == '"') {
+                for (++p; p < n && source_[p] != '"' && source_[p] != '\n'; ++p)
+                    if (source_[p] == '\\')
+                        ++p;
+            } else if (c == '/' && p + 1 < n && source_[p + 1] == '/') {
+                p = source_.find('\n', p);
+                if (p == std::string::npos)
+                    return std::string::npos;
+            } else if (c == '/' && p + 1 < n && source_[p + 1] == '*') {
+                p = source_.find("*/", p + 2);
+                if (p == std::string::npos)
+                    return std::string::npos;
+                ++p;
+            } else if (c == ';') {
+                return std::string::npos;
+            } else if (c == '(') {
+                ++depth;
+            } else if (c == ')' && --depth == 0) {
+                return p + 1;
+            }
+        }
+        return std::string::npos;
+    }
+
     // Returns the source offset one-past-the-end of a multiline `define block
     // that starts at 'start', or 0 if the define is a single-line define.
     size_t find_multiline_define_end(size_t start) const {
         size_t src_size = source_.size();
+        // `define M(a,
+        //           b) \
+        // -- the formal list may span lines without a backslash, so the
+        // body starts on the line of its `)`.  Only checking the first line
+        // left such a macro unfrozen, and its body was formatted as code.
+        const size_t formals_end = define_formals_end(start);
+        const bool formals_span_lines =
+            formals_end != std::string::npos &&
+            source_.find('\n', start) < formals_end;
+        const size_t body_line = formals_span_lines ? formals_end : start;
         // Find end of first line and check for backslash continuation.
-        size_t eol = source_.find('\n', start);
-        if (eol == std::string::npos) return 0;
+        size_t eol = source_.find('\n', body_line);
+        if (eol == std::string::npos) return formals_span_lines ? src_size : 0;
         // On a CRLF line the `\r` belongs to the terminator, not to the text
         // before it, so `\` `\r` `\n` is a continuation too.
         auto is_trailing_blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
         size_t check = eol;
-        while (check > start && is_trailing_blank(source_[check - 1]))
+        while (check > body_line && is_trailing_blank(source_[check - 1]))
             --check;
-        if (check == start || source_[check - 1] != '\\') return 0;
+        if (check == body_line || source_[check - 1] != '\\')
+            return formals_span_lines ? eol + 1 : 0;
 
         // Walk continuation lines.
         size_t pos = eol + 1;
@@ -840,6 +900,32 @@ private:
         return source_.size();
     }
 
+    // See LexemeFacts::disabled_region_scope_keywords.  Lexed, so a `begin`
+    // in a comment or a string is no keyword.
+    static std::vector<slang::parsing::TokenKind> unmatched_block_keywords(std::string_view body) {
+        using TKind = slang::parsing::TokenKind;
+        auto opens = [](TKind k) {
+            return k == TKind::BeginKeyword || k == TKind::ForkKeyword || k == TKind::CaseKeyword ||
+                   k == TKind::CaseXKeyword || k == TKind::CaseZKeyword || k == TKind::RandCaseKeyword;
+        };
+        auto closes = [](TKind k) {
+            return k == TKind::EndKeyword || k == TKind::JoinKeyword || k == TKind::JoinAnyKeyword ||
+                   k == TKind::JoinNoneKeyword || k == TKind::EndCaseKeyword;
+        };
+        std::vector<TKind> closers, openers;
+        SourceTextLexer lexer(body);
+        for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; token = lexer.lex()) {
+            if (opens(token.kind))
+                openers.push_back(token.kind);
+            else if (closes(token.kind) && !openers.empty())
+                openers.pop_back();
+            else if (closes(token.kind))
+                closers.push_back(token.kind);
+        }
+        closers.insert(closers.end(), openers.begin(), openers.end());
+        return closers;
+    }
+
     void collect_disabled_region_body() {
         consume_disabled_region_boundary_newline(source_.size());
         const size_t body_start = cursor_;
@@ -849,6 +935,7 @@ private:
             add_token(slang::parsing::TokenKind::Unknown, raw_body, body_start,
                       false, true, CommentLexemeKind::None,
                       false, false, true);
+            tokens_.back().lex.disabled_region_scope_keywords = unmatched_block_keywords(raw_body);
             consume_text(raw_body, false);
         }
         passthrough_end_ = std::max(passthrough_end_, body_end);
