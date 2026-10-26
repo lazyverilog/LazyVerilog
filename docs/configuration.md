@@ -69,9 +69,14 @@ define = ["RTL_SIM"]
 enable_format_on_save = true
 indent_size = 4
 
-[lint]
+[lint.statement]
 enable = true
+case_missing_default = true
 ```
+
+Lint rules are all off until you turn them on: `[lint].enable` defaults to `true` and only switches
+everything off, while each category (`[lint.statement]`, `[lint.naming]`, ...) needs its own
+`enable = true` plus the rules you want. See [Linter options](linter/options.md).
 
 ## Complete example
 
@@ -79,6 +84,26 @@ The `lazyverilog.toml` from the repository root, imported here so it cannot drif
 project tests against.
 
 <<< ../lazyverilog.toml
+
+## Index cache
+
+The index of each project file is cached on disk, so a restart does not parse the project again:
+
+- In a project with a `lazyverilog.toml`: `.cache/lazyverilog/index` next to that file. Add `.cache/`
+  to your `.gitignore`.
+- Files under no project: `lazyverilog/index` in the user cache directory (listed above).
+- Implicit projects: `lazyverilog/i` in the user cache directory.
+
+An entry is reused only when the file, its includes, its defines and include directories are
+unchanged, compared by content, not by timestamp. You can delete the directory at any time; the next
+start indexes the files again.
+
+## CPU use
+
+Indexing uses up to 8 worker threads, never more than the CPUs this process may use: its CPU affinity,
+a container CPU quota (cgroup), and the batch scheduler's allocation. The scheduler variables read are
+`SLURM_CPUS_PER_TASK` (Slurm), `LSB_DJOB_NUMPROC` (LSF), `NCPUS` (PBS Pro) and `PBS_NUM_PPN`
+(Torque); the smallest one set wins. `OMP_NUM_THREADS` is not read.
 
 ## Option reference
 

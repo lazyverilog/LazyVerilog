@@ -13,9 +13,13 @@ define = ["MY_DEFINE"]
 [format]
 enable_format_on_save = true
 
-[lint]
+[lint.statement]
 enable = true
+case_missing_default = true
 ```
+
+Every lint rule is off until its section has `enable = true` and the rule is turned on. See
+[Linter options](../linter/options.md).
 
 `vcode` points to a filelist. It lets LazyVerilog index modules, ports, and cross-file references:
 

@@ -14,6 +14,14 @@ interface RtlNode {
   recursive?: boolean;
   unknown?: boolean;
   children?: RtlNode[];
+  // [rtltree] options; the server sends them on the root node only.
+  show_instance_name?: boolean;
+  show_file?: boolean;
+}
+
+interface RtlLabelOptions {
+  showInstanceName: boolean;
+  showFile: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -24,19 +32,27 @@ class RtlTreeItem extends vscode.TreeItem {
   constructor(
     readonly node: RtlNode,
     readonly collapsibleState: vscode.TreeItemCollapsibleState,
+    readonly options: RtlLabelOptions,
   ) {
     super(node.name, collapsibleState);
 
     // Label: show instance name in parens when it differs from module name
-    if (node.inst && node.inst !== node.name) {
+    if (options.showInstanceName && node.inst && node.inst !== node.name) {
       this.label = `${node.name} (${node.inst})`;
     }
 
-    if (node.recursive) {
-      this.description = "<recursive>";
-    } else if (node.unknown) {
-      this.description = "<unknown>";
+    const description: string[] = [];
+    if (options.showFile && node.file) {
+      description.push(
+        vscode.workspace.asRelativePath(node.file.replace(/^file:\/\//, "")),
+      );
     }
+    if (node.recursive) {
+      description.push("<recursive>");
+    } else if (node.unknown) {
+      description.push("<unknown>");
+    }
+    if (description.length > 0) this.description = description.join("  ");
 
     if (node.file) {
       const filePath = node.file.replace(/^file:\/\//, "");
@@ -136,6 +152,10 @@ class RtlTreeDataProvider
   getChildren(element?: RtlTreeItem): vscode.ProviderResult<RtlTreeItem[]> {
     if (!this.root) return [];
     const node = element ? element.node : this.root;
+    const options: RtlLabelOptions = {
+      showInstanceName: this.root.show_instance_name ?? true,
+      showFile: this.root.show_file ?? true,
+    };
 
     if (!element) {
       // Return the root as the single top-level item
@@ -145,6 +165,7 @@ class RtlTreeDataProvider
           (this.root.children?.length ?? 0) > 0
             ? vscode.TreeItemCollapsibleState.Expanded
             : vscode.TreeItemCollapsibleState.None,
+          options,
         ),
       ];
     }
@@ -156,6 +177,7 @@ class RtlTreeDataProvider
           (child.children?.length ?? 0) > 0
             ? vscode.TreeItemCollapsibleState.Expanded
             : vscode.TreeItemCollapsibleState.None,
+          options,
         ),
     );
   }

@@ -12,7 +12,10 @@ its `` `include `` files. Slower semantic diagnostics are separate: see
 
 ### `enable`
 
-Global kill-switch. When `false`, no lint rules run regardless of per-category settings.
+Global kill-switch. When `false`, no lint rules run regardless of per-category settings. It defaults to
+`true`, and on its own it turns on nothing: every category's `enable` and every rule default to off.
+Turn on a category with its `enable = true`, then the rules you want in it (see the
+[complete example](#complete-example-configuration)).
 
 ```toml
 [lint]
@@ -692,6 +695,21 @@ logic [7:0] s_result = clamp(i_val, 8'hF0);
 // good
 logic [7:0] s_result = clamp(.val(i_val), .limit(8'hF0));
 ```
+
+---
+
+## Quick fixes
+
+Some diagnostics come with a code action (`quickfix`) that fixes them. Use your editor's code action
+menu on the diagnostic (`Ctrl+.` in VS Code, `vim.lsp.buf.code_action()` in Neovim).
+
+| Rule | Code action | Edit |
+|------|-------------|------|
+| `case_missing_default` | Add default case | Inserts `default: ;` before `endcase` |
+| `explicit_function_lifetime`, `functions_automatic` | Add 'automatic' lifetime | Inserts `automatic` after `function` |
+| `explicit_task_lifetime` | Add 'automatic' lifetime to task | Inserts `automatic` after `task` |
+
+The other rules have no quick fix.
 
 ---
 

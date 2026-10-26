@@ -36,9 +36,16 @@ uvm/src/uvm_pkg.sv
 | Line | Effect |
 |------|--------|
 | `rtl.sv` | A source file to index |
-| `-f <filelist>` | Load a nested filelist, its paths relative to itself |
+| `-f <filelist>` | Load a nested filelist, its paths relative to itself. `-F`, `-f=<filelist>` and `-f<filelist>` are the same |
+| `-v <file>` | A library file. It is indexed like any source file |
 | `+incdir+<dir>` | Add an include directory. `+incdir+<a>+<b>` adds several |
-| others | Comments (`//`, `#`) and any other `+<option>` or `-<flag>` are ignored |
+| `-y <dir>`, `-l <file>`, `-top <name>`, `-o`, `-work`, ... | Ignored, together with their argument |
+| `+define+<NAME>` | Ignored. Put defines in `[design].define` |
+| others | Comments and any other `+<option>` or `-<flag>` are ignored |
+
+Paths are relative to the filelist that names them, for `-f` and `-F` alike. A line ending in `\`
+continues on the next line. Quote a path that contains spaces (`"my dir/top.sv"` or `'...'`).
+`//` and `#` start a comment anywhere on the line, even inside quotes.
 
 `+incdir+` entries are search paths for `` `include ``, not source files.
 
