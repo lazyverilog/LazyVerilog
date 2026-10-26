@@ -1091,6 +1091,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // not one of these.
         std::unordered_set<std::string> subroutine_locals;
         bool in_subroutine_{false};
+        // Walking an out-of-block method body (`function void cfg::set(...)`).
+        bool in_out_of_block_{false};
         // Declared type of a receiver written inside a class, so `it.addr` and
         // `t.op` resolve like a module-scope `p.data` instead of decaying to
         // `name:`: formals and locals of the subroutine being walked, and the
@@ -1456,6 +1458,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             auto previous_class_bare = current_class_bare;
             const bool previous_has_base = current_class_has_base;
             auto previous_class_base = current_class_base;
+            const bool previously_out_of_block = in_out_of_block_;
+            in_out_of_block_ = out_of_block_class.has_value();
             if (out_of_block_class) {
                 current_class_bare = *out_of_block_class;
                 // Same scoped spelling the class body is walked with, so
@@ -1493,6 +1497,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             current_class_bare = std::move(previous_class_bare);
             current_class_has_base = previous_has_base;
             current_class_base = std::move(previous_class_base);
+            in_out_of_block_ = previously_out_of_block;
         }
 
         /// Stable label for a subroutine's lexical scope.
@@ -1567,14 +1572,24 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             subroutine_symbol_id(SubroutineOwnerKind::Class, owner, name));
                 }
             }
-            // The prototype's formals are its own names, not same-named fields.
+            // The prototype's formals name nothing outside it: not a same-named
+            // field, and no `name:` occurrence for the include bridge to hand
+            // to one.  Their types are not class property types either.
+            if (proto.portList) {
+                for (const auto* port : proto.portList->ports)
+                    if (const auto* p = port ? port->as_if<FunctionPortSyntax>() : nullptr)
+                        classified_tokens.insert(token_key(p->declarator->name));
+            }
             auto previous_locals = std::move(subroutine_locals);
+            auto previous_value_types = std::move(subroutine_value_types);
             const bool previously_in_subroutine = in_subroutine_;
             subroutine_locals.clear();
+            subroutine_value_types.clear();
             in_subroutine_ = true;
             visitDefault(node);
             in_subroutine_ = previously_in_subroutine;
             subroutine_locals = std::move(previous_locals);
+            subroutine_value_types = std::move(previous_value_types);
         }
 
         void add_subroutine_invocation_ref(const slang::parsing::Token& name_token,
@@ -2775,6 +2790,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 scope_key += name;
                 if (class_fields.contains(scope_key)) {
                     add_ref(token, symbol_canonical("class_field", current_class, name));
+                    // An out-of-block body is often its own header: the field
+                    // asked from the class's header has an unscoped identity,
+                    // so keep the `name:` occurrence the include bridge matches.
+                    if (in_out_of_block_)
+                        add_ref(token, "name:" + name);
                     return;
                 }
             }

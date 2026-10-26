@@ -3701,3 +3701,56 @@ endpackage
         sites.emplace(change.range.start.line, change.range.start.character);
     CHECK(sites == std::set<std::pair<int, int>>{{6, 8}, {15, 31}, {19, 9}});
 }
+
+// The class and its out-of-block bodies in two headers that one package
+// includes.  The bare `n = v` in the body still has to reach the field asked
+// from the class's header, or renaming the field leaves an undefined name.
+TEST_CASE("references: a bare field use in an out-of-block body in a sibling header",
+          "[references][class]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog_refs_oob_sibling";
+    std::filesystem::create_directories(dir);
+    const auto cfg_path = dir / "cfg.svh";
+    const auto impl_path = dir / "cfg_impl.svh";
+    const auto pkg_path = dir / "pkg.sv";
+    const std::string cfg = R"(class cfg;
+  int n;
+  extern function void set(int v);
+  extern function void set_n(int n);
+endclass
+)";
+    const std::string impl = R"(function void cfg::set(int v);
+  this.n = v;
+  n = v;
+endfunction
+function void cfg::set_n(int n);
+  this.n = n;
+endfunction
+)";
+    const std::string pkg = R"(package pkg;
+  `include "cfg.svh"
+  `include "cfg_impl.svh"
+endpackage
+)";
+    for (const auto& [path, text] :
+         {std::pair{cfg_path, cfg}, std::pair{impl_path, impl}, std::pair{pkg_path, pkg}}) {
+        std::ofstream out(path);
+        REQUIRE(out.good());
+        out << text;
+    }
+
+    Analyzer analyzer;
+    analyzer.set_include_dirs({dir.string()});
+    analyzer.set_extra_files({pkg_path.string()});
+    analyzer.wait_for_background_index_idle();
+    const std::string cfg_uri = uri_from_path(cfg_path);
+    const std::string impl_uri = uri_from_path(impl_path);
+    analyzer.open(uri_from_path(pkg_path), pkg);
+    analyzer.open(cfg_uri, cfg);
+    analyzer.open(impl_uri, impl);
+
+    const auto refs = analyzer.find_references(cfg_uri, 1, 6, true);
+    CHECK(reference_lines(refs, cfg_uri) == std::vector<int>{1});
+    CHECK(reference_lines(refs, impl_uri) == std::vector<int>{1, 2, 5});
+
+    std::filesystem::remove_all(dir);
+}
