@@ -1607,3 +1607,41 @@ TEST_CASE("a filelist entry inside an implicit root keeps the defaults",
     CHECK(names.contains("m_listed"));
     CHECK_FALSE(names.contains("m_unlisted"));
 }
+
+TEST_CASE("a warning inside another project's macro body is not reported",
+          "[project-root][macro-warnings]") {
+    // `uvm_field_int expands to ten warnings about UVM's own code, all landing
+    // on the user's line.  The same truncation three ways, each its own width so
+    // the message says which one survived: written inside a library macro,
+    // inside the user's own macro, and inline.
+    TempTree tree("foreign-macro-warning");
+    tree.write("lib/lazyverilog.toml", "[design]\n");
+    tree.write("chip/lazyverilog.toml", "[design]\n");
+    tree.write("lib/lib_macros.svh",
+               "`define LIB_DECL logic [2:0] lib_n; int lib_w; assign lib_n = lib_w; assign lib_w = undeclared_lib_thing;\n");
+    tree.write("chip/rtl/own_macros.svh",
+               "`define OWN_DECL logic [4:0] own_n; int own_w; assign own_n = own_w;\n");
+    auto top = tree.write("chip/rtl/top.sv", "`include \"../../lib/lib_macros.svh\"\n"
+                                             "`include \"own_macros.svh\"\n"
+                                             "module top;\n"
+                                             "    `LIB_DECL\n"
+                                             "    `OWN_DECL\n"
+                                             "    logic [3:0] n;\n"
+                                             "    int w;\n"
+                                             "    assign n = w;\n"
+                                             "endmodule\n");
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_project_config({}, {}, {top.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string all_messages = semantic_messages(analyzer);
+    INFO(all_messages);
+    // The library macro did expand: its error is still the user's to see.
+    CHECK(all_messages.find("undeclared_lib_thing") != std::string::npos);
+    CHECK(all_messages.find("truncates from 32 to 3 bits") == std::string::npos);
+    CHECK(all_messages.find("truncates from 32 to 5 bits") != std::string::npos);
+    CHECK(all_messages.find("truncates from 32 to 4 bits") != std::string::npos);
+}

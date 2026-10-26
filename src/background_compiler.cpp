@@ -81,6 +81,26 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
     return info;
 }
 
+/// A warning about code written in a macro body from another project than the
+/// file it lands in -- `uvm_field_int expands to UVM code the user cannot fix.
+/// slang's --suppress-macro-warnings, with "another project" as the path set.
+/// Code passed in as a macro argument is the user's and stays reported.
+static bool is_foreign_macro_warning(const slang::SourceManager& sm,
+                                     const slang::Diagnostic& diagnostic,
+                                     const ProjectParseInputs& inputs) {
+    if (slang::getDefaultSeverity(diagnostic.code) != slang::DiagnosticSeverity::Warning)
+        return false;
+    auto loc = diagnostic.location;
+    while (loc.valid() && sm.isMacroArgLoc(loc))
+        loc = sm.getOriginalLoc(loc);
+    if (!loc.valid() || !sm.isMacroLoc(loc))
+        return false;
+    const auto& written = sm.getFullPath(sm.getFullyOriginalLoc(loc).buffer());
+    const auto& reported = sm.getFullPath(sm.getFullyExpandedLoc(loc).buffer());
+    return !written.empty() && !reported.empty() &&
+           inputs.project_root_for(written) != inputs.project_root_for(reported);
+}
+
 } // namespace
 
 struct BackgroundCompiler::WorkerSlot {
@@ -473,6 +493,8 @@ void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
         slang::DiagnosticEngine engine(*source_manager);
         try {
             for (const auto& diagnostic : compilation.getSemanticDiagnostics()) {
+                if (parse_inputs && is_foreign_macro_warning(*source_manager, diagnostic, *parse_inputs))
+                    continue;
                 std::string uri;
                 auto info = convert_diagnostic(*source_manager, engine, diagnostic, first_uri, uri);
                 result.diagnostics_by_uri[uri].push_back(std::move(info));
