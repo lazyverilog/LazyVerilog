@@ -999,6 +999,8 @@ struct IncluderCandidate {
 struct MacroNameScan {
     std::set<std::string, std::less<>> uses;
     std::set<std::string, std::less<>> prefixes;
+    /// Names the text (re)defines or `undef's for certain, which its includer's
+    /// value must not shadow: everything except a default, below.
     std::set<std::string, std::less<>> defines;
 };
 
@@ -1013,24 +1015,66 @@ static void scan_macro_names(std::string_view text, MacroNameScan& scan) {
             return std::string_view{};
         return text.substr(at, end - at);
     };
+    // A `define directly inside `ifndef NAME for the same NAME is a default
+    // (`ifndef W `define W 32 `endif): the includer's W must still win.  Unless
+    // that `ifndef is the file's include guard, wrapping the whole text.
+    struct Frame {
+        std::string_view name;
+        bool ifndef;
+        size_t index;
+    };
+    std::vector<Frame> frames;
+    std::vector<std::string_view> guard_defines;  // defaults directly inside frame 0
+    size_t frames_opened = 0;
+    bool first_is_guard_candidate = false;
+    size_t first_closed_at = std::string_view::npos;
+    size_t last_directive = 0;
+    bool seen_directive = false;
     for (auto at = text.find('`'); at != std::string_view::npos; at = text.find('`', at + 1)) {
         const auto name = ident_at(at + 1);
         if (name.empty())
             continue;
         const size_t end = at + 1 + name.size();
-        if (name == "define" || name == "undef" || name == "ifdef" || name == "ifndef" ||
-            name == "elsif") {
-            const auto arg_at = text.find_first_not_of(" \t", end);
-            const auto arg = arg_at == std::string_view::npos ? std::string_view{} : ident_at(arg_at);
+        const auto arg_at = text.find_first_not_of(" \t", end);
+        const auto arg = arg_at == std::string_view::npos ? std::string_view{} : ident_at(arg_at);
+        if (name == "ifdef" || name == "ifndef") {
+            if (!seen_directive && frames_opened == 0)
+                first_is_guard_candidate = name == "ifndef";
+            frames.push_back({arg, name == "ifndef", frames_opened++});
             if (!arg.empty())
-                (name == "define" || name == "undef" ? scan.defines : scan.uses).emplace(arg);
+                scan.uses.emplace(arg);
+        } else if (name == "elsif" || name == "else") {
+            if (!frames.empty())
+                frames.back().ifndef = false;
+            if (name == "elsif" && !arg.empty())
+                scan.uses.emplace(arg);
+        } else if (name == "endif") {
+            if (!frames.empty()) {
+                if (frames.back().index == 0)
+                    first_closed_at = at;
+                frames.pop_back();
+            }
+        } else if (name == "define" || name == "undef") {
+            if (!arg.empty()) {
+                const bool is_default = name == "define" && !frames.empty() &&
+                                        frames.back().ifndef && frames.back().name == arg;
+                if (!is_default)
+                    scan.defines.emplace(arg);
+                else if (frames.back().index == 0)
+                    guard_defines.push_back(arg);
+            }
         } else if (text.substr(end, 2) == "``") {
             scan.prefixes.emplace(name);
         } else {
             scan.uses.emplace(name);
         }
+        seen_directive = true;
+        last_directive = at;
         at = end - 1;
     }
+    // Frame 0 is the guard when it is the first directive and its `endif the last.
+    if (first_is_guard_candidate && first_closed_at == last_directive)
+        scan.defines.insert(guard_defines.begin(), guard_defines.end());
 }
 
 /// Where the `include at @p spelled from @p includer_path resolves: slang's
@@ -1216,9 +1260,11 @@ find_includer_macros(const std::string& header_path, std::vector<IncluderCandida
 /// The names of the macros in @p all that @p text uses, directly or through
 /// the bodies of the ones it uses, plus @p extras; sorted.  A macro @p text
 /// defines itself is never one -- its include guard, or a redefinition slang
-/// would otherwise lose to the predefine.
+/// would otherwise lose to the predefine -- nor is one in @p hidden (sorted),
+/// which the files @p text includes define.
 static std::vector<std::string> used_includer_macros(const IncluderMacros& all, std::string_view text,
-                                                     const std::vector<std::string>& extras) {
+                                                     const std::vector<std::string>& extras,
+                                                     const std::vector<std::string>& hidden) {
     MacroNameScan scan;
     scan_macro_names(text, scan);
     std::vector<std::string_view> pending(scan.uses.begin(), scan.uses.end());
@@ -1237,7 +1283,8 @@ static std::vector<std::string> used_includer_macros(const IncluderMacros& all, 
     while (!pending.empty()) {
         const auto name = pending.back();
         pending.pop_back();
-        if (scan.defines.contains(name) || picked.contains(name))
+        if (scan.defines.contains(name) || picked.contains(name) ||
+            std::ranges::binary_search(hidden, name))
             continue;
         const auto it = std::lower_bound(all.begin(), all.end(), name, by_name);
         if (it == all.end() || it->name != name)
@@ -1281,6 +1328,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     std::shared_ptr<const IncluderMacros> includer_macros;
     std::vector<std::string> previous_macro_names;
     std::vector<std::string> macro_extras;
+    std::vector<std::string> macro_hidden;
     std::shared_ptr<const std::string> includer_predefine;
     uint64_t graph_generation = 0;
     std::vector<IncluderCandidate> includers;
@@ -1307,6 +1355,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
                 includer_macros = previous.includer_macros;
                 previous_macro_names = previous.includer_macro_names;
                 macro_extras = previous.includer_macro_extras;
+                macro_hidden = previous.includer_macro_hidden;
                 includer_predefine = previous.includer_predefine;
             }
         }
@@ -1364,7 +1413,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     // Only the ones this text uses: all of UVM is ~280 KB to lex per keystroke.
     std::vector<std::string> macro_names;
     if (!includer_macros->empty())
-        macro_names = used_includer_macros(*includer_macros, text, macro_extras);
+        macro_names = used_includer_macros(*includer_macros, text, macro_extras, macro_hidden);
     if (macro_names != previous_macro_names || (!macro_names.empty() && !includer_predefine))
         includer_predefine = includer_predefine_for(*includer_macros, macro_names);
 
@@ -1403,26 +1452,33 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     };
     auto tree = parse();
     if (!includer_macros->empty()) {
-        // A body that builds a macro name by pasting (`FUNCTION``_op) asks for
-        // macros no scan can name.  slang names them: add those and parse once
-        // more.  Kept as extras, so later keystrokes include them from the start.
-        std::vector<std::string> missing;
+        // What the scan of this text cannot see: names the files it includes
+        // test or define (`ifdef FEATURE in a sub-header), and names a body
+        // builds by pasting (`FUNCTION``_op), which slang reports as unknown.
+        // Kept, so later keystrokes have them from the start and parse once.
+        MacroNameScan included;
+        for (const auto& include : tree->getIncludeDirectives()) {
+            if (include.buffer.id.valid())
+                scan_macro_names(sm->getSourceText(include.buffer.id), included);
+        }
+        macro_hidden.assign(included.defines.begin(), included.defines.end());
+        macro_extras.insert(macro_extras.end(), included.uses.begin(), included.uses.end());
         for (const auto& diagnostic : tree->diagnostics()) {
             if (diagnostic.code != slang::diag::UnknownDirective || diagnostic.args.empty())
                 continue;
-            const auto* spelled = std::get_if<std::string>(&diagnostic.args[0]);
-            if (!spelled)
-                continue;
-            std::string name = spelled->starts_with('`') ? spelled->substr(1) : *spelled;
-            if (!std::ranges::binary_search(macro_names, name) &&
-                std::ranges::binary_search(*includer_macros, name, {}, &IncluderMacro::name))
-                missing.push_back(std::move(name));
+            if (const auto* spelled = std::get_if<std::string>(&diagnostic.args[0]))
+                macro_extras.push_back(spelled->starts_with('`') ? spelled->substr(1) : *spelled);
         }
-        if (!missing.empty()) {
-            macro_extras.insert(macro_extras.end(), missing.begin(), missing.end());
-            std::ranges::sort(macro_extras);
-            macro_extras.erase(std::unique(macro_extras.begin(), macro_extras.end()), macro_extras.end());
-            macro_names = used_includer_macros(*includer_macros, text, macro_extras);
+        std::erase_if(macro_extras, [&](const std::string& name) {
+            return !std::ranges::binary_search(*includer_macros, name, {}, &IncluderMacro::name);
+        });
+        std::ranges::sort(macro_extras);
+        macro_extras.erase(std::unique(macro_extras.begin(), macro_extras.end()), macro_extras.end());
+        // At most one more parse, and only when the set changed: a name this
+        // text defines itself stays out however often slang reports it.
+        auto names = used_includer_macros(*includer_macros, text, macro_extras, macro_hidden);
+        if (names != macro_names) {
+            macro_names = std::move(names);
             includer_predefine = includer_predefine_for(*includer_macros, macro_names);
             include_dirs = parse_inputs->for_path(normalized_current_path).include_dir_paths;
             tree = parse();
@@ -1434,6 +1490,7 @@ std::shared_ptr<DocumentState> Analyzer::make_state(const std::string& uri,
     state->includer_graph_generation = graph_generation;
     state->includer_macro_names = std::move(macro_names);
     state->includer_macro_extras = std::move(macro_extras);
+    state->includer_macro_hidden = std::move(macro_hidden);
     state->includer_predefine = std::move(includer_predefine);
     cache_document_end_position(*state);
     state->source_manager = std::move(sm);
@@ -1622,6 +1679,7 @@ uint64_t Analyzer::enqueue_parse_if_current(const std::string& uri, std::string 
                 state->includer_graph_generation = previous.includer_graph_generation;
                 state->includer_macro_names = previous.includer_macro_names;
                 state->includer_macro_extras = previous.includer_macro_extras;
+                state->includer_macro_hidden = previous.includer_macro_hidden;
                 state->includer_predefine = previous.includer_predefine;
             }
             // Keep the last snapshot that actually parsed, so an AST-shaped

@@ -547,3 +547,61 @@ TEST_CASE("a header that includes itself is not reparsed forever", "[sync][inclu
     REQUIRE(before != nullptr);
     CHECK(after == before);
 }
+namespace {
+
+/// The text of the definition of @p name the parse of @p state ended with.
+std::string defined_macro(const DocumentState& state, std::string_view name) {
+    std::string text;
+    for (const auto* def : state.tree->getDefinedMacros()) {
+        if (def->name.valueText() == name)
+            text = def->toString();
+    }
+    return text;
+}
+
+} // namespace
+
+TEST_CASE("a header's own include sees the includer's macros its conditions test",
+          "[sync][includer-context]") {
+    // item.svh never names FEATURE; sub.svh, which it includes, tests it.
+    HeaderTree tree("subif");
+    tree.write("inc/defs.svh", "`define FEATURE\n");
+    tree.write("inc/sub.svh", "`ifdef FEATURE\n`define W2 8\n`else\n`define W2 2\n`endif\n");
+    const auto item = tree.write("inc/item.svh", "`include \"sub.svh\"\nclass item;\n  logic [`W2-1:0] d;\nendclass\n");
+    tree.write("src/pkg.sv", "package pkg;\n`include \"defs.svh\"\n`include \"item.svh\"\nendpackage\n");
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/item.svh"), item);
+    const auto state = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(state != nullptr);
+    REQUIRE(state->tree != nullptr);
+    CHECK(defined_macro(*state, "W2").find('8') != std::string::npos);
+
+    // Known from the first parse on: a keystroke parses once, with the same input.
+    a.change(tree.uri("inc/item.svh"), item + "\n");
+    const auto edited = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(edited != nullptr);
+    CHECK(edited->includer_predefine == state->includer_predefine);
+}
+
+TEST_CASE("an includer's value wins over a header's `ifndef default", "[sync][includer-context]") {
+    // `ifndef BUS_AW `define BUS_AW 32 is a default for when nobody set it; the
+    // package did.  The include guard around it is still the header's own.
+    HeaderTree tree("dflt");
+    tree.write("inc/defs.svh", "`define BUS_AW 16\n");
+    const auto item = tree.write("inc/item.svh", "`ifndef ITEM_SVH\n`define ITEM_SVH\n"
+                                                 "`ifndef BUS_AW\n`define BUS_AW 32\n`endif\n"
+                                                 "class item;\n  logic [`BUS_AW-1:0] a;\nendclass\n"
+                                                 "`endif\n");
+    tree.write("src/pkg.sv", "package pkg;\n`include \"defs.svh\"\n`include \"item.svh\"\nendpackage\n");
+    Analyzer a;
+    tree.index(a);
+    a.open(tree.uri("inc/item.svh"), item);
+    const auto state = a.get_state(tree.uri("inc/item.svh"));
+    REQUIRE(state != nullptr);
+    REQUIRE(state->includer_predefine != nullptr);
+    CHECK(state->includer_predefine->find("`define BUS_AW") != std::string::npos);
+    CHECK(state->includer_predefine->find("ITEM_SVH") == std::string::npos);
+    CHECK(parses_active(*state));
+    CHECK(defined_macro(*state, "BUS_AW").find("32") == std::string::npos);
+}

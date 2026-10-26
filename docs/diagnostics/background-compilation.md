@@ -28,8 +28,9 @@ It can be slow on a weak machine, so enable it where you have the CPU and memory
 A warning that slang raises while expanding a macro written in another project is not shown. One
 example is UVM's `` `uvm_field_int `` (implicit conversions inside UVM code). "Another project" means
 the macro's file belongs to a different `lazyverilog.toml` than the file the warning lands in, or to
-none at all. This includes a warning on your own argument when the outermost macro is the library's.
-The conversion it reports is one that the library body applies, and you cannot change it.
+none at all. A warning on your own macro argument is dropped only when it also points into the
+library's body, such as an assignment to a variable the macro declares. A warning wholly inside your
+argument, such as the truncation in `` `LIB_DO(n = w) ``, is still shown.
 
 - Errors from such macros are always shown.
 - A sibling project's macros count as foreign. A library vendored under your own `lazyverilog.toml`,
