@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -149,6 +150,23 @@ struct DocumentState {
     // gets a new DocumentState and therefore a fresh once_flag/cache pair.
     mutable std::once_flag dynamic_index_once_;
     mutable SyntaxIndex dynamic_index_cache_;
+    // Every typedef the tree declares (class bodies and macro expansions
+    // included), name -> {first target, first target that is a named type},
+    // as completion's member access and `::` resolution read them.  Filled on
+    // first use, so a member-access request walks the tree for typedefs once
+    // per snapshot rather than once per lookup.
+    mutable std::once_flag typedef_targets_once_;
+    mutable std::unordered_map<std::string, std::pair<std::string, std::string>>
+        typedef_targets_cache_;
+    // How long this snapshot's tree took to land: from the oldest edit it
+    // answers to the commit for a reparse, make_state() alone for didOpen.
+    // A request that would wait for the next reparse uses its predecessor's
+    // figure to tell whether the wait can pay off at all.
+    std::chrono::steady_clock::duration parse_time{};
+    // For a placeholder: when the oldest edit still waiting for a parse
+    // arrived -- inherited from the placeholder it replaces, so typing faster
+    // than the file parses keeps it in the past.  Unset for a parsed state.
+    std::chrono::steady_clock::time_point enqueued_at{};
     // Folds derived from this snapshot's text, computed at most once.
     //
     // Whole-file foldingRange is the most expensive request on the edit path,

@@ -1663,21 +1663,30 @@ static std::string current_file_typedef_target_from_ast(const DocumentState& sta
                                                         bool named_only = false) {
     if (!state.tree || name.empty())
         return {};
-    using namespace slang::syntax;
-    struct Visitor : SyntaxVisitor<Visitor> {
-        std::string_view name;
-        bool named_only;
-        std::string result;
-        Visitor(std::string_view name, bool named_only) : name(name), named_only(named_only) {}
-        void handle(const TypedefDeclarationSyntax& node) {
-            if (result.empty() && std::string_view(node.name.valueText()) == name &&
-                (!named_only || node.type->kind == SyntaxKind::NamedType))
-                result = completion_base_type_name(current_ast_decl_text(*node.type));
-            visitDefault(node);
-        }
-    } visitor(name, named_only);
-    state.tree->root().visit(visitor);
-    return visitor.result;
+    // One walk per snapshot: a member-access request asks several times.
+    std::call_once(state.typedef_targets_once_, [&] {
+        using namespace slang::syntax;
+        struct Visitor : SyntaxVisitor<Visitor> {
+            std::unordered_map<std::string, std::pair<std::string, std::string>>& out;
+            explicit Visitor(decltype(out) out) : out(out) {}
+            void handle(const TypedefDeclarationSyntax& node) {
+                auto target = completion_base_type_name(current_ast_decl_text(*node.type));
+                if (!target.empty()) {
+                    auto& [any, named] = out[std::string(node.name.valueText())];
+                    if (named.empty() && node.type->kind == SyntaxKind::NamedType)
+                        named = target;
+                    if (any.empty())
+                        any = std::move(target);
+                }
+                visitDefault(node);
+            }
+        } visitor(state.typedef_targets_cache_);
+        state.tree->root().visit(visitor);
+    });
+    const auto it = state.typedef_targets_cache_.find(std::string(name));
+    if (it == state.typedef_targets_cache_.end())
+        return {};
+    return named_only ? it->second.second : it->second.first;
 }
 
 /// Every class this buffer declares, for the contexts that admit only a class
@@ -2990,10 +2999,36 @@ class FileProvider : public CompletionProvider {
     }
 };
 
-std::shared_ptr<const DocumentState> completion_document_state(const Analyzer& analyzer,
-                                                               const std::string& uri) {
-    auto parsed = analyzer.get_parsed_state(uri);
+std::shared_ptr<const DocumentState>
+completion_document_state(const Analyzer& analyzer, const lsTextDocumentPositionParams& params,
+                          std::chrono::milliseconds budget) {
+    const auto& uri = params.textDocument.uri.raw_uri_;
     auto latest = analyzer.get_state(uri);
+    if (!latest || latest->tree)
+        return latest;
+    // Plain identifier typing answers from the placeholder, as it always did:
+    // only a `.`, `::` or `` ` `` context reads the tree, and nvim-cmp asks on
+    // every identifier keystroke while the request thread serves one at a time.
+    size_t pos = position_to_offset(latest->text, params.position.line, params.position.character);
+    while (pos > 0 && is_ident_char(latest->text[pos - 1]))
+        --pos;
+    const char before = pos > 0 ? latest->text[pos - 1] : '\0';
+    if (before != '.' && before != ':' && before != '`')
+        return latest;
+    // Waiting only pays when the parse can land inside the budget, counted
+    // from the oldest edit still unparsed: a file whose last parse took longer,
+    // or a worker already that far behind, would only add the budget to the
+    // keystroke.
+    const auto behind = std::chrono::steady_clock::now() - latest->enqueued_at;
+    if (latest->enqueued_at != std::chrono::steady_clock::time_point{} && behind >= budget)
+        return latest;
+    if (latest->previous_parsed && latest->previous_parsed->parse_time > budget)
+        return latest;
+    const auto remaining = latest->enqueued_at != std::chrono::steady_clock::time_point{}
+                               ? std::chrono::duration_cast<std::chrono::milliseconds>(budget - behind)
+                               : budget;
+    auto parsed = analyzer.get_parsed_state(uri, remaining);
+    latest = analyzer.get_state(uri);
     return parsed && latest && parsed->text == latest->text ? parsed : latest;
 }
 
@@ -3604,6 +3639,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // (`bus_item` -> `uvm_sequence_item` -> ... -> `uvm_object`), so
             // climb across the layers here and ask the shards for every level.
             // The AST pass already emitted the levels this buffer declares.
+            // Two projects may each declare a class of the same name with a
+            // different base: take the one nearest this file (rank, don't
+            // filter); the ranked list carries header shards and unlisted
+            // buffers too.  Opened shards cover a buffer not yet published.
+            std::shared_ptr<const std::vector<const ExtraFileInfo*>> ranked;
             const auto shard_base_of = [&](const std::string& cls) -> std::optional<std::string> {
                 const auto lookup = [&](const SyntaxIndex& index) -> std::optional<std::string> {
                     const auto it = index.class_by_name.find(cls);
@@ -3611,13 +3651,16 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         return std::nullopt;
                     return base_class_lookup_name(index.classes[it->second].base_class);
                 };
+                if (!ranked)
+                    ranked = analyzer.ranked_extra_files(state);
+                if (ranked)
+                    for (const auto* extra : *ranked)
+                        if (extra && extra->index)
+                            if (auto base = lookup(*extra->index))
+                                return base;
                 for (const auto& shard : *opened_shards)
                     if (shard.index)
                         if (auto base = lookup(*shard.index))
-                            return base;
-                for (const auto* shard : project_shards)
-                    if (shard)
-                        if (auto base = lookup(*shard))
                             return base;
                 return std::nullopt;
             };

@@ -4,6 +4,7 @@
 #include "LibLsp/lsp/lsTextDocumentPositionParams.h"
 #include "LibLsp/lsp/textDocument/completion.h"
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -121,14 +122,17 @@ class CompletionEngine {
                        const std::unordered_set<std::string>& same_type_names) const;
 };
 
-/// The snapshot completion should answer from for @p uri.
+/// The snapshot completion should answer from for @p params.
 ///
 /// The editor sends completion right behind the didChange that typed the
 /// trigger character, so `get_state()` is usually the text-only placeholder:
 /// with no tree, `p_sequencer.` cannot be seen as member access and the
-/// generic identifier list comes back instead.  Waits for that parse like the
-/// other AST-shaped requests do, but never answers from the one-keystroke-old
-/// fallback: completion reads the cursor's surroundings out of the snapshot's
-/// own text, and the old text does not have the `.` the user just typed.
-std::shared_ptr<const DocumentState> completion_document_state(const Analyzer& analyzer,
-                                                               const std::string& uri);
+/// generic identifier list comes back instead.  After a `.`, `::` or `` ` ``
+/// this waits up to @p budget for that parse, unless the previous parse of
+/// the file took longer than the budget; plain identifier typing never waits.
+/// It never answers from the one-keystroke-old fallback: completion reads the
+/// cursor's surroundings out of the snapshot's own text, and the old text does
+/// not have the `.` the user just typed.  See docs/dev/edit-perf.md.
+std::shared_ptr<const DocumentState>
+completion_document_state(const Analyzer& analyzer, const lsTextDocumentPositionParams& params,
+                          std::chrono::milliseconds budget = std::chrono::milliseconds(150));
