@@ -1567,7 +1567,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             subroutine_symbol_id(SubroutineOwnerKind::Class, owner, name));
                 }
             }
+            // The prototype's formals are its own names, not same-named fields.
+            auto previous_locals = std::move(subroutine_locals);
+            const bool previously_in_subroutine = in_subroutine_;
+            subroutine_locals.clear();
+            in_subroutine_ = true;
             visitDefault(node);
+            in_subroutine_ = previously_in_subroutine;
+            subroutine_locals = std::move(previous_locals);
         }
 
         void add_subroutine_invocation_ref(const slang::parsing::Token& name_token,
@@ -2708,6 +2715,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         add_ref(token, symbol_canonical("class_method", owner, name));
                         return;
                     }
+                    // `this.n` in a method body, the class declared in this file.
+                    if (object_name == "this" &&
+                        class_fields.contains(current_class + '\n' + name)) {
+                        add_ref(token, symbol_canonical("class_field", current_class, name));
+                        return;
+                    }
                     // The owner's declaration usually lives in another file, so
                     // this shard cannot say which ancestor declares the member.
                     // `class_member::` is the alias find_references completes by
@@ -2755,7 +2768,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 add_ref(token, scope_key, form);
                 return;
             }
-            if (!current_class.empty() && type_name_token_ != token_key(token)) {
+            if (!current_class.empty() && type_name_token_ != token_key(token) &&
+                !subroutine_locals.contains(name)) {
                 scope_key = current_class;
                 scope_key += '\n';
                 scope_key += name;

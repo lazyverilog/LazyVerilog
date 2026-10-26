@@ -2072,14 +2072,7 @@ void LazyVerilogServer::register_handlers() {
         td_prepareRename::response rsp;
         rsp.id = req.id;
         try {
-            // Symbols declared outside the asking file's project are refused.
-            const auto info = root_resolver_
-                                  ? root_resolver_->project_info(
-                                        path_from_file_uri(req.params.textDocument.uri.raw_uri_),
-                                        ProjectRootResolver::PathKind::File)
-                                  : std::nullopt;
-            if (auto prepared = prepare_rename(analyzer_, req.params,
-                                               info ? info->source_root : std::filesystem::path{}))
+            if (auto prepared = prepare_rename(analyzer_, req.params))
                 rsp.result = std::make_pair(optional<lsRange>{},
                                             optional<PrepareRenameResult>(std::move(*prepared)));
         } catch (const RenameRefused& e) {
@@ -2095,7 +2088,8 @@ void LazyVerilogServer::register_handlers() {
     });
 
     // ── textDocument/rename ───────────────────────────────────────────────────
-    ep.registerHandler([&](const td_rename::request& req) {
+    ep.registerHandler([&](const td_rename::request& req)
+                           -> lsp::ResponseOrError<td_rename::response> {
         td_rename::response rsp;
         rsp.id = req.id;
         try {
@@ -2104,11 +2098,15 @@ void LazyVerilogServer::register_handlers() {
                                         path_from_file_uri(req.params.textDocument.uri.raw_uri_),
                                         ProjectRootResolver::PathKind::File)
                                   : std::nullopt;
-            rsp.result = provide_rename(analyzer_, req.params, info && info->implicit,
-                                        info ? info->source_root : std::filesystem::path{});
+            rsp.result = provide_rename(analyzer_, req.params, info && info->implicit);
         } catch (const std::exception& e) {
+            // Answer with an error: the default response has no result, which
+            // lspcpp cannot serialize, so the client got no reply at all.
             std::cerr << "[lazyverilog] rename error: " << e.what() << "\n";
-            show_warning(e.what());
+            Rsp_Error refused;
+            refused.error.code = static_cast<lsErrorCodes>(-32803); // LSP RequestFailed
+            refused.error.message = e.what();
+            return refused;
         }
         return rsp;
     });

@@ -2477,7 +2477,18 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             if (const auto* identifier =
                     node.prototype->name->as_if<slang::syntax::IdentifierNameSyntax>())
                 maybe_set(identifier->identifier, false);
+        // Its formals are scoped to the prototype, as a body's are to the body;
+        // left at class depth they read as same-named fields.
+        const auto range = node.sourceRange();
+        if (!range.start().valid() || !range.end().valid() ||
+            uri_from_source_location(sm, range.start()) != uri)
+            return;
+        subroutine_bodies.emplace_back((int)sm.getLineNumber(range.start()),
+                                       (int)sm.getLineNumber(range.end()));
+        push_scope(range);
         visitDefault(node);
+        scope_stack.pop_back();
+        subroutine_bodies.pop_back();
     }
 
     void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
