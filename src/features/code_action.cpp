@@ -397,15 +397,22 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                 if (case_stmt)
                     endcase_line = token_line(state->tree->sourceManager(), case_stmt->endcase);
                 if (endcase_line >= 0) {
-                    std::string case_indent;
-                    for (char c : doc_lines[line]) {
-                        if (c == ' ' || c == '\t')
-                            case_indent += c;
-                        else
-                            break;
+                    int col = token_col(state->tree->sourceManager(), case_stmt->endcase);
+                    std::string text;
+                    if (doc_lines[endcase_line].find_first_not_of(" \t") < (size_t)col) {
+                        // `endcase` shares its line with code: put the item right before it.
+                        text = "default: ; ";
+                    } else {
+                        col = 0;
+                        for (char c : doc_lines[line]) {
+                            if (c == ' ' || c == '\t')
+                                text += c;
+                            else
+                                break;
+                        }
+                        text += "  default: ;\n";
                     }
-                    auto we = make_range_edit(uri, endcase_line, 0, endcase_line, 0,
-                                              case_indent + "  default: ;\n");
+                    auto we = make_range_edit(uri, endcase_line, col, endcase_line, col, text);
                     CodeAction action;
                     action.title = "Add default case";
                     action.kind = optional<std::string>(std::string("quickfix"));
