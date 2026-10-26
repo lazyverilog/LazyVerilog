@@ -3536,8 +3536,23 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                 // `vif.drv_cb.`: a last hop that is no field may name a clocking
                 // block of the interface; its clockvars are filed under
                 // `<interface>.<block>` (index_clocking_block()).
-                if (!value_type && &hop == &ctx.member_chain.back())
-                    clocking_scope = owner + "." + hop;
+                if (!value_type && &hop == &ctx.member_chain.back()) {
+                    const auto names_clocking = [&](const SyntaxIndex* index) {
+                        return index &&
+                               std::any_of(index->values.begin(), index->values.end(),
+                                           [&](const ValueEntry& v) {
+                                               return v.kind == "clocking" && v.name == hop &&
+                                                      v.parent_scope == owner;
+                                           });
+                    };
+                    bool found = names_clocking(&completion_index);
+                    for (const auto& shard : *opened_shards)
+                        found = found || names_clocking(shard.index);
+                    for (const auto* shard : project_shards)
+                        found = found || names_clocking(shard);
+                    if (found)
+                        clocking_scope = owner + "." + hop;
+                }
             }
             if (value_type) {
                 const std::string base = completion_base_type_name(*value_type);

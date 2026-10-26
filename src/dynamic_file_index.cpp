@@ -874,7 +874,11 @@ void collect_macros(const slang::syntax::SyntaxTree& tree, SyntaxIndex& index,
     for (const auto* def : tree.getDefinedMacros()) {
         if (!def || !def->name || !def->name.location().valid() || !sm.isFileLoc(def->name.location()))
             continue;
-        index.macros.push_back(macro_entry_from_define(index, resolver, sm, *def));
+        // Bodies only for the buffer's own defines: an included header's
+        // (all of uvm_macros.svh for a UVM file) are served by its own shard,
+        // and this runs on every edit.
+        const bool own = !sm.isIncludedFileLoc(def->name.location());
+        index.macros.push_back(macro_entry_from_define(index, resolver, sm, *def, own));
     }
 }
 

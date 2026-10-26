@@ -82,6 +82,38 @@ endmodule
     CHECK(hover->contents.second->value.find("input logic [3:0]") != std::string::npos);
 }
 
+TEST_CASE("hover: preprocessor directives get no hover", "[hover][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_hover_directives/top.sv";
+    analyzer.open(uri, "`timescale 1ns/1ps\n"
+                       "`default_nettype none\n"
+                       "`include \"missing.svh\"\n"
+                       "`define ON 1\n"
+                       "`ifdef ON\n"
+                       "module top;\n"
+                       "  int l = `__LINE__;\n"
+                       "  int m = `ON;\n"
+                       "endmodule\n"
+                       "`endif\n"
+                       "`resetall\n");
+
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    for (const auto& [line, col] : std::vector<std::pair<int, int>>{
+             {0, 1}, {1, 1}, {2, 1}, {3, 1}, {4, 1}, {6, 11}, {9, 1}, {10, 1}}) {
+        CAPTURE(line, col);
+        params.position = lsPosition(line, col);
+        CHECK_FALSE(provide_hover(analyzer, params).has_value());
+    }
+
+    // A macro this file defines still answers.
+    params.position = lsPosition(7, 11);
+    auto hover = provide_hover(analyzer, params);
+    REQUIRE(hover.has_value());
+    REQUIRE(hover->contents.second.has_value());
+    CHECK(hover->contents.second->value.find("ON") != std::string::npos);
+}
+
 TEST_CASE("hover: a module declared only in another open buffer is described", "[hover]") {
     Analyzer analyzer;
     const std::string sub_uri = "file:///tmp/lazyverilog_hover_open/sub.sv";
