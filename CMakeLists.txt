@@ -305,6 +305,47 @@ if(_rep_h_ok EQUAL -1 OR _rep_cpp_ok EQUAL -1)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Patch: answer a request for a method nobody handles with MethodNotFound.
+#
+# LspCpp logs "Unknown support request" (no parser for the method) or "can't
+# find method2request" (a parser but no handler) and drops the message, so a
+# client that sends e.g. textDocument/declaration waits for its own timeout (30 s
+# in Neovim).  JSON-RPC requires a reply to every request; unknown notifications
+# stay ignored.  Idempotent; the helper is in cmake/lspcpp/.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_unk_inc_anchor "#include \"LibLsp/JsonRpc/RemoteEndPoint.h\"")
+set(_unk_fn_anchor "bool RemoteEndPoint::dispatch(std::string const& content)")
+set(_unk_parse_anchor "                std::string info = \"Unknown support request message when consumer message:\\n\";")
+set(_unk_handler_anchor "        local_endpoint->onRequest(std::move(msg));")
+file(READ "${_rep_cpp}" _unk_content)
+string(FIND "${_unk_content}" "lazyverilogMethodNotFound" _unk_done)
+if(_unk_done EQUAL -1)
+    foreach(_unk_anchor _unk_inc_anchor _unk_fn_anchor _unk_parse_anchor _unk_handler_anchor)
+        string(FIND "${_unk_content}" "${${_unk_anchor}}" _unk_at)
+        if(_unk_at EQUAL -1)
+            message(FATAL_ERROR
+                "Could not patch LspCpp's RemoteEndPoint to answer unknown requests (${_unk_anchor}). "
+                "The pinned LspCpp revision has probably moved and the anchor no longer matches its "
+                "source. Re-derive it before bumping GIT_TAG.")
+        endif()
+    endforeach()
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lspcpp/unknown_request_method_not_found.cpp.in" _unk_insert)
+    string(REPLACE "${_unk_inc_anchor}" "${_unk_inc_anchor}\n#include \"LibLsp/lsp/lsp_diagnostic.h\""
+           _unk_content "${_unk_content}")
+    string(REPLACE "${_unk_fn_anchor}" "${_unk_insert}${_unk_fn_anchor}" _unk_content "${_unk_content}")
+    # No parser for the method: dispatch() gets no message at all.
+    string(REPLACE "${_unk_parse_anchor}"
+           "                lsRequestId unknown_id;\n                ReflectMember(visitor, \"id\", unknown_id);\n                lazyverilogMethodNotFound(*this, unknown_id, visitor[\"method\"]->GetString());\n${_unk_parse_anchor}"
+           _unk_content "${_unk_content}")
+    # A parser but no handler: GenericEndpoint::onRequest() returns false.
+    # Every registered handler returns true.
+    string(REPLACE "${_unk_handler_anchor}"
+           "        auto const unknown_id = req->id;\n        std::string const unknown_method = req->GetMethodType();\n        if (!local_endpoint->onRequest(std::move(msg)))\n            lazyverilogMethodNotFound(*this, unknown_id, unknown_method);"
+           _unk_content "${_unk_content}")
+    file(WRITE "${_rep_cpp}" "${_unk_content}")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Patch: LspCpp's per-thread Context must not be a thread_local with a destructor.
 #
 # MinGW's emulated TLS frees a thread's storage before it runs that thread's

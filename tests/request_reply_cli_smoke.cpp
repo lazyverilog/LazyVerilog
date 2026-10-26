@@ -345,6 +345,12 @@ int main(int argc, char** argv) {
          "{" + doc +
              R"(,"range":{"start":{"line":-3,"character":-3},"end":{"line":-1,"character":0}}})",
          "a negative range"},
+        // Methods the server has no handler for: MethodNotFound, checked below.
+        {20, "textDocument/declaration", "{" + doc + R"(,"position":{"line":0,"character":0}})",
+         "an unsupported method"},
+        {21, "textDocument/semanticTokens/full", "{" + doc + "}", "an unsupported method"},
+        {22, "lazyverilog/noSuchMethod", "{}", "an unknown method"},
+        {23, "$/noSuchRequest", "{}", "an unknown $/ request"},
         // Well-formed, and last: a server that answered nothing at all would
         // otherwise pass every case above.
         {17, "textDocument/foldingRange", "{" + doc + "}", "a well-formed request"},
@@ -361,6 +367,8 @@ int main(int argc, char** argv) {
                      R"("uri":")" +
                      doc_uri + R"(","languageId":"systemverilog","version":1,"text":)"
                      R"("module m;\n  always_comb begin\n    x = 1;\n  end\nendmodule\n"}}})");
+        // An unknown `$/` notification is ignored, and must not get a reply.
+        out << frame(R"({"jsonrpc":"2.0","method":"$/noSuchNotification","params":{}})");
         for (const auto& c : cases)
             out << frame(R"({"jsonrpc":"2.0","id":)" + std::to_string(c.id) + R"(,"method":")" +
                          c.method + R"(","params":)" + c.params + "}");
@@ -379,6 +387,12 @@ int main(int argc, char** argv) {
     for (const auto& c : cases)
         expect(contains(result.stdout_text, R"("id":)" + std::to_string(c.id)),
                c.method + " answered " + c.what);
+    // -32601 is MethodNotFound.
+    for (int id : {20, 21, 22, 23})
+        expect(contains(reply_for(result.stdout_text, id), "-32601"),
+               "request " + std::to_string(id) + " for an unhandled method is MethodNotFound");
+    expect(!contains(result.stdout_text, "noSuchNotification"),
+           "an unknown $/ notification gets no reply");
 
     // A withdrawn request is answered with RequestCancelled rather than run.
     expect(cancelled_request_errors(server_bin, work) > 0,
