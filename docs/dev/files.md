@@ -146,6 +146,7 @@ When this rule is enabled:
 
 ```toml
 [lint.instance]
+enable = true
 stale_instance_diagnostic = true
 ```
 

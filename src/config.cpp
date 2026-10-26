@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <toml++/toml.hpp>
 
 namespace {
@@ -26,18 +27,25 @@ std::string toml_type_name(const toml::node& node) {
     return "unknown";
 }
 
+// The value errors, plus every node a reader looked at: whatever is left over
+// afterwards is a key nobody reads -- a typo or a removed option.
+struct ConfigErrors : std::vector<std::string> {
+    std::unordered_set<const toml::node*> seen;
+};
+
 void push_type_error(std::vector<std::string>& errors, const std::string& path,
                      const char* expected, const toml::node& got) {
     errors.push_back(path + ": expected " + expected + ", got " + toml_type_name(got));
 }
 
 void read_bool(const toml::table* table, const char* key, const std::string& path,
-               bool& dst, std::vector<std::string>& errors) {
+               bool& dst, ConfigErrors& errors) {
     if (!table)
         return;
     const toml::node_view node = (*table)[key];
     if (!node)
         return;
+    errors.seen.insert(node.node());
     if (const auto* value = node.as_boolean()) {
         dst = value->get();
         return;
@@ -46,12 +54,13 @@ void read_bool(const toml::table* table, const char* key, const std::string& pat
 }
 
 void read_string(const toml::table* table, const char* key, const std::string& path,
-                 std::string& dst, std::vector<std::string>& errors) {
+                 std::string& dst, ConfigErrors& errors) {
     if (!table)
         return;
     const toml::node_view node = (*table)[key];
     if (!node)
         return;
+    errors.seen.insert(node.node());
     if (const auto* value = node.as_string()) {
         dst = value->get();
         return;
@@ -60,12 +69,13 @@ void read_string(const toml::table* table, const char* key, const std::string& p
 }
 
 void read_int(const toml::table* table, const char* key, const std::string& path,
-              int min_value, int max_value, int& dst, std::vector<std::string>& errors) {
+              int min_value, int max_value, int& dst, ConfigErrors& errors) {
     if (!table)
         return;
     const toml::node_view node = (*table)[key];
     if (!node)
         return;
+    errors.seen.insert(node.node());
 
     const auto* value = node.as_integer();
     if (!value) {
@@ -84,12 +94,13 @@ void read_int(const toml::table* table, const char* key, const std::string& path
 
 void append_string_array(const toml::table* table, const char* key, const std::string& path,
                          std::vector<std::string>& dst,
-                         std::vector<std::string>& errors) {
+                         ConfigErrors& errors) {
     if (!table)
         return;
     const toml::node_view node = (*table)[key];
     if (!node)
         return;
+    errors.seen.insert(node.node());
 
     const toml::array* arr = node.as_array();
     if (!arr) {
@@ -108,6 +119,29 @@ void append_string_array(const toml::table* table, const char* key, const std::s
         }
         ++index;
     });
+}
+
+// Report every key under `table` that no reader looked at.  A warning, not an
+// error: the rest of the file still applies.
+void report_unknown_keys(const toml::table& table, const std::string& section,
+                         ConfigErrors& errors) {
+    for (auto&& [key, value] : table) {
+        const std::string name = section.empty() ? std::string(key.str())
+                                                 : section + "." + std::string(key.str());
+        if (errors.seen.count(&value)) {
+            if (const auto* sub = value.as_table())
+                report_unknown_keys(*sub, name, errors);
+            continue;
+        }
+        std::string msg = value.is_table() ? "[" + name + "]: unknown section, ignored"
+                          : section.empty()
+                              ? name + ": unknown top-level key, ignored"
+                              : "[" + section + "]." + std::string(key.str()) +
+                                    ": unknown key, ignored";
+        if (const auto line = value.source().begin.line)
+            msg += " (line " + std::to_string(line) + ")";
+        errors.push_back(std::move(msg));
+    }
 }
 
 } // namespace
@@ -129,6 +163,7 @@ static std::vector<std::string> validate_config(const Config& cfg) {
     check_severity(cfg.lint.function.severity, "[lint.function].severity");
     check_severity(cfg.lint.statement.severity, "[lint.statement].severity");
     check_severity(cfg.lint.module.severity, "[lint.module].severity");
+    check_severity(cfg.lint.instance.severity, "[lint.instance].severity");
     check_severity(cfg.lint.naming.severity, "[lint.naming].severity");
 
     auto check_enum = [&](const std::string& val, const char* ctx,
@@ -259,7 +294,7 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
     const auto toml_text = read_file_text_optional(toml_path);
     if (!toml_text)
         return cfg;
-    std::vector<std::string> value_errors;
+    ConfigErrors value_errors;
     try {
         auto tbl = toml::parse(*toml_text, toml_path.string());
 
@@ -268,6 +303,8 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
             if (!parent)
                 return;
             const auto node = (*parent)[key];
+            if (node)
+                value_errors.seen.insert(node.node());
             if (node && !node.as_table())
                 push_type_error(value_errors, path, "table", *node.node());
         };
@@ -658,7 +695,7 @@ Config load_config(const std::filesystem::path& root, std::string* warning,
                       cfg.autofunc.use_named_arguments, value_errors);
         }
 
-        // Unknown top-level keys silently ignored (toml++ doesn't error on them)
+        report_unknown_keys(tbl, "", value_errors);
 
     } catch (const toml::parse_error& e) {
         const auto& pos = e.source().begin;

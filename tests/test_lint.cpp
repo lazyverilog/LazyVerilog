@@ -66,7 +66,9 @@ static bool has_message_containing(const std::vector<ParseDiagInfo>& diags,
 
 TEST_CASE("lint: module rules emit diagnostics", "[lint]") {
     LintConfig cfg;
+    cfg.module.enable = true;
     cfg.module.one_module_per_file = true;
+    cfg.instance.enable = true;
     cfg.instance.stale_instance_diagnostic = true;
 
     auto diags = lint_text("module child(input a, output b);\nendmodule\n"
@@ -100,6 +102,7 @@ TEST_CASE("lint: stale autoinst uses merged extra-file module ports", "[lint]") 
     REQUIRE(project_index != nullptr);
 
     LintConfig cfg;
+    cfg.instance.enable = true;
     cfg.instance.stale_instance_diagnostic = true;
     auto diags = run_lint(*state, cfg, project_index.get());
 
@@ -129,6 +132,7 @@ TEST_CASE("lint: stale autoinst ignores parameter-only module entries", "[lint]"
     REQUIRE(project_index != nullptr);
 
     LintConfig cfg;
+    cfg.instance.enable = true;
     cfg.instance.stale_instance_diagnostic = true;
     auto diags = run_lint(*state, cfg, project_index.get());
 
@@ -336,7 +340,7 @@ TEST_CASE("lint: [lint.function] severity applies to the lifetime rules", "[lint
     for (const auto& d : diags) {
         if (d.message.find("missing explicit lifetime") != std::string::npos) {
             ++lifetime_diags;
-            CHECK(d.severity == 3);
+            CHECK(d.severity == 4);
         }
     }
     CHECK(lifetime_diags == 2);
@@ -421,7 +425,7 @@ TEST_CASE("lint: [lint.statement] severity applies to every statement rule",
     for (const auto& d : diags) {
         if (d.message.find("[statement]") != std::string::npos) {
             ++statement_diags;
-            CHECK(d.severity == 3);
+            CHECK(d.severity == 4);
         }
     }
     // case_missing_default, latch_inference_detection, no_raw_always, and
@@ -436,6 +440,101 @@ TEST_CASE("lint: [lint.statement] rules still fire with enable=true", "[lint][st
     CHECK(has_message_containing(diags, "may infer a latch"));
     CHECK(has_message_containing(diags, "raw always block"));
     CHECK(has_message_containing(diags, "should use begin/end"));
+}
+
+static LintConfig latch_config() {
+    LintConfig cfg;
+    cfg.statement.enable = true;
+    cfg.statement.latch_inference_detection = true;
+    return cfg;
+}
+
+static bool latch_flagged(const std::string& body) {
+    auto diags = lint_text("module top(input logic en, sel, d, output logic o, p);\n"
+                           "  always_comb begin\n" + body + "  end\nendmodule\n",
+                           latch_config());
+    return has_message_containing(diags, "may infer a latch");
+}
+
+TEST_CASE("lint: latch_inference_detection accepts a default assignment before the if",
+          "[lint][statement][latch]") {
+    // Assigned on every path before the if: no latch.
+    CHECK_FALSE(latch_flagged("    o = 1'b0;\n    if (en) o = d;\n"));
+    CHECK_FALSE(latch_flagged("    {o, p} = '0;\n    if (en) begin o = d; p = d; end\n"));
+    // Covered by both branches of an earlier if/else.
+    CHECK_FALSE(latch_flagged("    if (sel) o = 1'b0; else o = 1'b1;\n    if (en) o = d;\n"));
+    // Nothing assigned: nothing to latch.
+    CHECK_FALSE(latch_flagged("    if (en) $display(\"x\");\n"));
+}
+
+TEST_CASE("lint: latch_inference_detection still flags an uncovered if without else",
+          "[lint][statement][latch]") {
+    CHECK(latch_flagged("    if (en) o = d;\n"));
+    // Default assigned only after the if.
+    CHECK(latch_flagged("    if (en) o = d;\n    p = 1'b0;\n"));
+    // A default for one signal does not cover another.
+    CHECK(latch_flagged("    o = 1'b0;\n    if (en) begin o = d; p = d; end\n"));
+    // Assigned on one branch only, so it covers nothing later.
+    CHECK(latch_flagged("    if (sel) o = 1'b0;\n    else p = 1'b0;\n    if (en) o = d;\n"));
+    // Assigned inside a case: conditional, covers nothing.
+    CHECK(latch_flagged("    case (sel) 1'b0: o = 1'b0; default: ; endcase\n    if (en) o = d;\n"));
+    // Nested inside an else branch.
+    CHECK(latch_flagged("    if (sel) o = 1'b0; else begin if (en) o = d; end\n"));
+}
+
+TEST_CASE("lint: [lint.module] enable=false turns off one_module_per_file", "[lint][module]") {
+    const char* source = "module a;\nendmodule\nmodule b;\nendmodule\n";
+    LintConfig cfg;
+    cfg.module.enable = false;
+    cfg.module.one_module_per_file = true;
+
+    CHECK_FALSE(has_message_containing(lint_text(source, cfg), "more than one module"));
+    cfg.module.enable = true;
+    CHECK(has_message_containing(lint_text(source, cfg), "more than one module"));
+}
+
+static const char* kInstanceSource = "module child(input a, output b);\nendmodule\n"
+                                     "module top;\n"
+                                     "child u_child(.a(a), .old(b));\n"
+                                     "endmodule\n";
+
+TEST_CASE("lint: [lint.instance] enable=false turns off every instance rule",
+          "[lint][instance]") {
+    LintConfig cfg;
+    cfg.instance.enable = false;
+    cfg.instance.module_instantiation_style = "positional";
+    cfg.instance.stale_instance_diagnostic = true;
+
+    auto diags = lint_text(kInstanceSource, cfg);
+
+    CHECK(diags.empty());
+}
+
+TEST_CASE("lint: [lint.instance] severity, not [lint.module]'s, applies to instance rules",
+          "[lint][instance]") {
+    LintConfig cfg;
+    cfg.module.enable = true;
+    cfg.module.severity = "hint";
+    cfg.module.one_module_per_file = true;
+    cfg.instance.enable = true;
+    cfg.instance.severity = "error";
+    cfg.instance.module_instantiation_style = "positional";
+    cfg.instance.stale_instance_diagnostic = true;
+
+    auto diags = lint_text(kInstanceSource, cfg);
+
+    int instance_diags = 0;
+    for (const auto& d : diags) {
+        if (d.message.find("more than one module") != std::string::npos) {
+            CHECK(d.severity == 4);
+            continue;
+        }
+        ++instance_diags;
+        CHECK(d.severity == 1);
+        CHECK(d.message.rfind("[instance] ", 0) == 0);
+    }
+    // style, stale 'old', missing 'b'
+    CHECK(instance_diags == 3);
 }
 
 // A header shared by every file in a design is the largest thing lint sees, and

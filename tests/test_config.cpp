@@ -47,19 +47,63 @@ TEST_CASE("config: missing file returns defaults", "[config]") {
     CHECK(cfg.autoarg.autoarg_on_save == false);
 }
 
-TEST_CASE("config: unknown TOML keys silently ignored", "[config]") {
+TEST_CASE("config: unknown keys and sections are reported, the rest still applies",
+          "[config]") {
     auto dir = make_temp_toml(R"(
+indent = 4
+
 [unknown_section]
 some_key = "value"
-another_key = 42
 
 [design]
 vcode = "test.f"
 unknown_design_key = true
+
+[fromat]
+indent_size = 4
+
+[format]
+indnet_size = 4
+
+[format.statment]
+align = true
+
+[lint.instance]
+enable = true
+severity = "fatal"
 )");
+    std::string warning;
+    ConfigWarning warning_detail;
     Config cfg;
-    REQUIRE_NOTHROW(cfg = load_config(dir));
+    REQUIRE_NOTHROW(cfg = load_config(dir, &warning, &warning_detail));
     CHECK(cfg.design.vcode == "test.f");
+    CHECK(cfg.lint.instance.enable == true);
+
+    const auto& errs = warning_detail.validation_errors;
+    auto has = [&](const std::string& needle) {
+        return std::any_of(errs.begin(), errs.end(), [&](const std::string& e) {
+            return e.find(needle) != std::string::npos;
+        });
+    };
+    CHECK(has("indent: unknown top-level key, ignored (line 2)"));
+    CHECK(has("[unknown_section]: unknown section, ignored"));
+    CHECK(has("[design].unknown_design_key: unknown key, ignored"));
+    CHECK(has("[fromat]: unknown section, ignored"));
+    CHECK(has("[format].indnet_size: unknown key, ignored"));
+    CHECK(has("[format.statment]: unknown section, ignored"));
+    CHECK(has("[lint.instance].severity: invalid severity \"fatal\""));
+    CHECK(errs.size() == 7);
+    CHECK(warning.find("indnet_size") != std::string::npos);
+}
+
+TEST_CASE("config: the repository's own lazyverilog.toml has no unknown keys", "[config]") {
+    // Every key it sets is read; a reader added without its key, or a key
+    // renamed on one side only, shows up here.
+    const auto root = fs::path(LAZYVERILOG_SOURCE_DIR);
+    std::string warning;
+    ConfigWarning warning_detail;
+    (void)load_config(root, &warning, &warning_detail);
+    CHECK(warning.empty());
 }
 
 TEST_CASE("config: parse all sections correctly", "[config]") {
