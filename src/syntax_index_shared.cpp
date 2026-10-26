@@ -22,6 +22,76 @@ slang::parsing::Token subroutine_name_token(const FunctionPrototypeSyntax& proto
     return proto.keyword;
 }
 
+const FunctionPrototypeSyntax* member_subroutine_prototype(const MemberSyntax& member) {
+    if (const auto* fn = member.as_if<FunctionDeclarationSyntax>())
+        return fn->prototype;
+    if (const auto* dpi = member.as_if<DPIImportSyntax>())
+        return dpi->method;
+    return nullptr;
+}
+
+std::string macro_body_text(const DefineDirectiveSyntax& def) {
+    std::string body;
+    for (const auto& token : def.body)
+        body += token.toString();
+    return trim_copy(body);
+}
+
+MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                                   const slang::SourceManager& sm,
+                                   const DefineDirectiveSyntax& def) {
+    MacroEntry mac;
+    mac.name = std::string(def.name.valueText());
+    mac.file_id = resolver.for_declaration_token(index, sm, def.name);
+    if (def.formalArguments) {
+        mac.is_function_like = true;
+        for (const auto* arg : def.formalArguments->args) {
+            if (arg)
+                mac.params.push_back(std::string(arg->name.valueText()));
+        }
+    }
+    std::tie(mac.line, mac.col) = token_pos_line1_col0(sm, def.name);
+    mac.body = macro_body_text(def);
+    return mac;
+}
+
+void index_clocking_block(const ClockingDeclarationSyntax& block, SyntaxIndex& index,
+                          SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                          const std::string& scope) {
+    // `default clocking @(posedge clk);` has no name and nothing can address it.
+    if (block.blockName.valueText().empty())
+        return;
+    const auto push = [&](const slang::parsing::Token& name, std::string type, std::string kind,
+                          std::string parent) {
+        if (!resolver.wants_declaration(index, sm, name))
+            return;
+        auto [line, col] = token_pos_line1_col0(sm, name);
+        index.values.push_back(ValueEntry{.name = token_value_text(name),
+                                          .type = std::move(type),
+                                          .kind = std::move(kind),
+                                          .parent_scope = std::move(parent),
+                                          .file_id = resolver.for_declaration_token(index, sm, name),
+                                          .line = line,
+                                          .col = col});
+    };
+    push(block.blockName, "clocking", "clocking", scope);
+    const auto block_scope = scope + "." + token_value_text(block.blockName);
+    for (const auto* item_base : block.items) {
+        const auto* item = item_base ? item_base->as_if<ClockingItemSyntax>() : nullptr;
+        if (!item)
+            continue;
+        const auto& dir = *item->direction;
+        // `input`, `output`, `inout` or `input ... output ...`, as written.
+        std::string direction(dir.input.rawText());
+        if (dir.output)
+            direction += (direction.empty() ? "" : " ") + std::string(dir.output.rawText());
+        for (const auto* decl : item->decls) {
+            if (decl)
+                push(decl->name, direction, "clockvar", block_scope);
+        }
+    }
+}
+
 std::string make_subroutine_signature(const FunctionPrototypeSyntax& proto,
                                       const std::string& name,
                                       const slang::SourceManager& sm) {

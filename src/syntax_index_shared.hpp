@@ -19,8 +19,11 @@
 namespace slang {
 class SourceManager;
 namespace syntax {
+class ClockingDeclarationSyntax;
+class DefineDirectiveSyntax;
 class ExpressionSyntax;
 class FunctionPrototypeSyntax;
+class MemberSyntax;
 class PropertyExprSyntax;
 class SyntaxTree;
 }
@@ -204,6 +207,33 @@ std::string render_syntax_node_text_expanded(const slang::SourceManager& sm,
 /// right answer for a name that is a macro-body literal, which has no
 /// identifier token of its own.
 slang::parsing::Token subroutine_name_token(const slang::syntax::FunctionPrototypeSyntax& proto);
+
+/// Prototype of a module/interface/package member that declares a subroutine:
+/// a function/task declaration or an `import "DPI-C"` import, which declares a
+/// scope-level subroutine of its own.  Null for any other member.
+const slang::syntax::FunctionPrototypeSyntax*
+member_subroutine_prototype(const slang::syntax::MemberSyntax& member);
+
+/// Replacement text of a `` `define `` as hover renders it: the body tokens with
+/// their trivia, trimmed.  Shared by the live-tree hover and the shard entry.
+std::string macro_body_text(const slang::syntax::DefineDirectiveSyntax& def);
+
+/// MacroEntry for @p def, body included.  Used by the shard and the
+/// open-buffer index alike.
+MacroEntry macro_entry_from_define(SyntaxIndex& index, SourceFileIdResolver& resolver,
+                                   const slang::SourceManager& sm,
+                                   const slang::syntax::DefineDirectiveSyntax& def);
+
+/// Index a named clocking block declared in @p scope (an interface or module).
+///
+/// The block becomes `ValueEntry{kind="clocking", parent_scope=scope}`, so
+/// `vif.drv_cb` resolves like any other interface member, and each clockvar
+/// becomes `ValueEntry{kind="clockvar", type=<direction>,
+/// parent_scope="<scope>.<block>"}` for `vif.drv_cb.ready`.  Shared so the
+/// closed-file shard and the open-buffer index record identical entries.
+void index_clocking_block(const slang::syntax::ClockingDeclarationSyntax& block, SyntaxIndex& index,
+                          SourceFileIdResolver& resolver, const slang::SourceManager& sm,
+                          const std::string& scope);
 
 /// Render the hover/documentation signature block for a function or task
 /// prototype.  Shared so the closed-file shard and the open-buffer dynamic

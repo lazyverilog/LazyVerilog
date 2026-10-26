@@ -2448,3 +2448,65 @@ TEST_CASE("definition: an embedded covergroup's sample() is its own, per class",
     CHECK(at(11, 33) == std::make_pair(11, 33));
     CHECK(at(16, 24) == std::make_pair(16, 24));
 }
+
+// Clocking blocks and DPI imports were absent from both indexes, so
+// `vif.drv_cb.ready` and a DPI call resolved to nothing.  The closed half reads
+// the interface/package shard; the open half reads the open buffer's index.
+TEST_CASE("definition: clocking blocks, clockvars and DPI imports resolve",
+          "[definition][clocking]") {
+    const std::string decls = "interface cbd_if (input logic clk);\n"
+                              "  logic valid;\n"
+                              "  logic ready;\n"
+                              "  clocking drv_cb @(posedge clk);\n"
+                              "    output valid;\n"
+                              "    input  ready;\n"
+                              "  endclocking\n"
+                              "endinterface\n"
+                              "package cbd_pkg;\n"
+                              "  import \"DPI-C\" function int c_model(input int v);\n"
+                              "  import \"DPI-C\" context task c_wait(input int n);\n"
+                              "endpackage\n";
+    const std::string user = "module cbd_user;\n"
+                             "  import cbd_pkg::*;\n"
+                             "  class drv;\n"
+                             "    virtual cbd_if vif;\n"
+                             "    task run();\n"
+                             "      while (!vif.drv_cb.ready) @(vif.drv_cb);\n"
+                             "      c_wait(c_model(1));\n"
+                             "    endtask\n"
+                             "  endclass\n"
+                             "endmodule\n";
+    const auto path = write_temp_sv("lazyverilog_def_clocking_decls.sv", decls);
+    const auto decl_uri = uri_from_path(path);
+    const std::string uri = "file:///tmp/lazyverilog_def_clocking_user.sv";
+
+    Analyzer analyzer;
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    SECTION("declarations in a closed file") {}
+    SECTION("declarations in an open buffer") { analyzer.open(decl_uri, decls); }
+    analyzer.open(uri, user);
+
+    const auto expect = [&](int line, int col, int def_line, int def_col) {
+        auto loc = analyzer.definition_of(uri, line, col);
+        REQUIRE(loc.has_value());
+        CHECK(loc->uri == decl_uri);
+        CHECK(loc->line == def_line);
+        CHECK(loc->col == def_col);
+    };
+    expect(5, 26, 5, 11); // vif.drv_cb.ready
+    expect(5, 42, 3, 11); // @(vif.drv_cb)
+    expect(6, 7, 10, 30); // c_wait
+    expect(6, 14, 9, 30); // c_model
+
+    auto clockvar = analyzer.symbol_at(uri, 5, 26);
+    REQUIRE(clockvar.has_value());
+    CHECK(clockvar->kind == "clockvar");
+    CHECK(clockvar->detail == "input");
+    auto dpi = analyzer.symbol_at(uri, 6, 14);
+    REQUIRE(dpi.has_value());
+    CHECK(dpi->kind == "function");
+    CHECK(dpi->doc.find("c_model") != std::string::npos);
+
+    std::filesystem::remove(path);
+}

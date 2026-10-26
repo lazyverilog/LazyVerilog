@@ -205,6 +205,10 @@ struct MacroEntry {
     bool is_function_like{false};
     std::vector<std::string> params;
     int line{0};
+    int col{0}; // 0-based UTF-16 column of the name
+    // Replacement text as hover shows it (macro_body_text()).  A closed file
+    // keeps no tree, so this is the only place hover can read it from.
+    std::string body;
 };
 
 struct ValueEntry {

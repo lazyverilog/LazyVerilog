@@ -61,6 +61,7 @@ const char* kSource = R"(
 
 package cfg_pkg;
     parameter int DEPTH = 8;
+    import "DPI-C" function int c_model(input int v);
     typedef logic [7:0] byte_t;
     typedef enum { IDLE, BUSY, DONE } state_e;
     typedef struct packed { logic [3:0] hi; logic [3:0] lo; } split_t;
@@ -86,6 +87,10 @@ interface bus_if (input logic clk);
     logic [31:0] data;
     modport master (output valid, output data);
     modport slave  (input valid, input data);
+    clocking cb @(posedge clk);
+        output valid;
+        input  data;
+    endclocking
 endinterface
 
 module leaf #(parameter int W = 4) (
@@ -272,6 +277,8 @@ void require_same_index(const SyntaxIndex& a, const SyntaxIndex& b) {
         CHECK(a.macros[i].is_function_like == b.macros[i].is_function_like);
         CHECK(a.macros[i].params == b.macros[i].params);
         CHECK(a.macros[i].line == b.macros[i].line);
+        CHECK(a.macros[i].col == b.macros[i].col);
+        CHECK(a.macros[i].body == b.macros[i].body);
     }
 
     REQUIRE(a.values.size() == b.values.size());
@@ -354,6 +361,8 @@ TEST_CASE("index cache: a parsed shard survives a round trip unchanged", "[index
     REQUIRE(!original.package_names.empty());
     REQUIRE(!original.interface_names.empty());
     REQUIRE(!original.package_symbols.empty());
+    REQUIRE(!original.macros.empty());
+    CHECK(original.macros.front().body == "$bits(x)");
 
     const auto bytes = serialize_index_shard(some_key(), original);
     const auto loaded = deserialize_index_shard(bytes);
@@ -1155,6 +1164,78 @@ TEST_CASE("index cache: an unchanged project is served from the shards", "[index
     const auto warm = snapshot_values(project.index(analyzer, {"a.sv"}));
     CHECK(warm.count("only_a_reused_shard_has_this") == 1);
     CHECK(warm.count("sig_a") == 1);
+}
+
+TEST_CASE("index cache: macros, clocking blocks and DPI imports are served from the shards",
+          "[index-cache][clocking]") {
+    // Closed files answer hover/definition for these only through their
+    // shards.  The stored macro body is rewritten on disk, keeping the key, so
+    // the hover below can only show it if the warm launch read the shard.
+    CacheProject project("analyzer-closed-file-facts");
+    project.write("defs.sv", "`define LOG_MSG(m) $display(m)\n"
+                             "package defs_pkg;\n"
+                             "  import \"DPI-C\" function int c_model(input int v);\n"
+                             "endpackage\n"
+                             "interface cb_if (input logic clk);\n"
+                             "  logic ready;\n"
+                             "  clocking cb @(posedge clk);\n"
+                             "    input ready;\n"
+                             "  endclocking\n"
+                             "endinterface\n");
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"defs.sv"});
+    }
+
+    size_t edited = 0;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(IndexCache::directory_for(project.root()))) {
+        if (entry.path().extension() != ".idx")
+            continue;
+        std::string bytes;
+        {
+            std::ifstream in(entry.path(), std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        auto loaded = deserialize_index_shard(bytes);
+        REQUIRE(loaded);
+        for (auto& mac : loaded->index.macros) {
+            if (mac.name == "LOG_MSG") {
+                mac.body = "only_a_reused_shard_has_this";
+                ++edited;
+            }
+        }
+        const auto rewritten =
+            serialize_index_shard(loaded->key, loaded->index, loaded->stands_alone);
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(rewritten.data(), static_cast<std::streamsize>(rewritten.size()));
+    }
+    REQUIRE(edited == 1);
+
+    Analyzer analyzer;
+    const auto warm = project.index(analyzer, {"defs.sv"});
+    std::set<std::string> kinds;
+    for (const auto& shard : warm->shards) {
+        for (const auto& value : shard.index->values)
+            kinds.insert(value.name + ":" + value.kind + ":" + value.parent_scope);
+    }
+    CHECK(kinds.count("c_model:function:defs_pkg") == 1);
+    CHECK(kinds.count("cb:clocking:cb_if") == 1);
+    CHECK(kinds.count("ready:clockvar:cb_if.cb") == 1);
+
+    // `LOG_MSG` is defined only in the closed file; this buffer's own parse
+    // never sees the define.
+    const std::string uri = uri_from_path(project.root() / "user.sv");
+    analyzer.open(uri, "module user;\n  initial `LOG_MSG(\"x\");\nendmodule\n");
+    const auto hover = analyzer.symbol_at(uri, 1, 12);
+    REQUIRE(hover.has_value());
+    CHECK(hover->kind == "macro");
+    CHECK(hover->detail == "only_a_reused_shard_has_this");
+    const auto def = analyzer.definition_of(uri, 1, 12);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == uri_from_path(project.root() / "defs.sv"));
+    CHECK(def->line == 0);
+    CHECK(def->col == 8);
 }
 
 TEST_CASE("index cache: an unchanged implicit project is served from the user cache",

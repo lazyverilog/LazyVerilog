@@ -2372,6 +2372,18 @@ class MemberProvider : public CompletionProvider {
         std::vector<lsCompletionItem> items;
         std::string name = ctx.scope_name;
 
+        // `<interface>.<clocking block>`, set by the member-chain walk.
+        if (name.find('.') != std::string::npos) {
+            for (const auto& v : index.values) {
+                if (v.kind != "clockvar" || v.parent_scope != name)
+                    continue;
+                auto item = make_item(v.name, lsCompletionItemKind::Field);
+                item.detail = optional<std::string>(v.type);
+                items.push_back(std::move(item));
+            }
+            return items;
+        }
+
         // Resolve "variable." through the visible variable's declared type.
         // Without this, member access only works for "ClassName." or
         // "ModuleName.", which is rarely what users type in real code.
@@ -3501,6 +3513,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // costs one map lookup per shard rather than another tree walk.
             // A hop nothing can explain leaves value_type empty, which is the
             // same state as an unresolvable receiver.
+            std::string clocking_scope;
             for (const auto& hop : ctx.member_chain) {
                 if (!value_type)
                     break;
@@ -3520,11 +3533,18 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     if (shard)
                         value_type = field_type_in_shard(*shard, owner, hop);
                 }
+                // `vif.drv_cb.`: a last hop that is no field may name a clocking
+                // block of the interface; its clockvars are filed under
+                // `<interface>.<block>` (index_clocking_block()).
+                if (!value_type && &hop == &ctx.member_chain.back())
+                    clocking_scope = owner + "." + hop;
             }
             if (value_type) {
                 const std::string base = completion_base_type_name(*value_type);
                 if (!base.empty())
                     indexed_ctx.scope_name = base;
+            } else if (!clocking_scope.empty()) {
+                indexed_ctx.scope_name = clocking_scope;
             }
             // The receiver's class may be declared in this buffer while its
             // base class is not.  The AST pass emitted what it could see; the
