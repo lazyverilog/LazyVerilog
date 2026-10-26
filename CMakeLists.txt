@@ -150,9 +150,17 @@ if(MINGW)
             file(WRITE "${slang_SOURCE_DIR}/${_sm_file}" "${_sm_content}")
         endif()
     endforeach()
-    file(READ "${slang_SOURCE_DIR}/include/slang/text/SourceManager.h" _sm_content)
-    string(FIND "${_sm_content}" "slang/text/SourceManagerMutex.h" _sm_ok)
-    if(_sm_ok EQUAL -1)
+    # Every mention must be swapped in both files: a lock type left behind in
+    # one (e.g. the .cpp's `is_same_v<TLock, std::shared_lock<...>>`) would
+    # silently take a different path than the header expects.
+    file(READ "${slang_SOURCE_DIR}/include/slang/text/SourceManager.h" _sm_header)
+    file(READ "${slang_SOURCE_DIR}/source/text/SourceManager.cpp" _sm_source)
+    string(FIND "${_sm_header}" "slang/text/SourceManagerMutex.h" _sm_include)
+    string(FIND "${_sm_header}" "mutable SourceManagerMutex mutex;" _sm_member)
+    string(FIND "${_sm_header}" "std::shared_mutex" _sm_left_header)
+    string(FIND "${_sm_source}" "std::shared_mutex" _sm_left_source)
+    if(_sm_include EQUAL -1 OR _sm_member EQUAL -1 OR NOT _sm_left_header EQUAL -1
+       OR NOT _sm_left_source EQUAL -1)
         message(FATAL_ERROR "Could not patch slang's SourceManager mutex; re-derive the patch.")
     endif()
     target_sources(slang_slang PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/SourceManagerMutex.cpp")
