@@ -250,6 +250,7 @@ TEST_CASE("shared header: index build cost is flat in unreferenced macro count",
 // did not actually filter.  The result was a copy of an includer's declarations
 // under the header's URI.
 #include "analyzer.hpp"
+#include "features/completion.hpp"
 #include "string_utils.hpp"
 
 #include <set>
@@ -808,4 +809,54 @@ TEST_CASE("package fragment shard: a class in a fragment stays addressable as pk
         found = true;
     }
     CHECK(found);
+}
+
+TEST_CASE("header shard: a file-scope class lives only in the header's shard",
+          "[index][scaling]") {
+    // `include outside any package: the class is the header's, not the
+    // includer's.  The includer's shard carried it anyway -- process_member()
+    // kept every class the tree held -- so a header shared by N files was N
+    // copies of each class, fields and methods included.
+    SharedHeaderDesign design("file-scope-class", 1,
+                              "class item;\n  int data;\nendclass\n",
+                              "`include \"defs.svh\"\n"
+                              "module @NAME@;\n"
+                              "  item it = new;\n"
+                              "endmodule\n");
+    Analyzer analyzer;
+    (void)design.index_ms(analyzer);
+
+    CHECK(shard_classes(analyzer, design.header_uri()).contains("item"));
+    CHECK_FALSE(shard_classes(analyzer, design.module_uri(0)).contains("item"));
+
+    // Features still find it, through the header's shard.
+    const auto user_path =
+        std::filesystem::path(path_from_file_uri(design.header_uri())).parent_path() / "user.sv";
+    const auto user_uri = uri_from_path(user_path);
+    const std::string user_text = "module user;\n"
+                                  "  item it;\n"
+                                  "  initial it.\n"
+                                  "endmodule\n";
+    analyzer.open(user_uri, user_text);
+
+    const auto def = analyzer.definition_of(user_uri, 1, 3);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == design.header_uri());
+    CHECK(def->line == 0);
+
+    const auto refs = analyzer.find_references(user_uri, 1, 3);
+    CHECK(std::any_of(refs.begin(), refs.end(), [&](const Location& loc) {
+        return loc.uri == design.module_uri(0) && loc.line == 2;
+    }));
+
+    CompletionEngine engine;
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = user_uri;
+    params.position = lsPosition(2, 13);
+    CancellationToken tok;
+    const auto state = analyzer.get_state(user_uri);
+    REQUIRE(state != nullptr);
+    const auto list = engine.complete(params, *state, analyzer, tok);
+    CHECK(std::any_of(list.items.begin(), list.items.end(),
+                      [](const lsCompletionItem& item) { return item.label == "data"; }));
 }

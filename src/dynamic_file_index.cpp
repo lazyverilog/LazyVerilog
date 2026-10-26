@@ -929,9 +929,11 @@ SyntaxIndex build_structural_index(const DocumentState& state, std::string_view 
             } else {
                 process_module(*mod, index, resolver, sm, state.text);
             }
-        } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>())
-            process_class(*cls, index, resolver, sm);
-        else if (const auto* td = member.as_if<TypedefDeclarationSyntax>())
+        } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
+            // Same rule as SyntaxIndex::build(): a header's class is the header's.
+            if (resolver.accepts(index, sm, cls->name))
+                process_class(*cls, index, resolver, sm);
+        } else if (const auto* td = member.as_if<TypedefDeclarationSyntax>())
             process_typedef(*td, index, resolver, sm);
     };
 
