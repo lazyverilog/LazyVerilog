@@ -1866,5 +1866,9 @@ TEST_CASE("index cache: a listed file adopted by a discarded header build is red
     REQUIRE(snapshot);
     const auto values = snapshot_values(snapshot);
     CHECK(values.count("frag_var") == 1);
-    CHECK(shards_for(snapshot, uri_from_path((project.root() / "cls.sv").string())) == 1);
+    const auto cls_uri = uri_from_path((project.root() / "cls.sv").string());
+    CHECK(shards_for(snapshot, cls_uri) == 1);
+    // The package's redo alone would rebuild cls.sv as a header; the file's
+    // own shard only comes back if the adopted entry was requeued.
+    CHECK(analyzer.has_filelist_shard_for_testing(cls_uri));
 }
