@@ -362,22 +362,47 @@ Neovim sends `foldingRange` right behind `inlayHint`, so on a file that parses
 slower than that the fold waited too, and on a one-core slice the queue fell
 further behind with every keystroke.
 
-It now answers at once from the last tree that parsed (`previous_parsed`, one
-keystroke old) and remembers that it did.  When that file's parse commits, the
-server sends `workspace/inlayHint/refresh` once, and the client re-requests
-against the new tree.  Neovim does not re-ask on its own after a reply, so the
-refresh is what keeps the final hints right after typing stops.  The cost is one
-extra `inlayHint` per parse that a stale answer preceded, served from a tree
-that is already there.
+For a client that advertises `workspace.inlayHint.refreshSupport` (Neovim
+does), it now answers at once from the last tree that parsed
+(`previous_parsed`, one keystroke old).  A stale answer asks the analyzer for
+one parse-idle notification (`request_parse_idle_notification()`); the parse
+worker calls back once its queue has stayed empty for `kParseIdleNotifyDelay`
+(300 ms, after any live shard rebuild), and the server then sends
+`workspace/inlayHint/refresh` once.  Neovim does not re-ask on its own after a
+reply, so that refresh is what keeps the final hints right after typing stops.
 
-Measured with a pipelined variant of `edit_latency_bench.py` (`inlayHint` and
-`foldingRange` sent back to back, as Neovim does), 42k-line
-`pinmux_reg_top.sv` with 14241 hints, 30 keystrokes, machine under concurrent
-build load:
+The refresh is per burst, not per parse.  The first version sent it from the
+parse-complete callback, and since Neovim re-requests every visible buffer on a
+refresh, each keystroke cost a second whole-file `inlayHint`.  The delay is
+longer than the gap between keystrokes on purpose: at 150 ms, a parse that
+finished before the next key was already "idle".
 
-| CPUs | build | inlayHint p50 / p95 | queued foldingRange p50 / p95 |
-|---|---|---|---|
-| all | wait 150 ms | 220 / 316 ms | 42 / 47 ms |
-| all | no wait | 47 / 366 ms | 45 / 76 ms |
-| 1 | wait 150 ms | 418 / 2616 ms | 569 / 2856 ms |
-| 1 | no wait | 122 / 176 ms | 136 / 250 ms |
+A client without `refreshSupport` would never hear about the newer tree, so it
+keeps the bounded 150 ms wait, and the server sends it no refresh at all --
+neither this one nor the one after a project-index publish
+(`request_inlay_hint_refresh()`).  `tools/inlay_refresh_smoke.py` (ctest
+`inlay-refresh-smoke`) checks both modes.
+
+Measured with a Windows variant of `edit_latency_bench.py` that types every
+150 ms without waiting for replies and sends `inlayHint` and `foldingRange` back
+to back for the whole file, as Neovim does; the client re-requests on refresh.
+42k-line `pinmux_reg_top.sv` with 14241 hints, 20 keystrokes, three
+interleaved runs each, machine at ~60% load from other work (so the spread is
+wide):
+
+| CPUs | build | inlayHint p50 | queued foldingRange p50 | refreshes per burst |
+|---|---|---|---|---|
+| all | wait 150 ms | 177-187 ms | 78-85 ms | 1 |
+| all | no wait, refresh per parse | 28 ms | 42 ms | 18 |
+| all | no wait, refresh per burst | 211-236 ms | 121-123 ms | 2 |
+| 1 | wait 150 ms | 134-579 ms | 165-676 ms | 1-5 |
+| 1 | no wait, refresh per parse | 130 ms | 148 ms | 2 |
+| 1 | no wait, refresh per burst | 136-279 ms | 160-406 ms | 2-4 |
+
+With every CPU the wait cost nothing, because the parse finished inside it,
+and answering early is no faster: each answer computes the hints for the whole
+file either way, now while the parse runs next to it.  The per-parse
+refresh looks fast in that row, but it paid 18 more whole-file requests that
+the table does not time.  The gain is on a slice that parses slower
+than the 150 ms wait, where the wait held the queue and each keystroke fell
+further behind.  The second refresh in a burst is the project-index publish's.
