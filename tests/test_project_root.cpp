@@ -1983,3 +1983,109 @@ TEST_CASE("rename: an explicit import outranks a wildcard in an override chain",
     CHECK(edit_starts(pa_edit, pa_uri) == std::set<std::pair<int, int>>{{2, 24}});
     CHECK(edit_starts(pa_edit, top_uri).empty());
 }
+
+TEST_CASE("rename: a module after a package's class is not in that package",
+          "[rename][override-chain]") {
+    // top.sv's package pa ends before module top, which imports pb: its
+    // `drv h` is pb's even though pa's class foo is the last class above.
+    const std::string drv = "class drv;\n  virtual function void run();\n  endfunction\nendclass\n";
+    const std::string pb_text = "package pb;\n" + drv + "endpackage\n";
+    const std::string top_text = "package pa;\n"           // 0
+                                 "`include \"a_drv.svh\"\n" // 1
+                                 "class foo;\n"             // 2
+                                 "endclass\n"               // 3
+                                 "endpackage\n"             // 4
+                                 "module top;\n"            // 5
+                                 "  import pb::*;\n"        // 6
+                                 "  drv h;\n"               // 7
+                                 "  initial h.run();\n"     // 8
+                                 "endmodule\n";
+    TempTree tree("override-chain-module-after-package");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto a_drv = tree.write("proj/a_drv.svh", drv);
+    const auto pb = tree.write("proj/pb.sv", pb_text);
+    const auto top = tree.write("proj/top.sv", top_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pb.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto pb_uri = uri_from_path(pb);
+    analyzer.open(pb_uri, pb_text);
+
+    const auto edit = provide_rename(analyzer, rename_run_at(pb_uri, 2, 24));
+    CHECK(edit_starts(edit, pb_uri) == std::set<std::pair<int, int>>{{2, 24}});
+    CHECK(edit_starts(edit, uri_from_path(top)) == std::set<std::pair<int, int>>{{8, 12}});
+    CHECK(edit_starts(edit, uri_from_path(a_drv)).empty());
+}
+
+TEST_CASE("rename: a call site starts the chain from the class its own occurrence means",
+          "[rename][override-chain]") {
+    // pa is nearer by path, but `import pb::drv` names pb's class: renaming
+    // from `h.run` renames pb's chain and always includes the cursor.
+    const std::string pa_text =
+        "package pa;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string pb_text =
+        "package pb;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string top_text = "module top;\n"        // 0
+                                 "  import pa::*;\n"    // 1
+                                 "  import pb::drv;\n"  // 2
+                                 "  drv h;\n"           // 3
+                                 "  initial h.run();\n" // 4
+                                 "endmodule\n";
+    TempTree tree("override-chain-call-site");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pa = tree.write("proj/pa.sv", pa_text);
+    const auto pb = tree.write("proj/b/pb.sv", pb_text);
+    const auto top = tree.write("proj/top.sv", top_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pa.string(), pb.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto top_uri = uri_from_path(top);
+    analyzer.open(top_uri, top_text);
+
+    const auto edit = provide_rename(analyzer, rename_run_at(top_uri, 4, 13));
+    CHECK(edit_starts(edit, top_uri) == std::set<std::pair<int, int>>{{4, 12}});
+    CHECK(edit_starts(edit, uri_from_path(pb)) == std::set<std::pair<int, int>>{{2, 24}});
+    CHECK(edit_starts(edit, uri_from_path(pa)).empty());
+    std::set<std::pair<int, int>> highlighted;
+    for (const auto& ref : analyzer.find_references(top_uri, 4, 13, true, true))
+        highlighted.emplace(ref.line, ref.col);
+    CHECK(highlighted == std::set<std::pair<int, int>>{{4, 12}});
+}
+
+TEST_CASE("references: the override class table does not pin replaced shards",
+          "[rename][override-chain]") {
+    // A reload replaces every shard.  The table built for an earlier
+    // class-method request must not keep the old set alive.
+    TempTree tree("override-chain-table-pins");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto base = tree.write("proj/base.sv", kOverrideBase);
+    const auto derived = tree.write("proj/derived.sv", kOverrideDerived);
+    Analyzer analyzer;
+    const std::string uri = open_override_chain(analyzer, base, derived);
+    const std::string base_uri = uri_from_path(base);
+
+    std::weak_ptr<const SyntaxIndex> old_base;
+    {
+        const auto snapshot = analyzer.extra_index_snapshot_ptr();
+        for (const auto& shard : *snapshot)
+            if (shard.uri == base_uri)
+                old_base = shard.index;
+    }
+    REQUIRE(!old_base.expired());
+    REQUIRE(analyzer.find_references(uri, 1, 33, true, true).size() == 4);
+
+    tree.write("proj/base.sv", std::string(kOverrideBase) + "\n");
+    analyzer.refresh_changed_extra_files({base_uri});
+    analyzer.wait_for_background_index_idle();
+    {
+        const auto snapshot = analyzer.extra_index_snapshot_ptr();
+        REQUIRE(snapshot);
+    }
+    CHECK(old_base.expired());
+    // And the next request still answers from the new shard.
+    CHECK(analyzer.find_references(uri, 1, 33, true, true).size() == 4);
+}

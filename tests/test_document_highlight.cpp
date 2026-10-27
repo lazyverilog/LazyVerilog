@@ -267,14 +267,20 @@ double fastest_override_highlight_ms(int closed, int runs) {
     const std::string uri = uri_from_path(base_path);
     analyzer.open(uri, base);
 
+    REQUIRE(provide_document_highlight(analyzer, at(uri, 1, 24)).size() == 3);
+    // A single highlight takes ~0.1 ms; a batch keeps timer and scheduler
+    // noise out of the ratio.
+    constexpr int kBatch = 20;
     std::vector<double> samples;
     for (int i = 0; i < runs; ++i) {
         const auto start = std::chrono::steady_clock::now();
-        const auto result = provide_document_highlight(analyzer, at(uri, 1, 24));
+        size_t found = 0;
+        for (int k = 0; k < kBatch; ++k)
+            found += provide_document_highlight(analyzer, at(uri, 1, 24)).size();
         samples.push_back(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count());
-        REQUIRE(result.size() == 3);
+        REQUIRE(found == 3 * kBatch);
     }
     std::filesystem::remove_all(dir);
     return *std::min_element(samples.begin(), samples.end());
