@@ -2046,14 +2046,28 @@ TEST_CASE("rename: a call site starts the chain from the class its own occurrenc
     const auto top_uri = uri_from_path(top);
     analyzer.open(top_uri, top_text);
 
-    const auto edit = provide_rename(analyzer, rename_run_at(top_uri, 4, 13));
-    CHECK(edit_starts(edit, top_uri) == std::set<std::pair<int, int>>{{4, 12}});
-    CHECK(edit_starts(edit, uri_from_path(pb)) == std::set<std::pair<int, int>>{{2, 24}});
-    CHECK(edit_starts(edit, uri_from_path(pa)).empty());
-    std::set<std::pair<int, int>> highlighted;
-    for (const auto& ref : analyzer.find_references(top_uri, 4, 13, true, true))
-        highlighted.emplace(ref.line, ref.col);
-    CHECK(highlighted == std::set<std::pair<int, int>>{{4, 12}});
+    // The answer must not depend on which files are open: go to definition
+    // opens pa.sv, whose `run` the cursor's definition may name.
+    const auto check = [&] {
+        const auto edit = provide_rename(analyzer, rename_run_at(top_uri, 4, 13));
+        CHECK(edit_starts(edit, top_uri) == std::set<std::pair<int, int>>{{4, 12}});
+        CHECK(edit_starts(edit, uri_from_path(pb)) == std::set<std::pair<int, int>>{{2, 24}});
+        CHECK(edit_starts(edit, uri_from_path(pa)).empty());
+        std::set<std::pair<int, int>> highlighted;
+        for (const auto& ref : analyzer.find_references(top_uri, 4, 13, true, true))
+            highlighted.emplace(ref.line, ref.col);
+        CHECK(highlighted == std::set<std::pair<int, int>>{{4, 12}});
+    };
+    SECTION("only top.sv open") { check(); }
+    SECTION("pa.sv open too") {
+        analyzer.open(uri_from_path(pa), pa_text);
+        check();
+    }
+    SECTION("pa.sv and pb.sv open too") {
+        analyzer.open(uri_from_path(pa), pa_text);
+        analyzer.open(uri_from_path(pb), pb_text);
+        check();
+    }
 }
 
 TEST_CASE("references: the override class table does not pin replaced shards",
