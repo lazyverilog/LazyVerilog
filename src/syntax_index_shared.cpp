@@ -2247,9 +2247,18 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             // A type this shard does know was already given its precise
             // SymbolID by one of the attempts above; re-recording it here
             // would attach a second, weaker identity to the same token.
-            if (unique_class_scopes.contains(*object_type) ||
-                unique_typedef_scopes.contains(*object_type))
+            if (unique_typedef_scopes.contains(*object_type))
                 return false;
+            // A class this shard declares, whose own body has no such member:
+            // the member is inherited (`c2 h; h.m()` with m on c1).  Name the
+            // receiver's class so find_references() can complete the hop, and
+            // keep the `name:` occurrence the include bridge matches.
+            if (unique_class_scopes.contains(*object_type)) {
+                add_ref(token,
+                        symbol_canonical("class_member", *object_type, std::string(member_name)));
+                add_ref(token, "name:" + std::string(member_name));
+                return true;
+            }
             add_ref(token,
                     symbol_canonical("class_member", *object_type, std::string(member_name)));
             return true;

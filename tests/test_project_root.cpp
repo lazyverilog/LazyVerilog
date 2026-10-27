@@ -1744,6 +1744,8 @@ TEST_CASE("rename: a method renames its whole override chain inside the project"
         refs.emplace(ref.uri, ref.line);
     CHECK(refs == std::set<std::pair<std::string, int>>{
                       {base_uri, 1}, {uri, 1}, {uri, 3}, {uri, 4}, {uri, 10}});
+    // documentHighlight: the chain's occurrences in this file.
+    CHECK(analyzer.find_references(uri, 1, 33, true, true).size() == 4);
 }
 
 TEST_CASE("rename: an override chain reaching outside the project is refused",
@@ -1769,5 +1771,135 @@ TEST_CASE("rename: an override chain reaching outside the project is refused",
             CHECK(message.find("base_c::run") != std::string::npos);
             CHECK(message.find("base.sv:2") != std::string::npos);
         }
+    }
+}
+
+namespace {
+
+/// One indexed file under proj/ (with a lazyverilog.toml), opened.
+std::string open_one_project_file(Analyzer& analyzer, const TempTree& tree,
+                                  const std::string& relative, const std::string& text) {
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto path = tree.write("proj/" + relative, text);
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({path.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto uri = uri_from_path(path);
+    analyzer.open(uri, text);
+    return uri;
+}
+
+} // namespace
+
+TEST_CASE("rename: a new method in a class extending an unindexed base is renamed",
+          "[rename][override-chain]") {
+    // uvm-core not in the filelist.  Nothing says my_helper overrides anything,
+    // so it renames as it always did; a `super.build_phase` does say so.
+    const std::string text = "class my_test extends uvm_test;\n" // 0
+                             "  function void my_helper();\n"    // 1
+                             "  endfunction\n"                   // 2
+                             "  function void build_phase();\n"  // 3
+                             "    super.build_phase();\n"        // 4
+                             "    my_helper();\n"                // 5
+                             "  endfunction\n"                   // 6
+                             "endclass\n";
+    TempTree tree("override-chain-unindexed");
+    Analyzer analyzer;
+    const auto uri = open_one_project_file(analyzer, tree, "t.sv", text);
+
+    const auto edit = provide_rename(analyzer, rename_run_at(uri, 1, 18));
+    CHECK(edit_starts(edit, uri) == std::set<std::pair<int, int>>{{1, 16}, {5, 4}});
+
+    try {
+        provide_rename(analyzer, rename_run_at(uri, 3, 18));
+        FAIL("an override of an unindexed base was renamed");
+    } catch (const RenameRefused& e) {
+        CHECK(std::string(e.what()).find("uvm_test") != std::string::npos);
+    }
+}
+
+TEST_CASE("rename: buffers under no project rename their override chain",
+          "[rename][override-chain]") {
+    // No lazyverilog.toml anywhere: there is no project to protect.
+    TempTree tree("override-chain-no-project");
+    const auto base = tree.write("b/base.sv", kOverrideBase);
+    const auto derived = tree.write("b/derived.sv", kOverrideDerived);
+    Analyzer analyzer;
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.open(uri_from_path(base), std::string(kOverrideBase));
+    const auto uri = uri_from_path(derived);
+    analyzer.open(uri, std::string(kOverrideDerived));
+
+    const auto edit = provide_rename(analyzer, rename_run_at(uri, 1, 33));
+    CHECK(edit_starts(edit, uri_from_path(base)) == std::set<std::pair<int, int>>{{1, 24}});
+    CHECK(edit_starts(edit, uri).size() == 4);
+}
+
+TEST_CASE("rename: an override chain keeps to its own package's class",
+          "[rename][override-chain]") {
+    // pa::drv and pb::drv share a bare name; only pb's is in the chain.
+    const std::string a_text = "package pa;\n"
+                               "class drv;\n"
+                               "  virtual function void run();\n"
+                               "  endfunction\n"
+                               "endclass\n"
+                               "endpackage\n";
+    const std::string b_text = "package pb;\n"                       // 0
+                               "class drv;\n"                        // 1
+                               "  virtual function void run();\n"    // 2
+                               "  endfunction\n"                     // 3
+                               "endclass\n"                          // 4
+                               "class child extends drv;\n"          // 5
+                               "  virtual function void run();\n"    // 6
+                               "  endfunction\n"                     // 7
+                               "endclass\n"                          // 8
+                               "endpackage\n";
+    TempTree tree("override-chain-packages");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto a = tree.write("proj/a/pa.sv", a_text);
+    const auto b = tree.write("proj/b/pb.sv", b_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({a.string(), b.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto uri = uri_from_path(b);
+    analyzer.open(uri, b_text);
+
+    for (const auto& [line, col] : {std::pair{6, 25}, std::pair{2, 25}}) {
+        CAPTURE(line, col);
+        const auto edit = provide_rename(analyzer, rename_run_at(uri, line, col));
+        CHECK(edit_starts(edit, uri) == std::set<std::pair<int, int>>{{2, 24}, {6, 24}});
+        CHECK(edit_starts(edit, uri_from_path(a)).empty());
+    }
+}
+
+TEST_CASE("rename: a handle of a class that only inherits the method is in the chain",
+          "[rename][override-chain]") {
+    const std::string text = "class c1 #(type T = int);\n"   // 0
+                             "  virtual function void m();\n" // 1
+                             "  endfunction\n"               // 2
+                             "endclass\n"                    // 3
+                             "class c2 extends c1 #(int);\n" // 4
+                             "endclass\n"                    // 5
+                             "class c3 extends c2;\n"        // 6
+                             "  function void m();\n"        // 7
+                             "    super.m();\n"              // 8
+                             "  endfunction\n"               // 9
+                             "endclass\n"                    // 10
+                             "module top;\n"                 // 11
+                             "  c2 h;\n"                     // 12
+                             "  initial h.m();\n"            // 13
+                             "endmodule\n";
+    TempTree tree("override-chain-inherited-handle");
+    Analyzer analyzer;
+    const auto uri = open_one_project_file(analyzer, tree, "d.sv", text);
+
+    // The same edit wherever the rename starts.
+    const std::set<std::pair<int, int>> want = {{1, 24}, {7, 16}, {8, 10}, {13, 12}};
+    for (const auto& [line, col] : {std::pair{1, 24}, std::pair{7, 16}, std::pair{13, 12}}) {
+        CAPTURE(line, col);
+        CHECK(edit_starts(provide_rename(analyzer, rename_run_at(uri, line, col)), uri) == want);
     }
 }
