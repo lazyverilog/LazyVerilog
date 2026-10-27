@@ -4033,9 +4033,11 @@ struct OverrideClassNode {
 /// extends.  Built once per snapshot (Analyzer::override_class_table()), so a
 /// request only overlays the open buffers and walks the chain it asks about.
 struct OverrideClassTable {
-    /// The shards the nodes were read from, in snapshot order; holding them
-    /// keeps every node's pointers alive.
-    std::vector<std::pair<std::string, std::shared_ptr<const SyntaxIndex>>> shards;
+    /// The shards the nodes were read from, in snapshot order.  Weak: the
+    /// table must not pin a replaced shard set (a project reload would keep
+    /// the old one alive).  A node is read only while its shard is the one
+    /// the request's snapshot holds; an expired shard's nodes are hidden.
+    std::vector<std::pair<std::string, std::weak_ptr<const SyntaxIndex>>> shards;
     std::vector<OverrideClassNode> nodes; ///< snapshot order, i.e. sorted by path
     std::unordered_map<std::string, std::vector<size_t>> by_name;
     std::unordered_map<std::string, std::vector<size_t>> by_base;
@@ -4135,32 +4137,54 @@ class OverrideClassView {
     /// The package @p node is declared in.  A header opened on its own does
     /// not know it; the closed shard of the package that includes it does.
     std::string_view scope_of(const OverrideClassNode& node) const {
-        if (!node.cls->parent_scope.empty())
-            return node.cls->parent_scope;
-        for (const auto* other : named(node.cls->name))
-            if (other->uri == node.uri && !other->cls->parent_scope.empty())
-                return other->cls->parent_scope;
-        return {};
+        return scope_of(*node.cls, node.uri);
     }
 
-    /// The package of the class whose body holds an occurrence at @p line of
-    /// @p file_id in @p index (declared at @p uri): the last class declared
-    /// above it in that file.  Empty outside any class.
+    /// The package around an occurrence at @p line of @p file_id in @p index
+    /// (written in @p uri): whichever of the last class and the last
+    /// module/interface/package declared above it in that file comes later.
+    /// A module after a package's class is not in that package.
+    ///
+    /// shortcut: the index records where a class or package starts, not where
+    /// it ends, so an occurrence after `endpackage` with no declaration
+    /// between still counts as inside; index the end lines if that matters.
     std::string_view enclosing_scope(const SyntaxIndex& index, SourceFileID file_id, int line,
                                      const std::string& uri) const {
-        const ClassEntry* best = nullptr;
+        const ClassEntry* cls = nullptr;
         for (const auto& c : index.classes)
-            if (c.file_id == file_id && c.line <= line && (!best || c.line > best->line))
-                best = &c;
-        if (!best)
-            return {};
-        if (!best->parent_scope.empty())
-            return best->parent_scope;
-        for (const auto* other : named(best->name))
-            if (other->uri == uri && !other->cls->parent_scope.empty())
-                return other->cls->parent_scope;
-        return {};
+            if (c.file_id == file_id && c.line <= line && (!cls || c.line > cls->line))
+                cls = &c;
+        const ModuleEntry* unit = nullptr;
+        for (const auto& m : index.modules)
+            if (m.file_id == file_id && m.line <= line && (!unit || m.line > unit->line))
+                unit = &m;
+        if (unit && (!cls || unit->line > cls->line))
+            return index.package_names.contains(unit->name) ? std::string_view(unit->name)
+                                                             : std::string_view{};
+        return cls ? scope_of(*cls, uri) : std::string_view{};
     }
+
+  private:
+    /// @p cls's own package, or for a header that does not know it, the
+    /// package of the nearest shard that includes the header.
+    std::string_view scope_of(const ClassEntry& cls, const std::string& uri) const {
+        if (!cls.parent_scope.empty())
+            return cls.parent_scope;
+        const OverrideClassNode* best = nullptr;
+        PathProximityScore best_score{};
+        for (const auto* other : named(cls.name)) {
+            if (other->uri != uri || other->cls->parent_scope.empty())
+                continue;
+            const auto score = path_proximity_score(uri, other->shard_uri);
+            if (!best || score > best_score) {
+                best = other;
+                best_score = score;
+            }
+        }
+        return best ? std::string_view(best->cls->parent_scope) : std::string_view{};
+    }
+
+  public:
 
   private:
     std::vector<const OverrideClassNode*>
@@ -4275,6 +4299,8 @@ static OverrideChain override_chain(const OverrideClassView& view, const Overrid
 std::shared_ptr<const OverrideClassTable> Analyzer::override_class_table(
     const std::shared_ptr<const std::vector<ExtraIndexInfo>>& extra,
     const std::unordered_set<std::string>& open_uris) const {
+    // Declared before the lock: a replaced table is freed after unlocking.
+    std::shared_ptr<const OverrideClassTable> replaced;
     std::lock_guard<std::mutex> lock(override_class_table_mutex_);
     // Typing in a listed file republishes the snapshot with that file's shard
     // replaced, but the view hides an open file's shard anyway: keep the table
@@ -4291,7 +4317,8 @@ std::shared_ptr<const OverrideClassTable> Analyzer::override_class_table(
         for (size_t i = 0; current && i < extra->size(); ++i) {
             const auto& [uri, index] = table->shards[i];
             current = uri == (*extra)[i].uri;
-            if (current && index != (*extra)[i].index)
+            const auto& now = (*extra)[i].index;
+            if (current && (index.owner_before(now) || now.owner_before(index)))
                 stale.push_back(uri);
         }
         if (current) {
@@ -4307,7 +4334,7 @@ std::shared_ptr<const OverrideClassTable> Analyzer::override_class_table(
         table->shards.emplace_back(shard.uri, shard.index);
         table->add(shard.index_ref(), shard.uri);
     }
-    override_class_table_ = table;
+    replaced = std::exchange(override_class_table_, table);
     override_class_table_checked_ = extra;
     override_class_table_stale_.clear();
     return table;
@@ -7711,6 +7738,41 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         return found;
     };
 
+    // The class an occurrence's spelling names, resolved from where it is
+    // written: its file, its imports and the package around it.  The one
+    // ranking for every occurrence, the cursor's included.
+    const auto override_resolve_at = [&](const std::string& file_uri, const SyntaxIndex& index,
+                                         const ReferenceEntry& ref,
+                                         const std::vector<ImportEntry>& imports,
+                                         const std::string& name) -> const OverrideClassNode* {
+        auto occurrence_uri = index.source_uri(ref.file_id);
+        if (occurrence_uri.empty())
+            occurrence_uri = file_uri;
+        const auto scope =
+            override_view->enclosing_scope(index, ref.file_id, ref.line, occurrence_uri);
+        auto [memo, inserted] = override_resolved.try_emplace(occurrence_uri + '\n' +
+                                                              std::string(scope) + '\n' + name);
+        if (inserted)
+            memo->second = override_view->resolve(name, occurrence_uri,
+                                                   path_from_file_uri(occurrence_uri), scope, imports);
+        return memo->second;
+    };
+    // The class named by a `class_method::C::m` / `class_member::C::m` spelling
+    // of the chain's method, empty for any other spelling.
+    const auto override_spelled_class = [&](const ReferenceEntry& ref) -> std::string {
+        std::string_view spelling = ref.symbol_debug;
+        if (!spelling.starts_with("class_method::") && !spelling.starts_with("class_member::"))
+            return {};
+        spelling.remove_prefix(std::string_view("class_method::").size());
+        if (spelling.size() <= override_member.size() + 2 || !spelling.ends_with(override_member))
+            return {};
+        spelling.remove_suffix(override_member.size());
+        if (!spelling.ends_with("::"))
+            return {};
+        spelling.remove_suffix(2);
+        return std::string(spelling);
+    };
+
     // Whether a chain-spelled occurrence means a class of the chain.  The
     // spelling carries a bare class name, so when another class shares it the
     // occurrence's own file decides, the way the chain itself was resolved.
@@ -7718,36 +7780,17 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     auto override_chain_match = [&](const std::string& file_uri, const SyntaxIndex& index,
                                     const ReferenceEntry& ref,
                                     const std::vector<ImportEntry>& imports) -> std::optional<bool> {
-        // The class an occurrence's spelling names, resolved from where it is
-        // written: its file, and the package of the class around it.
-        const auto resolve_here = [&](const std::string& name) -> const OverrideClassNode* {
-            auto occurrence_uri = index.source_uri(ref.file_id);
-            if (occurrence_uri.empty())
-                occurrence_uri = file_uri;
-            const auto scope =
-                override_view->enclosing_scope(index, ref.file_id, ref.line, occurrence_uri);
-            auto [memo, inserted] = override_resolved.try_emplace(
-                occurrence_uri + '\n' + std::string(scope) + '\n' + name);
-            if (inserted)
-                memo->second = override_view->resolve(
-                    name, occurrence_uri, path_from_file_uri(occurrence_uri), scope, imports);
-            return memo->second;
-        };
+        // Every chain spelling names the method itself: one string compare
+        // turns away the rest of a shard before any hashing.
+        if (override_member.empty() || ref.name != override_member)
+            return std::nullopt;
         if (override_upward) {
-            if (ref.name != override_member)
+            const auto name = override_spelled_class(ref);
+            if (name.empty())
                 return std::nullopt;
-            std::string_view spelling = ref.symbol_debug;
-            if (!spelling.starts_with("class_method::") && !spelling.starts_with("class_member::"))
-                return std::nullopt;
-            spelling.remove_prefix(std::string_view("class_method::").size());
-            if (!spelling.ends_with("::" + override_member))
-                return std::nullopt;
-            spelling.remove_suffix(override_member.size() + 2);
-            const auto* node = resolve_here(std::string(spelling));
+            const auto* node = override_resolve_at(file_uri, index, ref, imports, name);
             return node && reaches_root(*node);
         }
-        if (override_chain_ids.empty())
-            return std::nullopt;
         if (override_above_ids.contains(ref.symbol_id))
             override_outside_evidence = true;
         const auto it = override_chain_ids.find(ref.symbol_id);
@@ -7755,15 +7798,12 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             return std::nullopt;
         if (!override_ambiguous.contains(it->second))
             return true;
-        const auto* node = resolve_here(it->second);
+        const auto* node = override_resolve_at(file_uri, index, ref, imports, it->second);
         return node && override_chain_keys.contains(OverrideClassView::key(*node));
     };
 
-    auto reference_matches_target = [&](const std::string& file_uri, const SyntaxIndex& index,
-                                        const ReferenceEntry& ref,
+    auto reference_matches_target = [&](const SyntaxIndex& index, const ReferenceEntry& ref,
                                         const std::vector<ImportEntry>& imports) {
-        if (const auto chain = override_chain_match(file_uri, index, ref, imports))
-            return *chain;
         if (target_symbol_id && ref.symbol_id == target_symbol_id)
             return true;
         if (std::find(alias_symbol_ids.begin(), alias_symbol_ids.end(), ref.symbol_id) !=
@@ -7966,18 +8006,41 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             const std::string member(rest.substr(sep + 2));
             override_table = override_class_table(extra_idx, open_uris);
             auto& view = override_view.emplace(*override_table, open_uris);
+            // The dynamic index carries imports, which an open subclass's
+            // `extends drv` needs to pick the imported drv.  The scan below
+            // builds it for every open file anyway; highlight scans only the
+            // asking one.
+            // shortcut: highlight resolves another open file's base without
+            // its imports; build the dynamic index there too if it disagrees.
             for (const auto& [state_uri, open] : open_states)
                 if (open)
-                    view.overlay(get_structural_index(*open), state_uri);
+                    view.overlay(!this_file_only || open == state ? get_dynamic_index(*open)
+                                                                  : get_structural_index(*open),
+                                 state_uri);
+            override_member = member;
+            const std::string start_class = base_class_lookup_name(rest.substr(0, sep));
+            // A call site such as `h.run()` with two same-named `drv`s in reach
+            // starts from the class its own occurrence resolves to, with the
+            // ranking every other occurrence gets -- so the cursor's own
+            // occurrence is always in the chain.
+            const OverrideClassNode* start = nullptr;
+            if (view.named(start_class).size() > 1) {
+                const auto& asking = get_dynamic_index(*state);
+                for (const auto& ref : asking.references)
+                    if (ref.line == line + 1 && ref.col <= col && col < ref.end_col &&
+                        ref.name == member && override_spelled_class(ref) == start_class) {
+                        start = override_resolve_at(uri, asking, ref, asking.imports, start_class);
+                        break;
+                    }
+            }
             static const std::vector<ImportEntry> kNoImports;
-            const auto* start =
-                view.resolve(base_class_lookup_name(rest.substr(0, sep)), target_def->uri,
-                             path_from_file_uri(target_def->uri), {}, kNoImports);
+            if (!start)
+                start = view.resolve(start_class, target_def->uri,
+                                     path_from_file_uri(target_def->uri), {}, kNoImports);
             const auto chain =
                 start ? override_chain(view, *start, member, !this_file_only) : OverrideChain{};
             if (this_file_only && chain.root) {
                 override_upward = true;
-                override_member = member;
                 override_root_key = OverrideClassView::key(*chain.root);
             }
             override_chain_keys = chain.keys;
@@ -8032,6 +8095,8 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             }
         }
     }
+
+    const bool override_active = !override_member.empty();
 
     auto resolve_snapshot = [&](const std::string& candidate_uri, int ref_line,
                                 int ref_col) -> std::optional<Location> {
@@ -8122,7 +8187,10 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                            ? get_dynamic_index(*state).imports
                                            : open_index.imports;
             for (const auto& ref : open_index.references) {
-                if (reference_matches_target(state_uri, open_index, ref, open_imports))
+                const auto chain = override_active ? override_chain_match(state_uri, open_index,
+                                                                          ref, open_imports)
+                                                   : std::nullopt;
+                if (chain ? *chain : reference_matches_target(open_index, ref, open_imports))
                     add_indexed_reference(state_uri, open_index, ref);
             }
         }
@@ -8159,10 +8227,23 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // acceleration buckets.  That keeps initial project indexing lighter and
         // closer to the v1.0.4 model; explicit references / rename requests pay
         // the linear scan cost over compact ReferenceEntry records instead.
-        for (const auto& ref : extra.index_ref().references) {
-            if (reference_matches_target(extra.uri, extra.index_ref(), ref,
-                                         extra.index_ref().imports))
-                add_indexed_reference(extra.uri, extra.index_ref(), ref);
+        // Two loops, so a request with no override chain -- nearly all of
+        // them -- scans with no chain test at all (one per reference cost a
+        // quarter of a control request's time).
+        const auto& shard = extra.index_ref();
+        if (override_active) {
+            for (const auto& ref : shard.references) {
+                // The name test first, here: a call per reference costs.
+                const auto chain = ref.name == override_member
+                                       ? override_chain_match(extra.uri, shard, ref, shard.imports)
+                                       : std::nullopt;
+                if (chain ? *chain : reference_matches_target(shard, ref, shard.imports))
+                    add_indexed_reference(extra.uri, shard, ref);
+            }
+        } else {
+            for (const auto& ref : shard.references)
+                if (reference_matches_target(shard, ref, shard.imports))
+                    add_indexed_reference(extra.uri, shard, ref);
         }
     }
 
