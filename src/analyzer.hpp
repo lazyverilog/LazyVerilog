@@ -736,9 +736,11 @@ class Analyzer {
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
 
     /// Classes of @p extra by name and by base, for the override-chain walk.
-    /// Built once per published snapshot, not per request.
+    /// Built once per published snapshot, not per request; kept across a
+    /// snapshot that differs only in shards of @p open_uris.
     std::shared_ptr<const OverrideClassTable>
-    override_class_table(const std::shared_ptr<const std::vector<ExtraIndexInfo>>& extra) const;
+    override_class_table(const std::shared_ptr<const std::vector<ExtraIndexInfo>>& extra,
+                         const std::unordered_set<std::string>& open_uris) const;
 
     /// The published shard snapshot, ordered nearest-first against @p state's
     /// own path -- the order every by-name scan over the project has to run in,
@@ -1038,6 +1040,10 @@ class Analyzer {
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
     mutable std::mutex override_class_table_mutex_;
     mutable std::shared_ptr<const OverrideClassTable> override_class_table_;
+    // The last snapshot checked against the table, and the shards in which
+    // they differ (each open when checked, so hidden from the view).
+    mutable std::weak_ptr<const std::vector<ExtraIndexInfo>> override_class_table_checked_;
+    mutable std::vector<std::string> override_class_table_stale_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
     mutable std::function<void()> project_index_publish_callback_;
 
