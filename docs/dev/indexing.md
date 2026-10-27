@@ -126,8 +126,11 @@ Two consequences worth knowing before writing a feature:
   the queue fans out the projection is already installed.  The header's bulk is
   read exactly once instead of once per includer, and that does not move with the
   core count or with how loaded the machine is.  The one includer that read it
-  keeps its mentioned header declarations, which is a duplicate of what the
-  header shard holds, not a different answer.
+  keeps the header declarations it mentions -- parameters, typedefs and the
+  like -- which duplicate what the header shard holds, not a different answer.
+  A file-scope class is the exception: no includer's shard keeps one, whether
+  it read the header whole or not, so a class resolves only through the
+  header's shard.
 
   Before the gate the count was whatever the scheduler allowed: measured on a
   four-core box as 1 file on a single-core slice, 9–12 idle, and 35 of 60 under
