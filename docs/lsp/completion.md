@@ -40,8 +40,11 @@ uvm_pkg::                   // scope completion lists the package
 - A handle typed by a type parameter (`REQ req;` in `uvm_driver #(type REQ = ...)`) is resolved by following
   each `extends X #(...)` from the class you are in, or from a handle's own `X #(...)` type, up to the class
   that declares it: at most 8 steps, arguments by position or name, defaults otherwise. An `extends` or a
-  handle may name a specialization typedef (`typedef X #(item) x_t;`). An argument is taken as a type name:
-  expressions and nested `#(...)` in it are not followed.
+  handle may name a specialization typedef (`typedef X #(item) x_t;`); a package qualifier (`pa::x_t`) picks
+  that package's declaration. An argument is taken as a type name: expressions and nested `#(...)` in it are
+  not followed. A chain longer than 8 steps, or one through a base the index cannot follow (a typedef declared
+  inside a class), offers nothing rather than the parameter's default; the default is used only when no
+  argument appears anywhere in the chain.
 - Inherited members on a bare identifier need the file's last parse to have taken 50 ms or less. In a slower
   file the class the cursor is in is unknown, so only the names the unparsed text shows are offered.
 - Hierarchical references (`top.dut.signal`) resolve one `.` hop.

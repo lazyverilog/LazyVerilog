@@ -324,7 +324,10 @@ something does.
 A type parameter after `.` (`req.` in a UVM driver) is bound by walking the
 `extends X #(...)` chain from the asking class to the declaring one: one
 `find_class()` (or `find_specialization()`, for `extends some_t`) per step, at
-most 8 steps, no file reads.
+most 8 steps, no file reads.  A package-qualified name (`pa::base_t`) is
+looked up under its package_scoped_key(), which publish also files in
+`class_slots` / `specialization_slots`; the bare name is ranked by proximity
+only when that finds nothing.  A cut chain answers nothing, not the default.
 
 The trade-off: in a file that parses inside the budget, member access after `.`
 costs up to the parse time plus the completion itself on a real tree, where it

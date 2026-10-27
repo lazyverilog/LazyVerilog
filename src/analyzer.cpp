@@ -10528,6 +10528,14 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
             if (is_specialization_typedef(*entry.index, entry.index->typedefs[i]))
                 snapshot->specialization_slots[entry.index->typedefs[i].name].emplace_back(
                     shard_slot, i);
+        // `pa::base_t`: the package-scoped spellings, under package_scoped_key().
+        for (const auto& [key, i] : entry.index->package_class_by_scoped_name)
+            if (i < entry.index->classes.size())
+                snapshot->class_slots[key].emplace_back(shard_slot, i);
+        for (const auto& [key, i] : entry.index->package_type_by_scoped_name)
+            if (i < entry.index->typedefs.size() &&
+                is_specialization_typedef(*entry.index, entry.index->typedefs[i]))
+                snapshot->specialization_slots[key].emplace_back(shard_slot, i);
         if (!entry.index->macros.empty())
             snapshot->macro_shard_slots.push_back(shard_slot);
 

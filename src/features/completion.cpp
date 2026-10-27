@@ -3088,9 +3088,15 @@ static const ClassEntry* find_class_for_request(const std::string& name, const S
                                                 const ProjectIndexSnapshot* snapshot,
                                                 std::string_view from_path,
                                                 const std::vector<OpenIndexShard>& opened) {
+    // A package_scoped_key() name (`pa\nbase_c`) reads the package's table.
+    const auto table_of = [&](const SyntaxIndex& index) -> const auto& {
+        return name.find('\n') != std::string::npos ? index.package_class_by_scoped_name
+                                                    : index.class_by_name;
+    };
     const auto in = [&](const SyntaxIndex& index) -> const ClassEntry* {
-        const auto it = index.class_by_name.find(name);
-        return it != index.class_by_name.end() && it->second < index.classes.size()
+        const auto& table = table_of(index);
+        const auto it = table.find(name);
+        return it != table.end() && it->second < index.classes.size()
                    ? &index.classes[it->second]
                    : nullptr;
     };
@@ -3165,8 +3171,11 @@ static const TypedefEntry* find_specialization_for_request(
     const std::string& name, const SyntaxIndex& here, const ProjectIndexSnapshot* snapshot,
     std::string_view from_path, const std::vector<OpenIndexShard>& opened) {
     const auto in = [&](const SyntaxIndex& index) -> const TypedefEntry* {
-        const auto it = index.typedef_by_name.find(name);
-        return it != index.typedef_by_name.end() && it->second < index.typedefs.size() &&
+        const auto& table = name.find('\n') != std::string::npos
+                                ? index.package_type_by_scoped_name
+                                : index.typedef_by_name;
+        const auto it = table.find(name);
+        return it != table.end() && it->second < index.typedefs.size() &&
                        is_specialization_typedef(index, index.typedefs[it->second])
                    ? &index.typedefs[it->second]
                    : nullptr;
@@ -3267,18 +3276,49 @@ struct TypeLookup {
     std::function<const TypedefEntry*(const std::string&)> specialization_named;
 };
 
-/// The class @p name names -- through a specialization typedef if it is one,
-/// whose arguments then land in @p args.
-static const ClassEntry* class_or_specialization(const std::string& name, const TypeLookup& lookup,
-                                                 std::vector<ClassParamEntry>* args) {
-    if (const auto* cls = lookup.class_named(name))
-        return cls;
-    const auto* td = lookup.specialization_named(name);
-    if (!td)
-        return nullptr;
-    if (args)
-        *args = type_arguments_of(td->resolved);
-    return lookup.class_named(completion_base_type_name(td->resolved));
+/// `pa::base_t #(x)` as a package_scoped_key() (`pa\nbase_t`); empty when
+/// @p written has no package qualifier.
+static std::string package_scoped_name(std::string_view written) {
+    written = written.substr(0, written.find('#'));
+    const size_t scope = written.rfind("::");
+    if (scope == std::string_view::npos)
+        return {};
+    std::string package = trim_completion_copy(std::string(written.substr(0, scope)));
+    if (const size_t outer = package.rfind("::"); outer != std::string::npos)
+        package.erase(0, outer + 2);
+    const std::string name = trim_completion_copy(std::string(written.substr(scope + 2)));
+    return package.empty() || name.empty() ? std::string{} : package_scoped_key(package, name);
+}
+
+/// The class type text @p written (`drv_base #(x)`, `pa::base_t`) names --
+/// through a specialization typedef if it is one, whose arguments then land in
+/// @p args and @p through_typedef is set.  A package-qualified name is looked
+/// up in that package first; only when it finds nothing there is the bare name
+/// ranked by proximity.
+static const ClassEntry* class_or_specialization(const std::string& written,
+                                                 const TypeLookup& lookup,
+                                                 std::vector<ClassParamEntry>* args,
+                                                 bool* through_typedef = nullptr) {
+    const auto class_written = [&](const std::string& text) -> const ClassEntry* {
+        if (const std::string scoped = package_scoped_name(text); !scoped.empty())
+            if (const auto* cls = lookup.class_named(scoped))
+                return cls;
+        return lookup.class_named(base_class_lookup_name(text));
+    };
+    for (const std::string& key : {package_scoped_name(written), base_class_lookup_name(written)}) {
+        if (key.empty())
+            continue;
+        if (const auto* cls = lookup.class_named(key))
+            return cls;
+        if (const auto* td = lookup.specialization_named(key)) {
+            if (args)
+                *args = type_arguments_of(td->resolved);
+            if (through_typedef)
+                *through_typedef = true;
+            return class_written(td->resolved);
+        }
+    }
+    return nullptr;
 }
 
 /// What the type parameter @p type of class @p declarer stands for in an
@@ -3291,35 +3331,42 @@ static const ClassEntry* class_or_specialization(const std::string& name, const 
 /// step maps its arguments, by position or name and written in the subclass's
 /// scope, to X's parameters; a parameter no argument sets takes its default.
 /// An `extends` may name a specialization typedef.  At most kMaxSteps steps,
-/// each one lookup; a chain that breaks before @p declarer falls back to
-/// @p declarer's defaults.  @p type itself when it is no parameter.
+/// each one lookup.  @p type itself when it is no parameter.
+///
+/// A chain cut before @p declarer answers empty: an argument in it may have set
+/// the parameter, and the default would offer the wrong members.  A base no
+/// lookup finds (a class-scoped typedef) counts as such an argument.  Only a
+/// chain cut for depth with no argument at all falls back to @p declarer's
+/// default.
 static std::string resolve_type_parameter(const std::string& type, const ClassEntry* start,
                                           const std::vector<ClassParamEntry>& start_args,
                                           const std::string& declarer, const TypeLookup& lookup) {
     constexpr int kMaxSteps = 8;
     if (!start || type.empty())
         return type;
+    bool any_argument = !start_args.empty();
     TypeBindings bindings = bind_class_parameters(*start, start_args, {});
     const ClassEntry* cls = start;
     for (int step = 0; cls && cls->name != declarer; ++step) {
         std::vector<ClassParamEntry> args = cls->base_args;
-        const TypeBindings* outer = &bindings;
-        const TypeBindings none;
-        const std::string base_name = base_class_lookup_name(cls->base_class);
-        const ClassEntry* base = step < kMaxSteps ? lookup.class_named(base_name) : nullptr;
-        if (!base && step < kMaxSteps && !base_name.empty()) {
-            // A typedef's arguments are written where it is declared.
-            base = class_or_specialization(base_name, lookup, &args);
-            outer = &none;
-        }
+        bool through_typedef = false;
+        const ClassEntry* base =
+            step < kMaxSteps && !cls->base_class.empty()
+                ? class_or_specialization(cls->base_class, lookup, &args, &through_typedef)
+                : nullptr;
+        // A base no lookup finds may hide arguments (a class-scoped typedef).
+        any_argument = any_argument || !args.empty() || (!base && step < kMaxSteps);
         if (!base) {
             cls = nullptr;
             break;
         }
-        bindings = bind_class_parameters(*base, args, *outer);
+        // A typedef's arguments are written where it is declared.
+        bindings = bind_class_parameters(*base, args, through_typedef ? TypeBindings{} : bindings);
         cls = base;
     }
     if (!cls) {
+        if (any_argument)
+            return {};
         const auto* own = lookup.class_named(declarer);
         return own ? substitute_type(bind_class_parameters(*own, {}, {}), type) : type;
     }
@@ -3980,9 +4027,9 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                                                            project_index.get(),
                                                            state.normalized_path, *opened_shards);
                 }};
-            // Field @p field of class @p name or of a class it inherits, across
-            // files, one lookup per level; @p declarer receives the class
-            // declaring it.
+            // Field @p field of the class @p name names (as written, so `pa::`
+            // picks the package) or of a class it inherits, across files, one
+            // lookup per level; @p declarer receives the class declaring it.
             const auto inherited_field = [&](std::string name, const std::string& field,
                                              std::string& declarer) -> std::optional<std::string> {
                 std::unordered_set<std::string> visited;
@@ -3996,7 +4043,7 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                             declarer = cls->name;
                             return f.type;
                         }
-                    name = base_class_lookup_name(cls->base_class);
+                    name = cls->base_class;
                 }
                 return std::nullopt;
             };
@@ -4021,7 +4068,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     current_file_unresolved_base_class(state, ctx.current_scope_name);
                 std::string declarer;
                 if (!base.empty()) {
-                    value_type = inherited_field(base, ctx.scope_name, declarer);
+                    // From the enclosing class's `extends` as written: a
+                    // package qualifier there picks the base.
+                    const auto* own = lookup.class_named(ctx.current_scope_name);
+                    value_type = own ? inherited_field(own->base_class, ctx.scope_name, declarer)
+                                     : inherited_field(base, ctx.scope_name, declarer);
                     for (const auto& shard : *opened_shards) {
                         if (value_type)
                             break;
@@ -4043,6 +4094,10 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                 // `T item;` in this class: T's default.
                 value_type = bind_parameter(declared_text.empty() ? *value_type : declared_text,
                                             {});
+            }
+            // A type parameter whose chain was cut: no answer beats a wrong one.
+            if (value_type && value_type->empty()) {
+                value_type.reset();
             }
             // `a.b.c.` — the steps above resolved the receiver `a`.  Each
             // remaining hop is a field of the type resolved so far, and
@@ -4089,6 +4144,8 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                             : declared;
                     if (bound == declared)
                         next_args = type_arguments_of(*value_type);
+                    else if (bound.empty())
+                        value_type.reset(); // chain cut: no answer beats a wrong one
                     else
                         value_type = bound;
                 }

@@ -2879,6 +2879,78 @@ TEST_CASE("completion: a type parameter follows the forwarding chain across file
     CHECK_FALSE(has_label(complete_in("class t;\n  dv_base_driver h;\n", "h.req."), "addr"));
 }
 
+TEST_CASE("completion: a package-qualified base picks that package's typedef",
+          "[completion][inherited]") {
+    ScratchTree tree("lazyverilog-completion-param-package");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("drv_base.sv", "class drv_base #(type REQ = int);\n  REQ req;\nendclass\n"),
+        tree.write("a/p.sv", "package pa;\n  class req_c;\n    int req_field;\n  endclass\n"
+                             "  typedef drv_base #(req_c) base_t;\nendpackage\n"),
+        tree.write("b/p.sv", "package pb;\n  class rsp_c;\n    int rsp_field;\n  endclass\n"
+                             "  typedef drv_base #(rsp_c) base_t;\nendpackage\n")};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    int n = 0;
+    const auto complete_in = [&](const std::string& base) {
+        const std::string text = "class d extends " + base +
+                                 ";\n  function void f();\n    req.\n  endfunction\nendclass\n";
+        // b/ is nearer pb's typedef: only the qualifier can pick pa's.
+        const auto uri = uri_from_path(tree.write("b/ask" + std::to_string(n++) + ".sv", text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "    req.");
+        return complete_at(engine, analyzer, uri, line, col);
+    };
+    auto qualified = complete_in("pa::base_t");
+    CHECK(has_label(qualified, "req_field"));
+    CHECK_FALSE(has_label(qualified, "rsp_field"));
+    auto other = complete_in("pb::base_t");
+    CHECK(has_label(other, "rsp_field"));
+    CHECK_FALSE(has_label(other, "req_field"));
+}
+
+// A chain cut before the declaring class gives no answer rather than the
+// default: an argument in it may have set the parameter.
+TEST_CASE("completion: a cut forwarding chain does not fall back to the default",
+          "[completion][inherited]") {
+    ScratchTree tree("lazyverilog-completion-param-cut");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("drv_base.sv", "class drv_base #(type REQ = dflt_c);\n  REQ req;\nendclass\n"),
+        tree.write("items.sv", "class item_c;\n  int addr;\nendclass\n"
+                               "class dflt_c;\n  int dflt_f;\nendclass\n"),
+        tree.write("holder.sv", "class holder;\n  typedef drv_base #(item_c) inner_t;\nendclass\n"),
+        tree.write("fwd0.sv", "class fwd0 #(type T = int) extends drv_base #(T);\nendclass\n")};
+    for (int i = 1; i < 10; ++i)
+        files.push_back(tree.write("fwd" + std::to_string(i) + ".sv",
+                                   "class fwd" + std::to_string(i) + " #(type T = int) extends fwd" +
+                                       std::to_string(i - 1) + " #(T);\nendclass\n"));
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    int n = 0;
+    const auto complete_in = [&](const std::string& base) {
+        const std::string text = "class d extends " + base +
+                                 ";\n  function void f();\n    req.\n  endfunction\nendclass\n";
+        const auto uri = uri_from_path(tree.write("ask" + std::to_string(n++) + ".sv", text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "    req.");
+        return complete_at(engine, analyzer, uri, line, col);
+    };
+    // Within 8 steps the actual arrives; past them, nothing rather than dflt_c.
+    CHECK(has_label(complete_in("fwd5 #(item_c)"), "addr"));
+    auto deep = complete_in("fwd9 #(item_c)");
+    CHECK_FALSE(has_label(deep, "addr"));
+    CHECK_FALSE(has_label(deep, "dflt_f"));
+    // A class-scoped typedef is no specialization the lookup follows.
+    CHECK_FALSE(has_label(complete_in("holder::inner_t"), "dflt_f"));
+    // No argument anywhere: the default is the answer.
+    CHECK(has_label(complete_in("drv_base"), "dflt_f"));
+}
+
 TEST_CASE("completion: backtick offers the asking project's macros only",
           "[completion][macro]") {
     ScratchTree tree("lazyverilog-completion-project-macros");
