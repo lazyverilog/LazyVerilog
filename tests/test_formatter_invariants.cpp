@@ -448,11 +448,29 @@ void check_call_estimate(const Rendered& r, const CorpusFile& f, const RunConfig
         const svfmt::Tok& t = r.tokens[open];
         // A call inside another list or a bracket is never measured alone.
         if (!t.immutable.topology.starts_argument_list || !visible(r, open) || lists_open[open] > 0 ||
-            t.immutable.syntax.bracket_depth > 0 || svfmt::is_gate_terminal_open(r.tokens, open) ||
-            t.mutable_.wrap.list_kind != svfmt::WrapListKind::None)
+            t.immutable.syntax.bracket_depth > 0 || svfmt::is_gate_terminal_open(r.tokens, open))
             continue;
         const size_t close = t.immutable.syntax.matching_token;
         const int line = r.trace.line[open];
+        if (t.mutable_.wrap.list_kind != svfmt::WrapListKind::None) {
+            // The other way round: a call broken for its width did not fit by
+            // the estimate either.  Too high an estimate breaks calls that fit.
+            const auto& fc = c.opts.function_call;
+            const bool by_width = (t.mutable_.wrap.list_kind == svfmt::WrapListKind::FunctionBlock ||
+                                   t.mutable_.wrap.list_kind == svfmt::WrapListKind::FunctionHanging) &&
+                                  fc.break_policy == "auto" && fc.arg_count < 0;
+            bool comment = false;
+            for (size_t k = open + 1; k < close && k < r.tokens.size() && !comment; ++k)
+                comment = r.tokens[k].lex.comment_kind != svfmt::CommentLexemeKind::None;
+            if (by_width && !comment) {
+                const int estimate = svfmt::one_line_list_width(r.tokens, open, close, 1 << 20, c.opts);
+                if (estimate <= fc.line_length)
+                    rep.add("call-estimate-high", f, c, line,
+                            "broken, but estimated " + std::to_string(estimate) + " <= " +
+                                std::to_string(fc.line_length) + ": " + r.lines[line]);
+            }
+            continue;
+        }
         if (close == svfmt::npos || close >= r.tokens.size() || !visible(r, close) || r.trace.line[close] != line)
             continue;
         // The rendered end of what follows the `)` on its line, through the

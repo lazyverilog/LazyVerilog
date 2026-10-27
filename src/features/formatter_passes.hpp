@@ -3,6 +3,7 @@
 #include "formatter_token.hpp"
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1071,22 +1072,35 @@ inline bool ends_verbatim_line(const Tok& t) {
     return t.lex.is_format_on_marker || t.lex.is_format_off_marker || t.lex.is_disabled_region_body;
 }
 
-// The padding AlignPass will put before the line's assignment operator, when
-// that operator stands before `token_idx`: `statement.align` pads a
-// statement's LHS to `lhs_min_width`, and `var_declaration.align` puts a
-// declaration's initializer `=` at least section1+2+3 past the indent.
+// How far a scan of a line for the padding AlignPass will put before its
+// assignment operator has got, and what decided it.  WrapPass keeps one per
+// line start and resumes it, rather than rescanning the line for every list
+// on it.
+struct AlignScan {
+    size_t next{npos};     // the first token not scanned yet
+    int names{0};
+    size_t decided{npos};  // the token that decided the padding
+    int pad{0};
+};
+
+// Scans [line_start, token_idx) for the token that decides the padding before
+// the line's assignment operator: `statement.align` pads a statement's LHS to
+// `lhs_min_width`, and `var_declaration.align` puts a declaration's
+// initializer `=` its sections past the indent.  `width(k)` is the width of
+// [line_start, k) on one line.
 // shortcut: a lower bound -- a non-adaptive group can pad more to match its
 // widest line; upgrade with a group-width fact.
-inline int statement_align_padding(const TokenStream& tokens, size_t line_start, size_t token_idx,
-                                   const FormatOptions& opts) {
-    if (line_start >= tokens.size())
-        return 0;
+template <class Width>
+inline void scan_statement_align(const TokenStream& tokens, size_t line_start, size_t token_idx,
+                                 const FormatOptions& opts, AlignScan& s, Width width) {
+    if (s.next == npos)
+        s.next = line_start;
     const auto& depth = tokens[line_start].immutable.syntax;
     const TK lead = tokens[line_start].lex.kind;
     const bool decl_lead = depth.paren_depth == 0 &&
         (is_var_decl_leading_keyword(lead) || lead == TK::VarKeyword || is_net_type_keyword(lead));
-    int names = 0;
-    for (size_t k = line_start; k < token_idx && k < tokens.size(); ++k) {
+    for (; s.decided == npos && s.next < token_idx && s.next < tokens.size(); ++s.next) {
+        const size_t k = s.next;
         const auto& t = tokens[k];
         if (!is_code_token(t) || t.immutable.syntax.paren_depth != depth.paren_depth ||
             t.immutable.syntax.bracket_depth != depth.bracket_depth ||
@@ -1095,51 +1109,56 @@ inline int statement_align_padding(const TokenStream& tokens, size_t line_start,
         // `S1: x = 1;` -- a case item or a labelled statement is no
         // declaration, and its two names are not a type and a variable.
         if (kind_is(t, TK::Semicolon) || t.immutable.topology.is_case_item_colon ||
-            t.immutable.topology.is_item_label_colon)
-            return 0;
+            t.immutable.topology.is_item_label_colon) {
+            s.decided = k;
+            break;
+        }
         if (is_assignment_op(t.lex.kind)) {
+            s.decided = k;
             // `logic v = x` / `my_t v = x` is a declaration; statement
             // alignment skips it.
-            if (decl_lead || (names >= 2 && depth.paren_depth == 0)) {
-                // section1 = 0 leaves the type unpadded; the dimension and
-                // name sections still pad.
+            if (decl_lead || (s.names >= 2 && depth.paren_depth == 0)) {
                 if (!kind_is(t, TK::Equals) || !opts.var_declaration.align)
-                    return 0;
-                const int sections = option_width(opts.var_declaration.section1_min_width, opts) +
-                                     option_width(opts.var_declaration.section2_min_width, opts) +
-                                     option_width(opts.var_declaration.section3_min_width, opts);
+                    break;
+                // AlignPass puts the name section2 past the type field: at
+                // least section1, or with section1 = 0 the type and a space.
+                const auto& vd = opts.var_declaration;
+                const int type_field = vd.section1_min_width > 0
+                                           ? option_width(vd.section1_min_width, opts)
+                                           : option_width(token_width(tokens[line_start]) + 1, opts);
+                const int sections =
+                    type_field + option_width(vd.section2_min_width, opts) + option_width(vd.section3_min_width, opts);
                 // The compact layout puts one space before the `=`.
-                return std::max(0, sections - compact_width(tokens, line_start, k, opts) - 1);
+                s.pad = std::max(0, sections - width(k) - 1);
+                break;
             }
-            if (names >= 2 || !opts.statement.align || opts.statement.lhs_min_width <= 0)
-                return 0;
-            return std::max(0, opts.statement.lhs_min_width - compact_width(tokens, line_start, k, opts));
+            if (s.names < 2 && opts.statement.align && opts.statement.lhs_min_width > 0)
+                s.pad = std::max(0, opts.statement.lhs_min_width - width(k));
+            break;
         }
         if (is_identifier_like(t)) {
             const size_t p = prev_code(tokens, k);
             if (p == npos || p < line_start ||
                 !(kind_is(tokens[p], TK::Dot) || kind_is(tokens[p], TK::Hash) || kind_is(tokens[p], TK::At)))
-                ++names;
+                ++s.names;
         }
     }
-    return 0;
 }
 
-// The first token of the line `token_idx` is on, by the breaks decided so far.
-// A blank line BlankLinePass keeps also starts one: `)` / (blank) /
-// `extends base #(...)`.
-inline size_t line_start_before(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
-    for (size_t i = token_idx; i > 0; --i)
-        if (tokens[i].mutable_.wrap.must_break_before || tokens[i - 1].mutable_.wrap.must_break_after ||
-            ends_verbatim_line(tokens[i - 1]) ||
-            (opts.blank_lines_between_items > 0 && is_blank_line_boundary(tokens, i)))
-            return i;
-    return 0;
+// The padding AlignPass will put before the line's assignment operator, when
+// that operator stands before `token_idx`.
+inline int statement_align_padding(const TokenStream& tokens, size_t line_start, size_t token_idx,
+                                   const FormatOptions& opts) {
+    if (line_start >= tokens.size())
+        return 0;
+    AlignScan s;
+    scan_statement_align(tokens, line_start, token_idx, opts, s,
+                         [&](size_t k) { return compact_width(tokens, line_start, k, opts); });
+    return s.decided < token_idx ? s.pad : 0;
 }
 
 inline bool closes_control_header(const TokenStream& tokens, size_t close);
-inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts);
-inline int token_column(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts);
+inline bool is_instance_port_open(const TokenStream& tokens, size_t open);
 
 // Where a block call's arguments indent from: the start of its callee,
 // `obj.sub.meth(`, `pkg::cls::fn(` and `cfg_db #(T)::set(` included, not its
@@ -1172,110 +1191,250 @@ inline size_t callee_chain_start(const TokenStream& tokens, size_t open, LineOf 
     return name;
 }
 
-// The indent of the line starting at `line_start`, as IndentPass will set it:
-// the scope depth SyntaxPass recorded, unless the line is an item or the `)`
-// of a list WrapPass broke (after the `(` when hanging; else a level in from
-// the callee or the list's line, the `)` at it) or a brace-less body (a
-// level in from its control).
-inline int line_indent(const TokenStream& tokens, size_t line_start, const FormatOptions& opts) {
-    if (line_start >= tokens.size())
-        return 0;
-    const Tok& s = tokens[line_start];
-    const size_t list = s.mutable_.wrap.list_open;
-    if (list != npos && list < line_start) {
-        const WrapListKind kind = tokens[list].mutable_.wrap.list_kind;
-        if (kind == WrapListKind::FunctionHanging || kind == WrapListKind::ModuleParametersHanging ||
-            kind == WrapListKind::FunctionDeclHanging) {
-            // After the `(` and the space the inside-paren options put there.
-            const size_t first = next_code(tokens, list + 1, tokens[list].immutable.syntax.matching_token);
-            const bool first_follows = first != npos && !tokens[first].mutable_.wrap.must_break_before &&
-                                       !tokens[list].mutable_.wrap.must_break_after;
-            return token_column(tokens, list, opts) + token_width(tokens[list]) +
-                   (first_follows ? spacing_gap(tokens, first, opts) : 0);
+// Where the breaks WrapPass has decided so far put each token: the line it
+// is on, that line's indent as IndentPass will set it, and its column.
+// WrapPass runs before IndentPass, SpacingPass and AlignPass, so it measures
+// with this; a limit compared against the text alone let a line run past it
+// by exactly its own indent.
+//
+// WrapPass decides lists in source order, and deciding one changes breaks
+// and list kinds only inside it and after it.  So `cached`, every line
+// start, line width, indent and gap is remembered, and invalidate() drops
+// what the list just decided can have changed.  Uncached, each query walks
+// back to its line's start: a statement of n calls cost O(n^3).
+class LineGeometry {
+public:
+    LineGeometry(const TokenStream& tokens, const FormatOptions& opts, bool cached = false)
+        : tokens_(tokens), opts_(opts), cached_(cached) {
+        if (!cached_)
+            return;
+        const size_t n = tokens.size();
+        start_.resize(n);
+        width_.resize(n);
+        seen_.resize(n);
+        gap_.assign(n, kUnknown);
+        indent_.assign(n, kUnknown);
+    }
+
+    // The first token of the line `i` is on.  A blank line BlankLinePass
+    // keeps also starts one: `)` / (blank) / `extends base #(...)`.
+    size_t line_start(size_t i) {
+        if (cached_) {
+            extend(i);
+            return start_[i];
         }
-        int base;
-        const size_t callee = kind == WrapListKind::FunctionBlock
-            ? callee_chain_start(tokens, list, [&](size_t i) { return line_start_before(tokens, i, opts); })
-            : npos;
-        if (callee != npos)
-            base = token_column(tokens, callee, opts);
-        else
-            base = line_indent(tokens, line_start_before(tokens, list, opts), opts);
-        return line_start == tokens[list].immutable.syntax.matching_token ? base : base + opts.indent_size;
+        for (; i > 0; --i)
+            if (starts_line(i))
+                return i;
+        return 0;
     }
-    if (s.mutable_.wrap.must_break_before) {
-        const size_t control = prev_code(tokens, line_start);
-        // A level in from the line the control starts on, not from where a
-        // broken header's `)` ended up.
-        if (control != npos && closes_control_header(tokens, control))
-            return line_indent(tokens,
-                               line_start_before(tokens, tokens[control].immutable.syntax.matching_token, opts),
-                               opts) +
-                   opts.indent_size;
-        if (control != npos &&
-            (kind_is(tokens[control], TK::ElseKeyword) || kind_is(tokens[control], TK::ForeverKeyword) ||
-             kind_is(tokens[control], TK::DoKeyword) || is_procedural_block_at(tokens, control)))
-            return line_indent(tokens, line_start_before(tokens, control, opts), opts) + opts.indent_size;
+
+    // The gap SpacingPass will put before `i` on a line it shares with i - 1.
+    int gap(size_t i) {
+        if (!cached_)
+            return spacing_gap(tokens_, i, opts_);
+        if (gap_[i] == kUnknown)
+            gap_[i] = spacing_gap(tokens_, i, opts_);
+        return gap_[i];
     }
-    const auto& topo = s.immutable.topology;
-    int levels = topo.scope_depth;
-    if (topo.in_outermost_unit && opts.default_indent_level_inside_outmost_block > 0)
-        ++levels;
-    return levels * opts.indent_size;
-}
 
-// The width of the line in front of `token_idx`, indentation included.
-// WrapPass runs before IndentPass, so the indent comes from line_indent()
-// rather than from IndentMetadata; a limit compared against the text alone
-// let a line run past it by exactly its own indent.
-inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
-    const size_t line_start = line_start_before(tokens, token_idx, opts);
-    return line_indent(tokens, line_start, opts) + compact_width(tokens, line_start, token_idx, opts) +
-           statement_align_padding(tokens, line_start, token_idx, opts);
-}
-
-// The column `token_idx` will be printed at: its line's prefix and the gap
-// before it.
-inline int token_column(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
-    const bool starts_line = line_start_before(tokens, token_idx, opts) == token_idx;
-    return line_prefix_width(tokens, token_idx, opts) + (starts_line ? 0 : spacing_gap(tokens, token_idx, opts));
-}
-
-// The width a list's `)` carries after it on its line, up to the next place
-// WrapPass can break it: the `;`, the next call's or parameter list's `(` or
-// a `{` (that list is measured on its own, this one in front of it), the
-// end of a macro statement, or a break, comment or directive already ending
-// the line.  Lists open in
-// source order, so an enclosing list has been decided by now: a `,` of one
-// that broke carries its break, and one that stayed whole is no break point.
-// Nor are operators, `?:`, `@(...)` or `iff (...)`: `fn(a) ? x : y;` keeps
-// its `? x : y;` on the call's line.  It stops once past `limit`, beyond
-// which more width changes no decision.
-inline int close_tail_width(const TokenStream& tokens, size_t close, int limit, const FormatOptions& opts) {
-    int w = 0;
-    for (size_t k = close + 1; k < tokens.size() && w <= limit; ++k) {
-        const Tok& t = tokens[k];
-        const TK tk = t.lex.kind;
-        // A semicolonless macro statement (`` `uvm_fatal(a, b) ``) ends where
-        // a `;` would.
-        if (!prints_inline(t) || t.mutable_.wrap.must_break_before || tokens[k - 1].mutable_.wrap.must_break_after ||
-            tokens[k - 1].mutable_.macro.ends_statement)
-            break;
-        w += spacing_gap(tokens, k, opts) + token_width(t);
-        if (tk == TK::Semicolon || tk == TK::OpenBrace || tk == TK::ApostropheOpenBrace ||
-            (tk == TK::OpenParenthesis &&
-             (t.immutable.topology.starts_argument_list || t.immutable.topology.starts_parameter_list)))
-            break;
+    // compact_width() of [first, end).
+    int width(size_t first, size_t end) {
+        int w = 0;
+        bool first_tok = true;
+        end = std::min(end, tokens_.size());
+        for (size_t i = first; i < end; ++i) {
+            if (!prints_inline(tokens_[i]))
+                continue;
+            if (!first_tok)
+                w += gap(i);
+            w += token_width(tokens_[i]);
+            first_tok = false;
+        }
+        return w;
     }
-    return w;
-}
+
+    // statement_align_padding(line_start, i).
+    int align_padding(size_t line_start, size_t i) {
+        if (line_start >= tokens_.size())
+            return 0;
+        auto line_width = [&](size_t k) { return width(line_start, k); };
+        if (!cached_)
+            return statement_align_padding(tokens_, line_start, i, opts_);
+        AlignScan& s = align_[line_start];
+        scan_statement_align(tokens_, line_start, i, opts_, s, line_width);
+        return s.decided < i ? s.pad : 0;
+    }
+
+    // The indent of the line starting at `line_start`: the scope depth
+    // SyntaxPass recorded, unless the line is an item or the `)` of a list
+    // WrapPass broke (after the `(` when hanging; else a level in from the
+    // callee or the list's line, the `)` at it) or a brace-less body (a level
+    // in from its control).
+    int line_indent(size_t line_start) {
+        if (line_start >= tokens_.size())
+            return 0;
+        if (cached_ && indent_[line_start] != kUnknown)
+            return indent_[line_start];
+        const int indent = compute_indent(line_start);
+        if (cached_) {
+            indent_[line_start] = indent;
+            indent_hi_ = std::max(indent_hi_, line_start);
+        }
+        return indent;
+    }
+
+    // The width of the line in front of `i`, indentation included.
+    int prefix_width(size_t i) {
+        const size_t s = line_start(i);
+        return line_indent(s) + line_width_before(i) + align_padding(s, i);
+    }
+
+    // The column `i` will be printed at: its line's prefix and the gap
+    // before it.
+    int column(size_t i) { return prefix_width(i) + (line_start(i) == i ? 0 : gap(i)); }
+
+    // The width a list's `)` carries after it on its line, up to the next
+    // place WrapPass can break it: the `;`, the next call's, parameter
+    // list's or port list's `(` or a `{` (that list is measured on its own,
+    // this one in front of it), the end of a macro statement, or a break,
+    // blank line, comment or directive already ending the line.  Lists open
+    // in source order, so an enclosing list has been decided by now: a `,`
+    // of one that broke carries its break, and one that stayed whole is no
+    // break point.  Nor are operators, `?:`, `@(...)` or `iff (...)`:
+    // `fn(a) ? x : y;` keeps its `? x : y;` on the call's line.  It stops
+    // once past `limit`, beyond which more width changes no decision.
+    int tail_width(size_t close, int limit) {
+        int w = 0;
+        for (size_t k = close + 1; k < tokens_.size() && w <= limit; ++k) {
+            const Tok& t = tokens_[k];
+            const TK tk = t.lex.kind;
+            // A semicolonless macro statement (`` `uvm_fatal(a, b) ``) ends
+            // where a `;` would.
+            if (!prints_inline(t) || starts_line(k) || tokens_[k - 1].mutable_.macro.ends_statement)
+                break;
+            w += gap(k) + token_width(t);
+            if (tk == TK::Semicolon || tk == TK::OpenBrace || tk == TK::ApostropheOpenBrace ||
+                (tk == TK::OpenParenthesis &&
+                 (t.immutable.topology.starts_argument_list || t.immutable.topology.starts_parameter_list ||
+                  is_instance_port_open(tokens_, k))))
+                break;
+        }
+        return w;
+    }
+
+    // The width of the line through list `open`...`close` and what follows
+    // it, were the list kept on one line.
+    int one_line_list_width(size_t open, size_t close, int limit) {
+        return column(open) + width(open, close + 1) + tail_width(close, limit);
+    }
+
+    // WrapPass has decided the list `open`...`close`: its breaks and list
+    // kinds changed inside it and right after it.
+    void invalidate(size_t open, size_t close) {
+        if (!cached_)
+            return;
+        valid_ = std::min(valid_, open + 1);
+        for (size_t i = open; i <= close && i < gap_.size(); ++i)
+            gap_[i] = kUnknown;
+        for (size_t i = open + 1; i <= indent_hi_; ++i)
+            indent_[i] = kUnknown;
+        indent_hi_ = std::min(indent_hi_, open);
+    }
+
+private:
+    static constexpr int kUnknown = std::numeric_limits<int>::min();
+
+    bool starts_line(size_t i) const {
+        return tokens_[i].mutable_.wrap.must_break_before || tokens_[i - 1].mutable_.wrap.must_break_after ||
+               ends_verbatim_line(tokens_[i - 1]) ||
+               (opts_.blank_lines_between_items > 0 && is_blank_line_boundary(tokens_, i));
+    }
+
+    // Line starts and the width of each line before every token, in source
+    // order up to `i`.
+    void extend(size_t i) {
+        for (; valid_ <= i; ++valid_) {
+            const size_t j = valid_;
+            if (j == 0 || starts_line(j)) {
+                start_[j] = j;
+                width_[j] = 0;
+                seen_[j] = false;
+                continue;
+            }
+            const Tok& p = tokens_[j - 1];
+            const bool shown = prints_inline(p);
+            start_[j] = start_[j - 1];
+            width_[j] = width_[j - 1] + (shown ? (seen_[j - 1] ? gap(j - 1) : 0) + token_width(p) : 0);
+            seen_[j] = seen_[j - 1] || shown;
+        }
+    }
+
+    // width(line_start(i), i).
+    int line_width_before(size_t i) {
+        if (!cached_)
+            return width(line_start(i), i);
+        extend(i);
+        return width_[i];
+    }
+
+    int compute_indent(size_t line_start) {
+        const Tok& s = tokens_[line_start];
+        const size_t list = s.mutable_.wrap.list_open;
+        if (list != npos && list < line_start) {
+            const WrapListKind kind = tokens_[list].mutable_.wrap.list_kind;
+            if (kind == WrapListKind::FunctionHanging || kind == WrapListKind::ModuleParametersHanging ||
+                kind == WrapListKind::FunctionDeclHanging) {
+                // After the `(` and the space the inside-paren options put
+                // there.
+                const size_t first = next_code(tokens_, list + 1, tokens_[list].immutable.syntax.matching_token);
+                const bool first_follows = first != npos && !tokens_[first].mutable_.wrap.must_break_before &&
+                                           !tokens_[list].mutable_.wrap.must_break_after;
+                return column(list) + token_width(tokens_[list]) + (first_follows ? gap(first) : 0);
+            }
+            const size_t callee = kind == WrapListKind::FunctionBlock
+                ? callee_chain_start(tokens_, list, [&](size_t i) { return this->line_start(i); })
+                : npos;
+            const int base = callee != npos ? column(callee) : line_indent(this->line_start(list));
+            return line_start == tokens_[list].immutable.syntax.matching_token ? base : base + opts_.indent_size;
+        }
+        if (s.mutable_.wrap.must_break_before) {
+            const size_t control = prev_code(tokens_, line_start);
+            // A level in from the line the control starts on, not from where
+            // a broken header's `)` ended up.
+            if (control != npos && closes_control_header(tokens_, control))
+                return line_indent(this->line_start(tokens_[control].immutable.syntax.matching_token)) +
+                       opts_.indent_size;
+            if (control != npos &&
+                (kind_is(tokens_[control], TK::ElseKeyword) || kind_is(tokens_[control], TK::ForeverKeyword) ||
+                 kind_is(tokens_[control], TK::DoKeyword) || is_procedural_block_at(tokens_, control)))
+                return line_indent(this->line_start(control)) + opts_.indent_size;
+        }
+        const auto& topo = s.immutable.topology;
+        int levels = topo.scope_depth;
+        if (topo.in_outermost_unit && opts_.default_indent_level_inside_outmost_block > 0)
+            ++levels;
+        return levels * opts_.indent_size;
+    }
+
+    const TokenStream& tokens_;
+    const FormatOptions& opts_;
+    const bool cached_;
+    size_t valid_{0};         // start_/width_/seen_ hold for [0, valid_)
+    std::vector<size_t> start_;
+    std::vector<int> width_;
+    std::vector<bool> seen_;  // a token printed between start_[i] and i
+    std::vector<int> gap_;
+    std::vector<int> indent_;
+    size_t indent_hi_{0};     // no indent_ past it is known
+    std::unordered_map<size_t, AlignScan> align_;
+};
 
 // The width of the line through list `open`...`close` and what follows it,
-// were the list kept on one line.
+// were the list kept on one line, by the breaks in `tokens`.
 inline int one_line_list_width(const TokenStream& tokens, size_t open, size_t close, int limit,
                                const FormatOptions& opts) {
-    return token_column(tokens, open, opts) + compact_width(tokens, open, close + 1, opts) +
-           close_tail_width(tokens, close, limit, opts);
+    return LineGeometry(tokens, opts).one_line_list_width(open, close, limit);
 }
 
 struct ListItem {
@@ -3725,6 +3884,8 @@ public:
             }
         }
 
+        LineGeometry geo(tokens, opts_, true);
+        size_t decided_open = npos, decided_close = npos;
         for (size_t open = 0; open < tokens.size(); ++open) {
             if (!kind_is(tokens[open], TK::OpenParenthesis) && !kind_is(tokens[open], TK::OpenBrace) &&
                 !kind_is(tokens[open], TK::ApostropheOpenBrace))
@@ -3734,6 +3895,11 @@ public:
             size_t close = tokens[open].immutable.syntax.matching_token;
             if (close == npos || close >= tokens.size())
                 continue;
+            // Only the list decided last can have changed what was measured.
+            if (decided_open != npos)
+                geo.invalidate(decided_open, decided_close);
+            decided_open = open;
+            decided_close = close;
 
             // `'{8, // byte` / `16, // half` -- a pattern or a concatenation
             // stays on its line, and a comment that ends a line inside it
@@ -3812,10 +3978,9 @@ public:
                     !is_passthrough(tokens[open + 1]);
                 bool block = opts_.module.parameter_layout != "hanging" || comment_after_open;
                 const int one_line =
-                    one_line_list_width(tokens, open, close,
+                    geo.one_line_list_width(open, close,
                                         declaration ? opts_.function_declaration.line_length
-                                                    : opts_.function_call.line_length,
-                                        opts_);
+                                                    : opts_.function_call.line_length);
                 const bool directive = parameter_list_contains_directive(tokens, open, close);
                 bool breaks_inside = directive;
                 for (size_t k = open + 1; k < close && !breaks_inside; ++k)
@@ -3894,7 +4059,7 @@ public:
                                          kind_is(tokens[kw], TK::CheckerKeyword));
             }
             if (is_decl) {
-                int approx = one_line_list_width(tokens, open, close, opts_.function_declaration.line_length, opts_);
+                int approx = geo.one_line_list_width(open, close, opts_.function_declaration.line_length);
                 // `function int f( // why` -- a comment right after the `(`
                 // ends that line, so the arguments cannot hang from it: the
                 // list is laid out as a block whatever its length.
@@ -3954,20 +4119,33 @@ public:
                     // the limit: after the `(` for a hanging list, one indent
                     // past the callee for a block list.  A call already past
                     // the limit would only push them further right.
-                    const int open_end = token_column(tokens, open, opts_) + 1;
-                    const int approx =
-                        one_line_list_width(tokens, open, close, opts_.function_call.line_length, opts_);
-                    const size_t callee = callee_chain_start(
-                        tokens, open, [&](size_t i) { return line_start_before(tokens, i, opts_); });
-                    const bool from_open = opts_.function_call.layout == "hanging" || callee == npos;
+                    const int limit = opts_.function_call.line_length;
+                    const int open_col = geo.column(open);
+                    const int open_end = open_col + 1;
+                    const int call_end = open_col + geo.width(open, close + 1);
+                    const int tail = geo.tail_width(close, limit);
+                    const int approx = call_end + tail;
+                    const size_t callee =
+                        callee_chain_start(tokens, open, [&](size_t i) { return geo.line_start(i); });
+                    const bool hanging = opts_.function_call.layout == "hanging";
+                    const bool from_open = hanging || callee == npos;
                     // A statement broken over lines is not aligned, so the
                     // padding before its `=` goes with the break.
                     const size_t at = from_open ? open : callee;
+                    const int unpad = geo.align_padding(geo.line_start(at), at);
                     const int args_col =
-                        (from_open ? open_end : token_column(tokens, callee, opts_) + opts_.indent_size) -
-                        statement_align_padding(tokens, line_start_before(tokens, at, opts_), at, opts_);
-                    if (approx > opts_.function_call.line_length &&
-                        args_col <= opts_.function_call.line_length)
+                        (from_open ? open_end : geo.column(callee) + opts_.indent_size) - unpad;
+                    // The line the `)` ends: after the last argument when
+                    // hanging, else at the callee (or the call's line).  Its
+                    // tail moves down with it, so `$past(` / `x) |-> long;`
+                    // only moved the overflow to the `)` line.  Break for
+                    // that only when the call alone is past the limit.
+                    const int close_line =
+                        tail + (hanging ? args_col + geo.width(items.back().first, close + 1)
+                                        : (callee != npos ? geo.column(callee)
+                                                          : geo.line_indent(geo.line_start(open))) -
+                                              unpad + token_width(tokens[close]));
+                    if (approx > limit && args_col <= limit && (close_line <= limit || call_end > limit))
                         do_break = true;
                 }
                 // `foo(a, // first` / `b, c);` -- a comment that ends a line
@@ -7362,6 +7540,11 @@ inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions&
         kind_is(t, TK::OpenParenthesis) && t.immutable.syntax.matching_token != npos &&
         next_code(tokens, i + 1, tokens.size()) == t.immutable.syntax.matching_token &&
         is_instance_port_open(tokens, i);
+    // WrapPass measures this gap before it has decided the port list, so the
+    // instance's shape decides, as for an empty one.
+    const bool instance_ports =
+        kind_is(t, TK::OpenParenthesis) &&
+        (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_instance_port_open(tokens, i));
     if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
         spaces = opts.function_declaration.space_before_paren ? 1 : 0;
     // Function/task call spacing.  `new` lexes as its own keyword rather
@@ -7384,7 +7567,7 @@ inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions&
             spaces = opts.function_call.space_before_paren ? 1 : 0;
         // `u_arr[3:0](...)` -- an instance array's connections space
         // like the plain instance's `u_one(...)`.
-        else if (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts ||
+        else if (instance_ports ||
                  is_gate_terminal_open(tokens, i) || empty_instance_ports)
             spaces = opts.function_call.space_before_paren ? 1 : 0;
     }
@@ -7397,7 +7580,7 @@ inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions&
             spaces = 1;
     }
     if (kind_is(t, TK::OpenParenthesis) && opts.instance.align &&
-        (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i) ||
+        (instance_ports || is_gate_terminal_open(tokens, i) ||
          empty_instance_ports))
         spaces = 1;
     if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::ModportBody)

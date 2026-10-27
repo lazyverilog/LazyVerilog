@@ -86,16 +86,26 @@ the same rule SpacingPass prints with, so a line is measured as it will be
 printed. Inline block comments are measured too.
 
 A call's and a function header's `line_length` counts what follows the `)`
-up to the next place WrapPass can break: the `;`, the next call's `(`, a `{`,
-or a break already decided (`close_tail_width()`). Operators, `?:`, `@(...)`
-and `iff (...)` are not break points, so `fn(a) ? x : y;` is measured through
-its `;`. The indent comes from `line_indent()`, which predicts what
-IndentPass will set (scope depth, broken list items and their `)`,
+up to the next place WrapPass can break: the `;`, the next call's or port
+list's `(`, a `{`, a blank line BlankLinePass keeps, or a break already
+decided (`LineGeometry::tail_width()`). Operators, `?:`, `@(...)` and
+`iff (...)` are not break points, so `fn(a) ? x : y;` is measured through
+its `;`. The indent comes from `LineGeometry::line_indent()`, which predicts
+what IndentPass will set (scope depth, broken list items and their `)`,
 brace-less bodies); a blank line BlankLinePass keeps starts a line. A call
 that is past the limit even when broken stays whole, but the alignment
 padding before a statement's `=` does not count there: a broken statement
-is not aligned. The invariants test checks that the predicted width of
-every call left on one line equals its rendered width.
+is not aligned. Nor does a call break when only what follows its `)` is
+past the limit and the `)` line would be too: the overflow just moves down.
+The invariants test checks that the predicted width of every call left on
+one line equals its rendered width, and that a call broken for its width
+was predicted past the limit.
+
+WrapPass decides lists in source order, and a decision changes breaks and
+list kinds only inside the list and after it. `LineGeometry` therefore
+caches line starts, widths, indents and gaps, and drops only what the list
+just decided can have changed; walking back to the line's start for every
+call made a statement of n calls O(n^3). `[formatter][scaling]` guards it.
 
 The test flips every value of every option from eight base configs (default,
 all aligners on, six random mixes) and

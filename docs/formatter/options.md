@@ -896,7 +896,6 @@ break_policy = "auto"
 When `break_policy = "auto"`, break if the single-line rendering exceeds this character width.
 The width is the whole line as it will be written, indentation included, so the limit is a
 column and a call nested four levels deep breaks at the same column as one at the top level.
-A brace-less body (`if (a) call(...);` on two lines) is measured one indent short.
 
 ```toml
 [format.function_call]

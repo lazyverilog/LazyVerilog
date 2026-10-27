@@ -10,6 +10,7 @@
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <algorithm>
+#include <chrono>
 #include <regex>
 #include <string>
 
@@ -7062,6 +7063,92 @@ TEST_CASE("formatter regression: a call's line length counts its semicolon", "[f
     CHECK(format_stable(src, d) == src);
     d.function_declaration.line_length -= 1;
     CHECK(format_stable(src, d).find(header) == std::string::npos);
+}
+
+TEST_CASE("formatter regression: a call breaks only where its lines then fit", "[formatter][regression]") {
+    FormatOptions o;
+    o.function_call.arg_count = -1;
+    // What follows the `)` moves down with it: `$past(` / `x) |-> long;` only
+    // moved the overflow to the `)` line.  A call that fits by itself stays
+    // whole unless that line fits.
+    const std::string sva = "module m;\n"
+                            "  property p;\n"
+                            "    $past(rst || zero) |-> aaaaaaaa && bbbbbbbb && cccccccc;\n"
+                            "  endproperty\n"
+                            "endmodule\n";
+    o.function_call.line_length = 42; // `    ) |-> aaaaaaaa && bbbbbbbb && cccccccc;` is 43
+    CHECK(format_stable(sva, o) == sva);
+    o.function_call.line_length = 43;
+    CHECK(format_stable(sva, o).find("    $past(\n") != std::string::npos);
+
+    // A blank line BlankLinePass keeps ends the line, and so does an
+    // instance's port list `(`: neither counts what comes after it.
+    const std::string blank = "class c;\n"
+                              "  task t();\n"
+                              "    `M(aaaa, bbbb)\n"
+                              "\n"
+                              "    super.f();\n"
+                              "  endtask\n"
+                              "endclass\n";
+    o.function_call.line_length = 18; // `    `M(aaaa, bbbb)`
+    CHECK(format_stable(blank, o) == blank);
+    const std::string inst = "module m;\n"
+                             "  sub #(.W(1)) u[3:0](\n"
+                             "    .a(a)\n"
+                             "  );\n"
+                             "endmodule\n";
+    o.function_call.line_length = 22; // `  sub #(.W(1)) u[3:0](`
+    CHECK(format_stable(inst, o) == inst);
+
+    // `var_declaration.align` with section1 = 0 still puts the name a type's
+    // width and a space past the indent, and the `=` section2 + 3 past it.
+    FormatOptions a;
+    a.var_declaration.align = true;
+    a.function_call.arg_count = -1;
+    a.function_call.line_length = 1000;
+    const std::string decl = "module m;\n  int q = bar(aaaa, bbbb, cccc, dddd, eeee);\nendmodule\n";
+    const std::string aligned = format_stable(decl, a);
+    const size_t at = aligned.find("  int");
+    REQUIRE(at != std::string::npos);
+    const int width = static_cast<int>(aligned.find('\n', at) - at);
+    a.function_call.line_length = width;
+    CHECK(format_stable(decl, a) == aligned);
+    a.function_call.line_length = width - 1;
+    CHECK(format_stable(decl, a).find("bar(\n") != std::string::npos);
+}
+
+TEST_CASE("formatter: a statement of many calls formats in linear time", "[formatter][scaling]") {
+    // WrapPass measured each call's line by walking back to the line's start,
+    // asking spacing_gap() -- itself a walk back over the statement at every
+    // `(` -- for each gap: O(n^3) in one statement's calls, 52 s for 2000.
+    // A ratio against the same statement four times longer, min of runs:
+    // linear is 4, the quadratic floor SpacingPass shares is 16, cubic 64.
+    auto statement = [](int n, const char* sep) {
+        std::string s = "module m;\n  assign x = ";
+        for (int i = 0; i < n; ++i)
+            s += (i ? std::string(sep) : std::string()) + "f" + std::to_string(i) + "(a, b)";
+        return s + ";\nendmodule\n";
+    };
+    constexpr int kCalls = 300;
+    constexpr int kRuns = 5;
+    for (const char* sep : {" + ", " +\n    "}) {
+        CAPTURE(sep);
+        const std::string small = statement(kCalls, sep);
+        const std::string large = statement(kCalls * 4, sep);
+        double small_best = 1e9, large_best = 1e9;
+        for (int r = 0; r < kRuns; ++r) {
+            for (int side = 0; side < 2; ++side) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const std::string out = format_source(side ? large : small, FormatOptions{});
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                REQUIRE(!out.empty());
+                (side ? large_best : small_best) = std::min(side ? large_best : small_best, s);
+            }
+        }
+        const double ratio = large_best / small_best;
+        INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
+        CHECK(ratio < 24.0);
+    }
 }
 
 TEST_CASE("formatter regression: a range edit on CRLF lines keeps the line ends", "[formatter][regression]") {
