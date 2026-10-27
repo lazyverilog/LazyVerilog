@@ -521,7 +521,8 @@ struct ProjectIndexSnapshot {
     /// Every class declaration by name, as (shard slot, index into its classes).
     /// Filled at publish like module_by_name: a listed file's edit republishes
     /// per keystroke, so a map built on first use would be rebuilt by the
-    /// request thread every time.
+    /// request thread every time.  A package's class is also filed under its
+    /// package_scoped_key(), for a qualified `pa::base_c`; same below.
     std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>> class_slots;
     /// Every specialization typedef (`typedef drv_base #(item_c) base_t;`) by
     /// name, as (shard slot, index into its typedefs).  Class-scoped ones
