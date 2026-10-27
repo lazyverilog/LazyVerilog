@@ -10524,6 +10524,10 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
         });
         for (size_t i = 0; i < entry.index->classes.size(); ++i)
             snapshot->class_slots[entry.index->classes[i].name].emplace_back(shard_slot, i);
+        for (size_t i = 0; i < entry.index->typedefs.size(); ++i)
+            if (is_specialization_typedef(*entry.index, entry.index->typedefs[i]))
+                snapshot->specialization_slots[entry.index->typedefs[i].name].emplace_back(
+                    shard_slot, i);
         if (!entry.index->macros.empty())
             snapshot->macro_shard_slots.push_back(shard_slot);
 

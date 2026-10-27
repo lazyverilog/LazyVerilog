@@ -493,6 +493,14 @@ struct InheritedMember {
     bool is_task{false};
 };
 
+/// `typedef drv_base #(item_c) base_t;` outside any class of @p index: a name
+/// a class may extend, or a handle may be declared with, in place of the
+/// specialized class.
+inline bool is_specialization_typedef(const SyntaxIndex& index, const TypedefEntry& td) {
+    return td.resolved.find("#(") != std::string::npos &&
+           (td.parent_scope.empty() || !index.class_by_name.count(td.parent_scope));
+}
+
 struct ProjectIndexSnapshot {
     struct Shard {
         std::string path;
@@ -515,6 +523,10 @@ struct ProjectIndexSnapshot {
     /// per keystroke, so a map built on first use would be rebuilt by the
     /// request thread every time.
     std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>> class_slots;
+    /// Every specialization typedef (`typedef drv_base #(item_c) base_t;`) by
+    /// name, as (shard slot, index into its typedefs).  Class-scoped ones
+    /// (`type_id`) are left out.  Filled at publish like class_slots.
+    std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>> specialization_slots;
     /// The slots of the shards that define a macro, in shard order.
     std::vector<size_t> macro_shard_slots;
 
@@ -545,6 +557,11 @@ struct ProjectIndexSnapshot {
     /// can be declared by two projects at once.
     const ClassEntry* find_class(const std::string& name, std::string_view from_path) const;
 
+    /// The specialization typedef @p name nearest @p from_path, or null; ranked
+    /// like find_class().
+    const TypedefEntry* find_specialization(const std::string& name,
+                                            std::string_view from_path) const;
+
     /// Fields and methods class @p base_name and its bases declare, nearest
     /// level first, a name only once (the nearest declaration wins).  Every
     /// level is resolved with find_class() against @p from_path.  Computed on
@@ -555,9 +572,10 @@ struct ProjectIndexSnapshot {
     inherited_members(const std::string& base_name, std::string_view from_path) const;
 
     /// Every macro defined in a shard whose project root (per @p project_of,
-    /// given a shard's path) is @p root.  Cached per root like the above.
+    /// given a shard's path) is @p root, one per name.  Cached per root and
+    /// @p generation (the root resolver's) like the above.
     std::shared_ptr<const std::vector<const MacroEntry*>>
-    project_macros(const std::string& root,
+    project_macros(const std::string& root, uint64_t generation,
                    const std::function<std::string(const std::string&)>& project_of) const;
 
   private:

@@ -1822,18 +1822,22 @@ static std::optional<std::string> field_type_in_shard(const SyntaxIndex& index,
 }
 
 static std::string current_file_type_of_name_from_ast(const DocumentState& state,
-                                                      const CompletionContext& ctx) {
+                                                      const CompletionContext& ctx,
+                                                      std::string* declared_text = nullptr) {
     if (!state.tree || ctx.scope_name.empty())
         return ctx.scope_name;
     const size_t offset = position_to_offset(state.text, ctx.line, ctx.col);
     std::string result;
+    std::string text; // as declared, `drv_base #(item_c)` with its arguments
     using namespace slang::syntax;
     struct Visitor : SyntaxVisitor<Visitor> {
         const CompletionContext& ctx;
         size_t offset;
         std::string& result;
-        Visitor(const CompletionContext& ctx, size_t offset, std::string& result)
-            : ctx(ctx), offset(offset), result(result) {}
+        std::string& text;
+        Visitor(const CompletionContext& ctx, size_t offset, std::string& result,
+                std::string& text)
+            : ctx(ctx), offset(offset), result(result), text(text) {}
         bool before(const slang::parsing::Token& t) const {
             return current_ast_token_before(t, offset);
         }
@@ -1842,7 +1846,8 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 return;
             for (const auto* decl : node.declarators) {
                 if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
-                    result = completion_base_type_name(current_ast_decl_text(*node.type));
+                    text = current_ast_decl_text(*node.type);
+                    result = completion_base_type_name(text);
                     return;
                 }
             }
@@ -1853,7 +1858,8 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 return;
             for (const auto* decl : node.declarators) {
                 if (decl && before(decl->name) && decl->name.valueText() == ctx.scope_name) {
-                    result = completion_base_type_name(current_ast_decl_text(*node.type));
+                    text = current_ast_decl_text(*node.type);
+                    result = completion_base_type_name(text);
                     return;
                 }
             }
@@ -1901,8 +1907,10 @@ static std::string current_file_type_of_name_from_ast(const DocumentState& state
                 node.declarator->name.valueText() == ctx.scope_name)
                 result = completion_base_type_name(current_ast_decl_text(*node.dataType));
         }
-    } visitor(ctx, offset, result);
+    } visitor(ctx, offset, result, text);
     state.tree->root().visit(visitor);
+    if (declared_text)
+        *declared_text = std::move(text);
     return result.empty() ? ctx.scope_name : result;
 }
 
@@ -3151,44 +3159,171 @@ static void append_class_member_items(const std::string& class_name, const Compl
     }
 }
 
-/// What the type parameter @p type stands for inside class @p owner.
-///
-/// `class bus_driver extends uvm_driver #(bus_item)` inherits `REQ req;`, and
-/// REQ is uvm_driver's parameter.  Only @p owner's direct `extends X #(...)` is
-/// consulted, its arguments matched by position or name against @p base's
-/// (X's) parameter list.  A parameter no argument sets takes its default --
-/// @p owner's own, or @p declarer's (the class that declares the handle) when
-/// neither X nor @p owner has one.  @p type itself when it is no parameter.
-static std::string resolve_type_parameter(const std::string& type, const ClassEntry* owner,
-                                          const ClassEntry* base, const ClassEntry* declarer,
-                                          int hops = 0) {
-    const auto resolved = [&](const std::string& value) {
-        const std::string next = completion_base_type_name(value);
-        // `type RSP = REQ`: a default may name another parameter of the same list.
-        return next.empty() || next == type || hops >= 4
-                   ? next.empty() ? type : next
-                   : resolve_type_parameter(next, owner, base, declarer, hops + 1);
+/// Specialization typedef @p name as a request sees it, in the order
+/// find_class_for_request() asks.
+static const TypedefEntry* find_specialization_for_request(
+    const std::string& name, const SyntaxIndex& here, const ProjectIndexSnapshot* snapshot,
+    std::string_view from_path, const std::vector<OpenIndexShard>& opened) {
+    const auto in = [&](const SyntaxIndex& index) -> const TypedefEntry* {
+        const auto it = index.typedef_by_name.find(name);
+        return it != index.typedef_by_name.end() && it->second < index.typedefs.size() &&
+                       is_specialization_typedef(index, index.typedefs[it->second])
+                   ? &index.typedefs[it->second]
+                   : nullptr;
     };
-    if (owner && base) {
-        for (size_t i = 0; i < base->params.size(); ++i) {
-            if (base->params[i].name != type)
-                continue;
-            for (size_t a = 0; a < owner->base_args.size(); ++a) {
-                const auto& arg = owner->base_args[a];
-                if (arg.name.empty() ? a == i : arg.name == type)
-                    return resolved(arg.value);
+    if (name.empty())
+        return nullptr;
+    if (const auto* td = in(here))
+        return td;
+    if (const auto* td = snapshot ? snapshot->find_specialization(name, from_path) : nullptr)
+        return td;
+    for (const auto& shard : opened)
+        if (const auto* td = shard.index ? in(*shard.index) : nullptr)
+            return td;
+    return nullptr;
+}
+
+/// The arguments of the `#(...)` in type text @p text (`drv_base #(item_c)`,
+/// `X #(.REQ(a), .RSP(b))`), in order.  An empty positional argument keeps its
+/// place with an empty value.
+static std::vector<ClassParamEntry> type_arguments_of(std::string_view text) {
+    std::vector<ClassParamEntry> args;
+    const size_t open = text.find("#(");
+    if (open == std::string_view::npos)
+        return args;
+    const auto push = [&](std::string_view arg) {
+        std::string value = trim_completion_copy(std::string(arg));
+        std::string name;
+        if (!value.empty() && value.front() == '.') {
+            const size_t paren = value.find('(');
+            const size_t close = value.rfind(')');
+            if (paren == std::string::npos || close == std::string::npos || close < paren)
+                return;
+            name = trim_completion_copy(value.substr(1, paren - 1));
+            value = trim_completion_copy(value.substr(paren + 1, close - paren - 1));
+        }
+        args.push_back({std::move(name), std::move(value)});
+    };
+    int depth = 0;
+    size_t start = open + 2;
+    for (size_t i = open + 1; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '(' || c == '[' || c == '{') {
+            ++depth;
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (--depth == 0) {
+                push(text.substr(start, i - start));
+                break;
             }
-            return resolved(base->params[i].value);
+        } else if (c == ',' && depth == 1) {
+            push(text.substr(start, i - start));
+            start = i + 1;
         }
     }
-    for (const auto* cls : {owner, declarer}) {
-        if (!cls)
-            continue;
-        for (const auto& p : cls->params)
-            if (p.name == type)
-                return resolved(p.value);
+    if (args.size() == 1 && args.front().name.empty() && args.front().value.empty())
+        args.clear(); // `#()`
+    return args;
+}
+
+/// Type parameter name -> the type it stands for, in one class.
+using TypeBindings = std::vector<ClassParamEntry>;
+
+/// @p text with a parameter @p bindings knows replaced by what it stands for;
+/// its bare type name otherwise.
+static std::string substitute_type(const TypeBindings& bindings, const std::string& text) {
+    std::string name = completion_base_type_name(text);
+    for (const auto& b : bindings)
+        if (b.name == name)
+            return b.value;
+    return name;
+}
+
+/// @p cls's parameters given the arguments @p args, which are written where
+/// @p outer binds names.  A parameter no argument sets takes its default,
+/// which is written in @p cls and may name an earlier parameter
+/// (`type RSP = REQ`).
+static TypeBindings bind_class_parameters(const ClassEntry& cls,
+                                          const std::vector<ClassParamEntry>& args,
+                                          const TypeBindings& outer) {
+    TypeBindings bound;
+    bound.reserve(cls.params.size());
+    for (size_t i = 0; i < cls.params.size(); ++i) {
+        const auto& param = cls.params[i];
+        const ClassParamEntry* arg = nullptr;
+        for (size_t a = 0; a < args.size() && !arg; ++a)
+            if (args[a].name.empty() ? a == i : args[a].name == param.name)
+                arg = &args[a];
+        std::string value = arg && !arg->value.empty() ? substitute_type(outer, arg->value)
+                                                       : substitute_type(bound, param.value);
+        if (!value.empty())
+            bound.push_back({param.name, std::move(value)});
     }
-    return type;
+    return bound;
+}
+
+/// How a request finds a class, or a specialization typedef, by name.
+struct TypeLookup {
+    std::function<const ClassEntry*(const std::string&)> class_named;
+    std::function<const TypedefEntry*(const std::string&)> specialization_named;
+};
+
+/// The class @p name names -- through a specialization typedef if it is one,
+/// whose arguments then land in @p args.
+static const ClassEntry* class_or_specialization(const std::string& name, const TypeLookup& lookup,
+                                                 std::vector<ClassParamEntry>* args) {
+    if (const auto* cls = lookup.class_named(name))
+        return cls;
+    const auto* td = lookup.specialization_named(name);
+    if (!td)
+        return nullptr;
+    if (args)
+        *args = type_arguments_of(td->resolved);
+    return lookup.class_named(completion_base_type_name(td->resolved));
+}
+
+/// What the type parameter @p type of class @p declarer stands for in an
+/// object of class @p start specialized by @p start_args (a handle's
+/// `drv_base #(item_c) h;`, or none).
+///
+/// `class bus_driver extends dv_base_driver #(bus_item)` with
+/// `class dv_base_driver #(type ITEM_T) extends uvm_driver #(ITEM_T)` inherits
+/// uvm_driver's `REQ req;`, and REQ is bus_item there.  Each `extends X #(...)`
+/// step maps its arguments, by position or name and written in the subclass's
+/// scope, to X's parameters; a parameter no argument sets takes its default.
+/// An `extends` may name a specialization typedef.  At most kMaxSteps steps,
+/// each one lookup; a chain that breaks before @p declarer falls back to
+/// @p declarer's defaults.  @p type itself when it is no parameter.
+static std::string resolve_type_parameter(const std::string& type, const ClassEntry* start,
+                                          const std::vector<ClassParamEntry>& start_args,
+                                          const std::string& declarer, const TypeLookup& lookup) {
+    constexpr int kMaxSteps = 8;
+    if (!start || type.empty())
+        return type;
+    TypeBindings bindings = bind_class_parameters(*start, start_args, {});
+    const ClassEntry* cls = start;
+    for (int step = 0; cls && cls->name != declarer; ++step) {
+        std::vector<ClassParamEntry> args = cls->base_args;
+        const TypeBindings* outer = &bindings;
+        const TypeBindings none;
+        const std::string base_name = base_class_lookup_name(cls->base_class);
+        const ClassEntry* base = step < kMaxSteps ? lookup.class_named(base_name) : nullptr;
+        if (!base && step < kMaxSteps && !base_name.empty()) {
+            // A typedef's arguments are written where it is declared.
+            base = class_or_specialization(base_name, lookup, &args);
+            outer = &none;
+        }
+        if (!base) {
+            cls = nullptr;
+            break;
+        }
+        bindings = bind_class_parameters(*base, args, *outer);
+        cls = base;
+    }
+    if (!cls) {
+        const auto* own = lookup.class_named(declarer);
+        return own ? substitute_type(bind_class_parameters(*own, {}, {}), type) : type;
+    }
+    return substitute_type(bindings, type);
 }
 
 /// Every macro the asking file's project defines, in any of its files.  A file
@@ -3209,19 +3344,27 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
         return false;
     // An edit to a listed file republishes the snapshot, and with it the macro
     // list, per keystroke.  Which project a directory is in does not change
-    // with it -- only with the project inputs, which are replaced whenever a
-    // config appears, goes or changes -- so remember it across snapshots: the
+    // with it -- only with the project inputs, replaced on any config change,
+    // or the resolver's generation -- so remember it across snapshots: the
     // resolver re-stats every ancestor of a directory with no config every few
     // seconds, and on a network filesystem those are round trips.
+    //
+    // shortcut: a config written where no request or parse looks, with no
+    // watcher event, is seen only once something re-stats that directory (the
+    // resolver's own backstop is per lookup, and the memo makes none); upgrade
+    // to an expiring memo if clients without file watching matter.
     static std::mutex memo_mutex;
     static std::shared_ptr<const ProjectParseInputs> memo_inputs;
+    static uint64_t memo_generation = 0;
     static std::unordered_map<std::string, std::string> memo_roots; // directory -> root
-    const auto macros = snapshot->project_macros(root, [&](const std::string& path) {
+    const uint64_t generation = inputs->root_generation();
+    const auto macros = snapshot->project_macros(root, generation, [&](const std::string& path) {
         const std::string dir = std::filesystem::path(path).parent_path().string();
         {
             std::lock_guard<std::mutex> lock(memo_mutex);
-            if (memo_inputs != inputs) {
+            if (memo_inputs != inputs || memo_generation != generation) {
                 memo_inputs = inputs;
+                memo_generation = generation;
                 memo_roots.clear();
             }
             if (const auto it = memo_roots.find(dir); it != memo_roots.end())
@@ -3229,7 +3372,7 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
         }
         std::string found = inputs->project_root_for(path).string();
         std::lock_guard<std::mutex> lock(memo_mutex);
-        if (memo_inputs == inputs)
+        if (memo_inputs == inputs && memo_generation == generation)
             memo_roots.emplace(dir, found);
         return found;
     });
@@ -3792,6 +3935,8 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             // variable of that name to look up, and asking for one would search
             // for a declaration named after the class itself.
             std::optional<std::string> value_type;
+            std::string declared_text; // the receiver's, with its `#(...)`
+            std::vector<ClassParamEntry> value_args; // value_type's `#(...)`
             if (!ctx.receiver_type.empty()) {
                 value_type = ctx.receiver_type;
             } else {
@@ -3802,7 +3947,8 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                 // a same-named symbol declared in an unrelated file (e.g. two
                 // modules that both happen to have a port named `reg2hw`) win
                 // over the receiver's real type in this file.
-                const std::string ast_type = current_file_type_of_name_from_ast(state, ctx);
+                const std::string ast_type =
+                    current_file_type_of_name_from_ast(state, ctx, &declared_text);
                 if (!ast_type.empty() && ast_type != ctx.scope_name)
                     value_type = ast_type;
             }
@@ -3819,19 +3965,53 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                         break;
                 }
             }
+            if (value_type)
+                value_args =
+                    type_arguments_of(declared_text.empty() ? *value_type : declared_text);
             // `class bus_driver extends uvm_driver #(bus_item)`: an inherited
             // `REQ req;` is a bus_item here (resolve_type_parameter()).
-            const auto class_named = [&](const std::string& name) {
-                return find_class_for_request(name, current_file_index, project_index.get(),
-                                              state.normalized_path, *opened_shards);
+            const TypeLookup lookup{
+                [&](const std::string& name) {
+                    return find_class_for_request(name, current_file_index, project_index.get(),
+                                                  state.normalized_path, *opened_shards);
+                },
+                [&](const std::string& name) {
+                    return find_specialization_for_request(name, current_file_index,
+                                                           project_index.get(),
+                                                           state.normalized_path, *opened_shards);
+                }};
+            // Field @p field of class @p name or of a class it inherits, across
+            // files, one lookup per level; @p declarer receives the class
+            // declaring it.
+            const auto inherited_field = [&](std::string name, const std::string& field,
+                                             std::string& declarer) -> std::optional<std::string> {
+                std::unordered_set<std::string> visited;
+                for (int level = 0; level < 16 && !name.empty() && visited.insert(name).second;
+                     ++level) {
+                    const auto* cls = class_or_specialization(name, lookup, nullptr);
+                    if (!cls)
+                        break;
+                    for (const auto& f : cls->fields)
+                        if (f.name == field && !f.type.empty()) {
+                            declarer = cls->name;
+                            return f.type;
+                        }
+                    name = base_class_lookup_name(cls->base_class);
+                }
+                return std::nullopt;
             };
-            const auto bind_parameter = [&](const std::string& type, const ClassEntry* owner,
-                                            const std::string& declarer) {
-                if (!owner || type.empty() || class_named(type))
+            // @p type, declared by @p declarer, as a member of the enclosing
+            // class; value_args follow when it is no parameter.
+            const auto bind_parameter = [&](const std::string& type, const std::string& declarer) {
+                const auto* owner = lookup.class_named(ctx.current_scope_name);
+                const std::string name = completion_base_type_name(type);
+                value_args.clear();
+                if (!owner || name.empty() || lookup.class_named(name)) {
+                    value_args = type_arguments_of(type);
                     return type;
-                return resolve_type_parameter(type, owner,
-                                              class_named(base_class_lookup_name(owner->base_class)),
-                                              declarer.empty() ? owner : class_named(declarer));
+                }
+                return resolve_type_parameter(name, owner, {},
+                                              declarer.empty() ? owner->name : declarer, lookup);
             };
             if (!value_type && !ctx.current_scope_name.empty()) {
                 // The receiver can also be a field the enclosing class only
@@ -3841,13 +4021,13 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     current_file_unresolved_base_class(state, ctx.current_scope_name);
                 std::string declarer;
                 if (!base.empty()) {
+                    value_type = inherited_field(base, ctx.scope_name, declarer);
                     for (const auto& shard : *opened_shards) {
-                        if (!shard.index)
-                            continue;
-                        value_type = field_type_in_shard_hierarchy(*shard.index, base,
-                                                                   ctx.scope_name, &declarer);
                         if (value_type)
                             break;
+                        if (shard.index)
+                            value_type = field_type_in_shard_hierarchy(*shard.index, base,
+                                                                       ctx.scope_name, &declarer);
                     }
                     for (const auto* shard : project_shards) {
                         if (value_type)
@@ -3858,12 +4038,11 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     }
                 }
                 if (value_type)
-                    value_type = bind_parameter(completion_base_type_name(*value_type),
-                                                class_named(ctx.current_scope_name), declarer);
+                    value_type = bind_parameter(*value_type, declarer);
             } else if (value_type && ctx.receiver_type.empty() && !ctx.current_scope_name.empty()) {
                 // `T item;` in this class: T's default.
-                value_type = bind_parameter(completion_base_type_name(*value_type),
-                                            class_named(ctx.current_scope_name), {});
+                value_type = bind_parameter(declared_text.empty() ? *value_type : declared_text,
+                                            {});
             }
             // `a.b.c.` — the steps above resolved the receiver `a`.  Each
             // remaining hop is a field of the type resolved so far, and
@@ -3875,8 +4054,15 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
             for (const auto& hop : ctx.member_chain) {
                 if (!value_type)
                     break;
-                const std::string owner = completion_base_type_name(*value_type);
+                std::string owner = completion_base_type_name(*value_type);
+                // `base_t h;` names drv_base #(item_c) through a typedef.
+                const auto* owner_class = class_or_specialization(owner, lookup, &value_args);
+                if (owner_class)
+                    owner = owner_class->name;
+                std::string declarer = owner;
                 value_type = current_file_field_type_from_ast(state, owner, hop);
+                if (!value_type && owner_class)
+                    value_type = inherited_field(owner, hop, declarer);
                 if (!value_type)
                     value_type = field_type_in_shard(completion_index, owner, hop);
                 for (const auto& shard : *opened_shards) {
@@ -3891,11 +4077,22 @@ CompletionList CompletionEngine::complete(const lsTextDocumentPositionParams& pa
                     if (shard)
                         value_type = field_type_in_shard(*shard, owner, hop);
                 }
-                // A field typed by its own class's parameter: that parameter's default.
-                if (value_type)
-                    if (const auto* owner_class = class_named(owner))
-                        value_type = resolve_type_parameter(completion_base_type_name(*value_type),
-                                                            nullptr, nullptr, owner_class);
+                // A field typed by a type parameter: what the receiver's
+                // specialization (`drv_base #(item_c) h;`) makes it.
+                std::vector<ClassParamEntry> next_args;
+                if (value_type) {
+                    const std::string declared = completion_base_type_name(*value_type);
+                    const std::string bound =
+                        owner_class && !lookup.class_named(declared)
+                            ? resolve_type_parameter(declared, owner_class, value_args, declarer,
+                                                     lookup)
+                            : declared;
+                    if (bound == declared)
+                        next_args = type_arguments_of(*value_type);
+                    else
+                        value_type = bound;
+                }
+                value_args = std::move(next_args);
                 // `vif.drv_cb.`: a last hop that is no field may name a clocking
                 // block of the interface; its clockvars are filed under
                 // `<interface>.<block>` (index_clocking_block()).

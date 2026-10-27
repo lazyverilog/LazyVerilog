@@ -88,6 +88,11 @@ public:
     /// the user can see is wrong.
     void invalidate() const;
 
+    /// Bumped whenever a cached answer may have changed: invalidate(), a new
+    /// forced or implicit root, or a re-stat that found a marker appear or go.
+    /// A caller memoizing answers keyed on this sees what the resolver sees.
+    uint64_t generation() const { return generation_.load(std::memory_order_relaxed); }
+
 private:
     /// What one directory was last seen to hold, and when it was looked at.
     ///
@@ -120,6 +125,7 @@ private:
     std::filesystem::path forced_root_;
     /// Normalized and sorted; a handful of entries.
     std::vector<std::filesystem::path> implicit_roots_;
+    mutable std::atomic<uint64_t> generation_{0};
 };
 
 /// Whether @p root must never become an implicit project: a filesystem or

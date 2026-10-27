@@ -309,6 +309,23 @@ the answer: one `extends` climb by map lookups, or one pass over the macro
 shards with a directory -> project memo kept across snapshots.  Both contexts
 send at most 200 items with `isIncomplete`.
 
+Above the 50 ms budget nothing reads `previous_parsed`, so the class the cursor
+is in is unknown and a bare identifier gets no inherited members, even when the
+snapshot has the class.  Within it, the class is looked up in the snapshot
+first; the previous parse's dynamic index (a pass over the file, once per parse)
+is built only for a class the snapshot does not have yet.
+
+The directory -> project memo is reset when the root resolver's generation
+moves (`ProjectRootResolver::generation()`: forced/implicit roots, invalidation,
+a re-stat that finds a config appeared or went away).  A `lazyverilog.toml`
+written where nothing re-stats and no watcher event arrives is seen once
+something does.
+
+A type parameter after `.` (`req.` in a UVM driver) is bound by walking the
+`extends X #(...)` chain from the asking class to the declaring one: one
+`find_class()` (or `find_specialization()`, for `extends some_t`) per step, at
+most 8 steps, no file reads.
+
 The trade-off: in a file that parses inside the budget, member access after `.`
 costs up to the parse time plus the completion itself on a real tree, where it
 used to cost nothing and answer wrongly.  In a file that does not, it costs what
