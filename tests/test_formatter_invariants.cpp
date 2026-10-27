@@ -8,6 +8,8 @@
 //   - alignment: every token AlignPass gave a column renders at that column
 //   - tightness: an aligned column is no wider than its widest member needs
 //   - line length: a call left on one line past the limit could not break
+//   - call estimate: the width WrapPass predicts for a whole call's line is
+//     the rendered width
 //   - option contracts: an option changes only the output aspects it owns
 //     (docs/dev/formatter-contracts.md)
 #include <catch2/catch_test_macros.hpp>
@@ -135,19 +137,19 @@ const std::vector<Knob>& knobs() {
         LV_VALUES(modport.direction_min_width, Space | Indent, 1, 8),
         LV_VALUES(modport.signal_min_width, Space | Indent, 0, 12),
 
-        LV_BOOL(spacing.control_keyword_space, Space | Indent),
-        // WrapPass counts the spaces it puts inside parens (paren_spacing_width).
+        // WrapPass measures every gap with spacing_gap(), the rule SpacingPass
+        // prints with, so each spacing option can move a line break.
+        LV_BOOL(spacing.control_keyword_space, Breaks | Space | Indent),
         LV_BOOL(spacing.space_inside_parens, Breaks | Space | Indent),
-        LV_BOOL(spacing.space_inside_dimension_brackets, Space | Indent),
-        LV_BOOL(spacing.space_inside_event_control_parens, Space | Indent),
-        LV_VALUES(spacing.binary_operator_spacing, Space | Indent, "both", "none", "before", "after"),
-        // WrapPass counts the gaps these put in a dimension (compact_gap).
+        LV_BOOL(spacing.space_inside_dimension_brackets, Breaks | Space | Indent),
+        LV_BOOL(spacing.space_inside_event_control_parens, Breaks | Space | Indent),
+        LV_VALUES(spacing.binary_operator_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.dimension_binary_operator_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.semicolon_spacing, Space | Indent, "both", "none", "before", "after"),
+        LV_VALUES(spacing.semicolon_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
         LV_VALUES(spacing.range_colon_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.indexed_part_select_spacing, Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.procedural_event_control_at_spacing, Space | Indent, "both", "none", "before", "after"),
-        LV_VALUES(spacing.assignment_operator_spacing, Space | Indent, "both", "none", "before", "after"),
+        LV_VALUES(spacing.indexed_part_select_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
+        LV_VALUES(spacing.procedural_event_control_at_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
+        LV_VALUES(spacing.assignment_operator_spacing, Breaks | Space | Indent, "both", "none", "before", "after"),
     };
     return table;
 }
@@ -421,6 +423,73 @@ void check_call_length(const Rendered& r, const CorpusFile& f, const RunConfig& 
     }
 }
 
+// WrapPass decides a call by the width it predicts for the call's line:
+// indent, the text before the `(`, the call and what follows the `)` up to
+// the next break point.  For every call left on one line that prediction
+// must be the rendered width, or a call that fit breaks or one that did not
+// stays whole.  Alignment padding is left out on both sides: WrapPass runs
+// before AlignPass and counts only statement_align_padding's lower bound.
+void check_call_estimate(const Rendered& r, const CorpusFile& f, const RunConfig& c, Report& rep) {
+    std::vector<int> lists_open(r.tokens.size(), 0);
+    int depth = 0;
+    for (size_t i = 0; i < r.tokens.size(); ++i) {
+        const svfmt::Tok& t = r.tokens[i];
+        lists_open[i] = depth;
+        if (!svfmt::is_code_token(t))
+            continue;
+        if (t.immutable.topology.starts_argument_list || t.immutable.topology.starts_parameter_list)
+            ++depth;
+        else if (t.lex.kind == svfmt::TK::CloseParenthesis && t.immutable.syntax.matching_token != svfmt::npos &&
+                 (r.tokens[t.immutable.syntax.matching_token].immutable.topology.starts_argument_list ||
+                  r.tokens[t.immutable.syntax.matching_token].immutable.topology.starts_parameter_list))
+            --depth;
+    }
+    for (size_t open = 0; open < r.tokens.size(); ++open) {
+        const svfmt::Tok& t = r.tokens[open];
+        // A call inside another list or a bracket is never measured alone.
+        if (!t.immutable.topology.starts_argument_list || !visible(r, open) || lists_open[open] > 0 ||
+            t.immutable.syntax.bracket_depth > 0 || svfmt::is_gate_terminal_open(r.tokens, open) ||
+            t.mutable_.wrap.list_kind != svfmt::WrapListKind::None)
+            continue;
+        const size_t close = t.immutable.syntax.matching_token;
+        const int line = r.trace.line[open];
+        if (close == svfmt::npos || close >= r.tokens.size() || !visible(r, close) || r.trace.line[close] != line)
+            continue;
+        // The rendered end of what follows the `)` on its line, through the
+        // next break point.
+        size_t last = close;
+        for (size_t k = close + 1; k < r.tokens.size(); ++k) {
+            const svfmt::Tok& n = r.tokens[k];
+            if (r.trace.line[k] < 0)
+                continue;
+            if (r.trace.line[k] != line || !svfmt::prints_inline(n))
+                break;
+            last = k;
+            const auto kind = n.lex.kind;
+            if (kind == svfmt::TK::Semicolon || kind == svfmt::TK::OpenBrace ||
+                kind == svfmt::TK::ApostropheOpenBrace ||
+                (kind == svfmt::TK::OpenParenthesis &&
+                 (n.immutable.topology.starts_argument_list || n.immutable.topology.starts_parameter_list)))
+                break;
+        }
+        int padding = 0;
+        size_t line_start = open;
+        for (size_t k = last + 1; k-- > 0 && r.trace.line[k] == line;) {
+            if (r.tokens[k].mutable_.align.enabled && visible(r, k) && !at_line_start(r, k))
+                padding += std::max(0, gap_before(r, k) - svfmt::compose(r.tokens[k]).spaces_before);
+            if (visible(r, k) && k <= open)
+                line_start = k;
+        }
+        const int rendered = r.trace.column[last] + static_cast<int>(svfmt::token_width(r.tokens[last])) - padding;
+        const int estimate = svfmt::one_line_list_width(r.tokens, open, close, 1 << 20, c.opts) -
+                             svfmt::statement_align_padding(r.tokens, line_start, open, c.opts);
+        if (estimate != rendered)
+            rep.add("call-estimate", f, c, line,
+                    "estimated " + std::to_string(estimate) + ", rendered " + std::to_string(rendered) + ": " +
+                        r.lines[line]);
+    }
+}
+
 } // namespace
 
 TEST_CASE("formatter invariants hold over the corpus", "[formatter][invariants]") {
@@ -450,6 +519,7 @@ TEST_CASE("formatter invariants hold over the corpus", "[formatter][invariants]"
             const Rendered r = render(f.text, c.opts);
             check_alignment(r, f, c, rep);
             check_call_length(r, f, c, rep);
+            check_call_estimate(r, f, c, rep);
         }
     }
     INFO(rep.text());

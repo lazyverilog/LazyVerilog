@@ -1008,78 +1008,31 @@ struct AlignField {
     int width(int own) const { return adaptive ? std::max(min_width, own) : widest; }
 };
 
-// The gap WrapPass assumes between code tokens `l` and `t`: one space except
-// where SpacingPass always closes it up, and the range colons and dimension
-// operators its options space.  An estimate over the gap SpacingPass prints
-// made a list break that fit (`[15 : 0]`, `a [i] [j]`, `8 'hFF`, `- 1`).
-// The space before a call's `(` is paren_spacing_width()'s to count.
-inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens, size_t open);
-inline int compact_gap(const TokenStream& tokens, size_t l, size_t t_idx, const FormatOptions& opts) {
-    const Tok& L = tokens[l];
-    const Tok& t = tokens[t_idx];
-    const TK lk = L.lex.kind;
-    const TK tk = t.lex.kind;
-    // `f(.a(x), .b(y))`: a named item's `.` takes the comma's space.
-    if (lk == TK::Comma && tk == TK::Dot)
-        return 1;
-    if (no_space_before(tk) || no_space_after(lk))
-        return 0;
-    // `lbl: assert ...`, `S_A: x = 1;`, `end: blk`
-    if (tk == TK::Colon && (t.immutable.topology.is_item_label_colon || t.immutable.topology.is_case_item_colon ||
-                            t.immutable.topology.is_block_name_colon))
-        return 0;
-    // `a[i]` binds; `my_t [3:0] x` and a declarator's `q [$]` do not.
-    if (tk == TK::OpenBracket && is_identifier_like(L)) {
-        const size_t close = t.immutable.syntax.matching_token;
-        const size_t after = close == npos ? npos : next_code(tokens, close + 1, tokens.size());
-        return (after != npos && is_identifier_like(tokens[after])) ||
-                       is_var_declaration_trailing_dimension_open(tokens, t_idx)
-                   ? 1 : 0;
-    }
-    if ((tk == TK::OpenParenthesis && t.immutable.topology.starts_argument_list) ||
-        tk == TK::Apostrophe || lk == TK::Apostrophe ||
-        (tk == TK::IntegerBase && lk == TK::IntegerLiteral) || t.lex.continues_vector_literal ||
-        (tk == TK::OpenBracket &&
-         (lk == TK::CloseBracket || (lk == TK::CloseParenthesis && !closes_strength(tokens, l)))))
-        return 0;
-    const bool l_unary = (is_unary_op(lk) || is_sign_or_reduction_op(lk)) &&
-                         (lk == TK::Tilde || lk == TK::Exclamation || in_prefix_position(tokens, l));
-    if (l_unary)
-        return unary_pair_merges(lk, tk) ? 1 : 0;
-    if ((tk == TK::DoublePlus || tk == TK::DoubleMinus) &&
-        (is_identifier_like(L) || lk == TK::CloseBracket || lk == TK::CloseParenthesis))
-        return 0;
-    const bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
-                        (L.immutable.syntax.bracket_depth > 0 && lk != TK::CloseBracket);
-    if (tk == TK::Colon && (in_dim || t.immutable.topology.is_min_typ_max_colon))
-        return wants_before(opts.spacing.range_colon_spacing) ? 1 : 0;
-    if (lk == TK::Colon && (in_dim || L.immutable.topology.is_min_typ_max_colon))
-        return wants_after(opts.spacing.range_colon_spacing) ? 1 : 0;
-    if (in_dim) {
-        const std::string& mode = opts.spacing.dimension_binary_operator_spacing;
-        const bool t_bin = is_binary_op(tk) && !is_assignment_op(tk) &&
-                           !(is_sign_or_reduction_op(tk) && in_prefix_position(tokens, t_idx));
-        if (is_binary_op(lk) && !is_assignment_op(lk))
-            return can_begin_unary_expression(tk) || wants_after(mode) ? 1 : 0;
-        if (t_bin)
-            return wants_before(mode) ? 1 : 0;
-    }
-    return 1;
+// A token printed on the line it shares with its neighbours: code, or a
+// block comment that keeps its place.  A line comment ends its line.
+inline bool prints_inline(const Tok& t) {
+    return is_code_token(t) || (t.lex.comment_kind == CommentLexemeKind::Block && !is_passthrough(t) &&
+                                last_newline_offset(t.lex.text) == std::string_view::npos);
 }
 
-// WrapPass's estimate of a width: it runs before SpacingPass, so it assumes
-// the gaps compact_gap() gives.  Later passes measure with rendered_width().
+inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions& opts);
+
+// WrapPass's estimate of the width of [first, end) printed on one line, the
+// gap before `first` left out.  It runs before SpacingPass, so it asks
+// spacing_gap() -- the rule SpacingPass prints with -- for every gap; any
+// other estimate let a call that fit break, or one that did not stay whole.
+// Later passes measure with rendered_width().
 inline int compact_width(const TokenStream& tokens, size_t first, size_t end, const FormatOptions& opts) {
     int w = 0;
-    size_t prev = npos;
+    bool first_tok = true;
     end = std::min(end, tokens.size());
     for (size_t i = first; i < end; ++i) {
         const Tok& t = tokens[i];
-        if (!is_code_token(t)) continue;
-        if (prev != npos)
-            w += compact_gap(tokens, prev, i, opts);
+        if (!prints_inline(t)) continue;
+        if (!first_tok)
+            w += spacing_gap(tokens, i, opts);
         w += token_width(t);
-        prev = i;
+        first_tok = false;
     }
     return w;
 }
@@ -1118,36 +1071,6 @@ inline bool ends_verbatim_line(const Tok& t) {
     return t.lex.is_format_on_marker || t.lex.is_format_off_marker || t.lex.is_disabled_region_body;
 }
 
-// The spaces SpacingPass puts at parens that compact_width() does not count:
-// `spacing.space_inside_parens` pads every non-empty pair, and
-// `function_call.space_*` a call's.  Left out, `f( a, b )` measured two
-// narrower than it prints and a call that fit by the estimate ran past the
-// line length.
-inline int paren_spacing_width(const TokenStream& tokens, size_t first, size_t end, const FormatOptions& opts) {
-    int w = 0;
-    end = std::min(end, tokens.size());
-    for (size_t i = first; i < end; ++i) {
-        const Tok& t = tokens[i];
-        if (!is_code_token(t))
-            continue;
-        size_t open = npos;
-        if (kind_is(t, TK::OpenParenthesis))
-            open = i;
-        else if (kind_is(t, TK::CloseParenthesis))
-            open = t.immutable.syntax.matching_token;
-        if (open == npos)
-            continue;
-        const size_t close = tokens[open].immutable.syntax.matching_token;
-        const bool call = tokens[open].immutable.topology.starts_argument_list;
-        if (i == open && call && opts.function_call.space_before_paren)
-            ++w;
-        const bool empty = close != npos && next_code(tokens, open + 1, close + 1) == close;
-        if (!empty && (opts.spacing.space_inside_parens || (call && opts.function_call.space_inside_paren)))
-            ++w;
-    }
-    return w;
-}
-
 // The padding AlignPass will put before the line's assignment operator, when
 // that operator stands before `token_idx`: `statement.align` pads a
 // statement's LHS to `lhs_min_width`, and `var_declaration.align` puts a
@@ -1169,14 +1092,18 @@ inline int statement_align_padding(const TokenStream& tokens, size_t line_start,
             t.immutable.syntax.bracket_depth != depth.bracket_depth ||
             t.immutable.syntax.brace_depth != depth.brace_depth)
             continue;
-        if (kind_is(t, TK::Semicolon))
+        // `S1: x = 1;` -- a case item or a labelled statement is no
+        // declaration, and its two names are not a type and a variable.
+        if (kind_is(t, TK::Semicolon) || t.immutable.topology.is_case_item_colon ||
+            t.immutable.topology.is_item_label_colon)
             return 0;
         if (is_assignment_op(t.lex.kind)) {
             // `logic v = x` / `my_t v = x` is a declaration; statement
             // alignment skips it.
             if (decl_lead || (names >= 2 && depth.paren_depth == 0)) {
-                if (!kind_is(t, TK::Equals) || !opts.var_declaration.align ||
-                    opts.var_declaration.section1_min_width <= 0)
+                // section1 = 0 leaves the type unpadded; the dimension and
+                // name sections still pad.
+                if (!kind_is(t, TK::Equals) || !opts.var_declaration.align)
                     return 0;
                 const int sections = option_width(opts.var_declaration.section1_min_width, opts) +
                                      option_width(opts.var_declaration.section2_min_width, opts) +
@@ -1198,65 +1125,157 @@ inline int statement_align_padding(const TokenStream& tokens, size_t line_start,
     return 0;
 }
 
-// The width of the line in front of `token_idx`, indentation included.
-// WrapPass runs before IndentPass, so the indent is taken from the scope depth
-// SyntaxPass recorded for the line's first token rather than from
-// IndentMetadata; a limit compared against the text alone let a line run past
-// it by exactly its own indent.
-inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
-    size_t line_start = 0;
-    for (size_t i = token_idx; i > 0; --i) {
+// The first token of the line `token_idx` is on, by the breaks decided so far.
+// A blank line BlankLinePass keeps also starts one: `)` / (blank) /
+// `extends base #(...)`.
+inline size_t line_start_before(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
+    for (size_t i = token_idx; i > 0; --i)
         if (tokens[i].mutable_.wrap.must_break_before || tokens[i - 1].mutable_.wrap.must_break_after ||
-            ends_verbatim_line(tokens[i - 1])) {
-            line_start = i;
+            ends_verbatim_line(tokens[i - 1]) ||
+            (opts.blank_lines_between_items > 0 && is_blank_line_boundary(tokens, i)))
+            return i;
+    return 0;
+}
+
+inline bool closes_control_header(const TokenStream& tokens, size_t close);
+inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts);
+inline int token_column(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts);
+
+// Where a block call's arguments indent from: the start of its callee,
+// `obj.sub.meth(`, `pkg::cls::fn(` and `cfg_db #(T)::set(` included, not its
+// last name.  A chain already broken (`).next(`) hangs from the line its `)`
+// starts.  `line_of(i)` is the first token of i's line; npos when the `(`
+// has no callee.
+template <class LineOf>
+inline size_t callee_chain_start(const TokenStream& tokens, size_t open, LineOf line_of) {
+    size_t name = prev_code(tokens, open);
+    while (name != npos) {
+        const size_t sep = prev_code(tokens, name);
+        if (sep == npos || !(kind_is(tokens[sep], TK::Dot) || kind_is(tokens[sep], TK::DoubleColon)))
             break;
+        size_t q = prev_code(tokens, sep);
+        while (q != npos && (kind_is(tokens[q], TK::CloseParenthesis) || kind_is(tokens[q], TK::CloseBracket)) &&
+               tokens[q].immutable.syntax.matching_token != npos) {
+            q = prev_code(tokens, tokens[q].immutable.syntax.matching_token);
+            if (q != npos && kind_is(tokens[q], TK::Hash))
+                q = prev_code(tokens, q);
         }
+        if (q != npos && line_of(q) != line_of(open))
+            return line_of(open);
+        if (q == npos ||
+            !(kind_is(tokens[q], TK::Identifier) || kind_is(tokens[q], TK::SystemIdentifier) ||
+              kind_is(tokens[q], TK::ThisKeyword) || kind_is(tokens[q], TK::SuperKeyword) ||
+              kind_is(tokens[q], TK::LocalKeyword) || kind_is(tokens[q], TK::UnitSystemName)))
+            break;
+        name = q;
     }
-    // `) + compute(gamma, delta)` -- the `)` of a call broken one argument
-    // per line sits under the call's name, not at the scope's indent.
-    if (line_start < token_idx && kind_is(tokens[line_start], TK::CloseParenthesis)) {
-        const size_t open = tokens[line_start].immutable.syntax.matching_token;
-        const size_t name = open == npos ? npos : prev_code(tokens, open);
-        if (name != npos && name < line_start && tokens[open].immutable.topology.starts_argument_list)
-            return line_prefix_width(tokens, name, opts) + compact_width(tokens, line_start, token_idx, opts) +
-                   paren_spacing_width(tokens, line_start, token_idx, opts) +
-                   statement_align_padding(tokens, line_start, token_idx, opts);
+    return name;
+}
+
+// The indent of the line starting at `line_start`, as IndentPass will set it:
+// the scope depth SyntaxPass recorded, unless the line is an item or the `)`
+// of a list WrapPass broke (after the `(` when hanging; else a level in from
+// the callee or the list's line, the `)` at it) or a brace-less body (a
+// level in from its control).
+inline int line_indent(const TokenStream& tokens, size_t line_start, const FormatOptions& opts) {
+    if (line_start >= tokens.size())
+        return 0;
+    const Tok& s = tokens[line_start];
+    const size_t list = s.mutable_.wrap.list_open;
+    if (list != npos && list < line_start) {
+        const WrapListKind kind = tokens[list].mutable_.wrap.list_kind;
+        if (kind == WrapListKind::FunctionHanging || kind == WrapListKind::ModuleParametersHanging ||
+            kind == WrapListKind::FunctionDeclHanging) {
+            // After the `(` and the space the inside-paren options put there.
+            const size_t first = next_code(tokens, list + 1, tokens[list].immutable.syntax.matching_token);
+            const bool first_follows = first != npos && !tokens[first].mutable_.wrap.must_break_before &&
+                                       !tokens[list].mutable_.wrap.must_break_after;
+            return token_column(tokens, list, opts) + token_width(tokens[list]) +
+                   (first_follows ? spacing_gap(tokens, first, opts) : 0);
+        }
+        int base;
+        const size_t callee = kind == WrapListKind::FunctionBlock
+            ? callee_chain_start(tokens, list, [&](size_t i) { return line_start_before(tokens, i, opts); })
+            : npos;
+        if (callee != npos)
+            base = token_column(tokens, callee, opts);
+        else
+            base = line_indent(tokens, line_start_before(tokens, list, opts), opts);
+        return line_start == tokens[list].immutable.syntax.matching_token ? base : base + opts.indent_size;
     }
-    int levels = 0;
-    if (line_start < tokens.size()) {
-        const auto& topo = tokens[line_start].immutable.topology;
-        levels = topo.scope_depth;
-        if (topo.in_outermost_unit && opts.default_indent_level_inside_outmost_block > 0)
-            ++levels;
+    if (s.mutable_.wrap.must_break_before) {
+        const size_t control = prev_code(tokens, line_start);
+        // A level in from the line the control starts on, not from where a
+        // broken header's `)` ended up.
+        if (control != npos && closes_control_header(tokens, control))
+            return line_indent(tokens,
+                               line_start_before(tokens, tokens[control].immutable.syntax.matching_token, opts),
+                               opts) +
+                   opts.indent_size;
+        if (control != npos &&
+            (kind_is(tokens[control], TK::ElseKeyword) || kind_is(tokens[control], TK::ForeverKeyword) ||
+             kind_is(tokens[control], TK::DoKeyword) || is_procedural_block_at(tokens, control)))
+            return line_indent(tokens, line_start_before(tokens, control, opts), opts) + opts.indent_size;
     }
-    return levels * opts.indent_size + compact_width(tokens, line_start, token_idx, opts) +
-           paren_spacing_width(tokens, line_start, token_idx, opts) +
+    const auto& topo = s.immutable.topology;
+    int levels = topo.scope_depth;
+    if (topo.in_outermost_unit && opts.default_indent_level_inside_outmost_block > 0)
+        ++levels;
+    return levels * opts.indent_size;
+}
+
+// The width of the line in front of `token_idx`, indentation included.
+// WrapPass runs before IndentPass, so the indent comes from line_indent()
+// rather than from IndentMetadata; a limit compared against the text alone
+// let a line run past it by exactly its own indent.
+inline int line_prefix_width(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
+    const size_t line_start = line_start_before(tokens, token_idx, opts);
+    return line_indent(tokens, line_start, opts) + compact_width(tokens, line_start, token_idx, opts) +
            statement_align_padding(tokens, line_start, token_idx, opts);
 }
 
-// The width a list's `)` carries after it that no break can move off its
-// line: the `));` of `f(g(a, b));`, the ` u_x (` of `sub #(.W(8)) u_x (`,
-// the `::type_id::create(` of `c #(.W(8))::type_id::create(`.  Closers,
-// names, `.` and `::`, through a `;` or the next `(`; anything else (an
-// operator, `=`, `with`) is a place the line can break, so it ends there,
-// as it does before a comment or a break already decided.
-inline int close_tail_width(const TokenStream& tokens, size_t close, const FormatOptions& opts) {
+// The column `token_idx` will be printed at: its line's prefix and the gap
+// before it.
+inline int token_column(const TokenStream& tokens, size_t token_idx, const FormatOptions& opts) {
+    const bool starts_line = line_start_before(tokens, token_idx, opts) == token_idx;
+    return line_prefix_width(tokens, token_idx, opts) + (starts_line ? 0 : spacing_gap(tokens, token_idx, opts));
+}
+
+// The width a list's `)` carries after it on its line, up to the next place
+// WrapPass can break it: the `;`, the next call's or parameter list's `(` or
+// a `{` (that list is measured on its own, this one in front of it), the
+// end of a macro statement, or a break, comment or directive already ending
+// the line.  Lists open in
+// source order, so an enclosing list has been decided by now: a `,` of one
+// that broke carries its break, and one that stayed whole is no break point.
+// Nor are operators, `?:`, `@(...)` or `iff (...)`: `fn(a) ? x : y;` keeps
+// its `? x : y;` on the call's line.  It stops once past `limit`, beyond
+// which more width changes no decision.
+inline int close_tail_width(const TokenStream& tokens, size_t close, int limit, const FormatOptions& opts) {
     int w = 0;
-    size_t prev = close;
-    for (size_t k = close + 1; k < tokens.size(); ++k) {
+    for (size_t k = close + 1; k < tokens.size() && w <= limit; ++k) {
         const Tok& t = tokens[k];
         const TK tk = t.lex.kind;
-        if (!is_code_token(t) || t.mutable_.wrap.must_break_before || tokens[prev].mutable_.wrap.must_break_after)
+        // A semicolonless macro statement (`` `uvm_fatal(a, b) ``) ends where
+        // a `;` would.
+        if (!prints_inline(t) || t.mutable_.wrap.must_break_before || tokens[k - 1].mutable_.wrap.must_break_after ||
+            tokens[k - 1].mutable_.macro.ends_statement)
             break;
-        if (tk != TK::CloseParenthesis && tk != TK::CloseBracket && tk != TK::CloseBrace && tk != TK::Dot &&
-            tk != TK::DoubleColon && tk != TK::Identifier && tk != TK::Semicolon && tk != TK::OpenParenthesis)
-            break;
-        w += compact_gap(tokens, prev, k, opts) + token_width(t);
-        prev = k;
-        if (tk == TK::Semicolon || tk == TK::OpenParenthesis)
+        w += spacing_gap(tokens, k, opts) + token_width(t);
+        if (tk == TK::Semicolon || tk == TK::OpenBrace || tk == TK::ApostropheOpenBrace ||
+            (tk == TK::OpenParenthesis &&
+             (t.immutable.topology.starts_argument_list || t.immutable.topology.starts_parameter_list)))
             break;
     }
     return w;
+}
+
+// The width of the line through list `open`...`close` and what follows it,
+// were the list kept on one line.
+inline int one_line_list_width(const TokenStream& tokens, size_t open, size_t close, int limit,
+                               const FormatOptions& opts) {
+    return token_column(tokens, open, opts) + compact_width(tokens, open, close + 1, opts) +
+           close_tail_width(tokens, close, limit, opts);
 }
 
 struct ListItem {
@@ -3793,8 +3812,10 @@ public:
                     !is_passthrough(tokens[open + 1]);
                 bool block = opts_.module.parameter_layout != "hanging" || comment_after_open;
                 const int one_line =
-                    line_prefix_width(tokens, open, opts_) + 1 + compact_width(tokens, open + 1, close, opts_) + 1 +
-                    close_tail_width(tokens, close, opts_);
+                    one_line_list_width(tokens, open, close,
+                                        declaration ? opts_.function_declaration.line_length
+                                                    : opts_.function_call.line_length,
+                                        opts_);
                 const bool directive = parameter_list_contains_directive(tokens, open, close);
                 bool breaks_inside = directive;
                 for (size_t k = open + 1; k < close && !breaks_inside; ++k)
@@ -3873,8 +3894,7 @@ public:
                                          kind_is(tokens[kw], TK::CheckerKeyword));
             }
             if (is_decl) {
-                int approx = line_prefix_width(tokens, open, opts_) + 1 + compact_width(tokens, open + 1, close, opts_) + 1 +
-                             close_tail_width(tokens, close, opts_);
+                int approx = one_line_list_width(tokens, open, close, opts_.function_declaration.line_length, opts_);
                 // `function int f( // why` -- a comment right after the `(`
                 // ends that line, so the arguments cannot hang from it: the
                 // list is laid out as a block whatever its length.
@@ -3934,14 +3954,18 @@ public:
                     // the limit: after the `(` for a hanging list, one indent
                     // past the callee for a block list.  A call already past
                     // the limit would only push them further right.
-                    const int open_end = line_prefix_width(tokens, open, opts_) + 1;
-                    int approx = open_end + compact_width(tokens, open + 1, close, opts_) + 1 +
-                                 paren_spacing_width(tokens, open, close + 1, opts_) +
-                                 close_tail_width(tokens, close, opts_);
-                    const size_t callee = prev_code(tokens, open);
-                    const int args_col = opts_.function_call.layout == "hanging" || callee == npos
-                                             ? open_end
-                                             : line_prefix_width(tokens, callee, opts_) + opts_.indent_size;
+                    const int open_end = token_column(tokens, open, opts_) + 1;
+                    const int approx =
+                        one_line_list_width(tokens, open, close, opts_.function_call.line_length, opts_);
+                    const size_t callee = callee_chain_start(
+                        tokens, open, [&](size_t i) { return line_start_before(tokens, i, opts_); });
+                    const bool from_open = opts_.function_call.layout == "hanging" || callee == npos;
+                    // A statement broken over lines is not aligned, so the
+                    // padding before its `=` goes with the break.
+                    const size_t at = from_open ? open : callee;
+                    const int args_col =
+                        (from_open ? open_end : token_column(tokens, callee, opts_) + opts_.indent_size) -
+                        statement_align_padding(tokens, line_start_before(tokens, at, opts_), at, opts_);
                     if (approx > opts_.function_call.line_length &&
                         args_col <= opts_.function_call.line_length)
                         do_break = true;
@@ -4947,33 +4971,9 @@ public:
                 // not from its last name: `obj.sub.meth(`, `pkg::cls::fn(` and
                 // `cfg_db #(T)::set(` pushed the arguments right by the
                 // length of the prefix.
-                while (name != npos) {
-                    const size_t sep = prev_code(tokens, name);
-                    if (sep == npos || !(kind_is(tokens[sep], TK::Dot) || kind_is(tokens[sep], TK::DoubleColon)))
-                        break;
-                    size_t q = prev_code(tokens, sep);
-                    while (q != npos &&
-                           (kind_is(tokens[q], TK::CloseParenthesis) || kind_is(tokens[q], TK::CloseBracket)) &&
-                           tokens[q].immutable.syntax.matching_token != npos) {
-                        q = prev_code(tokens, tokens[q].immutable.syntax.matching_token);
-                        if (q != npos && kind_is(tokens[q], TK::Hash))
-                            q = prev_code(tokens, q);
-                    }
-                    // A chain already broken (`).next(`) hangs from the line
-                    // its `)` starts, which sits at the chain's own indent.
-                    if (q != npos && line_start_of(q) != open_line) {
-                        name = open_line;
-                        name_col = column_before(name);
-                        break;
-                    }
-                    if (q == npos ||
-                        !(kind_is(tokens[q], TK::Identifier) || kind_is(tokens[q], TK::SystemIdentifier) ||
-                          kind_is(tokens[q], TK::ThisKeyword) || kind_is(tokens[q], TK::SuperKeyword) ||
-                          kind_is(tokens[q], TK::LocalKeyword) || kind_is(tokens[q], TK::UnitSystemName)))
-                        break;
-                    name = q;
+                name = callee_chain_start(tokens, open, [&](size_t i) { return line_start_of(i); });
+                if (name != npos)
                     name_col = column_before(name);
-                }
                 item_indent = name_col + opts_.indent_size;
                 close_indent = name_col;
                 if (name != npos) anchor = name;
@@ -7153,6 +7153,587 @@ public:
     }
 };
 
+// The spaces SpacingPass puts before token `i` on a line it shares with
+// `i - 1`.  It reads only lexer and SyntaxPass facts (and the list kinds
+// WrapPass has set), so WrapPass measures a line with it before SpacingPass
+// runs and its estimate is the printed width.
+inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions& opts) {
+    const Tok& t = tokens[i];
+    const Tok& L = tokens[i - 1];
+    int spaces = 1;
+
+    // An escaped identifier is delimited by whitespace, so the token
+    // after it can never be closed up against it -- `\\esc` + `;` would
+    // re-lex as the single identifier `\\esc;`.  This outranks every
+    // no-space rule below, so decide it before any of them run.
+    if (L.lex.is_escaped_identifier) {
+        return 1;
+    }
+
+    // `` `DV_CHECK_FATAL(a == b, "msg") `` with a listed macro: the
+    // lexer froze everything between the parentheses, the gap before
+    // `)` included, so the `)` binds to it as the `(` side already
+    // does.  Padding it grew the gap by one on every format.
+    if (L.lex.is_whitespace_sensitive && kind_is(t, TK::CloseParenthesis)) {
+        return 0;
+    }
+
+    // `(*` and `*)` are single lexemes in the LRM.  Letting the ordinary
+    // paren rules put a space between the halves turns an attribute into
+    // a parenthesised expression, so keep them closed up.  The text
+    // between the delimiters spaces like any other expression.
+    if (t.lex.in_attribute_instance && L.lex.in_attribute_instance &&
+        ((kind_is(L, TK::OpenParenthesis) && kind_is(t, TK::Star)) ||
+         (kind_is(L, TK::Star) && kind_is(t, TK::CloseParenthesis)))) {
+        return 0;
+    }
+
+    // Slang represents based literals as multiple tokens -- `12'h7c4`
+    // is `12`, `'h`, `7`, `c4` and `4'b1??0` is `4`, `'b`, `1`, `?`,
+    // `?`, `0`.  Keep the size against its base and the value pieces
+    // closed up; a space before a `?` digit re-lexes it as the
+    // conditional operator, so no later rule may reopen the gap.
+    // A macro can be the size: `` `WIDTH'h3 ``, `` `W(8)'d1 ``.
+    auto is_macro_size = [&]() {
+        if (kind_is(L, TK::MacroUsage))
+            return true;
+        if (!kind_is(L, TK::CloseParenthesis) || L.immutable.syntax.matching_token == npos)
+            return false;
+        const size_t callee = prev_code(tokens, L.immutable.syntax.matching_token);
+        return callee != npos && kind_is(tokens[callee], TK::MacroUsage);
+    };
+    if ((kind_is(t, TK::IntegerBase) && (kind_is(L, TK::IntegerLiteral) || is_macro_size())) ||
+        t.lex.continues_vector_literal) {
+        return 0;
+    }
+
+    // SVA repetition `b[->1]`, `b[*1:3]`, `b[=2:$]` is an operator,
+    // not a dimension: everything inside its brackets binds, and the
+    // dimension options (padding, range-colon spacing) do not apply.
+    {
+        const size_t li = prev_code(tokens, i);
+        const size_t lli = li == npos ? npos : prev_code(tokens, li);
+        size_t enclosing = npos;
+        if (kind_is(t, TK::CloseBracket)) {
+            enclosing = t.immutable.syntax.matching_token;
+        } else if (t.immutable.syntax.bracket_depth > 0) {
+            for (size_t n = i; n > 0; --n) {
+                const Tok& b = tokens[n - 1];
+                if (kind_is(b, TK::CloseBracket) && b.immutable.syntax.matching_token != npos &&
+                    b.immutable.syntax.matching_token < n - 1) {
+                    n = b.immutable.syntax.matching_token + 1;
+                    continue;
+                }
+                if (kind_is(b, TK::OpenBracket)) {
+                    enclosing = n - 1;
+                    break;
+                }
+            }
+        }
+        if ((enclosing != npos && enclosing < tokens.size() && is_code_token(t) &&
+             tokens[enclosing].immutable.topology.is_repetition_bracket) ||
+            (li != npos && tokens[li].immutable.topology.is_repetition_bracket) ||
+            (lli != npos && tokens[lli].immutable.topology.is_repetition_bracket)) {
+            return 0;
+        }
+    }
+
+    // An inline conditional directive is delimited by whitespace:
+    // `` `else31 `` would re-lex as a macro named `else31`.
+    if (L.lex.is_directive || (t.lex.is_directive && !kind_is(L, TK::OpenBracket))) {
+        return 1;
+    }
+
+    // Basic no-space rules
+    if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
+    // `( /*autoinst*/` keeps its space before the list.  A block
+    // comment that is the parens' only content is padded like any
+    // other first token, symmetric with its `)`: `.o(/* unused */)`.
+    if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis)) {
+        const bool sole_content = t.lex.comment_kind == CommentLexemeKind::Block &&
+            L.immutable.syntax.matching_token != npos &&
+            next_code(tokens, i + 1, tokens.size()) == L.immutable.syntax.matching_token;
+        if (!sole_content) spaces = 1;
+    }
+    // `typedef enum { // open` -- a comment after a `{` keeps its
+    // space too, as it does after a block brace.
+    if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenBrace) &&
+        next_code(tokens, i + 1, tokens.size()) != L.immutable.syntax.matching_token)
+        spaces = 1;
+    // Empty positional argument: `, ,` — keep one space so the slot is visible
+    if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
+
+    // Unary ops: no space after.
+    // Exception: `~ &a`, `~ |a`, `~ ^a` — tilde followed by a
+    // reduction operator must keep a space so it isn't read as
+    // the compound `~&` / `~|` / `~^` operator.
+    //
+    // Which tokens are unary depends on position: `-a`, `&c` and
+    // prefix `++x` bind to their operand, while binary `b ^~ c` and
+    // postfix `x++ > 3` space like any binary operator.
+    const size_t li = prev_code(tokens, i);
+    const bool L_prefix = li != npos && li == i - 1 && in_prefix_position(tokens, li);
+    const bool L_unary =
+        (is_unary_op(L.lex.kind) || is_sign_or_reduction_op(L.lex.kind)) &&
+        (L_prefix || kind_is(L, TK::Tilde) || kind_is(L, TK::Exclamation));
+    if (L_unary) {
+        if (!unary_pair_merges(L.lex.kind, t.lex.kind)) {
+            return 0;
+        }
+        spaces = 1;
+    }
+
+    // Hierarchy: . and ::
+    if (kind_is(L, TK::Dot) || kind_is(L, TK::DoubleColon)) {
+        return 0;
+    }
+    // function_call.space_inside_paren pads an argument list.  `new` is
+    // a keyword, so its `(` is not marked as one for the wrapping
+    // passes -- a constructor call is not broken like a call -- but it
+    // is one to this option, as it already is to space_before_paren.
+    auto pads_call_open = [&](size_t at) {
+        if (!opts.function_call.space_inside_paren || !kind_is(tokens[at], TK::OpenParenthesis))
+            return false;
+        if (tokens[at].immutable.topology.starts_argument_list)
+            return true;
+        const size_t callee = prev_code(tokens, at);
+        return callee != npos && kind_is(tokens[callee], TK::NewKeyword);
+    };
+    auto pads_call_close = [&](size_t at) {
+        if (!opts.function_call.space_inside_paren || !kind_is(tokens[at], TK::CloseParenthesis))
+            return false;
+        if (tokens[at].immutable.topology.ends_argument_list)
+            return true;
+        const size_t match = tokens[at].immutable.syntax.matching_token;
+        return match != npos && pads_call_open(match);
+    };
+    // `#( .WIDTH(8) )` -- a padded `(` pads before a named connection
+    // too, as it does before any other first token.
+    const bool padded_open = kind_is(L, TK::OpenParenthesis) &&
+        (opts.spacing.space_inside_parens ||
+         (pads_call_open(i - 1)));
+    // `sub u ((* keep *) .p(x));` -- an attribute keeps a space on each
+    // side, before the connection it annotates as before anything else.
+    const bool after_attribute = kind_is(L, TK::CloseParenthesis) &&
+                                 L.lex.in_attribute_instance;
+    const bool dot_spaced = kind_is(t, TK::Dot) &&
+        (dot_keeps_space_after(tokens, i) || padded_open || after_attribute);
+    if (dot_spaced) {
+        spaces = 1;
+    } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {
+        return 0;
+    }
+
+    // # hash: no space before next token.  `##` is the cycle delay
+    // (`a ##1 b`, `##[1:3]`) and binds the same way.  A comment
+    // after it is no operand and keeps its space: `# /* d */ 5`.
+    if (kind_is(L, TK::Hash) || kind_is(L, TK::DoubleHash)) {
+        const bool comment = t.lex.comment_kind != CommentLexemeKind::None;
+        return comment ? 1 : 0;
+    }
+
+    // No space before '[' when it's an index/dimension on an identifier or closer
+    if (kind_is(t, TK::OpenBracket) &&
+        (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis) ||
+         kind_is(L, TK::NewKeyword) ||
+         // `{b, c}[3:0]` -- a select on a concatenation.  A `}` that
+         // closes a block or a struct body ends no expression.
+         (kind_is(L, TK::CloseBrace) && L.immutable.syntax.matching_token != npos &&
+          !tokens[L.immutable.syntax.matching_token].immutable.topology.opens_brace_block)) &&
+        !closes_strength(tokens, i - 1))
+        spaces = 0;
+    if (kind_is(t, TK::OpenBracket) && is_identifier_like(L) &&
+        t.immutable.syntax.matching_token != npos) {
+        size_t after_dim = next_code(tokens, t.immutable.syntax.matching_token + 1, tokens.size());
+        if (after_dim != npos && is_identifier_like(tokens[after_dim]))
+            spaces = 1;
+        else if (is_var_declaration_trailing_dimension_open(tokens, i))
+            spaces = 1;
+    }
+
+    // Function/task declaration spacing has its own option because many
+    // codebases prefer `foo (...)` for calls but `function foo(...)` for
+    // declarations (or vice versa).  Check it before the generic
+    // call-like rule below; wrapped and unwrapped declarations both
+    // pass through this spacing pass.
+    // An empty port list (`sub u0 ();`) is no list to WrapPass, so it
+    // is recognised by its shape here.
+    const bool empty_instance_ports =
+        kind_is(t, TK::OpenParenthesis) && t.immutable.syntax.matching_token != npos &&
+        next_code(tokens, i + 1, tokens.size()) == t.immutable.syntax.matching_token &&
+        is_instance_port_open(tokens, i);
+    if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
+        spaces = opts.function_declaration.space_before_paren ? 1 : 0;
+    // Function/task call spacing.  `new` lexes as its own keyword rather
+    // than an identifier, but `new(...)` is a constructor call and must
+    // follow the same option -- otherwise every class constructor
+    // renders as `new (name)`.
+    // `type(x)` and `binsof(cp)` are call-shaped keywords too.
+    else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword) ||
+                                                kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword) ||
+                                                // `q.unique()`, `q.and()` -- a member named by a keyword
+                                                // is still a method.  Nothing but a name follows a `.`.
+                                                (is_code_token(L) && i >= 2 && kind_is(tokens[i - 2], TK::Dot))))
+        spaces = opts.function_call.space_before_paren ? 1 : 0;
+    // `new[10](init)` -- the initializer is the constructor's argument
+    // list, so it spaces like `new(...)`.
+    else if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::CloseBracket) &&
+             L.immutable.syntax.matching_token != npos) {
+        const size_t before_dim = prev_code(tokens, L.immutable.syntax.matching_token);
+        if (before_dim != npos && kind_is(tokens[before_dim], TK::NewKeyword))
+            spaces = opts.function_call.space_before_paren ? 1 : 0;
+        // `u_arr[3:0](...)` -- an instance array's connections space
+        // like the plain instance's `u_one(...)`.
+        else if (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts ||
+                 is_gate_terminal_open(tokens, i) || empty_instance_ports)
+            spaces = opts.function_call.space_before_paren ? 1 : 0;
+    }
+    // `rand join (0.5) a b` -- the lexer hands a production's `join`
+    // over as a plain word; it is still a keyword and calls nothing.
+    if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::Identifier)) {
+        const size_t word = prev_code(tokens, i);
+        const size_t before = word == npos ? npos : prev_code(tokens, word);
+        if (before != npos && kind_is(tokens[before], TK::RandKeyword))
+            spaces = 1;
+    }
+    if (kind_is(t, TK::OpenParenthesis) && opts.instance.align &&
+        (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i) ||
+         empty_instance_ports))
+        spaces = 1;
+    if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::ModportBody)
+        spaces = 1;
+    if (kind_is(t, TK::OpenParenthesis) && t.immutable.topology.starts_port_list &&
+        kind_is(L, TK::CloseParenthesis))
+        spaces = 0;
+    if (kind_is(t, TK::OpenParenthesis) && is_control_keyword(L.lex.kind))
+        spaces = opts.spacing.control_keyword_space ? 1 : 0;
+    if ((kind_is(L, TK::OpenParenthesis) || kind_is(t, TK::CloseParenthesis)) && opts.spacing.space_inside_parens) spaces = 1;
+    // function.space_inside_paren: space inside argument-list parens only
+    if (kind_is(L, TK::OpenParenthesis) && pads_call_open(i - 1)) spaces = 1;
+    if (kind_is(t, TK::CloseParenthesis) && pads_call_close(i)) spaces = 1;
+    if ((kind_is(L, TK::OpenBracket) || kind_is(t, TK::CloseBracket)) && opts.spacing.space_inside_dimension_brackets) spaces = 1;
+
+    // } brace: 1 space after (unless followed by ; or ,).  Only a brace
+    // that closes a statement block takes this; an expression brace's
+    // `}` spaces like any other closing token, so a nested
+    // concatenation renders `{f, {g, h}}` rather than `{f, {g, h} }`.
+    if (kind_is(L, TK::CloseBrace) && closes_indent_scope_at(tokens, i - 1) &&
+        !kind_is(t, TK::Semicolon) && !kind_is(t, TK::Comma)) spaces = 1;
+    // A statement block kept on one line, `with { a < 5; b == 3; }`,
+    // is padded inside its braces like `begin ... end`.
+    if (kind_is(L, TK::OpenBrace) && L.immutable.topology.opens_brace_block)
+        spaces = 1;
+    if (kind_is(t, TK::CloseBrace) && t.immutable.syntax.matching_token != npos &&
+        kind_is(tokens[t.immutable.syntax.matching_token], TK::OpenBrace) &&
+        tokens[t.immutable.syntax.matching_token].immutable.topology.opens_brace_block)
+        spaces = 1;
+    // An empty block has nothing to pad: `constraint c {}`.
+    if (kind_is(t, TK::CloseBrace) && is_empty_brace_pair(tokens, i - 1))
+        spaces = 0;
+    // A padded `)` keeps its pad after a `}` as after anything else.
+    if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis) &&
+        !opts.spacing.space_inside_parens &&
+        !(pads_call_close(i)))
+        spaces = 0;
+
+    // Apostrophe / cast: no space
+    if (kind_is(t, TK::Apostrophe) || kind_is(L, TK::Apostrophe)) spaces = 0;
+    // Apostrophe-open-brace assignment patterns / casts.  Only a
+    // cast's type (`pkt_t'{...}`) and an opening delimiter bind to the
+    // pattern; after a comma, a pattern key's `:` or a `?` it is an
+    // operand like any other (`data : '{raw : 0}`, `c ? '{1} : '{2}`).
+    // A padded `(` or `[` keeps its pad before a pattern as before
+    // any other first token: `fn( '{1, 2}, x )`.
+    if (kind_is(t, TK::ApostropheOpenBrace) &&
+        (is_identifier_like(L) || is_type_keyword(L.lex.kind) ||
+         kind_is(L, TK::CloseParenthesis) || kind_is(L, TK::CloseBracket) ||
+         (kind_is(L, TK::OpenParenthesis) && !padded_open) ||
+         (kind_is(L, TK::OpenBracket) && !opts.spacing.space_inside_dimension_brackets) ||
+         kind_is(L, TK::OpenBrace) || kind_is(L, TK::ApostropheOpenBrace)))
+        spaces = 0;
+    // `tagged Pair '{.a, .b}` -- the name is a union member's tag and
+    // the pattern its value, as in `tagged Valid .n`; it is not the
+    // cast `Pair'{...}`.
+    if (kind_is(t, TK::ApostropheOpenBrace) && kind_is(L, TK::Identifier)) {
+        const size_t tag_kw = prev_code(tokens, i - 1);
+        if (tag_kw != npos && kind_is(tokens[tag_kw], TK::TaggedKeyword))
+            spaces = 1;
+    }
+
+    // Postfix ++ / --: no space before when attached to an identifier, ], or )
+    if ((kind_is(t, TK::DoublePlus) || kind_is(t, TK::DoubleMinus)) &&
+        (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis)))
+        spaces = 0;
+
+    // Assignment operators.
+    // LessThanEquals is context-sensitive: inside parens it's a comparison, not
+    // non-blocking assignment.  Treat it as a regular binary op in that context.
+    auto is_assign = [&](size_t at) {
+        return is_assignment_op(tokens[at].lex.kind) && !is_relational_less_equal(tokens, at);
+    };
+    const bool t_assign = is_assign(i);
+    const bool L_assign = is_assign(i - 1);
+    if (t_assign) spaces = wants_before(opts.spacing.assignment_operator_spacing) ? 1 : 0;
+    if (L_assign) spaces = wants_after(opts.spacing.assignment_operator_spacing) ? 1 : 0;
+
+    // Binary operators (non-assignment).
+    // Closing brackets carry depth=1 (before decrement), so exclude them from the
+    // L-side dim check to avoid treating tokens after ] as inside a dimension.
+    bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
+                  (L.immutable.syntax.bracket_depth > 0 && !kind_is(L, TK::CloseBracket));
+    const std::string& bop_mode = in_dim ? opts.spacing.dimension_binary_operator_spacing : opts.spacing.binary_operator_spacing;
+    // A sign or reduction in unary position is not a binary operator:
+    // `f(-a)`, `y = &c`.  Its own gap after it was settled above.
+    const bool t_unary = is_sign_or_reduction_op(t.lex.kind) && in_prefix_position(tokens, i);
+    if (is_binary_op(t.lex.kind) && !t_assign && !t_unary)
+        spaces = wants_before(bop_mode) ? 1 : 0;
+    if (is_binary_op(L.lex.kind) && !L_assign && !L_unary)
+        spaces = wants_after(bop_mode) ? 1 : 0;
+    if (is_binary_op(L.lex.kind) && !L_assign &&
+        can_begin_unary_expression(t.lex.kind)) {
+        // Do not concatenate a binary operator with the unary operator
+        // that starts its right-hand operand.  SystemVerilog has many
+        // multi-character operator tokens, so removing this separator
+        // can change the token stream on the next pass:
+        //
+        //   a && &b  -> a&&&b  // lexes as the single &&& token
+        //   a + +b   -> a++b   // prefix/postfix increment ambiguity
+        //   a - -b   -> a--b   // decrement ambiguity
+        //   a ^ ~b   -> a^~b   // xnor token
+        //
+        // Keep one syntactic separator independent of the configured
+        // binary_operator_spacing style -- where one is needed.
+        // `a*-b` and `c&~d` lex as written.
+        if (operators_would_merge(L.lex.text, t.lex.text))
+            spaces = std::max(spaces, 1);
+    }
+    // `@(*)` -- the `*` is the implicit event list, not a multiplication,
+    // so the `(` before it spaces like the one before any first token.
+    if (kind_is(t, TK::Star) && kind_is(L, TK::OpenParenthesis)) {
+        const size_t before_open = prev_code(tokens, i - 1);
+        if (before_open != npos && kind_is(tokens[before_open], TK::At))
+            spaces = (opts.spacing.space_inside_parens || opts.spacing.space_inside_event_control_parens) ? 1 : 0;
+    }
+    // `inside` is a keyword operator — always needs spaces regardless of bop_mode
+    if (kind_is(t, TK::InsideKeyword)) spaces = 1;
+    if (kind_is(L, TK::InsideKeyword)) spaces = 1;
+
+    // Range/part-select
+    // A min:typ:max triple (`#(1:2:3)`) is one value, spaced as a range.
+    const bool t_range_colon = kind_is(t, TK::Colon) && (in_dim || t.immutable.topology.is_min_typ_max_colon);
+    const bool L_range_colon = kind_is(L, TK::Colon) && (in_dim || L.immutable.topology.is_min_typ_max_colon);
+    if (t_range_colon) spaces = wants_before(opts.spacing.range_colon_spacing) ? 1 : 0;
+    if (L_range_colon) spaces = wants_after(opts.spacing.range_colon_spacing) ? 1 : 0;
+    if (kind_is(t, TK::PlusColon) || kind_is(t, TK::MinusColon)) spaces = wants_before(opts.spacing.indexed_part_select_spacing) ? 1 : 0;
+    if (kind_is(L, TK::PlusColon) || kind_is(L, TK::MinusColon)) spaces = wants_after(opts.spacing.indexed_part_select_spacing) ? 1 : 0;
+
+    // wait keyword: no space before ( (like a function call, not a control keyword)
+    if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::WaitKeyword)) spaces = 0;
+    // `first_match(s)` is an operator applied to its argument, written
+    // like a call.  So are `strong(s)` and `weak(s)`.
+    if (kind_is(t, TK::OpenParenthesis) &&
+        (kind_is(L, TK::FirstMatchKeyword) || kind_is(L, TK::StrongKeyword) ||
+         kind_is(L, TK::WeakKeyword)))
+        spaces = 0;
+
+    // @ event control spacing.  `always @(e)`, a statement `@(e);` and
+    // `@(e) x = 1;` are one construct and follow the same options,
+    // whatever the event expression holds.  A covergroup's sampling
+    // event is not procedural and keeps its own spacing.
+    if (kind_is(t, TK::At)) {
+        // After a `;` the `@` starts a statement: the `;` decides.
+        spaces = kind_is(L, TK::Semicolon) ||
+                         wants_before(opts.spacing.procedural_event_control_at_spacing)
+                     ? 1 : 0;
+        // `assert property (@(posedge clk) ...)` -- right after a
+        // `(` the parenthesis spacing decides, not the event rule.
+        if (kind_is(L, TK::OpenParenthesis))
+            spaces = opts.spacing.space_inside_parens ? 1 : 0;
+        // The option is about the keyword the event control follows
+        // (`always @(e)`).  An intra-assignment event takes the
+        // operator's spacing (`q <= @(e) d;`), and a control's `)`
+        // or delay is always separated from the `@` after it
+        // (`wait (a) @(e) x = 1;`, `#5 @(e) x = 1;`,
+        // `q <= repeat (2) @(e) d;`).
+        const size_t before_L = prev_code(tokens, i - 1);
+        const size_t L_open = kind_is(L, TK::CloseParenthesis) ? L.immutable.syntax.matching_token : npos;
+        const size_t L_owner = L_open == npos ? npos : prev_code(tokens, L_open);
+        if (L_assign)
+            spaces = wants_after(opts.spacing.assignment_operator_spacing) ? 1 : 0;
+        else if (closes_control_header(tokens, i - 1) ||
+                 (before_L != npos && kind_is(tokens[before_L], TK::Hash)) ||
+                 (L_owner != npos && tokens[L_owner].immutable.topology.is_intra_assignment_repeat))
+            spaces = 1;
+        // `clocking cb @(e);`, `covergroup cg @(e);` -- the event
+        // follows the name being declared, not a keyword, and a name
+        // is separated from what comes after it.
+        else if (is_covergroup_event_at(tokens, i) || is_named_clocking_event_at(tokens, i))
+            spaces = 1;
+    }
+    if (kind_is(L, TK::At)) {
+        const bool covergroup_event = is_covergroup_event_at(tokens, i - 1);
+        spaces = (!covergroup_event && wants_after(opts.spacing.procedural_event_control_at_spacing)) ? 1 : 0;
+    }
+    // `@@(begin f)` -- a covergroup's block event, spaced as its `@(e)` is.
+    if (kind_is(t, TK::DoubleAt))
+        spaces = 1;
+    if (kind_is(L, TK::DoubleAt))
+        spaces = 0;
+    // space_inside_event_control_parens: add space inside ( ) of procedural event control.
+    // Only applies when ( directly follows @ which is not a standalone delay control.
+    if (opts.spacing.space_inside_event_control_parens) {
+        if (kind_is(L, TK::OpenParenthesis) && i >= 2 && kind_is(tokens[i-2], TK::At)) {
+            if (!is_covergroup_event_at(tokens, i - 2)) spaces = 1;
+        }
+        if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token != npos) {
+            size_t j = t.immutable.syntax.matching_token;
+            if (j >= 1 && j < tokens.size() && kind_is(tokens[j], TK::OpenParenthesis) &&
+                j >= 1 && kind_is(tokens[j-1], TK::At)) {
+                if (!is_covergroup_event_at(tokens, j - 1)) spaces = 1;
+            }
+        }
+    }
+
+    // An attribute `(* keep *)` is one delimited unit: a space on
+    // each side of it, and one inside each delimiter under every
+    // config -- its `*` are not multiplications, and its `(` is not
+    // a call's (`sub (* keep *) u`, `function (* noinline *) int f`).
+    if (t.lex.in_attribute_instance) {
+        const bool attr_open = kind_is(t, TK::OpenParenthesis) && i + 1 < tokens.size() &&
+                               tokens[i + 1].lex.in_attribute_instance &&
+                               kind_is(tokens[i + 1], TK::Star);
+        const bool attr_close_star = kind_is(t, TK::Star) && i + 1 < tokens.size() &&
+                                     tokens[i + 1].lex.in_attribute_instance &&
+                                     kind_is(tokens[i + 1], TK::CloseParenthesis);
+        const bool after_attr_open = i >= 2 && kind_is(L, TK::Star) && L.lex.in_attribute_instance &&
+                                     kind_is(tokens[i - 2], TK::OpenParenthesis) &&
+                                     tokens[i - 2].lex.in_attribute_instance;
+        if (attr_open && !L.lex.in_attribute_instance &&
+            !(kind_is(L, TK::OpenParenthesis) || kind_is(L, TK::OpenBracket) ||
+              kind_is(L, TK::OpenBrace) || no_space_after(L.lex.kind) ||
+              is_binary_op(L.lex.kind) || is_assignment_op(L.lex.kind) || L_unary))
+            spaces = 1;
+        if (attr_close_star || after_attr_open)
+            spaces = 1;
+    }
+
+    // "No space" around an operator or `@` is about its operands.  A
+    // comment beside one is not an operand: `a+ // carry-in`,
+    // `a&& /* gate */ b`, `always_ff /* c */ @(...)`.
+    {
+        auto operator_like = [&](const Tok& tok) {
+            return is_code_token(tok) && !tok.lex.in_attribute_instance &&
+                   (is_binary_op(tok.lex.kind) || is_assignment_op(tok.lex.kind) ||
+                    kind_is(tok, TK::At));
+        };
+        if ((t.lex.comment_kind != CommentLexemeKind::None && operator_like(L)) ||
+            (L.lex.comment_kind != CommentLexemeKind::None && operator_like(t)))
+            spaces = std::max(spaces, 1);
+    }
+
+    // End-label colon: `endclass: Foo`, `endfunction: bar`, etc. — no space before `:`
+    if (kind_is(t, TK::Colon) && t.immutable.topology.is_block_name_colon)
+        spaces = 0;
+    // Case item labels are `label: stmt` whatever the label ends in.
+    // Deciding from the left token alone gave `8'b0111:` but
+    // `4'hc4 :`, `` `OP :`` and `default :` -- and closed up the
+    // conditional in `c ? 4'd1 : 4'd2`, whose colon also follows a
+    // number.
+    if (kind_is(t, TK::Colon) && t.immutable.topology.is_case_item_colon)
+        spaces = 0;
+    // `a_x: assert property ...`, `cp: coverpoint x;`, `g: if (P)`
+    // -- a label names the statement or item that follows it.
+    if (kind_is(t, TK::Colon) && t.immutable.topology.is_item_label_colon)
+        spaces = 0;
+    // `instance top.a use lib.cell:cfg;` -- in a config's `use` clause
+    // the colon joins a cell to the configuration that binds it.  It is
+    // part of the name, not a conditional's or a label's.  `use` is a
+    // keyword of config blocks and nothing else.
+    {
+        auto is_use_clause_colon = [&](size_t at) {
+            if (!kind_is(tokens[at], TK::Colon))
+                return false;
+            for (size_t p = prev_code(tokens, at); p != npos; p = prev_code(tokens, p)) {
+                if (kind_is(tokens[p], TK::UseKeyword))
+                    return true;
+                if (kind_is(tokens[p], TK::Semicolon) || is_open_block(tokens[p].lex.kind) ||
+                    is_close_block(tokens[p].lex.kind))
+                    return false;
+            }
+            return false;
+        };
+        if (is_use_clause_colon(i) || is_use_clause_colon(i - 1))
+            spaces = 0;
+    }
+
+    // semicolon_spacing: controls space before/after `;` inside for-loop headers
+    // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)
+    // A brace block's own `;` inside parentheses (`with { a; b; }`)
+    // ends a statement, not a header clause.
+    auto header_semicolon = [](const Tok& tok) {
+        return kind_is(tok, TK::Semicolon) && tok.immutable.syntax.paren_depth > 0 &&
+               !tok.immutable.topology.separates_brace_block_items;
+    };
+    if (header_semicolon(t))
+        spaces = wants_before(opts.spacing.semicolon_spacing) ? 1 : 0;
+    if (header_semicolon(L))
+        spaces = wants_after(opts.spacing.semicolon_spacing) ? 1 : 0;
+    // An empty clause adds no padding: `for (;;)`, `for (i = 0;;)`.
+    // Without this the `;` beside `(` took its before-space and the
+    // one beside `)` did not, or the other way round.
+    if ((header_semicolon(t) && (kind_is(L, TK::OpenParenthesis) || header_semicolon(L))) ||
+        (header_semicolon(L) && kind_is(t, TK::CloseParenthesis)))
+        spaces = 0;
+
+    if ((kind_is(t, TK::Semicolon) && !header_semicolon(t)) ||
+        (kind_is(t, TK::Comma) && !kind_is(L, TK::Comma)) ||
+        (kind_is(t, TK::Dot) && !dot_spaced) || kind_is(t, TK::DoubleColon))
+        spaces = 0;
+    if (kind_is(t, TK::CloseParenthesis) &&
+        !opts.spacing.space_inside_parens &&
+        !(pads_call_close(i))) {
+        bool event_control_close = false;
+        if (opts.spacing.space_inside_event_control_parens &&
+            t.immutable.syntax.matching_token != npos) {
+            size_t open = t.immutable.syntax.matching_token;
+            size_t before_open = prev_code(tokens, open);
+            event_control_close = before_open != npos && kind_is(tokens[before_open], TK::At);
+        }
+        if (!event_control_close)
+        spaces = 0;
+    }
+    // ... and the `)` after the implicit event list mirrors that `(`.
+    if (kind_is(t, TK::CloseParenthesis) && kind_is(L, TK::Star) &&
+        t.immutable.syntax.matching_token == i - 2) {
+        const size_t before_open = prev_code(tokens, i - 2);
+        if (before_open != npos && kind_is(tokens[before_open], TK::At))
+            spaces = (opts.spacing.space_inside_parens || opts.spacing.space_inside_event_control_parens) ? 1 : 0;
+    }
+    // Empty parens have nothing to pad: `f()`, `new()`, `sub u();`.
+    if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token == i - 1)
+        spaces = 0;
+
+    // `{4{a}}` -- the multiplier binds to its replicated braces.
+    if (kind_is(t, TK::OpenBrace) && t.immutable.topology.is_replication_brace)
+        spaces = 0;
+
+    // Stream concatenation header: `{`, the stream operator, an optional
+    // slice size, then the braces holding the operand all bind tightly.
+    // This runs last because the operator-spacing rules above would
+    // otherwise re-separate `<<` as the binary shift it is spelled like.
+    {
+        const size_t pc = prev_code(tokens, i);
+        const size_t ppc = pc == npos ? npos : prev_code(tokens, pc);
+        if (is_stream_operator_at(tokens, i) ||
+            (pc != npos && is_stream_operator_at(tokens, pc)) ||
+            ((kind_is(t, TK::OpenBrace) || kind_is(t, TK::ApostropheOpenBrace)) &&
+             ppc != npos && is_stream_operator_at(tokens, ppc)))
+            spaces = 0;
+    }
+
+    return std::max(0, spaces);
+}
+
 // SpacingPass owns SpaceMetadata.  It reads upstream wrap/comment metadata to
 // avoid assigning in-line spaces before tokens that will start a line.
 class SpacingPass final : public IFormatPass {
@@ -7171,600 +7752,8 @@ public:
                 t.mutable_.space.spaces_before = after_escaped_on_same_line ? 1 : 0;
                 continue;
             }
-            const Tok& L = tokens[i - 1];
-            int spaces = 1;
-
-            // An escaped identifier is delimited by whitespace, so the token
-            // after it can never be closed up against it -- `\\esc` + `;` would
-            // re-lex as the single identifier `\\esc;`.  This outranks every
-            // no-space rule below, so decide it before any of them run.
-            if (L.lex.is_escaped_identifier) {
-                t.mutable_.space.spaces_before = 1;
-                t.mutable_.space.suppress_space = false;
-                continue;
-            }
-
-            // `` `DV_CHECK_FATAL(a == b, "msg") `` with a listed macro: the
-            // lexer froze everything between the parentheses, the gap before
-            // `)` included, so the `)` binds to it as the `(` side already
-            // does.  Padding it grew the gap by one on every format.
-            if (L.lex.is_whitespace_sensitive && kind_is(t, TK::CloseParenthesis)) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
-                continue;
-            }
-
-            // `(*` and `*)` are single lexemes in the LRM.  Letting the ordinary
-            // paren rules put a space between the halves turns an attribute into
-            // a parenthesised expression, so keep them closed up.  The text
-            // between the delimiters spaces like any other expression.
-            if (t.lex.in_attribute_instance && L.lex.in_attribute_instance &&
-                ((kind_is(L, TK::OpenParenthesis) && kind_is(t, TK::Star)) ||
-                 (kind_is(L, TK::Star) && kind_is(t, TK::CloseParenthesis)))) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
-                continue;
-            }
-
-            // Slang represents based literals as multiple tokens -- `12'h7c4`
-            // is `12`, `'h`, `7`, `c4` and `4'b1??0` is `4`, `'b`, `1`, `?`,
-            // `?`, `0`.  Keep the size against its base and the value pieces
-            // closed up; a space before a `?` digit re-lexes it as the
-            // conditional operator, so no later rule may reopen the gap.
-            // A macro can be the size: `` `WIDTH'h3 ``, `` `W(8)'d1 ``.
-            auto is_macro_size = [&]() {
-                if (kind_is(L, TK::MacroUsage))
-                    return true;
-                if (!kind_is(L, TK::CloseParenthesis) || L.immutable.syntax.matching_token == npos)
-                    return false;
-                const size_t callee = prev_code(tokens, L.immutable.syntax.matching_token);
-                return callee != npos && kind_is(tokens[callee], TK::MacroUsage);
-            };
-            if ((kind_is(t, TK::IntegerBase) && (kind_is(L, TK::IntegerLiteral) || is_macro_size())) ||
-                t.lex.continues_vector_literal) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
-                continue;
-            }
-
-            // SVA repetition `b[->1]`, `b[*1:3]`, `b[=2:$]` is an operator,
-            // not a dimension: everything inside its brackets binds, and the
-            // dimension options (padding, range-colon spacing) do not apply.
-            {
-                const size_t li = prev_code(tokens, i);
-                const size_t lli = li == npos ? npos : prev_code(tokens, li);
-                size_t enclosing = npos;
-                if (kind_is(t, TK::CloseBracket)) {
-                    enclosing = t.immutable.syntax.matching_token;
-                } else if (t.immutable.syntax.bracket_depth > 0) {
-                    for (size_t n = i; n > 0; --n) {
-                        const Tok& b = tokens[n - 1];
-                        if (kind_is(b, TK::CloseBracket) && b.immutable.syntax.matching_token != npos &&
-                            b.immutable.syntax.matching_token < n - 1) {
-                            n = b.immutable.syntax.matching_token + 1;
-                            continue;
-                        }
-                        if (kind_is(b, TK::OpenBracket)) {
-                            enclosing = n - 1;
-                            break;
-                        }
-                    }
-                }
-                if ((enclosing != npos && enclosing < tokens.size() && is_code_token(t) &&
-                     tokens[enclosing].immutable.topology.is_repetition_bracket) ||
-                    (li != npos && tokens[li].immutable.topology.is_repetition_bracket) ||
-                    (lli != npos && tokens[lli].immutable.topology.is_repetition_bracket)) {
-                    t.mutable_.space.spaces_before = 0;
-                    t.mutable_.space.suppress_space = true;
-                    continue;
-                }
-            }
-
-            // An inline conditional directive is delimited by whitespace:
-            // `` `else31 `` would re-lex as a macro named `else31`.
-            if (L.lex.is_directive || (t.lex.is_directive && !kind_is(L, TK::OpenBracket))) {
-                t.mutable_.space.spaces_before = 1;
-                t.mutable_.space.suppress_space = false;
-                continue;
-            }
-
-            // Basic no-space rules
-            if (no_space_before(t.lex.kind) || no_space_after(L.lex.kind)) spaces = 0;
-            // `( /*autoinst*/` keeps its space before the list.  A block
-            // comment that is the parens' only content is padded like any
-            // other first token, symmetric with its `)`: `.o(/* unused */)`.
-            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenParenthesis)) {
-                const bool sole_content = t.lex.comment_kind == CommentLexemeKind::Block &&
-                    L.immutable.syntax.matching_token != npos &&
-                    next_code(tokens, i + 1, tokens.size()) == L.immutable.syntax.matching_token;
-                if (!sole_content) spaces = 1;
-            }
-            // `typedef enum { // open` -- a comment after a `{` keeps its
-            // space too, as it does after a block brace.
-            if (t.lex.comment_kind != CommentLexemeKind::None && kind_is(L, TK::OpenBrace) &&
-                next_code(tokens, i + 1, tokens.size()) != L.immutable.syntax.matching_token)
-                spaces = 1;
-            // Empty positional argument: `, ,` — keep one space so the slot is visible
-            if (kind_is(t, TK::Comma) && kind_is(L, TK::Comma)) spaces = 1;
-
-            // Unary ops: no space after.
-            // Exception: `~ &a`, `~ |a`, `~ ^a` — tilde followed by a
-            // reduction operator must keep a space so it isn't read as
-            // the compound `~&` / `~|` / `~^` operator.
-            //
-            // Which tokens are unary depends on position: `-a`, `&c` and
-            // prefix `++x` bind to their operand, while binary `b ^~ c` and
-            // postfix `x++ > 3` space like any binary operator.
-            const size_t li = prev_code(tokens, i);
-            const bool L_prefix = li != npos && li == i - 1 && in_prefix_position(tokens, li);
-            const bool L_unary =
-                (is_unary_op(L.lex.kind) || is_sign_or_reduction_op(L.lex.kind)) &&
-                (L_prefix || kind_is(L, TK::Tilde) || kind_is(L, TK::Exclamation));
-            if (L_unary) {
-                if (!unary_pair_merges(L.lex.kind, t.lex.kind)) {
-                    t.mutable_.space.spaces_before = 0;
-                    t.mutable_.space.suppress_space = true;
-                    continue;
-                }
-                spaces = 1;
-            }
-
-            // Hierarchy: . and ::
-            if (kind_is(L, TK::Dot) || kind_is(L, TK::DoubleColon)) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
-                continue;
-            }
-            // function_call.space_inside_paren pads an argument list.  `new` is
-            // a keyword, so its `(` is not marked as one for the wrapping
-            // passes -- a constructor call is not broken like a call -- but it
-            // is one to this option, as it already is to space_before_paren.
-            auto pads_call_open = [&](size_t at) {
-                if (!opts_.function_call.space_inside_paren || !kind_is(tokens[at], TK::OpenParenthesis))
-                    return false;
-                if (tokens[at].immutable.topology.starts_argument_list)
-                    return true;
-                const size_t callee = prev_code(tokens, at);
-                return callee != npos && kind_is(tokens[callee], TK::NewKeyword);
-            };
-            auto pads_call_close = [&](size_t at) {
-                if (!opts_.function_call.space_inside_paren || !kind_is(tokens[at], TK::CloseParenthesis))
-                    return false;
-                if (tokens[at].immutable.topology.ends_argument_list)
-                    return true;
-                const size_t match = tokens[at].immutable.syntax.matching_token;
-                return match != npos && pads_call_open(match);
-            };
-            // `#( .WIDTH(8) )` -- a padded `(` pads before a named connection
-            // too, as it does before any other first token.
-            const bool padded_open = kind_is(L, TK::OpenParenthesis) &&
-                (opts_.spacing.space_inside_parens ||
-                 (pads_call_open(i - 1)));
-            // `sub u ((* keep *) .p(x));` -- an attribute keeps a space on each
-            // side, before the connection it annotates as before anything else.
-            const bool after_attribute = kind_is(L, TK::CloseParenthesis) &&
-                                         L.lex.in_attribute_instance;
-            const bool dot_spaced = kind_is(t, TK::Dot) &&
-                (dot_keeps_space_after(tokens, i) || padded_open || after_attribute);
-            if (dot_spaced) {
-                spaces = 1;
-            } else if (kind_is(t, TK::Dot) || kind_is(t, TK::DoubleColon)) {
-                t.mutable_.space.spaces_before = 0;
-                t.mutable_.space.suppress_space = true;
-                continue;
-            }
-
-            // # hash: no space before next token.  `##` is the cycle delay
-            // (`a ##1 b`, `##[1:3]`) and binds the same way.  A comment
-            // after it is no operand and keeps its space: `# /* d */ 5`.
-            if (kind_is(L, TK::Hash) || kind_is(L, TK::DoubleHash)) {
-                const bool comment = t.lex.comment_kind != CommentLexemeKind::None;
-                t.mutable_.space.spaces_before = comment ? 1 : 0;
-                t.mutable_.space.suppress_space = !comment;
-                continue;
-            }
-
-            // No space before '[' when it's an index/dimension on an identifier or closer
-            if (kind_is(t, TK::OpenBracket) &&
-                (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis) ||
-                 kind_is(L, TK::NewKeyword) ||
-                 // `{b, c}[3:0]` -- a select on a concatenation.  A `}` that
-                 // closes a block or a struct body ends no expression.
-                 (kind_is(L, TK::CloseBrace) && L.immutable.syntax.matching_token != npos &&
-                  !tokens[L.immutable.syntax.matching_token].immutable.topology.opens_brace_block)) &&
-                !closes_strength(tokens, i - 1))
-                spaces = 0;
-            if (kind_is(t, TK::OpenBracket) && is_identifier_like(L) &&
-                t.immutable.syntax.matching_token != npos) {
-                size_t after_dim = next_code(tokens, t.immutable.syntax.matching_token + 1, tokens.size());
-                if (after_dim != npos && is_identifier_like(tokens[after_dim]))
-                    spaces = 1;
-                else if (is_var_declaration_trailing_dimension_open(tokens, i))
-                    spaces = 1;
-            }
-
-            // Function/task declaration spacing has its own option because many
-            // codebases prefer `foo (...)` for calls but `function foo(...)` for
-            // declarations (or vice versa).  Check it before the generic
-            // call-like rule below; wrapped and unwrapped declarations both
-            // pass through this spacing pass.
-            // An empty port list (`sub u0 ();`) is no list to WrapPass, so it
-            // is recognised by its shape here.
-            const bool empty_instance_ports =
-                kind_is(t, TK::OpenParenthesis) && t.immutable.syntax.matching_token != npos &&
-                next_code(tokens, i + 1, tokens.size()) == t.immutable.syntax.matching_token &&
-                is_instance_port_open(tokens, i);
-            if (kind_is(t, TK::OpenParenthesis) && is_function_task_declaration_open(tokens, i))
-                spaces = opts_.function_declaration.space_before_paren ? 1 : 0;
-            // Function/task call spacing.  `new` lexes as its own keyword rather
-            // than an identifier, but `new(...)` is a constructor call and must
-            // follow the same option -- otherwise every class constructor
-            // renders as `new (name)`.
-            // `type(x)` and `binsof(cp)` are call-shaped keywords too.
-            else if (kind_is(t, TK::OpenParenthesis) && (kind_is(L, TK::Identifier) || kind_is(L, TK::SystemIdentifier) || kind_is(L, TK::MacroUsage) || kind_is(L, TK::NewKeyword) ||
-                                                        kind_is(L, TK::TypeKeyword) || kind_is(L, TK::BinsOfKeyword) ||
-                                                        // `q.unique()`, `q.and()` -- a member named by a keyword
-                                                        // is still a method.  Nothing but a name follows a `.`.
-                                                        (is_code_token(L) && i >= 2 && kind_is(tokens[i - 2], TK::Dot))))
-                spaces = opts_.function_call.space_before_paren ? 1 : 0;
-            // `new[10](init)` -- the initializer is the constructor's argument
-            // list, so it spaces like `new(...)`.
-            else if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::CloseBracket) &&
-                     L.immutable.syntax.matching_token != npos) {
-                const size_t before_dim = prev_code(tokens, L.immutable.syntax.matching_token);
-                if (before_dim != npos && kind_is(tokens[before_dim], TK::NewKeyword))
-                    spaces = opts_.function_call.space_before_paren ? 1 : 0;
-                // `u_arr[3:0](...)` -- an instance array's connections space
-                // like the plain instance's `u_one(...)`.
-                else if (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts ||
-                         is_gate_terminal_open(tokens, i) || empty_instance_ports)
-                    spaces = opts_.function_call.space_before_paren ? 1 : 0;
-            }
-            // `rand join (0.5) a b` -- the lexer hands a production's `join`
-            // over as a plain word; it is still a keyword and calls nothing.
-            if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::Identifier)) {
-                const size_t word = prev_code(tokens, i);
-                const size_t before = word == npos ? npos : prev_code(tokens, word);
-                if (before != npos && kind_is(tokens[before], TK::RandKeyword))
-                    spaces = 1;
-            }
-            if (kind_is(t, TK::OpenParenthesis) && opts_.instance.align &&
-                (t.mutable_.wrap.list_kind == WrapListKind::InstancePorts || is_gate_terminal_open(tokens, i) ||
-                 empty_instance_ports))
-                spaces = 1;
-            if (kind_is(t, TK::OpenParenthesis) && t.mutable_.wrap.list_kind == WrapListKind::ModportBody)
-                spaces = 1;
-            if (kind_is(t, TK::OpenParenthesis) && t.immutable.topology.starts_port_list &&
-                kind_is(L, TK::CloseParenthesis))
-                spaces = 0;
-            if (kind_is(t, TK::OpenParenthesis) && is_control_keyword(L.lex.kind))
-                spaces = opts_.spacing.control_keyword_space ? 1 : 0;
-            if ((kind_is(L, TK::OpenParenthesis) || kind_is(t, TK::CloseParenthesis)) && opts_.spacing.space_inside_parens) spaces = 1;
-            // function.space_inside_paren: space inside argument-list parens only
-            if (kind_is(L, TK::OpenParenthesis) && pads_call_open(i - 1)) spaces = 1;
-            if (kind_is(t, TK::CloseParenthesis) && pads_call_close(i)) spaces = 1;
-            if ((kind_is(L, TK::OpenBracket) || kind_is(t, TK::CloseBracket)) && opts_.spacing.space_inside_dimension_brackets) spaces = 1;
-
-            // } brace: 1 space after (unless followed by ; or ,).  Only a brace
-            // that closes a statement block takes this; an expression brace's
-            // `}` spaces like any other closing token, so a nested
-            // concatenation renders `{f, {g, h}}` rather than `{f, {g, h} }`.
-            if (kind_is(L, TK::CloseBrace) && closes_indent_scope_at(tokens, i - 1) &&
-                !kind_is(t, TK::Semicolon) && !kind_is(t, TK::Comma)) spaces = 1;
-            // A statement block kept on one line, `with { a < 5; b == 3; }`,
-            // is padded inside its braces like `begin ... end`.
-            if (kind_is(L, TK::OpenBrace) && L.immutable.topology.opens_brace_block)
-                spaces = 1;
-            if (kind_is(t, TK::CloseBrace) && t.immutable.syntax.matching_token != npos &&
-                kind_is(tokens[t.immutable.syntax.matching_token], TK::OpenBrace) &&
-                tokens[t.immutable.syntax.matching_token].immutable.topology.opens_brace_block)
-                spaces = 1;
-            // An empty block has nothing to pad: `constraint c {}`.
-            if (kind_is(t, TK::CloseBrace) && is_empty_brace_pair(tokens, i - 1))
-                spaces = 0;
-            // A padded `)` keeps its pad after a `}` as after anything else.
-            if (kind_is(L, TK::CloseBrace) && kind_is(t, TK::CloseParenthesis) &&
-                !opts_.spacing.space_inside_parens &&
-                !(pads_call_close(i)))
-                spaces = 0;
-
-            // Apostrophe / cast: no space
-            if (kind_is(t, TK::Apostrophe) || kind_is(L, TK::Apostrophe)) spaces = 0;
-            // Apostrophe-open-brace assignment patterns / casts.  Only a
-            // cast's type (`pkt_t'{...}`) and an opening delimiter bind to the
-            // pattern; after a comma, a pattern key's `:` or a `?` it is an
-            // operand like any other (`data : '{raw : 0}`, `c ? '{1} : '{2}`).
-            // A padded `(` or `[` keeps its pad before a pattern as before
-            // any other first token: `fn( '{1, 2}, x )`.
-            if (kind_is(t, TK::ApostropheOpenBrace) &&
-                (is_identifier_like(L) || is_type_keyword(L.lex.kind) ||
-                 kind_is(L, TK::CloseParenthesis) || kind_is(L, TK::CloseBracket) ||
-                 (kind_is(L, TK::OpenParenthesis) && !padded_open) ||
-                 (kind_is(L, TK::OpenBracket) && !opts_.spacing.space_inside_dimension_brackets) ||
-                 kind_is(L, TK::OpenBrace) || kind_is(L, TK::ApostropheOpenBrace)))
-                spaces = 0;
-            // `tagged Pair '{.a, .b}` -- the name is a union member's tag and
-            // the pattern its value, as in `tagged Valid .n`; it is not the
-            // cast `Pair'{...}`.
-            if (kind_is(t, TK::ApostropheOpenBrace) && kind_is(L, TK::Identifier)) {
-                const size_t tag_kw = prev_code(tokens, i - 1);
-                if (tag_kw != npos && kind_is(tokens[tag_kw], TK::TaggedKeyword))
-                    spaces = 1;
-            }
-
-            // Postfix ++ / --: no space before when attached to an identifier, ], or )
-            if ((kind_is(t, TK::DoublePlus) || kind_is(t, TK::DoubleMinus)) &&
-                (is_identifier_like(L) || kind_is(L, TK::CloseBracket) || kind_is(L, TK::CloseParenthesis)))
-                spaces = 0;
-
-            // Assignment operators.
-            // LessThanEquals is context-sensitive: inside parens it's a comparison, not
-            // non-blocking assignment.  Treat it as a regular binary op in that context.
-            auto is_assign = [&](size_t at) {
-                return is_assignment_op(tokens[at].lex.kind) && !is_relational_less_equal(tokens, at);
-            };
-            const bool t_assign = is_assign(i);
-            const bool L_assign = is_assign(i - 1);
-            if (t_assign) spaces = wants_before(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
-            if (L_assign) spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
-
-            // Binary operators (non-assignment).
-            // Closing brackets carry depth=1 (before decrement), so exclude them from the
-            // L-side dim check to avoid treating tokens after ] as inside a dimension.
-            bool in_dim = t.immutable.syntax.bracket_depth > 0 ||
-                          (L.immutable.syntax.bracket_depth > 0 && !kind_is(L, TK::CloseBracket));
-            const std::string& bop_mode = in_dim ? opts_.spacing.dimension_binary_operator_spacing : opts_.spacing.binary_operator_spacing;
-            // A sign or reduction in unary position is not a binary operator:
-            // `f(-a)`, `y = &c`.  Its own gap after it was settled above.
-            const bool t_unary = is_sign_or_reduction_op(t.lex.kind) && in_prefix_position(tokens, i);
-            if (is_binary_op(t.lex.kind) && !t_assign && !t_unary)
-                spaces = wants_before(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex.kind) && !L_assign && !L_unary)
-                spaces = wants_after(bop_mode) ? 1 : 0;
-            if (is_binary_op(L.lex.kind) && !L_assign &&
-                can_begin_unary_expression(t.lex.kind)) {
-                // Do not concatenate a binary operator with the unary operator
-                // that starts its right-hand operand.  SystemVerilog has many
-                // multi-character operator tokens, so removing this separator
-                // can change the token stream on the next pass:
-                //
-                //   a && &b  -> a&&&b  // lexes as the single &&& token
-                //   a + +b   -> a++b   // prefix/postfix increment ambiguity
-                //   a - -b   -> a--b   // decrement ambiguity
-                //   a ^ ~b   -> a^~b   // xnor token
-                //
-                // Keep one syntactic separator independent of the configured
-                // binary_operator_spacing style -- where one is needed.
-                // `a*-b` and `c&~d` lex as written.
-                if (operators_would_merge(L.lex.text, t.lex.text))
-                    spaces = std::max(spaces, 1);
-            }
-            // `@(*)` -- the `*` is the implicit event list, not a multiplication,
-            // so the `(` before it spaces like the one before any first token.
-            if (kind_is(t, TK::Star) && kind_is(L, TK::OpenParenthesis)) {
-                const size_t before_open = prev_code(tokens, i - 1);
-                if (before_open != npos && kind_is(tokens[before_open], TK::At))
-                    spaces = (opts_.spacing.space_inside_parens || opts_.spacing.space_inside_event_control_parens) ? 1 : 0;
-            }
-            // `inside` is a keyword operator — always needs spaces regardless of bop_mode
-            if (kind_is(t, TK::InsideKeyword)) spaces = 1;
-            if (kind_is(L, TK::InsideKeyword)) spaces = 1;
-
-            // Range/part-select
-            // A min:typ:max triple (`#(1:2:3)`) is one value, spaced as a range.
-            const bool t_range_colon = kind_is(t, TK::Colon) && (in_dim || t.immutable.topology.is_min_typ_max_colon);
-            const bool L_range_colon = kind_is(L, TK::Colon) && (in_dim || L.immutable.topology.is_min_typ_max_colon);
-            if (t_range_colon) spaces = wants_before(opts_.spacing.range_colon_spacing) ? 1 : 0;
-            if (L_range_colon) spaces = wants_after(opts_.spacing.range_colon_spacing) ? 1 : 0;
-            if (kind_is(t, TK::PlusColon) || kind_is(t, TK::MinusColon)) spaces = wants_before(opts_.spacing.indexed_part_select_spacing) ? 1 : 0;
-            if (kind_is(L, TK::PlusColon) || kind_is(L, TK::MinusColon)) spaces = wants_after(opts_.spacing.indexed_part_select_spacing) ? 1 : 0;
-
-            // wait keyword: no space before ( (like a function call, not a control keyword)
-            if (kind_is(t, TK::OpenParenthesis) && kind_is(L, TK::WaitKeyword)) spaces = 0;
-            // `first_match(s)` is an operator applied to its argument, written
-            // like a call.  So are `strong(s)` and `weak(s)`.
-            if (kind_is(t, TK::OpenParenthesis) &&
-                (kind_is(L, TK::FirstMatchKeyword) || kind_is(L, TK::StrongKeyword) ||
-                 kind_is(L, TK::WeakKeyword)))
-                spaces = 0;
-
-            // @ event control spacing.  `always @(e)`, a statement `@(e);` and
-            // `@(e) x = 1;` are one construct and follow the same options,
-            // whatever the event expression holds.  A covergroup's sampling
-            // event is not procedural and keeps its own spacing.
-            if (kind_is(t, TK::At)) {
-                // After a `;` the `@` starts a statement: the `;` decides.
-                spaces = kind_is(L, TK::Semicolon) ||
-                                 wants_before(opts_.spacing.procedural_event_control_at_spacing)
-                             ? 1 : 0;
-                // `assert property (@(posedge clk) ...)` -- right after a
-                // `(` the parenthesis spacing decides, not the event rule.
-                if (kind_is(L, TK::OpenParenthesis))
-                    spaces = opts_.spacing.space_inside_parens ? 1 : 0;
-                // The option is about the keyword the event control follows
-                // (`always @(e)`).  An intra-assignment event takes the
-                // operator's spacing (`q <= @(e) d;`), and a control's `)`
-                // or delay is always separated from the `@` after it
-                // (`wait (a) @(e) x = 1;`, `#5 @(e) x = 1;`,
-                // `q <= repeat (2) @(e) d;`).
-                const size_t before_L = prev_code(tokens, i - 1);
-                const size_t L_open = kind_is(L, TK::CloseParenthesis) ? L.immutable.syntax.matching_token : npos;
-                const size_t L_owner = L_open == npos ? npos : prev_code(tokens, L_open);
-                if (L_assign)
-                    spaces = wants_after(opts_.spacing.assignment_operator_spacing) ? 1 : 0;
-                else if (closes_control_header(tokens, i - 1) ||
-                         (before_L != npos && kind_is(tokens[before_L], TK::Hash)) ||
-                         (L_owner != npos && tokens[L_owner].immutable.topology.is_intra_assignment_repeat))
-                    spaces = 1;
-                // `clocking cb @(e);`, `covergroup cg @(e);` -- the event
-                // follows the name being declared, not a keyword, and a name
-                // is separated from what comes after it.
-                else if (is_covergroup_event_at(tokens, i) || is_named_clocking_event_at(tokens, i))
-                    spaces = 1;
-            }
-            if (kind_is(L, TK::At)) {
-                const bool covergroup_event = is_covergroup_event_at(tokens, i - 1);
-                spaces = (!covergroup_event && wants_after(opts_.spacing.procedural_event_control_at_spacing)) ? 1 : 0;
-            }
-            // `@@(begin f)` -- a covergroup's block event, spaced as its `@(e)` is.
-            if (kind_is(t, TK::DoubleAt))
-                spaces = 1;
-            if (kind_is(L, TK::DoubleAt))
-                spaces = 0;
-            // space_inside_event_control_parens: add space inside ( ) of procedural event control.
-            // Only applies when ( directly follows @ which is not a standalone delay control.
-            if (opts_.spacing.space_inside_event_control_parens) {
-                if (kind_is(L, TK::OpenParenthesis) && i >= 2 && kind_is(tokens[i-2], TK::At)) {
-                    if (!is_covergroup_event_at(tokens, i - 2)) spaces = 1;
-                }
-                if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token != npos) {
-                    size_t j = t.immutable.syntax.matching_token;
-                    if (j >= 1 && j < tokens.size() && kind_is(tokens[j], TK::OpenParenthesis) &&
-                        j >= 1 && kind_is(tokens[j-1], TK::At)) {
-                        if (!is_covergroup_event_at(tokens, j - 1)) spaces = 1;
-                    }
-                }
-            }
-
-            // An attribute `(* keep *)` is one delimited unit: a space on
-            // each side of it, and one inside each delimiter under every
-            // config -- its `*` are not multiplications, and its `(` is not
-            // a call's (`sub (* keep *) u`, `function (* noinline *) int f`).
-            if (t.lex.in_attribute_instance) {
-                const bool attr_open = kind_is(t, TK::OpenParenthesis) && i + 1 < tokens.size() &&
-                                       tokens[i + 1].lex.in_attribute_instance &&
-                                       kind_is(tokens[i + 1], TK::Star);
-                const bool attr_close_star = kind_is(t, TK::Star) && i + 1 < tokens.size() &&
-                                             tokens[i + 1].lex.in_attribute_instance &&
-                                             kind_is(tokens[i + 1], TK::CloseParenthesis);
-                const bool after_attr_open = i >= 2 && kind_is(L, TK::Star) && L.lex.in_attribute_instance &&
-                                             kind_is(tokens[i - 2], TK::OpenParenthesis) &&
-                                             tokens[i - 2].lex.in_attribute_instance;
-                if (attr_open && !L.lex.in_attribute_instance &&
-                    !(kind_is(L, TK::OpenParenthesis) || kind_is(L, TK::OpenBracket) ||
-                      kind_is(L, TK::OpenBrace) || no_space_after(L.lex.kind) ||
-                      is_binary_op(L.lex.kind) || is_assignment_op(L.lex.kind) || L_unary))
-                    spaces = 1;
-                if (attr_close_star || after_attr_open)
-                    spaces = 1;
-            }
-
-            // "No space" around an operator or `@` is about its operands.  A
-            // comment beside one is not an operand: `a+ // carry-in`,
-            // `a&& /* gate */ b`, `always_ff /* c */ @(...)`.
-            {
-                auto operator_like = [&](const Tok& tok) {
-                    return is_code_token(tok) && !tok.lex.in_attribute_instance &&
-                           (is_binary_op(tok.lex.kind) || is_assignment_op(tok.lex.kind) ||
-                            kind_is(tok, TK::At));
-                };
-                if ((t.lex.comment_kind != CommentLexemeKind::None && operator_like(L)) ||
-                    (L.lex.comment_kind != CommentLexemeKind::None && operator_like(t)))
-                    spaces = std::max(spaces, 1);
-            }
-
-            // End-label colon: `endclass: Foo`, `endfunction: bar`, etc. — no space before `:`
-            if (kind_is(t, TK::Colon) && t.immutable.topology.is_block_name_colon)
-                spaces = 0;
-            // Case item labels are `label: stmt` whatever the label ends in.
-            // Deciding from the left token alone gave `8'b0111:` but
-            // `4'hc4 :`, `` `OP :`` and `default :` -- and closed up the
-            // conditional in `c ? 4'd1 : 4'd2`, whose colon also follows a
-            // number.
-            if (kind_is(t, TK::Colon) && t.immutable.topology.is_case_item_colon)
-                spaces = 0;
-            // `a_x: assert property ...`, `cp: coverpoint x;`, `g: if (P)`
-            // -- a label names the statement or item that follows it.
-            if (kind_is(t, TK::Colon) && t.immutable.topology.is_item_label_colon)
-                spaces = 0;
-            // `instance top.a use lib.cell:cfg;` -- in a config's `use` clause
-            // the colon joins a cell to the configuration that binds it.  It is
-            // part of the name, not a conditional's or a label's.  `use` is a
-            // keyword of config blocks and nothing else.
-            {
-                auto is_use_clause_colon = [&](size_t at) {
-                    if (!kind_is(tokens[at], TK::Colon))
-                        return false;
-                    for (size_t p = prev_code(tokens, at); p != npos; p = prev_code(tokens, p)) {
-                        if (kind_is(tokens[p], TK::UseKeyword))
-                            return true;
-                        if (kind_is(tokens[p], TK::Semicolon) || is_open_block(tokens[p].lex.kind) ||
-                            is_close_block(tokens[p].lex.kind))
-                            return false;
-                    }
-                    return false;
-                };
-                if (is_use_clause_colon(i) || is_use_clause_colon(i - 1))
-                    spaces = 0;
-            }
-
-            // semicolon_spacing: controls space before/after `;` inside for-loop headers
-            // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)
-            // A brace block's own `;` inside parentheses (`with { a; b; }`)
-            // ends a statement, not a header clause.
-            auto header_semicolon = [](const Tok& tok) {
-                return kind_is(tok, TK::Semicolon) && tok.immutable.syntax.paren_depth > 0 &&
-                       !tok.immutable.topology.separates_brace_block_items;
-            };
-            if (header_semicolon(t))
-                spaces = wants_before(opts_.spacing.semicolon_spacing) ? 1 : 0;
-            if (header_semicolon(L))
-                spaces = wants_after(opts_.spacing.semicolon_spacing) ? 1 : 0;
-            // An empty clause adds no padding: `for (;;)`, `for (i = 0;;)`.
-            // Without this the `;` beside `(` took its before-space and the
-            // one beside `)` did not, or the other way round.
-            if ((header_semicolon(t) && (kind_is(L, TK::OpenParenthesis) || header_semicolon(L))) ||
-                (header_semicolon(L) && kind_is(t, TK::CloseParenthesis)))
-                spaces = 0;
-
-            if ((kind_is(t, TK::Semicolon) && !header_semicolon(t)) ||
-                (kind_is(t, TK::Comma) && !kind_is(L, TK::Comma)) ||
-                (kind_is(t, TK::Dot) && !dot_spaced) || kind_is(t, TK::DoubleColon))
-                spaces = 0;
-            if (kind_is(t, TK::CloseParenthesis) &&
-                !opts_.spacing.space_inside_parens &&
-                !(pads_call_close(i))) {
-                bool event_control_close = false;
-                if (opts_.spacing.space_inside_event_control_parens &&
-                    t.immutable.syntax.matching_token != npos) {
-                    size_t open = t.immutable.syntax.matching_token;
-                    size_t before_open = prev_code(tokens, open);
-                    event_control_close = before_open != npos && kind_is(tokens[before_open], TK::At);
-                }
-                if (!event_control_close)
-                spaces = 0;
-            }
-            // ... and the `)` after the implicit event list mirrors that `(`.
-            if (kind_is(t, TK::CloseParenthesis) && kind_is(L, TK::Star) &&
-                t.immutable.syntax.matching_token == i - 2) {
-                const size_t before_open = prev_code(tokens, i - 2);
-                if (before_open != npos && kind_is(tokens[before_open], TK::At))
-                    spaces = (opts_.spacing.space_inside_parens || opts_.spacing.space_inside_event_control_parens) ? 1 : 0;
-            }
-            // Empty parens have nothing to pad: `f()`, `new()`, `sub u();`.
-            if (kind_is(t, TK::CloseParenthesis) && t.immutable.syntax.matching_token == i - 1)
-                spaces = 0;
-
-            // `{4{a}}` -- the multiplier binds to its replicated braces.
-            if (kind_is(t, TK::OpenBrace) && t.immutable.topology.is_replication_brace)
-                spaces = 0;
-
-            // Stream concatenation header: `{`, the stream operator, an optional
-            // slice size, then the braces holding the operand all bind tightly.
-            // This runs last because the operator-spacing rules above would
-            // otherwise re-separate `<<` as the binary shift it is spelled like.
-            {
-                const size_t pc = prev_code(tokens, i);
-                const size_t ppc = pc == npos ? npos : prev_code(tokens, pc);
-                if (is_stream_operator_at(tokens, i) ||
-                    (pc != npos && is_stream_operator_at(tokens, pc)) ||
-                    ((kind_is(t, TK::OpenBrace) || kind_is(t, TK::ApostropheOpenBrace)) &&
-                     ppc != npos && is_stream_operator_at(tokens, ppc)))
-                    spaces = 0;
-            }
-
-            t.mutable_.space.spaces_before = std::max(0, spaces);
-            t.mutable_.space.suppress_space = spaces == 0;
+            t.mutable_.space.spaces_before = spacing_gap(tokens, i, opts_);
+            t.mutable_.space.suppress_space = t.mutable_.space.spaces_before == 0;
         }
     }
 private: const FormatOptions& opts_;

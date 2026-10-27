@@ -69,8 +69,8 @@ and nothing else:
 | Options | Own |
 | --- | --- |
 | `blank_lines_between_items` | blank |
-| every `align`, `align_adaptive`, `*_min_width`, `*_width`; every `[format.spacing]` option | space, indent |
-| `statement.align`, `statement.lhs_min_width`, `var_declaration.align`, `var_declaration.section1..3_min_width`, `tab_align`, `spacing.space_inside_parens`, `spacing.range_colon_spacing`, `spacing.dimension_binary_operator_spacing` | breaks, space, indent |
+| every `align`, `align_adaptive`, `*_min_width`, `*_width` | space, indent |
+| `statement.align`, `statement.lhs_min_width`, `var_declaration.align`, `var_declaration.section1..3_min_width`, `tab_align`, every `[format.spacing]` option | breaks, space, indent |
 | `instance.port_indent_level` | space, indent |
 | `indent_size`, `default_indent_level_inside_outmost_block` | breaks, indent, space |
 | `function_call.*`, `function_declaration.*`, `module.*` | breaks, indent, space |
@@ -78,19 +78,24 @@ and nothing else:
 
 Spacing and alignment options own indent only through hanging continuation
 lines, which sit under a column of the line above (`compute(alpha,` /
-`        beta)`). They never own breaks: WrapPass measures with
-`compact_width()`, which assumes one space between tokens except where the
-renderer always closes the gap up (`a[i][j]`, `8'hFF`, `-a`, `i++`), so a
-spacing option cannot move a line break. The exceptions widen what WrapPass
-measures, so they own breaks: call spacing (`function_call.space_*`) and
-`spacing.space_inside_parens` (`paren_spacing_width()`), the range colon and
-dimension operator spacing (`compact_gap()`: `[15:0]` is measured as
-printed), and the padding statement and declaration alignment put before
-`=` (`statement_align_padding()`).
+`        beta)`). Alignment options do not own breaks, except the padding
+statement and declaration alignment put before `=`
+(`statement_align_padding()`). Spacing options do: WrapPass runs before
+SpacingPass, and `compact_width()` measures every gap with `spacing_gap()`,
+the same rule SpacingPass prints with, so a line is measured as it will be
+printed. Inline block comments are measured too.
 
 A call's and a function header's `line_length` counts what follows the `)`
-that no break can move off its line: closers, names, `.` and `::`, through
-the `;` or the next `(` (`close_tail_width()`).
+up to the next place WrapPass can break: the `;`, the next call's `(`, a `{`,
+or a break already decided (`close_tail_width()`). Operators, `?:`, `@(...)`
+and `iff (...)` are not break points, so `fn(a) ? x : y;` is measured through
+its `;`. The indent comes from `line_indent()`, which predicts what
+IndentPass will set (scope depth, broken list items and their `)`,
+brace-less bodies); a blank line BlankLinePass keeps starts a line. A call
+that is past the limit even when broken stays whole, but the alignment
+padding before a statement's `=` does not count there: a broken statement
+is not aligned. The invariants test checks that the predicted width of
+every call left on one line equals its rendered width.
 
 The test flips every value of every option from eight base configs (default,
 all aligners on, six random mixes) and
