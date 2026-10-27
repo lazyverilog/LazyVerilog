@@ -1859,23 +1859,43 @@ ProjectIndexSnapshot::DerivedCache& ProjectIndexSnapshot::derived() const {
     return *derived_;
 }
 
-const ClassEntry* ProjectIndexSnapshot::find_class(const std::string& name,
-                                                   std::string_view from_path) const {
-    const auto it = class_slots.find(name);
-    if (it == class_slots.end())
+// The entry of @p slots' @p name whose shard is nearest @p from_path.  Shards
+// are in path order, headers first, so the strictly-nearer test keeps the same
+// tie-break find_module() has.
+template <typename Entry, typename Pick>
+static const Entry*
+nearest_slot(const ProjectIndexSnapshot& snapshot,
+             const std::unordered_map<std::string, std::vector<std::pair<size_t, size_t>>>& slots,
+             const std::string& name, std::string_view from_path, Pick pick) {
+    const auto it = slots.find(name);
+    if (it == slots.end())
         return nullptr;
-    // Shards are in path order, headers first, so the strictly-nearer test keeps
-    // the same tie-break find_module() has.
-    const ClassEntry* best = nullptr;
+    const Entry* best = nullptr;
     PathProximityScore best_score;
     for (const auto& [slot, i] : it->second) {
-        const auto score = path_proximity_score(from_path, shards[slot].path);
+        const auto score = path_proximity_score(from_path, snapshot.shards[slot].path);
         if (!best || score > best_score) {
-            best = &shards[slot].index->classes[i];
+            best = &pick(*snapshot.shards[slot].index)[i];
             best_score = score;
         }
     }
     return best;
+}
+
+const ClassEntry* ProjectIndexSnapshot::find_class(const std::string& name,
+                                                   std::string_view from_path) const {
+    return nearest_slot<ClassEntry>(*this, class_slots, name, from_path,
+                                    [](const SyntaxIndex& index) -> const auto& {
+                                        return index.classes;
+                                    });
+}
+
+const TypedefEntry* ProjectIndexSnapshot::find_specialization(const std::string& name,
+                                                              std::string_view from_path) const {
+    return nearest_slot<TypedefEntry>(*this, specialization_slots, name, from_path,
+                                      [](const SyntaxIndex& index) -> const auto& {
+                                          return index.typedefs;
+                                      });
 }
 
 std::shared_ptr<const std::vector<InheritedMember>>
@@ -1922,17 +1942,22 @@ ProjectIndexSnapshot::inherited_members(const std::string& base_name,
 
 std::shared_ptr<const std::vector<const MacroEntry*>>
 ProjectIndexSnapshot::project_macros(
-    const std::string& root, const std::function<std::string(const std::string&)>& project_of) const {
+    const std::string& root, uint64_t generation,
+    const std::function<std::string(const std::string&)>& project_of) const {
     auto& cache = derived();
+    std::string key = root;
+    key += '\x1f';
+    key += std::to_string(generation);
     {
         std::lock_guard<std::mutex> lock(cache.mutex);
-        if (auto it = cache.macros.find(root); it != cache.macros.end())
+        if (auto it = cache.macros.find(key); it != cache.macros.end())
             return it->second;
     }
     auto macros = std::make_shared<std::vector<const MacroEntry*>>();
     // The project is a fact about the directory, and a project's files come in
     // directories of tens or hundreds, so ask once per directory.
     std::unordered_map<std::string, bool> in_project_by_dir;
+    std::unordered_set<std::string_view> names;
     for (const size_t slot : macro_shard_slots) {
         const auto& shard = shards[slot];
         const auto slash = shard.path.find_last_of("/\\");
@@ -1942,11 +1967,14 @@ ProjectIndexSnapshot::project_macros(
             it->second = project_of(shard.path) == root;
         if (!it->second)
             continue;
+        // A header's macros are also recorded by every includer's shard: one
+        // per name, the first in shard order (headers first).
         for (const auto& mac : shard.index->macros)
-            macros->push_back(&mac);
+            if (names.insert(mac.name).second)
+                macros->push_back(&mac);
     }
     std::lock_guard<std::mutex> lock(cache.mutex);
-    return cache.macros.try_emplace(root, std::move(macros)).first->second;
+    return cache.macros.try_emplace(std::move(key), std::move(macros)).first->second;
 }
 
 const ProjectIndexModuleRef* ProjectIndexSnapshot::find_module(const std::string& name,

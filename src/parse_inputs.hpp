@@ -112,6 +112,10 @@ public:
     /// not asking how either of them parses.
     std::filesystem::path project_root_for(const std::filesystem::path& path) const;
 
+    /// ProjectRootResolver::generation(): changes whenever project_root_for()
+    /// may answer differently with these inputs.
+    uint64_t root_generation() const { return resolver_ ? resolver_->generation() : 0; }
+
     /// The merged inputs, for a caller that has no project to ask about -- a file
     /// under none, and the semantic compilation fallback taken when no project
     /// has registered what it compiles.  A project that has is served by

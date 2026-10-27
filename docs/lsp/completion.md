@@ -36,9 +36,14 @@ uvm_pkg::                   // scope completion lists the package
 ## Known gaps
 
 - Typedef chains resolve one step only.
-- Members of parameterized classes (`my_class #(T)`) are not offered. A handle typed by a type parameter
-  (`REQ req;` in `uvm_driver #(type REQ = ...)`) is resolved through the direct `extends X #(...)` of the
-  class you are in, or the parameter's default; deeper parameter chains are not followed.
+- Members of parameterized classes (`my_class #(T)`) are not offered.
+- A handle typed by a type parameter (`REQ req;` in `uvm_driver #(type REQ = ...)`) is resolved by following
+  each `extends X #(...)` from the class you are in, or from a handle's own `X #(...)` type, up to the class
+  that declares it: at most 8 steps, arguments by position or name, defaults otherwise. An `extends` or a
+  handle may name a specialization typedef (`typedef X #(item) x_t;`). An argument is taken as a type name:
+  expressions and nested `#(...)` in it are not followed.
+- Inherited members on a bare identifier need the file's last parse to have taken 50 ms or less. In a slower
+  file the class the cursor is in is unknown, so only the names the unparsed text shows are offered.
 - Hierarchical references (`top.dut.signal`) resolve one `.` hop.
 - Fields of anonymous `struct { ... }` types are not indexed. Named `typedef struct` types are.
 - With syntax errors in the file, keyword context falls back to plain identifiers.

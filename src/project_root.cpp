@@ -53,6 +53,7 @@ void ProjectRootResolver::set_forced_root(fs::path directory) {
     std::lock_guard<std::mutex> lock(mutex_);
     forced_root_ = directory.empty() ? fs::path{} : normalize_filesystem_path(directory);
     directories_.clear();
+    ++generation_;
 }
 
 void ProjectRootResolver::set_implicit_roots(std::vector<fs::path> roots) {
@@ -62,11 +63,13 @@ void ProjectRootResolver::set_implicit_roots(std::vector<fs::path> roots) {
     roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
     std::lock_guard<std::mutex> lock(mutex_);
     implicit_roots_ = std::move(roots);
+    ++generation_;
 }
 
 void ProjectRootResolver::invalidate() const {
     std::lock_guard<std::mutex> lock(mutex_);
     directories_.clear();
+    ++generation_;
 }
 
 bool ProjectRootResolver::directory_has_marker(const fs::path& directory) const {
@@ -92,7 +95,11 @@ bool ProjectRootResolver::directory_has_marker(const fs::path& directory) const 
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        directories_[key] = DirectoryCache{found, now};
+        auto& entry = directories_[key];
+        if (entry.checked_at != std::chrono::steady_clock::time_point{} &&
+            entry.has_marker != found)
+            ++generation_;
+        entry = DirectoryCache{found, now};
     }
     return found;
 }

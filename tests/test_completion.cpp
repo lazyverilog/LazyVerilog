@@ -2817,6 +2817,66 @@ TEST_CASE("completion: an inherited handle typed by a base parameter takes the a
                   "class seq_base #(type T = item_c);\n  T item;\nendclass\n");
     CHECK(has_label(complete_in("file:///tmp/completion_param_dflt.sv", "seq_base", "item."),
                     "addr"));
+
+    // Forwarded: the argument names the subclass's own parameter, same name or not.
+    for (const std::string param : {"REQ", "ITEM_T"}) {
+        INFO("forwarding " << param);
+        const std::string text = "class fwd_drv #(type " + param + " = item_c) extends drv_base #(" +
+                                 param + ");\n  function void f();\n    req.\n"
+                                 "  endfunction\nendclass\n";
+        const std::string uri = "file:///tmp/completion_param_fwd_" + param + ".sv";
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "    req.");
+        CHECK(has_label(complete_at(engine, analyzer, uri, line, col), "addr"));
+    }
+}
+
+// OpenTitan's shape, every class in its own closed file: uart_driver extends
+// dv_base_driver #(uart_item, ...), which forwards to uvm_driver #(.REQ(ITEM_T)).
+TEST_CASE("completion: a type parameter follows the forwarding chain across files",
+          "[completion][inherited]") {
+    ScratchTree tree("lazyverilog-completion-param-chain");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("uvm/uvm_driver.svh", "class uvm_driver #(type REQ = int, type RSP = REQ);\n"
+                                         "  REQ req;\n  RSP rsp;\nendclass\n"),
+        tree.write("dv/dv_base_driver.sv",
+                   "class dv_base_driver #(type ITEM_T = int, type CFG_T = int,\n"
+                   "                       type RSP_ITEM_T = ITEM_T)\n"
+                   "  extends uvm_driver #(.REQ(ITEM_T), .RSP(RSP_ITEM_T));\nendclass\n"),
+        tree.write("dv/mid_driver.sv", "class mid_driver #(type REQ = int)\n"
+                                       "  extends dv_base_driver #(REQ);\nendclass\n"),
+        tree.write("agent/my_item.sv", "class my_item;\n  int addr;\nendclass\n"
+                                       "class my_cfg;\n  int cfg_f;\nendclass\n"),
+        tree.write("agent/my_pkg.sv", "typedef dv_base_driver #(my_item, my_cfg) base_t;\n")};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    int n = 0;
+    const auto complete_in = [&](const std::string& decls, const std::string& receiver) {
+        const std::string text = decls + "  function void f();\n    " + receiver + "\n"
+                                 "  endfunction\nendclass\n";
+        const auto uri = uri_from_path(tree.write("agent/d" + std::to_string(n++) + ".sv", text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "    " + receiver);
+        return complete_at(engine, analyzer, uri, line, col);
+    };
+    // Two steps: ITEM_T is my_item, REQ is ITEM_T; RSP via RSP_ITEM_T's default.
+    const std::string two = "class d extends dv_base_driver #(my_item, my_cfg);\n";
+    CHECK(has_label(complete_in(two, "req."), "addr"));
+    CHECK(has_label(complete_in(two, "rsp."), "addr"));
+    // Three steps, one forwarding a same-name parameter.
+    CHECK(has_label(complete_in("class d extends mid_driver #(my_item);\n", "req."), "addr"));
+    // No actuals: the defaults all the way up.
+    CHECK_FALSE(has_label(complete_in("class d extends dv_base_driver;\n", "req."), "addr"));
+    // A specialization typedef in place of the class.
+    CHECK(has_label(complete_in("class d extends base_t;\n", "req."), "addr"));
+    // A handle of a specialized type, written out or through the typedef.
+    CHECK(has_label(complete_in("class t;\n  dv_base_driver #(my_item, my_cfg) h;\n", "h.req."),
+                    "addr"));
+    CHECK(has_label(complete_in("class t;\n  base_t h;\n", "h.req."), "addr"));
+    CHECK_FALSE(has_label(complete_in("class t;\n  dv_base_driver h;\n", "h.req."), "addr"));
 }
 
 TEST_CASE("completion: backtick offers the asking project's macros only",
@@ -2877,11 +2937,43 @@ TEST_CASE("completion: a project with many macros sends the best and says it is 
     CHECK(narrow.items.front().label == "GEN_MACRO_42");
 }
 
+// Includers' shards record the macros of every header they include, so one name
+// shows up in many shards: copies must not fill the cap.
+TEST_CASE("completion: project macros count each name once against the cap",
+          "[completion][macro]") {
+    ScratchTree tree("lazyverilog-completion-macro-dupes");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::string defs;
+    for (int i = 0; i < 150; ++i)
+        defs += "`define DUP_MACRO_" + std::to_string(i) + " " + std::to_string(i) + "\n";
+    std::vector<std::string> files{tree.write("a/defs.svh", defs), tree.write("b/defs.svh", defs),
+                                   tree.write("c/defs.svh", defs)};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    const std::string text = "module m;\n  initial x = `DUP\nendmodule\n";
+    const auto uri = uri_from_path(tree.write("m.sv", text));
+    analyzer.open(uri, text);
+    auto [line, col] = pos_after(text, "x = `DUP");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+    CHECK_FALSE(result.isIncomplete);
+    CHECK(result.items.size() == 150);
+    CHECK(count_label(result, "DUP_MACRO_7") == 1);
+}
+
 namespace {
 
-/// Fastest of @p runs completing a bare identifier in a method of a class five
-/// levels deep, in a project of @p classes unrelated closed class files.
-double fastest_inherited_completion_ms(int classes, int runs) {
+//// Fastest of @p runs completing a bare identifier in a method of a class five
+/// levels deep, in a project of @p classes unrelated closed class files: the
+/// cached answer (`hit`, per completion, twenty at a time for the clock) and
+/// the first answer after a re-publish (`miss`), which rebuilds it.
+struct InheritedTimes {
+    double hit;
+    double miss;
+};
+
+InheritedTimes fastest_inherited_completion_ms(int classes, int runs) {
     ScratchTree tree("lazyverilog-completion-inherited-scaling-" + std::to_string(classes));
     tree.write("lazyverilog.toml", "[design]\n");
     std::vector<std::string> files;
@@ -2903,35 +2995,55 @@ double fastest_inherited_completion_ms(int classes, int runs) {
     const auto uri = uri_from_path(tree.write("user.sv", text));
     analyzer.open(uri, text);
     auto [line, col] = pos_after(text, "    f");
+    const auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
 
-    std::vector<double> samples;
+    std::vector<double> hits, misses;
     for (int i = 0; i < runs; ++i) {
-        // Twenty completions per sample: one is too short for the clock.
-        const auto start = std::chrono::steady_clock::now();
-        CompletionList result;
+        // A changed listed file republishes the snapshot, dropping its cache.
+        const auto before = analyzer.project_index_snapshot();
+        const auto changed = tree.write("other/c0.sv", "class other_0;\n  int g" +
+                                                           std::to_string(1000 + i) +
+                                                           ";\nendclass\n");
+        analyzer.refresh_changed_extra_files({uri_from_path(changed)});
+        analyzer.wait_for_background_index_idle();
+        REQUIRE(analyzer.project_index_snapshot() != before);
+
+        auto start = std::chrono::steady_clock::now();
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        misses.push_back(ms_since(start));
+        REQUIRE(has_label(result, "f0"));
+
+        start = std::chrono::steady_clock::now();
         for (int k = 0; k < 20; ++k)
             result = complete_at(engine, analyzer, uri, line, col);
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
+        hits.push_back(ms_since(start) / 20);
         REQUIRE(has_label(result, "f0"));
     }
-    return *std::min_element(samples.begin(), samples.end());
+    return {*std::min_element(hits.begin(), hits.end()),
+            *std::min_element(misses.begin(), misses.end())};
 }
 
 } // namespace
 
 TEST_CASE("completion: inherited identifier cost does not grow with project size",
           "[completion][inherited][scaling]") {
-    constexpr int kSmall = 20;
-    constexpr int kLarge = 320; // 16x the closed class files
+    constexpr int kSmall = 40;
+    constexpr int kLarge = 1280; // 32x the closed class files
     constexpr int kRuns = 7;
-    const double small_ms = fastest_inherited_completion_ms(kSmall, kRuns);
-    const double large_ms = fastest_inherited_completion_ms(kLarge, kRuns);
-    const double ratio = large_ms / small_ms;
+    const auto small = fastest_inherited_completion_ms(kSmall, kRuns);
+    const auto large = fastest_inherited_completion_ms(kLarge, kRuns);
+    const double hit_ratio = large.hit / small.hit;
+    const double miss_ratio = large.miss / small.miss;
     std::cout << "\n[inherited completion scaling] classes " << kSmall << " -> " << kLarge
-              << ": " << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
-    // The chain is answered from the snapshot's class map and its per-snapshot
-    // cache: ~1.  Scanning every shard per level is ~16.
-    CHECK(ratio < 4.0);
+              << ": hit " << small.hit << " -> " << large.hit << " ms (ratio " << hit_ratio
+              << "), after re-publish " << small.miss << " -> " << large.miss
+              << " ms (ratio " << miss_ratio << ")\n";
+    // The chain is answered from the class map filled at publish, cached for the
+    // snapshot: ~1 either way.  Scanning every shard, or building the map on
+    // the request after each publish, is ~32.
+    CHECK(hit_ratio < 4.0);
+    CHECK(miss_ratio < 4.0);
 }
