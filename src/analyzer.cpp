@@ -8007,16 +8007,12 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             override_table = override_class_table(extra_idx, open_uris);
             auto& view = override_view.emplace(*override_table, open_uris);
             // The dynamic index carries imports, which an open subclass's
-            // `extends drv` needs to pick the imported drv.  The scan below
-            // builds it for every open file anyway; highlight scans only the
-            // asking one.
-            // shortcut: highlight resolves another open file's base without
-            // its imports; build the dynamic index there too if it disagrees.
+            // `extends drv` needs to pick the imported drv.  It is cached per
+            // document snapshot, so highlight builds another file's once per
+            // edit of that file, and the references scan builds it anyway.
             for (const auto& [state_uri, open] : open_states)
                 if (open)
-                    view.overlay(!this_file_only || open == state ? get_dynamic_index(*open)
-                                                                  : get_structural_index(*open),
-                                 state_uri);
+                    view.overlay(get_dynamic_index(*open), state_uri);
             override_member = member;
             const std::string start_class = base_class_lookup_name(rest.substr(0, sep));
             // A call site such as `h.run()` with two same-named `drv`s in reach
@@ -8024,6 +8020,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
             // ranking every other occurrence gets -- so the cursor's own
             // occurrence is always in the chain.
             const OverrideClassNode* start = nullptr;
+            static const std::vector<MethodEntry> kNoMethods;
             if (view.named(start_class).size() > 1) {
                 const auto& asking = get_dynamic_index(*state);
                 for (const auto& ref : asking.references)
@@ -8032,6 +8029,24 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                         start = override_resolve_at(uri, asking, ref, asking.imports, start_class);
                         break;
                     }
+                // definition_of() ranks by path alone and may have picked the
+                // other `drv`.  The tree walk below keeps tokens resolving to
+                // target_def, so point it at the class the chain starts from,
+                // or an open pa.sv would have its unrelated `run` renamed.
+                // shortcut: definition_of() still ignores imports, so a rename
+                // started from that declaration follows the path ranking; give
+                // definition_of() the import ranking if users trip on it.
+                for (const auto& m : start ? start->cls->methods : kNoMethods) {
+                    if (m.name != member || m.line <= 0)
+                        continue;
+                    auto m_uri = start->index->source_uri(m.file_id);
+                    if (m_uri.empty())
+                        m_uri = start->uri;
+                    const int m_line = to_lsp_line(m.line);
+                    target_def = Location{m_uri, m_line, m.col, m_line,
+                                          m.col + lsp_column_width(m.name)};
+                    break;
+                }
             }
             static const std::vector<ImportEntry> kNoImports;
             if (!start)
