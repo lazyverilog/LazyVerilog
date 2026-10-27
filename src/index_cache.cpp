@@ -27,7 +27,8 @@ namespace {
 constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
 // 10: an includer's shard no longer carries a file-scope class from its headers.
 // 11: classes carry their parameters and their extends arguments.
-constexpr uint32_t kFormatVersion = 11;
+// 12: a call through an inherited method on an in-shard class records its class member.
+constexpr uint32_t kFormatVersion = 12;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is

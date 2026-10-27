@@ -459,6 +459,7 @@ struct RtlTreeNode {
 };
 
 struct DefinitionTreeQueries;
+struct OverrideClassTable;
 
 class Analyzer {
   public:
@@ -733,6 +734,11 @@ class Analyzer {
     /// they only need indexed structural data.  This supports the indexing
     /// philosophy: current file uses AST, project files use index.
     std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_ptr() const;
+
+    /// Classes of @p extra by name and by base, for the override-chain walk.
+    /// Built once per published snapshot, not per request.
+    std::shared_ptr<const OverrideClassTable>
+    override_class_table(const std::shared_ptr<const std::vector<ExtraIndexInfo>>& extra) const;
 
     /// The published shard snapshot, ordered nearest-first against @p state's
     /// own path -- the order every by-name scan over the project has to run in,
@@ -1030,6 +1036,8 @@ class Analyzer {
     // Open entries whose `state` the cached snapshot no longer matches.
     mutable std::unordered_set<std::string> extra_file_snapshot_stale_;
     mutable std::shared_ptr<const std::vector<ExtraIndexInfo>> extra_index_snapshot_cache_;
+    mutable std::mutex override_class_table_mutex_;
+    mutable std::shared_ptr<const OverrideClassTable> override_class_table_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
     mutable std::function<void()> project_index_publish_callback_;
 
