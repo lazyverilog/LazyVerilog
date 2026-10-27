@@ -1901,5 +1901,85 @@ TEST_CASE("rename: a handle of a class that only inherits the method is in the c
     for (const auto& [line, col] : {std::pair{1, 24}, std::pair{7, 16}, std::pair{13, 12}}) {
         CAPTURE(line, col);
         CHECK(edit_starts(provide_rename(analyzer, rename_run_at(uri, line, col)), uri) == want);
+        // documentHighlight walks up from each occurrence instead of down.
+        std::set<std::pair<int, int>> highlighted;
+        for (const auto& ref : analyzer.find_references(uri, line, col, true, true))
+            highlighted.emplace(ref.line, ref.col);
+        CHECK(highlighted == want);
     }
+}
+
+TEST_CASE("rename: an override chain in a UVM include layout keeps to its package",
+          "[rename][override-chain]") {
+    // Two packages include a same-named drv from one directory; child is pb's.
+    // Its `super.run` must resolve through pb, not the first drv by path.
+    const std::string drv = "class drv;\n"
+                            "  virtual function void run();\n"
+                            "  endfunction\n"
+                            "endclass\n";
+    const std::string child = "class child extends drv;\n"     // 0
+                              "  virtual function void run();\n" // 1
+                              "    super.run();\n"               // 2
+                              "  endfunction\n"                  // 3
+                              "endclass\n";
+    TempTree tree("override-chain-uvm-layout");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pa_drv = tree.write("proj/pa_drv.svh", drv);
+    const auto pb_drv = tree.write("proj/pb_drv.svh", drv);
+    const auto ch = tree.write("proj/pb_child.svh", child);
+    const auto pa = tree.write("proj/pa_pkg.sv", "package pa;\n`include \"pa_drv.svh\"\nendpackage\n");
+    const auto pb = tree.write(
+        "proj/pb_pkg.sv",
+        "package pb;\n`include \"pb_drv.svh\"\n`include \"pb_child.svh\"\nendpackage\n");
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pa.string(), pb.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto uri = uri_from_path(ch);
+    analyzer.open(uri, child);
+
+    const auto edit = provide_rename(analyzer, rename_run_at(uri, 1, 25));
+    CHECK(edit_starts(edit, uri) == std::set<std::pair<int, int>>{{1, 24}, {2, 10}});
+    CHECK(edit_starts(edit, uri_from_path(pb_drv)) == std::set<std::pair<int, int>>{{1, 24}});
+    CHECK(edit_starts(edit, uri_from_path(pa_drv)).empty());
+    CHECK(analyzer.find_references(uri, 1, 25, true, true).size() == 2);
+}
+
+TEST_CASE("rename: an explicit import outranks a wildcard in an override chain",
+          "[rename][override-chain]") {
+    // `import pa::*; import pb::drv;` -- `drv` is pb's.
+    const std::string pa_text =
+        "package pa;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string pb_text =
+        "package pb;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string top_text = "module top;\n"        // 0
+                                 "  import pa::*;\n"    // 1
+                                 "  import pb::drv;\n"  // 2
+                                 "  drv h;\n"           // 3
+                                 "  initial h.run();\n" // 4
+                                 "endmodule\n";
+    TempTree tree("override-chain-explicit-import");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pa = tree.write("proj/pa.sv", pa_text);
+    const auto pb = tree.write("proj/pb.sv", pb_text);
+    const auto top = tree.write("proj/top.sv", top_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pa.string(), pb.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto pb_uri = uri_from_path(pb);
+    analyzer.open(pb_uri, pb_text);
+    const auto top_uri = uri_from_path(top);
+
+    const auto edit = provide_rename(analyzer, rename_run_at(pb_uri, 2, 25));
+    CHECK(edit_starts(edit, pb_uri) == std::set<std::pair<int, int>>{{2, 24}});
+    CHECK(edit_starts(edit, top_uri) == std::set<std::pair<int, int>>{{4, 12}});
+
+    const auto pa_uri = uri_from_path(pa);
+    analyzer.open(pa_uri, pa_text);
+    const auto pa_edit = provide_rename(analyzer, rename_run_at(pa_uri, 2, 25));
+    CHECK(edit_starts(pa_edit, pa_uri) == std::set<std::pair<int, int>>{{2, 24}});
+    CHECK(edit_starts(pa_edit, top_uri).empty());
 }

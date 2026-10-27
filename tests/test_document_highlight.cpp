@@ -227,3 +227,74 @@ TEST_CASE("document highlight: cost grows linearly with same-named candidates",
     CHECK(ratio < 8.0);
 }
 
+
+namespace {
+
+/// Fastest of @p runs highlighting `base_c::m` in an open file, with @p closed
+/// closed project files that each declare a subclass overriding it -- the shape
+/// of uvm_component's subtree under build_phase.
+double fastest_override_highlight_ms(int closed, int runs) {
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("lazyverilog_highlight_override_" + std::to_string(closed));
+    std::filesystem::create_directories(dir);
+    std::vector<std::string> paths;
+    for (int i = 0; i < closed; ++i) {
+        const auto path = dir / ("sub_" + std::to_string(i) + ".sv");
+        std::ofstream(path) << "class sub_" + std::to_string(i) +
+                                   " extends base_c;\n"
+                                   "  virtual function void m();\n"
+                                   "    super.m();\n"
+                                   "  endfunction\n"
+                                   "endclass\n";
+        paths.push_back(path.string());
+    }
+    const auto base_path = dir / "base.sv";
+    const std::string base = "class base_c;\n"
+                             "  virtual function void m();\n"
+                             "  endfunction\n"
+                             "endclass\n"
+                             "class near_c extends base_c;\n"
+                             "  virtual function void m();\n"
+                             "    super.m();\n"
+                             "  endfunction\n"
+                             "endclass\n";
+    std::ofstream(base_path) << base;
+    paths.push_back(base_path.string());
+
+    Analyzer analyzer;
+    analyzer.set_extra_files(paths);
+    analyzer.wait_for_background_index_idle();
+    const std::string uri = uri_from_path(base_path);
+    analyzer.open(uri, base);
+
+    std::vector<double> samples;
+    for (int i = 0; i < runs; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = provide_document_highlight(analyzer, at(uri, 1, 24));
+        samples.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
+        REQUIRE(result.size() == 3);
+    }
+    std::filesystem::remove_all(dir);
+    return *std::min_element(samples.begin(), samples.end());
+}
+
+} // namespace
+
+TEST_CASE("document highlight: a method's cost does not grow with its override subtree",
+          "[document-highlight][scaling]") {
+    constexpr int kSmall = 25;
+    constexpr int kLarge = 400; // 16x the closed overrides
+    constexpr int kRuns = 7;
+
+    const double small_ms = fastest_override_highlight_ms(kSmall, kRuns);
+    const double large_ms = fastest_override_highlight_ms(kLarge, kRuns);
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[highlight override scaling] overrides " << kSmall << " -> " << kLarge
+              << ": " << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+
+    // Highlight walks up from this file's occurrences: ~1.  Walking the root's
+    // whole subtree on every cursor move is ~16.
+    CHECK(ratio < 4.0);
+}
