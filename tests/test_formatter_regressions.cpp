@@ -6963,6 +6963,32 @@ TEST_CASE("formatter regression: a format-off region that opens or closes a unit
           "  // verilog_format: on\n"
           "  int y;\n"
           "endclass\n");
+    // Only one branch of an `ifdef compiles: the region opens one function,
+    // not two.
+    CHECK(format_stable("module n;\n"
+                        "// verilog_format: off\n"
+                        "`ifdef A\n"
+                        "function int f(int a);\n"
+                        "`else\n"
+                        "function int f(int b);\n"
+                        "`endif\n"
+                        "// verilog_format: on\n"
+                        "return a;\n"
+                        "endfunction\n"
+                        "assign x=y;\n"
+                        "endmodule\n") ==
+          "module n;\n"
+          "// verilog_format: off\n"
+          "`ifdef A\n"
+          "function int f(int a);\n"
+          "`else\n"
+          "function int f(int b);\n"
+          "`endif\n"
+          "// verilog_format: on\n"
+          "    return a;\n"
+          "  endfunction\n"
+          "  assign x = y;\n"
+          "endmodule\n");
 }
 
 TEST_CASE("formatter regression: a call's line length counts its semicolon", "[formatter][regression]") {
@@ -6983,15 +7009,51 @@ TEST_CASE("formatter regression: a call's line length counts its semicolon", "[f
     // or `-c` (it used to count `[3 : 0]`, `] [`, `8 'hFF`, `- c`), nor
     // before a label's `:`; one after the `,` of `, .k(`; and the `));` a
     // call inside a cast carries.
+    // What follows the `)` is counted up to the next break point, through
+    // operators, `?:` and commas of a list that stayed whole; an inline block
+    // comment and the gaps of `+:` count as printed.
     for (const std::string fits : {"  assign r = fn(a[3:0], b[1][2], 8'hFF, -c);\n",
                                    "  a_l: assert property (p(aa, bb));\n",
-                                   "  assign r = int'(o.f(.v(e), .k(K)));\n"}) {
+                                   "  assign r = int'(o.f(.v(e), .k(K)));\n",
+                                   "  assign r = fn(aa) ? g + h : k[2:0];\n",
+                                   "  assign r = {fn(aa, bb), w[15:1]};\n",
+                                   "  assign r = fn(aa /* c */, bb);\n",
+                                   "  assign r = fn(a[i*8 +: 8], b);\n"}) {
         CAPTURE(fits);
         o.function_call.line_length = static_cast<int>(fits.size()) - 1;
         CHECK(format_stable("module m;\n" + fits + "endmodule\n", o) == "module m;\n" + fits + "endmodule\n");
         o.function_call.line_length -= 1;
         CHECK(format_stable("module m;\n" + fits + "endmodule\n", o).find(fits) == std::string::npos);
     }
+
+    // An aligned declaration's padding before `=` counts, and breaking drops
+    // it (a broken statement is not aligned); a blank line kept before
+    // `extends` starts the line the `#(` is measured on.
+    FormatOptions a;
+    a.var_declaration.align = true;
+    a.function_call.line_length = 60;
+    CHECK(format_stable("module m;\ninitial begin\nstring s = n.substr(p.len(), n.len() - 1);\nend\nendmodule\n", a) ==
+          "module m;\n"
+          "  initial begin\n"
+          "    string s = n.substr(\n"
+          "                 p.len(),\n"
+          "                 n.len() - 1\n"
+          "               );\n"
+          "  end\n"
+          "endmodule\n");
+    // A brace-less body is a level in from the line its control starts on,
+    // not from where a broken header's `)` ended up.
+    FormatOptions b;
+    b.function_call.line_length = 35;
+    CHECK(format_stable("module m;\ninitial\nif (fnc(aaaaaa, bbbbbb, cccccc))\n`uvm_fatal(get_name(), \"msg\")\n"
+                        "endmodule\n", b)
+              .find("\n      `uvm_fatal(get_name(), \"msg\")\n") != std::string::npos);
+    FormatOptions e;
+    const std::string ext = "class c #(\n  int W = 1\n)\n\n  extends b #(.WIDTH(W), .DEPTH(1));\nendclass\n";
+    e.function_call.line_length = 36; // `  extends b #(.WIDTH(W), .DEPTH(1));`
+    CHECK(format_stable(ext, e) == ext);
+    e.function_call.line_length = 35;
+    CHECK(format_stable(ext, e).find("extends b #(\n") != std::string::npos);
 
     FormatOptions d;
     const std::string header = "  function logic [15:0] f(logic [7:0] a);\n";

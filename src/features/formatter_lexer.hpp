@@ -918,20 +918,39 @@ private:
         using TKind = slang::parsing::TokenKind;
         // The body's code tokens; a directive line, a macro body included,
         // opens nothing where it is written (`` `define START begin ``).
+        // Of a conditional only the first branch counts: `` `ifdef A
+        // module top(input a); `else module top(input b); `endif `` opens
+        // one module, as the code after it is written for.
         std::vector<TKind> ks;
         {
+            using SK = slang::syntax::SyntaxKind;
             SourceTextLexer lexer(body);
             TKind prev = TKind::Unknown;
             bool in_directive = false;
+            std::vector<bool> later_branch;  // per open conditional
+            size_t skipping = 0;             // open conditionals in a later branch
             for (auto token = lexer.lex(); token.kind != TKind::EndOfFile; prev = token.kind, token = lexer.lex()) {
                 bool new_line = false;
                 for (const auto& trivia : token.trivia())
                     new_line = new_line || trivia.kind == slang::parsing::TriviaKind::EndOfLine;
                 if (new_line && prev != TKind::LineContinuation)
                     in_directive = false;
-                if (token.kind == TKind::Directive && token.directiveKind() != slang::syntax::SyntaxKind::MacroUsage)
+                if (token.kind == TKind::Directive && token.directiveKind() != SK::MacroUsage) {
                     in_directive = true;
-                if (!in_directive)
+                    const SK dk = token.directiveKind();
+                    if (dk == SK::IfDefDirective || dk == SK::IfNDefDirective) {
+                        later_branch.push_back(false);
+                    } else if ((dk == SK::ElsIfDirective || dk == SK::ElseDirective) && !later_branch.empty() &&
+                               !later_branch.back()) {
+                        later_branch.back() = true;
+                        ++skipping;
+                    } else if (dk == SK::EndIfDirective && !later_branch.empty()) {
+                        if (later_branch.back())
+                            --skipping;
+                        later_branch.pop_back();
+                    }
+                }
+                if (!in_directive && skipping == 0)
                     ks.push_back(token.kind);
             }
         }
