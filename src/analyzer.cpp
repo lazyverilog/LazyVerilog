@@ -51,6 +51,12 @@ constexpr unsigned kMaxBackgroundIndexThreads = 8;
 // that it never runs twice inside one burst of keystrokes.
 constexpr auto kLiveShardIdleDelay = std::chrono::milliseconds(150);
 
+// How long the parse queue must stay empty (after any live shard rebuild) before
+// a request_parse_idle_notification() caller hears about it.  Longer than the
+// gap between keystrokes, so a typing burst gets one notification, not one per
+// reparse that happened to finish before the next key.
+constexpr auto kParseIdleNotifyDelay = std::chrono::milliseconds(300);
+
 // Smallest header an open buffer's parse is willing to see as directives alone.
 //
 // The projection trades exactness of the buffer's own tree -- the header's
@@ -1759,6 +1765,18 @@ void Analyzer::set_parse_complete_callback(
     parse_complete_cb_ = std::move(cb);
 }
 
+void Analyzer::set_parse_idle_callback(std::function<void()> cb) {
+    parse_idle_cb_ = std::move(cb);
+}
+
+void Analyzer::request_parse_idle_notification() {
+    {
+        std::lock_guard<std::mutex> lock(parse_mutex_);
+        parse_idle_wanted_.store(true);
+    }
+    parse_cv_.notify_all();
+}
+
 void Analyzer::set_parse_paused(bool paused) {
     {
         std::lock_guard<std::mutex> lock(parse_mutex_);
@@ -1790,16 +1808,22 @@ void Analyzer::parse_worker_loop() {
         try {
         ParseJob job;
         bool have_job = false;
+        bool notify_idle = false;
         {
             std::unique_lock<std::mutex> lock(parse_mutex_);
             const auto takeable = [&] {
                 return parse_stop_.load() ||
                        (!parse_paused_.load() && !parse_pending_.empty());
             };
-            if (deferred_shards.empty() && deferred_dependents.empty()) {
-                parse_cv_.wait(lock, takeable);
+            const bool deferred = !deferred_shards.empty() || !deferred_dependents.empty();
+            if (!deferred && !parse_idle_wanted_.load()) {
+                parse_cv_.wait(lock, [&] { return takeable() || parse_idle_wanted_.load(); });
+                // Woken only to time an idle period: the timed wait below does it.
+                if (!takeable())
+                    continue;
             } else {
-                parse_cv_.wait_for(lock, kLiveShardIdleDelay, takeable);
+                parse_cv_.wait_for(lock, deferred ? kLiveShardIdleDelay : kParseIdleNotifyDelay,
+                                   takeable);
             }
             if (parse_stop_.load())
                 break;
@@ -1808,6 +1832,8 @@ void Analyzer::parse_worker_loop() {
                 job = std::move(it->second);
                 parse_pending_.erase(it);
                 have_job = true;
+            } else if (parse_pending_.empty() && !deferred) {
+                notify_idle = parse_idle_wanted_.exchange(false);
             }
         }
 
@@ -1860,6 +1886,8 @@ void Analyzer::parse_worker_loop() {
                 }
                 deferred_dependents.clear();
             }
+            if (notify_idle && parse_idle_cb_)
+                parse_idle_cb_();
             continue;
         }
 

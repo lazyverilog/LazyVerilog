@@ -70,6 +70,8 @@
 #include "features/workspace_symbols.hpp"
 #include "features/document_symbols.hpp"
 #include "syntax_index.hpp"
+#include <rapidjson/document.h>
+#include <rapidjson/pointer.h>
 #include <slang/syntax/SyntaxTree.h>
 
 #include <algorithm>
@@ -92,6 +94,25 @@
 
 DEFINE_REQUEST_RESPONSE_TYPE(wp_inlayHintRefresh, JsonNull, JsonNull,
                              "workspace/inlayHint/refresh");
+
+/// `workspace.inlayHint.refreshSupport` from an `initialize` message, or nullopt
+/// for any other message.  Read off the wire because lspcpp's workspace client
+/// capabilities have no `inlayHint` member.
+static std::optional<bool> inlay_hint_refresh_support_from_initialize(std::string_view raw) {
+    if (raw.find("\"initialize\"") == std::string_view::npos)
+        return std::nullopt;
+    rapidjson::Document doc;
+    doc.Parse(raw.data(), raw.size());
+    if (doc.HasParseError() || !doc.IsObject())
+        return std::nullopt;
+    const auto method = doc.FindMember("method");
+    if (method == doc.MemberEnd() || !method->value.IsString() ||
+        std::string_view(method->value.GetString(), method->value.GetStringLength()) != "initialize")
+        return std::nullopt;
+    const auto* flag =
+        rapidjson::Pointer("/params/capabilities/workspace/inlayHint/refreshSupport").Get(doc);
+    return flag && flag->IsBool() && flag->GetBool();
+}
 
 // Local types for client/registerCapability with file watcher options.
 // LibLsp's Registration struct omits registerOptions, so we define our own.
@@ -551,8 +572,14 @@ LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
     // Hardcoded 250 ms shard-merge cadence.  This coalesces rapid shard
     // completions without exposing a knob most users never tune.
     analyzer_.set_project_index_publish_debounce_ms(250);
+    // Once per typing burst: the parse queue stayed empty for the idle delay.
+    // Neovim re-requests hints for every visible buffer on a refresh, so one
+    // per parse would recompute other windows' files on every keystroke.
+    analyzer_.set_parse_idle_callback([this] {
+        if (inlay_hint_refresh_pending_.exchange(false))
+            request_inlay_hint_refresh();
+    });
     analyzer_.set_parse_complete_callback([this](const std::string& uri) {
-        refresh_stale_inlay_hints(uri);
         publish_diagnostics(uri);
         schedule_background_compilation();
     });
@@ -599,6 +626,8 @@ LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
         // queued, which is before the `initialize` handler configures the
         // project and starts indexing.  The index stores columns, so the
         // encoding has to be settled before the first shard is built.
+        if (const auto refresh = inlay_hint_refresh_support_from_initialize(raw))
+            inlay_hint_refresh_supported_.store(*refresh);
         if (auto encoding = position_encoding_from_initialize(raw)) {
             set_negotiated_position_encoding(*encoding);
             std::cerr << "[lazyverilog] position encoding: "
@@ -646,6 +675,7 @@ LazyVerilogServer::~LazyVerilogServer() {
     analyzer_.stop();
     analyzer_.set_project_index_publish_callback({});
     analyzer_.set_parse_complete_callback({});
+    analyzer_.set_parse_idle_callback({});
 }
 
 void LazyVerilogServer::run() {
@@ -1108,7 +1138,10 @@ void LazyVerilogServer::request_inlay_hint_refresh() {
     // answers with nothing when the file's own project has hints off.  Guarding
     // on any single project's setting would suppress the refresh for every
     // other project's files.
-    if (!impl_)
+    //
+    // A client that did not offer `workspace.inlayHint.refreshSupport` may not
+    // handle the request at all.
+    if (!impl_ || !inlay_hint_refresh_supported_.load())
         return;
 
     std::lock_guard<std::mutex> outbound_lock(outbound_mutex_);
@@ -1119,15 +1152,6 @@ void LazyVerilogServer::request_inlay_hint_refresh() {
     } catch (const std::exception& e) {
         std::cerr << "[lazyverilog] inlayHint refresh error: " << e.what() << "\n";
     }
-}
-
-void LazyVerilogServer::refresh_stale_inlay_hints(const std::string& uri) {
-    {
-        std::lock_guard<std::mutex> lock(stale_inlay_hint_mutex_);
-        if (stale_inlay_hint_uris_.erase(uri) == 0)
-            return;
-    }
-    request_inlay_hint_refresh();
 }
 
 bool LazyVerilogServer::any_project_compiles() const {
@@ -2250,17 +2274,22 @@ void LazyVerilogServer::register_handlers() {
             const auto& uri = req.params.textDocument.uri.raw_uri_;
             if (!config_for(uri)->inlay_hint.enable)
                 return rsp;
+            // A client that can be told to re-ask is answered at once, from
+            // the last parsed tree, and refreshed once the typing burst's
+            // parses have landed.  One that cannot would keep a stale answer
+            // after typing stops, so it still waits a bounded time for the parse.
+            if (!inlay_hint_refresh_supported_.load()) {
+                rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
+                                                 req.params.range.end.line, nullptr,
+                                                 std::chrono::milliseconds(150));
+                return rsp;
+            }
             bool stale = false;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
                                              req.params.range.end.line, &stale);
             if (stale) {
-                {
-                    std::lock_guard<std::mutex> lock(stale_inlay_hint_mutex_);
-                    stale_inlay_hint_uris_.insert(uri);
-                }
-                // The parse may have committed meanwhile, finding nothing to refresh.
-                if (const auto now = analyzer_.get_state(uri); now && now->tree)
-                    refresh_stale_inlay_hints(uri);
+                inlay_hint_refresh_pending_.store(true);
+                analyzer_.request_parse_idle_notification();
             }
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] inlayHint error: " << e.what() << "\n";

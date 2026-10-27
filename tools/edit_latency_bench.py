@@ -100,7 +100,8 @@ def main():
                 "inlayHint": {"dynamicRegistration": False},
                 "publishDiagnostics": {},
             },
-            "workspace": {"didChangeWatchedFiles": {"dynamicRegistration": True}},
+            "workspace": {"didChangeWatchedFiles": {"dynamicRegistration": True},
+                          "inlayHint": {"refreshSupport": True}},
         },
     })
     client.notify("initialized", {})
@@ -130,6 +131,14 @@ def main():
         line, col = anchor + 1, 4
     folding, hints, diagnostics, completion, sizes = [], [], [], [], []
     typed = 0
+    hint_params = {"textDocument": {"uri": uri},
+                   "range": {"start": {"line": 0, "character": 0},
+                             "end": {"line": min(len(lines) - 1, 200), "character": 0}}}
+    # Re-request on workspace/inlayHint/refresh, as Neovim does: a refresh is
+    # a whole-file inlayHint the queue has to serve too.
+    client.refresh_params = hint_params
+    refreshes_before = sum(1 for _, m, _ in client.notifications
+                           if m == "workspace/inlayHint/refresh")
     for k in range(args.keystrokes):
         edit_start = time.monotonic()
         version += 1
@@ -161,10 +170,7 @@ def main():
             sizes.append(len(json.dumps(reply.get("result"))) / 1024.0)
         ms, _ = client.request("textDocument/foldingRange", {"textDocument": {"uri": uri}})
         folding.append(ms)
-        ms, _ = client.request("textDocument/inlayHint", {
-            "textDocument": {"uri": uri},
-            "range": {"start": {"line": 0, "character": 0},
-                      "end": {"line": min(len(lines) - 1, 200), "character": 0}}})
+        ms, _ = client.request("textDocument/inlayHint", hint_params)
         hints.append(ms)
         diagnostics.append(client.wait_diagnostics(uri, edit_start))
         time.sleep(args.gap)
@@ -179,6 +185,12 @@ def main():
     if completion:
         summarize("completion", completion)
         summarize("completion size", sizes, "KiB")
+    client.wait_quiet(1.0)
+    refreshes = sum(1 for _, m, _ in client.notifications
+                    if m == "workspace/inlayHint/refresh") - refreshes_before
+    print(f"  per burst: {refreshes} inlayHint/refresh, "
+          f"{args.keystrokes + client.refresh_rerequests} inlayHint requests "
+          f"({client.refresh_rerequests} of them re-requests on refresh)")
 
     client.notify("exit", {})
     try:

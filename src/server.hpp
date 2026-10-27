@@ -55,8 +55,6 @@ class LazyVerilogServer {
     void clear_published_diagnostics_for_owner(const std::string& owner_uri);
     void publish_config_diagnostic(const ConfigWarning* warning);
     void request_inlay_hint_refresh();
-    /// Refresh if @p uri's hints were last answered from a stale tree.
-    void refresh_stale_inlay_hints(const std::string& uri);
     /// Whether any open project asks for semantic compilation.
     bool any_project_compiles() const;
     /// @p uri's semantic diagnostics, or none when @p config -- that file's own,
@@ -310,10 +308,13 @@ class LazyVerilogServer {
     // concurrently mutable server state, so serialize those outbound paths here.
     std::mutex outbound_mutex_;
 
-    // Buffers whose inlayHint reply came from the tree before an in-flight
-    // parse; that parse's commit sends workspace/inlayHint/refresh once.
-    std::mutex stale_inlay_hint_mutex_;
-    std::unordered_set<std::string> stale_inlay_hint_uris_;
+    // The client's `workspace.inlayHint.refreshSupport`, read off the wire
+    // before `initialize` is queued.  Without it the server never sends
+    // workspace/inlayHint/refresh and inlayHint waits for the parse instead.
+    std::atomic<bool> inlay_hint_refresh_supported_{false};
+    // An inlayHint was answered from a tree older than the text: refresh once
+    // the parse queue goes idle (Analyzer::set_parse_idle_callback()).
+    std::atomic<bool> inlay_hint_refresh_pending_{false};
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

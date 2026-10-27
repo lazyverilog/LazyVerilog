@@ -508,6 +508,13 @@ class Analyzer {
     void set_parse_complete_callback(
         std::function<void(const std::string& uri)> cb);
 
+    /// Server registers this once.  Called on the parse worker once its queue
+    /// has stayed empty for kParseIdleNotifyDelay after a
+    /// request_parse_idle_notification(): once per typing burst, not per parse.
+    void set_parse_idle_callback(std::function<void()> cb);
+    /// Ask for one parse-idle callback.  Safe from any thread.
+    void request_parse_idle_notification();
+
     /// Hold queued parses instead of letting the worker take them.
     ///
     /// A snapshot with text and no tree is the state the editor's own requests
@@ -1291,6 +1298,9 @@ private:
     };
 
     std::function<void(const std::string&)> parse_complete_cb_;
+    std::function<void()> parse_idle_cb_;
+    /// See request_parse_idle_notification().  Set and read under parse_mutex_.
+    std::atomic<bool> parse_idle_wanted_{false};
     std::function<void(const std::string&, bool)> background_index_hook_;
 
     // Version tracking — under map_mutex_

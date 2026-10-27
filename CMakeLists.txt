@@ -809,4 +809,10 @@ if(Python3_Interpreter_FOUND)
                 --binary $<TARGET_FILE:lazyverilog-lsp>
     )
     set_tests_properties(rename-smoke PROPERTIES TIMEOUT 120)
+    add_test(
+        NAME inlay-refresh-smoke
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/inlay_refresh_smoke.py
+                --binary $<TARGET_FILE:lazyverilog-lsp>
+    )
+    set_tests_properties(inlay-refresh-smoke PROPERTIES TIMEOUT 120)
 endif()

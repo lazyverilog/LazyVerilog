@@ -43,6 +43,10 @@ class Client:
         self.eof = False
         self.stderr_tail = b""
         self.sanitizer_hit = False
+        # inlayHint params to re-send on workspace/inlayHint/refresh, as
+        # Neovim's on_refresh does for every visible buffer; None ignores it.
+        self.refresh_params = None
+        self.refresh_rerequests = 0
         self.cv = threading.Condition()
         threading.Thread(target=self._read_loop, daemon=True).start()
         threading.Thread(target=self._write_loop, daemon=True).start()
@@ -84,6 +88,13 @@ class Client:
                     self.notifications.append((arrived, msg["method"], msg.get("params")))
                     if "id" in msg:      # server->client request, e.g. inlayHint/refresh
                         self.send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+                    if (msg["method"] == "workspace/inlayHint/refresh"
+                            and self.refresh_params is not None):
+                        self.refresh_rerequests += 1
+                        self.send({"jsonrpc": "2.0",
+                                   "id": f"refresh-{self.refresh_rerequests}",
+                                   "method": "textDocument/inlayHint",
+                                   "params": self.refresh_params})
                 self.cv.notify_all()
 
     def _stderr_loop(self):
