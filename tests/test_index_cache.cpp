@@ -703,7 +703,9 @@ TEST_CASE("index cache: a file that cannot be read has no digest", "[index-cache
 #include "config.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <set>
+#include <thread>
 
 namespace {
 
@@ -1857,9 +1859,22 @@ TEST_CASE("index cache: a listed file adopted by a discarded header build is red
 
     Analyzer analyzer;
     std::atomic<bool> bumped{false};
+    std::atomic<bool> cls_redone{false};
     analyzer.set_background_index_hook_for_testing([&](const std::string& path, bool built) {
         if (built && path.ends_with("pkg.sv") && !bumped.exchange(true))
             analyzer.refresh_changed_extra_files({other_uri});
+        else if (built && bumped && path.ends_with("cls.sv"))
+            cls_redone = true;
+        // The requeue puts cls.sv ahead of the package's redo, but a second
+        // worker can still be parsing it when the package claims its headers.
+        // An in-flight file is neither queued nor known, so the package would
+        // parse it again as a header: two shards, as before the adoption.
+        // Hold the package until cls.sv's redo is committed.
+        if (!built && bumped && path.ends_with("pkg.sv")) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!cls_redone && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     });
     const auto snapshot = project.index(analyzer, {"pkg.sv", "cls.sv", "frag.sv", "other.sv"});
     REQUIRE(bumped);
