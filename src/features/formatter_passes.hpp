@@ -1517,79 +1517,108 @@ inline bool is_module_header_import_semicolon(const TokenStream& tokens, size_t 
     return false;
 }
 
-inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open) {
-    int pd = 0;
-    for (size_t n = open; n > 0; --n) {
-        size_t i = n - 1;
-        if (!is_code_token(tokens[i])) continue;
-        if (kind_is(tokens[i], TK::CloseParenthesis)) ++pd;
-        else if (kind_is(tokens[i], TK::OpenParenthesis) && pd > 0) --pd;
+// Sets TopologyFacts::header_keyword on every `(`.  The answer a walk back
+// from a `(` gives is the one from the token before it, so one forward walk
+// carries it: `at` is that answer for the next token.  A walk back counts
+// parentheses, stepping over each balanced group to its `(` and past it;
+// `opens` pairs them the same way.
+inline void mark_header_keywords(TokenStream& tokens) {
+    size_t at = npos;
+    std::vector<size_t> opens;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        Tok& t = tokens[i];
+        if (!is_code_token(t))
+            continue;
+        if (kind_is(t, TK::OpenParenthesis)) {
+            t.immutable.topology.header_keyword = at;
+            opens.push_back(i);
+            continue;
+        }
+        if (kind_is(t, TK::CloseParenthesis)) {
+            // An unpaired `)` hides everything before it.
+            at = opens.empty() ? npos : tokens[opens.back()].immutable.topology.header_keyword;
+            if (!opens.empty())
+                opens.pop_back();
+            continue;
+        }
         // `virtual interface bus_if #(16) vif;` -- the keyword is part of a
         // type, and the `#(` after it specializes rather than declares.
-        if (pd == 0 && kind_is(tokens[i], TK::InterfaceKeyword)) {
+        if (kind_is(t, TK::InterfaceKeyword)) {
             const size_t p = prev_code(tokens, i);
-            if (p != npos && kind_is(tokens[p], TK::VirtualKeyword))
-                break;
+            if (p != npos && kind_is(tokens[p], TK::VirtualKeyword)) {
+                at = npos;
+                continue;
+            }
         }
-        if (pd == 0 && starts_module_like_header(tokens[i].lex.kind))
-            return i;
+        if (starts_module_like_header(t.lex.kind))
+            at = i;
         // Only a header import's `;` (`module m import p::*; (...)`) sits
         // inside a header.  Any other one ends an item, and a `(` after it --
         // a specify path `(clk => q) = 1;` after `specparam ...;` -- is not
         // the header's port list.
-        if (pd == 0 && kind_is(tokens[i], TK::Semicolon) &&
-            !is_module_header_import_semicolon(tokens, i))
-            break;
-        if (pd == 0 && (is_outer_close(tokens[i].lex.kind) || is_close_block(tokens[i].lex.kind)))
-            break;
+        else if (kind_is(t, TK::Semicolon) && !is_module_header_import_semicolon(tokens, i))
+            at = npos;
+        else if (is_outer_close(t.lex.kind) || is_close_block(t.lex.kind))
+            at = npos;
         // A header holds no block: a `(` inside `specify`, `begin`, ...
         // belongs to that block.
-        if (pd == 0 && is_open_block(tokens[i].lex.kind) && !kind_is(tokens[i], TK::OpenBrace))
-            break;
+        else if (is_open_block(t.lex.kind) && !kind_is(t, TK::OpenBrace))
+            at = npos;
     }
-    return npos;
+}
+
+inline size_t find_header_keyword_before(const TokenStream& tokens, size_t open) {
+    return tokens[open].immutable.topology.header_keyword;
+}
+
+// Sets TopologyFacts::opens_subroutine_formals and after_subroutine_keyword
+// on every `(`.  Needs matching_token.
+//
+// The first option is about the declaration header:
+//
+//   function int add(
+//                   ^ this open paren
+//
+// not about nested calls/default expressions inside the port list.  Walking
+// backward until a declaration boundary keeps the test token-kind based and
+// idempotent.  Seeing another '(' first means the current '(' belongs to an
+// expression nested inside an already-open declaration header.  As for
+// header_keyword, the walk back is carried forward: `formals` is its answer
+// for the next token, and a balanced `)` restores the answer its `(` had.
+//
+// `function type(x) f (int a);` -- a `type(...)` return type has
+// parentheses of its own.  Its `(` is not the header's, and its balanced
+// pair is stepped over on the way back from the one that is.
+inline void mark_subroutine_formals(TokenStream& tokens) {
+    std::vector<char> formals_at(tokens.size(), 0);
+    bool formals = false, after_keyword = false;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        Tok& t = tokens[i];
+        if (!is_code_token(t))
+            continue;
+        const TK k = t.lex.kind;
+        if (k == TK::OpenParenthesis) {
+            formals_at[i] = formals;
+            const size_t before = prev_code(tokens, i);
+            t.immutable.topology.opens_subroutine_formals =
+                formals && !(before != npos && kind_is(tokens[before], TK::TypeKeyword));
+            t.immutable.topology.after_subroutine_keyword = after_keyword;
+        }
+        if (k == TK::FunctionKeyword || k == TK::TaskKeyword)
+            formals = after_keyword = true;
+        else if (k == TK::Semicolon)
+            formals = after_keyword = false;
+        else if (k == TK::CloseParenthesis && t.immutable.syntax.matching_token != npos &&
+                 t.immutable.syntax.matching_token < i)
+            formals = formals_at[t.immutable.syntax.matching_token];
+        else if (k == TK::OpenParenthesis || is_close_block(k) || is_outer_close(k))
+            formals = false;
+    }
 }
 
 inline bool is_function_task_declaration_open(const TokenStream& tokens, size_t open) {
-    if (open >= tokens.size() || !kind_is(tokens[open], TK::OpenParenthesis))
-        return false;
-
-    // This option is about the declaration header:
-    //
-    //   function int add(
-    //                   ^ this open paren
-    //
-    // not about nested calls/default expressions inside the port list.  Walking
-    // backward until a declaration boundary keeps the test token-kind based and
-    // idempotent.  Seeing another '(' first means the current '(' belongs to an
-    // expression nested inside an already-open declaration header.
-    //
-    // `function type(x) f (int a);` -- a `type(...)` return type has
-    // parentheses of its own.  Its `(` is not the header's, and its balanced
-    // pair is stepped over on the way back from the one that is.
-    const size_t before_open = prev_code(tokens, open);
-    if (before_open != npos && kind_is(tokens[before_open], TK::TypeKeyword))
-        return false;
-    for (size_t n = open; n > 0; --n) {
-        size_t i = n - 1;
-        if (!is_code_token(tokens[i]))
-            continue;
-        if (kind_is(tokens[i], TK::CloseParenthesis)) {
-            const size_t match = tokens[i].immutable.syntax.matching_token;
-            if (match != npos && match < i) {
-                n = match + 1;
-                continue;
-            }
-        }
-        if (kind_is(tokens[i], TK::FunctionKeyword) || kind_is(tokens[i], TK::TaskKeyword))
-            return true;
-        if (kind_is(tokens[i], TK::OpenParenthesis) ||
-            kind_is(tokens[i], TK::Semicolon) ||
-            is_close_block(tokens[i].lex.kind) ||
-            is_outer_close(tokens[i].lex.kind))
-            return false;
-    }
-    return false;
+    return open < tokens.size() && kind_is(tokens[open], TK::OpenParenthesis) &&
+           tokens[open].immutable.topology.opens_subroutine_formals;
 }
 
 // The `)` closing a control header or timing control -- `if (c)`,
@@ -2215,6 +2244,7 @@ class SyntaxPass final : public IFormatPass {
 public:
     const char* name() const override { return "syntax"; }
     void run(TokenStream& tokens) override {
+        mark_header_keywords(tokens);
         std::vector<size_t> parens, brackets, braces;
         // Paren/bracket depth at each open brace, so a `;` nested inside
         // parentheses is not mistaken for the brace's own statement separator.
@@ -2434,6 +2464,7 @@ public:
                 in_covergroup = false;
         }
         mark_property_expressions(tokens);
+        mark_subroutine_formals(tokens);
         for (size_t i = 0; i < tokens.size(); ++i) {
             // `bins t = (1 [->2] => 0);` -- a transition list repeats a value the
             // way a sequence repeats an expression, and sits in parentheses.
@@ -4038,16 +4069,7 @@ public:
             if (is_gate_terminal_open(tokens, open))
                 continue;
 
-            bool is_decl = false;
-            for (size_t j = open; j > 0; --j) {
-                size_t k = j - 1;
-                if (!is_code_token(tokens[k])) continue;
-                if (kind_is(tokens[k], TK::FunctionKeyword) || kind_is(tokens[k], TK::TaskKeyword)) {
-                    is_decl = true;
-                    break;
-                }
-                if (kind_is(tokens[k], TK::Semicolon)) break;
-            }
+            bool is_decl = tokens[open].immutable.topology.after_subroutine_keyword;
             // `sequence s(a, b)`, `property p(...)`, `let max(a, b)`,
             // `covergroup cg(int lo, int hi)`, `checker chk(logic clk)` --
             // the formals of a declaration, laid out like a function's.
