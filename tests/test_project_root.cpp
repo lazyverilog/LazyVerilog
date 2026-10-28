@@ -2099,6 +2099,9 @@ TEST_CASE("references: the override class table does not pin replaced shards",
         const auto snapshot = analyzer.extra_index_snapshot_ptr();
         REQUIRE(snapshot);
     }
+    // The old shard's own cache write may still be queued and holds it; that
+    // pin ends with the write, not with the reload.
+    analyzer.wait_for_index_cache_writes_idle();
     CHECK(old_base.expired());
     // And the next request still answers from the new shard.
     CHECK(analyzer.find_references(uri, 1, 33, true, true).size() == 4);
