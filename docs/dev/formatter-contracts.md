@@ -101,10 +101,11 @@ The invariants test checks that the predicted width of every call left on
 one line equals its rendered width, and that a call broken for its width
 was predicted past the limit.
 
-WrapPass decides lists in source order, and a decision changes breaks and
-list kinds only inside the list and after it. `LineGeometry` therefore
-caches line starts, widths, indents and gaps, and drops only what the list
-just decided can have changed; walking back to the line's start for every
+WrapPass decides lists in source order and measures only up to the list
+it is deciding, so `LineGeometry` caches line starts, widths, indents and
+gaps. The only value cached past that list before its decision is a gap,
+and `spacing_gap()` does not depend on the decision; `invalidate()` is
+defensive. Walking back to the line's start for every
 call made a statement of n calls O(n^3). `[formatter][scaling]` guards it.
 
 The test flips every value of every option from eight base configs (default,
