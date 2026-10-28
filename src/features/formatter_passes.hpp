@@ -1197,11 +1197,13 @@ inline size_t callee_chain_start(const TokenStream& tokens, size_t open, LineOf 
 // with this; a limit compared against the text alone let a line run past it
 // by exactly its own indent.
 //
-// WrapPass decides lists in source order, and deciding one changes breaks
-// and list kinds only inside it and after it.  So `cached`, every line
-// start, line width, indent and gap is remembered, and invalidate() drops
-// what the list just decided can have changed.  Uncached, each query walks
-// back to its line's start: a statement of n calls cost O(n^3).
+// WrapPass decides lists in source order and only measures up to the list
+// it is deciding, so `cached`, every line start, line width, indent and gap
+// is remembered.  The one value cached past that list before its decision
+// is a gap, and spacing_gap() does not depend on the decision (an
+// instance's port list is recognised by its shape).  invalidate() is
+// defensive.  Uncached, each query walks back to its line's start: a
+// statement of n calls cost O(n^3).
 class LineGeometry {
 public:
     LineGeometry(const TokenStream& tokens, const FormatOptions& opts, bool cached = false)
@@ -1329,8 +1331,8 @@ public:
         return column(open) + width(open, close + 1) + tail_width(close, limit);
     }
 
-    // WrapPass has decided the list `open`...`close`: its breaks and list
-    // kinds changed inside it and right after it.
+    // WrapPass has decided the list `open`...`close`.  Defensive: nothing
+    // cached at or past `open` should depend on that decision.
     void invalidate(size_t open, size_t close) {
         if (!cached_)
             return;
@@ -3895,7 +3897,7 @@ public:
             size_t close = tokens[open].immutable.syntax.matching_token;
             if (close == npos || close >= tokens.size())
                 continue;
-            // Only the list decided last can have changed what was measured.
+            // Defensive: drop what the list decided last could touch.
             if (decided_open != npos)
                 geo.invalidate(decided_open, decided_close);
             decided_open = open;

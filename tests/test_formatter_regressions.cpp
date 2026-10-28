@@ -7129,8 +7129,8 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
             s += (i ? std::string(sep) : std::string()) + "f" + std::to_string(i) + "(a, b)";
         return s + ";\nendmodule\n";
     };
-    constexpr int kCalls = 300;
-    constexpr int kRuns = 5;
+    constexpr int kCalls = 1000; // ~50 ms on the small side, so load noise stays small
+    constexpr int kRuns = 3;
     for (const char* sep : {" + ", " +\n    "}) {
         CAPTURE(sep);
         const std::string small = statement(kCalls, sep);
@@ -7147,7 +7147,8 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
         }
         const double ratio = large_best / small_best;
         INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
-        CHECK(ratio < 24.0);
+        // The geometric midpoint of quadratic (16) and cubic (64).
+        CHECK(ratio < 32.0);
     }
 }
 
