@@ -2085,11 +2085,15 @@ Analyzer::get_parsed_state(const std::string& uri, std::chrono::milliseconds tim
 
     // A reparse is in flight.  Wait for it rather than answer from a snapshot
     // the user has already typed past -- but only for as long as the request
-    // thread can afford, since it answers one request at a time.
-    parse_committed_cv_.wait_for(lock, timeout, [&] {
-        const auto latest = current();
-        return !latest || latest->tree;
-    });
+    // thread can afford, since it answers one request at a time.  A zero
+    // timeout skips the call: MinGW's timed wait sleeps a scheduler tick
+    // (measured 4-20 ms) even when asked for none.
+    if (timeout.count() > 0) {
+        parse_committed_cv_.wait_for(lock, timeout, [&] {
+            const auto latest = current();
+            return !latest || latest->tree;
+        });
+    }
 
     state = current();
     if (!state || state->tree)
