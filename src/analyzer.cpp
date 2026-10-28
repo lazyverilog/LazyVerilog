@@ -8674,6 +8674,10 @@ void Analyzer::drain_shard_writes_inline() const {
             std::cerr << "[lazyverilog] index cache write failed\n";
         }
 
+        // Drop the shard before reporting idle.  Destroyed at the end of the
+        // iteration instead, it outlived wait_for_index_cache_writes_idle(),
+        // so a caller could still see a replaced shard alive after the wait.
+        write = PendingShardWrite{};
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
         index_cache_write_cv_.notify_all();
@@ -8732,14 +8736,17 @@ void Analyzer::index_cache_writer_loop() const {
         // A generation bump means the config moved, so this shard would be
         // keyed on defines that are no longer current.  Dropping it costs one
         // reparse next launch; writing it would serve the wrong index.
+        bool current_generation = false;
         {
             std::lock_guard<std::mutex> lock(map_mutex_);
-            if (write.generation != background_generation_) {
-                std::lock_guard<std::mutex> write_lock(index_cache_write_mutex_);
-                index_cache_writing_ = false;
-                index_cache_write_cv_.notify_all();
-                continue;
-            }
+            current_generation = write.generation == background_generation_;
+        }
+        if (!current_generation) {
+            write = PendingShardWrite{}; // released before "idle", as below
+            std::lock_guard<std::mutex> write_lock(index_cache_write_mutex_);
+            index_cache_writing_ = false;
+            index_cache_write_cv_.notify_all();
+            continue;
         }
 
         // `index_cache_writing_` is set, and wait_for_index_cache_writes_idle()
@@ -8759,6 +8766,10 @@ void Analyzer::index_cache_writer_loop() const {
             std::cerr << "[lazyverilog] index cache write failed\n";
         }
 
+        // Drop the shard before reporting idle.  Destroyed at the end of the
+        // iteration instead, it outlived wait_for_index_cache_writes_idle(),
+        // so a caller could still see a replaced shard alive after the wait.
+        write = PendingShardWrite{};
         std::lock_guard<std::mutex> lock(index_cache_write_mutex_);
         index_cache_writing_ = false;
         index_cache_write_cv_.notify_all();
