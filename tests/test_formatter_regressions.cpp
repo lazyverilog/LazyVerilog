@@ -7149,10 +7149,11 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
         }
         const double ratio = large_best / small_best;
         INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
-        // Linear measures 4-5 alone and up to 8 beside six busy test
+        // Linear measures 4-5 alone and up to 8.6 beside eleven busy test
         // processes (the larger input feels the cache pressure more); the
-        // quadratic code measured 15.
-        CHECK(ratio < 10.0);
+        // quadratic code measured 15 to 17.  CI runners have read higher than
+        // local ones before, so the limit sits between with room both ways.
+        CHECK(ratio < 12.0);
     }
 }
 
