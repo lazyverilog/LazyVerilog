@@ -227,20 +227,22 @@ TEST_CASE("implicit scan time scales linearly with the tree", "[implicit-project
     build(small, 60);
     build(large, 120);
 
-    const auto min_ms = [](const fs::path& root) {
-        double best = 1e9;
-        for (int i = 0; i < 5; ++i) {
-            const auto start = std::chrono::steady_clock::now();
-            auto scan = scan_implicit_root(root);
-            const std::chrono::duration<double, std::milli> took =
-                std::chrono::steady_clock::now() - start;
-            REQUIRE_FALSE(scan.over_limit);
-            best = std::min(best, took.count());
-        }
-        return best;
+    const auto time_ms = [](const fs::path& root) {
+        const auto start = std::chrono::steady_clock::now();
+        auto scan = scan_implicit_root(root);
+        const std::chrono::duration<double, std::milli> took =
+            std::chrono::steady_clock::now() - start;
+        REQUIRE_FALSE(scan.over_limit);
+        return took.count();
     };
-    const double n = min_ms(small.root);
-    const double two_n = min_ms(large.root);
+    // Interleaved, so a slow stretch on a shared runner hits both trees
+    // instead of only the one being timed then (a few ms each, so it shows).
+    double n = 1e9;
+    double two_n = 1e9;
+    for (int i = 0; i < 15; ++i) {
+        n = std::min(n, time_ms(small.root));
+        two_n = std::min(two_n, time_ms(large.root));
+    }
     INFO("scan N=" << n << " ms, 2N=" << two_n << " ms");
     CHECK(two_n <= 2.6 * n + 1.0);
 }
