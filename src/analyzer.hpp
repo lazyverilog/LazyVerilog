@@ -511,6 +511,8 @@ class Analyzer {
     /// Server registers this once.  Called on the parse worker once its queue
     /// has stayed empty for kParseIdleNotifyDelay after a
     /// request_parse_idle_notification(): once per typing burst, not per parse.
+    /// A request made after the worker has already been idle that long is
+    /// answered at once.
     void set_parse_idle_callback(std::function<void()> cb);
     /// Ask for one parse-idle callback.  Safe from any thread.
     void request_parse_idle_notification();

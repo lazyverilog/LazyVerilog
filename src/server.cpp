@@ -550,7 +550,12 @@ LazyVerilogServer::LazyVerilogServer(ImplicitProjectMode implicit_mode)
     // Mirrors read by the handlers that run on the worker pool; see the
     // declarations.
     analyzer_.set_project_index_publish_callback([this] {
-        request_inlay_hint_refresh();
+        // Through the same idle rule as a stale inlayHint answer: while the
+        // user types, each keystroke's live shard publishes, and a refresh per
+        // publish made Neovim re-ask for every visible buffer per keystroke.
+        // A publish while idle (another file's index changed) still refreshes
+        // at once.
+        schedule_inlay_hint_refresh();
         // The shard of an open header's includer may be what just arrived.
         analyzer_.reparse_open_headers_missing_includer();
 
@@ -1130,6 +1135,13 @@ void LazyVerilogServer::invalidate_config_cache() {
     // that, and it re-derives the accumulated inputs at the same time.  Clearing
     // it here instead left the analyzer holding a filelist no longer backed by
     // any recorded root.
+}
+
+void LazyVerilogServer::schedule_inlay_hint_refresh() {
+    if (!inlay_hint_refresh_supported_.load())
+        return;
+    inlay_hint_refresh_pending_.store(true);
+    analyzer_.request_parse_idle_notification();
 }
 
 void LazyVerilogServer::request_inlay_hint_refresh() {
@@ -2287,10 +2299,8 @@ void LazyVerilogServer::register_handlers() {
             bool stale = false;
             rsp.result = provide_inlay_hints(analyzer_, uri, req.params.range.start.line,
                                              req.params.range.end.line, &stale);
-            if (stale) {
-                inlay_hint_refresh_pending_.store(true);
-                analyzer_.request_parse_idle_notification();
-            }
+            if (stale)
+                schedule_inlay_hint_refresh();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] inlayHint error: " << e.what() << "\n";
         }

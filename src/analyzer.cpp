@@ -1798,6 +1798,10 @@ void Analyzer::parse_worker_loop() {
     // Reparsed buffers whose includers still have to be told, waiting for the
     // same moment.  See the fanout note below.
     std::unordered_set<std::string> deferred_dependents;
+    // When the worker last finished a parse or a deferred rebuild.  An idle
+    // notification asked for long after it -- a project publish while the user
+    // is not typing -- fires at once instead of sitting out another full delay.
+    Clock::time_point last_work{};
 
     while (true) {
         // A parse that throws must cost the keystroke that started it and
@@ -1821,9 +1825,11 @@ void Analyzer::parse_worker_loop() {
                 // Woken only to time an idle period: the timed wait below does it.
                 if (!takeable())
                     continue;
-            } else {
-                parse_cv_.wait_for(lock, deferred ? kLiveShardIdleDelay : kParseIdleNotifyDelay,
-                                   takeable);
+            } else if (deferred) {
+                parse_cv_.wait_for(lock, kLiveShardIdleDelay, takeable);
+            } else if (const auto idle_for = Clock::now() - last_work;
+                       idle_for < kParseIdleNotifyDelay) {
+                parse_cv_.wait_for(lock, kParseIdleNotifyDelay - idle_for, takeable);
             }
             if (parse_stop_.load())
                 break;
@@ -1838,6 +1844,7 @@ void Analyzer::parse_worker_loop() {
         }
 
         if (!have_job) {
+            const bool deferred_work = !deferred_shards.empty() || !deferred_dependents.empty();
             // The queue stayed empty for kLiveShardIdleDelay, so the user has
             // stopped typing and the deferred shards are worth building.
             for (auto& [shard_uri, deferred] : deferred_shards) {
@@ -1886,6 +1893,8 @@ void Analyzer::parse_worker_loop() {
                 }
                 deferred_dependents.clear();
             }
+            if (deferred_work)
+                last_work = Clock::now();
             if (notify_idle && parse_idle_cb_)
                 parse_idle_cb_();
             continue;
@@ -1957,6 +1966,7 @@ void Analyzer::parse_worker_loop() {
             // This parse may be the includer of a header opened before it.
             reparse_open_headers_missing_includer();
         }
+        last_work = Clock::now();
         } catch (const std::exception& e) {
             std::cerr << "[lazyverilog] parse worker error: " << e.what() << "\n";
         } catch (...) {

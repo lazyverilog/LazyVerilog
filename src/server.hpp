@@ -55,6 +55,9 @@ class LazyVerilogServer {
     void clear_published_diagnostics_for_owner(const std::string& owner_uri);
     void publish_config_diagnostic(const ConfigWarning* warning);
     void request_inlay_hint_refresh();
+    /// One refresh once the parse queue goes idle (at once if it already is);
+    /// any number of calls before then share it.
+    void schedule_inlay_hint_refresh();
     /// Whether any open project asks for semantic compilation.
     bool any_project_compiles() const;
     /// @p uri's semantic diagnostics, or none when @p config -- that file's own,
