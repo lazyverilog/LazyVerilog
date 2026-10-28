@@ -377,33 +377,44 @@ refresh, each keystroke cost a second whole-file `inlayHint`.  The delay is
 longer than the gap between keystrokes on purpose: at 150 ms, a parse that
 finished before the next key was already "idle".
 
+The project-index publish refresh (`request_inlay_hint_refresh()`) goes
+through the same path (`schedule_inlay_hint_refresh()`).  While the user
+types slower than the live-shard idle delay, every keystroke's shard publishes,
+and main sent a refresh per publish: 15-20 per 20-keystroke burst at a 300 ms
+gap, each a whole-file re-request per visible buffer.  Now every source sets one
+pending flag and the parse worker sends one refresh once its queue has been
+idle for `kParseIdleNotifyDelay`.  A request made when the worker has already
+been idle that long -- a publish caused by another file changing on disk --
+fires at once: the smoke test measures 280 ms from `didChangeWatchedFiles` to
+the refresh, the same as the old immediate send (indexing plus the 250 ms
+publish debounce).
+
 A client without `refreshSupport` would never hear about the newer tree, so it
-keeps the bounded 150 ms wait, and the server sends it no refresh at all --
-neither this one nor the one after a project-index publish
-(`request_inlay_hint_refresh()`).  `tools/inlay_refresh_smoke.py` (ctest
-`inlay-refresh-smoke`) checks both modes.
+keeps the bounded 150 ms wait, and the server sends it no refresh at all.
+`tools/inlay_refresh_smoke.py` (ctest `inlay-refresh-smoke`) checks both modes,
+including the refresh after an idle publish.
 
 Measured with a Windows variant of `edit_latency_bench.py` that types at a
 fixed cadence without waiting for replies and sends `inlayHint` and
 `foldingRange` back to back for the whole file, as Neovim does; the client
 re-requests on refresh.  42k-line `pinmux_reg_top.sv` with 14241 hints, 20
-keystrokes, five interleaved runs per cell, machine load 1-6% outside the
+keystrokes, five interleaved runs per cell, machine load 10-15% during the
 runs.  min/median of each run's p50 and p95, in ms:
 
 | gap | CPUs | build | inlayHint p50 | inlayHint p95 | foldingRange p50 | foldingRange p95 | refreshes |
 |---|---|---|---|---|---|---|---|
-| 150 ms | all | wait 150 ms | 97/98 | 100/101 | 23/23 | 24/24 | 1 |
-| 150 ms | all | no wait | 82/82 | 84/88 | 23/23 | 24/26 | 2 |
-| 150 ms | 1 | wait 150 ms | 103/104 | 106/107 | 140/141 | 160/161 | 1 |
-| 150 ms | 1 | no wait | 101/102 | 105/108 | 134/139 | 158/160 | 2 |
-| 300 ms | all | wait 150 ms | 98/99 | 101/103 | 23/23 | 24/24 | 20 |
-| 300 ms | all | no wait | 33/38 | 87/87 | 47/53 | 83/96 | 17 |
-| 300 ms | 1 | wait 150 ms | 109/111 | 132/141 | 141/142 | 153/185 | 16 |
-| 300 ms | 1 | no wait | 107/108 | 110/111 | 111/140 | 145/172 | 15 |
-| 50 ms | all | wait 150 ms | 394/416 | 551/554 | 376/381 | 531/532 | 1 |
-| 50 ms | all | no wait | 121/121 | 146/160 | 89/94 | 118/127 | 2 |
-| 50 ms | 1 | wait 150 ms | 125/139 | 168/174 | 144/171 | 192/199 | 1 |
-| 50 ms | 1 | no wait | 102/121 | 123/155 | 109/125 | 135/155 | 2 |
+| 150 ms | all | wait 150 ms | 97/100 | 100/108 | 22/23 | 24/31 | 1 |
+| 150 ms | all | no wait | 82/84 | 83/88 | 23/23 | 24/25 | 1 |
+| 150 ms | 1 | wait 150 ms | 103/106 | 105/112 | 140/144 | 158/165 | 1 |
+| 150 ms | 1 | no wait | 102/105 | 105/110 | 139/142 | 159/165 | 1 |
+| 300 ms | all | wait 150 ms | 97/100 | 100/105 | 22/23 | 23/36 | 19 |
+| 300 ms | all | no wait | 87/88 | 89/90 | 23/23 | 25/26 | 1 |
+| 300 ms | 1 | wait 150 ms | 110/111 | 129/143 | 138/145 | 172/180 | 17 |
+| 300 ms | 1 | no wait | 102/104 | 110/113 | 110/110 | 129/143 | 1 |
+| 50 ms | all | wait 150 ms | 404/412 | 548/561 | 375/382 | 526/534 | 1 |
+| 50 ms | all | no wait | 91/130 | 134/170 | 70/102 | 118/130 | 1 |
+| 50 ms | 1 | wait 150 ms | 127/131 | 172/179 | 136/147 | 197/200 | 1 |
+| 50 ms | 1 | no wait | 124/127 | 159/172 | 121/144 | 187/202 | 1 |
 
 Where the time goes, from timing the handler: the parse of this file takes
 about 25 ms, even on one CPU, and the hints themselves 3-5 ms.  Nearly all of
@@ -412,23 +423,23 @@ ms, and every keystroke makes a new tree.  So waiting for the parse and
 answering stale cost the same index build per keystroke; the stale answer
 just does not sit out the parse first.
 
-Two things made the first no-wait version slower than the wait at full CPU
-(p95 156-160 ms against 100):
+Three things made the first no-wait version lose to the wait somewhere:
 
 - `build_module_map()` looked up the asking buffer through its *latest*
   snapshot.  When the parse landed during a stale answer, that was a second
-  tree to index in the same request, 75-90 ms more.  It now uses the snapshot
-  being answered from.
+  tree to index in the same request, 75-90 ms more (inlayHint p95 156-160 ms
+  against 100 at full CPU).  It now uses the snapshot being answered from.
 - `get_parsed_state()` with a zero timeout still called `wait_for()`, and
   MinGW's timed wait sleeps a scheduler tick (4-20 ms) even for zero.  A zero
   timeout now skips the call.
+- At a 300 ms gap, `foldingRange` went from 23 to 47-53 ms p50 (83-96 p95)
+  at full CPU.  Timing each pool request showed why: every publish refresh's
+  re-request now indexed the newest tree (78-94 ms, since the stale answer had
+  not), so it held one of the two pool workers when the next keystroke's
+  `inlayHint` and `foldingRange` arrived.  The fold queued 9-31 ms and then ran
+  29-80 ms instead of 20 beside two concurrent index builds.  With one refresh
+  per burst the same trace shows the fold queued 0 ms and run in 20-21 ms.
 
 Requests run on two pool workers when more than one CPU is available, so at
-full CPU `foldingRange` is not queued behind `inlayHint`; it is on one CPU.
-The one cell that is worse is `foldingRange` at a 300 ms gap with every CPU.
-At that gap each keystroke also gets a project-index publish and its refresh
-(the 15-20 refreshes per burst, on main too).  Most likely the re-request it
-triggers is what indexes the newest tree now, so it holds a worker when the
-next fold arrives (not profiled).  The work is the same; it lands at a worse
-time.  The fold is still
-under 100 ms there, and the `inlayHint` beside it is 60 ms faster.
+full CPU `foldingRange` is only queued behind `inlayHint` when something else
+holds the other worker; on one CPU it always is.

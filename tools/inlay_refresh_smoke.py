@@ -3,8 +3,10 @@
 
   refreshSupport offered: inlayHint answers from the last parsed tree while a
       typing burst is being parsed, and the server sends one refresh once the
-      parse queue goes idle -- not one per parse.  The client re-requests on
-      it, as Neovim does, and that answer matches the settled hints.
+      parse queue goes idle -- not one per parse or per project publish.  The
+      client re-requests on it, as Neovim does, and that answer matches the
+      settled hints.  A project publish while idle (another file changed on
+      disk) still refreshes promptly.
   refreshSupport not offered: the server never sends the refresh (the client
       may not handle it), and inlayHint waits for the parse instead.
 
@@ -26,10 +28,10 @@ from lsp_client import Client  # noqa: E402
 KEYSTROKES = 12
 # Enough instances that each reparse is still running when its inlayHint
 # arrives, which is the window the refresh exists for.
-TOP = ("module child (input logic a, output logic b);\n"
-       "    assign b = a;\n"
-       "endmodule\n"
-       "module top;\n"
+CHILD = ("module child (input logic a, output logic b);\n"
+         "    assign b = a;\n"
+         "endmodule\n")
+TOP = ("module top;\n"
        "    logic x, y;\n"
        "    child u_child (.a(x), .b(y));\n"
        "    // typing here\n"
@@ -84,8 +86,11 @@ def run(binary: str, root: Path, refresh_support: bool) -> list[str]:
         if not settled:
             errors.append(f"{mode}: no hints at all; the check proves nothing")
         if refresh_support:
-            # One for the burst; a project-index publish may add one more.
-            if not 1 <= sent <= 2:
+            # One per burst is expected: the parse-idle and project-publish
+            # refreshes share one debounced path.  Up to 3 tolerates a slow
+            # runner whose reply outlasts the idle delay and splits the burst;
+            # a refresh per parse or per publish is about KEYSTROKES.
+            if not 1 <= sent <= 3:
                 errors.append(f"{mode}: expected one refresh per burst, got {sent}")
             last = f"refresh-{client.refresh_rerequests}"
             with client.cv:
@@ -94,6 +99,32 @@ def run(binary: str, root: Path, refresh_support: bool) -> list[str]:
                 errors.append(f"{mode}: the re-requested hints differ from the settled ones")
         elif sent:
             errors.append(f"{mode}: refresh sent to a client that did not offer it")
+
+        # Idle: another file's index changes, and with it this buffer's hints.
+        before = refreshes(client)
+        child = root / "child.sv"
+        child.write_text(CHILD.replace("output logic b", "output logic b, input logic c"))
+        changed = time.monotonic()
+        client.notify("workspace/didChangeWatchedFiles",
+                      {"changes": [{"uri": child.as_uri(), "type": 2}]})
+        got = None
+        while got is None and time.monotonic() - changed < 10:
+            if refreshes(client) > before:
+                got = time.monotonic() - changed
+            time.sleep(0.02)
+        if not refresh_support:
+            client.wait_quiet(1.5)
+        _, after = client.request("textDocument/inlayHint", hint_params)
+        labels = [h.get("label") for h in after.get("result") or []]
+        print(f"{mode}: idle publish -> refresh after "
+              f"{'none' if got is None else f'{got * 1000:.0f} ms'}, first label {labels[:1]}")
+        if refresh_support and got is None:
+            errors.append(f"{mode}: a publish while idle sent no refresh")
+        if not refresh_support and refreshes(client) > before:
+            errors.append(f"{mode}: idle publish refreshed a client that did not offer it")
+        if "2/3 ports" not in labels:
+            errors.append(f"{mode}: hints do not see the changed child.sv: {labels[:3]}")
+        child.write_text(CHILD)
     finally:
         try:
             client.request("shutdown", None, timeout=10)
@@ -112,7 +143,8 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="lazyverilog-inlay-refresh-"))
     try:
         (root / "top.sv").write_text(TOP)
-        (root / "files.f").write_text("top.sv\n")
+        (root / "child.sv").write_text(CHILD)
+        (root / "files.f").write_text("child.sv\ntop.sv\n")
         (root / "lazyverilog.toml").write_text('[design]\nvcode = "files.f"\n')
         errors = run(args.binary, root, True) + run(args.binary, root, False)
     finally:
