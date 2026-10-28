@@ -169,6 +169,18 @@ struct TopologyFacts {
     // SyntaxPass to replace O(n) backward scans.
     bool inside_argument_list{false};
 
+    // Set on every `(`, each by one forward walk in SyntaxPass, so a long
+    // statement does not cost a backward scan per `(` (O(n^2) in its calls).
+    // header_keyword: the `module`/`interface`/`program` keyword whose header
+    // holds this `(` (find_header_keyword_before), or npos.
+    // opens_subroutine_formals: the `(` of a function/task declaration's
+    // formals (is_function_task_declaration_open).
+    // after_subroutine_keyword: a `function`/`task` keyword comes after the
+    // last `;` before this `(`.
+    size_t header_keyword{npos};
+    bool opens_subroutine_formals{false};
+    bool after_subroutine_keyword{false};
+
     // The `:` that ends a case item's label list (`` `OP, 4'hc: ``,
     // `default:`).  What precedes it can be any expression -- a literal, an
     // identifier, a macro -- so spacing cannot be decided from the left token.

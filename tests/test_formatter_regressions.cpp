@@ -7121,16 +7121,18 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
     // WrapPass measured each call's line by walking back to the line's start,
     // asking spacing_gap() -- itself a walk back over the statement at every
     // `(` -- for each gap: O(n^3) in one statement's calls, 52 s for 2000.
-    // A ratio against the same statement four times longer, min of runs:
-    // linear is 4, the quadratic floor SpacingPass shares is 16, cubic 64.
+    // Then SyntaxPass, WrapPass and SpacingPass each still walked back over
+    // the statement from every `(` (header keyword, `function`/`task`
+    // before it): O(n^2).  A ratio against the same statement four times
+    // longer, min of interleaved runs: linear is 4, quadratic 16.
     auto statement = [](int n, const char* sep) {
         std::string s = "module m;\n  assign x = ";
         for (int i = 0; i < n; ++i)
             s += (i ? std::string(sep) : std::string()) + "f" + std::to_string(i) + "(a, b)";
         return s + ";\nendmodule\n";
     };
-    constexpr int kCalls = 1000; // ~50 ms on the small side, so load noise stays small
-    constexpr int kRuns = 3;
+    constexpr int kCalls = 2000; // ~15 ms on the small side
+    constexpr int kRuns = 11;
     for (const char* sep : {" + ", " +\n    "}) {
         CAPTURE(sep);
         const std::string small = statement(kCalls, sep);
@@ -7147,8 +7149,10 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
         }
         const double ratio = large_best / small_best;
         INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
-        // The geometric midpoint of quadratic (16) and cubic (64).
-        CHECK(ratio < 32.0);
+        // Linear measures 4-5 alone and up to 8 beside six busy test
+        // processes (the larger input feels the cache pressure more); the
+        // quadratic code measured 15.
+        CHECK(ratio < 10.0);
     }
 }
 
