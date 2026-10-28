@@ -49,15 +49,27 @@ struct ModuleMap {
 /// project half is cheap.
 static ModuleMap build_module_map(const Analyzer& analyzer,
                                   const std::unordered_set<std::string>& wanted,
-                                  std::string_view from_path) {
+                                  const std::string& asking_uri,
+                                  const std::shared_ptr<const DocumentState>& asking) {
     ModuleMap modules;
     if (wanted.empty())
         return modules;
 
     analyzer.for_each_state(
-        [&](const std::string&, const std::shared_ptr<const DocumentState>& state) {
+        [&](const std::string& uri, const std::shared_ptr<const DocumentState>& state) {
             if (!state)
                 return;
+            // The asking buffer's own modules come from the snapshot this
+            // request answers from.  Its latest snapshot may have parsed since,
+            // and indexing that too doubled the cost of a stale answer.
+            if (uri == asking_uri) {
+                const auto& index = get_structural_index(*asking);
+                for (const auto& module : index.modules)
+                    if (wanted.contains(module.name))
+                        modules.by_name[module.name] = &module;
+                modules.open_documents.push_back(asking);
+                return;
+            }
             // A buffer whose reparse is in flight is a text-only placeholder.
             // Skipping it dropped every module it declares from the map for as
             // long as that parse ran, so an instance of a module declared in
@@ -91,7 +103,7 @@ static ModuleMap build_module_map(const Analyzer& analyzer,
     for (const auto& name : wanted) {
         if (modules.by_name.contains(name))
             continue; // an open buffer already answered for this name
-        const auto* found = project->find_module(name, from_path);
+        const auto* found = project->find_module(name, asking->normalized_path);
         if (!found)
             continue;
         const auto& ref = *found;
@@ -201,7 +213,7 @@ std::vector<lsInlayHint> provide_inlay_hints(const Analyzer& analyzer, const std
         instantiated.insert(inst.module_name);
 
     const auto lines = split_lines_view(state->text);
-    const auto modules = build_module_map(analyzer, instantiated, state->normalized_path);
+    const auto modules = build_module_map(analyzer, instantiated, uri, state);
     PortMapCache port_maps;
     std::vector<lsInlayHint> hints;
 
