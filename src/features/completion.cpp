@@ -3399,7 +3399,15 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
     static std::shared_ptr<const ProjectParseInputs> memo_inputs;
     static uint64_t memo_generation = 0;
     static std::unordered_map<std::string, std::string> memo_roots; // directory -> root
+    // root -> its last macros, which the next snapshot reuses if its shards are the same.
+    static std::unordered_map<std::string, std::shared_ptr<const ProjectMacros>> memo_macros;
     const uint64_t generation = inputs->root_generation();
+    std::shared_ptr<const ProjectMacros> previous;
+    {
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        if (const auto it = memo_macros.find(root); it != memo_macros.end())
+            previous = it->second;
+    }
     const auto macros = snapshot->project_macros(root, generation, [&](const std::string& path) {
         const std::string dir = std::filesystem::path(path).parent_path().string();
         {
@@ -3417,11 +3425,31 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
         if (memo_inputs == inputs && memo_generation == generation)
             memo_roots.emplace(dir, found);
         return found;
-    });
+    }, previous);
+    if (macros != previous) {
+        std::lock_guard<std::mutex> lock(memo_mutex);
+        memo_macros[root] = macros;
+    }
     std::vector<std::pair<int, const MacroEntry*>> matches;
-    for (const auto* mac : *macros)
-        if (const int score = prefix_score(mac->name, ctx.prefix); score > 0)
-            matches.emplace_back(score, mac);
+    // Every prefix match outscores every fuzzy one (prefix_score()), so when
+    // more than @p limit names start with the prefix the answer is the best of
+    // those: a binary search, not a scan.  Otherwise fuzzy matches may fill the
+    // rest, and only a scan finds them.
+    const auto prefixed = macros->prefix_range(ctx.prefix);
+    if (prefixed.size() > limit && ctx.prefix.empty()) {
+        // All score alike; the tie-break is the name.
+        for (size_t i = 0; i < limit; ++i)
+            items.push_back(macro_item(*macros->by_name[i]));
+        return true;
+    }
+    if (prefixed.size() > limit) {
+        for (const auto* mac : prefixed)
+            matches.emplace_back(prefix_score(mac->name, ctx.prefix), mac);
+    } else {
+        for (const auto* mac : macros->in_order)
+            if (const int score = prefix_score(mac->name, ctx.prefix); score > 0)
+                matches.emplace_back(score, mac);
+    }
     const bool truncated = matches.size() > limit;
     if (truncated) {
         std::partial_sort(matches.begin(), matches.begin() + limit, matches.end(),

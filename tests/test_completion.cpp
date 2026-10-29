@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -3066,6 +3067,50 @@ TEST_CASE("completion: a project with many macros sends the best and says it is 
     CHECK(narrow.items.front().label == "GEN_MACRO_42");
 }
 
+// More than the cap start with the prefix: the best of those, shortest first
+// then by name, whatever the prefix's case -- the same as scoring every macro.
+TEST_CASE("completion: a capped macro prefix sends the best prefix matches",
+          "[completion][macro]") {
+    ScratchTree tree("lazyverilog-completion-macro-prefix-index");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::string defs = "`define G_E_N_MACRO_FUZZY 1\n`define AAA_FIRST 1\n";
+    for (int i = 0; i < 500; ++i)
+        defs += "`define GEN_MACRO_" + std::to_string(i) + " " + std::to_string(i) + "\n";
+    std::vector<std::string> files{tree.write("inc/defs.svh", defs)};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+
+    std::set<std::string> best; // 0-9, 10-99, then 100-199 by name
+    for (int i = 0; i < 200; ++i)
+        best.insert("GEN_MACRO_" + std::to_string(i));
+    for (const std::string prefix : {"GEN_MACRO_", "gen_macro_", "Gen"}) {
+        const std::string text = "module m;\n  initial x = `" + prefix + "\nendmodule\n";
+        const auto uri = uri_from_path(tree.write("m.sv", text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "x = `" + prefix);
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        analyzer.close(uri);
+        INFO("prefix " << prefix);
+        CHECK(result.isIncomplete);
+        std::set<std::string> labels;
+        for (const auto& item : result.items)
+            labels.insert(item.label);
+        CHECK(labels == best);
+    }
+
+    // No prefix: every macro scores alike, so the first by name.
+    const std::string text = "module m;\n  initial x = `\nendmodule\n";
+    const auto uri = uri_from_path(tree.write("m.sv", text));
+    analyzer.open(uri, text);
+    auto [line, col] = pos_after(text, "x = `");
+    auto result = complete_at(engine, analyzer, uri, line, col);
+    CHECK(result.isIncomplete);
+    CHECK(has_label(result, "AAA_FIRST"));
+    CHECK_FALSE(has_label(result, "G_E_N_MACRO_FUZZY")); // last by name
+    CHECK_FALSE(has_label(result, "GEN_MACRO_99")); // 202nd by name
+}
+
 // Includers' shards record the macros of every header they include, so one name
 // shows up in many shards: copies must not fill the cap.
 TEST_CASE("completion: project macros count each name once against the cap",
@@ -3174,5 +3219,87 @@ TEST_CASE("completion: inherited identifier cost does not grow with project size
     // snapshot: ~1 either way.  Scanning every shard, or building the map on
     // the request after each publish, is ~32.
     CHECK(hit_ratio < 4.0);
+    CHECK(miss_ratio < 4.0);
+}
+
+namespace {
+
+/// Fastest of @p runs completing `` `FIXED_ `` and a bare `` ` `` in a project
+/// of @p macros macros over eight headers (300 `FIXED_*`, the rest `M_*`): the
+/// cached answer (`hit`, twenty pairs at a time for the clock) and the first
+/// after a re-publish by a file that defines no macro (`miss`).
+InheritedTimes fastest_macro_completion_ms(int macros, int runs) {
+    ScratchTree tree("lazyverilog-completion-macro-scaling-" + std::to_string(macros));
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files;
+    std::string defs[8];
+    for (int i = 0; i < macros; ++i)
+        defs[i % 8] += std::string("`define ") + (i < 300 ? "FIXED_" : "M_") +
+                       std::to_string(i) + " 1\n";
+    for (int f = 0; f < 8; ++f)
+        files.push_back(tree.write("inc/defs" + std::to_string(f) + ".svh", defs[f]));
+    files.push_back(tree.write("rtl/other.sv", "module other;\nendmodule\n"));
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+    const std::string text = "module m;\n  initial x = `FIXED_;\n  initial y = `\nendmodule\n";
+    const auto uri = uri_from_path(tree.write("m.sv", text));
+    analyzer.open(uri, text);
+    auto [fl, fc] = pos_after(text, "x = `FIXED_");
+    auto [bl, bc] = pos_after(text, "y = `");
+    const auto both = [&] {
+        auto fixed = complete_at(engine, analyzer, uri, fl, fc);
+        auto bare = complete_at(engine, analyzer, uri, bl, bc);
+        REQUIRE(fixed.isIncomplete);
+        REQUIRE(has_label(fixed, "FIXED_8"));
+        REQUIRE(bare.isIncomplete);
+    };
+    const auto ms_since = [](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+
+    std::vector<double> hits, misses;
+    for (int i = 0; i < runs; ++i) {
+        const auto before = analyzer.project_index_snapshot();
+        const auto changed = tree.write("rtl/other.sv", "module other;\n  wire w" +
+                                                            std::to_string(i) + ";\nendmodule\n");
+        analyzer.refresh_changed_extra_files({uri_from_path(changed)});
+        analyzer.wait_for_background_index_idle();
+        REQUIRE(analyzer.project_index_snapshot() != before);
+
+        auto start = std::chrono::steady_clock::now();
+        both();
+        misses.push_back(ms_since(start));
+
+        start = std::chrono::steady_clock::now();
+        for (int k = 0; k < 20; ++k)
+            both();
+        hits.push_back(ms_since(start) / 20);
+    }
+    return {*std::min_element(hits.begin(), hits.end()),
+            *std::min_element(misses.begin(), misses.end())};
+}
+
+} // namespace
+
+TEST_CASE("completion: backtick cost does not grow with the project's macro count",
+          "[completion][macro][scaling]") {
+    constexpr int kSmall = 2000;
+    constexpr int kLarge = 32000; // 16x the macros
+    constexpr int kRuns = 5;
+    const auto small = fastest_macro_completion_ms(kSmall, kRuns);
+    const auto large = fastest_macro_completion_ms(kLarge, kRuns);
+    const double hit_ratio = large.hit / small.hit;
+    const double miss_ratio = large.miss / small.miss;
+    std::cout << "\n[macro completion scaling] macros " << kSmall << " -> " << kLarge << ": hit "
+              << small.hit << " -> " << large.hit << " ms (ratio " << hit_ratio
+              << "), after re-publish " << small.miss << " -> " << large.miss << " ms (ratio "
+              << miss_ratio << ")\n";
+    // A binary search in the sorted names, kept across a re-publish that leaves
+    // the macro shards alone: ~1 either way.  Scoring every macro is ~4.5 (the
+    // request's fixed cost hides the rest of 16), re-collecting them per
+    // snapshot ~9.
+    CHECK(hit_ratio < 3.0);
     CHECK(miss_ratio < 4.0);
 }
