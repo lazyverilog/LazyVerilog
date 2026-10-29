@@ -3225,12 +3225,13 @@ TEST_CASE("completion: inherited identifier cost does not grow with project size
 namespace {
 
 /// Fastest of @p runs completing `` `FIXED_ `` and a bare `` ` `` in a project
-/// of @p macros macros over eight headers (300 `FIXED_*`, the rest `M_*`): the
+/// of @p macros macros (300 `FIXED_*` in one header, the rest `M_*` over eight): the
 /// cached answer (`hit`, twenty pairs at a time for the clock), the first after
 /// a re-publish by a file that defines no macro (`miss`), and the first after
 /// an edit to a listed, open file that includes a header, whose shard records
-/// the header's macros (`edit`).  The asking file includes none: what its own
-/// includes reach is offered from its live tree, linear in them by design.
+/// the header's macros (`edit`).  It includes the fixed-size header, and the
+/// asking file none: what an open file's includes reach is offered from its
+/// live tree, linear in them by design.
 struct MacroTimes {
     double hit;
     double miss;
@@ -3241,14 +3242,16 @@ MacroTimes fastest_macro_completion_ms(int macros, int runs) {
     ScratchTree tree("lazyverilog-completion-macro-scaling-" + std::to_string(macros));
     tree.write("lazyverilog.toml", "[design]\n");
     std::vector<std::string> files;
-    std::string defs[8];
+    std::string fixed, defs[8];
     for (int i = 0; i < macros; ++i)
-        defs[i % 8] += std::string("`define ") + (i < 300 ? "FIXED_" : "M_") +
-                       std::to_string(i) + " 1\n";
+        (i < 300 ? fixed : defs[i % 8]) += std::string("`define ") +
+                                           (i < 300 ? "FIXED_" : "M_") + std::to_string(i) +
+                                           " 1\n";
+    files.push_back(tree.write("inc/fixed.svh", fixed));
     for (int f = 0; f < 8; ++f)
         files.push_back(tree.write("inc/defs" + std::to_string(f) + ".svh", defs[f]));
     files.push_back(tree.write("rtl/other.sv", "module other;\nendmodule\n"));
-    const std::string includer = "`include \"../inc/defs0.svh\"\nmodule inc_user;\nendmodule\n";
+    const std::string includer = "`include \"../inc/fixed.svh\"\nmodule inc_user;\nendmodule\n";
     const auto includer_path = tree.write("rtl/inc_user.sv", includer);
     files.push_back(includer_path);
     CompletionEngine engine;
@@ -3326,9 +3329,9 @@ TEST_CASE("completion: backtick cost does not grow with the project's macro coun
               << miss_ratio << "), after editing the open includer " << small.edit << " -> "
               << large.edit << " ms (ratio " << edit_ratio << ")\n";
     // A binary search in the sorted names, kept across a re-publish whose
-    // macro shards hold the same macros: ~1.5-2.2 (the open includer's own
-    // macros add some).  Scoring every macro is ~6, re-collecting them per
-    // snapshot ~8-10, re-sorting them after the includer's edit ~13.
+    // macro shards hold the same macros: ~1 either way.  Scoring every macro
+    // is ~5, re-collecting them per snapshot ~9, re-sorting them after the
+    // includer's edit ~10.
     CHECK(hit_ratio < 4.0);
     CHECK(miss_ratio < 4.0);
     CHECK(edit_ratio < 4.0);
