@@ -309,6 +309,15 @@ the answer: one `extends` climb by map lookups, or one pass over the macro
 shards with a directory -> project memo kept across snapshots.  Both contexts
 send at most 200 items with `isIncomplete`.
 
+The publish itself holds `map_mutex_` only to gather its input.  When no shard
+came, went or changed path since the installed snapshot was gathered (the
+per-keystroke case), the input is that snapshot plus the replaced shards, so the
+lock is held O(changed shards): about 10 us at 7400 shards, against 16-20 ms for
+the whole rebuild before.  Copying the slots and filling the maps (still
+O(all shards)) runs with the lock released; a publish whose epoch moved while it
+built (a later publish, or a clear) drops its snapshot.  Anything else, such as
+an indexing burst, gathers and sorts every shard under the lock as before.
+
 Above the 50 ms budget nothing reads `previous_parsed`, so the class the cursor
 is in is unknown and a bare identifier gets no inherited members, even when the
 snapshot has the class.  Within it, the class is looked up in the snapshot

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -909,7 +910,32 @@ class Analyzer {
                               const std::vector<IncludeResolution>& include_resolutions,
                               const std::string& extra_dependency_uri = {},
                               bool stands_alone = false) const;
-    std::function<void()> publish_project_index_snapshot_locked() const;
+    /// What a publish builds its snapshot from: every shard in publish order,
+    /// or the installed snapshot plus the shards that replaced some of its own.
+    struct ProjectIndexPublishInput {
+        struct Patch {
+            bool header{false};
+            ProjectIndexSnapshot::Shard shard;
+        };
+        std::vector<ProjectIndexSnapshot::Shard> shards;
+        std::shared_ptr<const ProjectIndexSnapshot> base;
+        std::vector<Patch> patches;
+        /// Header shards lead the shard list; this many of them.
+        size_t header_count{0};
+    };
+    /// map_mutex_ held; O(changed shards) when the shard layout is unchanged.
+    ProjectIndexPublishInput project_index_publish_input_locked() const;
+    /// The snapshot over @p input, or null if a patch finds no slot.  Reads
+    /// only immutable shards, so it runs with map_mutex_ released.
+    static std::shared_ptr<const ProjectIndexSnapshot>
+    build_project_index_snapshot(ProjectIndexPublishInput input);
+    /// Record, for the next publish, @p next replacing @p previous (null if
+    /// none) under @p uri in extra_cache_ or (@p header) background_header_shards_.
+    void note_shard_replaced_locked(const std::string& uri, const ExtraFileCacheEntry* previous,
+                                    const ExtraFileCacheEntry& next, bool header) const;
+    /// Install a background_header_shards_ entry; the only writer besides
+    /// erase/clear, which mark project_index_layout_dirty_ themselves.
+    void put_header_shard_locked(const std::string& uri, ExtraFileCacheEntry entry) const;
     void clear_project_index_snapshot_locked() const;
     /// The entries of a shard map in a fixed order.
     ///
@@ -1055,6 +1081,17 @@ class Analyzer {
     mutable std::vector<std::string> override_class_table_stale_;
     mutable std::shared_ptr<const ProjectIndexSnapshot> project_index_snapshot_cache_;
     mutable std::function<void()> project_index_publish_callback_;
+    // Moved by every publish as it gathers its shards and by every clear; a
+    // publish installs its snapshot only if nothing moved it while it built.
+    mutable uint64_t project_index_snapshot_epoch_{0};
+    // The epoch of the publish that installed project_index_snapshot_cache_.
+    mutable uint64_t project_index_installed_epoch_{0};
+    // Since the last publish gathered: a shard came, went or moved (forces a
+    // full gather), or replaced one in place (uri, is header shard).
+    mutable bool project_index_layout_dirty_{true};
+    mutable std::set<std::pair<std::string, bool>> project_index_changed_shards_;
+    // Header shards at the front of the last gathered shard list.
+    mutable size_t project_index_header_count_{0};
 
     // clangd-style background index state.
     //
@@ -1075,6 +1112,9 @@ class Analyzer {
     // the count, not a flag, because several workers drain the queue at once.
     mutable int background_index_active_{0};
     mutable bool background_publish_requested_{false};
+    // Publishes building their snapshot with map_mutex_ released; idle waits
+    // for them, so a waiter reads the snapshot they install.
+    mutable int background_publish_building_{0};
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
     mutable uint64_t background_generation_{0};

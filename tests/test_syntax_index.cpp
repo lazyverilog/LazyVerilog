@@ -1416,6 +1416,103 @@ TEST_CASE("project index: the published shard order does not depend on hash orde
     fs::remove_all(dir);
 }
 
+TEST_CASE("project index: a publish after an edit answers like a full rebuild", "[index]") {
+    // A listed file's edit replaces one shard, and the publish it causes
+    // patches that shard's slot into the installed snapshot instead of
+    // re-gathering and re-sorting every shard under map_mutex_.  Whatever it
+    // builds has to be what a fresh index of the same files builds: the same
+    // slots in the same order, and the same class, specialization, macro and
+    // module tables over them.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_incremental_publish";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto write_file = [&dir](const std::string& name, const std::string& text) {
+        std::ofstream out(dir / name, std::ios::binary);
+        REQUIRE(out.good());
+        out << text;
+        return (dir / name).string();
+    };
+
+    write_file("defs.svh", "`define DEFS_W 4\nclass hdr_c;\n  int hdr_f;\nendclass\n");
+    const auto base = write_file("base.sv", "`include \"defs.svh\"\n"
+                                            "class base_c #(type T = int) extends hdr_c;\n"
+                                            "  int base_f;\nendclass\n"
+                                            "typedef base_c #(int) base_t;\n"
+                                            "module fifo;\nendmodule\n");
+    std::vector<std::string> paths{
+        base,
+        write_file("child.sv", "class child_c extends base_c;\n  int child_f;\nendclass\n"),
+        write_file("a_fifo.sv", "module fifo;\nendmodule\nmodule top;\nendmodule\n"),
+        write_file("z_other.sv", "class other_c;\nendclass\n"),
+    };
+
+    const auto index_of = [&](Analyzer& analyzer) {
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_include_dirs({dir.string()});
+        analyzer.set_extra_files(paths);
+        analyzer.wait_for_background_index_idle();
+    };
+    Analyzer edited;
+    index_of(edited);
+    const auto before = edited.project_index_snapshot();
+    REQUIRE(before->find_class("base_c", base) != nullptr);
+
+    // The edit adds a field, a class, a specialization and a macro, and drops
+    // the module: every table the publish fills has an entry come or go.
+    write_file("base.sv", "`include \"defs.svh\"\n"
+                          "`define BASE_M 1\n"
+                          "class base_c #(type T = int) extends hdr_c;\n"
+                          "  int base_f;\n  int base_g;\nendclass\n"
+                          "class extra_c;\nendclass\n"
+                          "typedef base_c #(int) base_t;\n"
+                          "typedef base_c #(bit) bit_base_t;\n");
+    edited.refresh_changed_extra_files({uri_from_path(base)});
+    edited.wait_for_background_index_idle();
+    const auto patched = edited.project_index_snapshot();
+    REQUIRE(patched != before);
+
+    Analyzer fresh;
+    index_of(fresh);
+    const auto full = fresh.project_index_snapshot();
+
+    REQUIRE(patched->shards.size() == full->shards.size());
+    for (size_t i = 0; i < full->shards.size(); ++i) {
+        CHECK(patched->shards[i].path == full->shards[i].path);
+        CHECK(patched->shards[i].index->classes.size() == full->shards[i].index->classes.size());
+        CHECK(patched->shards[i].index->modules.size() == full->shards[i].index->modules.size());
+    }
+    CHECK(patched->class_slots == full->class_slots);
+    CHECK(patched->specialization_slots == full->specialization_slots);
+    CHECK(patched->macro_shard_slots == full->macro_shard_slots);
+    REQUIRE(patched->module_by_name.size() == full->module_by_name.size());
+    for (const auto& [name, ref] : full->module_by_name) {
+        const auto it = patched->module_by_name.find(name);
+        REQUIRE(it != patched->module_by_name.end());
+        CHECK(it->second.shard_slot == ref.shard_slot);
+        CHECK(it->second.module_index == ref.module_index);
+        // The ref reads the shard the slot now holds, not the one it replaced.
+        CHECK(it->second.shard == patched->shards[ref.shard_slot].index);
+    }
+    CHECK(patched->module_duplicates.size() == full->module_duplicates.size());
+    CHECK(!patched->module_duplicates.contains("fifo"));
+
+    REQUIRE(patched->find_class("extra_c", base) != nullptr);
+    REQUIRE(patched->find_specialization("bit_base_t", base) != nullptr);
+    const auto names = [](const auto& members) {
+        std::vector<std::string> out;
+        for (const auto& member : *members)
+            out.push_back(member.name + "@" + std::to_string(member.depth));
+        return out;
+    };
+    const auto inherited = names(patched->inherited_members("child_c", paths[1]));
+    CHECK(inherited == names(full->inherited_members("child_c", paths[1])));
+    CHECK(std::find(inherited.begin(), inherited.end(), "base_g@2") != inherited.end());
+    CHECK(std::find(inherited.begin(), inherited.end(), "hdr_f@3") != inherited.end());
+
+    fs::remove_all(dir);
+}
+
 namespace {
 
 /// A throwaway project of @p count trivial modules, indexed and ready to time.

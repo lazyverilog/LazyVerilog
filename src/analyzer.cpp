@@ -9396,11 +9396,11 @@ void Analyzer::preload_cached_shards(uint64_t generation) const {
             // header's directives alone instead of re-reading it per keystroke.
             if (stands_alone)
                 standalone_header_uris_.insert(header_uri);
-            background_header_shards_[header_uri] = ExtraFileCacheEntry{
+            put_header_shard_locked(header_uri, ExtraFileCacheEntry{
                 .path = path_from_file_uri(header_uri),
                 .uri = header_uri,
                 .index = header_index,
-            };
+            });
         }
         background_pending_set_.erase(hit.path);
         ++installed;
@@ -9493,7 +9493,8 @@ void Analyzer::refresh_changed_extra_files(const std::vector<std::string>& chang
         // for the rest of the session.
         const auto header_uri = uri_from_path(path);
         const bool was_indexed_header = background_header_claims_.erase(header_uri) > 0;
-        background_header_shards_.erase(header_uri);
+        if (background_header_shards_.erase(header_uri) > 0)
+            project_index_layout_dirty_ = true;
         standalone_header_uris_.erase(header_uri);
         if (!was_indexed_header)
             continue;
@@ -9536,7 +9537,7 @@ void Analyzer::wait_for_background_index_idle() const {
     std::unique_lock<std::mutex> lock(map_mutex_);
     background_cv_.wait(lock, [&] {
         return background_pending_files_.empty() && background_index_active_ == 0 &&
-               !background_publish_requested_;
+               !background_publish_requested_ && background_publish_building_ == 0;
     });
 }
 
@@ -10489,6 +10490,7 @@ void Analyzer::schedule_background_reindex_locked() const {
     // both maps is what guarantees a header is re-indexed rather than served
     // from the previous configuration.
     background_header_shards_.clear();
+    project_index_layout_dirty_ = true;
     background_header_claims_.clear();
     standalone_header_uris_.clear();
     listed_parse_stands_alone_.clear();
@@ -10558,9 +10560,45 @@ void Analyzer::background_index_loop() const {
                 }
 
                 background_publish_requested_ = false;
-                auto publish_callback = publish_project_index_snapshot_locked();
+                // Only the shard list is gathered under map_mutex_.  The maps
+                // are built from it with the lock released: they cost O(all
+                // shards) per publish -- 16-20 ms at 7400 shards, once per
+                // keystroke burst in a listed file -- and every request
+                // handler contends for this lock.  The shards are immutable,
+                // so the build needs nothing else.
+                const auto gather_start = Clock::now();
+                auto input = project_index_publish_input_locked();
+                const auto epoch = ++project_index_snapshot_epoch_;
+                ++background_publish_building_;
+                log_perf(std::string("project_index_publish_locked ") +
+                             (input.base ? "patches=" + std::to_string(input.patches.size())
+                                         : "shards=" + std::to_string(input.shards.size())),
+                         gather_start);
+                lock.unlock();
+                const auto build_start = Clock::now();
+                auto snapshot = build_project_index_snapshot(std::move(input));
+                if (snapshot)
+                    log_perf("project_index_publish shards=" +
+                                 std::to_string(snapshot->shards.size()),
+                             build_start);
+                lock.lock();
+                --background_publish_building_;
+                std::function<void()> publish_callback;
+                if (!snapshot) {
+                    project_index_layout_dirty_ = true;
+                    schedule_background_project_publish_locked();
+                } else if (epoch == project_index_snapshot_epoch_) {
+                    // Otherwise a later publish or a clear moved the epoch while
+                    // this one built: installing it would put back what the
+                    // clear dropped, or replace a newer snapshot with an older
+                    // one.  Swapped, so the old snapshot dies below, off the lock.
+                    project_index_snapshot_cache_.swap(snapshot);
+                    project_index_installed_epoch_ = epoch;
+                    publish_callback = project_index_publish_callback_;
+                }
                 background_cv_.notify_all();
                 lock.unlock();
+                snapshot.reset();
                 // The queue has drained, so this burst is over.  Dropping the
                 // header text here keeps the cache from outliving the work it
                 // was collected for: the next burst re-reads whatever it needs
@@ -10804,11 +10842,11 @@ void Analyzer::background_index_loop() const {
                     for (auto& header : built_headers) {
                         if (header.stands_alone)
                             standalone_header_uris_.insert(header.uri);
-                        background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                        put_header_shard_locked(header.uri, ExtraFileCacheEntry{
                             .path = path_from_file_uri(header.uri),
                             .uri = header.uri,
                             .index = std::move(header.index),
-                        };
+                        });
                     }
                     invalidate_extra_snapshots_locked();
                 }
@@ -11034,11 +11072,11 @@ void Analyzer::background_index_loop() const {
                     if (!header.from_open_buffer)
                         headers_to_cache.emplace_back(header.uri, header.index,
                                                       header.stands_alone);
-                    background_header_shards_[header.uri] = ExtraFileCacheEntry{
+                    put_header_shard_locked(header.uri, ExtraFileCacheEntry{
                         .path = path_from_file_uri(header.uri),
                         .uri = header.uri,
                         .index = std::move(header.index),
-                    };
+                    });
                 }
                 invalidate_extra_snapshots_locked();
             }
@@ -11136,73 +11174,64 @@ void Analyzer::background_index_loop() const {
     }
 }
 
-std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
-    auto snapshot = std::make_shared<ProjectIndexSnapshot>();
+void Analyzer::note_shard_replaced_locked(const std::string& uri,
+                                          const ExtraFileCacheEntry* previous,
+                                          const ExtraFileCacheEntry& next, bool header) const {
+    // Same path, a shard before and after: the shard keeps its slot, and the
+    // next publish patches just that slot.  Anything else moves slots.
+    if (previous && previous->index && next.index && previous->path == next.path)
+        project_index_changed_shards_.emplace(uri, header);
+    else if ((previous && previous->index) || next.index)
+        project_index_layout_dirty_ = true;
+}
 
-    // Header shards are published alongside file shards: a file's own shard no
-    // longer carries what it `include`d, so the header's shard is the only place
-    // those declarations live.
-    snapshot->shards.reserve(extra_cache_.size() + background_header_shards_.size());
-    const auto add_shard = [&snapshot](const ExtraFileCacheEntry& entry) {
-        if (!entry.index)
-            return;
+void Analyzer::put_header_shard_locked(const std::string& uri, ExtraFileCacheEntry entry) const {
+    const auto previous = background_header_shards_.find(uri);
+    note_shard_replaced_locked(
+        uri, previous != background_header_shards_.end() ? &previous->second : nullptr, entry,
+        /*header=*/true);
+    background_header_shards_[uri] = std::move(entry);
+}
 
-        const size_t shard_slot = snapshot->shards.size();
-        snapshot->shards.push_back(ProjectIndexSnapshot::Shard{
-            .path = entry.path,
-            .uri = entry.uri,
-            .index = entry.index,
-        });
-        for (size_t i = 0; i < entry.index->classes.size(); ++i)
-            snapshot->class_slots[entry.index->classes[i].name].emplace_back(shard_slot, i);
-        for (size_t i = 0; i < entry.index->typedefs.size(); ++i)
-            if (is_specialization_typedef(*entry.index, entry.index->typedefs[i]))
-                snapshot->specialization_slots[entry.index->typedefs[i].name].emplace_back(
-                    shard_slot, i);
-        // `pa::base_t`: the package-scoped spellings, under package_scoped_key().
-        for (const auto& [key, i] : entry.index->package_class_by_scoped_name)
-            if (i < entry.index->classes.size())
-                snapshot->class_slots[key].emplace_back(shard_slot, i);
-        for (const auto& [key, i] : entry.index->package_type_by_scoped_name)
-            if (i < entry.index->typedefs.size() &&
-                is_specialization_typedef(*entry.index, entry.index->typedefs[i]))
-                snapshot->specialization_slots[key].emplace_back(shard_slot, i);
-        if (!entry.index->macros.empty())
-            snapshot->macro_shard_slots.push_back(shard_slot);
-
-        // Lightweight global module lookup.  First definition still wins here,
-        // but it is no longer the whole answer: a name declared in more than
-        // one file also records its other declarations, and the lookup picks
-        // among them per querying file.  See
-        // ProjectIndexSnapshot::find_module().
-        for (size_t i = 0; i < entry.index->modules.size(); ++i) {
-            const auto& module = entry.index->modules[i];
-            ProjectIndexModuleRef ref{
-                .shard = entry.index,
-                .module_index = i,
-                .shard_slot = shard_slot,
-            };
-            const auto [slot, inserted] = snapshot->module_by_name.try_emplace(module.name, ref);
-            if (inserted)
-                continue;
-            if (snapshot->module_path(slot->second) == entry.path)
-                continue; // the same file reached through both shard maps
-            auto& candidates = snapshot->module_duplicates[module.name];
-            if (candidates.empty())
-                candidates.push_back(slot->second);
-            candidates.push_back(std::move(ref));
+Analyzer::ProjectIndexPublishInput Analyzer::project_index_publish_input_locked() const {
+    ProjectIndexPublishInput input;
+    // Patch the installed snapshot when it is the result of the last gather
+    // (nothing cleared it or is still building over it) and no shard has come
+    // or gone since: only the changed shards are looked at here, under the
+    // lock, instead of copying and sorting all of them.
+    if (!project_index_layout_dirty_ && project_index_snapshot_cache_ &&
+        project_index_installed_epoch_ == project_index_snapshot_epoch_) {
+        input.base = project_index_snapshot_cache_;
+        input.header_count = project_index_header_count_;
+        for (const auto& [uri, header] : project_index_changed_shards_) {
+            const auto& map = header ? background_header_shards_ : extra_cache_;
+            const auto it = map.find(uri);
+            if (it == map.end() || !it->second.index) {
+                input.base.reset(); // not a replacement after all
+                input.patches.clear();
+                break;
+            }
+            input.patches.push_back(ProjectIndexPublishInput::Patch{
+                .header = header,
+                .shard = {.path = it->second.path, .uri = uri, .index = it->second.index},
+            });
         }
-    };
+    }
+    project_index_changed_shards_.clear();
+    project_index_layout_dirty_ = false;
+    if (input.base)
+        return input;
 
     // In a fixed order, which neither map has.  Both are unordered_maps, so
-    // "first definition wins" above meant "whichever bucket order this rehash
-    // produced wins", and SystemVerilog's module namespace is flat and global
-    // -- two projects open at once routinely both declare `fifo`.
-    // find_module() breaks a proximity tie by taking the candidate recorded
-    // first and says the answer is therefore stable; it was stable only within
-    // one snapshot, and a republish (one per indexing burst, one per edit of a
-    // listed file) could pick the other one.  Go-to-definition and AutoInst
-    // would answer differently for the same cursor with nothing having changed.
+    // "first definition wins" in build_project_index_snapshot() meant
+    // "whichever bucket order this rehash produced wins", and SystemVerilog's
+    // module namespace is flat and global -- two projects open at once
+    // routinely both declare `fifo`.  find_module() breaks a proximity tie by
+    // taking the candidate recorded first and says the answer is therefore
+    // stable; it was stable only within one snapshot, and a republish (one per
+    // indexing burst, one per edit of a listed file) could pick the other one.
+    // Go-to-definition and AutoInst would answer differently for the same
+    // cursor with nothing having changed.
     //
     // Headers first, then files, each by path.  Path is the one key that is
     // unique per shard, already held, and the same from one launch to the next.
@@ -11210,25 +11239,102 @@ std::function<void()> Analyzer::publish_project_index_snapshot_locked() const {
     // an includer's copy of them can be a burst behind -- only one closed
     // includer is re-queued when a header changes, by design -- so a consumer
     // that scans shards in order should meet the authoritative one first.
-    // Pointers, not copies, and the sort is the only cost added: it runs once
-    // per debounced publish, against the per-module hash inserts below that
-    // were already there.
+    //
+    // Header shards are published alongside file shards: a file's own shard no
+    // longer carries what it `include`d, so the header's shard is the only place
+    // those declarations live.
+    auto& shards = input.shards;
+    shards.reserve(extra_cache_.size() + background_header_shards_.size());
+    const auto add = [&shards](const ExtraFileCacheEntry& entry) {
+        if (entry.index)
+            shards.push_back(ProjectIndexSnapshot::Shard{
+                .path = entry.path,
+                .uri = entry.uri,
+                .index = entry.index,
+            });
+    };
     for (const auto* entry : sorted_by_path(background_header_shards_))
-        add_shard(*entry);
+        add(*entry);
+    input.header_count = shards.size();
     for (const auto* entry : sorted_by_path(extra_cache_))
-        add_shard(*entry);
+        add(*entry);
+    project_index_header_count_ = input.header_count;
+    return input;
+}
 
-    project_index_snapshot_cache_ = std::move(snapshot);
+std::shared_ptr<const ProjectIndexSnapshot>
+Analyzer::build_project_index_snapshot(ProjectIndexPublishInput input) {
+    auto snapshot = std::make_shared<ProjectIndexSnapshot>();
+    if (input.base) {
+        // Every slot as the base had it, the replaced shards' indexes swapped
+        // in: the order a full gather would produce, since no shard came, went
+        // or moved.  Each run (headers, then files) is sorted by path.
+        snapshot->shards = input.base->shards;
+        auto& shards = snapshot->shards;
+        for (auto& patch : input.patches) {
+            const auto run_begin = shards.begin() + (patch.header ? 0 : input.header_count);
+            const auto run_end = patch.header ? shards.begin() + input.header_count : shards.end();
+            auto it = std::lower_bound(run_begin, run_end, patch.shard.path,
+                                       [](const ProjectIndexSnapshot::Shard& shard,
+                                          const std::string& path) { return shard.path < path; });
+            while (it != run_end && it->path == patch.shard.path && it->uri != patch.shard.uri)
+                ++it;
+            if (it == run_end || it->uri != patch.shard.uri)
+                return nullptr; // the layout moved after all; the caller gathers again
+            it->index = std::move(patch.shard.index);
+        }
+    } else {
+        snapshot->shards = std::move(input.shards);
+    }
 
-    // Return the callback to the caller instead of invoking it here.  This
-    // function is called while map_mutex_ is held; endpoint notifications can
-    // block on client or logging behavior and must not run under the analyzer
-    // mutex.
-    return project_index_publish_callback_;
+    for (size_t shard_slot = 0; shard_slot < snapshot->shards.size(); ++shard_slot) {
+        const auto& shard = snapshot->shards[shard_slot];
+        const auto& index = *shard.index;
+        for (size_t i = 0; i < index.classes.size(); ++i)
+            snapshot->class_slots[index.classes[i].name].emplace_back(shard_slot, i);
+        for (size_t i = 0; i < index.typedefs.size(); ++i)
+            if (is_specialization_typedef(index, index.typedefs[i]))
+                snapshot->specialization_slots[index.typedefs[i].name].emplace_back(shard_slot,
+                                                                                    i);
+        // `pa::base_t`: the package-scoped spellings, under package_scoped_key().
+        for (const auto& [key, i] : index.package_class_by_scoped_name)
+            if (i < index.classes.size())
+                snapshot->class_slots[key].emplace_back(shard_slot, i);
+        for (const auto& [key, i] : index.package_type_by_scoped_name)
+            if (i < index.typedefs.size() && is_specialization_typedef(index, index.typedefs[i]))
+                snapshot->specialization_slots[key].emplace_back(shard_slot, i);
+        if (!index.macros.empty())
+            snapshot->macro_shard_slots.push_back(shard_slot);
+
+        // Lightweight global module lookup.  First definition still wins here,
+        // but it is no longer the whole answer: a name declared in more than
+        // one file also records its other declarations, and the lookup picks
+        // among them per querying file.  See
+        // ProjectIndexSnapshot::find_module().
+        for (size_t i = 0; i < index.modules.size(); ++i) {
+            const auto& module = index.modules[i];
+            ProjectIndexModuleRef ref{
+                .shard = shard.index,
+                .module_index = i,
+                .shard_slot = shard_slot,
+            };
+            const auto [slot, inserted] = snapshot->module_by_name.try_emplace(module.name, ref);
+            if (inserted)
+                continue;
+            if (snapshot->module_path(slot->second) == shard.path)
+                continue; // the same file reached through both shard maps
+            auto& candidates = snapshot->module_duplicates[module.name];
+            if (candidates.empty())
+                candidates.push_back(slot->second);
+            candidates.push_back(std::move(ref));
+        }
+    }
+    return snapshot;
 }
 
 void Analyzer::clear_project_index_snapshot_locked() const {
     project_index_snapshot_cache_.reset();
+    ++project_index_snapshot_epoch_; // a publish building now must not install
 }
 
 void Analyzer::put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntry entry) const {
@@ -11239,7 +11345,12 @@ void Analyzer::put_extra_cache_locked(const std::string& uri, ExtraFileCacheEntr
                                previous->second.index->include_dependencies ==
                                    entry.index->include_dependencies;
     const auto generation = include_graph_generation_;
+    note_shard_replaced_locked(uri, previous != extra_cache_.end() ? &previous->second : nullptr,
+                               entry, /*header=*/false);
+    // The erase is half of a replacement, which the line above already judged.
+    const bool layout_dirty = project_index_layout_dirty_;
     erase_extra_cache_locked(uri);
+    project_index_layout_dirty_ = layout_dirty;
     if (same_includes)
         include_graph_generation_ = generation;
     if (entry.index) {
@@ -11267,12 +11378,15 @@ void Analyzer::erase_extra_cache_locked(const std::string& uri) const {
                 extra_cache_includers_.erase(includers);
         }
     }
+    if (it->second.index)
+        project_index_layout_dirty_ = true;
     extra_cache_.erase(it);
 }
 
 void Analyzer::clear_extra_cache_locked() const {
     ++include_graph_generation_;
     extra_cache_.clear();
+    project_index_layout_dirty_ = true;
     extra_cache_includers_.clear();
 }
 
