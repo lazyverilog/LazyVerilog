@@ -7157,6 +7157,43 @@ TEST_CASE("formatter: a statement of many calls formats in linear time", "[forma
     }
 }
 
+TEST_CASE("formatter: a statement of many chained instances formats in linear time", "[formatter][scaling]") {
+    // `sub u1 (...), u2 (...), ...;` -- is_instance_port_open() and
+    // is_gate_terminal_open() asked each instance about the one before it,
+    // all the way back to the first, and spacing_gap() walked back from
+    // every `:` (`u1[1:0]`) looking for a config's `use`: O(n^2) in one
+    // statement's instances.  Ratio against the same statement four times
+    // longer, min of interleaved runs, as above: linear is 4, quadratic 16.
+    // `sub u0 (a, b), ...`, `sub u0[1:0] (a, b), ...`, `and g0 (a, b), ...`
+    auto statement = [](int n, const char* head, const char* name, const char* dims) {
+        std::string s = std::string("module m;\n  ") + head;
+        for (int i = 0; i < n; ++i)
+            s += (i ? ", " : " ") + std::string(name) + std::to_string(i) + dims + " (a, b)";
+        return s + ";\nendmodule\n";
+    };
+    constexpr int kInstances = 4000;
+    constexpr int kRuns = 7;
+    const char* const shapes[][3] = {{"sub", "u", ""}, {"sub", "u", "[1:0]"}, {"and", "g", ""}};
+    for (const auto& shape : shapes) {
+        CAPTURE(shape[0], shape[2]);
+        const std::string small = statement(kInstances, shape[0], shape[1], shape[2]);
+        const std::string large = statement(kInstances * 4, shape[0], shape[1], shape[2]);
+        double small_best = 1e9, large_best = 1e9;
+        for (int r = 0; r < kRuns; ++r) {
+            for (int side = 0; side < 2; ++side) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const std::string out = format_source(side ? large : small, FormatOptions{});
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                REQUIRE(!out.empty());
+                (side ? large_best : small_best) = std::min(side ? large_best : small_best, s);
+            }
+        }
+        const double ratio = large_best / small_best;
+        INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
+        CHECK(ratio < 12.0);
+    }
+}
+
 TEST_CASE("formatter regression: a range edit on CRLF lines keeps the line ends", "[formatter][regression]") {
     // The span ended past the last line's `\r`, so applying the edit deleted
     // it and joined the line's CRLF into a bare LF.

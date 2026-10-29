@@ -180,6 +180,13 @@ struct TopologyFacts {
     size_t header_keyword{npos};
     bool opens_subroutine_formals{false};
     bool after_subroutine_keyword{false};
+    // instance_chain_head / gate_chain_head: on the `(` of a later instance
+    // in `sub u1 (...), u2 (...);` (`and g1 (...), g2 (...);`), the first
+    // instance's `(`, or npos when the chain breaks; on any other `(`,
+    // itself.  is_instance_port_open() / is_gate_terminal_open() ask the
+    // first instance once rather than each instance before in turn.
+    size_t instance_chain_head{npos};
+    size_t gate_chain_head{npos};
 
     // The `:` that ends a case item's label list (`` `OP, 4'hc: ``,
     // `default:`).  What precedes it can be any expression -- a literal, an
@@ -193,6 +200,10 @@ struct TopologyFacts {
     // The `:` after a statement or item label: `a_x: assert property ...`,
     // `cp: coverpoint x;`, `x: cross a, b;`.
     bool is_item_label_colon{false};
+
+    // The `:` in a config's `use` clause, `use lib.cell:cfg;`: a `use` comes
+    // after the last `;` or block boundary before it.
+    bool is_use_clause_colon{false};
 
     // The inner `{` of a replication, `{4{a}}`: it binds to its multiplier.
     bool is_replication_brace{false};
