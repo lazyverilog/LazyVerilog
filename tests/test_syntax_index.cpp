@@ -1705,13 +1705,13 @@ TEST_CASE("project index: an unrelated edit does not rebuild the project snapsho
     // buffer the snapshots do not mention.
     //
     // A ratio against a structurally identical project eight times the size,
-    // fastest of several interleaved rounds.  Measured over 100 edits (now 500) plus the
-    // two snapshot reads a request handler makes:
+    // fastest of several interleaved rounds.  A sample is 500 edits, each with
+    // the two snapshot reads a request handler makes after it:
     //
-    //     before   200 -> 2.36 ms, 1600 -> 17.09 ms   (ratio 7.23)
-    //     after    200 -> 0.81 ms, 1600 ->  0.82 ms   (ratio 1.01)
+    //     before   ratio 7.23
+    //     after    ratio 1.01
     //
-    // which at 1600 shards is 171 us per keystroke against 8.
+    // At 1600 shards the rebuild cost 171 us per keystroke against 8 without it.
     SizedProject small("lazyverilog_snapshot_scaling", 200);
     SizedProject large("lazyverilog_snapshot_scaling", 1600);
     const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
