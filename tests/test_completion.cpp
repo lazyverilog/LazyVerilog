@@ -3226,9 +3226,18 @@ namespace {
 
 /// Fastest of @p runs completing `` `FIXED_ `` and a bare `` ` `` in a project
 /// of @p macros macros over eight headers (300 `FIXED_*`, the rest `M_*`): the
-/// cached answer (`hit`, twenty pairs at a time for the clock) and the first
-/// after a re-publish by a file that defines no macro (`miss`).
-InheritedTimes fastest_macro_completion_ms(int macros, int runs) {
+/// cached answer (`hit`, twenty pairs at a time for the clock), the first after
+/// a re-publish by a file that defines no macro (`miss`), and the first after
+/// an edit to a listed, open file that includes a header, whose shard records
+/// the header's macros (`edit`).  The asking file includes none: what its own
+/// includes reach is offered from its live tree, linear in them by design.
+struct MacroTimes {
+    double hit;
+    double miss;
+    double edit;
+};
+
+MacroTimes fastest_macro_completion_ms(int macros, int runs) {
     ScratchTree tree("lazyverilog-completion-macro-scaling-" + std::to_string(macros));
     tree.write("lazyverilog.toml", "[design]\n");
     std::vector<std::string> files;
@@ -3239,9 +3248,14 @@ InheritedTimes fastest_macro_completion_ms(int macros, int runs) {
     for (int f = 0; f < 8; ++f)
         files.push_back(tree.write("inc/defs" + std::to_string(f) + ".svh", defs[f]));
     files.push_back(tree.write("rtl/other.sv", "module other;\nendmodule\n"));
+    const std::string includer = "`include \"../inc/defs0.svh\"\nmodule inc_user;\nendmodule\n";
+    const auto includer_path = tree.write("rtl/inc_user.sv", includer);
+    files.push_back(includer_path);
     CompletionEngine engine;
     Analyzer analyzer;
     index_project(analyzer, files);
+    const auto includer_uri = uri_from_path(includer_path);
+    analyzer.open(includer_uri, includer);
     const std::string text = "module m;\n  initial x = `FIXED_;\n  initial y = `\nendmodule\n";
     const auto uri = uri_from_path(tree.write("m.sv", text));
     analyzer.open(uri, text);
@@ -3258,15 +3272,20 @@ InheritedTimes fastest_macro_completion_ms(int macros, int runs) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
             .count();
     };
+    const auto republished = [&](const auto& before) {
+        for (int wait = 0; wait < 5000 && analyzer.project_index_snapshot() == before; ++wait)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return analyzer.project_index_snapshot() != before;
+    };
 
-    std::vector<double> hits, misses;
+    std::vector<double> hits, misses, edits;
     for (int i = 0; i < runs; ++i) {
-        const auto before = analyzer.project_index_snapshot();
+        auto before = analyzer.project_index_snapshot();
         const auto changed = tree.write("rtl/other.sv", "module other;\n  wire w" +
                                                             std::to_string(i) + ";\nendmodule\n");
         analyzer.refresh_changed_extra_files({uri_from_path(changed)});
         analyzer.wait_for_background_index_idle();
-        REQUIRE(analyzer.project_index_snapshot() != before);
+        REQUIRE(republished(before));
 
         auto start = std::chrono::steady_clock::now();
         both();
@@ -3276,9 +3295,17 @@ InheritedTimes fastest_macro_completion_ms(int macros, int runs) {
         for (int k = 0; k < 20; ++k)
             both();
         hits.push_back(ms_since(start) / 20);
+
+        before = analyzer.project_index_snapshot();
+        analyzer.change(includer_uri, includer + "// edit " + std::to_string(i) + "\n");
+        REQUIRE(republished(before));
+        start = std::chrono::steady_clock::now();
+        both();
+        edits.push_back(ms_since(start));
     }
     return {*std::min_element(hits.begin(), hits.end()),
-            *std::min_element(misses.begin(), misses.end())};
+            *std::min_element(misses.begin(), misses.end()),
+            *std::min_element(edits.begin(), edits.end())};
 }
 
 } // namespace
@@ -3292,14 +3319,17 @@ TEST_CASE("completion: backtick cost does not grow with the project's macro coun
     const auto large = fastest_macro_completion_ms(kLarge, kRuns);
     const double hit_ratio = large.hit / small.hit;
     const double miss_ratio = large.miss / small.miss;
+    const double edit_ratio = large.edit / small.edit;
     std::cout << "\n[macro completion scaling] macros " << kSmall << " -> " << kLarge << ": hit "
               << small.hit << " -> " << large.hit << " ms (ratio " << hit_ratio
               << "), after re-publish " << small.miss << " -> " << large.miss << " ms (ratio "
-              << miss_ratio << ")\n";
-    // A binary search in the sorted names, kept across a re-publish that leaves
-    // the macro shards alone: ~1 either way.  Scoring every macro is ~4.5 (the
-    // request's fixed cost hides the rest of 16), re-collecting them per
-    // snapshot ~9.
-    CHECK(hit_ratio < 3.0);
+              << miss_ratio << "), after editing the open includer " << small.edit << " -> "
+              << large.edit << " ms (ratio " << edit_ratio << ")\n";
+    // A binary search in the sorted names, kept across a re-publish whose
+    // macro shards hold the same macros: ~1.5-2.2 (the open includer's own
+    // macros add some).  Scoring every macro is ~6, re-collecting them per
+    // snapshot ~8-10, re-sorting them after the includer's edit ~13.
+    CHECK(hit_ratio < 4.0);
     CHECK(miss_ratio < 4.0);
+    CHECK(edit_ratio < 4.0);
 }
