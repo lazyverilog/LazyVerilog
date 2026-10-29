@@ -7162,8 +7162,9 @@ TEST_CASE("formatter: a statement of many chained instances formats in linear ti
     // is_gate_terminal_open() asked each instance about the one before it,
     // all the way back to the first, and spacing_gap() walked back from
     // every `:` (`u1[1:0]`) looking for a config's `use`: O(n^2) in one
-    // statement's instances.  Ratio against the same statement four times
-    // longer, min of interleaved runs, as above: linear is 4, quadratic 16.
+    // statement's instances.  Ratio against the same statement eight times
+    // longer, min of interleaved runs: linear is 8, quadratic 64.  A 4x step
+    // left the quadratic plain shape at 13 against a limit of 12.
     // `sub u0 (a, b), ...`, `sub u0[1:0] (a, b), ...`, `and g0 (a, b), ...`
     auto statement = [](int n, const char* head, const char* name, const char* dims) {
         std::string s = std::string("module m;\n  ") + head;
@@ -7171,13 +7172,20 @@ TEST_CASE("formatter: a statement of many chained instances formats in linear ti
             s += (i ? ", " : " ") + std::string(name) + std::to_string(i) + dims + " (a, b)";
         return s + ";\nendmodule\n";
     };
-    constexpr int kInstances = 4000;
     constexpr int kRuns = 7;
-    const char* const shapes[][3] = {{"sub", "u", ""}, {"sub", "u", "[1:0]"}, {"and", "g", ""}};
-    for (const auto& shape : shapes) {
-        CAPTURE(shape[0], shape[2]);
-        const std::string small = statement(kInstances, shape[0], shape[1], shape[2]);
-        const std::string large = statement(kInstances * 4, shape[0], shape[1], shape[2]);
+    struct Shape {
+        const char* head;
+        const char* name;
+        const char* dims;
+        int instances;
+    };
+    // The array shape was the slowest quadratic one (146 s for 16000), so it
+    // runs smaller: a regression still fails in seconds, not minutes.
+    const Shape shapes[] = {{"sub", "u", "", 4000}, {"and", "g", "", 4000}, {"sub", "u", "[1:0]", 1000}};
+    for (const Shape& shape : shapes) {
+        CAPTURE(shape.head, shape.dims, shape.instances);
+        const std::string small = statement(shape.instances, shape.head, shape.name, shape.dims);
+        const std::string large = statement(shape.instances * 8, shape.head, shape.name, shape.dims);
         double small_best = 1e9, large_best = 1e9;
         for (int r = 0; r < kRuns; ++r) {
             for (int side = 0; side < 2; ++side) {
@@ -7187,10 +7195,16 @@ TEST_CASE("formatter: a statement of many chained instances formats in linear ti
                 REQUIRE(!out.empty());
                 (side ? large_best : small_best) = std::min(side ? large_best : small_best, s);
             }
+            // Linear takes well under a second here; past this, more runs
+            // only make a regression slower to report.
+            if (large_best > 5.0)
+                break;
         }
         const double ratio = large_best / small_best;
         INFO("small " << small_best << " s, large " << large_best << " s, ratio " << ratio);
-        CHECK(ratio < 12.0);
+        // Linear measured 10-11 alone and up to 15 beside six busy
+        // [formatter] processes; the quadratic code 51 to 70 alone.
+        CHECK(ratio < 25.0);
     }
 }
 
