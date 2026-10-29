@@ -357,6 +357,10 @@ inline std::string package_scoped_key(std::string_view package, std::string_view
     return key;
 }
 
+/// `pa::base_t #(x)` as a package_scoped_key() (`pa\nbase_t`); empty when
+/// @p written has no package qualifier.
+std::string package_scoped_name(std::string_view written);
+
 struct SyntaxIndex {
     // Per-index file table.  All source-backed entries store SourceFileID
     // instead of repeating URI strings.  merge() remaps IDs from shard-local
@@ -563,12 +567,20 @@ struct ProjectIndexSnapshot {
     const TypedefEntry* find_specialization(const std::string& name,
                                             std::string_view from_path) const;
 
-    /// Fields and methods class @p base_name and its bases declare, nearest
-    /// level first, a name only once (the nearest declaration wins).  Every
-    /// level is resolved with find_class() against @p from_path.  Computed on
-    /// first use and kept for the life of this snapshot -- a publish replaces
-    /// the snapshot, and with it the answer -- so a completion per identifier
-    /// keystroke costs a map lookup, not a climb.
+    /// The class type text @p written (`drv_base #(x)`, `pa::base_t`) names,
+    /// through a specialization typedef if it is one.  The package-qualified
+    /// name is asked first, then the bare one; each as a class, then as a
+    /// typedef.  Null when neither finds a class.
+    const ClassEntry* find_class_written(std::string_view written,
+                                         std::string_view from_path) const;
+
+    /// Fields and methods the class type text @p base_name names and its bases
+    /// declare, nearest level first, a name only once (the nearest declaration
+    /// wins).  Every level is resolved with find_class_written() against
+    /// @p from_path, so an `extends` may name a specialization typedef.
+    /// Computed on first use and kept for the life of this snapshot -- a
+    /// publish replaces the snapshot, and with it the answer -- so a completion
+    /// per identifier keystroke costs a map lookup, not a climb.
     std::shared_ptr<const std::vector<InheritedMember>>
     inherited_members(const std::string& base_name, std::string_view from_path) const;
 

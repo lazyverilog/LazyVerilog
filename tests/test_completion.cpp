@@ -2754,6 +2754,63 @@ TEST_CASE("completion: a bare identifier in a method offers inherited members",
     CHECK(has_label(partial, "get_name"));
 }
 
+TEST_CASE("completion: a bare identifier climbs through a specialization typedef base",
+          "[completion][inherited]") {
+    ScratchTree tree("lazyverilog-completion-bare-typedef");
+    tree.write("lazyverilog.toml", "[design]\n");
+    std::vector<std::string> files{
+        tree.write("base.sv", "class drv_base #(type T = int);\n  int base_field;\n"
+                              "  function void base_fn(); endfunction\nendclass\n"
+                              "typedef drv_base #(int) base_t;\n"
+                              "class mid_c extends base_t;\n  int mid_field;\nendclass\n"),
+        tree.write("pa.sv", "package pa;\n  class pbase #(type T = int);\n"
+                            "    int pkg_field;\n  endclass\n"
+                            "  typedef pbase #(int) pbase_t;\nendpackage\n")};
+    CompletionEngine engine;
+    Analyzer analyzer;
+    index_project(analyzer, files);
+    const auto ask = [&](const std::string& file, const std::string& base) {
+        std::string text = kSplitUser;
+        text.replace(text.find("mid_c"), 5, base);
+        const auto uri = uri_from_path(tree.write(file, text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "  int local_v;\n  ");
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        analyzer.close(uri);
+        return result;
+    };
+
+    SECTION("the typedef is the direct base, in a closed file") {
+        auto result = ask("user_direct.sv", "base_t");
+        CHECK(has_label(result, "base_field"));
+        CHECK(has_label(result, "base_fn"));
+        CHECK(index_of_label(result, "own_field") < index_of_label(result, "base_field"));
+    }
+    SECTION("a closed base extends the typedef") {
+        auto result = ask("user_mid.sv", "mid_c");
+        CHECK(has_label(result, "mid_field"));
+        CHECK(has_label(result, "base_field"));
+        CHECK(index_of_label(result, "mid_field") < index_of_label(result, "base_field"));
+    }
+    SECTION("a package-qualified typedef") {
+        auto result = ask("user_pkg.sv", "pa::pbase_t");
+        CHECK(has_label(result, "pkg_field"));
+    }
+    SECTION("the typedef and its class are in the open buffer") {
+        const std::string text = "class lbase #(type T = int);\n  int live_field;\nendclass\n"
+                                 "typedef lbase #(int) lbase_t;\n" +
+                                 [&] {
+                                     std::string user = kSplitUser;
+                                     user.replace(user.find("mid_c"), 5, "lbase_t");
+                                     return user;
+                                 }();
+        const auto uri = uri_from_path(tree.write("user_live.sv", text));
+        analyzer.open(uri, text);
+        auto [line, col] = pos_after(text, "  int local_v;\n  ");
+        CHECK(has_label(complete_at(engine, analyzer, uri, line, col), "live_field"));
+    }
+}
+
 TEST_CASE("completion: a bare identifier climbs the asking project's same-name base",
           "[completion][inherited][module-proximity]") {
     ScratchTree tree("lazyverilog-completion-bare-rank");
