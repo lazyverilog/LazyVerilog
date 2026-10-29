@@ -1204,7 +1204,8 @@ static void process_package(const ModuleDeclarationSyntax& pkg, SyntaxIndex& ind
 
 static void process_member(const MemberSyntax& member, SyntaxIndex& index,
                             SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                            std::string_view source, IndexDepth depth = IndexDepth::Full) {
+                            std::string_view source, IndexDepth depth = IndexDepth::Full,
+                            slang::BufferID file_buffer = {}) {
     if (const auto* mod = member.as_if<ModuleDeclarationSyntax>()) {
         if (member.kind == SyntaxKind::InterfaceDeclaration) {
             process_module(*mod, index, resolver, sm, source, depth);
@@ -1216,8 +1217,9 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
         }
     } else if (const auto* import_decl = member.as_if<PackageImportDeclarationSyntax>()) {
         // Compilation-unit scope: visible to everything parsed after it, so it
-        // carries no enclosing scope name or end line.
-        add_package_imports(*import_decl, index, resolver, sm, {}, {0, 0});
+        // carries no enclosing scope name or end line.  One from an `include`d
+        // header starts at the `include` in the file being indexed.
+        add_package_imports(*import_decl, index, resolver, sm, {}, {0, 0}, file_buffer);
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
         // A file-scope class from an `include`d header lives in the header's
         // shard; a restricted build that kept it was one more copy per includer.
@@ -1346,9 +1348,12 @@ SyntaxIndex SyntaxIndex::build(const slang::syntax::SyntaxTree& tree, std::strin
         resolver.set_mentions_provider(ensure_mentions);
 
     if (const auto* compilation_unit = root.as_if<CompilationUnitSyntax>()) {
+        // End of file is always in the file itself, unlike its first token.
+        const auto file_buffer =
+            sm.getFullyExpandedLoc(compilation_unit->endOfFile.location()).buffer();
         for (const auto* member : compilation_unit->members) {
             if (member)
-                process_member(*member, index, resolver, sm, source, depth);
+                process_member(*member, index, resolver, sm, source, depth, file_buffer);
         }
     } else if (const auto* member = root.as_if<MemberSyntax>()) {
         // slang can expose a single-file design element directly as the
