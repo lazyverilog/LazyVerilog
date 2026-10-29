@@ -226,31 +226,39 @@ TEST_CASE("implicit scan time scales linearly with the tree", "[implicit-project
     constexpr int kFactor = 4;
     ScanTree small("scaling-n");
     ScanTree large("scaling-4n");
-    build(small, 60);
-    build(large, 60 * kFactor);
+    constexpr int kSmallDirs = 60;
+    build(small, kSmallDirs);
+    build(large, kSmallDirs * kFactor);
 
     // One sample of the small tree is kFactor scans of it, so both samples
     // take about as long.  Compared to a single small scan, a longer sample is
     // likelier to catch a preemption on a shared runner, and min-of-N then
     // keeps the clean small scans and only noisy large ones: 2N against N once
     // measured 2.76 on macOS x64 against a 2.6 limit, with nothing quadratic.
-    const auto time_ms = [](const fs::path& root, int scans) {
+    // Every scan must see the whole tree: a vanished or colliding temp tree
+    // would otherwise time a different input and report a bogus ratio.
+    const auto time_ms = [](const fs::path& root, int scans, size_t sources) {
         const auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < scans; ++i)
-            REQUIRE_FALSE(scan_implicit_root(root).over_limit);
+        for (int i = 0; i < scans; ++i) {
+            const auto scan = scan_implicit_root(root);
+            REQUIRE_FALSE(scan.over_limit);
+            REQUIRE(scan.files.size() == sources);
+        }
         const std::chrono::duration<double, std::milli> took =
             std::chrono::steady_clock::now() - start;
         return took.count();
     };
-    (void)time_ms(small.root, 1); // warm the path memo for both trees
-    (void)time_ms(large.root, 1);
+    const size_t small_sources = kSmallDirs * 10; // build() writes 10 sources per dir
+    const size_t large_sources = small_sources * kFactor;
+    (void)time_ms(small.root, 1, small_sources); // warm the path memo for both trees
+    (void)time_ms(large.root, 1, large_sources);
     // Interleaved, so a slow stretch on a shared runner hits both trees
     // instead of only the one being timed then.
     double n = 1e9;
     double large_n = 1e9;
     for (int i = 0; i < 15; ++i) {
-        n = std::min(n, time_ms(small.root, kFactor));
-        large_n = std::min(large_n, time_ms(large.root, 1));
+        n = std::min(n, time_ms(small.root, kFactor, small_sources));
+        large_n = std::min(large_n, time_ms(large.root, 1, large_sources));
     }
     const double ratio = large_n / n;
     std::cout << "\n[implicit scan scaling] " << kFactor << " x N: " << n << " ms, " << kFactor
