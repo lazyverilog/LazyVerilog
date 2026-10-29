@@ -223,6 +223,8 @@ struct MacroEntry {
     // Replacement text as hover shows it (macro_body_text()).  A closed file
     // keeps no tree, so this is the only place hover can read it from.
     std::string body;
+
+    bool operator==(const MacroEntry&) const = default;
 };
 
 struct ValueEntry {
@@ -490,18 +492,26 @@ struct ProjectIndexModuleRef {
 /// A project's macros, one per name, the first in shard order (headers first).
 struct ProjectMacros {
     /// The shards they were read from, in order.  A later snapshot whose
-    /// project shards are these same ones reuses this answer as is; holding
-    /// them also keeps the entries below alive.
+    /// project shards are these, or hold equal macros, reuses this answer as
+    /// is; holding them also keeps the entries below alive.
     std::vector<std::shared_ptr<const SyntaxIndex>> shards;
     std::vector<const MacroEntry*> in_order;
-    /// in_order by name with ASCII case folded, for prefix_range().
-    std::vector<const MacroEntry*> by_folded_name;
-    /// in_order by name.
-    std::vector<const MacroEntry*> by_name;
 
-    /// The entries of by_folded_name whose name starts with @p prefix, case
+    /// Sort orders of in_order, as indices into it: a later answer whose names
+    /// are the same sequence shares them instead of sorting again.
+    struct Order {
+        /// Indices by name with case folded (prefix_score()'s folding).
+        std::vector<uint32_t> by_folded;
+        /// The folded names, in by_folded's order.
+        std::vector<std::string> folded;
+        /// Indices by name.
+        std::vector<uint32_t> by_name;
+    };
+    std::shared_ptr<const Order> order;
+
+    /// The part of order->by_folded whose names start with @p prefix, case
     /// folded: a binary search.
-    std::span<const MacroEntry* const> prefix_range(std::string_view prefix) const;
+    std::span<const uint32_t> prefix_range(std::string_view prefix) const;
 };
 
 /// A member a class inherits, as completion offers it.  `depth` counts the
@@ -604,9 +614,10 @@ struct ProjectIndexSnapshot {
     /// Every macro defined in a shard whose project root (per @p project_of,
     /// given a shard's path) is @p root, one per name.  Cached per root and
     /// @p generation (the root resolver's) like the above.  @p previous, an
-    /// answer from an earlier snapshot, is returned as is when it was read from
-    /// the same shards: an edit to a file that defines no macro republishes
-    /// the snapshot but leaves the macros, and their sort, as they were.
+    /// answer from an earlier snapshot, is returned as is when its shards hold
+    /// the same macros: an edit to a file that defines none, or to an open
+    /// includer, republishes the snapshot but leaves the macros, and their
+    /// sort, as they were.  Same names in the same order keep the sort.
     std::shared_ptr<const ProjectMacros>
     project_macros(const std::string& root, uint64_t generation,
                    const std::function<std::string(const std::string&)>& project_of,

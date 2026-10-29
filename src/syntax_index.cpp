@@ -6,6 +6,7 @@
 #include <cctype>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -1970,24 +1971,42 @@ ProjectIndexSnapshot::inherited_members(const std::string& base_name,
     return cache.inherited.try_emplace(std::move(key), std::move(members)).first->second;
 }
 
-// prefix_score()'s case folding: ASCII through std::tolower.
-static int fold_char(char c) { return std::tolower(static_cast<unsigned char>(c)); }
-
-static bool folded_less(std::string_view a, std::string_view b) {
-    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
-                                        [](char x, char y) { return fold_char(x) < fold_char(y); });
+// prefix_score()'s case folding: std::tolower per byte.
+static std::string fold_case(std::string_view text) {
+    std::string folded(text);
+    for (char& c : folded)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return folded;
 }
 
-std::span<const MacroEntry* const> ProjectMacros::prefix_range(std::string_view prefix) const {
-    const auto first = std::lower_bound(
-        by_folded_name.begin(), by_folded_name.end(), prefix,
-        [](const MacroEntry* mac, std::string_view p) { return folded_less(mac->name, p); });
-    const auto last = std::partition_point(first, by_folded_name.end(), [&](const MacroEntry* mac) {
-        return mac->name.size() >= prefix.size() &&
-               std::equal(prefix.begin(), prefix.end(), mac->name.begin(),
-                          [](char x, char y) { return fold_char(x) == fold_char(y); });
-    });
-    return {first, last};
+std::span<const uint32_t> ProjectMacros::prefix_range(std::string_view prefix) const {
+    const std::string key = fold_case(prefix);
+    const auto& folded = order->folded;
+    const auto first = std::lower_bound(folded.begin(), folded.end(), key);
+    const auto last = std::partition_point(
+        first, folded.end(), [&](const std::string& name) { return name.starts_with(key); });
+    return std::span<const uint32_t>(order->by_folded)
+        .subspan(first - folded.begin(), last - first);
+}
+
+static std::shared_ptr<const ProjectMacros::Order>
+sort_macros(const std::vector<const MacroEntry*>& in_order) {
+    auto order = std::make_shared<ProjectMacros::Order>();
+    std::vector<std::string> folded;
+    folded.reserve(in_order.size());
+    for (const auto* mac : in_order)
+        folded.push_back(fold_case(mac->name));
+    order->by_folded.resize(in_order.size());
+    std::iota(order->by_folded.begin(), order->by_folded.end(), 0u);
+    order->by_name = order->by_folded;
+    std::sort(order->by_folded.begin(), order->by_folded.end(),
+              [&](uint32_t a, uint32_t b) { return folded[a] < folded[b]; });
+    std::sort(order->by_name.begin(), order->by_name.end(),
+              [&](uint32_t a, uint32_t b) { return in_order[a]->name < in_order[b]->name; });
+    order->folded.reserve(folded.size());
+    for (const uint32_t i : order->by_folded)
+        order->folded.push_back(std::move(folded[i]));
+    return order;
 }
 
 std::shared_ptr<const ProjectMacros>
@@ -2018,8 +2037,19 @@ ProjectIndexSnapshot::project_macros(
         if (it->second)
             from.push_back(shard.index);
     }
+    // An open buffer's shard is a new object per keystroke, and an includer's
+    // shard records every macro of the headers it includes: compare contents,
+    // so editing a file that `include`s uvm_macros.svh changes nothing here.
+    const auto same_shards = [&] {
+        if (previous->shards.size() != from.size())
+            return false;
+        for (size_t i = 0; i < from.size(); ++i)
+            if (previous->shards[i] != from[i] && previous->shards[i]->macros != from[i]->macros)
+                return false;
+        return true;
+    };
     std::shared_ptr<const ProjectMacros> answer = previous;
-    if (!previous || previous->shards != from) {
+    if (!previous || !same_shards()) {
         auto macros = std::make_shared<ProjectMacros>();
         // A header's macros are also recorded by every includer's shard: one
         // per name, the first in shard order (headers first).
@@ -2028,14 +2058,14 @@ ProjectIndexSnapshot::project_macros(
             for (const auto& mac : index->macros)
                 if (names.insert(mac.name).second)
                     macros->in_order.push_back(&mac);
-        macros->by_folded_name = macros->in_order;
-        std::sort(macros->by_folded_name.begin(), macros->by_folded_name.end(),
-                  [](const MacroEntry* a, const MacroEntry* b) {
-                      return folded_less(a->name, b->name);
-                  });
-        macros->by_name = macros->in_order;
-        std::sort(macros->by_name.begin(), macros->by_name.end(),
-                  [](const MacroEntry* a, const MacroEntry* b) { return a->name < b->name; });
+        // A changed body or line keeps the names, and with them the sort.
+        const bool same_names =
+            previous && std::equal(macros->in_order.begin(), macros->in_order.end(),
+                                   previous->in_order.begin(), previous->in_order.end(),
+                                   [](const MacroEntry* a, const MacroEntry* b) {
+                                       return a->name == b->name;
+                                   });
+        macros->order = same_names ? previous->order : sort_macros(macros->in_order);
         macros->shards = std::move(from);
         answer = std::move(macros);
     }

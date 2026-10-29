@@ -3399,12 +3399,23 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
     static std::shared_ptr<const ProjectParseInputs> memo_inputs;
     static uint64_t memo_generation = 0;
     static std::unordered_map<std::string, std::string> memo_roots; // directory -> root
-    // root -> its last macros, which the next snapshot reuses if its shards are the same.
+    // root -> its last macros, which the next snapshot reuses if its shards
+    // hold the same ones.  Dropped with memo_roots, so a vanished root's shards
+    // are not kept.
     static std::unordered_map<std::string, std::shared_ptr<const ProjectMacros>> memo_macros;
     const uint64_t generation = inputs->root_generation();
+    const auto refresh_memo_locked = [&] {
+        if (memo_inputs != inputs || memo_generation != generation) {
+            memo_inputs = inputs;
+            memo_generation = generation;
+            memo_roots.clear();
+            memo_macros.clear();
+        }
+    };
     std::shared_ptr<const ProjectMacros> previous;
     {
         std::lock_guard<std::mutex> lock(memo_mutex);
+        refresh_memo_locked();
         if (const auto it = memo_macros.find(root); it != memo_macros.end())
             previous = it->second;
     }
@@ -3412,11 +3423,7 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
         const std::string dir = std::filesystem::path(path).parent_path().string();
         {
             std::lock_guard<std::mutex> lock(memo_mutex);
-            if (memo_inputs != inputs || memo_generation != generation) {
-                memo_inputs = inputs;
-                memo_generation = generation;
-                memo_roots.clear();
-            }
+            refresh_memo_locked();
             if (const auto it = memo_roots.find(dir); it != memo_roots.end())
                 return it->second;
         }
@@ -3428,7 +3435,8 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
     }, previous);
     if (macros != previous) {
         std::lock_guard<std::mutex> lock(memo_mutex);
-        memo_macros[root] = macros;
+        if (memo_inputs == inputs && memo_generation == generation)
+            memo_macros[root] = macros;
     }
     std::vector<std::pair<int, const MacroEntry*>> matches;
     // Every prefix match outscores every fuzzy one (prefix_score()), so when
@@ -3439,12 +3447,14 @@ static bool append_project_macro_items(const DocumentState& state, const Complet
     if (prefixed.size() > limit && ctx.prefix.empty()) {
         // All score alike; the tie-break is the name.
         for (size_t i = 0; i < limit; ++i)
-            items.push_back(macro_item(*macros->by_name[i]));
+            items.push_back(macro_item(*macros->in_order[macros->order->by_name[i]]));
         return true;
     }
     if (prefixed.size() > limit) {
-        for (const auto* mac : prefixed)
+        for (const uint32_t i : prefixed) {
+            const auto* mac = macros->in_order[i];
             matches.emplace_back(prefix_score(mac->name, ctx.prefix), mac);
+        }
     } else {
         for (const auto* mac : macros->in_order)
             if (const int score = prefix_score(mac->name, ctx.prefix); score > 0)
