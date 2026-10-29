@@ -1130,6 +1130,15 @@ static void dedupe_completion_items(std::vector<lsCompletionItem>& items) {
     items = std::move(deduped);
 }
 
+// Whether @p imp's design unit holds the cursor.  current_scope_name is the
+// innermost scope (a class, `C` for `C::m`), not the module or package the
+// import sits in; an import that knows its end line is placed by its line range,
+// which the callers check next.
+static bool import_scope_reaches(const ImportEntry& imp, const CompletionContext& ctx) {
+    return imp.parent_scope.empty() || imp.end_line > 0 ||
+           imp.parent_scope == ctx.current_scope_name;
+}
+
 static bool value_visible_in_context(const SyntaxIndex& index, const CompletionContext& ctx,
                                      const ValueEntry& value) {
     if (!ctx.current_scope_name.empty() && !value.parent_scope.empty() &&
@@ -1142,7 +1151,7 @@ static bool value_visible_in_context(const SyntaxIndex& index, const CompletionC
         for (const auto& imp : ctx.visible_imports) {
             if (imp.package_name != value.parent_scope)
                 continue;
-            if (!imp.parent_scope.empty() && imp.parent_scope != ctx.current_scope_name)
+            if (!import_scope_reaches(imp, ctx))
                 continue;
             if (imp.start_line > 0 && one_based_line < imp.start_line)
                 continue;
@@ -1180,7 +1189,7 @@ static bool package_symbol_visible_in_identifier_context(const SyntaxIndex& inde
     for (const auto& imp : ctx.visible_imports) {
         if (imp.package_name != package_name)
             continue;
-        if (!imp.parent_scope.empty() && imp.parent_scope != ctx.current_scope_name)
+        if (!import_scope_reaches(imp, ctx))
             continue;
         if (imp.start_line > 0 && one_based_line < imp.start_line)
             continue;
