@@ -2132,29 +2132,41 @@ TEST_CASE("definition: a same-named class follows the asking file's imports",
 
 TEST_CASE("definition: an unimported same-named class does not hide an imported typedef",
           "[definition][module-proximity]") {
-    // pa and pb both declare class cfg; top imports neither, but pc's typedef.
-    TempTree tree("definition-import-ranking-typedef");
-    tree.write("proj/lazyverilog.toml", "[design]\n");
-    const auto pc = tree.write("proj/pc.sv", "package pc;\n  typedef int cfg;\nendpackage\n");
-    const auto pa = tree.write("proj/x/pa.sv", "package pa;\nclass cfg;\nendclass\nendpackage\n");
-    const auto pb = tree.write("proj/x/pb.sv", "package pb;\nclass cfg;\nendclass\nendpackage\n");
-    const std::string top_text = "module top;\n"     // 0
-                                 "  import pc::*;\n" // 1
-                                 "  cfg c;\n"        // 2
-                                 "endmodule\n";
-    const auto top = tree.write("proj/top.sv", top_text);
-    Analyzer analyzer;
-    analyzer.set_project_index_publish_debounce_ms(0);
-    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
-    analyzer.set_extra_files({pc.string(), pa.string(), pb.string(), top.string()});
-    analyzer.wait_for_background_index_idle();
-    const auto top_uri = uri_from_path(top);
-    analyzer.open(top_uri, top_text);
+    // pa and pb both declare class cfg; the use imports neither in its own
+    // scope, but pc's typedef.  @p line is the `cfg c;` line.
+    const auto check = [](const std::string& top_text, int line) {
+        TempTree tree("definition-import-ranking-typedef");
+        tree.write("proj/lazyverilog.toml", "[design]\n");
+        const auto pc = tree.write("proj/pc.sv", "package pc;\n  typedef int cfg;\nendpackage\n");
+        const auto pa =
+            tree.write("proj/x/pa.sv", "package pa;\nclass cfg;\nendclass\nendpackage\n");
+        const auto pb =
+            tree.write("proj/x/pb.sv", "package pb;\nclass cfg;\nendclass\nendpackage\n");
+        const auto top = tree.write("proj/top.sv", top_text);
+        Analyzer analyzer;
+        analyzer.set_project_index_publish_debounce_ms(0);
+        analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+        analyzer.set_extra_files({pc.string(), pa.string(), pb.string(), top.string()});
+        analyzer.wait_for_background_index_idle();
+        const auto top_uri = uri_from_path(top);
+        analyzer.open(top_uri, top_text);
 
-    const auto def = analyzer.definition_of(top_uri, 2, 3);
-    REQUIRE(def);
-    CHECK(def->uri == uri_from_path(pc));
-    CHECK(def->line == 1);
+        const auto def = analyzer.definition_of(top_uri, line, 3);
+        REQUIRE(def);
+        CHECK(def->uri == uri_from_path(pc));
+        CHECK(def->line == 1);
+    };
+    SECTION("no class imported") {
+        check("module top;\n  import pc::*;\n  cfg c;\nendmodule\n", 2);
+    }
+    SECTION("a class imported only in another module") {
+        check("module a;\n  import pb::*;\nendmodule\n" // 0-2
+              "module b;\n  import pc::*;\n  cfg c;\nendmodule\n", // 3-6
+              5);
+    }
+    SECTION("a class imported after the use") {
+        check("module b;\n  import pc::*;\n  cfg c;\n  import pb::*;\nendmodule\n", 2);
+    }
 }
 
 TEST_CASE("definition: an inherited member follows the imported class's own base",

@@ -2817,6 +2817,31 @@ struct GenericDeclarationCandidate {
 /// extending it, which the caller resolves separately), so the same-class
 /// declaration answers over every other one; a generated register model
 /// declares the same `sample` in a hundred classes.
+// Whether @p sym_name of package @p package is visible at the cursor: inside
+// that package, or imported by an import in scope (same module, at or before
+// the use line).
+static bool package_member_visible(std::string_view package, std::string_view sym_name,
+                                   std::string_view preferred_module,
+                                   std::string_view preferred_package,
+                                   const std::vector<ImportEntry>& visible_imports,
+                                   int use_line_one_based) {
+    if (preferred_package == package)
+        return true;
+    for (const auto& imp : visible_imports) {
+        if (imp.package_name != package)
+            continue;
+        if (!imp.parent_scope.empty() && imp.parent_scope != preferred_module)
+            continue;
+        if (imp.start_line > 0 && use_line_one_based < imp.start_line)
+            continue;
+        if (imp.end_line > 0 && use_line_one_based > imp.end_line)
+            continue;
+        if (imp.wildcard || imp.symbol_name == sym_name)
+            return true;
+    }
+    return false;
+}
+
 static std::optional<Location>
 choose_generic_definition(const std::vector<GenericDeclarationCandidate>& candidates,
                           const std::string& name, const std::string& preferred_module,
@@ -2839,22 +2864,8 @@ choose_generic_definition(const std::vector<GenericDeclarationCandidate>& candid
         //
         // SystemVerilog package members are reached by qualification
         // (cpu_pkg::add_number) or import (cpu_pkg::* / cpu_pkg::add_number).
-        if (preferred_package == package_name)
-            return true;
-
-        for (const auto& import : visible_imports) {
-            if (import.package_name != package_name)
-                continue;
-            if (!import.parent_scope.empty() && import.parent_scope != preferred_module)
-                continue;
-            if (import.start_line > 0 && use_line_one_based < import.start_line)
-                continue;
-            if (import.end_line > 0 && use_line_one_based > import.end_line)
-                continue;
-            if (import.wildcard || import.symbol_name == name)
-                return true;
-        }
-        return false;
+        return ::package_member_visible(package_name, name, preferred_module, preferred_package,
+                                        visible_imports, use_line_one_based);
     };
 
     const auto contains_use = [&](std::pair<int, int> scope) {
@@ -3182,21 +3193,8 @@ static std::optional<Location> find_generic_definition_from_index(
     auto pkg_visible = [&](std::string_view parent_scope, std::string_view sym_name) -> bool {
         if (parent_scope.empty() || !index.package_names.count(std::string(parent_scope)))
             return true; // not in a package — module/interface scope, always visible
-        if (preferred_package == parent_scope)
-            return true; // cursor is inside the same package
-        for (const auto& imp : visible_imports) {
-            if (imp.package_name != parent_scope)
-                continue;
-            if (!imp.parent_scope.empty() && imp.parent_scope != preferred_module)
-                continue;
-            if (imp.start_line > 0 && use_line_one_based < imp.start_line)
-                continue;
-            if (imp.end_line > 0 && use_line_one_based > imp.end_line)
-                continue;
-            if (imp.wildcard || imp.symbol_name == sym_name)
-                return true;
-        }
-        return false;
+        return package_member_visible(parent_scope, sym_name, preferred_module, preferred_package,
+                                      visible_imports, use_line_one_based);
     };
 
     auto make_loc = [&](SourceFileID file_id, int line, int col) -> Location {
@@ -6871,21 +6869,23 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     const auto import_ranked_class = [&](const std::string& name,
                                          std::string_view member) -> std::optional<RankedClass> {
         const auto shards = class_lookup_shards();
+        OverrideClassTable table;
+        const auto add_named = [&](const std::string& class_name) {
+            for (const auto& shard : shards)
+                if (const auto* cls = find_class_entry(*shard.index, class_name))
+                    table.add_class(*cls, *shard.index, *shard.uri);
+        };
+        add_named(name);
+        if (table.nodes.size() < 2)
+            return std::nullopt;
         // Every class named along the `extends` chain, so base_of() can rank
         // each hop the way rename's chain does.
-        OverrideClassTable table;
-        std::vector<std::string> names{name};
-        std::unordered_set<std::string> seen{name};
-        for (size_t i = 0; i < names.size(); ++i)
-            for (const auto& shard : shards)
-                if (const auto* cls = find_class_entry(*shard.index, names[i])) {
-                    table.add_class(*cls, *shard.index, *shard.uri);
-                    if (const auto& base = table.nodes.back().base;
-                        !member.empty() && !base.empty() && seen.insert(base).second)
-                        names.push_back(base);
-                }
-        if (table.by_name[name].size() < 2)
-            return std::nullopt;
+        if (!member.empty()) {
+            std::unordered_set<std::string> seen{name};
+            for (size_t i = 0; i < table.nodes.size(); ++i)
+                if (const auto base = table.nodes[i].base; !base.empty() && seen.insert(base).second)
+                    add_named(base);
+        }
         static const std::unordered_set<std::string> kNoHidden;
         const OverrideClassView view(table, kNoHidden);
         const auto& imports = get_dynamic_index(state).imports;
@@ -6895,10 +6895,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return std::nullopt;
         const auto scope = view.scope_of(*node);
         const bool visible =
-            node->uri == uri || (!scope.empty() && scope == target.scope_package) ||
-            (!scope.empty() && std::any_of(imports.begin(), imports.end(), [&](const auto& i) {
-                 return i.package_name == scope && (i.wildcard || i.symbol_name == name);
-             }));
+            node->uri == uri ||
+            (!scope.empty() && package_member_visible(scope, name, target.scope_module,
+                                                      target.scope_package, imports,
+                                                      use_line_one_based));
         std::optional<Location> found;
         std::unordered_set<std::string> walked;
         for (const auto* cur = member.empty() ? nullptr : node;

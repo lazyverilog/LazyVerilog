@@ -849,6 +849,19 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
         explicit Visitor(SyntaxIndex& index, SourceFileIdResolver& resolver,
                          const slang::SourceManager& sm)
             : index(index), resolver(resolver), sm(sm) {}
+        // The enclosing module/interface/package and its end line, as the
+        // shard's imports carry them: an import in `module a` is not visible
+        // in `module b`.
+        std::string scope;
+        int scope_end_line = 0;
+        void handle(const ModuleDeclarationSyntax& node) {
+            const auto end = node.sourceRange().end();
+            auto saved = std::pair{std::exchange(scope, token_value_text(node.header->name)),
+                                   std::exchange(scope_end_line,
+                                                 end.valid() ? (int)sm.getLineNumber(end) : 0)};
+            visitDefault(node);
+            std::tie(scope, scope_end_line) = std::move(saved);
+        }
         void handle(const PackageImportDeclarationSyntax& node) {
             auto [line, _] = token_pos_line1_col0(sm, node.keyword);
             for (const auto* item : node.items) {
@@ -861,6 +874,8 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
                     entry.symbol_name = token_value_text(item->item);
                 entry.file_id = resolver.for_declaration_token(index, sm, item->package);
                 entry.start_line = line;
+                entry.parent_scope = scope;
+                entry.end_line = scope_end_line;
                 index.imports.push_back(std::move(entry));
             }
             visitDefault(node);
