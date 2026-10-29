@@ -2070,6 +2070,66 @@ TEST_CASE("rename: a call site starts the chain from the class its own occurrenc
     }
 }
 
+TEST_CASE("definition: a same-named class follows the asking file's imports",
+          "[definition][override-chain][module-proximity]") {
+    // pa.sv is nearer to top.sv by path, but top imports pb: `drv` and
+    // `h.run` are pb's, and rename agrees from either end.  b/user.sv, nearer
+    // to pb, imports pa: the other direction.
+    const std::string pa_text =
+        "package pa;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string pb_text =
+        "package pb;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n";
+    const std::string top_text = "module top;\n"        // 0
+                                 "  import pb::*;\n"    // 1
+                                 "  drv h;\n"           // 2
+                                 "  initial h.run();\n" // 3
+                                 "endmodule\n";
+    const std::string user_text = "module user;\n"       // 0
+                                  "  import pa::*;\n"    // 1
+                                  "  drv h;\n"           // 2
+                                  "  initial h.run();\n" // 3
+                                  "endmodule\n";
+    TempTree tree("definition-import-ranking");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pa = tree.write("proj/pa.sv", pa_text);
+    const auto pb = tree.write("proj/b/pb.sv", pb_text);
+    const auto top = tree.write("proj/top.sv", top_text);
+    const auto user = tree.write("proj/b/user.sv", user_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pa.string(), pb.string(), top.string(), user.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto pa_uri = uri_from_path(pa);
+    const auto pb_uri = uri_from_path(pb);
+    const auto top_uri = uri_from_path(top);
+    const auto user_uri = uri_from_path(user);
+    analyzer.open(top_uri, top_text);
+    analyzer.open(user_uri, user_text);
+
+    const auto lands = [&](const std::string& uri, int line, int col) {
+        const auto def = analyzer.definition_of(uri, line, col);
+        REQUIRE(def);
+        return std::pair{def->uri, def->line};
+    };
+    CHECK(lands(top_uri, 2, 3) == std::pair{pb_uri, 1});
+    CHECK(lands(top_uri, 3, 13) == std::pair{pb_uri, 2});
+    CHECK(lands(user_uri, 2, 3) == std::pair{pa_uri, 1});
+    CHECK(lands(user_uri, 3, 13) == std::pair{pa_uri, 2});
+
+    // Go to definition opens pb.sv; renaming there must edit what renaming
+    // from the call site does.
+    analyzer.open(pb_uri, pb_text);
+    const auto from_call = provide_rename(analyzer, rename_run_at(top_uri, 3, 13));
+    const auto from_def = provide_rename(analyzer, rename_run_at(pb_uri, 2, 25));
+    for (const auto* edit : {&from_call, &from_def}) {
+        CHECK(edit_starts(*edit, top_uri) == std::set<std::pair<int, int>>{{3, 12}});
+        CHECK(edit_starts(*edit, pb_uri) == std::set<std::pair<int, int>>{{2, 24}});
+        CHECK(edit_starts(*edit, pa_uri).empty());
+        CHECK(edit_starts(*edit, user_uri).empty());
+    }
+}
+
 TEST_CASE("references: the override class table does not pin replaced shards",
           "[rename][override-chain]") {
     // A reload replaces every shard.  The table built for an earlier
