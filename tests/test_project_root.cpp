@@ -2130,6 +2130,74 @@ TEST_CASE("definition: a same-named class follows the asking file's imports",
     }
 }
 
+TEST_CASE("definition: an unimported same-named class does not hide an imported typedef",
+          "[definition][module-proximity]") {
+    // pa and pb both declare class cfg; top imports neither, but pc's typedef.
+    TempTree tree("definition-import-ranking-typedef");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pc = tree.write("proj/pc.sv", "package pc;\n  typedef int cfg;\nendpackage\n");
+    const auto pa = tree.write("proj/x/pa.sv", "package pa;\nclass cfg;\nendclass\nendpackage\n");
+    const auto pb = tree.write("proj/x/pb.sv", "package pb;\nclass cfg;\nendclass\nendpackage\n");
+    const std::string top_text = "module top;\n"     // 0
+                                 "  import pc::*;\n" // 1
+                                 "  cfg c;\n"        // 2
+                                 "endmodule\n";
+    const auto top = tree.write("proj/top.sv", top_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pc.string(), pa.string(), pb.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto top_uri = uri_from_path(top);
+    analyzer.open(top_uri, top_text);
+
+    const auto def = analyzer.definition_of(top_uri, 2, 3);
+    REQUIRE(def);
+    CHECK(def->uri == uri_from_path(pc));
+    CHECK(def->line == 1);
+}
+
+TEST_CASE("definition: an inherited member follows the imported class's own base",
+          "[definition][override-chain][module-proximity]") {
+    // pa's drv (nearer) declares run; pb's drv only inherits it from pb's base.
+    const std::string pb_text = "package pb;\n"                        // 0
+                                "class base;\n"                        // 1
+                                "  virtual function void run();\n"     // 2
+                                "  endfunction\n"                      // 3
+                                "endclass\n"                           // 4
+                                "class drv extends base;\n"            // 5
+                                "endclass\n"                           // 6
+                                "endpackage\n";
+    const std::string top_text = "module top;\n"        // 0
+                                 "  import pb::*;\n"    // 1
+                                 "  drv h;\n"           // 2
+                                 "  initial h.run();\n" // 3
+                                 "endmodule\n";
+    TempTree tree("definition-import-ranking-inherited");
+    tree.write("proj/lazyverilog.toml", "[design]\n");
+    const auto pa = tree.write(
+        "proj/pa.sv",
+        "package pa;\nclass drv;\n  virtual function void run();\n  endfunction\nendclass\nendpackage\n");
+    const auto pb = tree.write("proj/b/pb.sv", pb_text);
+    const auto top = tree.write("proj/top.sv", top_text);
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_project_root_resolver(std::make_shared<ProjectRootResolver>());
+    analyzer.set_extra_files({pa.string(), pb.string(), top.string()});
+    analyzer.wait_for_background_index_idle();
+    const auto pb_uri = uri_from_path(pb);
+    const auto top_uri = uri_from_path(top);
+    analyzer.open(top_uri, top_text);
+
+    const auto def = analyzer.definition_of(top_uri, 3, 13);
+    REQUIRE(def);
+    CHECK(def->uri == pb_uri);
+    CHECK(def->line == 2);
+    const auto edit = provide_rename(analyzer, rename_run_at(top_uri, 3, 13));
+    CHECK(edit_starts(edit, pb_uri) == std::set<std::pair<int, int>>{{2, 24}});
+    CHECK(edit_starts(edit, uri_from_path(pa)).empty());
+}
+
 TEST_CASE("references: the override class table does not pin replaced shards",
           "[rename][override-chain]") {
     // A reload replaces every shard.  The table built for an earlier

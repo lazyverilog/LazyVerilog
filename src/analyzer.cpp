@@ -6860,28 +6860,56 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // A class name more than one shard declares (`pa::drv`, `pb::drv`) means
     // the one this file sees: same file, same package, imported, then nearest
     // by path -- the ranking rename's override chain gives every occurrence,
-    // so go-to-definition and rename agree.  Ranks, never filters: the caller
-    // only reorders.  nullopt when the name is not declared twice.
+    // so go-to-definition and rename agree.  Ranks, never filters: a miss falls
+    // back to the first-match scans.  nullopt when the name is not declared
+    // twice.
     struct RankedClass {
-        const SyntaxIndex* index;
         Location location;
+        bool visible; ///< same file, same package or imported, not just nearest
+        std::optional<Location> member; ///< @p member on it or the bases it resolves
     };
-    const auto import_ranked_class = [&](const std::string& name) -> std::optional<RankedClass> {
+    const auto import_ranked_class = [&](const std::string& name,
+                                         std::string_view member) -> std::optional<RankedClass> {
+        const auto shards = class_lookup_shards();
+        // Every class named along the `extends` chain, so base_of() can rank
+        // each hop the way rename's chain does.
         OverrideClassTable table;
-        for (const auto& shard : class_lookup_shards())
-            if (const auto* cls = find_class_entry(*shard.index, name))
-                table.add_class(*cls, *shard.index, *shard.uri);
-        if (table.nodes.size() < 2)
+        std::vector<std::string> names{name};
+        std::unordered_set<std::string> seen{name};
+        for (size_t i = 0; i < names.size(); ++i)
+            for (const auto& shard : shards)
+                if (const auto* cls = find_class_entry(*shard.index, names[i])) {
+                    table.add_class(*cls, *shard.index, *shard.uri);
+                    if (const auto& base = table.nodes.back().base;
+                        !member.empty() && !base.empty() && seen.insert(base).second)
+                        names.push_back(base);
+                }
+        if (table.by_name[name].size() < 2)
             return std::nullopt;
         static const std::unordered_set<std::string> kNoHidden;
         const OverrideClassView view(table, kNoHidden);
-        const auto* node = view.resolve(name, uri, path_from_file_uri(uri), target.scope_package,
-                                        get_dynamic_index(state).imports);
+        const auto& imports = get_dynamic_index(state).imports;
+        const auto* node =
+            view.resolve(name, uri, path_from_file_uri(uri), target.scope_package, imports);
         if (!node)
             return std::nullopt;
+        const auto scope = view.scope_of(*node);
+        const bool visible =
+            node->uri == uri || (!scope.empty() && scope == target.scope_package) ||
+            (!scope.empty() && std::any_of(imports.begin(), imports.end(), [&](const auto& i) {
+                 return i.package_name == scope && (i.wildcard || i.symbol_name == name);
+             }));
+        std::optional<Location> found;
+        std::unordered_set<std::string> walked;
+        for (const auto* cur = member.empty() ? nullptr : node;
+             cur && !found && walked.insert(OverrideClassView::key(*cur)).second;
+             cur = view.base_of(*cur))
+            found = find_class_member_definition(*cur->index, cur->shard_uri, cur->cls->name,
+                                                 member);
         const int cls_line = to_lsp_line(node->cls->line);
-        return RankedClass{node->index, Location{node->uri, cls_line, node->cls->col, cls_line,
-                                                 node->cls->col + lsp_column_width(name)}};
+        return RankedClass{Location{node->uri, cls_line, node->cls->col, cls_line,
+                                    node->cls->col + lsp_column_width(name)},
+                           visible, std::move(found)};
     };
 
     if (target.kind == DefinitionTargetKind::PackageMember) {
@@ -7048,11 +7076,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             // Search both compact index families so `obj.field` works for
             // closed-file classes as well as structs/unions.  Class lookup
             // walks the `extends` chain; typedef aggregates have no base type.
-            auto shards = class_lookup_shards();
-            if (const auto ranked_class = import_ranked_class(*class_type))
-                std::stable_partition(shards.begin(), shards.end(), [&](const auto& shard) {
-                    return shard.index == ranked_class->index;
-                });
+            const auto shards = class_lookup_shards();
+            if (auto ranked_class = import_ranked_class(*class_type, target.name);
+                ranked_class && ranked_class->member)
+                return ranked_class->member;
             if (auto loc = find_class_member_in_hierarchy(shards, *class_type, target.name))
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
@@ -7207,7 +7234,10 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
     }
 
-    if (const auto ranked_class = import_ranked_class(target.name))
+    // Only a class the file can see: a nearer class it does not import must not
+    // hide an imported typedef or function of that name.
+    if (const auto ranked_class = import_ranked_class(target.name, {});
+        ranked_class && ranked_class->visible)
         return ranked_class->location;
     return nearest_shard_answer([&](const ExtraFileInfo& extra) {
         return find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
