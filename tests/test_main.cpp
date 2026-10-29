@@ -6,16 +6,12 @@
 #include <catch2/reporters/catch_reporter_event_listener.hpp>
 #include <catch2/reporters/catch_reporter_registrars.hpp>
 
+#include "cli_process.hpp"
+
 #include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <system_error>
-
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
 
 namespace {
 
@@ -29,25 +25,24 @@ public:
 
     void testRunStarting(Catch::TestRunInfo const&) override {
         namespace fs = std::filesystem;
-#ifdef _WIN32
-        const int pid = _getpid();
-#else
-        const int pid = getpid();
-#endif
-        dir_ = fs::temp_directory_path() / ("lazyverilog-tests-" + std::to_string(pid));
+        dir_ = fs::temp_directory_path() /
+               ("lazyverilog-tests-" + std::to_string(cli_process::current_process_id()));
         std::error_code ec;
         fs::remove_all(dir_, ec);
         fs::create_directories(dir_);
-        const std::string value = dir_.string();
 #ifdef _WIN32
-        // GetTempPathW (temp_directory_path) reads TMP first.
-        _putenv_s("TMP", value.c_str());
-        _putenv_s("TEMP", value.c_str());
+        // GetTempPathW (temp_directory_path) reads TMP first.  Wide, so a
+        // temp path outside the ANSI code page survives.
+        _wputenv_s(L"TMP", dir_.c_str());
+        _wputenv_s(L"TEMP", dir_.c_str());
 #else
-        setenv("TMPDIR", value.c_str(), 1);
+        setenv("TMPDIR", dir_.c_str(), 1);
 #endif
     }
 
+    // A tree past MAX_PATH would hang libstdc++'s remove_all(); the one test
+    // that builds one ("a project deeper than MAX_PATH") renames it short
+    // on every exit it can take, and a crash never reaches here.
     void testRunEnded(Catch::TestRunStats const&) override {
         std::error_code ec;
         std::filesystem::remove_all(dir_, ec);
