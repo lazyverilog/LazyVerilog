@@ -359,26 +359,36 @@ std::pair<int, int> token_pos_line0_col0(const slang::SourceManager& sm,
     return {line > 0 ? line - 1 : 0, col};
 }
 
-std::pair<int, int> syntax_end_pos_line1_col0(const slang::SourceManager& sm,
-                                              const slang::syntax::SyntaxNode& node) {
-    const auto expanded_end = [&](slang::SourceLocation loc) {
-        while (loc.valid() && sm.isMacroLoc(loc))
-            loc = sm.getExpansionRange(loc).end();
-        return loc;
+std::pair<int, int> spelled_pos_line1_col0(const slang::SourceManager& sm,
+                                           slang::SourceLocation loc, slang::BufferID buffer,
+                                           bool is_end) {
+    const auto expanded = [&](slang::SourceLocation l) {
+        while (l.valid() && sm.isMacroLoc(l)) {
+            const auto range = sm.getExpansionRange(l);
+            l = is_end ? range.end() : range.start();
+        }
+        return l;
     };
-    const auto range = node.sourceRange();
-    const auto start = sm.getFullyExpandedLoc(range.start());
-    auto end = expanded_end(range.end());
-    if (!start.valid() || !end.valid())
+    loc = expanded(loc);
+    if (!loc.valid())
         return {0, 0};
-    while (end.buffer() != start.buffer()) {
-        const auto from = sm.getIncludedFrom(end.buffer());
+    while (buffer.valid() && loc.buffer() != buffer) {
+        const auto from = sm.getIncludedFrom(loc.buffer());
         if (!from.valid())
             return {0, 0};
-        end = expanded_end(from);
+        loc = expanded(from);
     }
-    const auto line = sm.getLineNumber(end);
-    return {line > 0 ? static_cast<int>(line) : 0, lsp_column(sm, end)};
+    const auto line = sm.getLineNumber(loc);
+    return {line > 0 ? static_cast<int>(line) : 0, lsp_column(sm, loc)};
+}
+
+std::pair<int, int> syntax_end_pos_line1_col0(const slang::SourceManager& sm,
+                                              const slang::syntax::SyntaxNode& node) {
+    const auto range = node.sourceRange();
+    const auto start = sm.getFullyExpandedLoc(range.start());
+    if (!start.valid())
+        return {0, 0};
+    return spelled_pos_line1_col0(sm, range.end(), start.buffer(), true);
 }
 
 bool syntax_fragment_edge_is_wordlike(char c) {

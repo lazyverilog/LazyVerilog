@@ -2143,6 +2143,9 @@ TEST_CASE("definition: an unimported same-named class does not hide an imported 
         const auto pb =
             tree.write("proj/x/pb.sv", "package pb;\nclass cfg;\nendclass\nendpackage\n");
         tree.write("proj/end.svh", "endmodule\n");
+        // Both put their import below any line the uses below are on.
+        tree.write("proj/imports.svh", std::string(49, '\n') + "`define IMPORTS import pc::*;\n");
+        tree.write("proj/import_body.svh", std::string(49, '\n') + "import pc::*;\n");
         const auto top = tree.write("proj/top.sv", top_text);
         Analyzer analyzer;
         analyzer.set_project_index_publish_debounce_ms(0);
@@ -2194,6 +2197,13 @@ TEST_CASE("definition: an unimported same-named class does not hide an imported 
     SECTION("an import in a module ended by an include reaches its uses") {
         // The header's `endmodule` is on its line 1, above the import.
         check("\n\nmodule b;\n  import pc::*;\n  cfg c;\n`include \"end.svh\"\n");
+    }
+    // The import starts where the asking file spells it, not at the define.
+    SECTION("an import written by a macro defined further down a header") {
+        check("`include \"imports.svh\"\nmodule b;\n  `IMPORTS\n  cfg c;\nendmodule\n");
+    }
+    SECTION("an import written by an include") {
+        check("module b;\n`include \"import_body.svh\"\n  cfg c;\nendmodule\n");
     }
     SECTION("a class imported in a module ended by an include on the same line") {
         check("module a; import pb::*; `include \"end.svh\" module b; import pc::*; cfg c; "
