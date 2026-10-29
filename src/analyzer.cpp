@@ -4085,18 +4085,21 @@ struct OverrideClassTable {
     std::unordered_map<std::string, std::vector<size_t>> by_base;
 
     void add(const SyntaxIndex& index, const std::string& shard_uri) {
-        for (const auto& cls : index.classes) {
-            auto cls_uri = index.source_uri(cls.file_id);
-            if (cls_uri.empty())
-                cls_uri = shard_uri;
-            auto cls_path = path_from_file_uri(cls_uri);
-            auto base = base_class_lookup_name(cls.base_class);
-            by_name[cls.name].push_back(nodes.size());
-            if (!base.empty())
-                by_base[base].push_back(nodes.size());
-            nodes.push_back({&cls, &index, shard_uri, std::move(cls_uri), std::move(cls_path),
-                             std::move(base)});
-        }
+        for (const auto& cls : index.classes)
+            add_class(cls, index, shard_uri);
+    }
+
+    void add_class(const ClassEntry& cls, const SyntaxIndex& index, const std::string& shard_uri) {
+        auto cls_uri = index.source_uri(cls.file_id);
+        if (cls_uri.empty())
+            cls_uri = shard_uri;
+        auto cls_path = path_from_file_uri(cls_uri);
+        auto base = base_class_lookup_name(cls.base_class);
+        by_name[cls.name].push_back(nodes.size());
+        if (!base.empty())
+            by_base[base].push_back(nodes.size());
+        nodes.push_back({&cls, &index, shard_uri, std::move(cls_uri), std::move(cls_path),
+                         std::move(base)});
     }
 };
 
@@ -6854,6 +6857,33 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return shards;
     };
 
+    // A class name more than one shard declares (`pa::drv`, `pb::drv`) means
+    // the one this file sees: same file, same package, imported, then nearest
+    // by path -- the ranking rename's override chain gives every occurrence,
+    // so go-to-definition and rename agree.  Ranks, never filters: the caller
+    // only reorders.  nullopt when the name is not declared twice.
+    struct RankedClass {
+        const SyntaxIndex* index;
+        Location location;
+    };
+    const auto import_ranked_class = [&](const std::string& name) -> std::optional<RankedClass> {
+        OverrideClassTable table;
+        for (const auto& shard : class_lookup_shards())
+            if (const auto* cls = find_class_entry(*shard.index, name))
+                table.add_class(*cls, *shard.index, *shard.uri);
+        if (table.nodes.size() < 2)
+            return std::nullopt;
+        static const std::unordered_set<std::string> kNoHidden;
+        const OverrideClassView view(table, kNoHidden);
+        const auto* node = view.resolve(name, uri, path_from_file_uri(uri), target.scope_package,
+                                        get_dynamic_index(state).imports);
+        if (!node)
+            return std::nullopt;
+        const int cls_line = to_lsp_line(node->cls->line);
+        return RankedClass{node->index, Location{node->uri, cls_line, node->cls->col, cls_line,
+                                                 node->cls->col + lsp_column_width(name)}};
+    };
+
     if (target.kind == DefinitionTargetKind::PackageMember) {
         // `my_item::type_id::create` — the qualifier is a type alias, so the
         // member lives in the type it names, not under the alias.  Substitute
@@ -7018,7 +7048,11 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             // Search both compact index families so `obj.field` works for
             // closed-file classes as well as structs/unions.  Class lookup
             // walks the `extends` chain; typedef aggregates have no base type.
-            const auto shards = class_lookup_shards();
+            auto shards = class_lookup_shards();
+            if (const auto ranked_class = import_ranked_class(*class_type))
+                std::stable_partition(shards.begin(), shards.end(), [&](const auto& shard) {
+                    return shard.index == ranked_class->index;
+                });
             if (auto loc = find_class_member_in_hierarchy(shards, *class_type, target.name))
                 return loc;
             if (auto loc = find_typedef_field_definition(current_index, uri, *class_type, target.name))
@@ -7173,6 +7207,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
             return loc;
     }
 
+    if (const auto ranked_class = import_ranked_class(target.name))
+        return ranked_class->location;
     return nearest_shard_answer([&](const ExtraFileInfo& extra) {
         return find_generic_definition_from_index(extra.index_ref(), extra.uri, target.name,
                                                   target.scope_module, target.scope_package,
@@ -8071,13 +8107,11 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                         start = override_resolve_at(uri, asking, ref, asking.imports, start_class);
                         break;
                     }
-                // definition_of() ranks by path alone and may have picked the
-                // other `drv`.  The tree walk below keeps tokens resolving to
-                // target_def, so point it at the class the chain starts from,
-                // or an open pa.sv would have its unrelated `run` renamed.
-                // shortcut: definition_of() still ignores imports, so a rename
-                // started from that declaration follows the path ranking; give
-                // definition_of() the import ranking if users trip on it.
+                // The tree walk below keeps tokens resolving to target_def, so
+                // point it at the class the chain starts from, or an open pa.sv
+                // would have its unrelated `run` renamed.  definition_of() ranks
+                // with the same resolve() and normally agrees; this pins the
+                // chain's own answer where its package guess differs.
                 for (const auto& m : start ? start->cls->methods : kNoMethods) {
                     if (m.name != member || m.line <= 0)
                         continue;
