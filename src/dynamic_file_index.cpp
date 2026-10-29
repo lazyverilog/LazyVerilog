@@ -854,6 +854,7 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
         // `module b`.
         std::string scope;
         std::pair<int, int> scope_end{0, 0};
+        // Outside any unit, the file itself: end of file is always in it.
         slang::BufferID scope_buffer;
         void handle(const ModuleDeclarationSyntax& node) {
             auto saved = std::tuple{
@@ -885,6 +886,8 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
             visitDefault(node);
         }
     } visitor(index, resolver, sm);
+    if (const auto eof = root.getLastToken())
+        visitor.scope_buffer = sm.getFullyExpandedLoc(eof.location()).buffer();
     root.visit(visitor);
 }
 

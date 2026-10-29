@@ -2205,6 +2205,9 @@ TEST_CASE("definition: an unimported same-named class does not hide an imported 
     SECTION("an import written by an include") {
         check("module b;\n`include \"import_body.svh\"\n  cfg c;\nendmodule\n");
     }
+    SECTION("a file-scope import written by an include") {
+        check("`include \"import_body.svh\"\nmodule b;\n  cfg c;\nendmodule\n");
+    }
     SECTION("a class imported in a module ended by an include on the same line") {
         check("module a; import pb::*; `include \"end.svh\" module b; import pc::*; cfg c; "
               "endmodule\n");
