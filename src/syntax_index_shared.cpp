@@ -359,6 +359,28 @@ std::pair<int, int> token_pos_line0_col0(const slang::SourceManager& sm,
     return {line > 0 ? line - 1 : 0, col};
 }
 
+std::pair<int, int> syntax_end_pos_line1_col0(const slang::SourceManager& sm,
+                                              const slang::syntax::SyntaxNode& node) {
+    const auto expanded_end = [&](slang::SourceLocation loc) {
+        while (loc.valid() && sm.isMacroLoc(loc))
+            loc = sm.getExpansionRange(loc).end();
+        return loc;
+    };
+    const auto range = node.sourceRange();
+    const auto start = sm.getFullyExpandedLoc(range.start());
+    auto end = expanded_end(range.end());
+    if (!start.valid() || !end.valid())
+        return {0, 0};
+    while (end.buffer() != start.buffer()) {
+        const auto from = sm.getIncludedFrom(end.buffer());
+        if (!from.valid())
+            return {0, 0};
+        end = expanded_end(from);
+    }
+    const auto line = sm.getLineNumber(end);
+    return {line > 0 ? static_cast<int>(line) : 0, lsp_column(sm, end)};
+}
+
 bool syntax_fragment_edge_is_wordlike(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '`';
 }

@@ -1228,6 +1228,40 @@ TEST_CASE("completion: a design unit's import reaches its classes and subroutine
     }
 }
 
+TEST_CASE("completion: an import stays inside its design unit on a shared line",
+          "[completion][imports]") {
+    // Units that share a line are told apart by column, and a unit's end is
+    // where the asking file spells it, not inside a macro expansion.
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.open("file:///tmp/completion_sameline_pkg.sv",
+                  "package sameline_pkg;\n"
+                  "    parameter int SAMELINE_PARAM = 3;\n"
+                  "endpackage\n");
+    const auto check = [&](const std::string& text, bool visible) {
+        const std::string uri = "file:///tmp/completion_sameline_user.sv";
+        analyzer.open(uri, text);
+        const auto [line, col] = pos_after(text, "/*here*/");
+        auto result = complete_at(engine, analyzer, uri, line, col);
+        CHECK(has_label(result, "SAMELINE_PARAM") == visible);
+    };
+    SECTION("imported in an earlier module") {
+        check("module a; import sameline_pkg::*; endmodule module b; /*here*/ endmodule\n",
+              false);
+    }
+    SECTION("imported later in the same module") {
+        check("module b; /*here*/ import sameline_pkg::*; endmodule\n", false);
+    }
+    SECTION("imported in a module ended by a macro") {
+        check("`define END endmodule\n"
+              "module a; import sameline_pkg::*; `END module b; /*here*/ endmodule\n",
+              false);
+    }
+    SECTION("imported earlier in the same module") {
+        check("module b; import sameline_pkg::*; /*here*/ endmodule\n", true);
+    }
+}
+
 TEST_CASE("completion: an un-imported package in another open buffer stays hidden",
           "[completion][imports]") {
     // The other half: the gate must still filter.  Without an import statement

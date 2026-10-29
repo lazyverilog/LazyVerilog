@@ -160,6 +160,13 @@ std::pair<int, int> token_pos_line1_col0(const slang::SourceManager& sm,
 /// directly because LSP text edits are already 0-based.
 std::pair<int, int> token_pos_line0_col0(const slang::SourceManager& sm,
                                          const slang::parsing::Token& token);
+
+/// Where @p node ends, as the file holding its start spells it: 1-based line,
+/// 0-based column, exclusive.  An end produced by a macro is the end of that
+/// macro's usage, and one in an `include`d file is the `include`.  {0, 0}
+/// when unknown.
+std::pair<int, int> syntax_end_pos_line1_col0(const slang::SourceManager& sm,
+                                              const slang::syntax::SyntaxNode& node);
 bool syntax_needs_space_between_fragments(std::string_view previous, std::string_view next);
 std::optional<std::string> source_text_for_syntax_range(const slang::SourceManager& sm,
                                                        slang::SourceRange range);

@@ -2133,8 +2133,8 @@ TEST_CASE("definition: a same-named class follows the asking file's imports",
 TEST_CASE("definition: an unimported same-named class does not hide an imported typedef",
           "[definition][module-proximity]") {
     // pa and pb both declare class cfg; the use imports neither in its own
-    // scope, but pc's typedef.  @p line is the `cfg c;` line.
-    const auto check = [](const std::string& top_text, int line) {
+    // scope, but pc's typedef.  The use is the `cfg c;` in @p top_text.
+    const auto check = [](const std::string& top_text) {
         TempTree tree("definition-import-ranking-typedef");
         tree.write("proj/lazyverilog.toml", "[design]\n");
         const auto pc = tree.write("proj/pc.sv", "package pc;\n  typedef int cfg;\nendpackage\n");
@@ -2142,6 +2142,7 @@ TEST_CASE("definition: an unimported same-named class does not hide an imported 
             tree.write("proj/x/pa.sv", "package pa;\nclass cfg;\nendclass\nendpackage\n");
         const auto pb =
             tree.write("proj/x/pb.sv", "package pb;\nclass cfg;\nendclass\nendpackage\n");
+        tree.write("proj/end.svh", "endmodule\n");
         const auto top = tree.write("proj/top.sv", top_text);
         Analyzer analyzer;
         analyzer.set_project_index_publish_debounce_ms(0);
@@ -2151,21 +2152,52 @@ TEST_CASE("definition: an unimported same-named class does not hide an imported 
         const auto top_uri = uri_from_path(top);
         analyzer.open(top_uri, top_text);
 
-        const auto def = analyzer.definition_of(top_uri, line, 3);
+        const auto use = top_text.find("cfg c;");
+        const auto line_start = top_text.rfind('\n', use) + 1; // npos + 1 == 0
+        const auto line = (int)std::count(top_text.begin(), top_text.begin() + use, '\n');
+        const auto def = analyzer.definition_of(top_uri, line, (int)(use - line_start));
         REQUIRE(def);
         CHECK(def->uri == uri_from_path(pc));
         CHECK(def->line == 1);
     };
     SECTION("no class imported") {
-        check("module top;\n  import pc::*;\n  cfg c;\nendmodule\n", 2);
+        check("module top;\n  import pc::*;\n  cfg c;\nendmodule\n");
     }
     SECTION("a class imported only in another module") {
-        check("module a;\n  import pb::*;\nendmodule\n" // 0-2
-              "module b;\n  import pc::*;\n  cfg c;\nendmodule\n", // 3-6
-              5);
+        check("module a;\n  import pb::*;\nendmodule\n"
+              "module b;\n  import pc::*;\n  cfg c;\nendmodule\n");
     }
     SECTION("a class imported after the use") {
-        check("module b;\n  import pc::*;\n  cfg c;\n  import pb::*;\nendmodule\n", 2);
+        check("module b;\n  import pc::*;\n  cfg c;\n  import pb::*;\nendmodule\n");
+    }
+    // A line range alone cannot tell design units that share a line apart.
+    SECTION("a class imported in an earlier module on the same line") {
+        check("module a; import pb::*; endmodule module b; import pc::*; cfg c; endmodule\n");
+    }
+    SECTION("a class imported later on the same line") {
+        check("module b; import pc::*; cfg c; import pb::*; endmodule\n");
+    }
+    // The unit ends where the asking file spells its end, not in an expansion.
+    SECTION("a class imported in a module ended by a macro") {
+        check("`define END endmodule\n"
+              "module a;\n  import pb::*;\n`END\n"
+              "module b;\n  import pc::*;\n  cfg c;\nendmodule\n");
+    }
+    SECTION("a class imported in a module ended by a macro on the same line") {
+        check("`define END endmodule\n"
+              "module a; import pb::*; `END module b; import pc::*; cfg c; endmodule\n");
+    }
+    SECTION("a class imported in a module ended by an include") {
+        check("module a;\n  import pb::*;\n`include \"end.svh\"\n"
+              "module b;\n  import pc::*;\n  cfg c;\nendmodule\n");
+    }
+    SECTION("an import in a module ended by an include reaches its uses") {
+        // The header's `endmodule` is on its line 1, above the import.
+        check("\n\nmodule b;\n  import pc::*;\n  cfg c;\n`include \"end.svh\"\n");
+    }
+    SECTION("a class imported in a module ended by an include on the same line") {
+        check("module a; import pb::*; `include \"end.svh\" module b; import pc::*; cfg c; "
+              "endmodule\n");
     }
 }
 

@@ -1132,7 +1132,7 @@ static void dedupe_completion_items(std::vector<lsCompletionItem>& items) {
 
 // Whether @p imp's design unit holds the cursor.  current_scope_name is the
 // innermost scope (a class, `C` for `C::m`), not the module or package the
-// import sits in; an import that knows its end line is placed by its line range,
+// import sits in; an import that knows its end is placed by its position range,
 // which the callers check next.
 static bool import_scope_reaches(const ImportEntry& imp, const CompletionContext& ctx) {
     return imp.parent_scope.empty() || imp.end_line > 0 ||
@@ -1146,16 +1146,13 @@ static bool value_visible_in_context(const SyntaxIndex& index, const CompletionC
         if (!index.package_names.count(value.parent_scope))
             return false;
 
-        const int one_based_line = ctx.line + 1;
         bool imported = false;
         for (const auto& imp : ctx.visible_imports) {
             if (imp.package_name != value.parent_scope)
                 continue;
             if (!import_scope_reaches(imp, ctx))
                 continue;
-            if (imp.start_line > 0 && one_based_line < imp.start_line)
-                continue;
-            if (imp.end_line > 0 && one_based_line > imp.end_line)
+            if (!import_in_effect_at(imp, ctx.line + 1, ctx.col))
                 continue;
             if (imp.wildcard || imp.symbol_name == value.name) {
                 imported = true;
@@ -1185,15 +1182,12 @@ static bool package_symbol_visible_in_identifier_context(const SyntaxIndex& inde
     if (ctx.current_scope_name == package_name)
         return true;
 
-    const int one_based_line = ctx.line + 1;
     for (const auto& imp : ctx.visible_imports) {
         if (imp.package_name != package_name)
             continue;
         if (!import_scope_reaches(imp, ctx))
             continue;
-        if (imp.start_line > 0 && one_based_line < imp.start_line)
-            continue;
-        if (imp.end_line > 0 && one_based_line > imp.end_line)
+        if (!import_in_effect_at(imp, ctx.line + 1, ctx.col))
             continue;
         if (imp.wildcard || imp.symbol_name == symbol_name)
             return true;

@@ -2819,7 +2819,8 @@ struct GenericDeclarationCandidate {
 /// declares the same `sample` in a hundred classes.
 // Whether @p sym_name of package @p package is visible at the cursor: inside
 // that package, or imported by an import in scope (same module, at or before
-// the use line).
+// the use).  Callers pass only the asking file's imports in effect at the use
+// (imports_in_effect_at()): a line alone cannot tell apart units sharing one.
 static bool package_member_visible(std::string_view package, std::string_view sym_name,
                                    std::string_view preferred_module,
                                    std::string_view preferred_package,
@@ -2830,7 +2831,7 @@ static bool package_member_visible(std::string_view package, std::string_view sy
     for (const auto& imp : visible_imports) {
         if (imp.package_name != package)
             continue;
-        // An import that knows its end line is placed by its line range below;
+        // An import that knows its end is placed by its position range;
         // preferred_module may name a nested scope rather than its design unit.
         if (!imp.parent_scope.empty() && imp.end_line == 0 && imp.parent_scope != preferred_module)
             continue;
@@ -6907,7 +6908,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         }
         static const std::unordered_set<std::string> kNoHidden;
         const OverrideClassView view(table, kNoHidden);
-        const auto& imports = get_dynamic_index(state).imports;
+        const auto imports =
+            imports_in_effect_at(get_dynamic_index(state).imports, use_line_one_based, col);
         const auto* node =
             view.resolve(name, uri, path_from_file_uri(uri), target.scope_package, imports);
         if (!node)
@@ -7214,7 +7216,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
 
     std::vector<ImportEntry> visible_imports;
     if (state.tree)
-        visible_imports = get_dynamic_index(state).imports;
+        visible_imports =
+            imports_in_effect_at(get_dynamic_index(state).imports, use_line_one_based, col);
 
     if (auto loc = queries
                        ? queries->generic_definition(target.name, target.scope_module,
@@ -7326,7 +7329,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
         // target into the other and then report that module's occurrences.
         const auto visible_imports =
             (target_info.kind == DefinitionTargetKind::Generic && state->tree)
-                ? get_dynamic_index(*state).imports
+                ? imports_in_effect_at(get_dynamic_index(*state).imports, line + 1, col)
                 : std::vector<ImportEntry>{};
         const auto ranked = by_path_proximity(std::span<const ExtraIndexInfo>(*extra_idx),
                                               std::string_view(state->normalized_path));
