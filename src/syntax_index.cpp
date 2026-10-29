@@ -1898,6 +1898,37 @@ const TypedefEntry* ProjectIndexSnapshot::find_specialization(const std::string&
                                       });
 }
 
+std::string package_scoped_name(std::string_view written) {
+    written = written.substr(0, written.find('#'));
+    const size_t scope = written.rfind("::");
+    if (scope == std::string_view::npos)
+        return {};
+    std::string package = trim_copy(std::string(written.substr(0, scope)));
+    if (const size_t outer = package.rfind("::"); outer != std::string::npos)
+        package.erase(0, outer + 2);
+    const std::string name = trim_copy(std::string(written.substr(scope + 2)));
+    return package.empty() || name.empty() ? std::string{} : package_scoped_key(package, name);
+}
+
+const ClassEntry* ProjectIndexSnapshot::find_class_written(std::string_view written,
+                                                           std::string_view from_path) const {
+    const auto class_written = [&](std::string_view text) -> const ClassEntry* {
+        if (const std::string scoped = package_scoped_name(text); !scoped.empty())
+            if (const auto* cls = find_class(scoped, from_path))
+                return cls;
+        return find_class(base_class_lookup_name(text), from_path);
+    };
+    for (const std::string& key : {package_scoped_name(written), base_class_lookup_name(written)}) {
+        if (key.empty())
+            continue;
+        if (const auto* cls = find_class(key, from_path))
+            return cls;
+        if (const auto* td = find_specialization(key, from_path))
+            return class_written(td->resolved);
+    }
+    return nullptr;
+}
+
 std::shared_ptr<const std::vector<InheritedMember>>
 ProjectIndexSnapshot::inherited_members(const std::string& base_name,
                                         std::string_view from_path) const {
@@ -1915,13 +1946,12 @@ ProjectIndexSnapshot::inherited_members(const std::string& base_name,
     // the first insert wins, which is the same answer.
     auto members = std::make_shared<std::vector<InheritedMember>>();
     std::unordered_set<std::string> seen;
-    std::unordered_set<std::string> visited;
+    std::unordered_set<const ClassEntry*> visited;
     constexpr int kMaxDepth = 16; // the member-access climb's limit
     std::string name = base_name;
-    for (int depth = 1; depth <= kMaxDepth && !name.empty() && visited.insert(name).second;
-         ++depth) {
-        const ClassEntry* cls = find_class(name, from_path);
-        if (!cls)
+    for (int depth = 1; depth <= kMaxDepth && !name.empty(); ++depth) {
+        const ClassEntry* cls = find_class_written(name, from_path);
+        if (!cls || !visited.insert(cls).second)
             break;
         for (const auto& f : cls->fields)
             if (seen.insert(f.name).second)
@@ -1933,7 +1963,7 @@ ProjectIndexSnapshot::inherited_members(const std::string& base_name,
                                     .depth = depth,
                                     .is_method = true,
                                     .is_task = m.is_task});
-        name = base_class_lookup_name(cls->base_class);
+        name = cls->base_class;
     }
 
     std::lock_guard<std::mutex> lock(cache.mutex);

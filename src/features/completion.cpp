@@ -3112,59 +3112,6 @@ static const ClassEntry* find_class_for_request(const std::string& name, const S
     return nullptr;
 }
 
-/// A bare identifier in a method of @p class_name: what the class declares and
-/// inherits, filtered by the typed prefix.  @p depth receives each offered
-/// name's distance from the class (0 = its own); a name already in it is
-/// declared nearer and is skipped.
-///
-/// Levels the live buffer declares are read from it on every keystroke; from
-/// the first level it does not, the published snapshot answers the rest of the
-/// chain from its per-snapshot cache.
-static void append_class_member_items(const std::string& class_name, const CompletionContext& ctx,
-                                      const SyntaxIndex& here, const ProjectIndexSnapshot* snapshot,
-                                      std::string_view from_path,
-                                      const std::vector<OpenIndexShard>& opened,
-                                      std::vector<lsCompletionItem>& items,
-                                      std::unordered_map<std::string, int>& depth) {
-    const auto add = [&](const std::string& name, const std::string& detail, bool is_method,
-                         int level) {
-        if (!ctx.prefix.empty() && prefix_score(name, ctx.prefix) == 0)
-            return;
-        if (!depth.try_emplace(name, level).second)
-            return;
-        auto item = make_item(name, is_method ? lsCompletionItemKind::Method
-                                              : lsCompletionItemKind::Field);
-        if (!detail.empty())
-            item.detail = optional<std::string>(detail);
-        items.push_back(std::move(item));
-    };
-    constexpr int kMaxLevels = 16; // the member-access climb's limit
-    std::unordered_set<std::string> visited;
-    std::string name = class_name;
-    for (int level = 0; level <= kMaxLevels && !name.empty() && visited.insert(name).second;
-         ++level) {
-        const auto here_it = here.class_by_name.find(name);
-        const ClassEntry* cls = here_it != here.class_by_name.end() &&
-                                        here_it->second < here.classes.size()
-                                    ? &here.classes[here_it->second]
-                                    : nullptr;
-        if (!cls && level > 0 && snapshot && snapshot->find_class(name, from_path)) {
-            for (const auto& m : *snapshot->inherited_members(name, from_path))
-                add(m.name, m.detail, m.is_method, level - 1 + m.depth);
-            return;
-        }
-        if (!cls)
-            cls = find_class_for_request(name, here, snapshot, from_path, opened);
-        if (!cls)
-            return;
-        for (const auto& f : cls->fields)
-            add(f.name, f.type, false, level);
-        for (const auto& m : cls->methods)
-            add(m.name, m.return_type, true, level);
-        name = base_class_lookup_name(cls->base_class);
-    }
-}
-
 /// Specialization typedef @p name as a request sees it, in the order
 /// find_class_for_request() asks.
 static const TypedefEntry* find_specialization_for_request(
@@ -3276,20 +3223,6 @@ struct TypeLookup {
     std::function<const TypedefEntry*(const std::string&)> specialization_named;
 };
 
-/// `pa::base_t #(x)` as a package_scoped_key() (`pa\nbase_t`); empty when
-/// @p written has no package qualifier.
-static std::string package_scoped_name(std::string_view written) {
-    written = written.substr(0, written.find('#'));
-    const size_t scope = written.rfind("::");
-    if (scope == std::string_view::npos)
-        return {};
-    std::string package = trim_completion_copy(std::string(written.substr(0, scope)));
-    if (const size_t outer = package.rfind("::"); outer != std::string::npos)
-        package.erase(0, outer + 2);
-    const std::string name = trim_completion_copy(std::string(written.substr(scope + 2)));
-    return package.empty() || name.empty() ? std::string{} : package_scoped_key(package, name);
-}
-
 /// The class type text @p written (`drv_base #(x)`, `pa::base_t`) names --
 /// through a specialization typedef if it is one, whose arguments then land in
 /// @p args and @p through_typedef is set.  A package-qualified name is looked
@@ -3319,6 +3252,68 @@ static const ClassEntry* class_or_specialization(const std::string& written,
         }
     }
     return nullptr;
+}
+
+/// A bare identifier in a method of @p class_name: what the class declares and
+/// inherits, filtered by the typed prefix.  @p depth receives each offered
+/// name's distance from the class (0 = its own); a name already in it is
+/// declared nearer and is skipped.  An `extends` may name a specialization
+/// typedef (`typedef drv_base #(item_c) base_t;`), package-qualified or not.
+///
+/// Levels the live buffer declares are read from it on every keystroke; from
+/// the first level it does not, the published snapshot answers the rest of the
+/// chain from its per-snapshot cache.
+static void append_class_member_items(const std::string& class_name, const CompletionContext& ctx,
+                                      const SyntaxIndex& here, const ProjectIndexSnapshot* snapshot,
+                                      std::string_view from_path,
+                                      const std::vector<OpenIndexShard>& opened,
+                                      std::vector<lsCompletionItem>& items,
+                                      std::unordered_map<std::string, int>& depth) {
+    const auto add = [&](const std::string& name, const std::string& detail, bool is_method,
+                         int level) {
+        if (!ctx.prefix.empty() && prefix_score(name, ctx.prefix) == 0)
+            return;
+        if (!depth.try_emplace(name, level).second)
+            return;
+        auto item = make_item(name, is_method ? lsCompletionItemKind::Method
+                                              : lsCompletionItemKind::Field);
+        if (!detail.empty())
+            item.detail = optional<std::string>(detail);
+        items.push_back(std::move(item));
+    };
+    const auto lookup_in = [&](const ProjectIndexSnapshot* snap,
+                               const std::vector<OpenIndexShard>& shards) {
+        return TypeLookup{[&, snap](const std::string& name) {
+                              return find_class_for_request(name, here, snap, from_path, shards);
+                          },
+                          [&, snap](const std::string& name) {
+                              return find_specialization_for_request(name, here, snap, from_path,
+                                                                     shards);
+                          }};
+    };
+    const std::vector<OpenIndexShard> no_shards;
+    const TypeLookup here_only = lookup_in(nullptr, no_shards);
+    const TypeLookup everywhere = lookup_in(snapshot, opened);
+    constexpr int kMaxLevels = 16; // the member-access climb's limit
+    std::unordered_set<const ClassEntry*> visited;
+    std::string name = class_name;
+    for (int level = 0; level <= kMaxLevels && !name.empty(); ++level) {
+        const ClassEntry* cls = class_or_specialization(name, here_only, nullptr);
+        if (!cls && level > 0 && snapshot && snapshot->find_class_written(name, from_path)) {
+            for (const auto& m : *snapshot->inherited_members(name, from_path))
+                add(m.name, m.detail, m.is_method, level - 1 + m.depth);
+            return;
+        }
+        if (!cls)
+            cls = class_or_specialization(name, everywhere, nullptr);
+        if (!cls || !visited.insert(cls).second)
+            return;
+        for (const auto& f : cls->fields)
+            add(f.name, f.type, false, level);
+        for (const auto& m : cls->methods)
+            add(m.name, m.return_type, true, level);
+        name = cls->base_class;
+    }
 }
 
 /// What the type parameter @p type of class @p declarer stands for in an
