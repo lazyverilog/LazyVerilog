@@ -504,8 +504,11 @@ static std::string type_parameter_default(const TypeAssignmentSyntax& decl,
 // whole-tree traversal for them.
 static void add_package_imports(const PackageImportDeclarationSyntax& node, SyntaxIndex& index,
                                 SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                                std::string_view parent_scope, std::pair<int, int> scope_end) {
-    const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
+                                std::string_view parent_scope, std::pair<int, int> scope_end,
+                                slang::BufferID scope_buffer = {}) {
+    // Where the unit's own file spells it: a macro's usage, not its define.
+    const auto [decl_line, decl_col] =
+        spelled_pos_line1_col0(sm, node.keyword.location(), scope_buffer);
 
     for (const auto* item : node.items) {
         if (!item)
@@ -628,6 +631,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     };
 
     const auto module_end = syntax_end_pos_line1_col0(sm, module);
+    const auto module_buffer = sm.getFullyExpandedLoc(module.sourceRange().start()).buffer();
 
     // Imports written in the module header (`module m import pkg::*; (...)`) are
     // not members, so the member loop below never sees them.  Without them the
@@ -635,14 +639,16 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     // unqualified, and references/rename skip every unqualified use in it.
     for (const auto* import_decl : module.header->imports) {
         if (import_decl)
-            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end);
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end,
+                                module_buffer);
     }
 
     for (const auto* member : module.members) {
         if (!member)
             continue;
         if (const auto* import_decl = member->as_if<PackageImportDeclarationSyntax>()) {
-            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end);
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end,
+                                module_buffer);
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
             std::optional<std::string> type_text;
             for (const auto* decl : data->declarators) {

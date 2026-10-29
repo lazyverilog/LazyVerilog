@@ -167,6 +167,14 @@ std::pair<int, int> token_pos_line0_col0(const slang::SourceManager& sm,
 /// when unknown.
 std::pair<int, int> syntax_end_pos_line1_col0(const slang::SourceManager& sm,
                                               const slang::syntax::SyntaxNode& node);
+
+/// Where @p loc is spelled in @p buffer: 1-based line, 0-based column.  A
+/// macro location maps to its usage (its end when @p is_end), and a location
+/// in a file included from @p buffer to the `include`.  An invalid @p buffer
+/// only maps macros.  {0, 0} when @p loc does not reach @p buffer.
+std::pair<int, int> spelled_pos_line1_col0(const slang::SourceManager& sm,
+                                           slang::SourceLocation loc, slang::BufferID buffer,
+                                           bool is_end = false);
 bool syntax_needs_space_between_fragments(std::string_view previous, std::string_view next);
 std::optional<std::string> source_text_for_syntax_range(const slang::SourceManager& sm,
                                                        slang::SourceRange range);

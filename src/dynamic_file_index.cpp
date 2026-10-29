@@ -854,14 +854,19 @@ void collect_imports(const SyntaxNode& root, SyntaxIndex& index, SourceFileIdRes
         // `module b`.
         std::string scope;
         std::pair<int, int> scope_end{0, 0};
+        slang::BufferID scope_buffer;
         void handle(const ModuleDeclarationSyntax& node) {
-            auto saved = std::pair{std::exchange(scope, token_value_text(node.header->name)),
-                                   std::exchange(scope_end, syntax_end_pos_line1_col0(sm, node))};
+            auto saved = std::tuple{
+                std::exchange(scope, token_value_text(node.header->name)),
+                std::exchange(scope_end, syntax_end_pos_line1_col0(sm, node)),
+                std::exchange(scope_buffer,
+                              sm.getFullyExpandedLoc(node.sourceRange().start()).buffer())};
             visitDefault(node);
-            std::tie(scope, scope_end) = std::move(saved);
+            std::tie(scope, scope_end, scope_buffer) = std::move(saved);
         }
         void handle(const PackageImportDeclarationSyntax& node) {
-            auto [line, col] = token_pos_line1_col0(sm, node.keyword);
+            // Where the unit's own file spells it: a macro's usage, not its define.
+            auto [line, col] = spelled_pos_line1_col0(sm, node.keyword.location(), scope_buffer);
             for (const auto* item : node.items) {
                 if (!item)
                     continue;

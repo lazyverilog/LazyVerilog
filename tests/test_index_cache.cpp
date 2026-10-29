@@ -323,6 +323,8 @@ void require_same_index(const SyntaxIndex& a, const SyntaxIndex& b) {
         CHECK(a.imports[i].file_id == b.imports[i].file_id);
         CHECK(a.imports[i].start_line == b.imports[i].start_line);
         CHECK(a.imports[i].end_line == b.imports[i].end_line);
+        CHECK(a.imports[i].start_col == b.imports[i].start_col);
+        CHECK(a.imports[i].end_col == b.imports[i].end_col);
     }
 
     REQUIRE(a.references.size() == b.references.size());
