@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -222,27 +223,39 @@ TEST_CASE("implicit scan time scales linearly with the tree", "[implicit-project
             tree.write(dir + "defs.svh");
         }
     };
+    constexpr int kFactor = 4;
     ScanTree small("scaling-n");
-    ScanTree large("scaling-2n");
+    ScanTree large("scaling-4n");
     build(small, 60);
-    build(large, 120);
+    build(large, 60 * kFactor);
 
-    const auto time_ms = [](const fs::path& root) {
+    // One sample of the small tree is kFactor scans of it, so both samples
+    // take about as long.  Compared to a single small scan, a longer sample is
+    // likelier to catch a preemption on a shared runner, and min-of-N then
+    // keeps the clean small scans and only noisy large ones: 2N against N once
+    // measured 2.76 on macOS x64 against a 2.6 limit, with nothing quadratic.
+    const auto time_ms = [](const fs::path& root, int scans) {
         const auto start = std::chrono::steady_clock::now();
-        auto scan = scan_implicit_root(root);
+        for (int i = 0; i < scans; ++i)
+            REQUIRE_FALSE(scan_implicit_root(root).over_limit);
         const std::chrono::duration<double, std::milli> took =
             std::chrono::steady_clock::now() - start;
-        REQUIRE_FALSE(scan.over_limit);
         return took.count();
     };
+    (void)time_ms(small.root, 1); // warm the path memo for both trees
+    (void)time_ms(large.root, 1);
     // Interleaved, so a slow stretch on a shared runner hits both trees
-    // instead of only the one being timed then (a few ms each, so it shows).
+    // instead of only the one being timed then.
     double n = 1e9;
-    double two_n = 1e9;
+    double large_n = 1e9;
     for (int i = 0; i < 15; ++i) {
-        n = std::min(n, time_ms(small.root));
-        two_n = std::min(two_n, time_ms(large.root));
+        n = std::min(n, time_ms(small.root, kFactor));
+        large_n = std::min(large_n, time_ms(large.root, 1));
     }
-    INFO("scan N=" << n << " ms, 2N=" << two_n << " ms");
-    CHECK(two_n <= 2.6 * n + 1.0);
+    const double ratio = large_n / n;
+    std::cout << "\n[implicit scan scaling] " << kFactor << " x N: " << n << " ms, " << kFactor
+              << "N: " << large_n << " ms, ratio=" << ratio << "\n";
+    // Linear is ~1.  A step quadratic in the tree makes the 4N scan ~4x its
+    // share of four N scans; 2 is halfway in log terms.
+    CHECK(ratio < 2.0);
 }
