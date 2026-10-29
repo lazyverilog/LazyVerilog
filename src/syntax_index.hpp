@@ -262,6 +262,7 @@ struct ImportEntry {
     // Visibility range: 1-based lines, 0-based UTF-16 columns, end exclusive.
     // end_line == 0 means visible to end of file.  Columns tell apart design
     // units that share a line.
+    // shortcut: positions are in the spelling (asking) file's coordinates and may not match file_id in a fragment header's shard (split_by_source_file()); upgrade if a request path ever reads shard import positions.
     int start_line{0};
     int end_line{0};
     int start_col{0};
