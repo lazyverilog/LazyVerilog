@@ -1299,113 +1299,115 @@ static double fastest_folding_ms(int stages, int runs, size_t& folds_out) {
 
 } // namespace
 
-TEST_CASE("foldingRange: cost grows with the file, not with its square",
-          "[folding][scaling]") {
-    // Linear is 2.0 at any size, so a larger input cannot lower the healthy
-    // ratio; what it lowers is the share of a sample one scheduler stall
-    // takes.  At 240 stages a sample was 5.5 / 11 ms, and under a loaded
-    // `ctest -j4` a stall of ~6.6 ms on the large half alone measured
-    // 5.8 / 17.5 ms = 3.01.  At 960 stages a sample is 21 / 43 ms: the same
-    // stall gives (43 + 6.6) / 21 = 2.3, while the quadratic term this guards
-    // against only grows with the input (3.5 at 240 stages, toward 4.0).
-    constexpr int kStages = 960;
-    constexpr int kRuns   = 5;
-
+/// Fastest equal-length samples of foldingRange over @p small_source and over
+/// @p large_source (@p factor times its size), alternated over @p runs rounds.
+///
+/// One small sample is @p factor computations, so both samples take about as
+/// long.  Against a single small computation, the longer large sample is the
+/// likelier one to catch a scheduler stall, and min-of-N then compares clean
+/// small samples with noisy large ones: macOS runners measured 3.01-3.05 for
+/// a 2x step against a 3.0 limit with nothing quadratic.  Linear is ~1 here.
+struct FoldRatio {
+    double small_ms = 0;
+    double large_ms = 0;
     size_t small_folds = 0;
     size_t large_folds = 0;
+    std::vector<double> small_samples;
+    std::vector<double> large_samples;
+    double ratio() const { return large_ms / small_ms; }
+};
 
+static FoldRatio interleaved_fold_ratio(const std::string& small_source,
+                                        const std::string& large_source, int factor, int runs,
+                                        const std::string& tag) {
+    FoldRatio out;
+    for (int round = 0; round < runs; ++round) {
+        const auto id = tag + std::to_string(round);
+        double small = 0;
+        for (int k = 0; k < factor; ++k)
+            small += folding_ms_once(small_source, id + "_s" + std::to_string(k), out.small_folds);
+        out.small_samples.push_back(small);
+        out.large_samples.push_back(folding_ms_once(large_source, id + "_l", out.large_folds));
+    }
+    out.small_ms = *std::min_element(out.small_samples.begin(), out.small_samples.end());
+    out.large_ms = *std::min_element(out.large_samples.begin(), out.large_samples.end());
+    return out;
+}
+
+static void print_fold_ratio(const char* label, const FoldRatio& r) {
+    // Every sample, not just the two that decide the ratio: a failure here is
+    // usually about the spread, and one number cannot show it.
+    std::cout << "\n[" << label << "] folds=" << r.small_folds << " ms=" << r.small_ms
+              << "  folds=" << r.large_folds << " ms=" << r.large_ms << " ratio=" << r.ratio()
+              << "\n  small:";
+    for (double sample : r.small_samples)
+        std::cout << " " << sample;
+    std::cout << "\n  large:";
+    for (double sample : r.large_samples)
+        std::cout << " " << sample;
+    std::cout << "\n";
+}
+
+TEST_CASE("foldingRange: cost grows with the file, not with its square",
+          "[folding][scaling]") {
+    // 480 stages against 1920, four small computations per sample.  Linear is
+    // ~1 and quadratic ~4: the passes this replaced measured 3.5 for a 2x step
+    // at 240 stages, already 1.75x past linear on one doubling.
+    constexpr int kStages = 480;
+    constexpr int kFactor = 4;
+    constexpr int kRuns   = 5;
+
+    const std::string small_source = folding_scaling_source(kStages);
+    const std::string large_source = folding_scaling_source(kStages * kFactor);
     // Warm the allocator and instruction cache so the first measured half is not
     // charged for both.
-    (void)fastest_folding_ms(kStages, 2, small_folds);
+    size_t warm = 0;
+    (void)folding_ms_once(small_source, "warm", warm);
 
-    const double small_ms = fastest_folding_ms(kStages, kRuns, small_folds);
-    const double large_ms = fastest_folding_ms(kStages * 2, kRuns, large_folds);
+    const auto r = interleaved_fold_ratio(small_source, large_source, kFactor, kRuns, "grow");
+    print_fold_ratio("folding scaling", r);
 
-    // Like for like: the large input must really be twice the small one.
-    REQUIRE(small_folds > 0);
+    // Like for like: the large input must really be kFactor times the small one.
+    REQUIRE(r.small_folds > 0);
     // The module's own fold is the one that is not per stage.
-    CHECK(large_folds - 1 == (small_folds - 1) * 2);
+    CHECK(r.large_folds - 1 == (r.small_folds - 1) * kFactor);
 
-    const double ratio = large_ms / small_ms;
-    std::cout << "\n[folding scaling] stages=" << kStages << " folds=" << small_folds
-              << " ms=" << small_ms << "  stages=" << (kStages * 2)
-              << " folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio << "\n";
-
-    // Linear is 2.0 and quadratic is 4.0.  Measured at 2.2-2.5 across a 16x
-    // range of sizes, against 3.5 for the quadratic passes this replaced, which
-    // this threshold fails.
-    CHECK(ratio < 3.0);
+    // Measured ~1.0 on Windows.  2 is halfway between linear and quadratic in
+    // log terms, and leaves room for macOS's memory effects (a 2x step there
+    // measured ~2.5 by median, so ~1.6 over this 4x step).
+    CHECK(r.ratio() < 2.0);
 }
 
 TEST_CASE("foldingRange: cost stays linear at large fold counts", "[folding][scaling]") {
-    // The guard above compares 12k folds against 25k (3k against 6k when this
-    // was written), and a quadratic term can hide under a 3.0 threshold there: the header-partner pass measured 2.5 /
-    // 2.9 / 2.8 across the first three doublings and only broke out on the fourth,
-    // at 5.86x.  A file that large is not hypothetical -- a generated register
+    // The guard above stays below 12k folds, and a quadratic term can hide
+    // there: the header-partner pass measured 2.5 / 2.9 / 2.8 across the first
+    // three doublings (3k to 25k folds) and only broke out on the fourth, at
+    // 5.86x.  A file that large is not hypothetical -- a generated register
     // block reaches it -- and 903 ms landed on the one thread that answers
     // completions, once per keystroke.
     //
-    // So take the doubling where the old shape actually showed itself.  Two runs
-    // per side: at ~80 ms a sample this is still well under a second, and the
-    // cost being guarded raises the floor, so the minimum is the honest statistic.
-    constexpr int kStages = 1920;
-    // Five rounds per side, not two.
+    // So span the last two doublings: 12k folds against 50k.  The old shape
+    // costs 2.8 x 5.86 = ~16x there, ~4 past linear.
     //
-    // The statistic is the minimum, because the cost being guarded raises the
-    // floor and everything a shared runner adds only ever makes a sample
-    // slower.  A minimum over two samples is a poor estimate of that floor,
-    // though, and the large side is both the more expensive half and the one
-    // with more room to be slow -- so one unlucky pair there was enough to fail
-    // a guard the code passes with 40% to spare.  That is what happened on the
-    // darwin-x64 job, which is the only one that runs its tests translated:
-    // macos-15 runners are arm64 and the job builds x86_64, so the binary goes
-    // through Rosetta.  It reported 49.68 ms and 151.45 ms, ratio 3.048, while
-    // the same commit passed the same job in another run.
-    //
-    // More samples cost less than they look: the sources are now built once
-    // rather than once per call, which is most of what the old two rounds
-    // spent.
-    constexpr int kRuns = 5;
-
-    size_t small_folds = 0;
-    size_t large_folds = 0;
+    // Five rounds: the statistic is the minimum, because the cost being
+    // guarded raises the floor and everything a shared runner adds only ever
+    // makes a sample slower, and two samples were a poor estimate of that
+    // floor on the darwin-x64 job (which runs translated through Rosetta).
+    constexpr int kStages = 960;
+    constexpr int kFactor = 4;
+    constexpr int kRuns   = 5;
 
     const std::string small_source = folding_scaling_source(kStages);
-    const std::string large_source = folding_scaling_source(kStages * 2);
+    const std::string large_source = folding_scaling_source(kStages * kFactor);
 
-    // Alternated, not one side then the other.  Timed in sequence, a runner
-    // that slows part way through lands entirely on one half and the ratio
-    // stops describing the code.  Interleaved, whatever it does hits both.
-    std::vector<double> small_samples;
-    std::vector<double> large_samples;
-    for (int round = 0; round < kRuns; ++round) {
-        const auto tag = std::to_string(round);
-        small_samples.push_back(folding_ms_once(small_source, "lin_s" + tag, small_folds));
-        large_samples.push_back(folding_ms_once(large_source, "lin_l" + tag, large_folds));
-    }
+    const auto r = interleaved_fold_ratio(small_source, large_source, kFactor, kRuns, "lin");
+    print_fold_ratio("folding scaling, large", r);
 
-    const double small_ms = *std::min_element(small_samples.begin(), small_samples.end());
-    const double large_ms = *std::min_element(large_samples.begin(), large_samples.end());
+    REQUIRE(r.small_folds > 12000);
+    CHECK(r.large_folds - 1 == (r.small_folds - 1) * kFactor);
 
-    REQUIRE(small_folds > 20000);
-    CHECK(large_folds - 1 == (small_folds - 1) * 2);
-
-    const double ratio = large_ms / small_ms;
-    // Every sample, not just the two that decide the ratio: a failure here is
-    // usually about the spread, and one number cannot show it.
-    std::cout << "\n[folding scaling, large] folds=" << small_folds << " ms=" << small_ms
-              << "  folds=" << large_folds << " ms=" << large_ms << " ratio=" << ratio
-              << "\n  small:";
-    for (double sample : small_samples)
-        std::cout << " " << sample;
-    std::cout << "\n  large:";
-    for (double sample : large_samples)
-        std::cout << " " << sample;
-    std::cout << "\n";
-
-    // Measured 1.7-1.8 once the partner pass stopped scanning the whole fold
-    // list; the version this replaced measures 5.86 and fails.
-    CHECK(ratio < 3.0);
+    // Measured ~1.0 on Windows; the version this replaced is ~4 and fails.
+    CHECK(r.ratio() < 2.0);
 }
 
 TEST_CASE("foldingRange: the scaling guard measures a computation, not a cache hit",

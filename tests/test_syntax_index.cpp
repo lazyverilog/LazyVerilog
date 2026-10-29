@@ -1631,18 +1631,24 @@ std::pair<double, double> interleaved_best(SizedProject& small, SizedProject& la
     };
     double small_best = std::numeric_limits<double>::max();
     double large_best = std::numeric_limits<double>::max();
-    for (int round = 0; round < 7; ++round) {
+    for (int round = 0; round < 15; ++round) {
         small_best = std::min(small_best, one(small));
         large_best = std::min(large_best, one(large));
     }
     return {small_best, large_best};
 }
 
-/// A buffer that is not a filelist entry and that nothing `include`s, edited a
-/// hundred times.  Every keystroke on it is the "nothing depends on me" case.
+/// A buffer that is not a filelist entry and that nothing `include`s, edited
+/// 500 times.  Every keystroke on it is the "nothing depends on me" case.
+///
+/// Both halves of these guards do the same work, so the samples are already of
+/// equal length and linear-in-nothing is ~1.  What they lacked was length: at
+/// 100 edits a sample was ~1.2 ms, so one stall on the large half alone
+/// (macOS x64 under Rosetta measured 1.57 against 2.60 ms, 1.66) failed a 1.4
+/// limit with no per-shard work in the path.  500 edits make it ~6 ms.
 void edit_unrelated_buffer(Analyzer& analyzer, bool read_snapshots) {
     const std::string uri = "file:///tmp/lazyverilog_scaling_edit.sv";
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 500; ++i) {
         analyzer.change(uri, "module edit;\n// e" + std::to_string(i) + "\nendmodule\n");
         if (read_snapshots) {
             // What a request handler does next.
@@ -1699,7 +1705,7 @@ TEST_CASE("project index: an unrelated edit does not rebuild the project snapsho
     // buffer the snapshots do not mention.
     //
     // A ratio against a structurally identical project eight times the size,
-    // fastest of several interleaved rounds.  Measured over 100 edits plus the
+    // fastest of several interleaved rounds.  Measured over 100 edits (now 500) plus the
     // two snapshot reads a request handler makes:
     //
     //     before   200 -> 2.36 ms, 1600 -> 17.09 ms   (ratio 7.23)
