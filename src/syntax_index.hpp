@@ -487,6 +487,23 @@ struct ProjectIndexModuleRef {
     size_t shard_slot{0};
 };
 
+/// A project's macros, one per name, the first in shard order (headers first).
+struct ProjectMacros {
+    /// The shards they were read from, in order.  A later snapshot whose
+    /// project shards are these same ones reuses this answer as is; holding
+    /// them also keeps the entries below alive.
+    std::vector<std::shared_ptr<const SyntaxIndex>> shards;
+    std::vector<const MacroEntry*> in_order;
+    /// in_order by name with ASCII case folded, for prefix_range().
+    std::vector<const MacroEntry*> by_folded_name;
+    /// in_order by name.
+    std::vector<const MacroEntry*> by_name;
+
+    /// The entries of by_folded_name whose name starts with @p prefix, case
+    /// folded: a binary search.
+    std::span<const MacroEntry* const> prefix_range(std::string_view prefix) const;
+};
+
 /// A member a class inherits, as completion offers it.  `depth` counts the
 /// `extends` hops from the class that was asked about (its own base is 1).
 struct InheritedMember {
@@ -586,10 +603,14 @@ struct ProjectIndexSnapshot {
 
     /// Every macro defined in a shard whose project root (per @p project_of,
     /// given a shard's path) is @p root, one per name.  Cached per root and
-    /// @p generation (the root resolver's) like the above.
-    std::shared_ptr<const std::vector<const MacroEntry*>>
+    /// @p generation (the root resolver's) like the above.  @p previous, an
+    /// answer from an earlier snapshot, is returned as is when it was read from
+    /// the same shards: an edit to a file that defines no macro republishes
+    /// the snapshot but leaves the macros, and their sort, as they were.
+    std::shared_ptr<const ProjectMacros>
     project_macros(const std::string& root, uint64_t generation,
-                   const std::function<std::string(const std::string&)>& project_of) const;
+                   const std::function<std::string(const std::string&)>& project_of,
+                   const std::shared_ptr<const ProjectMacros>& previous = nullptr) const;
 
   private:
     struct DerivedCache;

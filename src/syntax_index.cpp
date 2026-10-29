@@ -1851,7 +1851,7 @@ const std::string& ProjectIndexSnapshot::module_path(const ProjectIndexModuleRef
 struct ProjectIndexSnapshot::DerivedCache {
     std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<const std::vector<InheritedMember>>> inherited;
-    std::unordered_map<std::string, std::shared_ptr<const std::vector<const MacroEntry*>>> macros;
+    std::unordered_map<std::string, std::shared_ptr<const ProjectMacros>> macros;
 };
 
 ProjectIndexSnapshot::DerivedCache& ProjectIndexSnapshot::derived() const {
@@ -1970,10 +1970,31 @@ ProjectIndexSnapshot::inherited_members(const std::string& base_name,
     return cache.inherited.try_emplace(std::move(key), std::move(members)).first->second;
 }
 
-std::shared_ptr<const std::vector<const MacroEntry*>>
+// prefix_score()'s case folding: ASCII through std::tolower.
+static int fold_char(char c) { return std::tolower(static_cast<unsigned char>(c)); }
+
+static bool folded_less(std::string_view a, std::string_view b) {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+                                        [](char x, char y) { return fold_char(x) < fold_char(y); });
+}
+
+std::span<const MacroEntry* const> ProjectMacros::prefix_range(std::string_view prefix) const {
+    const auto first = std::lower_bound(
+        by_folded_name.begin(), by_folded_name.end(), prefix,
+        [](const MacroEntry* mac, std::string_view p) { return folded_less(mac->name, p); });
+    const auto last = std::partition_point(first, by_folded_name.end(), [&](const MacroEntry* mac) {
+        return mac->name.size() >= prefix.size() &&
+               std::equal(prefix.begin(), prefix.end(), mac->name.begin(),
+                          [](char x, char y) { return fold_char(x) == fold_char(y); });
+    });
+    return {first, last};
+}
+
+std::shared_ptr<const ProjectMacros>
 ProjectIndexSnapshot::project_macros(
     const std::string& root, uint64_t generation,
-    const std::function<std::string(const std::string&)>& project_of) const {
+    const std::function<std::string(const std::string&)>& project_of,
+    const std::shared_ptr<const ProjectMacros>& previous) const {
     auto& cache = derived();
     std::string key = root;
     key += '\x1f';
@@ -1983,11 +2004,10 @@ ProjectIndexSnapshot::project_macros(
         if (auto it = cache.macros.find(key); it != cache.macros.end())
             return it->second;
     }
-    auto macros = std::make_shared<std::vector<const MacroEntry*>>();
+    std::vector<std::shared_ptr<const SyntaxIndex>> from;
     // The project is a fact about the directory, and a project's files come in
     // directories of tens or hundreds, so ask once per directory.
     std::unordered_map<std::string, bool> in_project_by_dir;
-    std::unordered_set<std::string_view> names;
     for (const size_t slot : macro_shard_slots) {
         const auto& shard = shards[slot];
         const auto slash = shard.path.find_last_of("/\\");
@@ -1995,16 +2015,32 @@ ProjectIndexSnapshot::project_macros(
         auto [it, inserted] = in_project_by_dir.try_emplace(dir, false);
         if (inserted)
             it->second = project_of(shard.path) == root;
-        if (!it->second)
-            continue;
+        if (it->second)
+            from.push_back(shard.index);
+    }
+    std::shared_ptr<const ProjectMacros> answer = previous;
+    if (!previous || previous->shards != from) {
+        auto macros = std::make_shared<ProjectMacros>();
         // A header's macros are also recorded by every includer's shard: one
         // per name, the first in shard order (headers first).
-        for (const auto& mac : shard.index->macros)
-            if (names.insert(mac.name).second)
-                macros->push_back(&mac);
+        std::unordered_set<std::string_view> names;
+        for (const auto& index : from)
+            for (const auto& mac : index->macros)
+                if (names.insert(mac.name).second)
+                    macros->in_order.push_back(&mac);
+        macros->by_folded_name = macros->in_order;
+        std::sort(macros->by_folded_name.begin(), macros->by_folded_name.end(),
+                  [](const MacroEntry* a, const MacroEntry* b) {
+                      return folded_less(a->name, b->name);
+                  });
+        macros->by_name = macros->in_order;
+        std::sort(macros->by_name.begin(), macros->by_name.end(),
+                  [](const MacroEntry* a, const MacroEntry* b) { return a->name < b->name; });
+        macros->shards = std::move(from);
+        answer = std::move(macros);
     }
     std::lock_guard<std::mutex> lock(cache.mutex);
-    return cache.macros.try_emplace(std::move(key), std::move(macros)).first->second;
+    return cache.macros.try_emplace(std::move(key), std::move(answer)).first->second;
 }
 
 const ProjectIndexModuleRef* ProjectIndexSnapshot::find_module(const std::string& name,
