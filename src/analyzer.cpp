@@ -9941,6 +9941,10 @@ void Analyzer::set_background_index_hook_for_testing(
     background_index_hook_ = std::move(hook);
 }
 
+void Analyzer::set_project_index_build_hook_for_testing(std::function<void()> hook) {
+    project_index_build_hook_ = std::move(hook);
+}
+
 bool Analyzer::has_filelist_shard_for_testing(const std::string& uri) const {
     std::lock_guard<std::mutex> lock(map_mutex_);
     return extra_cache_.contains(uri);
@@ -10658,6 +10662,8 @@ void Analyzer::background_index_loop() const {
                                          : "shards=" + std::to_string(input.shards.size())),
                          gather_start);
                 lock.unlock();
+                if (project_index_build_hook_)
+                    project_index_build_hook_();
                 const auto build_start = Clock::now();
                 auto snapshot = build_project_index_snapshot(std::move(input));
                 if (snapshot)
@@ -11347,6 +11353,10 @@ Analyzer::ProjectIndexPublishInput Analyzer::project_index_publish_input_locked(
 
 std::shared_ptr<const ProjectIndexSnapshot>
 Analyzer::build_project_index_snapshot(ProjectIndexPublishInput input) {
+    // Every writer of either shard map records a patch or dirties the layout,
+    // so a base with no patches is exactly what a rebuild would produce.
+    if (input.base && input.patches.empty())
+        return input.base;
     auto snapshot = std::make_shared<ProjectIndexSnapshot>();
     if (input.base) {
         // Every slot as the base had it, the replaced shards' indexes swapped

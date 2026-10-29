@@ -1513,6 +1513,71 @@ TEST_CASE("project index: a publish after an edit answers like a full rebuild", 
     fs::remove_all(dir);
 }
 
+TEST_CASE("project index: a publish that a clear overtook is dropped", "[index]") {
+    // The publish builds with map_mutex_ released.  A clear landing in that
+    // window (here: the filelist emptied) moves the epoch, and the finished
+    // build must not put back the shards the clear dropped.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_publish_epoch_drop";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto path = (dir / "a.sv").string();
+    std::ofstream(path, std::ios::binary) << "module a_mod;\nendmodule\n";
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    std::atomic<bool> armed{false};
+    analyzer.set_project_index_build_hook_for_testing([&] {
+        if (armed.exchange(false))
+            analyzer.set_extra_files({});
+    });
+    analyzer.set_extra_files({path});
+    analyzer.wait_for_background_index_idle();
+    REQUIRE(analyzer.project_index_snapshot()->module_by_name.contains("a_mod"));
+
+    std::ofstream(path, std::ios::binary) << "module a_mod;\nendmodule\nmodule b_mod;\nendmodule\n";
+    armed = true;
+    analyzer.refresh_changed_extra_files({uri_from_path(path)});
+    analyzer.wait_for_background_index_idle();
+    CHECK(!armed); // the edit's publish reached the build
+    CHECK(analyzer.project_index_snapshot()->shards.empty());
+
+    analyzer.set_project_index_build_hook_for_testing({});
+    fs::remove_all(dir);
+}
+
+TEST_CASE("project index: a publish with no shard replaced keeps the snapshot", "[index]") {
+    // Deleting a listed file that is already gone erases nothing but still
+    // requests a publish: its input is the installed snapshot with no patches,
+    // which is that snapshot unchanged, so it is installed again as is.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_publish_no_patches";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto a = (dir / "a.sv").string();
+    const auto b = (dir / "b.sv").string();
+    std::ofstream(a, std::ios::binary) << "module a_mod;\nendmodule\n";
+    std::ofstream(b, std::ios::binary) << "module b_mod;\nendmodule\n";
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({a, b});
+    analyzer.wait_for_background_index_idle();
+
+    fs::remove(b);
+    analyzer.refresh_changed_extra_files({}, {uri_from_path(b)});
+    analyzer.wait_for_background_index_idle();
+    const auto before = analyzer.project_index_snapshot();
+    REQUIRE(before->module_by_name.contains("a_mod"));
+    REQUIRE(!before->module_by_name.contains("b_mod"));
+
+    analyzer.refresh_changed_extra_files({}, {uri_from_path(b)});
+    analyzer.wait_for_background_index_idle();
+    CHECK(analyzer.project_index_snapshot() == before);
+
+    fs::remove_all(dir);
+}
+
 namespace {
 
 /// A throwaway project of @p count trivial modules, indexed and ready to time.

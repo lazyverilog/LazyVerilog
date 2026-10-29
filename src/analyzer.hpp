@@ -793,6 +793,10 @@ class Analyzer {
     /// any indexing starts; production never sets it.
     void set_background_index_hook_for_testing(
         std::function<void(const std::string& path, bool headers_built)> hook);
+    /// Test seam.  Runs on the publishing worker after it gathered the shards
+    /// and released map_mutex_, before it builds the snapshot -- the window a
+    /// clear or another publish can move the epoch in.  Same rules as above.
+    void set_project_index_build_hook_for_testing(std::function<void()> hook);
     /// Test seam: whether @p uri has its filelist shard (not just a header
     /// shard built because another file `include`s it).
     bool has_filelist_shard_for_testing(const std::string& uri) const;
@@ -1344,6 +1348,7 @@ private:
     /// See request_parse_idle_notification().  Set and read under parse_mutex_.
     std::atomic<bool> parse_idle_wanted_{false};
     std::function<void(const std::string&, bool)> background_index_hook_;
+    std::function<void()> project_index_build_hook_;
 
     // Version tracking — under map_mutex_
     std::unordered_map<std::string, uint64_t> latest_version_;
