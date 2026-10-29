@@ -1190,6 +1190,44 @@ TEST_CASE("completion: an imported package in another open buffer is offered",
     CHECK(has_label(result, "OPEN_PARAM"));
 }
 
+TEST_CASE("completion: a design unit's import reaches its classes and subroutines",
+          "[completion][imports]") {
+    // The import belongs to the enclosing package/module; the cursor's own
+    // scope is a class or subroutine inside it.
+    CompletionEngine engine;
+    Analyzer analyzer;
+    analyzer.open("file:///tmp/completion_probe_pkg.sv",
+                  "package probe_pkg;\n"
+                  "    parameter int PROBE_PARAM = 3;\n"
+                  "    typedef int probe_t;\n"
+                  "endpackage\n");
+    const auto check = [&](const std::string& text) {
+        const std::string uri = "file:///tmp/completion_probe_user.sv";
+        analyzer.open(uri, text);
+        const auto [line, col] = pos_after(text, "// here\n");
+        auto result = complete_at(engine, analyzer, uri, line, col + 8);
+        CHECK(has_label(result, "PROBE_PARAM"));
+        CHECK(has_label(result, "probe_t"));
+    };
+    SECTION("class in a package") {
+        check("package user_pkg;\n  import probe_pkg::*;\n  class c;\n    function void f();\n"
+              "      // here\n        \n    endfunction\n  endclass\nendpackage\n");
+    }
+    SECTION("class in a module") {
+        check("module m;\n  import probe_pkg::*;\n  class c;\n    function void f();\n"
+              "      // here\n        \n    endfunction\n  endclass\nendmodule\n");
+    }
+    SECTION("out-of-block method in a package") {
+        check("package user_pkg;\n  import probe_pkg::*;\n  class c;\n"
+              "    extern function void f();\n  endclass\n  function void c::f();\n"
+              "      // here\n        \n  endfunction\nendpackage\n");
+    }
+    SECTION("task in a module") {
+        check("module m;\n  import probe_pkg::*;\n  task t();\n"
+              "      // here\n        \n  endtask\nendmodule\n");
+    }
+}
+
 TEST_CASE("completion: an un-imported package in another open buffer stays hidden",
           "[completion][imports]") {
     // The other half: the gate must still filter.  Without an import statement

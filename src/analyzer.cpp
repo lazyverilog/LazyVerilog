@@ -2830,7 +2830,9 @@ static bool package_member_visible(std::string_view package, std::string_view sy
     for (const auto& imp : visible_imports) {
         if (imp.package_name != package)
             continue;
-        if (!imp.parent_scope.empty() && imp.parent_scope != preferred_module)
+        // An import that knows its end line is placed by its line range below;
+        // preferred_module may name a nested scope rather than its design unit.
+        if (!imp.parent_scope.empty() && imp.end_line == 0 && imp.parent_scope != preferred_module)
             continue;
         if (imp.start_line > 0 && use_line_one_based < imp.start_line)
             continue;
@@ -6868,16 +6870,33 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     };
     const auto import_ranked_class = [&](const std::string& name,
                                          std::string_view member) -> std::optional<RankedClass> {
-        const auto shards = class_lookup_shards();
+        // A request with no candidate files (references' first, own-file pass)
+        // has nothing to rank against.
+        if (ranked.empty())
+            return std::nullopt;
+        // The published snapshot answers "who declares `name`" in one lookup,
+        // so the common unambiguous name costs no pass over the shards.  The
+        // asking file stands in with its live index for its own shard.
+        const auto snapshot = project_index_snapshot();
+        const auto& slots = snapshot->class_slots;
+        const auto* own_class = find_class_entry(current_index, name);
+        size_t declared = own_class ? 1 : 0;
+        if (const auto it = slots.find(name); it != slots.end())
+            for (const auto& [slot, i] : it->second)
+                declared += snapshot->shards[slot].uri != uri;
+        if (declared < 2)
+            return std::nullopt;
         OverrideClassTable table;
         const auto add_named = [&](const std::string& class_name) {
-            for (const auto& shard : shards)
-                if (const auto* cls = find_class_entry(*shard.index, class_name))
-                    table.add_class(*cls, *shard.index, *shard.uri);
+            if (const auto* cls = find_class_entry(current_index, class_name))
+                table.add_class(*cls, current_index, uri);
+            if (const auto it = slots.find(class_name); it != slots.end())
+                for (const auto& [slot, i] : it->second)
+                    if (const auto& shard = snapshot->shards[slot];
+                        shard.uri != uri && i < shard.index->classes.size())
+                        table.add_class(shard.index->classes[i], *shard.index, shard.uri);
         };
         add_named(name);
-        if (table.nodes.size() < 2)
-            return std::nullopt;
         // Every class named along the `extends` chain, so base_of() can rank
         // each hop the way rename's chain does.
         if (!member.empty()) {
