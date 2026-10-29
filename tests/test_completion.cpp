@@ -3330,9 +3330,9 @@ TEST_CASE("completion: backtick cost does not grow with the project's macro coun
               << large.edit << " ms (ratio " << edit_ratio << ")\n";
     // A binary search in the sorted names, kept across a re-publish whose
     // macro shards hold the same macros: ~1 either way.  Scoring every macro
-    // is ~5, re-collecting them per snapshot ~9, re-sorting them after the
-    // includer's edit ~10.
-    CHECK(hit_ratio < 4.0);
+    // is ~4-5 (the request's fixed cost hides the rest of 16), re-collecting
+    // them per snapshot ~9, re-sorting them after the includer's edit ~10.
+    CHECK(hit_ratio < 3.0);
     CHECK(miss_ratio < 4.0);
     CHECK(edit_ratio < 4.0);
 }
