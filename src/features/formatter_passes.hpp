@@ -1527,6 +1527,7 @@ inline void mark_header_keywords(TokenStream& tokens) {
     std::vector<size_t> opens;
     for (size_t i = 0; i < tokens.size(); ++i) {
         Tok& t = tokens[i];
+        // Skipping leaves no `(` without facts: format-off and frozen text lex as one verbatim token.
         if (!is_code_token(t))
             continue;
         if (kind_is(t, TK::OpenParenthesis)) {
@@ -1594,6 +1595,7 @@ inline void mark_subroutine_formals(TokenStream& tokens) {
     bool formals = false, after_keyword = false;
     for (size_t i = 0; i < tokens.size(); ++i) {
         Tok& t = tokens[i];
+        // No `(` is non-code; see mark_header_keywords().
         if (!is_code_token(t))
             continue;
         const TK k = t.lex.kind;
@@ -2150,12 +2152,10 @@ inline bool is_gate_terminal_open(const TokenStream& tokens, size_t open) {
     if (inst == npos)
         return false;
     size_t k = prev_code(tokens, inst);
-    // A later instance of the same gate statement.
+    // A later instance of the same gate statement: one when the first is.
     if (k != npos && kind_is(tokens[k], TK::Comma)) {
-        const size_t close = prev_code(tokens, k);
-        return close != npos && kind_is(tokens[close], TK::CloseParenthesis) &&
-               tokens[close].immutable.syntax.matching_token != npos &&
-               is_gate_terminal_open(tokens, tokens[close].immutable.syntax.matching_token);
+        const size_t head = tokens[open].immutable.topology.gate_chain_head;
+        return head != npos && is_gate_terminal_open(tokens, head);
     }
     // Delay: `#1`, `#d`, `#(1:2:3)`.
     if (k != npos && kind_is(tokens[k], TK::CloseParenthesis) &&
@@ -2182,7 +2182,18 @@ inline bool is_gate_terminal_open(const TokenStream& tokens, size_t open) {
            follows_module_item_boundary(tokens, prev_code(tokens, k));
 }
 
-inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
+// `a (...), b (...)` -- the `(` of the list before the `,` at `comma`, or npos.
+inline size_t list_open_before_comma(const TokenStream& tokens, size_t comma) {
+    const size_t close = prev_code(tokens, comma);
+    return close != npos && kind_is(tokens[close], TK::CloseParenthesis)
+               ? tokens[close].immutable.syntax.matching_token
+               : npos;
+}
+
+// The token before the instance name of port list `open`, past the module's
+// dimensions and parameter overrides: the module name, or the `,` of a later
+// instance.  npos when the token before `open` is no instance name.
+inline size_t instance_module_before(const TokenStream& tokens, size_t open) {
     size_t inst = prev_code(tokens, open);
     if (inst != npos && kind_is(tokens[inst], TK::CloseBracket)) {
         size_t br = tokens[inst].immutable.syntax.matching_token;
@@ -2192,12 +2203,12 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
     // An instance name is a plain identifier.  `$display(` is a system task
     // call, and the `(` after a macro (`` `T_DATA `CAT(d, 2); ``) is that
     // macro's own argument list -- neither is a port list, whatever precedes.
-    if (inst == npos || !kind_is(tokens[inst], TK::Identifier)) return false;
+    if (inst == npos || !kind_is(tokens[inst], TK::Identifier)) return npos;
     size_t mod = prev_code(tokens, inst);
     // `sub (* keep *) u (...)` -- an attribute on the instance name.
     while (mod != npos && tokens[mod].lex.in_attribute_instance)
         mod = prev_code(tokens, mod);
-    if (mod == npos) return false;
+    if (mod == npos) return npos;
     if (kind_is(tokens[mod], TK::CloseBracket)) {
         size_t br = tokens[mod].immutable.syntax.matching_token;
         if (br != npos) mod = prev_code(tokens, br);
@@ -2208,12 +2219,21 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
         if (hash != npos && kind_is(tokens[hash], TK::Hash))
             mod = prev_code(tokens, hash);
     }
-    // `sub u1 (...), u2 (...);` -- a later instance of the same statement.
-    if (mod != npos && kind_is(tokens[mod], TK::Comma) && tokens[open].immutable.syntax.paren_depth == 0) {
-        const size_t close = prev_code(tokens, mod);
-        return close != npos && kind_is(tokens[close], TK::CloseParenthesis) &&
-               tokens[close].immutable.syntax.matching_token != npos &&
-               is_instance_port_open(tokens, tokens[close].immutable.syntax.matching_token);
+    return mod;
+}
+
+// `sub u1 (...), u2 (...);` -- `open` follows a later instance's name.
+inline bool chains_instance(const TokenStream& tokens, size_t open, size_t mod) {
+    return mod != npos && kind_is(tokens[mod], TK::Comma) &&
+           tokens[open].immutable.syntax.paren_depth == 0;
+}
+
+inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
+    const size_t mod = instance_module_before(tokens, open);
+    // A later instance of the same statement: one when the first is.
+    if (chains_instance(tokens, open, mod)) {
+        const size_t head = tokens[open].immutable.topology.instance_chain_head;
+        return head != npos && is_instance_port_open(tokens, head);
     }
     if (mod == npos || !is_identifier_like(tokens[mod])) return false;
     size_t prev = prev_code(tokens, mod);
@@ -2234,6 +2254,46 @@ inline bool is_instance_port_open(const TokenStream& tokens, size_t open) {
             return false;
     }
     return false;
+}
+
+// Sets TopologyFacts::instance_chain_head and gate_chain_head on every `(`.
+// Needs matching_token and paren_depth.  A chain's earlier `(` comes first,
+// so one forward walk hands each later instance the head its previous one
+// found.
+inline void mark_instance_chains(TokenStream& tokens) {
+    auto head_of = [&](size_t open, size_t comma, size_t TopologyFacts::*head) {
+        const size_t prev = list_open_before_comma(tokens, comma);
+        return prev != npos && prev < open ? tokens[prev].immutable.topology.*head : npos;
+    };
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!kind_is(tokens[i], TK::OpenParenthesis))
+            continue;
+        auto& topo = tokens[i].immutable.topology;
+        const size_t mod = instance_module_before(tokens, i);
+        topo.instance_chain_head =
+            chains_instance(tokens, i, mod) ? head_of(i, mod, &TopologyFacts::instance_chain_head) : i;
+        const size_t inst = instance_name_before(tokens, i);
+        const size_t k = inst == npos ? npos : prev_code(tokens, inst);
+        topo.gate_chain_head = k != npos && kind_is(tokens[k], TK::Comma)
+                                   ? head_of(i, k, &TopologyFacts::gate_chain_head)
+                                   : i;
+    }
+}
+
+// Sets TopologyFacts::is_use_clause_colon: what a walk back from each `:`
+// to a `use` or a boundary would find, carried forward.
+inline void mark_use_clause_colons(TokenStream& tokens) {
+    bool after_use = false;
+    for (Tok& t : tokens) {
+        if (kind_is(t, TK::Colon))
+            t.immutable.topology.is_use_clause_colon = after_use;
+        if (!is_code_token(t))
+            continue;
+        if (kind_is(t, TK::UseKeyword))
+            after_use = true;
+        else if (kind_is(t, TK::Semicolon) || is_open_block(t.lex.kind) || is_close_block(t.lex.kind))
+            after_use = false;
+    }
 }
 
 // SyntaxPass is the early fact-freeze pass.  It writes SyntaxFacts,
@@ -2465,6 +2525,8 @@ public:
         }
         mark_property_expressions(tokens);
         mark_subroutine_formals(tokens);
+        mark_instance_chains(tokens);
+        mark_use_clause_colons(tokens);
         for (size_t i = 0; i < tokens.size(); ++i) {
             // `bins t = (1 [->2] => 0);` -- a transition list repeats a value the
             // way a sequence repeats an expression, and sits in parentheses.
@@ -7856,22 +7918,8 @@ inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions&
     // the colon joins a cell to the configuration that binds it.  It is
     // part of the name, not a conditional's or a label's.  `use` is a
     // keyword of config blocks and nothing else.
-    {
-        auto is_use_clause_colon = [&](size_t at) {
-            if (!kind_is(tokens[at], TK::Colon))
-                return false;
-            for (size_t p = prev_code(tokens, at); p != npos; p = prev_code(tokens, p)) {
-                if (kind_is(tokens[p], TK::UseKeyword))
-                    return true;
-                if (kind_is(tokens[p], TK::Semicolon) || is_open_block(tokens[p].lex.kind) ||
-                    is_close_block(tokens[p].lex.kind))
-                    return false;
-            }
-            return false;
-        };
-        if (is_use_clause_colon(i) || is_use_clause_colon(i - 1))
-            spaces = 0;
-    }
+    if (t.immutable.topology.is_use_clause_colon || L.immutable.topology.is_use_clause_colon)
+        spaces = 0;
 
     // semicolon_spacing: controls space before/after `;` inside for-loop headers
     // (paren_depth > 0 identifies the for(;;) context vs statement-ending `;`)
