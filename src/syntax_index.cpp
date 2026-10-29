@@ -504,9 +504,8 @@ static std::string type_parameter_default(const TypeAssignmentSyntax& decl,
 // whole-tree traversal for them.
 static void add_package_imports(const PackageImportDeclarationSyntax& node, SyntaxIndex& index,
                                 SourceFileIdResolver& resolver, const slang::SourceManager& sm,
-                                std::string_view parent_scope, int scope_end_line) {
+                                std::string_view parent_scope, std::pair<int, int> scope_end) {
     const auto [decl_line, decl_col] = token_pos_line1_col0(sm, node.keyword);
-    (void)decl_col;
 
     for (const auto* item : node.items) {
         if (!item)
@@ -522,7 +521,8 @@ static void add_package_imports(const PackageImportDeclarationSyntax& node, Synt
         entry.parent_scope = std::string(parent_scope);
         entry.file_id = resolver.for_declaration_token(index, sm, item->package);
         entry.start_line = decl_line;
-        entry.end_line = scope_end_line;
+        entry.start_col = decl_col;
+        std::tie(entry.end_line, entry.end_col) = scope_end;
         index.imports.push_back(std::move(entry));
     }
 }
@@ -627,7 +627,7 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
                 package_scoped_key(entry.name, member_name), index.values.size());
     };
 
-    const auto module_end_line = source_range_lines(sm, module.sourceRange()).second;
+    const auto module_end = syntax_end_pos_line1_col0(sm, module);
 
     // Imports written in the module header (`module m import pkg::*; (...)`) are
     // not members, so the member loop below never sees them.  Without them the
@@ -635,14 +635,14 @@ static void process_module(const ModuleDeclarationSyntax& module, SyntaxIndex& i
     // unqualified, and references/rename skip every unqualified use in it.
     for (const auto* import_decl : module.header->imports) {
         if (import_decl)
-            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end);
     }
 
     for (const auto* member : module.members) {
         if (!member)
             continue;
         if (const auto* import_decl = member->as_if<PackageImportDeclarationSyntax>()) {
-            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end_line);
+            add_package_imports(*import_decl, index, resolver, sm, entry.name, module_end);
         } else if (const auto* data = member->as_if<DataDeclarationSyntax>()) {
             std::optional<std::string> type_text;
             for (const auto* decl : data->declarators) {
@@ -1211,7 +1211,7 @@ static void process_member(const MemberSyntax& member, SyntaxIndex& index,
     } else if (const auto* import_decl = member.as_if<PackageImportDeclarationSyntax>()) {
         // Compilation-unit scope: visible to everything parsed after it, so it
         // carries no enclosing scope name or end line.
-        add_package_imports(*import_decl, index, resolver, sm, {}, 0);
+        add_package_imports(*import_decl, index, resolver, sm, {}, {0, 0});
     } else if (const auto* cls = member.as_if<ClassDeclarationSyntax>()) {
         // A file-scope class from an `include`d header lives in the header's
         // shard; a restricted build that kept it was one more copy per includer.

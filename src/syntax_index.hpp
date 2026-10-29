@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <memory>
@@ -258,10 +259,30 @@ struct ImportEntry {
     bool wildcard{false};
     std::string parent_scope; // empty means compilation-unit import
     SourceFileID file_id{kInvalidSourceFileID};
-    // 1-based visibility range. end_line == 0 means visible to end of file.
+    // Visibility range: 1-based lines, 0-based UTF-16 columns, end exclusive.
+    // end_line == 0 means visible to end of file.  Columns tell apart design
+    // units that share a line.
     int start_line{0};
     int end_line{0};
+    int start_col{0};
+    int end_col{0};
 };
+
+/// Whether @p imp is in effect at 1-based @p line, 0-based @p col.
+inline bool import_in_effect_at(const ImportEntry& imp, int line, int col) {
+    if (imp.start_line > 0 && std::pair{line, col} < std::pair{imp.start_line, imp.start_col})
+        return false;
+    return imp.end_line == 0 || std::pair{line, col} < std::pair{imp.end_line, imp.end_col};
+}
+
+/// The imports of @p imports in effect at 1-based @p line, 0-based @p col.
+inline std::vector<ImportEntry> imports_in_effect_at(const std::vector<ImportEntry>& imports,
+                                                     int line, int col) {
+    std::vector<ImportEntry> out;
+    std::copy_if(imports.begin(), imports.end(), std::back_inserter(out),
+                 [&](const ImportEntry& imp) { return import_in_effect_at(imp, line, col); });
+    return out;
+}
 
 /// Which half of an implicit `.p,` port connection an occurrence stands for.
 /// Plain covers every ordinary identifier, including the explicit `.p(expr)`

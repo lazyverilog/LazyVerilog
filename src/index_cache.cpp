@@ -28,7 +28,8 @@ constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
 // 10: an includer's shard no longer carries a file-scope class from its headers.
 // 11: classes carry their parameters and their extends arguments.
 // 12: a call through an inherited method on an in-shard class records its class member.
-constexpr uint32_t kFormatVersion = 12;
+// 13: imports carry start and end columns.
+constexpr uint32_t kFormatVersion = 13;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is
@@ -658,6 +659,8 @@ void write_import(Writer& w, const ImportEntry& i) {
     w.u32(i.file_id);
     w.i32(i.start_line);
     w.i32(i.end_line);
+    w.i32(i.start_col);
+    w.i32(i.end_col);
 }
 
 ImportEntry read_import(Reader& r) {
@@ -669,6 +672,8 @@ ImportEntry read_import(Reader& r) {
     i.file_id = r.file_id();
     i.start_line = r.i32();
     i.end_line = r.i32();
+    i.start_col = r.i32();
+    i.end_col = r.i32();
     return i;
 }
 
@@ -760,7 +765,7 @@ static_assert(sizeof(EnumMemberEntry) == 48, "EnumMemberEntry changed: update co
 static_assert(sizeof(TypedefEntry) == 160, "TypedefEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(MacroEntry) == 104, "MacroEntry changed: update codec + kFormatVersion");
 static_assert(sizeof(ValueEntry) == 248, "ValueEntry changed: update codec + kFormatVersion");
-static_assert(sizeof(ImportEntry) == 120, "ImportEntry changed: update codec + kFormatVersion");
+static_assert(sizeof(ImportEntry) == 128, "ImportEntry changed: update codec + kFormatVersion");
 // ReferenceEntry::form fits in the padding that already followed end_col, so
 // this guard does NOT fire for it -- a field added into existing padding leaves
 // sizeof() unchanged.  The codec and kFormatVersion still had to be updated by
