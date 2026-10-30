@@ -797,6 +797,10 @@ class Analyzer {
     /// and released map_mutex_, before it builds the snapshot -- the window a
     /// clear or another publish can move the epoch in.  Same rules as above.
     void set_project_index_build_hook_for_testing(std::function<void()> hook);
+    /// Test seam.  Runs on the publishing worker after it installed (or
+    /// dropped) its snapshot and released map_mutex_, while it still holds the
+    /// snapshot that was replaced.  Same rules as above.
+    void set_project_index_install_hook_for_testing(std::function<void()> hook);
     /// Test seam: whether @p uri has its filelist shard (not just a header
     /// shard built because another file `include`s it).
     bool has_filelist_shard_for_testing(const std::string& uri) const;
@@ -1117,7 +1121,8 @@ class Analyzer {
     mutable int background_index_active_{0};
     mutable bool background_publish_requested_{false};
     // Publishes building their snapshot with map_mutex_ released; idle waits
-    // for them, so a waiter reads the snapshot they install.
+    // for them, so a waiter reads the snapshot they install and no longer
+    // finds the one it replaced alive.
     mutable int background_publish_building_{0};
     mutable int background_publish_debounce_ms_{0};
     mutable std::chrono::steady_clock::time_point background_publish_due_time_{};
@@ -1349,6 +1354,7 @@ private:
     std::atomic<bool> parse_idle_wanted_{false};
     std::function<void(const std::string&, bool)> background_index_hook_;
     std::function<void()> project_index_build_hook_;
+    std::function<void()> project_index_install_hook_;
 
     // Version tracking — under map_mutex_
     std::unordered_map<std::string, uint64_t> latest_version_;

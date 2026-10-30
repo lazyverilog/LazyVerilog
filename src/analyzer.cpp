@@ -9948,6 +9948,10 @@ void Analyzer::set_project_index_build_hook_for_testing(std::function<void()> ho
     project_index_build_hook_ = std::move(hook);
 }
 
+void Analyzer::set_project_index_install_hook_for_testing(std::function<void()> hook) {
+    project_index_install_hook_ = std::move(hook);
+}
+
 bool Analyzer::has_filelist_shard_for_testing(const std::string& uri) const {
     std::lock_guard<std::mutex> lock(map_mutex_);
     return extra_cache_.contains(uri);
@@ -10674,7 +10678,6 @@ void Analyzer::background_index_loop() const {
                                  std::to_string(snapshot->shards.size()),
                              build_start);
                 lock.lock();
-                --background_publish_building_;
                 std::function<void()> publish_callback;
                 if (!snapshot) {
                     project_index_layout_dirty_ = true;
@@ -10690,7 +10693,16 @@ void Analyzer::background_index_loop() const {
                 }
                 background_cv_.notify_all();
                 lock.unlock();
+                if (project_index_install_hook_)
+                    project_index_install_hook_();
                 snapshot.reset();
+                // Counted as building until here: the replaced snapshot holds
+                // every shard it was built from, and a caller that waited for
+                // idle expects a replaced shard to be gone.
+                lock.lock();
+                --background_publish_building_;
+                background_cv_.notify_all();
+                lock.unlock();
                 // The queue has drained, so this burst is over.  Dropping the
                 // header text here keeps the cache from outliving the work it
                 // was collected for: the next burst re-reads whatever it needs

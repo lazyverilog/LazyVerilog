@@ -1546,6 +1546,43 @@ TEST_CASE("project index: a publish that a clear overtook is dropped", "[index]"
     fs::remove_all(dir);
 }
 
+TEST_CASE("project index: idle waits until a publish dropped the snapshot it replaced",
+          "[index]") {
+    // The replaced snapshot is destroyed off map_mutex_, and it holds every
+    // shard it was built from.  Idle has to cover that, or a caller that waits
+    // for idle still finds a replaced shard alive.
+    namespace fs = std::filesystem;
+    const auto dir = fs::temp_directory_path() / "lazyverilog_publish_drops_replaced";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto path = (dir / "a.sv").string();
+    const auto uri = uri_from_path(path);
+    std::ofstream(path, std::ios::binary) << "module a_mod;\nendmodule\n";
+
+    Analyzer analyzer;
+    analyzer.set_project_index_publish_debounce_ms(0);
+    analyzer.set_extra_files({path});
+    analyzer.wait_for_background_index_idle();
+    std::weak_ptr<const SyntaxIndex> old_shard;
+    for (const auto& shard : *analyzer.extra_index_snapshot_ptr())
+        if (shard.uri == uri)
+            old_shard = shard.index;
+    REQUIRE(!old_shard.expired());
+
+    // Hold the window open: a waiter that is woken before the drop sees it.
+    analyzer.set_project_index_install_hook_for_testing(
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(200)); });
+    std::ofstream(path, std::ios::binary) << "module a_mod;\nendmodule\nmodule b_mod;\nendmodule\n";
+    analyzer.refresh_changed_extra_files({uri});
+    analyzer.wait_for_background_index_idle();
+    analyzer.wait_for_index_cache_writes_idle();
+    CHECK(old_shard.expired());
+    CHECK(analyzer.project_index_snapshot()->module_by_name.contains("b_mod"));
+
+    analyzer.set_project_index_install_hook_for_testing({});
+    fs::remove_all(dir);
+}
+
 TEST_CASE("project index: a publish with no shard replaced keeps the snapshot", "[index]") {
     // Deleting a listed file that is already gone erases nothing but still
     // requests a publish: its input is the installed snapshot with no patches,
