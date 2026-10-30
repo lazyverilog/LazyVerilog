@@ -6,7 +6,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <vector>
 
 namespace {
 
@@ -23,6 +25,48 @@ std::string text_of(const std::string& text, const lsRange& range) {
     for (int line = 0; line < range.start.line; ++line)
         pos = text.find('\n', pos) + 1;
     return text.substr(pos + range.start.character, range.end.character - range.start.character);
+}
+
+/// Fastest of @p runs samples of @p small and of @p large, alternated, as
+/// large / small.  Interleaved, a runner that slows part way through hits both
+/// sides; the minimum, because everything a shared runner adds only makes a
+/// sample slower.  Every sample is printed: a failure is usually about the
+/// spread, and one number cannot show it.
+double interleaved_ratio(const char* label, int runs, const std::function<double()>& small,
+                         const std::function<double()>& large) {
+    (void)small(); // warm both before the first measured round
+    (void)large();
+    std::vector<double> small_samples;
+    std::vector<double> large_samples;
+    for (int round = 0; round < runs; ++round) {
+        small_samples.push_back(small());
+        large_samples.push_back(large());
+    }
+    const double small_ms = *std::min_element(small_samples.begin(), small_samples.end());
+    const double large_ms = *std::min_element(large_samples.begin(), large_samples.end());
+    const double ratio = large_ms / small_ms;
+    std::cout << "\n[" << label << "] " << small_ms << " ms -> " << large_ms
+              << " ms  ratio=" << ratio << "\n  small:";
+    for (double sample : small_samples)
+        std::cout << " " << sample;
+    std::cout << "\n  large:";
+    for (double sample : large_samples)
+        std::cout << " " << sample;
+    std::cout << "\n";
+    return ratio;
+}
+
+/// Milliseconds for @p calls highlights at @p params, each finding @p expected.
+double highlight_ms(Analyzer& analyzer, const lsTextDocumentPositionParams& params, int calls,
+                    size_t expected) {
+    const auto start = std::chrono::steady_clock::now();
+    size_t found = 0;
+    for (int k = 0; k < calls; ++k)
+        found += provide_document_highlight(analyzer, params).size();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    REQUIRE(found == expected * calls);
+    return ms;
 }
 
 } // namespace
@@ -81,45 +125,38 @@ TEST_CASE("document highlight: keyword returns nothing", "[document-highlight]")
 
 namespace {
 
-/// Fastest of @p runs highlighting `leaf` in an open file, with @p closed
-/// closed project files that each instantiate it many times.  The minimum, for
-/// the reason the connect guard takes it.
-double fastest_highlight_ms(int closed, int runs) {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     ("lazyverilog_highlight_scaling_" + std::to_string(closed));
-    std::filesystem::create_directories(dir);
-    std::vector<std::string> paths;
-    for (int i = 0; i < closed; ++i) {
-        const auto path = dir / ("user_" + std::to_string(i) + ".sv");
-        std::string text = "module user_" + std::to_string(i) + ";\n";
-        for (int k = 0; k < 40; ++k)
-            text += "    leaf u_" + std::to_string(k) + "();\n";
-        std::ofstream(path) << text + "endmodule\n";
-        paths.push_back(path.string());
-    }
-    const auto leaf_path = dir / "leaf.sv";
-    const std::string leaf = "module leaf;\nendmodule\nmodule wrap;\n  leaf u_a();\nendmodule\n";
-    std::ofstream(leaf_path) << leaf;
-    paths.push_back(leaf_path.string());
-
+/// An open file declaring `leaf`, and @p closed closed project files that
+/// each instantiate it many times.
+struct ClosedUsers {
+    std::filesystem::path dir;
+    std::string uri;
     Analyzer analyzer;
-    analyzer.set_extra_files(paths);
-    analyzer.wait_for_background_index_idle();
-    const std::string uri = uri_from_path(leaf_path);
-    analyzer.open(uri, leaf);
 
-    std::vector<double> samples;
-    for (int i = 0; i < runs; ++i) {
-        const auto start = std::chrono::steady_clock::now();
-        const auto result = provide_document_highlight(analyzer, at(uri, 0, 7));
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
-        REQUIRE(result.size() == 2);
+    explicit ClosedUsers(int closed)
+        : dir(std::filesystem::temp_directory_path() /
+              ("lazyverilog_highlight_scaling_" + std::to_string(closed))) {
+        std::filesystem::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < closed; ++i) {
+            const auto path = dir / ("user_" + std::to_string(i) + ".sv");
+            std::string text = "module user_" + std::to_string(i) + ";\n";
+            for (int k = 0; k < 40; ++k)
+                text += "    leaf u_" + std::to_string(k) + "();\n";
+            std::ofstream(path) << text + "endmodule\n";
+            paths.push_back(path.string());
+        }
+        const auto leaf_path = dir / "leaf.sv";
+        const std::string leaf = "module leaf;\nendmodule\nmodule wrap;\n  leaf u_a();\nendmodule\n";
+        std::ofstream(leaf_path) << leaf;
+        paths.push_back(leaf_path.string());
+
+        analyzer.set_extra_files(paths);
+        analyzer.wait_for_background_index_idle();
+        uri = uri_from_path(leaf_path);
+        analyzer.open(uri, leaf);
     }
-    std::filesystem::remove_all(dir);
-    return *std::min_element(samples.begin(), samples.end());
-}
+    ~ClosedUsers() { std::filesystem::remove_all(dir); }
+};
 
 } // namespace
 
@@ -127,13 +164,19 @@ TEST_CASE("document highlight: cost does not grow with closed project files",
           "[document-highlight][scaling]") {
     constexpr int kSmall = 25;
     constexpr int kLarge = 400; // 16x the closed files and their uses
-    constexpr int kRuns = 7;
+    // One highlight is ~0.04 ms, below what one sample should be; 20 per
+    // sample (~1 ms, short enough to fit between preemptions on a loaded
+    // machine) and 60 alternated rounds, so the minimum is a clean sample on
+    // both sides.
+    constexpr int kCalls = 20;
+    constexpr int kRuns = 60;
 
-    const double small_ms = fastest_highlight_ms(kSmall, kRuns);
-    const double large_ms = fastest_highlight_ms(kLarge, kRuns);
-    const double ratio = large_ms / small_ms;
-    std::cout << "\n[highlight scaling] closed files " << kSmall << " -> " << kLarge << ": "
-              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+    ClosedUsers small(kSmall);
+    ClosedUsers large(kLarge);
+    const double ratio = interleaved_ratio(
+        "highlight scaling", kRuns,
+        [&] { return highlight_ms(small.analyzer, at(small.uri, 0, 7), kCalls, 2); },
+        [&] { return highlight_ms(large.analyzer, at(large.uri, 0, 7), kCalls, 2); });
 
     // Highlight answers for one file, so closed shards should not be scanned:
     // ~1.  Scanning them all is ~16.
@@ -187,104 +230,86 @@ TEST_CASE("document highlight: an embedded covergroup's sample() stays in its cl
 
 namespace {
 
-/// Fastest of @p runs highlighting the first class's `rd_cg.sample` in a file
-/// of @p classes register classes.  Every class adds same-named candidates the
-/// highlight has to rule out.
-double fastest_member_highlight_ms(int classes, int runs) {
+/// A file of @p classes register classes.  Every class adds same-named
+/// candidates a highlight of the first class's `rd_cg.sample` has to rule out.
+struct RegisterFile {
     const std::string uri = "file:///tmp/lazyverilog_highlight_member_scaling.sv";
-    const std::string text = register_classes(classes);
     Analyzer analyzer;
-    analyzer.open(uri, text);
 
-    std::vector<double> samples;
-    for (int i = 0; i < runs; ++i) {
-        const auto start = std::chrono::steady_clock::now();
-        const auto result = provide_document_highlight(analyzer, at(uri, 7, 10));
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
-        REQUIRE(result.size() == 2);
-    }
-    return *std::min_element(samples.begin(), samples.end());
-}
+    explicit RegisterFile(int classes) { analyzer.open(uri, register_classes(classes)); }
+};
 
 } // namespace
 
 TEST_CASE("document highlight: cost grows linearly with same-named candidates",
           "[document-highlight][scaling]") {
+    // 4x the classes, the file and the candidates.  One small sample is four
+    // highlights against one on the large file, so both take about as long
+    // and linear is ~1: timed one against one (linear ~4), the longer large
+    // sample was the likelier one to catch a stall.
     constexpr int kSmall = 25;
-    constexpr int kLarge = 100; // 4x the classes, the file and the candidates
-    constexpr int kRuns = 5;
+    constexpr int kFactor = 4;
+    constexpr int kRuns = 15;
 
-    const double small_ms = fastest_member_highlight_ms(kSmall, kRuns);
-    const double large_ms = fastest_member_highlight_ms(kLarge, kRuns);
-    const double ratio = large_ms / small_ms;
-    std::cout << "\n[highlight member scaling] classes " << kSmall << " -> " << kLarge << ": "
-              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+    RegisterFile small(kSmall);
+    RegisterFile large(kSmall * kFactor);
+    const double ratio = interleaved_ratio(
+        "highlight member scaling", kRuns,
+        [&] { return highlight_ms(small.analyzer, at(small.uri, 7, 10), kFactor, 2); },
+        [&] { return highlight_ms(large.analyzer, at(large.uri, 7, 10), 1, 2); });
 
-    // Linear is ~4.  Resolving each candidate with its own walk of the file is
-    // ~16.
-    CHECK(ratio < 8.0);
+    // Resolving each candidate with its own walk of the file is ~4 (16 before
+    // the per-sample factor).  2 is the 8.0 this limit was over one-to-one
+    // samples, divided by that factor.
+    CHECK(ratio < 2.0);
 }
 
 
 namespace {
 
-/// Fastest of @p runs highlighting `base_c::m` in an open file, with @p closed
-/// closed project files that each declare a subclass overriding it -- the shape
-/// of uvm_component's subtree under build_phase.
-double fastest_override_highlight_ms(int closed, int runs) {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     ("lazyverilog_highlight_override_" + std::to_string(closed));
-    std::filesystem::create_directories(dir);
-    std::vector<std::string> paths;
-    for (int i = 0; i < closed; ++i) {
-        const auto path = dir / ("sub_" + std::to_string(i) + ".sv");
-        std::ofstream(path) << "class sub_" + std::to_string(i) +
-                                   " extends base_c;\n"
-                                   "  virtual function void m();\n"
-                                   "    super.m();\n"
-                                   "  endfunction\n"
-                                   "endclass\n";
-        paths.push_back(path.string());
-    }
-    const auto base_path = dir / "base.sv";
-    const std::string base = "class base_c;\n"
-                             "  virtual function void m();\n"
-                             "  endfunction\n"
-                             "endclass\n"
-                             "class near_c extends base_c;\n"
-                             "  virtual function void m();\n"
-                             "    super.m();\n"
-                             "  endfunction\n"
-                             "endclass\n";
-    std::ofstream(base_path) << base;
-    paths.push_back(base_path.string());
-
+/// An open file declaring `base_c::m`, and @p closed closed project files
+/// that each declare a subclass overriding it -- the shape of uvm_component's
+/// subtree under build_phase.
+struct ClosedOverrides {
+    std::filesystem::path dir;
+    std::string uri;
     Analyzer analyzer;
-    analyzer.set_extra_files(paths);
-    analyzer.wait_for_background_index_idle();
-    const std::string uri = uri_from_path(base_path);
-    analyzer.open(uri, base);
 
-    REQUIRE(provide_document_highlight(analyzer, at(uri, 1, 24)).size() == 3);
-    // A single highlight takes ~0.1 ms; a batch keeps timer and scheduler
-    // noise out of the ratio.
-    constexpr int kBatch = 20;
-    std::vector<double> samples;
-    for (int i = 0; i < runs; ++i) {
-        const auto start = std::chrono::steady_clock::now();
-        size_t found = 0;
-        for (int k = 0; k < kBatch; ++k)
-            found += provide_document_highlight(analyzer, at(uri, 1, 24)).size();
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
-        REQUIRE(found == 3 * kBatch);
+    explicit ClosedOverrides(int closed)
+        : dir(std::filesystem::temp_directory_path() /
+              ("lazyverilog_highlight_override_" + std::to_string(closed))) {
+        std::filesystem::create_directories(dir);
+        std::vector<std::string> paths;
+        for (int i = 0; i < closed; ++i) {
+            const auto path = dir / ("sub_" + std::to_string(i) + ".sv");
+            std::ofstream(path) << "class sub_" + std::to_string(i) +
+                                       " extends base_c;\n"
+                                       "  virtual function void m();\n"
+                                       "    super.m();\n"
+                                       "  endfunction\n"
+                                       "endclass\n";
+            paths.push_back(path.string());
+        }
+        const auto base_path = dir / "base.sv";
+        const std::string base = "class base_c;\n"
+                                 "  virtual function void m();\n"
+                                 "  endfunction\n"
+                                 "endclass\n"
+                                 "class near_c extends base_c;\n"
+                                 "  virtual function void m();\n"
+                                 "    super.m();\n"
+                                 "  endfunction\n"
+                                 "endclass\n";
+        std::ofstream(base_path) << base;
+        paths.push_back(base_path.string());
+
+        analyzer.set_extra_files(paths);
+        analyzer.wait_for_background_index_idle();
+        uri = uri_from_path(base_path);
+        analyzer.open(uri, base);
     }
-    std::filesystem::remove_all(dir);
-    return *std::min_element(samples.begin(), samples.end());
-}
+    ~ClosedOverrides() { std::filesystem::remove_all(dir); }
+};
 
 } // namespace
 
@@ -292,13 +317,16 @@ TEST_CASE("document highlight: a method's cost does not grow with its override s
           "[document-highlight][scaling]") {
     constexpr int kSmall = 25;
     constexpr int kLarge = 400; // 16x the closed overrides
-    constexpr int kRuns = 7;
+    // One highlight is ~0.08 ms; 20 per sample (~1.6 ms), 30 alternated rounds.
+    constexpr int kCalls = 20;
+    constexpr int kRuns = 30;
 
-    const double small_ms = fastest_override_highlight_ms(kSmall, kRuns);
-    const double large_ms = fastest_override_highlight_ms(kLarge, kRuns);
-    const double ratio = large_ms / small_ms;
-    std::cout << "\n[highlight override scaling] overrides " << kSmall << " -> " << kLarge
-              << ": " << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+    ClosedOverrides small(kSmall);
+    ClosedOverrides large(kLarge);
+    const double ratio = interleaved_ratio(
+        "highlight override scaling", kRuns,
+        [&] { return highlight_ms(small.analyzer, at(small.uri, 1, 24), kCalls, 3); },
+        [&] { return highlight_ms(large.analyzer, at(large.uri, 1, 24), kCalls, 3); });
 
     // Highlight walks up from this file's occurrences: ~1.  Walking the root's
     // whole subtree on every cursor move is ~16.

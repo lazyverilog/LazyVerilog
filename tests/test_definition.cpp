@@ -2646,38 +2646,40 @@ TEST_CASE("definition: clocking blocks, clockvars and DPI imports resolve",
 
 namespace {
 
-/// Fastest of @p runs finding the identifier in a tiny last module, after four
-/// modules of @p statements assignments each.  Last, so that stopping once the
-/// cursor is answered does not skip the bulk too.
-double fastest_identifier_at_ms(int statements, int runs) {
-    std::string text;
-    for (int m = 0; m < 4; ++m) {
-        text += "module bulk" + std::to_string(m) + ";\n  logic [7:0] acc;\n";
-        for (int i = 0; i < statements; ++i)
-            text += "  assign acc[" + std::to_string(i % 8) + "] = acc[" +
-                    std::to_string((i + 1) % 8) + "] ^ 1'b1;\n";
-        text += "endmodule\n";
-    }
-    const int line = int(std::count(text.begin(), text.end(), '\n')) + 2;
-    text += "module last;\n  logic probe;\n  assign probe = 1'b0;\nendmodule\n";
+/// A file of four modules of @p statements assignments each, then a tiny last
+/// module holding the cursor.  Last, so that stopping once the cursor is
+/// answered does not skip the bulk too.
+struct IdentifierAtFile {
     const std::string uri = "file:///tmp/lazyverilog_identifier_at_scaling.sv";
+    int line = 0;
     Analyzer analyzer;
-    analyzer.open(uri, text);
 
-    std::vector<double> samples;
-    for (int i = 0; i < runs; ++i) {
+    explicit IdentifierAtFile(int statements) {
+        std::string text;
+        for (int m = 0; m < 4; ++m) {
+            text += "module bulk" + std::to_string(m) + ";\n  logic [7:0] acc;\n";
+            for (int i = 0; i < statements; ++i)
+                text += "  assign acc[" + std::to_string(i % 8) + "] = acc[" +
+                        std::to_string((i + 1) % 8) + "] ^ 1'b1;\n";
+            text += "endmodule\n";
+        }
+        line = int(std::count(text.begin(), text.end(), '\n')) + 2;
+        text += "module last;\n  logic probe;\n  assign probe = 1'b0;\nendmodule\n";
+        analyzer.open(uri, text);
+    }
+
+    /// Milliseconds for @p calls lookups of the cursor.
+    double sample_ms(int calls) {
         const auto start = std::chrono::steady_clock::now();
-        for (int repeat = 0; repeat < 20; ++repeat) {
+        for (int k = 0; k < calls; ++k) {
             const auto found = analyzer.identifier_at(uri, line, 10);
             REQUIRE(found.has_value());
             REQUIRE(found->name == "probe");
         }
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
-                .count());
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
     }
-    return *std::min_element(samples.begin(), samples.end());
-}
+};
 
 } // namespace
 
@@ -2689,13 +2691,37 @@ TEST_CASE("definition: the cursor lookup does not walk code away from the cursor
           "[definition][scaling]") {
     constexpr int kSmall = 250;
     constexpr int kLarge = 4000; // 16x the code outside the cursor's module
-    constexpr int kRuns = 5;
+    // Both sides do the same work, so the samples are of equal length.  What
+    // decided the ratio was five sequential rounds a side: one stall on all
+    // five small samples, or on none of the large ones, and it read 2.84 or
+    // 0.41 (macOS).  60 interleaved rounds instead.  The samples stay short
+    // (20 lookups, ~1 ms): on a saturated machine a 500-lookup sample was
+    // almost never clean, and min-of-15 of those read 2.4-2.9.
+    constexpr int kCalls = 20;
+    constexpr int kRuns = 60;
 
-    const double small_ms = fastest_identifier_at_ms(kSmall, kRuns);
-    const double large_ms = fastest_identifier_at_ms(kLarge, kRuns);
+    IdentifierAtFile small(kSmall);
+    IdentifierAtFile large(kLarge);
+    (void)small.sample_ms(kCalls); // warm both before the first measured round
+    (void)large.sample_ms(kCalls);
+
+    std::vector<double> small_samples;
+    std::vector<double> large_samples;
+    for (int round = 0; round < kRuns; ++round) {
+        small_samples.push_back(small.sample_ms(kCalls));
+        large_samples.push_back(large.sample_ms(kCalls));
+    }
+    const double small_ms = *std::min_element(small_samples.begin(), small_samples.end());
+    const double large_ms = *std::min_element(large_samples.begin(), large_samples.end());
     const double ratio = large_ms / small_ms;
     std::cout << "\n[identifier_at scaling] statements " << kSmall << " -> " << kLarge << ": "
-              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n";
+              << small_ms << " ms -> " << large_ms << " ms  ratio=" << ratio << "\n  small:";
+    for (double sample : small_samples)
+        std::cout << " " << sample;
+    std::cout << "\n  large:";
+    for (double sample : large_samples)
+        std::cout << " " << sample;
+    std::cout << "\n";
 
     // A whole-file walk is ~16; skipping the other modules is ~1.
     CHECK(ratio < 4.0);
