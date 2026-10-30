@@ -82,6 +82,13 @@ set(SLANG_INCLUDE_TESTS OFF CACHE BOOL "Skip slang tests" FORCE)
 set(SLANG_INCLUDE_DOCS OFF CACHE BOOL "Skip slang docs" FORCE)
 set(SLANG_INCLUDE_PYLIB OFF CACHE BOOL "Skip slang Python bindings" FORCE)
 set(SLANG_INCLUDE_INSTALL OFF CACHE BOOL "Skip slang install targets" FORCE)
+# MinGW: slang's mimalloc overrides operator new/delete from a static library,
+# which mimalloc does not support on Windows: a std::string allocated by
+# mimalloc's operator new is freed by libstdc++-6.dll's operator delete (ucrt
+# free), and the server dies at startup with heap corruption (0xC0000374).
+if(MINGW)
+    set(SLANG_USE_MIMALLOC OFF CACHE BOOL "Enable use of the mimalloc library")
+endif()
 FetchContent_Declare(
     slang
     GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
@@ -186,6 +193,50 @@ FetchContent_MakeAvailable(LspCpp)
 # FetchContent_MakeAvailable(LspCpp) so the vendored target already exists.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND TARGET network-uri)
     target_compile_options(network-uri PRIVATE -Wno-error=maybe-uninitialized)
+endif()
+
+# Fix: LspCpp includes asio from third_party/asio/asio/{include,src}, which are
+# git symlinks to ../include and ../src.  A Windows checkout without symlink
+# support writes them as small text files, so no asio header is found.  Swap
+# each such stub for a copy of its target.  Headers are only read at build
+# time, so doing this after FetchContent_MakeAvailable is early enough.
+foreach(_asio_dir include src)
+    set(_asio_link "${lspcpp_SOURCE_DIR}/third_party/asio/asio/${_asio_dir}")
+    if(EXISTS "${_asio_link}" AND NOT IS_DIRECTORY "${_asio_link}")
+        file(REMOVE "${_asio_link}")
+        file(COPY "${lspcpp_SOURCE_DIR}/third_party/asio/${_asio_dir}"
+             DESTINATION "${lspcpp_SOURCE_DIR}/third_party/asio/asio")
+    endif()
+endforeach()
+
+# Patch (MinGW only): LspCpp guards two MSVC-only assumptions with _WIN32.
+# language.h includes <ppltasks.h> (MSVC's Concurrency runtime, which MinGW
+# does not ship), and string_ref.h skips <cstring> on Windows -- MSVC's
+# <string> pulls it in, libstdc++'s does not, so _stricmp and ::strlen go
+# undeclared.  Narrow both guards to _MSC_VER.  Idempotent, like the patches
+# below.
+if(MINGW)
+    foreach(_msvc_file include/LibLsp/lsp/language/language.h
+                       include/LibLsp/lsp/Markup/string_ref.h)
+        set(_msvc_path "${lspcpp_SOURCE_DIR}/${_msvc_file}")
+        file(READ "${_msvc_path}" _msvc_old)
+        # Both files are CRLF upstream; match either line ending.
+        string(REGEX REPLACE "#ifdef _WIN32(\r?\n#include <ppltasks.h>)" "#ifdef _MSC_VER\\1"
+               _msvc_content "${_msvc_old}")
+        string(REGEX REPLACE "#ifndef _WIN32(\r?\n#include <cstring>)" "#ifndef _MSC_VER\\1"
+               _msvc_content "${_msvc_content}")
+        if(NOT _msvc_content STREQUAL _msvc_old)
+            file(WRITE "${_msvc_path}" "${_msvc_content}")
+        endif()
+        string(FIND "${_msvc_content}" "_MSC_VER\r\n#include" _msvc_crlf)
+        string(FIND "${_msvc_content}" "_MSC_VER\n#include" _msvc_lf)
+        if(_msvc_crlf EQUAL -1 AND _msvc_lf EQUAL -1)
+            message(FATAL_ERROR
+                "Could not patch LspCpp's ${_msvc_file} for MinGW. The pinned LspCpp revision "
+                "has probably moved and the anchor above no longer matches its source. "
+                "Re-derive it before bumping GIT_TAG.")
+        endif()
+    endforeach()
 endif()
 
 # Patch: LspCpp's lsServerCapabilities MAKE_REFLECT_STRUCT omits inlayHintProvider,
