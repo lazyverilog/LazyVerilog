@@ -83,3 +83,11 @@ jobs:
       - name: Test
         shell: bash
         run: ctest --test-dir build --build-config Release --output-on-failure
+
+      # ctest shows a passing test's output only with -V, so the ratio guards'
+      # margins were invisible until one failed.  Rerun them alone to log it.
+      - name: Scaling guard ratios
+        shell: bash
+        run: |
+          bin=$(find build -name 'lazyverilog-tests' -type f -o -name 'lazyverilog-tests.exe' -type f | head -1)
+          "$bin" "[scaling]" 2>&1 | grep -E "^\[|ratio|small:|large:|scaling\]" || true
