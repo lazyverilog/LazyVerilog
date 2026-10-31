@@ -2700,40 +2700,80 @@ static std::string module_doc_from_entry(const ModuleEntry& module) {
     return doc;
 }
 
+/// The `define of @p name a usage in @p tree would see last: the one still
+/// defined at the end of the file or, for one the file `undef's again, the last
+/// one it expanded.  Null for a built-in.
+static const slang::syntax::DefineDirectiveSyntax*
+find_macro_define(const slang::syntax::SyntaxTree& tree, std::string_view name) {
+    const auto& sm = tree.sourceManager();
+    for (const auto* macro : tree.getDefinedMacros()) {
+        if (macro && macro->name.valueText() == name &&
+            macro_has_user_source_location(sm, macro->name))
+            return macro;
+    }
+    const auto refs = tree.getMacroRefs();
+    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+        if (it->definition && it->definition->name.valueText() == name &&
+            macro_has_user_source_location(sm, it->definition->name))
+            return it->definition;
+    }
+    return nullptr;
+}
+
 static std::optional<Location> find_macro_definition(const slang::syntax::SyntaxTree& tree,
                                                      const std::string& uri,
                                                      const std::string& name) {
-    const auto& sm = tree.sourceManager();
-
-    for (const auto* macro : tree.getDefinedMacros()) {
-        if (!macro || macro->name.valueText() != name)
-            continue;
-        if (!macro_has_user_source_location(sm, macro->name))
-            continue;
-        return location_from_token_actual_uri(sm, uri, macro->name);
-    }
+    if (const auto* macro = find_macro_define(tree, name))
+        return location_from_token_actual_uri(tree.sourceManager(), uri, macro->name);
     return std::nullopt;
+}
+
+static SymbolInfo macro_info(const slang::SourceManager& sm, const std::string& uri,
+                             const slang::syntax::DefineDirectiveSyntax& macro) {
+    const auto body = macro_body_text(macro);
+    auto loc = location_from_token_actual_uri(sm, uri, macro.name);
+    return SymbolInfo{.name = std::string(macro.name.valueText()),
+                      .kind = "macro",
+                      .detail = body.empty() ? "(empty)" : body,
+                      .line = loc.line,
+                      .col = loc.col};
 }
 
 static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree& tree,
                                                  const std::string& uri, const std::string& name) {
-    const auto& sm = tree.sourceManager();
-
-    for (const auto* macro : tree.getDefinedMacros()) {
-        if (!macro || macro->name.valueText() != name)
-            continue;
-        if (!macro_has_user_source_location(sm, macro->name))
-            continue;
-
-        const auto body = macro_body_text(*macro);
-        auto loc = location_from_token_actual_uri(sm, uri, macro->name);
-        return SymbolInfo{.name = name,
-                          .kind = "macro",
-                          .detail = body.empty() ? "(empty)" : body,
-                          .line = loc.line,
-                          .col = loc.col};
-    }
+    if (const auto* macro = find_macro_define(tree, name))
+        return macro_info(tree.sourceManager(), uri, *macro);
     return std::nullopt;
+}
+
+/// The `define slang expanded for the macro usage or `undef written in the
+/// tree's own file at (@p line, @p col): the one in effect there, which a
+/// redefine or `undef later in the file hides from getDefinedMacros().
+/// Read off the preprocessor's record, so no walk.
+static const slang::syntax::DefineDirectiveSyntax*
+macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, int col) {
+    using namespace slang::syntax;
+    const auto& sm = tree.sourceManager();
+    for (const auto& ref : tree.getMacroRefs()) {
+        const auto token = ref.syntax->kind == SyntaxKind::UndefDirective
+                               ? ref.syntax->as<UndefDirectiveSyntax>().name
+                               : ref.syntax->as<MacroUsageSyntax>().directive;
+        const auto loc = token.location();
+        if (!loc.valid() || !sm.isFileLoc(loc) || sm.getIncludedFrom(loc.buffer()).valid())
+            continue;
+        // The file's own references come in source order.
+        if (const int ref_line = (int)sm.getLineNumber(loc); ref_line > line + 1)
+            break;
+        else if (ref_line != line + 1)
+            continue;
+        const int start = lsp_column(sm, loc);
+        if (col < start || col >= start + (int)token.rawText().size())
+            continue;
+        return ref.definition && macro_has_user_source_location(sm, ref.definition->name)
+                   ? ref.definition
+                   : nullptr;
+    }
+    return nullptr;
 }
 
 /// `` `define `` of @p name recorded in a shard: the closed-file half of
@@ -6097,6 +6137,9 @@ std::optional<SymbolInfo> Analyzer::symbol_at(const std::string& uri, int line, 
     if (ident.empty())
         return std::nullopt;
 
+    if (const auto* macro = macro_definition_in_effect_at(*state->tree, line, col))
+        return macro_info(state->tree->sourceManager(), uri, *macro);
+
     auto target = definition_target_at(*state->tree, uri, line, col);
     // Nearest-first, and shared with the definition_of_state() call below: a
     // macro two projects both define is the same ambiguity a module is, and
@@ -6798,6 +6841,9 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
         return first_ranked_tree_answer(ranked, skip_extra_uri,
                                         std::forward<decltype(probe)>(probe));
     };
+
+    if (const auto* macro = macro_definition_in_effect_at(*state.tree, line, col))
+        return location_from_token_actual_uri(state.tree->sourceManager(), uri, macro->name);
 
     auto target = queries ? queries->target_at(line, col)
                           : definition_target_at(*state.tree, uri, line, col);

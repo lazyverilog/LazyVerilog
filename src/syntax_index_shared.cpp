@@ -1174,8 +1174,16 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         });
     };
 
-    // Macro declarations from the preprocessor table (not a tree walk)
-    for (const auto* def : tree.getDefinedMacros()) {
+    // Macro declarations from the preprocessor table (not a tree walk): the
+    // ones defined at the end, then redefined or `undef'd ones a usage expanded.
+    std::vector<const DefineDirectiveSyntax*> defines(tree.getDefinedMacros().begin(),
+                                                      tree.getDefinedMacros().end());
+    std::unordered_set<const DefineDirectiveSyntax*> seen_defines(defines.begin(), defines.end());
+    for (const auto& ref : tree.getMacroRefs()) {
+        if (seen_defines.insert(ref.definition).second)
+            defines.push_back(ref.definition);
+    }
+    for (const auto* def : defines) {
         if (!def || !def->name || !def->name.location().valid() ||
             !sm.isFileLoc(def->name.location()))
             continue;
@@ -1186,6 +1194,21 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         const auto [line, col] = token_pos_line1_col0(sm, def->name);
         add_macro_ref(std::string(def->name.valueText()), file_ids.for_token(index, sm, def->name),
                       line, col);
+    }
+
+    // Usages and `undef's, under the macro slang expanded: one that expands to
+    // nothing, or whose first token comes from another macro, leaves no token
+    // of its own to find in the tree.
+    for (const auto& ref : tree.getMacroRefs()) {
+        const auto token = ref.syntax->kind == SyntaxKind::UndefDirective
+                               ? ref.syntax->as<UndefDirectiveSyntax>().name
+                               : ref.syntax->as<MacroUsageSyntax>().directive;
+        if (!ref.definition || !token.location().valid() || !file_ids.accepts(index, sm, token))
+            continue;
+        const auto [line, col] = token_pos_line1_col0(sm, token);
+        add_macro_ref(std::string(ref.definition->name.valueText()),
+                      file_ids.for_token(index, sm, token), line,
+                      col + (token.rawText().starts_with('`') ? 1 : 0));
     }
 
     // === Combined visitor ===
@@ -1348,8 +1371,6 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         };
         std::vector<DeferredInvocation> deferred_invocations;
 
-        // Extra fields for macro visitor
-        decltype(add_macro_ref)& add_macro;
         SourceFileIdResolver& file_ids;
         // Per-buffer classification, populated on first token seen from each
         // buffer so the SourceManager is queried only once per buffer.  slang
@@ -1357,9 +1378,6 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         // one holding the macro body, so the answer really is uniform per buffer.
         enum class BufferKind : uint8_t { File, MacroBody, MacroArgument };
         std::unordered_map<uint32_t, BufferKind> buffer_kinds;
-        // Deduplication for macro expansion sites. Key = (expansion_buf_id << 32) | expansion_offset.
-        // Avoids recording the same macro invocation multiple times when it expands to many tokens.
-        std::unordered_set<uint64_t> seen_expansions;
         // Token locations whose identity is already fully decided by a specific
         // handler, so the generic name fallback in visitToken() must not add a
         // second, wrong identity for them.  Key = (buf_id << 32) | offset.
@@ -1402,7 +1420,6 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         std::unordered_map<std::string, SourceFileID>& declared_subroutines,
                         const decltype(module_owner_kind)& module_owner_kind,
                         const decltype(resolve_subroutine_owner_from_qualified_name)& resolve_subroutine_owner,
-                        decltype(add_macro_ref)& add_macro_ref,
                         SourceFileIdResolver& file_ids)
             : index(index), sm(sm), add_ref(add_reference), module_values(module_values),
               module_value_types(module_value_types), package_values(package_values),
@@ -1413,7 +1430,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
               package_type_ids(package_type_ids), declared_subroutines(declared_subroutines),
               module_kind_fn(module_owner_kind),
               resolve_subroutine_owner(resolve_subroutine_owner),
-              add_macro(add_macro_ref), file_ids(file_ids) {}
+              file_ids(file_ids) {}
 
         void handle(const ModuleDeclarationSyntax& node) {
             const std::string module_name(node.header->name.valueText());
@@ -2794,11 +2811,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             // drops out-of-scope tokens, so for an `include`d header -- walked
             // once per includer -- the valueText() copy, the source-text scan
             // behind the member-dot probes, and the scope-keyed lookups below
-            // are all computed and thrown away.  The macro arm needs the test
-            // for correctness rather than speed: add_macro() has no scope
-            // filter of its own, so a macro expanded inside a header would
-            // otherwise be recorded once per includer instead of once in the
-            // header's own shard.  The resolver caches per buffer, so this is
+            // are all computed and thrown away.  The resolver caches per buffer, so this is
             // one hash lookup per token, and accepts() returns true
             // immediately for unrestricted builds.
             //
@@ -2821,46 +2834,14 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                                                   : BufferKind::MacroBody;
             }
 
-            if (it->second != BufferKind::File) {
-                // Macro token — record the macro invocation once per expansion
-                // site.  Arguments record it too: `define ID(X) X expands to
-                // nothing but its argument, so body tokens cannot be relied on
-                // to be there.
-                auto range = sm.getExpansionRange(token.location());
-                // An argument's expansion range still sits inside a macro
-                // buffer, so keep expanding until the invocation lands in the
-                // file the user wrote.  Stopping early records a nonsense
-                // column and, because the dedup key is the range start, a
-                // second entry for an invocation the body tokens already
-                // recorded correctly.
-                while (range.start().valid() && sm.isMacroLoc(range.start()))
-                    range = sm.getExpansionRange(range.start());
-                if (!range.start().valid())
-                    return;
-                const uint64_t key = (static_cast<uint64_t>(range.start().buffer().getId()) << 32) |
-                                     static_cast<uint64_t>(range.start().offset());
-                if (seen_expansions.insert(key).second) {
-                    const auto macro_name = sm.getMacroName(token.location());
-                    if (!macro_name.empty()) {
-                        const int line_num = (int)sm.getLineNumber(range.start());
-                        int col = lsp_column(sm, range.start());
-                        if (col < 0)
-                            col = 0;
-                        if (auto text = source_text_for_syntax_range(sm, range);
-                            text && text->starts_with('`'))
-                            ++col;
-                        add_macro(std::string(macro_name),
-                                  file_ids.for_location(index, sm, range.start()), line_num, col);
-                    }
-                }
-                // A macro body token is preprocessor output and names nothing at
-                // this position.  An argument is text the user typed at the call
-                // site, so it is an occurrence in its own right and has to go on
-                // to be classified like any other identifier -- otherwise rename
-                // silently skips it and leaves the call broken.
-                if (it->second == BufferKind::MacroBody)
-                    return;
-            }
+            // A macro body token is preprocessor output and names nothing at
+            // this position (the usage itself is recorded from getMacroRefs()).
+            // An argument is text the user typed at the call site, so it is an
+            // occurrence in its own right and has to go on to be classified like
+            // any other identifier -- otherwise rename silently skips it and
+            // leaves the call broken.
+            if (it->second == BufferKind::MacroBody)
+                return;
             // Reference fallback
             if (!token || token.kind != slang::parsing::TokenKind::Identifier ||
                 !token.location().valid())
@@ -3032,7 +3013,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             unique_enum_member_ids, unique_type_ids, package_type_ids,
                             declared_subroutines, module_owner_kind,
                             resolve_subroutine_owner_from_qualified_name,
-                            add_macro_ref, file_ids);
+                            file_ids);
     root.visit(visitor);
     visitor.resolve_deferred_invocations();
 }

@@ -2078,6 +2078,79 @@ TEST_CASE("references: identifiers inside macro arguments are occurrences", "[re
     CHECK(has(id_refs, 7, 16));
 }
 
+TEST_CASE("references: every macro usage slang expands is recorded under its own name",
+          "[references][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_macro_refs.sv";
+    analyzer.open(uri, "`define EMPTY\n"
+                       "`define INNER 1\n"
+                       "`define OUTER `INNER\n"
+                       "`define TMP 2\n"
+                       "module top;\n"
+                       "    `EMPTY\n"
+                       "    localparam int A = `OUTER;\n"
+                       "    localparam int B = `TMP;\n"
+                       "`undef TMP\n"
+                       "endmodule\n");
+
+    auto has = [](const std::vector<Location>& refs, int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+
+    // Expands to no token at all, so nothing in the tree says it was used.
+    const auto empty_refs = analyzer.find_references(uri, 0, 8, true);
+    CHECK(empty_refs.size() == 2);
+    CHECK(has(empty_refs, 5, 5));
+
+    // `OUTER's first token comes out of `INNER's body: the usage is `OUTER's.
+    const auto outer_refs = analyzer.find_references(uri, 2, 8, true);
+    CHECK(outer_refs.size() == 2);
+    CHECK(has(outer_refs, 6, 24));
+    for (const auto& r : analyzer.find_references(uri, 1, 8, true))
+        CHECK_FALSE(r.line == 6);
+
+    // The `undef names the macro too, and rename has to rewrite it.
+    const auto tmp_refs = analyzer.find_references(uri, 3, 8, true);
+    CHECK(tmp_refs.size() == 3);
+    CHECK(has(tmp_refs, 7, 24));
+    CHECK(has(tmp_refs, 8, 7));
+}
+
+TEST_CASE("definition: a macro usage goes to the `define in effect where it is written",
+          "[definition][macro]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_def_macro_in_effect.sv";
+    analyzer.open(uri, "`define W 8\n"
+                       "module top;\n"
+                       "    logic [`W-1:0] a;\n"
+                       "`define W 16\n"
+                       "    logic [`W-1:0] b;\n"
+                       "`define T 1\n"
+                       "    localparam int A = `T;\n"
+                       "`undef T\n"
+                       "endmodule\n");
+
+    const auto first = analyzer.definition_of(uri, 2, 12);
+    REQUIRE(first);
+    CHECK(first->line == 0);
+    const auto first_info = analyzer.symbol_at(uri, 2, 12);
+    REQUIRE(first_info);
+    CHECK(first_info->detail == "8");
+
+    const auto second = analyzer.definition_of(uri, 4, 12);
+    REQUIRE(second);
+    CHECK(second->line == 3);
+
+    // Gone from the table at the end of the file, but in effect at the usage.
+    const auto undefd = analyzer.definition_of(uri, 6, 24);
+    REQUIRE(undefd);
+    CHECK(undefd->line == 5);
+    const auto on_undef = analyzer.definition_of(uri, 7, 7);
+    REQUIRE(on_undef);
+    CHECK(on_undef->line == 5);
+}
+
 TEST_CASE("rename: a macro body identifier does not answer for the whole invocation",
           "[references][rename][macro]") {
     Analyzer analyzer;
