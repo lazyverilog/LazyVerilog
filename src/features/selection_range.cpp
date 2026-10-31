@@ -2,6 +2,7 @@
 #include "folding_range.hpp"
 #include "string_utils.hpp"
 
+#include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxNode.h>
 #include <slang/syntax/SyntaxTree.h>
 
@@ -96,6 +97,48 @@ ByteRange word_at(const std::string& text, size_t offset) {
     return {start, end};
 }
 
+/// The list around child `i` of `node`: all ports, all arguments, the statements
+/// of a block.  slang v12 stores a list inline in its owner, so the list itself
+/// is no longer a node with a range.  A run of nodes and commas stands for one;
+/// without a comma it counts only when every node is a statement or member, so
+/// two neighboring single fields (a header's parameters and ports) do not.
+std::optional<ByteRange> list_around(const slang::syntax::SyntaxNode& node, size_t i,
+                                     slang::BufferID buffer) {
+    using slang::syntax::MemberSyntax;
+    using slang::syntax::StatementSyntax;
+    const auto element = [&](size_t k) -> std::optional<slang::SourceRange> {
+        if (const auto* child = node.childNode(k))
+            return child->sourceRange();
+        const auto t = node.childToken(k);
+        if (t && !t.isMissing() && t.kind == slang::parsing::TokenKind::Comma)
+            return t.range();
+        return std::nullopt;
+    };
+    if (!element(i))
+        return std::nullopt;
+    size_t first = i, last = i;
+    while (first > 0 && element(first - 1))
+        --first;
+    while (last + 1 < node.getChildCount() && element(last + 1))
+        ++last;
+    if (first == last)
+        return std::nullopt;
+    bool comma = false, statements = true;
+    for (size_t k = first; k <= last; ++k) {
+        if (const auto* child = node.childNode(k))
+            statements = statements &&
+                         (StatementSyntax::isKind(child->kind) || MemberSyntax::isKind(child->kind));
+        else
+            comma = true;
+    }
+    if (!comma && !statements)
+        return std::nullopt;
+    const auto from = element(first)->start(), to = element(last)->end();
+    if (from.buffer() != buffer || to.buffer() != buffer)
+        return std::nullopt;
+    return ByteRange{from.offset(), to.offset()};
+}
+
 /// One root-to-leaf descent: only the children containing `offset` are entered.
 void descend(const slang::syntax::SyntaxNode& node, size_t offset, slang::BufferID buffer,
              std::vector<ByteRange>& outer_to_inner, std::optional<ByteRange>& token) {
@@ -106,6 +149,8 @@ void descend(const slang::syntax::SyntaxNode& node, size_t offset, slang::Buffer
         if (const auto* child = node.childNode(i)) {
             const auto r = child->sourceRange();
             if (in_file(r) && r.start().offset() <= offset && offset < r.end().offset()) {
+                if (const auto list = list_around(node, i, buffer))
+                    outer_to_inner.push_back(*list);
                 outer_to_inner.push_back({r.start().offset(), r.end().offset()});
                 descend(*child, offset, buffer, outer_to_inner, token);
                 return;
@@ -113,10 +158,25 @@ void descend(const slang::syntax::SyntaxNode& node, size_t offset, slang::Buffer
         } else if (const auto t = node.childToken(i); t && !t.isMissing()) {
             const auto r = t.range();
             if (in_file(r) && r.start().offset() <= offset && offset < r.end().offset()) {
+                if (const auto list = list_around(node, i, buffer))
+                    outer_to_inner.push_back(*list);
                 token = ByteRange{r.start().offset(), r.end().offset()};
                 return;
             }
         }
+    }
+    // In the whitespace before an element: still inside its list.
+    for (size_t i = 0; i < node.getChildCount(); ++i) {
+        const auto* child = node.childNode(i);
+        const auto t = child ? slang::parsing::Token() : node.childToken(i);
+        if (!child && !t)
+            continue;
+        const auto r = child ? child->sourceRange() : t.range();
+        if (r.start().buffer() != buffer || r.start().offset() <= offset)
+            continue;
+        if (const auto list = list_around(node, i, buffer); list && list->start <= offset)
+            outer_to_inner.push_back(*list);
+        return;
     }
 }
 
