@@ -81,6 +81,44 @@ TEST_CASE("selection range: chain grows strictly", "[selection-range]") {
     check_strictly_growing(ranges);
 }
 
+TEST_CASE("selection range: a list is a step of its own", "[selection-range]") {
+    // slang v12 stores lists inline in their owner; the list's own range (all
+    // ports, all arguments, a block's statements) must still be a step.
+    const std::string uri = "file:///tmp/lazyverilog_selection_lists.sv";
+    const std::string text = "module m (\n"
+                             "    input  logic clk,\n"
+                             "    output logic [7:0] q\n"
+                             ");\n"
+                             "  always_ff @(posedge clk) begin\n"
+                             "    q <= q + 8'd1;\n"
+                             "    q <= f(a, b, c);\n"
+                             "  end\n"
+                             "endmodule\n";
+    Analyzer analyzer;
+    analyzer.open(uri, text);
+    const auto answer = provide_selection_range(
+        analyzer, request(uri, {lsPosition(1, 18), lsPosition(6, 11), lsPosition(6, 13)}));
+    REQUIRE(answer.result.size() == 3);
+
+    const auto port = chain(answer.result[0]);
+    check_strictly_growing(port);
+    CHECK(std::any_of(port.begin(), port.end(), [&](const lsRange& r) {
+        return text_of(text, r) == "input  logic clk,\n    output logic [7:0] q";
+    }));
+
+    const auto arg = chain(answer.result[1]);
+    check_strictly_growing(arg);
+    for (const std::string want : {"a, b, c", "q <= q + 8'd1;\n    q <= f(a, b, c);"})
+        CHECK(std::any_of(arg.begin(), arg.end(),
+                          [&](const lsRange& r) { return text_of(text, r) == want; }));
+
+    // On the space after a comma, between two arguments.
+    const auto gap = chain(answer.result[2]);
+    check_strictly_growing(gap);
+    CHECK(std::any_of(gap.begin(), gap.end(),
+                      [&](const lsRange& r) { return text_of(text, r) == "a, b, c"; }));
+}
+
 TEST_CASE("selection range: one result per position", "[selection-range]") {
     const std::string uri = "file:///tmp/lazyverilog_selection_many.sv";
     Analyzer analyzer;
