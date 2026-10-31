@@ -6,6 +6,7 @@
 #include <cctype>
 #include <filesystem>
 #include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
 #include <unordered_map>
@@ -173,7 +174,13 @@ std::string uri_from_source_location(const slang::SourceManager& sm,
     // that names its client URI.  Keep that exact spelling: features compare the
     // result against the document URI they were handed, and re-deriving it from
     // the path would silently rewrite a non-canonical client URI.
-    const auto file_name = sm.getFileName(location);
+    auto file_name = sm.getFileName(location);
+    // slang v12 spells a `line name relative to the buffer's own full path
+    // (`replace_filename`), so the URI arrives behind that file's directory.
+    const auto raw_name = sm.getRawFileName(sm.getFullyExpandedLoc(location).buffer());
+    const auto directory = raw_name.substr(0, raw_name.find_last_of("/\\") + 1);
+    if (file_name != raw_name && file_name.starts_with(directory))
+        file_name.remove_prefix(directory.size());
     if (file_name.starts_with("file://"))
         return std::string(file_name);
 

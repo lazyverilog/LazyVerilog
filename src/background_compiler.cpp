@@ -65,7 +65,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
     }
 
     info.code = slang_diagnostic_code(engine, diagnostic.code);
-    auto sev = slang::getDefaultSeverity(diagnostic.code);
+    auto sev = slang_diagnostic_severity(diagnostic.code);
     if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
         info.severity = 1;
     else if (sev == slang::DiagnosticSeverity::Warning)
@@ -90,7 +90,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
 static bool is_foreign_macro_warning(const slang::SourceManager& sm,
                                      const slang::Diagnostic& diagnostic,
                                      const ProjectParseInputs& inputs) {
-    if (slang::getDefaultSeverity(diagnostic.code) != slang::DiagnosticSeverity::Warning)
+    if (slang_diagnostic_severity(diagnostic.code) != slang::DiagnosticSeverity::Warning)
         return false;
     const auto location = diagnostic.location;
     if (!location.valid() || !sm.isMacroLoc(location))

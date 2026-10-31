@@ -970,9 +970,12 @@ static std::vector<ParseDiagInfo> run_lint_impl(const DocumentState& state, cons
         state.tree->root().visit(collector);
         current_modules = std::move(collector.modules);
     }
+    // slang v12 lists every `include`d buffer after the tree's own; a document
+    // is parsed from one buffer, so its own is the first.
+    const auto buffers = state.tree->getSourceBufferIds();
     LintVisitor v(config, current_modules, project_index, project_snapshot,
-                  state.normalized_path, sm,
-                  file_stem_from_uri(state.uri), state.tree->getSourceBufferIds());
+                  state.normalized_path, sm, file_stem_from_uri(state.uri),
+                  buffers.first(std::min<size_t>(buffers.size(), 1)));
     state.tree->root().visit(v);
     v.diags.erase(std::remove_if(v.diags.begin(), v.diags.end(), [&](const auto& diag) {
         return !diag.uri.empty() && diag.uri != state.uri;

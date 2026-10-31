@@ -27,27 +27,16 @@ using slang::parsing::TokenKind;
 using slang::syntax::SyntaxKind;
 using slang::syntax::SyntaxNode;
 
-// The syntax node a source token belongs to, skipping list wrappers, and
-// that node's own parent.
+// The syntax node a source token belongs to, and that node's own parent.
+// slang v12 flattens lists into their owner, so no list node sits between.
 struct Owner {
     TokenKind kind;
     SyntaxKind owner;
     SyntaxKind grandparent;
 };
 
-bool is_list(SyntaxKind k) {
-    return k == SyntaxKind::SyntaxList || k == SyntaxKind::SeparatedList || k == SyntaxKind::TokenList;
-}
-
-const SyntaxNode* real_parent(const SyntaxNode* n) {
-    const SyntaxNode* p = n ? n->parent : nullptr;
-    while (p && is_list(p->kind)) p = p->parent;
-    return p;
-}
-
 void collect(const SyntaxNode& node, const slang::SourceManager& sm, std::map<size_t, Owner>& out) {
     const SyntaxNode* owner = &node;
-    while (owner && is_list(owner->kind)) owner = owner->parent;
     for (size_t i = 0; i < node.getChildCount(); ++i) {
         if (const SyntaxNode* child = node.childNode(i)) {
             collect(*child, sm, out);
@@ -59,7 +48,7 @@ void collect(const SyntaxNode& node, const slang::SourceManager& sm, std::map<si
         const slang::SourceLocation loc = tok.location();
         if (sm.isMacroLoc(loc) || !sm.isFileLoc(loc))
             continue;
-        const SyntaxNode* gp = real_parent(owner);
+        const SyntaxNode* gp = owner->parent;
         out[loc.offset()] = {tok.kind, owner->kind, gp ? gp->kind : SyntaxKind::Unknown};
     }
 }

@@ -41,20 +41,6 @@ set(OPTIONAL_BUILD_TESTS OFF CACHE BOOL "Skip tl-optional tests" FORCE)
 set(USE_ZLIB OFF CACHE BOOL "Disable ixwebsocket zlib compression" FORCE)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# External: fmt v11
-# OVERRIDE_FIND_PACKAGE lets downstream dependencies reuse this pinned fmt.
-# fmt::fmt is brought transitively by slang::slang — do NOT link fmt::fmt
-# explicitly.
-# ──────────────────────────────────────────────────────────────────────────────
-FetchContent_Declare(
-    fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG        11.1.4
-    OVERRIDE_FIND_PACKAGE
-)
-FetchContent_MakeAvailable(fmt)
-
-# ──────────────────────────────────────────────────────────────────────────────
 # External: toml++ (header-only, for lazyverilog.toml parsing)
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(
@@ -92,50 +78,9 @@ endif()
 FetchContent_Declare(
     slang
     GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
-    GIT_TAG        v10.0
+    GIT_TAG        v12.1
 )
 FetchContent_MakeAvailable(slang)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Patch: slang v10.0 stringifies `"...`" through lexerStack.back(), which is
-# empty when a macro's argument list runs to the end of the input (`S(a<EOF>):
-# a read before the vector, and a crash on `define S(x) `"x`" followed by `S(a.
-# Upstream has since rewritten stringification to need no lexer.  Idempotent
-# after populate, like the LspCpp patches below; the helper is in cmake/slang/.
-# ──────────────────────────────────────────────────────────────────────────────
-set(_pp_cpp "${slang_SOURCE_DIR}/source/parsing/Preprocessor_macros.cpp")
-set(_pp_call "Lexer::stringify(*lexerStack.back(), ")
-set(_pp_anchor "bool Preprocessor::applyMacroOps(")
-file(READ "${_pp_cpp}" _pp_content)
-string(FIND "${_pp_content}" "lazyverilogStringifyLexer" _pp_done)
-if(_pp_done EQUAL -1)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/stringify_lexer.cpp.in" _pp_insert)
-    string(REPLACE "${_pp_anchor}" "${_pp_insert}${_pp_anchor}" _pp_content "${_pp_content}")
-    string(REPLACE "${_pp_call}"
-           "Lexer::stringify(lazyverilogStringifyLexer(lexerStack, alloc, diagnostics, sourceManager, lexerOptions), "
-           _pp_content "${_pp_content}")
-    file(WRITE "${_pp_cpp}" "${_pp_content}")
-endif()
-# A tree patched before the helper stopped keeping a thread_local Lexer: swap
-# the old helper (everything up to the anchor) for the current one.
-string(FIND "${_pp_content}" "thread_local std::optional<Lexer> empty;" _pp_stale)
-if(NOT _pp_stale EQUAL -1)
-    string(FIND "${_pp_content}" "// lazyverilog patch: a macro whose" _pp_from)
-    string(FIND "${_pp_content}" "${_pp_anchor}" _pp_to)
-    string(SUBSTRING "${_pp_content}" 0 ${_pp_from} _pp_head)
-    string(SUBSTRING "${_pp_content}" ${_pp_to} -1 _pp_tail)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/stringify_lexer.cpp.in" _pp_insert)
-    set(_pp_content "${_pp_head}${_pp_insert}${_pp_tail}")
-    file(WRITE "${_pp_cpp}" "${_pp_content}")
-endif()
-string(FIND "${_pp_content}" "${_pp_call}" _pp_left)
-string(FIND "${_pp_content}" "static Lexer& lazyverilogStringifyLexer" _pp_ok)
-if(NOT _pp_left EQUAL -1 OR _pp_ok EQUAL -1)
-    message(FATAL_ERROR
-        "Could not patch slang's Preprocessor_macros.cpp stringify calls. The pinned slang "
-        "revision has probably moved; re-derive the patch (or drop it if upstream no longer "
-        "stringifies through lexerStack) before bumping GIT_TAG.")
-endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Patch (MinGW only): slang's SourceManager locks a std::shared_mutex on every

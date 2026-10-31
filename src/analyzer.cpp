@@ -139,7 +139,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
         } catch (...) {
         }
         info.code = slang_diagnostic_code(engine, d.code);
-        auto sev = slang::getDefaultSeverity(d.code);
+        auto sev = slang_diagnostic_severity(d.code);
         if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
             info.severity = 1;
         else if (sev == slang::DiagnosticSeverity::Warning)
@@ -718,6 +718,11 @@ make_file_state_with_options(const std::filesystem::path& path,
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
     ppo.additionalIncludePaths = include_dirs;
+    // With a callback set, slang keeps the buffer of a header-guarded file it
+    // skips on a repeat `include; without one that directive reads as
+    // unresolved and the shard key never matches on a warm start.
+    static constexpr auto keep_skipped_include_buffer = [](slang::BufferID, bool, bool) {};
+    ppo.bufferChangeCB = keep_skipped_include_buffer;
     slang::Bag bag;
     // Moved in, not copied.  `Bag::set` takes its argument by const reference
     // when it can, and stores it in a `std::any` by value -- so binding an
@@ -5003,7 +5008,9 @@ private:
 static bool cursors_in_define(const slang::syntax::SyntaxTree& tree,
                               const std::vector<std::pair<int, int>>& cursors) {
     const auto& sm = tree.sourceManager();
-    for (const auto buffer : tree.getSourceBufferIds()) {
+    // Its own text only: slang v12 also lists the `include`d buffers, after it.
+    const auto buffers = tree.getSourceBufferIds();
+    for (const auto buffer : buffers.first(std::min<size_t>(buffers.size(), 1))) {
         const std::string_view text = sm.getSourceText(buffer);
         for (const auto& [line, col] : cursors) {
             if (line < 0)
@@ -10991,7 +10998,7 @@ void Analyzer::background_index_loop() const {
         const bool own_stands_alone = std::none_of(
             state->tree->diagnostics().begin(), state->tree->diagnostics().end(),
             [](const slang::Diagnostic& diag) {
-                const auto severity = slang::getDefaultSeverity(diag.code);
+                const auto severity = slang_diagnostic_severity(diag.code);
                 return severity == slang::DiagnosticSeverity::Error ||
                        severity == slang::DiagnosticSeverity::Fatal;
             });
