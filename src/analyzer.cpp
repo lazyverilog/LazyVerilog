@@ -279,6 +279,17 @@ static std::vector<IncludeResolution> collect_include_resolutions(
         return full_path.empty() ? own_uri : uri_from_path(full_path);
     };
 
+    // A directive with no buffer either failed (and says so in a diagnostic at
+    // its file name) or named a header-guarded file slang had already read and
+    // skipped.  slang does not say which file a skipped one found, but it is the
+    // file the same directive found earlier, so it gets that resolution.
+    std::vector<slang::SourceLocation> failed;
+    for (const auto& diagnostic : tree.diagnostics())
+        if (diagnostic.code == slang::diag::CouldNotOpenIncludeFile ||
+            diagnostic.code == slang::diag::ExceededMaxIncludeDepth)
+            failed.push_back(diagnostic.location);
+    std::vector<size_t> skipped;
+
     for (const auto& include : tree.getIncludeDirectives()) {
         if (!include.syntax)
             continue;
@@ -287,6 +298,9 @@ static std::vector<IncludeResolution> collect_include_resolutions(
             const auto& full_path = sm.getFullPath(include.buffer.id);
             if (!full_path.empty())
                 resolved = uri_from_path(full_path);
+        } else if (std::ranges::find(failed, include.syntax->fileName.location()) ==
+                   failed.end()) {
+            skipped.push_back(resolutions.size());
         }
         resolutions.push_back(IncludeResolution{
             .from_uri = directive_origin(include.syntax->getFirstToken().location()),
@@ -294,6 +308,15 @@ static std::vector<IncludeResolution> collect_include_resolutions(
             .is_system = include.isSystem,
             .resolved_uri = std::move(resolved),
         });
+    }
+    for (const size_t index : skipped) {
+        auto& repeat = resolutions[index];
+        const auto earlier = std::ranges::find_if(resolutions, [&](const IncludeResolution& r) {
+            return !r.resolved_uri.empty() && r.from_uri == repeat.from_uri &&
+                   r.spelling == repeat.spelling && r.is_system == repeat.is_system;
+        });
+        if (earlier != resolutions.end())
+            repeat.resolved_uri = earlier->resolved_uri;
     }
 
     for (const auto& diagnostic : tree.diagnostics()) {
@@ -720,11 +743,6 @@ make_file_state_with_options(const std::filesystem::path& path,
     slang::parsing::PreprocessorOptions ppo;
     ppo.predefines = defines;
     ppo.additionalIncludePaths = include_dirs;
-    // With a callback set, slang keeps the buffer of a header-guarded file it
-    // skips on a repeat `include; without one that directive reads as
-    // unresolved and the shard key never matches on a warm start.
-    static constexpr auto keep_skipped_include_buffer = [](slang::BufferID, bool, bool) {};
-    ppo.bufferChangeCB = keep_skipped_include_buffer;
     slang::Bag bag;
     // Moved in, not copied.  `Bag::set` takes its argument by const reference
     // when it can, and stores it in a `std::any` by value -- so binding an
