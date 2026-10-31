@@ -30,7 +30,7 @@ constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
 // 12: a call through an inherited method on an in-shard class records its class member.
 // 13: imports carry start and end columns.
 // 14: built by slang v12.1, whose parser fixes can change what a shard holds.
-constexpr uint32_t kFormatVersion = 14;
+constexpr uint32_t kFormatVersion = 15;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is
