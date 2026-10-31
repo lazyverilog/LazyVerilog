@@ -15,6 +15,7 @@
 #include "syntax_index_shared.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
 
@@ -1460,10 +1461,17 @@ TEST_CASE("index cache: a guarded header included twice is still a hit", "[index
     // slang skips a header-guarded file the second time it is `include`d, and
     // that directive then carries no buffer.  Recorded as unresolved, it never
     // matched the header the warm check finds, so the shard was never reused.
-    CacheProject project("analyzer-guarded-twice");
+    // The first read can also come through another header, or under another
+    // spelling, so the repeat has no identical directive before it.
+    const auto [name, first] = GENERATE(table<const char*, const char*>(
+        {{"analyzer-guarded-twice", "`include \"defs.svh\"\n"},
+         {"analyzer-guarded-nested", "`include \"inner.svh\"\n"},
+         {"analyzer-guarded-respelled", "`include \"./defs.svh\"\n"}}));
+    CacheProject project(name);
     project.write("defs.svh",
                   "`ifndef DEFS_SVH\n`define DEFS_SVH\nlocalparam int shared_decl = 9;\n`endif\n");
-    project.write("a.sv", "`include \"defs.svh\"\n`include \"defs.svh\"\n"
+    project.write("inner.svh", "`include \"defs.svh\"\n");
+    project.write("a.sv", std::string(first) + "`include \"defs.svh\"\n"
                           "module a;\n  logic [7:0] sig_a;\nendmodule\n");
     {
         Analyzer analyzer;
