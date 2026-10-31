@@ -1,4 +1,5 @@
 #include "analyzer.hpp"
+#include "features/document_highlight.hpp"
 #include "features/references.hpp"
 #include "features/rename.hpp"
 #include "string_utils.hpp"
@@ -2149,6 +2150,101 @@ TEST_CASE("definition: a macro usage goes to the `define in effect where it is w
     const auto on_undef = analyzer.definition_of(uri, 7, 7);
     REQUIRE(on_undef);
     CHECK(on_undef->line == 5);
+}
+
+TEST_CASE("references: a macro usage written inside another macro's arguments",
+          "[references][macro][macro-arg]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_refs_macro_in_arg.sv";
+    // Lines 9-10 redefine INNER after every usage: the usages still mean line 0's.
+    analyzer.open(uri, "`define INNER 1\n"
+                       "`define OUTER(x) (x + 1)\n"
+                       "`define TWICE(x) (x + x)\n"
+                       "`define NONE(x) 0\n"
+                       "module m;\n"
+                       "    localparam int A = `OUTER(`INNER);\n"
+                       "    localparam int B = `OUTER(`OUTER(`OUTER(`INNER)));\n"
+                       "    localparam int C = `TWICE(`INNER) + `NONE(`INNER);\n"
+                       "endmodule\n"
+                       "`undef INNER\n"
+                       "`define INNER 2\n");
+
+    auto has = [](const std::vector<Location>& refs, int line, int col) {
+        return std::any_of(refs.begin(), refs.end(),
+                           [&](const Location& r) { return r.line == line && r.col == col; });
+    };
+    auto count_on = [](const std::vector<Location>& refs, int line) {
+        return std::count_if(refs.begin(), refs.end(),
+                             [&](const Location& r) { return r.line == line; });
+    };
+
+    // Once per written occurrence: the argument TWICE uses twice and the one
+    // NONE never expands each count once.
+    const auto inner_refs = analyzer.find_references(uri, 0, 8, true);
+    CHECK(has(inner_refs, 5, 31));
+    CHECK(has(inner_refs, 6, 45));
+    CHECK(has(inner_refs, 7, 31));
+    CHECK(has(inner_refs, 7, 47));
+    CHECK(count_on(inner_refs, 5) == 1);
+    CHECK(count_on(inner_refs, 6) == 1);
+    CHECK(count_on(inner_refs, 7) == 2);
+
+    // Every nested level of `OUTER, once each.
+    const auto outer_refs = analyzer.find_references(uri, 1, 8, true);
+    CHECK(has(outer_refs, 5, 24));
+    CHECK(has(outer_refs, 6, 24));
+    CHECK(has(outer_refs, 6, 31));
+    CHECK(has(outer_refs, 6, 38));
+    CHECK(count_on(outer_refs, 6) == 3);
+
+    // From the usage itself: the same answer, so rename rewrites all of them.
+    const auto from_usage = analyzer.find_references(uri, 5, 31, true);
+    CHECK(from_usage.size() == inner_refs.size());
+    CHECK(has(from_usage, 0, 8));
+    const auto nested = analyzer.find_references(uri, 6, 38, true);
+    CHECK(nested.size() == outer_refs.size());
+    auto ident = analyzer.identifier_at(uri, 7, 47);
+    REQUIRE(ident);
+    CHECK(ident->name == "INNER");
+    CHECK(ident->col == 47);
+
+    // Definition and hover land on the `define in effect there.
+    for (auto [line, col] : {std::pair{5, 31}, {6, 45}, {7, 31}, {7, 47}}) {
+        CAPTURE(line, col);
+        const auto def = analyzer.definition_of(uri, line, col);
+        REQUIRE(def);
+        CHECK(def->line == 0);
+        const auto info = analyzer.symbol_at(uri, line, col);
+        REQUIRE(info);
+        CHECK(info->kind == "macro");
+        CHECK(info->detail == "1");
+    }
+    const auto nested_def = analyzer.definition_of(uri, 6, 38);
+    REQUIRE(nested_def);
+    CHECK(nested_def->line == 1);
+}
+
+TEST_CASE("document highlight: a macro usage inside another macro's arguments",
+          "[document-highlight][macro][macro-arg]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/lazyverilog_highlight_macro_in_arg.sv";
+    analyzer.open(uri, "`define INNER 1\n"
+                       "`define OUTER(x) (x + 1)\n"
+                       "module m;\n"
+                       "    localparam int A = `OUTER(`INNER) + `INNER;\n"
+                       "endmodule\n");
+    lsTextDocumentPositionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.position = lsPosition(3, 31);
+    const auto highlights = provide_document_highlight(analyzer, params);
+    auto has = [&](int line, int col) {
+        return std::any_of(highlights.begin(), highlights.end(), [&](const lsDocumentHighlight& h) {
+            return h.range.start.line == line && h.range.start.character == col;
+        });
+    };
+    CHECK(has(0, 8));
+    CHECK(has(3, 31));
+    CHECK(has(3, 41));
 }
 
 TEST_CASE("rename: a macro body identifier does not answer for the whole invocation",

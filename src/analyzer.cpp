@@ -2743,6 +2743,40 @@ static std::optional<SymbolInfo> find_macro_info(const slang::syntax::SyntaxTree
     return std::nullopt;
 }
 
+/// The `define of @p name in effect at @p at, from what slang recorded: the
+/// last `define of it before @p at that no `undef removed before @p at.  A
+/// `define the file redefines later and never uses outside an argument is in
+/// neither record, so null can also mean "not known here".
+static const slang::syntax::DefineDirectiveSyntax*
+macro_define_in_effect(const slang::syntax::SyntaxTree& tree, std::string_view name,
+                       slang::SourceLocation at) {
+    using namespace slang::syntax;
+    const auto& sm = tree.sourceManager();
+    // A location in another compilation unit (a predefine) comes first.
+    const auto before = [&](slang::SourceLocation a, slang::SourceLocation b) {
+        return sm.isBeforeInCompilationUnit(a, b).value_or(true);
+    };
+    const DefineDirectiveSyntax* best = nullptr;
+    const auto consider = [&](const DefineDirectiveSyntax* def) {
+        if (def && def->name.valueText() == name && before(def->name.location(), at) &&
+            (!best || before(best->name.location(), def->name.location())))
+            best = def;
+    };
+    for (const auto* def : tree.getDefinedMacros())
+        consider(def);
+    const auto refs = tree.getMacroRefs();
+    for (const auto& ref : refs)
+        consider(ref.definition);
+    if (!best || !macro_has_user_source_location(sm, best->name))
+        return nullptr;
+    for (const auto& ref : refs) {
+        if (ref.definition == best && ref.syntax->kind == SyntaxKind::UndefDirective &&
+            before(ref.syntax->as<UndefDirectiveSyntax>().name.location(), at))
+            return nullptr;
+    }
+    return best;
+}
+
 /// The `define slang expanded for the macro usage or `undef written in the
 /// tree's own file at (@p line, @p col): the one in effect there, which a
 /// redefine or `undef later in the file hides from getDefinedMacros().
@@ -2751,6 +2785,13 @@ static const slang::syntax::DefineDirectiveSyntax*
 macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, int col) {
     using namespace slang::syntax;
     const auto& sm = tree.sourceManager();
+    const auto covers = [&](slang::parsing::Token token) {
+        const auto loc = token.location();
+        if ((int)sm.getLineNumber(loc) != line + 1)
+            return false;
+        const int start = lsp_column(sm, loc);
+        return col >= start && col < start + (int)token.rawText().size();
+    };
     for (const auto& ref : tree.getMacroRefs()) {
         const auto token = ref.syntax->kind == SyntaxKind::UndefDirective
                                ? ref.syntax->as<UndefDirectiveSyntax>().name
@@ -2759,16 +2800,28 @@ macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, i
         if (!loc.valid() || !sm.isFileLoc(loc) || sm.getIncludedFrom(loc.buffer()).valid())
             continue;
         // The file's own references come in source order.
-        if (const int ref_line = (int)sm.getLineNumber(loc); ref_line > line + 1)
+        if ((int)sm.getLineNumber(loc) > line + 1)
             break;
-        else if (ref_line != line + 1)
+        if (covers(token)) {
+            return ref.definition && macro_has_user_source_location(sm, ref.definition->name)
+                       ? ref.definition
+                       : nullptr;
+        }
+        // A usage inside this one's arguments, which slang does not record: it
+        // expanded the `define in effect at this usage.
+        if (ref.syntax->kind != SyntaxKind::MacroUsage)
             continue;
-        const int start = lsp_column(sm, loc);
-        if (col < start || col >= start + (int)token.rawText().size())
+        const auto& usage = ref.syntax->as<MacroUsageSyntax>();
+        if (!usage.args || (usage.args->closeParen.location().valid() &&
+                            (int)sm.getLineNumber(usage.args->closeParen.location()) < line + 1))
             continue;
-        return ref.definition && macro_has_user_source_location(sm, ref.definition->name)
-                   ? ref.definition
-                   : nullptr;
+        slang::parsing::Token inner;
+        for_each_macro_usage_in_arguments(usage, [&](slang::parsing::Token t) {
+            if (!inner && t.location().valid() && sm.isFileLoc(t.location()) && covers(t))
+                inner = t;
+        });
+        if (inner)
+            return macro_define_in_effect(tree, inner.valueText().substr(1), loc);
     }
     return nullptr;
 }
@@ -5635,14 +5688,19 @@ struct DefinitionTargetVisitor : public slang::syntax::SyntaxVisitor<DefinitionT
             return;
 
         if (sm.isMacroLoc(token.location()) && !sm.isMacroArgLoc(token.location())) {
-            const auto [first, last] = cursors_in(sm.getExpansionRange(token.location()));
+            auto macro_name = sm.getMacroName(token.location());
+            if (macro_name.empty())
+                return;
+            // Only the `NAME itself: the range runs on over the arguments, and
+            // a `INNER written in one of them names INNER, not this macro.
+            const auto range = sm.getExpansionRange(token.location());
+            const auto name_end = range.start() + 1 + macro_name.size();
+            const auto [first, last] = cursors_in(
+                {range.start(), name_end < range.end() ? name_end : range.end()});
             for (size_t i = first; i < last; ++i) {
                 if (targets[i].kind != DefinitionTargetKind::None ||
                     macro_targets[i].kind != DefinitionTargetKind::None)
                     continue;
-                auto macro_name = sm.getMacroName(token.location());
-                if (macro_name.empty())
-                    break;
                 macro_targets[i].kind = DefinitionTargetKind::Macro;
                 macro_targets[i].name = std::string(macro_name);
                 macro_targets[i].scope_module = current_module;
