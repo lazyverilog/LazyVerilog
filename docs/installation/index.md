@@ -21,7 +21,7 @@ The editor picks the first one it finds:
 
 The managed download supports `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, and
 `windows-x64`. On Linux, if the binary needs libraries the system lacks, the editor retries with the
-`-static` build (glibc 2.35 or newer).
+`-static` build (glibc 2.28 or newer, e.g. RHEL 8).
 
 ## Build from source
 
