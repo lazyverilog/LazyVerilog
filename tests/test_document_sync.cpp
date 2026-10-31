@@ -39,6 +39,15 @@ TEST_CASE("doc sync: a stringifying macro whose arguments run to end of file par
     CHECK(state->tree != nullptr);
 }
 
+TEST_CASE("doc sync: a missing final newline is not reported", "[sync]") {
+    // slang v12 warns newline-eof; its own driver leaves it off by default.
+    Analyzer a;
+    a.open(kUri, "module m;\nendmodule");
+    auto state = a.get_state(kUri);
+    REQUIRE(state != nullptr);
+    CHECK(state->parse_diagnostics.empty());
+}
+
 TEST_CASE("doc sync: change updates text and re-parses tree", "[sync]") {
     Analyzer a;
     a.open(kUri, kSrc1);
