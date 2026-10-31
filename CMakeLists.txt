@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 project(lazyverilog-lsp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -68,13 +68,6 @@ set(SLANG_INCLUDE_TESTS OFF CACHE BOOL "Skip slang tests" FORCE)
 set(SLANG_INCLUDE_DOCS OFF CACHE BOOL "Skip slang docs" FORCE)
 set(SLANG_INCLUDE_PYLIB OFF CACHE BOOL "Skip slang Python bindings" FORCE)
 set(SLANG_INCLUDE_INSTALL OFF CACHE BOOL "Skip slang install targets" FORCE)
-# MinGW: slang's mimalloc overrides operator new/delete from a static library,
-# which mimalloc does not support on Windows: a std::string allocated by
-# mimalloc's operator new is freed by libstdc++-6.dll's operator delete (ucrt
-# free), and the server dies at startup with heap corruption (0xC0000374).
-if(MINGW)
-    set(SLANG_USE_MIMALLOC OFF CACHE BOOL "Enable use of the mimalloc library")
-endif()
 FetchContent_Declare(
     slang
     GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
