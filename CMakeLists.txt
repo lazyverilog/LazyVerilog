@@ -112,6 +112,32 @@ if(MINGW)
 endif()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Patch: give SourceManager the line an editor addresses.  getLineNumber()
+# applies `line directives; see cmake/slang/SourceManagerFileLine.cpp.  Its lock
+# is spelled with CTAD, so this applies before or after the MinGW swap above.
+# ──────────────────────────────────────────────────────────────────────────────
+set(_file_line_decl "size_t getFileLineNumber(SourceLocation location) const;")
+file(READ "${slang_SOURCE_DIR}/include/slang/text/SourceManager.h" _sm_header)
+string(FIND "${_sm_header}" "${_file_line_decl}" _file_line_done)
+if(_file_line_done EQUAL -1)
+    set(_line_decl "size_t getLineNumber(SourceLocation location) const;")
+    set(_line_def "size_t SourceManager::getColumnNumber(SourceLocation location) const {")
+    file(READ "${slang_SOURCE_DIR}/source/text/SourceManager.cpp" _sm_source)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/slang/SourceManagerFileLine.cpp" _file_line_def)
+    string(FIND "${_sm_header}" "${_line_decl}" _line_decl_at)
+    string(FIND "${_sm_source}" "${_line_def}" _line_def_at)
+    if(_line_decl_at EQUAL -1 OR _line_def_at EQUAL -1)
+        message(FATAL_ERROR "Could not patch slang's SourceManager file line number; re-derive the patch.")
+    endif()
+    string(REPLACE "${_line_decl}"
+           "${_line_decl}\n\n    /// lazyverilog patch: see cmake/slang/SourceManagerFileLine.cpp.\n    ${_file_line_decl}"
+           _sm_header "${_sm_header}")
+    string(REPLACE "${_line_def}" "${_file_line_def}${_line_def}" _sm_source "${_sm_source}")
+    file(WRITE "${slang_SOURCE_DIR}/include/slang/text/SourceManager.h" "${_sm_header}")
+    file(WRITE "${slang_SOURCE_DIR}/source/text/SourceManager.cpp" "${_sm_source}")
+endif()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # External: LspCpp (LSP JSON-RPC transport + type system)
 # ──────────────────────────────────────────────────────────────────────────────
 FetchContent_Declare(

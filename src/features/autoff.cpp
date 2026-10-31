@@ -26,7 +26,7 @@ struct DeclAtLineVisitor : public SyntaxVisitor<DeclAtLineVisitor> {
     bool on_target_line(const SyntaxNode& node) {
         auto tok = node.getFirstToken();
         if (!tok.valid() || !tok.location().valid()) return false;
-        size_t ln = sm.getLineNumber(tok.location());
+        size_t ln = sm.getFileLineNumber(tok.location());
         return (int)(ln > 0 ? ln - 1 : 0) == target_line;
     }
 
@@ -133,7 +133,7 @@ static const StatementSyntax* unwrap_procedural_body(const StatementSyntax* stat
 
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid()) return 0;
-    auto line = sm.getLineNumber(tok.location());
+    auto line = sm.getFileLineNumber(tok.location());
     return line > 0 ? (int)line - 1 : 0;
 }
 

@@ -23,8 +23,8 @@ static std::pair<int, int> source_range_lines(const slang::SourceManager& sm,
                                               slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
         return {0, 0};
-    const auto start = sm.getLineNumber(range.start());
-    const auto end = sm.getLineNumber(range.end());
+    const auto start = sm.getFileLineNumber(range.start());
+    const auto end = sm.getFileLineNumber(range.end());
     return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
 }
 
@@ -328,7 +328,7 @@ static int syntax_end_line0(const slang::SourceManager& sm, const SyntaxNode& no
     const auto end = node.sourceRange().end();
     if (!end.valid())
         return fallback_line;
-    const auto line = sm.getLineNumber(end);
+    const auto line = sm.getFileLineNumber(end);
     return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
 }
 

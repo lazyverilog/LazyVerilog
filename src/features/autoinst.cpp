@@ -28,7 +28,7 @@ struct InstCollector : public SyntaxVisitor<InstCollector> {
     void handle(const HierarchyInstantiationSyntax& node) {
         auto tok = node.getFirstToken();
         if (tok.valid() && tok.location().valid()) {
-            size_t ln = sm.getLineNumber(tok.location());
+            size_t ln = sm.getFileLineNumber(tok.location());
             int line_0 = (int)(ln > 0 ? ln - 1 : 0);
             candidates.push_back({line_0, &node});
         }

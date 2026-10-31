@@ -188,18 +188,24 @@ std::string uri_from_source_location(const slang::SourceManager& sm,
     // The current document is parsed from client text under a `line directive
     // that names its client URI.  Keep that exact spelling: features compare the
     // result against the document URI they were handed, and re-deriving it from
-    // the path would silently rewrite a non-canonical client URI.
-    auto file_name = sm.getFileName(location);
+    // the path would silently rewrite a non-canonical client URI.  That name is
+    // the one at the buffer's start: a `line the user wrote further down names
+    // some other file, while the editor still means this one.  Predefine text
+    // is the exception, as in cmake/slang/SourceManagerFileLine.cpp.
+    const auto buffer = sm.getFullyExpandedLoc(location).buffer();
+    const auto raw_name = sm.getRawFileName(buffer);
+    auto file_name = sm.getFileName(raw_name.starts_with("<unnamed_buffer")
+                                        ? location
+                                        : slang::SourceLocation(buffer, 0));
     // slang v12 spells a `line name relative to the buffer's own full path
     // (`replace_filename`), so the URI arrives behind that file's directory.
-    const auto raw_name = sm.getRawFileName(sm.getFullyExpandedLoc(location).buffer());
     const auto directory = raw_name.substr(0, raw_name.find_last_of("/\\") + 1);
     if (file_name != raw_name && file_name.starts_with(directory))
         file_name.remove_prefix(directory.size());
     if (file_name.starts_with("file://"))
         return std::string(file_name);
 
-    auto uri = uri_from_source_buffer(sm, sm.getFullyExpandedLoc(location).buffer());
+    auto uri = uri_from_source_buffer(sm, buffer);
     if (!uri.empty())
         return uri;
     return uri_from_file_name(file_name);
@@ -368,7 +374,7 @@ std::pair<int, int> token_pos_line1_col0(const slang::SourceManager& sm,
     // actually written instead, matching location_from_token()'s live-AST
     // handling of the same case.
     const auto location = token_true_origin_location(sm, token);
-    const auto line = sm.getLineNumber(location);
+    const auto line = sm.getFileLineNumber(location);
     // Stored columns are UTF-16, converted here while the buffer is still in
     // hand.  A shard keeps no source text, so a position recorded for a file
     // that is later closed can never be converted after the fact.
@@ -400,7 +406,7 @@ std::pair<int, int> spelled_pos_line1_col0(const slang::SourceManager& sm,
             return {0, 0};
         loc = expanded(from);
     }
-    const auto line = sm.getLineNumber(loc);
+    const auto line = sm.getFileLineNumber(loc);
     return {line > 0 ? static_cast<int>(line) : 0, lsp_column(sm, loc)};
 }
 
@@ -874,7 +880,7 @@ std::pair<int, int> token_pos(const slang::SourceManager& sm, const slang::parsi
     const auto location = sm.isMacroArgLoc(token.location())
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
-    const auto line = sm.getLineNumber(location);
+    const auto line = sm.getFileLineNumber(location);
     return {line > 0 ? static_cast<int>(line) : 0, lsp_column(sm, location)};
 }
 

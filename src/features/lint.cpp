@@ -46,7 +46,7 @@ static ParseDiagInfo make_diag(SourceManager& sm, SourceLocation loc,
             std::cerr << "[lazyverilog] lint diagnostic URI resolution failed: "
                          "non-standard exception\n";
         }
-        size_t ln = sm.getLineNumber(loc);
+        size_t ln = sm.getFileLineNumber(loc);
         d.line = ln > 0 ? (int)ln - 1 : 0;
         d.col  = lsp_column(sm, loc);
     }

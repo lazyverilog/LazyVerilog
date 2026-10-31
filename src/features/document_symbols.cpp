@@ -115,7 +115,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         const auto end = node.sourceRange().end();
         if (!end.valid())
             return {};
-        const auto line = sm.getLineNumber(end);
+        const auto line = sm.getFileLineNumber(end);
         return Extent{(int)line, lsp_column(sm, end)};
     }
 
@@ -152,7 +152,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         if (!expansion.start().valid() || !in_document(expansion.start()))
             return;
         out.macro_decl_sites.emplace(std::string(name.valueText()),
-                                     std::make_pair((int)sm.getLineNumber(expansion.start()),
+                                     std::make_pair((int)sm.getFileLineNumber(expansion.start()),
                                                     lsp_column(sm, expansion.start())));
     }
 
@@ -175,7 +175,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
                 if (!decl || !decl->name || !in_document(decl->name.location()))
                     continue;
                 block.decls.push_back(BlockDecl{std::string(decl->name.valueText()), type,
-                                                (int)sm.getLineNumber(decl->name.location()),
+                                                (int)sm.getFileLineNumber(decl->name.location()),
                                                 lsp_column(sm, decl->name.location())});
             }
         }
@@ -185,7 +185,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
     void handle(const slang::syntax::FunctionDeclarationSyntax& node) {
         const auto first = node.getFirstToken();
         if (first && in_document(first.location()))
-            out.subroutines[(int)sm.getLineNumber(first.location())] = extent_of(node);
+            out.subroutines[(int)sm.getFileLineNumber(first.location())] = extent_of(node);
         visitDefault(node);
     }
 
@@ -204,7 +204,7 @@ struct ShapeVisitor : slang::syntax::SyntaxVisitor<ShapeVisitor> {
         block.name = std::move(label);
         block.declarations_from_index = declarations_from_index;
         block.detail = std::move(detail);
-        block.line = (int)sm.getLineNumber(begin);
+        block.line = (int)sm.getFileLineNumber(begin);
         block.col = lsp_column(sm, begin);
         block.end_line = extent.end_line;
         block.end_col = extent.end_col;
