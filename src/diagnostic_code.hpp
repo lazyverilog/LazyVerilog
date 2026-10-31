@@ -2,6 +2,8 @@
 
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
+#include <slang/driver/CompatSettings.h>
+#include <slang/text/SourceManager.h>
 
 #include <string>
 
@@ -20,6 +22,20 @@
 /// slang's option names are lowercase-with-hyphens and its enum names are
 /// CamelCase, which is also how the CLI tells them apart when validating a
 /// `--nowarn` value.
+/// The severity slang's own driver reports for @p code.  Since v11 many errors
+/// are warnings that the driver promotes back to errors by default
+/// (`CompatSettings`, e.g. `redefinition`); getDefaultSeverity() alone would
+/// report them as warnings.
+inline slang::DiagnosticSeverity slang_diagnostic_severity(slang::DiagCode code) {
+    static const slang::DiagnosticEngine& engine = []() -> const slang::DiagnosticEngine& {
+        static slang::SourceManager sm;
+        static slang::DiagnosticEngine configured(sm);
+        slang::driver::CompatSettings{}.configureDiagnostics(configured);
+        return configured;
+    }();
+    return engine.getSeverity(code, slang::SourceLocation::NoLocation);
+}
+
 inline std::string slang_diagnostic_code(const slang::DiagnosticEngine& engine,
                                          slang::DiagCode code) {
     const std::string_view option = engine.getOptionName(code);

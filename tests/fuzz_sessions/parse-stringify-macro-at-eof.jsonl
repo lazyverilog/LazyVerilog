@@ -1,4 +1,4 @@
-{"note": "a stringifying macro whose arguments run to end of file read lexerStack.back() of an empty vector in slang v10.0 (fix: cmake/slang/stringify_lexer.cpp.in)"}
+{"note": "a stringifying macro whose arguments run to end of file read lexerStack.back() of an empty vector in slang v10.0 (fixed upstream: slang v12 stringifies without a lexer)"}
 {"send": {"jsonrpc": "2.0", "method": "initialize", "params": {"processId": null, "rootUri": null, "capabilities": {}}, "id": 0}}
 {"send": {"jsonrpc": "2.0", "method": "initialized", "params": {}}}
 {"send": {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": "file:///fuzz/stringify_eof.sv", "languageId": "systemverilog", "version": 1, "text": "`define S(x) `\"x`\"\n`S(a\n"}}}}

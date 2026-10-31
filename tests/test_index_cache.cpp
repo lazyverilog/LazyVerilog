@@ -1456,6 +1456,54 @@ TEST_CASE("index cache: an unchanged include resolution is still a hit", "[index
     CHECK(cold.count("shared_decl") == 1);
 }
 
+TEST_CASE("index cache: a guarded header included twice is still a hit", "[index-cache]") {
+    // slang skips a header-guarded file the second time it is `include`d, and
+    // that directive then carries no buffer.  Recorded as unresolved, it never
+    // matched the header the warm check finds, so the shard was never reused.
+    CacheProject project("analyzer-guarded-twice");
+    project.write("defs.svh",
+                  "`ifndef DEFS_SVH\n`define DEFS_SVH\nlocalparam int shared_decl = 9;\n`endif\n");
+    project.write("a.sv", "`include \"defs.svh\"\n`include \"defs.svh\"\n"
+                          "module a;\n  logic [7:0] sig_a;\nendmodule\n");
+    {
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv"});
+    }
+
+    // Plant a sentinel in every shard, keeping its key: it only comes back
+    // from a shard that was read rather than reparsed.
+    size_t edited = 0;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(IndexCache::directory_for(project.root()))) {
+        if (entry.path().extension() != ".idx")
+            continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+        in.close();
+        auto loaded = deserialize_index_shard(bytes);
+        REQUIRE(loaded);
+        if (loaded->index.modules.empty())
+            continue; // the header's shard; a.sv's holds the module
+        ValueEntry sentinel;
+        sentinel.name = "only_a_reused_shard_has_this";
+        sentinel.kind = "variable";
+        sentinel.file_id = kInvalidSourceFileID;
+        loaded->index.values.push_back(sentinel);
+        const auto rewritten =
+            serialize_index_shard(loaded->key, loaded->index, loaded->stands_alone);
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(rewritten.data(), static_cast<std::streamsize>(rewritten.size()));
+        ++edited;
+    }
+    REQUIRE(edited == 1);
+
+    Analyzer analyzer;
+    const auto warm = snapshot_values(project.index(analyzer, {"a.sv"}));
+    CHECK(warm.count("only_a_reused_shard_has_this") == 1);
+    CHECK(warm.count("shared_decl") == 1);
+}
+
 TEST_CASE("index cache: a shard whose file is gone is removed", "[index-cache]") {
     // A shard is named from its file's URI, so editing a file rewrites its
     // shard in place and the directory does not grow.  Deleting or renaming one

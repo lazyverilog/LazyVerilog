@@ -2,6 +2,7 @@
 #include "../syntax_index.hpp"
 #include "../string_utils.hpp"
 #include <slang/syntax/AllSyntax.h>
+#include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
 #include <optional>

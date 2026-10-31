@@ -27,9 +27,10 @@ TEST_CASE("doc sync: open creates DocumentState with parsed SyntaxTree", "[sync]
 
 TEST_CASE("doc sync: a stringifying macro whose arguments run to end of file parses",
           "[sync]") {
-    // slang v10.0 stringifies through the current lexer, and by the time an
+    // slang v10.0 stringified through the current lexer, and by the time an
     // unterminated `S(` is expanded the last one has been popped: it read
     // lexerStack.back() of an empty vector (found by the nightly fuzz).
+    // slang v12 stringifies without a lexer; this guards against a regression.
     Analyzer a;
     const std::string text = "`define S(x) `\"x`\"\n`S(a\n";
     a.open(kUri, text);
