@@ -23,6 +23,7 @@ class ClassDeclarationSyntax;
 class ClockingDeclarationSyntax;
 class DefineDirectiveSyntax;
 class ExpressionSyntax;
+class MacroUsageSyntax;
 class FunctionPrototypeSyntax;
 class MemberSyntax;
 class PropertyExprSyntax;
@@ -233,6 +234,15 @@ member_subroutine_prototype(const slang::syntax::MemberSyntax& member);
 /// Replacement text of a `` `define `` as hover renders it: the body tokens with
 /// their trivia, trimmed.  Shared by the live-tree hover and the shard entry.
 std::string macro_body_text(const slang::syntax::DefineDirectiveSyntax& def);
+
+/// Calls @p f with every `` `NAME `` written inside @p usage's arguments,
+/// nested ones included, in source order.  slang's getMacroRefs() records only
+/// the top-level usage: the ones in its arguments are expanded on the way and
+/// never recorded, and one in an argument the body never uses is not expanded
+/// at all.  The argument tokens are what the user wrote, so this sees each of
+/// them exactly once however often the body uses it.
+void for_each_macro_usage_in_arguments(const slang::syntax::MacroUsageSyntax& usage,
+                                       const std::function<void(slang::parsing::Token)>& f);
 
 /// MacroEntry for @p def.  Used by the shard and the open-buffer index alike;
 /// @p with_body false skips the body text (see collect_macros()).

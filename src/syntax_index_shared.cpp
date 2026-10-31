@@ -31,6 +31,21 @@ const FunctionPrototypeSyntax* member_subroutine_prototype(const MemberSyntax& m
     return nullptr;
 }
 
+void for_each_macro_usage_in_arguments(const MacroUsageSyntax& usage,
+                                       const std::function<void(slang::parsing::Token)>& f) {
+    if (!usage.args)
+        return;
+    // An argument is a flat token list: `A(`B(`C)) holds `B ( `C ) as is.
+    for (const auto* arg : usage.args->args) {
+        for (const auto token : arg->tokens) {
+            if (token.kind == slang::parsing::TokenKind::Directive &&
+                token.directiveKind() == SyntaxKind::MacroUsage &&
+                token.valueText().size() > 1)
+                f(token);
+        }
+    }
+}
+
 std::string macro_body_text(const DefineDirectiveSyntax& def) {
     std::string body;
     for (const auto& token : def.body)
@@ -1209,6 +1224,30 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         add_macro_ref(std::string(ref.definition->name.valueText()),
                       file_ids.for_token(index, sm, token), line,
                       col + (token.rawText().starts_with('`') ? 1 : 0));
+    }
+
+    // Usages written inside a usage's arguments, which getMacroRefs() leaves
+    // out.  Recorded under the name written, as a top-level usage of it is,
+    // when the tree defines it at all: `` `OUTER(`INNER) `` expands the `define
+    // of INNER in effect at `OUTER, which has INNER's name.
+    std::unordered_set<std::string_view> defined_names;
+    for (const auto* def : defines) {
+        if (def)
+            defined_names.insert(def->name.valueText());
+    }
+    for (const auto& ref : tree.getMacroRefs()) {
+        if (ref.syntax->kind != SyntaxKind::MacroUsage)
+            continue;
+        for_each_macro_usage_in_arguments(
+            ref.syntax->as<MacroUsageSyntax>(), [&](slang::parsing::Token token) {
+                const auto name = token.valueText().substr(1);
+                if (!defined_names.contains(name) || !token.location().valid() ||
+                    !sm.isFileLoc(token.location()) || !file_ids.accepts(index, sm, token))
+                    return;
+                const auto [line, col] = token_pos_line1_col0(sm, token);
+                add_macro_ref(std::string(name), file_ids.for_token(index, sm, token), line,
+                              col + 1);
+            });
     }
 
     // === Combined visitor ===
