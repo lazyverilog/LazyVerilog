@@ -127,6 +127,8 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
     auto& sm = state.tree->sourceManager();
     slang::DiagnosticEngine engine(sm);
     for (const auto& d : diags) {
+        if (slang_diagnostic_hidden(d.code))
+            continue;
         ParseDiagInfo info;
         try {
             auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;

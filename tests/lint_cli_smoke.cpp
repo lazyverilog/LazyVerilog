@@ -1,6 +1,7 @@
 #include "cli_process.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -72,6 +73,20 @@ int main(int argc, char** argv) {
         expect(contains(result.stdout_text, "[naming]"), "reports a [naming] lint diagnostic");
         expect(contains(result.stdout_text, "m_top.sv:"),
               "diagnostic lines are prefixed with the source file path");
+    }
+
+    // A file without a final newline: slang v12's newline-eof stays off, like in
+    // slang's own driver.
+    {
+        const fs::path no_eol = fs::temp_directory_path() / "lazyverilog_lint_smoke_no_eol.sv";
+        {
+            std::ofstream out(no_eol, std::ios::binary);
+            out << "module m_no_eol;\nendmodule";
+        }
+        auto result = run_command(lint_bin, shell_quote(no_eol));
+        expect(!contains(result.stdout_text, "newline-eof"), "newline-eof is not reported");
+        expect(result.exit_code == 0, "a clean file without a final newline exits 0");
+        fs::remove(no_eol);
     }
 
     // --lint-only: drops compilation diagnostics, keeps lint diagnostics.

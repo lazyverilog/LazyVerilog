@@ -2,6 +2,7 @@
 
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/diagnostics/Diagnostics.h>
+#include <slang/diagnostics/LexerDiags.h>
 #include <slang/driver/CompatSettings.h>
 #include <slang/text/SourceManager.h>
 
@@ -34,6 +35,13 @@ inline slang::DiagnosticSeverity slang_diagnostic_severity(slang::DiagCode code)
         return configured;
     }();
     return engine.getSeverity(code, slang::SourceLocation::NoLocation);
+}
+
+/// Diagnostics no lazyverilog binary reports.  `newline-eof` (slang v12) is a
+/// style warning slang's own driver leaves off by default, and it fires on
+/// most real files.
+inline bool slang_diagnostic_hidden(slang::DiagCode code) {
+    return code == slang::diag::NewlineEOF;
 }
 
 inline std::string slang_diagnostic_code(const slang::DiagnosticEngine& engine,

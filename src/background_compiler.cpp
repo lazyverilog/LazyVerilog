@@ -506,7 +506,8 @@ void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
         slang::DiagnosticEngine engine(*source_manager);
         try {
             for (const auto& diagnostic : compilation.getSemanticDiagnostics()) {
-                if (parse_inputs && is_foreign_macro_warning(*source_manager, diagnostic, *parse_inputs))
+                if (slang_diagnostic_hidden(diagnostic.code) ||
+                    (parse_inputs && is_foreign_macro_warning(*source_manager, diagnostic, *parse_inputs)))
                     continue;
                 std::string uri;
                 auto info = convert_diagnostic(*source_manager, engine, diagnostic, first_uri, uri);
