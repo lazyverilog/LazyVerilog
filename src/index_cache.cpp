@@ -32,7 +32,8 @@ constexpr uint32_t kMagic = 0x5849564c;  // "LVIX", little end first
 // 14: built by slang v12.1, whose parser fixes can change what a shard holds.
 // 15: macro usages and `undef sites come from slang's macro references.
 // 16: macro usages written inside another macro's arguments are recorded.
-constexpr uint32_t kFormatVersion = 16;
+// 17: positions after a `line directive are the lines of the file as written.
+constexpr uint32_t kFormatVersion = 17;
 // Written and compared in native byte order, like every other number here --
 // which means it cannot, on its own, detect the foreign-endian file it is named
 // for: kMagic above is a native u32 too and already fails first on one.  It is
