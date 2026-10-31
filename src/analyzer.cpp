@@ -134,7 +134,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
             auto loc = d.location.valid() ? sm.getFullyExpandedLoc(d.location) : d.location;
             info.uri = location_to_uri(sm, loc, fallback_uri);
             if (loc.valid() && sm.isFileLoc(loc)) {
-                size_t ln = sm.getLineNumber(loc);
+                size_t ln = sm.getFileLineNumber(loc);
                 info.line = ln > 0 ? (int)ln - 1 : 0;
                 info.col = lsp_column(sm, loc);
             }
@@ -1234,7 +1234,7 @@ static void collect_prefix_macros(std::string_view prefix, const std::string& pa
         // definition, hover and anything declared by an expansion land where the
         // macro is really written rather than in the predefine buffer.
         macro.definition.append("\n`line ")
-            .append(std::to_string(sm->getLineNumber(start)))
+            .append(std::to_string(sm->getFileLineNumber(start)))
             .append(" \"")
             .append(uri_from_path(sm->getFullPath(start.buffer())))
             .append("\" 0\n")
@@ -2583,7 +2583,7 @@ static Location location_from_token(const slang::SourceManager& sm, const std::s
     const auto location = sm.isMacroLoc(token.location())
                               ? sm.getFullyOriginalLoc(token.location())
                               : token.location();
-    const int line = to_lsp_line((int)sm.getLineNumber(location));
+    const int line = to_lsp_line((int)sm.getFileLineNumber(location));
     const int col = lsp_column(sm, location);
     return Location{uri, line, col, line,
                     col + lsp_column_width(token.valueText())};
@@ -2787,7 +2787,7 @@ macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, i
     const auto& sm = tree.sourceManager();
     const auto covers = [&](slang::parsing::Token token) {
         const auto loc = token.location();
-        if ((int)sm.getLineNumber(loc) != line + 1)
+        if ((int)sm.getFileLineNumber(loc) != line + 1)
             return false;
         const int start = lsp_column(sm, loc);
         return col >= start && col < start + (int)token.rawText().size();
@@ -2800,7 +2800,7 @@ macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, i
         if (!loc.valid() || !sm.isFileLoc(loc) || sm.getIncludedFrom(loc.buffer()).valid())
             continue;
         // The file's own references come in source order.
-        if ((int)sm.getLineNumber(loc) > line + 1)
+        if ((int)sm.getFileLineNumber(loc) > line + 1)
             break;
         if (covers(token)) {
             return ref.definition && macro_has_user_source_location(sm, ref.definition->name)
@@ -2813,7 +2813,7 @@ macro_definition_in_effect_at(const slang::syntax::SyntaxTree& tree, int line, i
             continue;
         const auto& usage = ref.syntax->as<MacroUsageSyntax>();
         if (!usage.args || (usage.args->closeParen.location().valid() &&
-                            (int)sm.getLineNumber(usage.args->closeParen.location()) < line + 1))
+                            (int)sm.getFileLineNumber(usage.args->closeParen.location()) < line + 1))
             continue;
         slang::parsing::Token inner;
         for_each_macro_usage_in_arguments(usage, [&](slang::parsing::Token t) {
@@ -3072,8 +3072,8 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             scope_stack.emplace_back(0, 0);
             return;
         }
-        scope_stack.emplace_back((int)sm.getLineNumber(range.start()),
-                                 (int)sm.getLineNumber(range.end()));
+        scope_stack.emplace_back((int)sm.getFileLineNumber(range.start()),
+                                 (int)sm.getFileLineNumber(range.end()));
     }
 
     int scope_depth() const {
@@ -3223,8 +3223,8 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
         if (!range.start().valid() || !range.end().valid() ||
             uri_from_source_location(sm, range.start()) != uri)
             return;
-        subroutine_bodies.emplace_back((int)sm.getLineNumber(range.start()),
-                                       (int)sm.getLineNumber(range.end()));
+        subroutine_bodies.emplace_back((int)sm.getFileLineNumber(range.start()),
+                                       (int)sm.getFileLineNumber(range.end()));
         push_scope(range);
         visitDefault(node);
         scope_stack.pop_back();
@@ -3247,8 +3247,8 @@ struct GenericDefinitionVisitor : public slang::syntax::SyntaxVisitor<GenericDef
             return;
         if (uri_from_source_location(sm, range.start()) != uri)
             return;
-        subroutine_bodies.emplace_back((int)sm.getLineNumber(range.start()),
-                                       (int)sm.getLineNumber(range.end()));
+        subroutine_bodies.emplace_back((int)sm.getFileLineNumber(range.start()),
+                                       (int)sm.getFileLineNumber(range.end()));
 
         // A subroutine body is a scope in exactly the way a begin/end block is:
         //
@@ -3755,8 +3755,8 @@ static std::pair<int, int> source_range_lines_one_based(const slang::SourceManag
                                                         slang::SourceRange range) {
     if (!range.start().valid() || !range.end().valid())
         return {0, 0};
-    const auto start = sm.getLineNumber(range.start());
-    const auto end = sm.getLineNumber(range.end());
+    const auto start = sm.getFileLineNumber(range.start());
+    const auto end = sm.getFileLineNumber(range.end());
     return {start > 0 ? (int)start : 0, end > 0 ? (int)end : 0};
 }
 
@@ -5003,9 +5003,9 @@ static bool contains_position(const slang::SourceManager& sm, slang::SourceRange
         return false;
 
     // Compared against a request position, which the client measures in UTF-16.
-    const int start_line = to_lsp_line((int)sm.getLineNumber(range.start()));
+    const int start_line = to_lsp_line((int)sm.getFileLineNumber(range.start()));
     const int start_col = lsp_column(sm, range.start());
-    const int end_line = to_lsp_line((int)sm.getLineNumber(range.end()));
+    const int end_line = to_lsp_line((int)sm.getFileLineNumber(range.end()));
     const int end_col = lsp_column(sm, range.end());
 
     if (line < start_line || line > end_line)
@@ -5039,9 +5039,9 @@ static std::pair<size_t, size_t> cursor_span(const slang::SourceManager& sm,
                                              slang::SourceRange range, const std::string& uri) {
     if (cursors.empty() || !range.start().valid() || !range.end().valid())
         return {0, 0};
-    const std::pair<int, int> start{to_lsp_line((int)sm.getLineNumber(range.start())),
+    const std::pair<int, int> start{to_lsp_line((int)sm.getFileLineNumber(range.start())),
                                     lsp_column(sm, range.start())};
-    const std::pair<int, int> end{to_lsp_line((int)sm.getLineNumber(range.end())),
+    const std::pair<int, int> end{to_lsp_line((int)sm.getFileLineNumber(range.end())),
                                   lsp_column(sm, range.end())};
     const auto first = std::lower_bound(cursors.begin(), cursors.end(), start);
     const auto last = std::lower_bound(first, cursors.end(), end);
@@ -5092,9 +5092,9 @@ public:
             start.buffer() != end.buffer())
             return true;
         // The containment cursor_span() tests: start <= cursor < end.
-        const std::pair<int, int> from{to_lsp_line((int)sm.getLineNumber(start)),
+        const std::pair<int, int> from{to_lsp_line((int)sm.getFileLineNumber(start)),
                                        lsp_column(sm, start)};
-        const std::pair<int, int> to{to_lsp_line((int)sm.getLineNumber(end)), lsp_column(sm, end)};
+        const std::pair<int, int> to{to_lsp_line((int)sm.getFileLineNumber(end)), lsp_column(sm, end)};
         const auto first_cursor = std::lower_bound(cursors.begin(), cursors.end(), from);
         const auto last_cursor = std::lower_bound(first_cursor, cursors.end(), to);
         bool any = false;
@@ -5130,7 +5130,7 @@ static bool cursors_in_define(const slang::syntax::SyntaxTree& tree,
             size_t past = text.size();
             while (start < past) {
                 const size_t mid = start + (past - start) / 2;
-                if (sm.getLineNumber(slang::SourceLocation(buffer, mid)) < size_t(line) + 1)
+                if (sm.getFileLineNumber(slang::SourceLocation(buffer, mid)) < size_t(line) + 1)
                     start = mid + 1;
                 else
                     past = mid;
@@ -6361,7 +6361,7 @@ struct IdentifierTokenVisitor : public slang::syntax::SyntaxVisitor<IdentifierTo
         for (size_t i = first; i < last; ++i) {
             if (results[i])
                 continue;
-            const int token_line = to_lsp_line((int)sm.getLineNumber(range.start()));
+            const int token_line = to_lsp_line((int)sm.getFileLineNumber(range.start()));
             const int token_col = lsp_column(sm, range.start());
             const std::string name(token.valueText());
             results[i] = IdentifierAtPosition{
@@ -6446,7 +6446,7 @@ static std::optional<Location> include_target_at(const DocumentState& state, int
         const auto loc = sm.getIncludedFrom(buffer);
         if (!loc.valid() || loc.buffer() != owning_buffer)
             continue;
-        if (static_cast<int>(sm.getLineNumber(loc)) - 1 != line)
+        if (static_cast<int>(sm.getFileLineNumber(loc)) - 1 != line)
             continue;
 
         const auto& full_path = sm.getFullPath(buffer);

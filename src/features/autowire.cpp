@@ -40,7 +40,7 @@ static bool in_range(int line, LineRange range) {
 static int token_line(const SourceManager& sm, const slang::parsing::Token& tok) {
     if (!tok || !tok.location().valid())
         return 0;
-    auto line = sm.getLineNumber(tok.location());
+    auto line = sm.getFileLineNumber(tok.location());
     return line > 0 ? (int)line - 1 : 0;
 }
 

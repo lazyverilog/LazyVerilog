@@ -3923,3 +3923,29 @@ endpackage
 
     std::filesystem::remove_all(dir);
 }
+
+// A `line directive renumbers slang's lines, but the editor addresses the
+// lines of the file as written.  Every position must stay physical.
+TEST_CASE("references: positions after a `line directive stay physical", "[references][line]") {
+    const std::string text = "`define W 8\n"
+                             "module top;\n"
+                             "`line 100 \"gen.sv\" 0\n"
+                             "  logic [`W-1:0] a;\n"
+                             "  logic b;\n"
+                             "  assign b = a[0];\n"
+                             "endmodule\n";
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_line_directive.sv";
+    analyzer.open(uri, text);
+
+    const auto def = analyzer.definition_of(uri, 5, 13);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == uri);
+    CHECK(def->line == 3);
+    CHECK(def->col == 17);
+
+    CHECK(reference_lines(analyzer.find_references(uri, 3, 17, true), uri) ==
+          std::vector<int>{3, 5});
+    CHECK(reference_lines(analyzer.find_references(uri, 0, 8, true), uri) ==
+          std::vector<int>{0, 3});
+}

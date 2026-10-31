@@ -290,7 +290,7 @@ static std::optional<SubroutineInfo> subroutine_at_declaration(const SyntaxTree&
             if (!loc.valid())
                 return false;
             // `col` came from the request, so it is a UTF-16 column.
-            return (int)sm.getLineNumber(loc) - 1 == line && lsp_column(sm, loc) == col;
+            return (int)sm.getFileLineNumber(loc) - 1 == line && lsp_column(sm, loc) == col;
         }
 
         void handle(const FunctionDeclarationSyntax& node) {

@@ -56,7 +56,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
                                                : diagnostic.location;
         uri = diagnostic_uri(sm, fallback_uri, loc);
         if (loc.valid() && sm.isFileLoc(loc)) {
-            const size_t line = sm.getLineNumber(loc);
+            const size_t line = sm.getFileLineNumber(loc);
             info.line = line > 0 ? static_cast<int>(line) - 1 : 0;
             info.col = lsp_column(sm, loc);
         }

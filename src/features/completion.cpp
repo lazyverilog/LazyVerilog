@@ -1226,7 +1226,7 @@ static std::pair<int, int> completion_ast_token_pos(const slang::SourceManager& 
                                                     const slang::parsing::Token& token) {
     if (!token || !token.location().valid())
         return {0, 0};
-    const auto line = sm.getLineNumber(token.location());
+    const auto line = sm.getFileLineNumber(token.location());
     const auto col = sm.getColumnNumber(token.location());
     return {line > 0 ? (int)line : 0, col > 0 ? (int)col - 1 : 0};
 }
@@ -2146,7 +2146,7 @@ static void append_current_file_imported_package_items(const DocumentState& stat
               cursor_line(cursor_line), sm(sm) {}
         void handle(const PackageImportDeclarationSyntax& node) {
             const int import_line =
-                node.keyword.location().valid() ? (int)sm.getLineNumber(node.keyword.location()) - 1 : 0;
+                node.keyword.location().valid() ? (int)sm.getFileLineNumber(node.keyword.location()) - 1 : 0;
             if (import_line > cursor_line)
                 return;
             for (const auto* item : node.items) {

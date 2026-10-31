@@ -210,7 +210,7 @@ int node_end_line0(const slang::SourceManager& sm, const SyntaxNode& node, int f
     const auto end = node.sourceRange().end();
     if (!end.valid())
         return fallback_line;
-    const auto line = sm.getLineNumber(end);
+    const auto line = sm.getFileLineNumber(end);
     return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
 }
 

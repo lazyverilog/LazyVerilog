@@ -14,8 +14,8 @@ static bool line_in_node(const SourceManager& sm, const SyntaxNode& node, int li
     auto last = node.getLastToken();
     if (!first || !last || !first.location().valid() || !last.location().valid())
         return false;
-    int first_line = (int)sm.getLineNumber(first.location()) - 1;
-    int last_line = (int)sm.getLineNumber(last.location()) - 1;
+    int first_line = (int)sm.getFileLineNumber(first.location()) - 1;
+    int last_line = (int)sm.getFileLineNumber(last.location()) - 1;
     return first_line <= line && line <= last_line;
 }
 
