@@ -267,8 +267,7 @@ static bool include_diagnostic_is_system(const slang::SourceManager& sm,
 /// that matters most here, because an unresolved `include leaves no file behind
 /// for the shard key to hash.  See IncludeResolution.
 static std::vector<IncludeResolution> collect_include_resolutions(
-    slang::syntax::SyntaxTree& tree, const slang::SourceManager& sm,
-    const std::string& own_uri) {
+    slang::syntax::SyntaxTree& tree, slang::SourceManager& sm, const std::string& own_uri) {
     std::vector<IncludeResolution> resolutions;
 
     // The file a directive is written in, which is the directory slang searches
@@ -281,26 +280,33 @@ static std::vector<IncludeResolution> collect_include_resolutions(
 
     // A directive with no buffer either failed (and says so in a diagnostic at
     // its file name) or named a header-guarded file slang had already read and
-    // skipped.  slang does not say which file a skipped one found, but it is the
-    // file the same directive found earlier, so it gets that resolution.
+    // skipped.  slang does not record which file a skipped one found -- the
+    // earlier read may have come through another header or another spelling --
+    // so ask the same search again; the header is cached, so nothing is reread.
     std::vector<slang::SourceLocation> failed;
     for (const auto& diagnostic : tree.diagnostics())
         if (diagnostic.code == slang::diag::CouldNotOpenIncludeFile ||
             diagnostic.code == slang::diag::ExceededMaxIncludeDepth)
             failed.push_back(diagnostic.location);
-    std::vector<size_t> skipped;
+    const auto& include_paths =
+        tree.options().getOrDefault<slang::parsing::PreprocessorOptions>().additionalIncludePaths;
 
     for (const auto& include : tree.getIncludeDirectives()) {
         if (!include.syntax)
             continue;
+        auto buffer = include.buffer.id;
+        if (!buffer.valid() &&
+            std::ranges::find(failed, include.syntax->fileName.location()) == failed.end()) {
+            const auto from = include.syntax->directive.location();
+            if (const auto found = sm.readHeader(include.path, from, sm.getLibraryFor(from.buffer()),
+                                                 include.isSystem, include_paths))
+                buffer = found->id;
+        }
         std::string resolved;
-        if (include.buffer.id.valid()) {
-            const auto& full_path = sm.getFullPath(include.buffer.id);
+        if (buffer.valid()) {
+            const auto& full_path = sm.getFullPath(buffer);
             if (!full_path.empty())
                 resolved = uri_from_path(full_path);
-        } else if (std::ranges::find(failed, include.syntax->fileName.location()) ==
-                   failed.end()) {
-            skipped.push_back(resolutions.size());
         }
         resolutions.push_back(IncludeResolution{
             .from_uri = directive_origin(include.syntax->getFirstToken().location()),
@@ -308,15 +314,6 @@ static std::vector<IncludeResolution> collect_include_resolutions(
             .is_system = include.isSystem,
             .resolved_uri = std::move(resolved),
         });
-    }
-    for (const size_t index : skipped) {
-        auto& repeat = resolutions[index];
-        const auto earlier = std::ranges::find_if(resolutions, [&](const IncludeResolution& r) {
-            return !r.resolved_uri.empty() && r.from_uri == repeat.from_uri &&
-                   r.spelling == repeat.spelling && r.is_system == repeat.is_system;
-        });
-        if (earlier != resolutions.end())
-            repeat.resolved_uri = earlier->resolved_uri;
     }
 
     for (const auto& diagnostic : tree.diagnostics()) {
