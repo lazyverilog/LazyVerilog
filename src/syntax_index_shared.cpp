@@ -9,6 +9,8 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -1367,6 +1369,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             bool collect_declarators{false};
         };
         std::vector<GenerateScope> generate_scopes;
+        std::vector<slang::parsing::Token> unnamed_generate_declarators;
 
         /// Innermost enclosing lexical scope that declares @p name, if any.
         const GenerateScope* generate_scope_for(std::string_view name) const {
@@ -1931,7 +1934,8 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                                             : std::string{};
             if (label.empty() && node.label)
                 label = std::string(node.label->name.valueText());
-            if (label.empty()) {
+            const bool unnamed = label.empty();
+            if (unnamed) {
                 // An unnamed block still shadows; key it on where it starts so the
                 // identity is stable for a given source text.
                 const auto [line, col] = token_pos(sm, node.begin);
@@ -1942,15 +1946,19 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             for (const auto* member : node.members) {
                 const auto* data = member ? member->as_if<DataDeclarationSyntax>() : nullptr;
                 const auto* net = member ? member->as_if<NetDeclarationSyntax>() : nullptr;
-                if (data) {
-                    for (const auto* decl : data->declarators)
-                        if (decl)
-                            scope.names.insert(std::string(decl->name.valueText()));
-                } else if (net) {
-                    for (const auto* decl : net->declarators)
-                        if (decl)
-                            scope.names.insert(std::string(decl->name.valueText()));
-                }
+                const auto collect = [&](const auto& declarators) {
+                    for (const auto* decl : declarators) {
+                        if (!decl)
+                            continue;
+                        scope.names.insert(std::string(decl->name.valueText()));
+                        if (unnamed)
+                            unnamed_generate_declarators.push_back(decl->name);
+                    }
+                };
+                if (data)
+                    collect(data->declarators);
+                else if (net)
+                    collect(net->declarators);
             }
 
             // Keep the block's members reachable after the walk leaves it: a
@@ -3059,6 +3067,31 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             declared_subroutines, module_owner_kind,
                             resolve_subroutine_owner_from_qualified_name,
                             file_ids);
+    const auto injected_end = static_cast<std::ptrdiff_t>(index.references.size());
     root.visit(visitor);
     visitor.resolve_deferred_invocations();
+
+    // A value's `generate_label` is what a hierarchical path can address, so an
+    // unnamed block has none of its own and its declarations were injected above
+    // under the enclosing scope.  The walk has now given them the block's identity,
+    // the one their uses carry.  Drop the injected occurrence: symbol lookup takes
+    // the first at a location, so it made references from the declaration miss
+    // every use and made references to a same-named signal of the enclosing named
+    // block claim it.
+    if (!visitor.unnamed_generate_declarators.empty()) {
+        std::set<std::tuple<SourceFileID, int, int>> declared_at;
+        for (const auto& token : visitor.unnamed_generate_declarators) {
+            const auto [line, col] = token_pos(sm, token);
+            declared_at.emplace(file_ids.for_token(index, sm, token), line, col);
+        }
+        const auto begin = index.references.begin();
+        const auto end = begin + injected_end;
+        index.references.erase(
+            std::remove_if(begin, end,
+                           [&](const ReferenceEntry& ref) {
+                               return ref.symbol_debug.starts_with("module_signal::") &&
+                                      declared_at.contains({ref.file_id, ref.line, ref.col});
+                           }),
+            end);
+    }
 }
