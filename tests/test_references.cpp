@@ -2640,6 +2640,73 @@ endmodule
     CHECK(refs.size() == 2);
 }
 
+// A declaration in an unnamed generate block had two identities, and only its
+// uses carried the block's.  From the declaration, references found the
+// declaration alone, so rename left every use with the old name.
+TEST_CASE("references: an unnamed generate block's declaration finds its uses",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_unnamed_generate.sv";
+    const std::string text = R"(module top #(parameter int N = 2) (input logic [N-1:0] a);
+  if (N > 0) begin : g
+    for (genvar i = 0; i < N; i++) begin
+      logic prev, next;
+      assign prev = a[i];
+      assign next = prev;
+    end
+  end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto lines_from = [&](int line, int col) {
+        std::vector<int> lines;
+        for (const auto& ref : analyzer.find_references(uri, line, col, true))
+            lines.push_back(ref.line);
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    const std::vector<int> prev{3, 4, 5};
+    CHECK(lines_from(3, 12) == prev); // declaration
+    CHECK(lines_from(4, 13) == prev); // use
+    CHECK(lines_from(5, 20) == prev); // use
+    const std::vector<int> next{3, 5};
+    CHECK(lines_from(3, 18) == next); // second declarator of the same declaration
+    CHECK(lines_from(5, 13) == next);
+}
+
+TEST_CASE("references: an unnamed generate block's declaration stays apart from the outer signal",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_unnamed_generate_shadow.sv";
+    const std::string text = R"(module top;
+  if (1) begin : g
+    logic dout;
+    assign dout = 1'b0;
+    if (1) begin
+      logic dout;
+      assign dout = 1'b1;
+    end
+  end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto lines_from = [&](int line, int col) {
+        std::vector<int> lines;
+        for (const auto& ref : analyzer.find_references(uri, line, col, true))
+            lines.push_back(ref.line);
+        std::sort(lines.begin(), lines.end());
+        return lines;
+    };
+    const std::vector<int> outer{2, 3};
+    const std::vector<int> inner{5, 6};
+    CHECK(lines_from(2, 10) == outer);
+    CHECK(lines_from(3, 11) == outer);
+    CHECK(lines_from(5, 12) == inner);
+    CHECK(lines_from(6, 13) == inner);
+}
+
 // Asking "who calls this?" from a method's declaration used to answer nothing,
 // while asking from the out-of-body definition or from a call site worked.  The
 // extern prototype is the declaration a UVM class body actually shows, so a
