@@ -19,6 +19,7 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -1970,4 +1971,51 @@ TEST_CASE("index cache: a listed file adopted by a discarded header build is red
     // The package's redo alone would rebuild cls.sv as a header; the file's
     // own shard only comes back if the adopted entry was requeued.
     CHECK(analyzer.has_filelist_shard_for_testing(cls_uri));
+}
+
+TEST_CASE("index cache: a closed file's `line directive leaves its positions physical",
+          "[index-cache][line]") {
+    CacheProject project("analyzer-line-directive");
+    project.write("a.sv", "// first\n"
+                          "`line 100 \"gen.sv\" 0\n"
+                          "module leaf;\n"
+                          "endmodule\n");
+    project.write("h.svh", "`line 50 \"other.sv\" 0\n"
+                           "typedef logic h_t;\n");
+    const std::string user = "`include \"h.svh\"\n"
+                             "module top;\n"
+                             "  leaf u();\n"
+                             "  h_t x;\n"
+                             "endmodule\n";
+    project.write("b.sv", user);
+    const auto a_uri = uri_from_path(project.root() / "a.sv");
+    const auto b_uri = uri_from_path(project.root() / "b.sv");
+    const auto h_uri = uri_from_path(project.root() / "h.svh");
+
+    // Cold, then served from the shards: both must answer the same.
+    for (const bool warm : {false, true}) {
+        CAPTURE(warm);
+        Analyzer analyzer;
+        project.index(analyzer, {"a.sv", "b.sv"});
+        analyzer.open(b_uri, user);
+
+        const auto leaf = analyzer.definition_of(b_uri, 2, 3);
+        REQUIRE(leaf.has_value());
+        CHECK(leaf->uri == a_uri);
+        CHECK(leaf->line == 2);
+
+        const auto type = analyzer.definition_of(b_uri, 3, 3);
+        REQUIRE(type.has_value());
+        CHECK(type->uri == h_uri);
+        CHECK(type->line == 1);
+
+        const auto refs = analyzer.find_references(b_uri, 2, 3, true);
+        const auto at = [&](const std::string& uri, int line) {
+            return std::any_of(refs.begin(), refs.end(), [&](const Location& r) {
+                return r.uri == uri && r.line == line;
+            });
+        };
+        CHECK(at(a_uri, 2));
+        CHECK(at(b_uri, 2));
+    }
 }

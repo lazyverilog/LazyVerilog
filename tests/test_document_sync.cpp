@@ -652,3 +652,39 @@ TEST_CASE("an includer's value wins over a header's `ifndef default", "[sync][in
     CHECK(parses_active(*state));
     CHECK(defined_macro(*state, "BUS_AW").find("32") == std::string::npos);
 }
+
+TEST_CASE("a `line directive leaves includer macros and parse errors on their real lines",
+          "[sync][includer-context][line]") {
+    IncluderTree tree("line-directive");
+    const auto defs = tree.root / "inc" / "defs.svh";
+    IncluderTree::write(defs, "// first\n"
+                              "`line 500 \"elsewhere.sv\" 0\n"
+                              "`define ITEM_W 8\n"
+                              "`define ITEM_LOG(msg) $display(msg)\n");
+    Analyzer a;
+    a.set_project_index_publish_debounce_ms(0);
+    a.set_include_dirs({(tree.root / "inc").string()});
+    a.set_extra_files({tree.pkg().string()});
+    a.wait_for_background_index_idle();
+
+    // ITEM_W reaches this buffer only through the includer's predefine text.
+    const auto item_uri = uri_from_path(tree.item());
+    a.open(item_uri, IncluderTree::item_text());
+    const auto state = a.get_state(item_uri);
+    REQUIRE(state != nullptr);
+    CHECK(unknown_macro_count(*state) == 0);
+    const auto def = a.definition_of(item_uri, 1, 11);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == uri_from_path(defs));
+    CHECK(def->line == 2);
+
+    const auto bad_uri = uri_from_path(tree.root / "rtl" / "bad.sv");
+    a.open(bad_uri, "module bad;\n"
+                    "`line 100 \"gen.sv\" 0\n"
+                    "  logic x\n"
+                    "endmodule\n");
+    const auto bad = a.get_state(bad_uri);
+    REQUIRE(bad != nullptr);
+    REQUIRE_FALSE(bad->parse_diagnostics.empty());
+    CHECK(bad->parse_diagnostics.front().line == 2);
+}
