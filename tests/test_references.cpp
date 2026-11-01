@@ -3949,3 +3949,21 @@ TEST_CASE("references: positions after a `line directive stay physical", "[refer
     CHECK(reference_lines(analyzer.find_references(uri, 0, 8, true), uri) ==
           std::vector<int>{0, 3});
 }
+
+// On the first line, the user's `line and the one naming the document share a
+// line number, and the document's must still win.
+TEST_CASE("references: a `line directive on the first line keeps the document URI",
+          "[references][line]") {
+    const std::string text = "`line 100 \"gen.sv\" 0\n"
+                             "module top;\n"
+                             "  logic a;\n"
+                             "  assign a = 1'b0;\n"
+                             "endmodule\n";
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_line_directive_first.sv";
+    analyzer.open(uri, text);
+    const auto def = analyzer.definition_of(uri, 3, 9);
+    REQUIRE(def.has_value());
+    CHECK(def->uri == uri);
+    CHECK(def->line == 2);
+}
