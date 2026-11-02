@@ -6401,15 +6401,24 @@ static std::optional<IdentifierAtPosition> macro_identifier_at(const std::string
     return std::nullopt;
 }
 
+/// The identifier at a position of this snapshot.  A request holding a snapshot
+/// must ask this rather than Analyzer::identifier_at(), which reads the latest
+/// document: an edit in between gives a column of a different text.
+static std::optional<IdentifierAtPosition>
+identifier_in_state(const DocumentState& state, const std::string& uri, int line, int col) {
+    if (!state.tree)
+        return std::nullopt;
+    if (auto found = identifier_tokens_at(*state.tree, uri, {{line, col}}).front())
+        return found;
+    return macro_identifier_at(state.text, line, col);
+}
+
 std::optional<IdentifierAtPosition> Analyzer::identifier_at(const std::string& uri, int line,
                                                             int col) const {
     auto state = get_state(uri);
-    if (!state || !state->tree)
+    if (!state)
         return std::nullopt;
-
-    if (auto found = identifier_tokens_at(*state->tree, uri, {{line, col}}).front())
-        return found;
-    return macro_identifier_at(state->text, line, col);
+    return identifier_in_state(*state, uri, line, col);
 }
 
 static std::optional<Location> include_target_at(const DocumentState& state, int line) {
@@ -6482,6 +6491,8 @@ static std::vector<std::string> hierarchical_path_at(const std::string& text, in
         line_end = text.size();
     const std::string_view src(text.data() + line_start, line_end - line_start);
     (void)col;
+    if (ident.col < 0 || static_cast<size_t>(ident.col) > src.size())
+        return {};
 
     const auto is_word = [](char c) {
         return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
@@ -6543,7 +6554,7 @@ static std::optional<Location> hierarchy_location(const SyntaxIndex& index,
 std::optional<Location> Analyzer::hierarchical_definition(const DocumentState& state,
                                                           const std::string& uri, int line,
                                                           int col) const {
-    auto ident = identifier_at(uri, line, col);
+    auto ident = identifier_in_state(state, uri, line, col);
     if (!ident || ident->name.empty())
         return std::nullopt;
     auto segments = hierarchical_path_at(state.text, line, col, *ident);
@@ -7326,7 +7337,8 @@ Analyzer::definition_of_state(const DocumentState& state, const std::string& uri
     // classification — slang spells it as a scoped name — so read the dotted
     // path straight from the source and apply the same rule.
     if (!receiver_names_a_scope) {
-        if (auto ident = queries ? queries->identifier_at(line, col) : identifier_at(uri, line, col)) {
+        if (auto ident = queries ? queries->identifier_at(line, col)
+                                 : identifier_in_state(state, uri, line, col)) {
             const auto segments = hierarchical_path_at(state.text, line, col, *ident);
             if (segments.size() >= 2)
                 receiver_names_a_scope = path_root_names_a_scope(segments.front());
@@ -7420,7 +7432,6 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
                                                 bool include_declaration,
                                                 bool this_file_only,
                                                 std::string* rename_refusal) const {
-    auto target = identifier_at(uri, line, col);
     // References/Rename must not walk closed project-file ASTs.  Current and
     // other open files are live SyntaxTrees; closed project files require a
     // future reference-occurrence index before they can participate scalably.
@@ -7429,6 +7440,7 @@ std::vector<Location> Analyzer::find_references(const std::string& uri, int line
     auto state = get_state(uri);
     if (!state)
         return {};
+    auto target = identifier_in_state(*state, uri, line, col);
 
     // Keep one immutable view of the closed-file project index for the whole
     // request.  Grabbing extra_index_snapshot_ptr() repeatedly would both
