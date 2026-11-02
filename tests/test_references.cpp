@@ -2743,6 +2743,41 @@ endmodule
     CHECK(spans_from(10, 11) == std::vector<std::pair<int, int>>{{0, 16}, {10, 11}});
 }
 
+// Every expansion declares at the same `define.  Linking the unnamed block's
+// declaration there must leave the module's and a named block's declarations
+// of the same macro in place.
+TEST_CASE("references: a macro expanded in an unnamed block and elsewhere",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_unnamed_generate_macro_shared.sv";
+    const std::string text = R"(`define D logic x;
+module top;
+  `D
+  assign x = 1'b0;
+  if (1) begin : g
+    `D
+    assign x = 1'b1;
+    if (1) begin
+      `D
+      assign x = 1'b0;
+    end
+  end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto spans_from = [&](int line, int col) {
+        std::vector<std::pair<int, int>> spans;
+        for (const auto& ref : analyzer.find_references(uri, line, col, true))
+            spans.emplace_back(ref.line, ref.col);
+        std::sort(spans.begin(), spans.end());
+        return spans;
+    };
+    CHECK(spans_from(3, 9) == std::vector<std::pair<int, int>>{{0, 16}, {3, 9}});
+    CHECK(spans_from(6, 11) == std::vector<std::pair<int, int>>{{0, 16}, {6, 11}});
+    CHECK(spans_from(9, 13) == std::vector<std::pair<int, int>>{{0, 16}, {9, 13}});
+}
+
 // Asking "who calls this?" from a method's declaration used to answer nothing,
 // while asking from the out-of-body definition or from a call site worked.  The
 // extern prototype is the declaration a UVM class body actually shows, so a
