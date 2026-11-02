@@ -1373,8 +1373,12 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
         struct UnnamedGenerateDeclarator {
             slang::parsing::Token name;
             std::string scope; // the block's, as its uses spell it
+            // What the declaration injection gave it: the nearest named
+            // ancestor block's identity, or nothing without one.
+            std::string injected_id;
         };
         std::vector<UnnamedGenerateDeclarator> unnamed_generate_declarators;
+        std::vector<std::string> named_generate_labels;
 
         /// Innermost enclosing lexical scope that declares @p name, if any.
         const GenerateScope* generate_scope_for(std::string_view name) const {
@@ -1956,8 +1960,17 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                         if (!decl)
                             continue;
                         scope.names.insert(std::string(decl->name.valueText()));
-                        if (unnamed)
-                            unnamed_generate_declarators.push_back({decl->name, scope.scope});
+                        if (unnamed) {
+                            const auto name = decl->name.valueText();
+                            unnamed_generate_declarators.push_back(
+                                {decl->name, scope.scope,
+                                 named_generate_labels.empty()
+                                     ? std::string{}
+                                     : symbol_canonical("module_signal",
+                                                        current_module + "." +
+                                                            named_generate_labels.back(),
+                                                        name)});
+                        }
                     }
                 };
                 if (data)
@@ -1973,7 +1986,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                 generate_block_members.insert(scope.scope + "\n" + member_name);
 
             generate_scopes.push_back(std::move(scope));
+            if (!unnamed)
+                named_generate_labels.push_back(label);
             visitDefault(node);
+            if (!unnamed)
+                named_generate_labels.pop_back();
             generate_scopes.pop_back();
         }
 
@@ -3088,28 +3105,35 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
     // add that occurrence here, at the `define where the injection put it.
     if (!visitor.unnamed_generate_declarators.empty()) {
         using At = std::tuple<SourceFileID, int, int>;
-        std::map<At, std::vector<std::string>> wanted; // location -> block identities
-        std::vector<std::pair<At, const std::string*>> added;
+        // Every expansion of a macro declares at the same `define, and a named
+        // block or the module may expand it too, each with its own injected
+        // occurrence there.  Drop exactly one per unnamed declarator, matched
+        // by identity, so theirs survive.
+        std::map<std::pair<At, std::string>, int> to_drop;
+        std::set<At> declared_at;
         for (const auto& decl : visitor.unnamed_generate_declarators) {
             const auto [line, col] = token_pos_line1_col0(sm, decl.name);
             const At at{file_ids.for_declaration_token(index, sm, decl.name), line, col};
-            auto& ids = wanted[at];
-            auto id = symbol_canonical("module_signal", decl.scope, decl.name.valueText());
-            if (std::find(ids.begin(), ids.end(), id) == ids.end())
-                ids.push_back(std::move(id));
+            declared_at.insert(at);
+            if (!decl.injected_id.empty())
+                ++to_drop[{at, decl.injected_id}];
         }
         const auto begin = index.references.begin();
         const auto end = begin + injected_end;
         index.references.erase(
             std::remove_if(begin, end,
                            [&](const ReferenceEntry& ref) {
-                               return ref.symbol_debug.starts_with("module_signal::") &&
-                                      wanted.contains({ref.file_id, ref.line, ref.col});
+                               const auto it = to_drop.find(
+                                   {At{ref.file_id, ref.line, ref.col}, ref.symbol_debug});
+                               if (it == to_drop.end() || it->second == 0)
+                                   return false;
+                               --it->second;
+                               return true;
                            }),
             end);
         std::set<std::pair<At, std::string>> walked;
         for (const auto& ref : index.references)
-            if (wanted.contains({ref.file_id, ref.line, ref.col}))
+            if (declared_at.contains({ref.file_id, ref.line, ref.col}))
                 walked.emplace(At{ref.file_id, ref.line, ref.col}, ref.symbol_debug);
         for (const auto& decl : visitor.unnamed_generate_declarators) {
             // Owned by the shard of the file that expands the macro, as the
