@@ -6491,7 +6491,7 @@ static std::vector<std::string> hierarchical_path_at(const std::string& text, in
         line_end = text.size();
     const std::string_view src(text.data() + line_start, line_end - line_start);
     (void)col;
-    if (ident.col < 0 || static_cast<size_t>(ident.col) > src.size())
+    if (ident.col < 0 || ident.col > lsp_column_width(src))
         return {};
 
     const auto is_word = [](char c) {
@@ -6499,7 +6499,8 @@ static std::vector<std::string> hierarchical_path_at(const std::string& text, in
     };
 
     std::vector<std::string> segments{ident.name};
-    size_t i = (size_t)ident.col;
+    // An LSP column, not a byte: `é` before the path is one column and two bytes.
+    size_t i = lsp_col_to_byte_offset(text, line_start, ident.col) - line_start;
     while (i > 0) {
         size_t j = i;
         while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1])))

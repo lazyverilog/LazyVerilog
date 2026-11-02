@@ -2033,6 +2033,42 @@ TEST_CASE("definition: a hierarchical path is read from the request's own snapsh
     std::filesystem::remove_all(dir);
 }
 
+// The walk back over `u_dut.` took the LSP column as a byte offset, so a
+// multibyte character earlier on the line made it start inside the name and
+// find no path at all.
+TEST_CASE("definition: a hierarchical path after a multibyte character",
+          "[definition][hierarchy]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-definition-hier-utf8";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto dut = dir / "utf8_dut.sv";
+    {
+        std::ofstream out(dut);
+        out << "module utf8_dut;\n"
+               "  logic din;\n"
+               "endmodule\n";
+    }
+    Analyzer analyzer;
+    analyzer.set_extra_files({dut.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "utf8_tb.sv");
+    // Each `é` is one UTF-16 unit and two bytes.
+    analyzer.open(uri, "module utf8_tb;\n"
+                       "  utf8_dut u_dut ();\n"
+                       "  initial /* \xC3\xA9\xC3\xA9\xC3\xA9 */ force u_dut.din = 1'b0;\n"
+                       "endmodule\n");
+
+    // `din` starts at UTF-16 column 32 (byte 35).
+    const auto loc = analyzer.definition_of(uri, 2, 33);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(dut));
+    CHECK(loc->line == 1);
+
+    std::filesystem::remove_all(dir);
+}
+
 // Hierarchical references resolved only the simplest shape.  The instance name
 // itself matched no declarator, a generate-block label had no type so its
 // members were unreachable, and an indexed generate segment broke the walk at
