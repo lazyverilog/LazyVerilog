@@ -1982,6 +1982,57 @@ TEST_CASE("definition: members resolve through a virtual interface handle",
     }
 }
 
+// A request holds one snapshot, but the hierarchical walk took the identifier
+// from the latest document and the path from the snapshot.  An edit in between
+// gave it a column past the end of the snapshot's line: a heap over-read that
+// the nightly fuzzer found through rename.
+TEST_CASE("definition: a hierarchical path is read from the request's own snapshot",
+          "[definition][hierarchy]") {
+    const auto dir = std::filesystem::temp_directory_path() / "lazyverilog-definition-hier-snapshot";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+
+    const auto dut = dir / "snap_dut.sv";
+    {
+        std::ofstream out(dut);
+        out << "module snap_dut;\n"
+               "  logic din;\n"
+               "endmodule\n";
+    }
+    Analyzer analyzer;
+    analyzer.set_extra_files({dut.string()});
+    analyzer.wait_for_background_index_idle();
+
+    const std::string uri = uri_from_path(dir / "snap_tb.sv");
+    analyzer.open(uri, "module snap_tb;\n"
+                       "  snap_dut u_dut ();\n"
+                       "  initial force u_dut.din = 1'b0;\n"
+                       "endmodule\n");
+    const auto before = analyzer.get_state(uri);
+    REQUIRE(before);
+    REQUIRE(before->tree);
+
+    // Every line is now far longer, with a plain name at each column asked below.
+    const std::string filler(120, ' ');
+    analyzer.change(uri, "module snap_tb;\n" + filler + "logic plain;\n" +
+                             "  logic other_name_long_enough_for_every_column;\n"
+                             "endmodule\n");
+    analyzer.wait_for_background_index_idle();
+    REQUIRE(analyzer.get_state(uri)->tree);
+
+    // On `din` in the snapshot; a different name in the latest document.
+    const auto din_col = 22;
+    const auto loc = analyzer.hierarchical_definition(*before, uri, 2, din_col);
+    REQUIRE(loc.has_value());
+    CHECK(loc->uri == uri_from_path(dut));
+    CHECK(loc->line == 1);
+
+    // Past the end of the snapshot's line, on `plain` in the latest document.
+    CHECK_FALSE(analyzer.hierarchical_definition(*before, uri, 1, 122).has_value());
+
+    std::filesystem::remove_all(dir);
+}
+
 // Hierarchical references resolved only the simplest shape.  The instance name
 // itself matched no declarator, a generate-block label had no type so its
 // members were unreachable, and an indexed generate segment broke the walk at
