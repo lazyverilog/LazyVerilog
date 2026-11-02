@@ -2707,6 +2707,42 @@ endmodule
     CHECK(lines_from(6, 13) == inner);
 }
 
+// A name declared through a macro body has its declaration at the `define.  A
+// use at module level or in a named block reports it; in an unnamed generate
+// block the declaration carried the enclosing scope's identity, or none at all,
+// so references and rename from a use left the `define out.
+TEST_CASE("references: a macro-body declaration in an unnamed generate block",
+          "[references]") {
+    Analyzer analyzer;
+    const std::string uri = "file:///tmp/references_unnamed_generate_macro.sv";
+    const std::string text = R"(`define D logic x;
+module top;
+  if (1) begin : g
+    if (1) begin
+      `D
+      assign x = 1'b0;
+    end
+  end
+  if (1) begin
+    `D
+    assign x = 1'b1;
+  end
+endmodule
+)";
+    analyzer.open(uri, text);
+
+    const auto spans_from = [&](int line, int col) {
+        std::vector<std::pair<int, int>> spans;
+        for (const auto& ref : analyzer.find_references(uri, line, col, true))
+            spans.emplace_back(ref.line, ref.col);
+        std::sort(spans.begin(), spans.end());
+        return spans;
+    };
+    // Under a named block, and with none: each block's own use and the `define.
+    CHECK(spans_from(5, 13) == std::vector<std::pair<int, int>>{{0, 16}, {5, 13}});
+    CHECK(spans_from(10, 11) == std::vector<std::pair<int, int>>{{0, 16}, {10, 11}});
+}
+
 // Asking "who calls this?" from a method's declaration used to answer nothing,
 // while asking from the out-of-body definition or from a call site worked.  The
 // extern prototype is the declaration a UVM class body actually shows, so a

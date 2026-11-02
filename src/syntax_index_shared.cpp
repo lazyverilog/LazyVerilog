@@ -9,6 +9,7 @@
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/syntax/SyntaxVisitor.h>
 #include <slang/text/SourceManager.h>
+#include <map>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -1369,7 +1370,11 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             bool collect_declarators{false};
         };
         std::vector<GenerateScope> generate_scopes;
-        std::vector<slang::parsing::Token> unnamed_generate_declarators;
+        struct UnnamedGenerateDeclarator {
+            slang::parsing::Token name;
+            std::string scope; // the block's, as its uses spell it
+        };
+        std::vector<UnnamedGenerateDeclarator> unnamed_generate_declarators;
 
         /// Innermost enclosing lexical scope that declares @p name, if any.
         const GenerateScope* generate_scope_for(std::string_view name) const {
@@ -1952,7 +1957,7 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
                             continue;
                         scope.names.insert(std::string(decl->name.valueText()));
                         if (unnamed)
-                            unnamed_generate_declarators.push_back(decl->name);
+                            unnamed_generate_declarators.push_back({decl->name, scope.scope});
                     }
                 };
                 if (data)
@@ -3073,16 +3078,25 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
 
     // A value's `generate_label` is what a hierarchical path can address, so an
     // unnamed block has none of its own and its declarations were injected above
-    // under the enclosing scope.  The walk has now given them the block's identity,
-    // the one their uses carry.  Drop the injected occurrence: symbol lookup takes
-    // the first at a location, so it made references from the declaration miss
-    // every use and made references to a same-named signal of the enclosing named
-    // block claim it.
+    // under the enclosing scope, while its uses carry the block's identity.  Drop
+    // the injected occurrence: symbol lookup takes the first at a location, so it
+    // made references from the declaration miss every use and made references to
+    // a same-named signal of the enclosing named block claim it.
+    //
+    // The walk normally gives the declaration the block's identity.  It records
+    // nothing for a name written in a macro body (`` `define D logic x; ``), so
+    // add that occurrence here, at the `define where the injection put it.
     if (!visitor.unnamed_generate_declarators.empty()) {
-        std::set<std::tuple<SourceFileID, int, int>> declared_at;
-        for (const auto& token : visitor.unnamed_generate_declarators) {
-            const auto [line, col] = token_pos(sm, token);
-            declared_at.emplace(file_ids.for_token(index, sm, token), line, col);
+        using At = std::tuple<SourceFileID, int, int>;
+        std::map<At, std::vector<std::string>> wanted; // location -> block identities
+        std::vector<std::pair<At, const std::string*>> added;
+        for (const auto& decl : visitor.unnamed_generate_declarators) {
+            const auto [line, col] = token_pos_line1_col0(sm, decl.name);
+            const At at{file_ids.for_declaration_token(index, sm, decl.name), line, col};
+            auto& ids = wanted[at];
+            auto id = symbol_canonical("module_signal", decl.scope, decl.name.valueText());
+            if (std::find(ids.begin(), ids.end(), id) == ids.end())
+                ids.push_back(std::move(id));
         }
         const auto begin = index.references.begin();
         const auto end = begin + injected_end;
@@ -3090,8 +3104,25 @@ void collect_combined_occurrences(const slang::syntax::SyntaxTree& tree,
             std::remove_if(begin, end,
                            [&](const ReferenceEntry& ref) {
                                return ref.symbol_debug.starts_with("module_signal::") &&
-                                      declared_at.contains({ref.file_id, ref.line, ref.col});
+                                      wanted.contains({ref.file_id, ref.line, ref.col});
                            }),
             end);
+        std::set<std::pair<At, std::string>> walked;
+        for (const auto& ref : index.references)
+            if (wanted.contains({ref.file_id, ref.line, ref.col}))
+                walked.emplace(At{ref.file_id, ref.line, ref.col}, ref.symbol_debug);
+        for (const auto& decl : visitor.unnamed_generate_declarators) {
+            // Owned by the shard of the file that expands the macro, as the
+            // walk's occurrences are.
+            if (!file_ids.accepts(index, sm, decl.name))
+                continue;
+            const auto [line, col] = token_pos_line1_col0(sm, decl.name);
+            const At at{file_ids.for_declaration_token(index, sm, decl.name), line, col};
+            auto id = symbol_canonical("module_signal", decl.scope, decl.name.valueText());
+            if (line <= 0 || !walked.emplace(at, id).second)
+                continue;
+            add_reference_entry(index, std::string(decl.name.valueText()), std::get<0>(at),
+                                std::move(id), line, col);
+        }
     }
 }
