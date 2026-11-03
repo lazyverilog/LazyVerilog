@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -282,6 +283,12 @@ void apply_cli_fixes(FixMode mode, const std::vector<std::shared_ptr<const Docum
     size_t total_applied = 0, total_skipped = 0, files_changed = 0;
     bool accept_all = false, quit = false;
 
+    // Each URI decoded once; a later state for one path wins, as it did.
+    std::unordered_map<std::string, const DocumentState*> state_by_path;
+    for (const auto& st : states)
+        if (st)
+            state_by_path[path_from_file_uri(st->uri)] = st.get();
+
     for (size_t begin = 0; begin < flat.size() && !quit;) {
         size_t end = begin;
         while (end < flat.size() && flat[end].file == flat[begin].file)
@@ -290,12 +297,10 @@ void apply_cli_fixes(FixMode mode, const std::vector<std::shared_ptr<const Docum
         const size_t group_begin = begin;
         begin = end;
 
-        const DocumentState* state = nullptr;
-        for (const auto& st : states)
-            if (st && path_from_file_uri(st->uri) == file)
-                state = st.get();
-        if (!state)
+        const auto found = state_by_path.find(file);
+        if (found == state_by_path.end())
             continue;
+        const DocumentState* state = found->second;
 
         // (diagnostic index, fix) in priority (position) order; one fix per diagnostic.
         std::vector<std::pair<size_t, const FixInfo*>> candidates;
