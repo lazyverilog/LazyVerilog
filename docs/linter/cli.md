@@ -85,7 +85,8 @@ lines as `-` (before) and `+` (after), and then asks `Apply this fix [y,n,a,q]?`
 `n` to skip, `a` to apply this and every remaining fix, or `q` to stop. End of input counts as `q`.
 The accepted fixes of a file are applied together at the end.
 
-Fixed diagnostics are not printed. A summary goes to stderr:
+Fixed diagnostics are not printed. A summary goes to stderr whenever a fix option is given, even when
+nothing was fixed. The count is of fixes applied, so identical fixes from duplicated diagnostics count once:
 
 ```
 fixed 2 issue(s) in 1 file(s)

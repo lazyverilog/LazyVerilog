@@ -4,10 +4,13 @@
 #include <string_view>
 #include <vector>
 
+enum class FixOutcome { Applied, Duplicate, Skipped };
+
 struct FixApplyResult {
     std::string text;
     size_t applied{0};
     size_t skipped{0};
+    std::vector<FixOutcome> outcomes; // one per input fix, in input order
 };
 
 /// Apply @p fixes (priority order) to @p text.  A fix is taken whole or skipped

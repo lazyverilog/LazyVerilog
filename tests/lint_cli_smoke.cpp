@@ -315,7 +315,8 @@ int main(int argc, char** argv) {
 
     // --fix modes work on temp copies; the fixture files are never touched.
     {
-        const fs::path dir = fs::temp_directory_path() / "lazyverilog_lint_fix_smoke";
+        const fs::path dir = fs::temp_directory_path() /
+                         ("lazyverilog_lint_fix_smoke_" + std::to_string(cli_process::current_process_id()));
         fs::create_directories(dir);
         const auto write = [&](const char* name, const std::string& text) {
             const fs::path p = dir / name;
@@ -332,6 +333,9 @@ int main(int argc, char** argv) {
             expect(contains(before.stdout_text, "[width-trunc]"), "fixture has width-trunc");
             auto fixed = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
             expect(contains(fixed.stderr_text, "fixed 2 issue(s) in 1 file(s)"), "--fix summary");
+            expect(!contains(fixed.stdout_text, "[width-trunc]"),
+                   "--fix does not print a fixed diagnostic");
+            expect(fixed.exit_code == 0, "--fix exits 0 once everything is fixed");
             const std::string text = cli_process::read_file(f);
             expect(contains(text, "assign a = 8'(b);"), "--fix casts the truncating assign");
             auto after = run_command(lint_bin, "--compile-only " + shell_quote(f));

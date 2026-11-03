@@ -351,35 +351,40 @@ void apply_cli_fixes(FixMode mode, const std::vector<std::shared_ptr<const Docum
             fixes.push_back(cand.second);
         const FixApplyResult result = apply_fixes(original, fixes);
 
-        // A skipped fix keeps its diagnostic.  Fixes are whole-or-nothing in priority order, so a
-        // fix's fate depends only on those before it: the first prefix that grows `skipped` names
-        // it.  Only needed when something was skipped.
-        size_t prev_skipped = 0;
-        for (size_t k = 0; k < candidates.size(); ++k) {
-            size_t skipped_now = 0;
-            if (result.skipped != 0) {
-                const std::vector<const FixInfo*> prefix(fixes.begin(), fixes.begin() + k + 1);
-                skipped_now = apply_fixes(original, prefix).skipped;
+        // Write beside the original and rename over it, so a failed write cannot truncate it.
+        bool wrote = true;
+        if (result.text != original) {
+            const std::filesystem::path tmp = file + ".lazyverilog-fix.tmp";
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                out << result.text;
+                out.flush();
+                wrote = static_cast<bool>(out);
             }
-            fixed[candidates[k].first] = skipped_now == prev_skipped;
-            prev_skipped = skipped_now;
+            std::error_code ec;
+            if (wrote)
+                std::filesystem::rename(tmp, file, ec);
+            if (!wrote || ec) {
+                wrote = false;
+                std::filesystem::remove(tmp, ec);
+            }
         }
+        if (!wrote) {
+            std::cerr << file << ": cannot write; not fixed\n";
+            continue;
+        }
+        for (size_t k = 0; k < candidates.size(); ++k)
+            fixed[candidates[k].first] = result.outcomes[k] != FixOutcome::Skipped;
 
         total_applied += result.applied;
         total_skipped += result.skipped;
-        if (result.text != original) {
-            std::ofstream out(file, std::ios::binary | std::ios::trunc);
-            out << result.text;
+        if (result.text != original)
             ++files_changed;
-        }
     }
 
-    if (total_applied != 0 || total_skipped != 0) {
-        std::cerr << "fixed " << total_applied << " issue(s) in " << files_changed
-                  << " file(s)\n";
-        if (total_skipped != 0)
-            std::cerr << "skipped " << total_skipped << " overlapping fix(es); run again\n";
-    }
+    std::cerr << "fixed " << total_applied << " issue(s) in " << files_changed << " file(s)\n";
+    if (total_skipped != 0)
+        std::cerr << "skipped " << total_skipped << " overlapping fix(es); run again\n";
 }
 
 void collect(std::vector<FlatDiag>& out, const std::string& fallback_uri,
@@ -558,7 +563,7 @@ int main(int argc, char* argv[]) {
                    flat.end());
     }
 
-    std::sort(flat.begin(), flat.end(), [](const FlatDiag& a, const FlatDiag& b) {
+    std::stable_sort(flat.begin(), flat.end(), [](const FlatDiag& a, const FlatDiag& b) {
         if (a.file != b.file)
             return a.file < b.file;
         if (a.diag.line != b.diag.line)

@@ -52,14 +52,18 @@ FixApplyResult apply_fixes(std::string_view text, const std::vector<const FixInf
                 for (const Resolved& b : cur)
                     clash = clash || conflicts(a, b);
         }
-        if (duplicate)
+        if (duplicate) {
+            result.outcomes.push_back(FixOutcome::Duplicate);
             continue;
+        }
         if (clash) {
             ++result.skipped;
+            result.outcomes.push_back(FixOutcome::Skipped);
             continue;
         }
         accepted.push_back(std::move(cur));
         ++result.applied;
+        result.outcomes.push_back(FixOutcome::Applied);
     }
 
     std::vector<Resolved> all;

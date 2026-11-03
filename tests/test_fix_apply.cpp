@@ -30,6 +30,7 @@ TEST_CASE("apply_fixes: an overlapping replacement is skipped", "[fix-apply]") {
     CHECK(r.text == "assign a = x;");
     CHECK(r.applied == 1);
     CHECK(r.skipped == 1);
+    CHECK(r.outcomes == std::vector<FixOutcome>{FixOutcome::Applied, FixOutcome::Skipped});
 }
 
 TEST_CASE("apply_fixes: CRLF and a multibyte column", "[fix-apply]") {
@@ -47,4 +48,5 @@ TEST_CASE("apply_fixes: an identical fix is applied once", "[fix-apply]") {
     CHECK(r.text == "assign a = 8'(b);");
     CHECK(r.applied == 1);
     CHECK(r.skipped == 0);
+    CHECK(r.outcomes == std::vector<FixOutcome>{FixOutcome::Applied, FixOutcome::Duplicate});
 }

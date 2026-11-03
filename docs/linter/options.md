@@ -726,7 +726,9 @@ menu on the diagnostic (`Ctrl+.` in VS Code, `vim.lsp.buf.code_action()` in Neov
 | `explicit_function_lifetime`, `functions_automatic` | Add 'automatic' lifetime | Inserts `automatic` after `function` |
 | `explicit_task_lifetime` | Add 'automatic' lifetime to task | Inserts `automatic` after `task` |
 | `width-trunc`, `width-expand`, `port-width-trunc`, `port-width-expand` | Cast to N bits | Wraps the expression as `N'(e)` |
-| `sign-conversion`, `sign-compare` | Cast to signed or unsigned | Wraps a primary operand as `signed'(e)` or `unsigned'(e)` |
+| `arith-op-mismatch`, `bitwise-op-mismatch` | Cast to N bits | Wraps the narrower operand as `N'(e)` |
+| `sign-conversion` | Cast to signed or unsigned | Wraps a primary operand as `signed'(e)` or `unsigned'(e)` |
+| `sign-compare` | Cast to unsigned | Wraps the signed operand as `unsigned'(e)` |
 | `implicit-conv`, `packed-array-conv`, `float-int-conv` | Cast to the target type | Wraps the expression as `T'(e)`, only when the target type has a name |
 | `int-float-conv`, `float-widen`, `float-narrow` | Cast to real or shortreal | Wraps the expression as `real'(e)` or `shortreal'(e)` |
 | `int-bool-conv`, `float-bool-conv` | Compare with zero | Rewrites `e` as `(e) != '0` or `(e) != 0.0` |
