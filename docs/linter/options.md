@@ -725,8 +725,19 @@ menu on the diagnostic (`Ctrl+.` in VS Code, `vim.lsp.buf.code_action()` in Neov
 | `case_missing_default` | Add default case | Inserts `default: ;` before `endcase` |
 | `explicit_function_lifetime`, `functions_automatic` | Add 'automatic' lifetime | Inserts `automatic` after `function` |
 | `explicit_task_lifetime` | Add 'automatic' lifetime to task | Inserts `automatic` after `task` |
+| `width-trunc`, `width-expand`, `port-width-trunc`, `port-width-expand` | Cast to N bits | Wraps the expression as `N'(e)` |
+| `sign-conversion`, `sign-compare` | Cast to signed or unsigned | Wraps a primary operand as `signed'(e)` or `unsigned'(e)` |
+| `implicit-conv`, `packed-array-conv`, `float-int-conv` | Cast to the target type | Wraps the expression as `T'(e)`, only when the target type has a name |
+| `int-float-conv`, `float-widen`, `float-narrow` | Cast to real or shortreal | Wraps the expression as `real'(e)` or `shortreal'(e)` |
+| `int-bool-conv`, `float-bool-conv` | Compare with zero | Rewrites `e` as `(e) != '0` or `(e) != 0.0` |
 
-The other rules have no quick fix.
+The lifetime fixes are unsafe, because making a function automatic changes how its variables
+behave. The case default fix and every conversion fix are safe. `lazyverilog-lint --fix` applies the
+safe ones and `--fix-unsafe` applies all of them (see [Fixing](cli.md#fixing)).
+
+Some compiler warnings get no fix: `comparison-mismatch`, a `float-int-conv` whose target type has no
+name, output and inout arguments or ports (they cannot be cast), and sign conversions or comparisons
+whose operand is a compound expression. The other rules have no quick fix.
 
 ---
 

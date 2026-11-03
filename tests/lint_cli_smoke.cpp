@@ -313,6 +313,87 @@ int main(int argc, char** argv) {
               "--help explains how slang errors are named");
     }
 
+    // --fix modes work on temp copies; the fixture files are never touched.
+    {
+        const fs::path dir = fs::temp_directory_path() / "lazyverilog_lint_fix_smoke";
+        fs::create_directories(dir);
+        const auto write = [&](const char* name, const std::string& text) {
+            const fs::path p = dir / name;
+            std::ofstream(p, std::ios::binary) << text;
+            return p;
+        };
+        const std::string widths =
+            "module m_w(input logic [15:0] b, input logic [15:0] c, output logic [7:0] a,"
+            " output logic [7:0] d);\n  assign a = b;\n  assign d = c;\nendmodule\n";
+
+        {
+            const fs::path f = write("w.sv", widths);
+            auto before = run_command(lint_bin, "--compile-only " + shell_quote(f));
+            expect(contains(before.stdout_text, "[width-trunc]"), "fixture has width-trunc");
+            auto fixed = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(contains(fixed.stderr_text, "fixed 2 issue(s) in 1 file(s)"), "--fix summary");
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "assign a = 8'(b);"), "--fix casts the truncating assign");
+            auto after = run_command(lint_bin, "--compile-only " + shell_quote(f));
+            expect(!contains(after.stdout_text, "[width-trunc]"), "no width-trunc after --fix");
+        }
+
+        {
+            const std::string fn = "module m_f;\n  function int f(int x);\n    return x;\n"
+                                   "  endfunction\nendmodule\n";
+            fs::create_directories(dir / "fn");
+            std::ofstream(dir / "fn" / "lazyverilog.toml")
+                << "[lint]\nenable = true\n[lint.function]\nenable = true\n"
+                   "functions_automatic = true\n";
+            const fs::path f = dir / "fn" / "f.sv";
+            std::ofstream(f, std::ios::binary) << fn;
+            run_command(lint_bin, "--fix " + shell_quote(f));
+            expect(!contains(cli_process::read_file(f), "automatic"),
+                   "--fix leaves an unsafe fix alone");
+            run_command(lint_bin, "--fix-unsafe " + shell_quote(f));
+            expect(contains(cli_process::read_file(f), "function automatic"),
+                   "--fix-unsafe adds automatic");
+        }
+
+        {
+            const fs::path f = write("i.sv", widths);
+            const std::string answers = "y\nn\n";
+            auto r = run_command(lint_bin, "--fix-interactive --compile-only " + shell_quote(f),
+                                 &answers);
+            expect(contains(r.stdout_text, "Apply this fix [y,n,a,q]?"), "interactive prompts");
+            expect(contains(r.stdout_text, "\n-  assign a = b;") &&
+                       contains(r.stdout_text, "\n+  assign a = 8'(b);"),
+                   "interactive shows a - and + line");
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "8'(b)") && !contains(text, "8'(c)"),
+                   "interactive applies only the accepted fix");
+        }
+
+        {
+            std::string crlf = widths;
+            for (size_t i = 0; (i = crlf.find('\n', i)) != std::string::npos; i += 2)
+                crlf.replace(i, 1, "\r\n");
+            const fs::path f = write("crlf.sv", crlf);
+            run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "8'(b);\r\n"), "CRLF file is fixed");
+            bool bare_lf = false;
+            for (size_t i = 0; i < text.size(); ++i)
+                if (text[i] == '\n' && (i == 0 || text[i - 1] != '\r'))
+                    bare_lf = true;
+            expect(!bare_lf, "CRLF file stays CRLF after --fix");
+        }
+
+        {
+            auto r = run_command(lint_bin, "--fix --fix-unsafe " + shell_quote(dir / "w.sv"));
+            expect(r.exit_code == 1, "--fix with --fix-unsafe exits 1");
+            expect(contains(r.stderr_text,
+                            "--fix, --fix-unsafe and --fix-interactive cannot be used together"),
+                   "--fix with --fix-unsafe explains");
+        }
+        fs::remove_all(dir);
+    }
+
     if (checks_failed > 0) {
         std::cerr << checks_failed << "/" << checks_run << " checks failed\n";
         return 1;

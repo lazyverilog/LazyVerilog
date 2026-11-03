@@ -74,7 +74,8 @@ struct CommandResult {
 
 /// Runs `binary` with `args` (a single already-quoted argument string, for
 /// example `shell_quote(a) + " " + shell_quote(b)`) and captures its output.
-inline CommandResult run_command(const fs::path& binary, const std::string& args) {
+inline CommandResult run_command(const fs::path& binary, const std::string& args,
+                                 const std::string* stdin_text = nullptr) {
     static int counter = 0;
     const fs::path base =
         fs::temp_directory_path() / ("lazyverilog-cli-smoke-" +
@@ -86,6 +87,11 @@ inline CommandResult run_command(const fs::path& binary, const std::string& args
     std::string command = shell_quote(binary);
     if (!args.empty())
         command += " " + args;
+    if (stdin_text != nullptr) {
+        const fs::path stdin_path = base.string() + ".in";
+        std::ofstream(stdin_path, std::ios::binary) << *stdin_text;
+        command += " < " + shell_quote(stdin_path);
+    }
     command += " > " + shell_quote(stdout_path) + " 2> " + shell_quote(stderr_path);
 #ifdef _WIN32
     // See rtl_format_sweep.cpp's run_formatter() for why the whole command
@@ -111,6 +117,7 @@ inline CommandResult run_command(const fs::path& binary, const std::string& args
     }
 #endif
 
+    fs::remove(base.string() + ".in");
     if (fs::exists(stdout_path)) {
         result.stdout_text = read_file(stdout_path);
         fs::remove(stdout_path);

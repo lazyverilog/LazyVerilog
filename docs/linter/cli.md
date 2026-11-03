@@ -66,6 +66,41 @@ lazyverilog-lint --nowarn lint-naming-input-port --nowarn width-trunc rtl/alu.sv
 A hidden error no longer sets exit code 2. Hiding does not free the `--maxerror` budget: hidden errors
 still count toward it.
 
+## Fixing
+
+Many diagnostics carry a fix. Each fix is either safe, meaning it keeps the design's behavior, or
+unsafe, meaning it may change it. The list is in [Quick fixes](options.md#quick-fixes). Choose one mode:
+
+| Option | What it does |
+|--------|--------------|
+| `--fix` | Apply the safe fixes to the files in place |
+| `--fix-unsafe` | Apply the safe and the unsafe fixes |
+| `--fix-interactive` | Show each fix and ask before applying it |
+
+The three options cannot be combined. The files are rewritten byte for byte, so CRLF line endings stay.
+A file that changed on disk since it was read is left alone, with a warning on stderr.
+
+Interactive mode prints the diagnostic, the fix title (marked `[unsafe]` when it is), the affected
+lines as `-` (before) and `+` (after), and then asks `Apply this fix [y,n,a,q]?`. Answer `y` to apply,
+`n` to skip, `a` to apply this and every remaining fix, or `q` to stop. End of input counts as `q`.
+The accepted fixes of a file are applied together at the end.
+
+Fixed diagnostics are not printed. A summary goes to stderr:
+
+```
+fixed 2 issue(s) in 1 file(s)
+skipped 1 overlapping fix(es); run again
+```
+
+Fixes that overlap another fix are skipped; run the command again to pick them up. The exit status
+reflects only the diagnostics that are still printed.
+
+```bash
+lazyverilog-lint --fix rtl/alu.sv
+lazyverilog-lint --fix-unsafe -f project.f
+lazyverilog-lint --fix-interactive rtl/alu.sv
+```
+
 ## Exit codes
 
 | Code | Meaning |

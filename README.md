@@ -197,7 +197,7 @@ Comparison of LazyVerilog and the two most commonly used open-source SystemVeril
 | Signature help | ✅ | ❌ | ✅ |
 | Inlay hints | ✅ | ❌ | ❌ |
 | Symbols | ✅ | ✅ | ✅ |
-| Lint autofix | ⚠️ | ✅ | ❌ |
+| Lint autofix | ✅ (`--fix`) | ✅ | ❌ |
 | RTL code generation | ✅ | ❌ | ❌ |
 | RTL hierarchy view | ✅ | ❌ | ✅ |
 | Interface and connect | ✅ | ❌ | ❌ |
