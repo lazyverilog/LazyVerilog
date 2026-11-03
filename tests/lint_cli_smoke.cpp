@@ -313,6 +313,129 @@ int main(int argc, char** argv) {
               "--help explains how slang errors are named");
     }
 
+    // --fix modes work on temp copies; the fixture files are never touched.
+    {
+        const fs::path dir = fs::temp_directory_path() /
+                         ("lazyverilog_lint_fix_smoke_" + std::to_string(cli_process::current_process_id()));
+        fs::create_directories(dir);
+        const auto write = [&](const char* name, const std::string& text) {
+            const fs::path p = dir / name;
+            std::ofstream(p, std::ios::binary) << text;
+            return p;
+        };
+        const std::string widths =
+            "module m_w(input logic [15:0] b, input logic [15:0] c, output logic [7:0] a,"
+            " output logic [7:0] d);\n  assign a = b;\n  assign d = c;\nendmodule\n";
+
+        {
+            const fs::path f = write("w.sv", widths);
+            auto before = run_command(lint_bin, "--compile-only " + shell_quote(f));
+            expect(contains(before.stdout_text, "[width-trunc]"), "fixture has width-trunc");
+            auto fixed = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(contains(fixed.stderr_text, "fixed 2 issue(s) in 1 file(s)"), "--fix summary");
+            expect(!contains(fixed.stdout_text, "[width-trunc]"),
+                   "--fix does not print a fixed diagnostic");
+            expect(fixed.exit_code == 0, "--fix exits 0 once everything is fixed");
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "assign a = 8'(b);"), "--fix casts the truncating assign");
+            auto after = run_command(lint_bin, "--compile-only " + shell_quote(f));
+            expect(!contains(after.stdout_text, "[width-trunc]"), "no width-trunc after --fix");
+        }
+
+        {
+            const std::string fn = "module m_f;\n  function int f(int x);\n    return x;\n"
+                                   "  endfunction\nendmodule\n";
+            fs::create_directories(dir / "fn");
+            std::ofstream(dir / "fn" / "lazyverilog.toml")
+                << "[lint]\nenable = true\n[lint.function]\nenable = true\n"
+                   "functions_automatic = true\n";
+            const fs::path f = dir / "fn" / "f.sv";
+            std::ofstream(f, std::ios::binary) << fn;
+            run_command(lint_bin, "--fix " + shell_quote(f));
+            expect(!contains(cli_process::read_file(f), "automatic"),
+                   "--fix leaves an unsafe fix alone");
+            run_command(lint_bin, "--fix-unsafe " + shell_quote(f));
+            expect(contains(cli_process::read_file(f), "function automatic"),
+                   "--fix-unsafe adds automatic");
+        }
+
+        {
+            // 8'(b) holds only for the default W; --fix must not bake it in.
+            const std::string param = "module p #(parameter int W = 8) (input logic [15:0] b,"
+                                      " output logic [W-1:0] y);\n  assign y = b;\nendmodule\n";
+            const fs::path f = write("p.sv", param);
+            run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(cli_process::read_file(f) == param,
+                   "--fix leaves a cast in a parameterized module alone");
+            run_command(lint_bin, "--fix-unsafe --compile-only " + shell_quote(f));
+            expect(contains(cli_process::read_file(f), "assign y = 8'(b);"),
+                   "--fix-unsafe applies a cast in a parameterized module");
+        }
+
+        {
+            const fs::path f = write("i.sv", widths);
+            const std::string answers = "y\nn\n";
+            auto r = run_command(lint_bin, "--fix-interactive --compile-only " + shell_quote(f),
+                                 &answers);
+            expect(contains(r.stdout_text, "Apply this fix [y,n,a,q]?"), "interactive prompts");
+            expect(contains(r.stdout_text, "\n-  assign a = b;") &&
+                       contains(r.stdout_text, "\n+  assign a = 8'(b);"),
+                   "interactive shows a - and + line");
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "8'(b)") && !contains(text, "8'(c)"),
+                   "interactive applies only the accepted fix");
+        }
+
+        {
+            std::string crlf = widths;
+            for (size_t i = 0; (i = crlf.find('\n', i)) != std::string::npos; i += 2)
+                crlf.replace(i, 1, "\r\n");
+            const fs::path f = write("crlf.sv", crlf);
+            run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            const std::string text = cli_process::read_file(f);
+            expect(contains(text, "8'(b);\r\n"), "CRLF file is fixed");
+            bool bare_lf = false;
+            for (size_t i = 0; i < text.size(); ++i)
+                if (text[i] == '\n' && (i == 0 || text[i - 1] != '\r'))
+                    bare_lf = true;
+            expect(!bare_lf, "CRLF file stays CRLF after --fix");
+        }
+
+        {
+            auto r = run_command(lint_bin, "--fix --fix-unsafe " + shell_quote(dir / "w.sv"));
+            expect(r.exit_code == 1, "--fix with --fix-unsafe exits 1");
+            expect(contains(r.stderr_text,
+                            "--fix, --fix-unsafe and --fix-interactive cannot be used together"),
+                   "--fix with --fix-unsafe explains");
+        }
+        {
+            const fs::path f = write("ro.sv", widths);
+            // MSVC sets the read-only attribute only when every write bit goes.
+            fs::permissions(f, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                           fs::perm_options::remove);
+            auto r = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(contains(r.stderr_text, "cannot write; not fixed"), "read-only file is refused");
+            expect(cli_process::read_file(f) == widths, "read-only file is unchanged");
+            expect(contains(r.stdout_text, "[width-trunc]"), "read-only file keeps its diagnostics");
+            fs::permissions(f, fs::perms::owner_write, fs::perm_options::add);
+        }
+#ifndef _WIN32
+        {
+            const fs::path real = write("real.sv", widths);
+            const fs::path link = dir / "link.sv";
+            std::error_code ec;
+            fs::create_symlink(real, link, ec);
+            if (!ec) {
+                run_command(lint_bin, "--fix --compile-only " + shell_quote(link));
+                expect(fs::is_symlink(link), "--fix keeps a symlink a symlink");
+                expect(contains(cli_process::read_file(real), "8'(b)"),
+                       "--fix writes through a symlink");
+            }
+        }
+#endif
+        fs::remove_all(dir);
+    }
+
     if (checks_failed > 0) {
         std::cerr << checks_failed << "/" << checks_run << " checks failed\n";
         return 1;

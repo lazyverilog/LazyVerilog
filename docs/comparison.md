@@ -21,7 +21,7 @@ and [svlangserver](https://github.com/imc-trading/svlangserver).
 | Signature help | ✅ | ❌ | ✅ |
 | Inlay hints | ✅ | ❌ | ❌ |
 | Symbols | ✅ | ✅ | ✅ |
-| Lint autofix | ❌ | ✅ | ❌ |
+| Lint autofix | ✅ (`--fix`) | ✅ | ❌ |
 | RTL code generation | ✅ | ❌ | ❌ |
 | RTL hierarchy view | ✅ | ❌ | ✅ |
 | Interface and connect | ✅ | ❌ | ❌ |

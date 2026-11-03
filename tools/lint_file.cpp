@@ -1,6 +1,7 @@
 #include "banner.hpp"
 #include "cli_project.hpp"
 #include "document_state.hpp"
+#include "fix_apply.hpp"
 #include "features/lint.hpp"
 #include "features/lint_codes.hpp"
 #include "string_utils.hpp"
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -25,7 +27,8 @@ namespace {
 
 void print_usage() {
     std::cerr << "Usage: lazyverilog-lint [-f <filelist>] [--lint-only | --compile-only] "
-                 "[--maxerror <n>] [--nowarn <code>] [--version] [--] [<file>]\n"
+                 "[--maxerror <n>] [--nowarn <code>]\n"
+                 "       [--fix | --fix-unsafe | --fix-interactive] [--version] [--] [<file>]\n"
                  "Run lazyverilog-lint --help for the list of diagnostic codes.\n";
 }
 
@@ -60,6 +63,10 @@ void print_help(const slang::DiagnosticEngine& engine) {
            "      --nowarn <code>        Do not report diagnostics with this code.  May be\n"
            "                             given more than once.  A suppressed error also\n"
            "                             stops contributing to the exit status.\n"
+           "      --fix                  Apply the safe fixes in place and print what is left.\n"
+           "      --fix-unsafe           Apply safe and unsafe fixes in place.\n"
+           "      --fix-interactive      Show each fix as a diff and ask: y, n, a (all), q (quit).\n"
+           "                             The three --fix options cannot be combined.\n"
            "      --version              Print the version and exit.\n"
            "  -h, --help                 Print this help and exit.\n"
            "\n"
@@ -219,6 +226,183 @@ struct FlatDiag {
     ParseDiagInfo diag;
 };
 
+enum class FixMode { None, Safe, Unsafe, Interactive };
+
+void print_diag(std::ostream& os, const FlatDiag& item) {
+    os << item.file << ":" << (item.diag.line + 1) << ":" << (item.diag.col + 1) << ": "
+       << severity_text(item.diag.severity) << ": " << item.diag.message;
+    if (!item.diag.code.empty())
+        os << " [" << item.diag.code << "]";
+    os << "\n";
+}
+
+std::string read_binary(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+std::vector<std::string> split_lines(const std::string& text) {
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = text.size();
+        size_t end = nl;
+        if (end > pos && text[end - 1] == '\r')
+            --end;
+        lines.push_back(text.substr(pos, end - pos));
+        pos = nl + 1;
+    }
+    return lines;
+}
+
+/// Print the lines @p fix touches as they are now (-) and with only that fix applied (+).
+void print_fix_preview(const std::string& text, const FixInfo& fix) {
+    int first = std::numeric_limits<int>::max();
+    int last = 0;
+    for (const auto& e : fix.edits) {
+        first = std::min(first, e.start_line);
+        last = std::max(last, e.end_line);
+    }
+    const auto old_lines = split_lines(text);
+    const auto new_lines = split_lines(apply_fixes(text, {&fix}).text);
+    const int delta = static_cast<int>(new_lines.size()) - static_cast<int>(old_lines.size());
+    for (int i = first; i <= last && i < static_cast<int>(old_lines.size()); ++i)
+        std::cout << "-" << old_lines[i] << "\n";
+    for (int i = first; i <= last + delta && i < static_cast<int>(new_lines.size()); ++i)
+        std::cout << "+" << new_lines[i] << "\n";
+}
+
+/// Applies fixes to the files in @p flat (sorted by file) and marks in @p fixed the diagnostics
+/// whose fix went in.
+void apply_cli_fixes(FixMode mode, const std::vector<std::shared_ptr<const DocumentState>>& states,
+                     const std::vector<FlatDiag>& flat, std::vector<bool>& fixed) {
+    size_t total_applied = 0, total_skipped = 0, files_changed = 0;
+    bool accept_all = false, quit = false;
+
+    // Each URI decoded once; a later state for one path wins, as it did.
+    std::unordered_map<std::string, const DocumentState*> state_by_path;
+    for (const auto& st : states)
+        if (st)
+            state_by_path[path_from_file_uri(st->uri)] = st.get();
+
+    for (size_t begin = 0; begin < flat.size() && !quit;) {
+        size_t end = begin;
+        while (end < flat.size() && flat[end].file == flat[begin].file)
+            ++end;
+        const std::string& file = flat[begin].file;
+        const size_t group_begin = begin;
+        begin = end;
+
+        const auto found = state_by_path.find(file);
+        if (found == state_by_path.end())
+            continue;
+        const DocumentState* state = found->second;
+
+        // (diagnostic index, fix) in priority (position) order; one fix per diagnostic.
+        std::vector<std::pair<size_t, const FixInfo*>> candidates;
+        for (size_t i = group_begin; i < end; ++i)
+            for (const auto& fix : flat[i].diag.fixes)
+                if (mode != FixMode::Safe || fix.safe) {
+                    candidates.emplace_back(i, &fix);
+                    break;
+                }
+        if (candidates.empty())
+            continue;
+
+        // Positions are only valid against the text the analyzer parsed.
+        const std::string original = read_binary(file);
+        if (original != state->text) {
+            std::cerr << file << ": changed on disk; not fixed\n";
+            continue;
+        }
+
+        if (mode == FixMode::Interactive) {
+            std::vector<std::pair<size_t, const FixInfo*>> accepted;
+            for (const auto& cand : candidates) {
+                bool take = accept_all;
+                if (!take && !quit) {
+                    print_diag(std::cout, flat[cand.first]);
+                    std::cout << "  fix: " << cand.second->title
+                              << (cand.second->safe ? "" : " [unsafe]") << "\n";
+                    print_fix_preview(original, *cand.second);
+                    std::cout << "Apply this fix [y,n,a,q]? " << std::flush;
+                    std::string answer;
+                    if (!std::getline(std::cin, answer))
+                        answer = "q"; // EOF
+                    const char c = answer.empty() ? 'n'
+                                                  : static_cast<char>(std::tolower(
+                                                        static_cast<unsigned char>(answer[0])));
+                    if (c == 'a')
+                        accept_all = take = true;
+                    else if (c == 'y')
+                        take = true;
+                    else if (c == 'q')
+                        quit = true;
+                }
+                if (take)
+                    accepted.push_back(cand);
+            }
+            candidates = std::move(accepted);
+        }
+        if (candidates.empty())
+            continue;
+
+        std::vector<const FixInfo*> fixes;
+        for (const auto& cand : candidates)
+            fixes.push_back(cand.second);
+        const FixApplyResult result = apply_fixes(original, fixes);
+
+        // Write beside the original and rename over it, so a failed write cannot truncate it.
+        bool wrote = true;
+        // shortcut: hard links and ownership are not preserved, upgrade to an in-place write if that matters
+        if (result.text != original) {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const fs::path target = fs::canonical(file, ec); // follow symlinks
+            const auto perms = ec ? fs::perms::none : fs::status(target, ec).permissions();
+            if (ec || (perms & fs::perms::owner_write) == fs::perms::none) {
+                wrote = false; // missing or read-only: leave it alone
+            } else {
+                const fs::path tmp = target.string() + ".lazyverilog-fix.tmp";
+                {
+                    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                    out << result.text;
+                    out.flush();
+                    out.close();
+                    wrote = static_cast<bool>(out);
+                }
+                if (wrote)
+                    fs::permissions(tmp, perms, ec);
+                if (wrote && !ec)
+                    fs::rename(tmp, target, ec);
+                if (!wrote || ec) {
+                    wrote = false;
+                    fs::remove(tmp, ec);
+                }
+            }
+        }
+        if (!wrote) {
+            std::cerr << file << ": cannot write; not fixed\n";
+            continue;
+        }
+        for (size_t k = 0; k < candidates.size(); ++k)
+            fixed[candidates[k].first] = result.outcomes[k] != FixOutcome::Skipped;
+
+        total_applied += result.applied;
+        total_skipped += result.skipped;
+        if (result.text != original)
+            ++files_changed;
+    }
+
+    std::cerr << "fixed " << total_applied << " issue(s) in " << files_changed << " file(s)\n";
+    if (total_skipped != 0)
+        std::cerr << "skipped " << total_skipped << " overlapping fix(es); run again\n";
+}
+
 void collect(std::vector<FlatDiag>& out, const std::string& fallback_uri,
             std::vector<ParseDiagInfo> diags) {
     for (auto& d : diags) {
@@ -244,6 +428,8 @@ int main(int argc, char* argv[]) {
     bool compile_only = false;
     uint32_t error_limit = kDefaultCompilationErrorLimit;
     NowarnFilter nowarn;
+    FixMode fix_mode = FixMode::None;
+    int fix_flags = 0;
 
     bool end_of_options = false;
     for (int i = 1; i < argc; ++i) {
@@ -291,6 +477,11 @@ int main(int argc, char* argv[]) {
             lint_only = true;
         } else if (arg == "--compile-only") {
             compile_only = true;
+        } else if (arg == "--fix" || arg == "--fix-unsafe" || arg == "--fix-interactive") {
+            ++fix_flags;
+            fix_mode = arg == "--fix"          ? FixMode::Safe
+                       : arg == "--fix-unsafe" ? FixMode::Unsafe
+                                               : FixMode::Interactive;
         } else if (arg == "--version") {
             std::cout << "lazyverilog-lint " << LAZYVERILOG_VERSION << "\n";
             return 0;
@@ -315,9 +506,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (fix_flags > 1) {
+        std::cerr << "--fix, --fix-unsafe and --fix-interactive cannot be used together\n";
+        print_usage();
+        return 1;
+    }
+
     std::string file_text;
     if (!file_arg.empty()) {
-        std::ifstream f(file_arg);
+        std::ifstream f(file_arg, std::ios::binary); // byte-exact: fixes apply by position
         if (!f) {
             std::cerr << "Cannot open " << file_arg << "\n";
             return 1;
@@ -382,7 +579,7 @@ int main(int argc, char* argv[]) {
                    flat.end());
     }
 
-    std::sort(flat.begin(), flat.end(), [](const FlatDiag& a, const FlatDiag& b) {
+    std::stable_sort(flat.begin(), flat.end(), [](const FlatDiag& a, const FlatDiag& b) {
         if (a.file != b.file)
             return a.file < b.file;
         if (a.diag.line != b.diag.line)
@@ -390,13 +587,16 @@ int main(int argc, char* argv[]) {
         return a.diag.col < b.diag.col;
     });
 
+    std::vector<bool> fixed(flat.size(), false);
+    if (fix_mode != FixMode::None)
+        apply_cli_fixes(fix_mode, states, flat, fixed);
+
     bool has_error = false;
-    for (const auto& item : flat) {
-        std::cout << item.file << ":" << (item.diag.line + 1) << ":" << (item.diag.col + 1) << ": "
-                  << severity_text(item.diag.severity) << ": " << item.diag.message;
-        if (!item.diag.code.empty())
-            std::cout << " [" << item.diag.code << "]";
-        std::cout << "\n";
+    for (size_t i = 0; i < flat.size(); ++i) {
+        if (fixed[i])
+            continue;
+        const auto& item = flat[i];
+        print_diag(std::cout, item);
         if (item.diag.severity == 1)
             has_error = true;
     }

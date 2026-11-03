@@ -19,6 +19,20 @@ class SyntaxTree;
 // consumer, and the cache below holds it behind a shared_ptr, so this core
 // header does not have to pull in the protocol headers to name it.
 struct FoldingRange;
+// One text replacement of a fix; 0-based line, UTF-16 column.  An empty range
+// is a pure insertion.
+struct FixEdit {
+    int start_line{0}, start_col{0}, end_line{0}, end_col{0};
+    std::string new_text;
+};
+
+// A fix is applied whole or not at all.  `safe` = cannot change behavior.
+struct FixInfo {
+    std::string title;
+    bool safe{true};
+    std::vector<FixEdit> edits;
+};
+
 /// Pre-formatted diagnostic info extracted at parse time.
 /// Avoids copying slang::Diagnostic (whose ConstantValue args are
 /// not safely copyable — internal arena pointers become dangling).
@@ -33,6 +47,7 @@ struct ParseDiagInfo {
     // lazyverilog-lint prints in brackets and what --nowarn takes.  Empty only
     // for a diagnostic built by a caller that has no code to give.
     std::string code;
+    std::vector<FixInfo> fixes;
 };
 
 /// Drop exact duplicates from @p diags, keeping the first of each.

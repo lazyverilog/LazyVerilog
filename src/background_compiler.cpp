@@ -1,5 +1,6 @@
 #include "background_compiler.hpp"
 #include "diagnostic_code.hpp"
+#include "features/fix_slang.hpp"
 #include "lsp_position.hpp"
 #include "cpu_budget.hpp"
 #include "syntax_index_shared.hpp"
@@ -49,7 +50,8 @@ static std::string diagnostic_uri(const slang::SourceManager& sm, const std::str
 static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
                                         slang::DiagnosticEngine& engine,
                                         const slang::Diagnostic& diagnostic,
-                                        const std::string& fallback_uri, std::string& uri) {
+                                        const std::string& fallback_uri, std::string& uri,
+                                        SlangFixContext& fix_context) {
     ParseDiagInfo info;
     try {
         auto loc = diagnostic.location.valid() ? sm.getFullyExpandedLoc(diagnostic.location)
@@ -65,6 +67,7 @@ static ParseDiagInfo convert_diagnostic(const slang::SourceManager& sm,
     }
 
     info.code = slang_diagnostic_code(engine, diagnostic.code);
+    info.fixes = slang_fixes(sm, diagnostic, fix_context);
     auto sev = slang_diagnostic_severity(diagnostic.code);
     if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
         info.severity = 1;
@@ -504,13 +507,15 @@ void BackgroundCompiler::compile_group(const CompilationSnapshot& snapshot,
 
     if (!first_uri.empty()) {
         slang::DiagnosticEngine engine(*source_manager);
+        SlangFixContext fix_context;
         try {
             for (const auto& diagnostic : compilation.getSemanticDiagnostics()) {
                 if (slang_diagnostic_hidden(diagnostic.code) ||
                     (parse_inputs && is_foreign_macro_warning(*source_manager, diagnostic, *parse_inputs)))
                     continue;
                 std::string uri;
-                auto info = convert_diagnostic(*source_manager, engine, diagnostic, first_uri, uri);
+                auto info = convert_diagnostic(*source_manager, engine, diagnostic, first_uri, uri,
+                                               fix_context);
                 result.diagnostics_by_uri[uri].push_back(std::move(info));
             }
         } catch (const std::exception& e) {

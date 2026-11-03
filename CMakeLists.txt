@@ -489,6 +489,8 @@ set(LAZYVERILOG_SOURCES
     src/project_root.cpp
     src/implicit_project.cpp
     src/parse_inputs.cpp
+    src/fix_apply.cpp
+    src/features/fix_slang.cpp
     src/edit_watermark.cpp
     src/position_encoding.cpp
     src/features/hover.cpp
@@ -539,6 +541,8 @@ set(LAZYVERILOG_TEST_SOURCES
     tests/test_cpu_budget.cpp
     tests/test_path_uri.cpp
     tests/test_json_string.cpp
+    tests/test_fix_apply.cpp
+    tests/test_lint_fix.cpp
     tests/test_filelist.cpp
     tests/test_document_sync.cpp
     tests/test_lsp_position_encoding.cpp
@@ -590,6 +594,8 @@ set(LAZYVERILOG_TEST_SOURCES
     src/project_root.cpp
     src/implicit_project.cpp
     src/parse_inputs.cpp
+    src/fix_apply.cpp
+    src/features/fix_slang.cpp
     src/edit_watermark.cpp
     src/position_encoding.cpp
     src/features/formatter.cpp
@@ -655,7 +661,8 @@ add_executable(index-bench
     src/syntax_index_shared.cpp
     src/index_cache.cpp
     src/project_root.cpp
-    src/parse_inputs.cpp)
+    src/parse_inputs.cpp
+    src/features/fix_slang.cpp)
 target_include_directories(index-bench PRIVATE src)
 target_link_libraries(index-bench PRIVATE slang::slang tomlplusplus::tomlplusplus)
 
@@ -684,6 +691,8 @@ set(LAZYVERILOG_CLI_PROJECT_SOURCES
     src/index_cache.cpp
     src/project_root.cpp
     src/parse_inputs.cpp
+    src/fix_apply.cpp
+    src/features/fix_slang.cpp
     src/features/lint.cpp
     src/features/lint_codes.cpp
 )

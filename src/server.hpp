@@ -304,6 +304,17 @@ class LazyVerilogServer {
     std::unordered_set<std::string> folding_result_live_uris_;
     std::unordered_map<std::string, std::unordered_set<std::string>> diagnostic_uris_by_owner_;
 
+    // The lint diagnostics publish_diagnostics() computed per URI and the
+    // state they came from, so a code action reuses them instead of linting
+    // on the request path.  weak_ptr: never keeps an old AST alive, and an
+    // expired one never matches a new state at a reused address.
+    struct PublishedLint {
+        std::weak_ptr<const DocumentState> state;
+        std::shared_ptr<const std::vector<ParseDiagInfo>> diags;
+    };
+    std::mutex published_lint_mutex_;
+    std::unordered_map<std::string, PublishedLint> published_lint_;
+
     // Background project indexing and optional semantic compilation can request
     // diagnostic / refresh notifications from worker threads, while normal LSP
     // didOpen/didChange handlers publish from the endpoint thread.  LspCpp
