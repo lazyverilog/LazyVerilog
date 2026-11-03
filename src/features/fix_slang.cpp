@@ -7,7 +7,6 @@
 #include <slang/ast/types/AllTypes.h>
 #include <slang/diagnostics/ExpressionsDiags.h>
 
-#include <any>
 #include <concepts>
 #include <optional>
 #include <string>
@@ -18,16 +17,6 @@ namespace {
 
 using namespace slang;
 using namespace slang::ast;
-
-const Type* type_arg(const Diagnostic& d, size_t index) {
-    if (index >= d.args.size())
-        return nullptr;
-    auto custom = std::get_if<Diagnostic::CustomArgType>(&d.args[index]);
-    if (!custom)
-        return nullptr;
-    auto type = std::any_cast<const Type*>(&custom->second);
-    return type ? *type : nullptr;
-}
 
 std::optional<uint64_t> width_arg(const Diagnostic& d, size_t index) {
     if (index >= d.args.size())
@@ -88,6 +77,9 @@ struct RangeFacts {
     bool lvalue = false;
     const ConversionExpression* conversion = nullptr;
     const Expression* expr = nullptr;
+    // The left-hand type of an assignment whose right-hand side is here: slang
+    // inserts no conversion between equivalent types (packed-array-conv).
+    const Type* assigned = nullptr;
 };
 
 struct RangeHash {
@@ -107,6 +99,8 @@ struct FactCollector : ASTVisitor<FactCollector, VisitFlags::AllGood> {
     void handle(const AssignmentExpression& expr) {
         if (expr.isLValueArg())
             facts[expr.left().sourceRange].lvalue = true;
+        else
+            facts[expr.right().sourceRange].assigned = expr.left().type;
         visitDefault(expr);
     }
 
@@ -306,7 +300,10 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
         return wrap(sm, range, open, close, "Cast to " + std::to_string(*width) + " bits");
     }
 
-    auto target = type_arg(d, 1);
+    // The implicit conversion's own type, not the diagnostic's Type argument:
+    // std::any_cast<const Type*> outside slang breaks slang's own cast of it on
+    // libc++ arm64 (see SLANG_TYPEOF in slang/util/Util.h).
+    const Type* target = facts.conversion ? facts.conversion->type.get() : facts.assigned;
     if (!target)
         return {};
 
@@ -348,19 +345,21 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
 // analyzeOpTypes(): args are the operand types, ranges 1 and 2 the operands.
 std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d,
                                    SlangFixContext& context) {
-    auto lt = type_arg(d, 0), rt = type_arg(d, 1);
-    if (!lt || !rt || d.ranges.size() < 3)
+    if (d.ranges.size() < 3 || !editable(sm, d, d.ranges[1]) || !editable(sm, d, d.ranges[2]))
         return {};
-    auto& left = lt->getCanonicalType();
-    auto& right = rt->getCanonicalType();
+    // Both operands must be primaries: an operator operand is evaluated at the
+    // context's width (~c, c * d) and would be evaluated at its own inside a
+    // cast, and its type here is already the propagated one.
+    auto lf = facts_at(d, d.ranges[1], context), rf = facts_at(d, d.ranges[2], context);
+    if (!lf || !rf || !lf->expr || !rf->expr || !is_primary(*lf->expr) || !is_primary(*rf->expr))
+        return {};
+    auto& left = lf->expr->type->getCanonicalType();
+    auto& right = rf->expr->type->getCanonicalType();
 
     if (d.code == diag::SignCompare) {
+        if (left.isSigned() == right.isSigned())
+            return {};
         auto range = left.isSigned() ? d.ranges[1] : d.ranges[2];
-        if (!editable(sm, d, range))
-            return {};
-        auto facts = facts_at(d, range, context);
-        if (!facts || !facts->expr || !is_primary(*facts->expr))
-            return {};
         return wrap(sm, range, "unsigned'(", ")", "Cast to unsigned");
     }
 
@@ -371,13 +370,6 @@ std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d,
         return {};
     const bool left_narrower = left.getBitWidth() < right.getBitWidth();
     auto range = left_narrower ? d.ranges[1] : d.ranges[2];
-    if (!editable(sm, d, range))
-        return {};
-    // An operator operand is evaluated at the context's width (~c, c * d);
-    // inside the cast it would be evaluated at its own.
-    auto facts = facts_at(d, range, context);
-    if (!facts || !facts->expr || !is_primary(*facts->expr))
-        return {};
     const auto width = std::to_string(std::max(left.getBitWidth(), right.getBitWidth()));
     return wrap(sm, range, width + "'(", ")",
                 "Cast " + title_text(sm, range) + " to " + width + " bits");

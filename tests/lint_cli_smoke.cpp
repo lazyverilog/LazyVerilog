@@ -410,7 +410,9 @@ int main(int argc, char** argv) {
         }
         {
             const fs::path f = write("ro.sv", widths);
-            fs::permissions(f, fs::perms::owner_write, fs::perm_options::remove);
+            // MSVC sets the read-only attribute only when every write bit goes.
+            fs::permissions(f, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                           fs::perm_options::remove);
             auto r = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
             expect(contains(r.stderr_text, "cannot write; not fixed"), "read-only file is refused");
             expect(cli_process::read_file(f) == widths, "read-only file is unchanged");
