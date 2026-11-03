@@ -157,11 +157,16 @@ std::optional<RangeFacts> facts_at(const Diagnostic& d, SourceRange range,
                                    SlangFixContext& context) {
     if (!d.symbol)
         return std::nullopt;
-    auto [it, fresh] = context.impl->scopes.try_emplace(d.symbol);
+    // A statement block's symbol holds its declarations, not its statements;
+    // the enclosing procedure, subroutine or body reaches those.
+    const Symbol* scope = d.symbol;
+    while (scope->kind == SymbolKind::StatementBlock && scope->getParentScope())
+        scope = &scope->getParentScope()->asSymbol();
+    auto [it, fresh] = context.impl->scopes.try_emplace(scope);
     if (fresh) {
         try {
             FactCollector collector(it->second);
-            d.symbol->visit(collector);
+            scope->visit(collector);
         } catch (...) {
             // A half-walked scope could miss an output argument.
             context.impl->scopes.erase(it);
@@ -206,6 +211,26 @@ bool is_conversion(DiagCode code) {
            code == diag::ImplicitConvert || code == diag::PackedArrayConv ||
            code == diag::SignConversion || code == diag::FloatIntConv ||
            code == diag::IntFloatConv || code == diag::FloatNarrow || code == diag::FloatWiden;
+}
+
+// An operand a cast cannot change the evaluation of: in context an operator's
+// operands are extended to the context's width and sign, inside a cast they
+// are self-determined.
+bool is_primary(const Expression& expr) {
+    switch (expr.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue:
+        case ExpressionKind::ElementSelect:
+        case ExpressionKind::RangeSelect:
+        case ExpressionKind::MemberAccess:
+        case ExpressionKind::Concatenation:
+        case ExpressionKind::Call:
+            return true;
+        case ExpressionKind::Conversion: // only explicit casts reach here
+            return !expr.as<ConversionExpression>().isImplicit();
+        default:
+            return false;
+    }
 }
 
 // checkImplicitConversions(): range 0 is the converted operand.
@@ -257,9 +282,11 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
 
     if (code == diag::SignConversion) {
         // Widening extends by the operand's sign; a sign cast would extend by
-        // the target's.  The width-expand fix leaves an equal-width case.  The
-        // operand's own width: slang's source type here is already widened.
-        if (!facts.expr || target->getBitWidth() > facts.expr->type->getBitWidth())
+        // the target's.  The width-expand fix leaves an equal-width case.  Only
+        // a primary keeps its own width: slang rewrites an operator's type to
+        // the target's, and its operands' evaluation would change in the cast.
+        if (!facts.expr || !is_primary(*facts.expr) ||
+            target->getBitWidth() > facts.expr->type->getBitWidth())
             return {};
         const bool to_signed = target->isSigned();
         return wrap(sm, range, to_signed ? "signed'(" : "unsigned'(", ")",
@@ -286,23 +313,6 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
     if (code == diag::FloatNarrow || shortreal)
         return wrap(sm, range, "shortreal'(", ")", "Convert to shortreal");
     return wrap(sm, range, "real'(", ")", "Convert to real");
-}
-
-// An operand a cast cannot change the evaluation of: inside the comparison an
-// operator's operands are extended unsigned, inside a cast by their own sign.
-bool is_primary(const Expression& expr) {
-    switch (expr.kind) {
-        case ExpressionKind::NamedValue:
-        case ExpressionKind::HierarchicalValue:
-        case ExpressionKind::ElementSelect:
-        case ExpressionKind::RangeSelect:
-        case ExpressionKind::MemberAccess:
-        case ExpressionKind::Concatenation:
-        case ExpressionKind::Call:
-            return true;
-        default:
-            return false;
-    }
 }
 
 // analyzeOpTypes(): args are the operand types, ranges 1 and 2 the operands.

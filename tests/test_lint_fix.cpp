@@ -544,3 +544,30 @@ TEST_CASE("lint-fix: value - width and sign on a truncation, in one run", "[lint
     CHECK((fixed.find("a = signed'(8'(b));") != std::string::npos ||
            fixed.find("a = 8'(signed'(b));") != std::string::npos));
 }
+
+TEST_CASE("lint-fix: sign-conversion on an operator operand gets no fix", "[lint-fix]") {
+    // b + c is evaluated 8 bits wide in the assignment (4'hF + 4'hF = 30);
+    // inside signed'(b + c) it would be 4 bits wide.
+    const char* src = "module m;\n"
+                      "  function automatic logic signed [7:0] f(logic [3:0] b, logic [3:0] c);\n"
+                      "    logic signed [7:0] a; a = b + c; return a;\n  endfunction\n"
+                      "  localparam logic signed [7:0] R0 = f(4'hF, 4'hF);\n"
+                      "  localparam logic signed [7:0] R1 = f(4'h1, 4'h2);\nendmodule\n";
+    CHECK(fixes_of(src, "sign-conversion").empty());
+    // slang raises no width-expand here (the add is context-determined), so
+    // nothing at all is rewritten and R0 stays 30.
+    CHECK(fix_codes(src, {"width-expand", "sign-conversion"}) == src);
+    CHECK(param_values(src).front() == "8'sd30");
+}
+
+TEST_CASE("lint-fix: a conversion inside a block scope still gets its fix", "[lint-fix]") {
+    check_fix("module m(input logic [15:0] w, output logic [7:0] q);\n"
+              "  always_comb begin : blk q = w; end\nendmodule\n",
+              "width-trunc", "begin : blk q = 8'(w); end");
+    check_fix("module m(input logic [15:0] w, output logic [7:0] z);\n"
+              "  always_comb for (int i = 0; i < 2; i++) z = w;\nendmodule\n",
+              "width-trunc", "z = 8'(w);");
+    check_fix("module m(input logic [15:0] w, output logic [7:0] q);\n"
+              "  always_comb begin logic [7:0] t; t = w; q = t; end\nendmodule\n",
+              "width-trunc", "t = 8'(w);");
+}
