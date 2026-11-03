@@ -24,7 +24,8 @@ warnings and lazyverilog lint rules that have an unambiguous fix.
 - Each fix is graded `safe` (keeps behavior, states intent) or `unsafe` (may
   change behavior). `--fix` applies safe fixes only; `--fix-unsafe` applies all;
   interactive mode offers all and tags unsafe ones `[unsafe]`; the server offers
-  all and marks safe ones `isPreferred`.
+  all, safe ones first, and appends ` (may change behavior)` to an unsafe
+  fix's title (lspcpp's `CodeAction` has no `isPreferred` field).
 - Delivered as four PRs, in order, each reviewed before merge.
 
 ## Model
@@ -91,7 +92,8 @@ syntax tree they already walk (`src/features/lint.cpp`).
 `src/features/code_action.cpp`: for each diagnostic in the request, find the
 current document's diagnostic (lint from `run_lint`, parse, and semantic from
 `Analyzer::semantic_diagnostics`) with the same start position and code, and
-turn each of its fixes into a `quickfix` code action (`isPreferred` when safe).
+turn each of its fixes into a `quickfix` code action (safe first; unsafe
+titles end in ` (may change behavior)`).
 Semantic diagnostics are used only when their version matches the open
 buffer's, so a stale fix is never offered. The three message-matching branches
 are removed.
@@ -217,7 +219,7 @@ needs intent (`casez-with-x`, `finish-num`, `index-oob`, `case-overlap`, ...).
   text out, then recompile the fixed text and require the code gone and no new
   diagnostic. Guard cases: macro body, macro argument, include file.
 - `tests/test_code_action.cpp` (or the existing code-action tests): a quick fix
-  appears for a width warning, `isPreferred` follows the grade, a stale semantic
+  appears for a width warning, ordering and title follow the grade, a stale semantic
   diagnostic yields none, the three moved fixes still appear.
 - `tests/lint_cli_smoke.cpp`: `--fix` rewrites a temp file and the exit status
   drops; `--fix-interactive` with `y\nn\n` on stdin applies only the first;
