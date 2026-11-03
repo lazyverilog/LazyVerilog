@@ -725,21 +725,25 @@ menu on the diagnostic (`Ctrl+.` in VS Code, `vim.lsp.buf.code_action()` in Neov
 | `case_missing_default` | Add default case | Inserts `default: ;` before `endcase` |
 | `explicit_function_lifetime`, `functions_automatic` | Add 'automatic' lifetime | Inserts `automatic` after `function` |
 | `explicit_task_lifetime` | Add 'automatic' lifetime to task | Inserts `automatic` after `task` |
-| `width-trunc`, `width-expand`, `port-width-trunc`, `port-width-expand` | Cast to N bits | Wraps the expression as `N'(e)` |
-| `arith-op-mismatch`, `bitwise-op-mismatch` | Cast to N bits | Wraps the narrower operand as `N'(e)` |
+| `width-trunc`, `width-expand`, `port-width-trunc`, `port-width-expand` | Cast to N bits | Wraps the expression as `N'(e)`. On a port, a net connection becomes an expression connection |
+| `arith-op-mismatch`, `bitwise-op-mismatch` | Cast to N bits | Wraps a primary narrower operand as `N'(e)` |
 | `sign-conversion` | Cast to signed or unsigned | Wraps a primary operand as `signed'(e)` or `unsigned'(e)` |
-| `sign-compare` | Cast to unsigned | Wraps the signed operand as `unsigned'(e)` |
+| `sign-compare` | Cast to unsigned | Wraps a primary signed operand as `unsigned'(e)` |
 | `implicit-conv`, `packed-array-conv`, `float-int-conv` | Cast to the target type | Wraps the expression as `T'(e)`, only when the target type has a name |
 | `int-float-conv`, `float-widen`, `float-narrow` | Cast to real or shortreal | Wraps the expression as `real'(e)` or `shortreal'(e)` |
 | `int-bool-conv`, `float-bool-conv` | Compare with zero | Rewrites `e` as `(e) != '0` or `(e) != 0.0` |
 
 The lifetime fixes are unsafe, because making a function automatic changes how its variables
-behave. The case default fix and every conversion fix are safe. `lazyverilog-lint --fix` applies the
+behave. The width, sign and operand casts are unsafe in a parameterized scope (the module, or a
+scope around the code, declares a parameter or localparam, or it is in a generate loop): the cast
+holds the width of the one elaboration that was checked. The case default fix and every other
+conversion fix are safe. `lazyverilog-lint --fix` applies the
 safe ones and `--fix-unsafe` applies all of them (see [Fixing](cli.md#fixing)).
 
 Some compiler warnings get no fix: `comparison-mismatch`, a `float-int-conv` whose target type has no
-name, output and inout arguments or ports (they cannot be cast), and sign conversions or comparisons
-whose operand is a compound expression. The other rules have no quick fix.
+name, output and inout arguments or ports (they cannot be cast), and sign conversions, comparisons
+and operator mismatches whose operand is a compound expression such as `~c` or `c * d` (in context it
+is evaluated at the wider width, inside a cast at its own). The other rules have no quick fix.
 
 ---
 

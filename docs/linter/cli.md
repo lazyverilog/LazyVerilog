@@ -82,7 +82,8 @@ A file that changed on disk since it was read is left alone, with a warning on s
 
 Interactive mode prints the diagnostic, the fix title (marked `[unsafe]` when it is), the affected
 lines as `-` (before) and `+` (after), and then asks `Apply this fix [y,n,a,q]?`. Answer `y` to apply,
-`n` to skip, `a` to apply this and every remaining fix, or `q` to stop. End of input counts as `q`.
+`n` to skip, `a` to apply this and every remaining fix without asking again (unsafe ones
+included), or `q` to stop. End of input counts as `q`.
 The accepted fixes of a file are applied together at the end.
 
 Fixed diagnostics are not printed. A summary goes to stderr whenever a fix option is given, even when

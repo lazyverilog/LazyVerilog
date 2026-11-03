@@ -129,18 +129,19 @@ The run does not re-lint after writing.
 ## Catalog
 
 `safe` keeps behavior. Each fix's test recompiles the fixed text and checks the
-diagnostic is gone and no new diagnostic appears.
+diagnostic is gone and no new diagnostic appears; every safe cast also has a
+value check (see Testing).
 
 ### PR 1: model, CLI modes, server wiring, conversions
 
 | Code | Fix | Grade |
 |---|---|---|
 | width-trunc, width-expand, port-width-trunc, port-width-expand | `N'(e)` with the target width | safe |
-| arith-op-mismatch, bitwise-op-mismatch, comparison-mismatch | `N'(e)` on the narrower operand, to the wider width | safe |
-| sign-conversion | `signed'(e)` or `unsigned'(e)` to the target's signedness | safe |
-| sign-compare | `unsigned'(e)` on the signed operand (the comparison is unsigned already) | safe |
+| arith-op-mismatch, bitwise-op-mismatch | `N'(e)` on the narrower operand, to the wider width, when that operand is primary; no fix otherwise | safe |
+| sign-conversion | `signed'(e)` or `unsigned'(e)` to the target's signedness, when `e` is primary and not widened; no fix otherwise | safe |
+| sign-compare | `unsigned'(e)` on the signed operand (the comparison is unsigned already), when it is primary; no fix otherwise | safe |
 | implicit-conv, packed-array-conv | `T'(e)` when the target type is named (typedef, or a built-in type keyword); no fix otherwise | safe |
-| float-int-conv | `T'(e)` when the target is named, else `N'(e)`, or `signed'(N'(e))` for a signed target (rounds like the implicit conversion) | safe |
+| float-int-conv | `T'(e)` when the target is named (typedef or built-in type keyword); no fix otherwise (`N'(e)` of a real is an error) | safe |
 | int-float-conv, float-widen | `real'(e)` (`shortreal'(e)` when the target is shortreal) | safe |
 | float-narrow | `shortreal'(e)` | safe |
 | int-bool-conv | `(e) != '0` | safe |
@@ -164,6 +165,18 @@ argument and output port that get no fix.
 `N'(e)` uses the bare width; the target's signedness is handled by the
 separate sign-conversion fix when slang reports one. Parentheses are added
 around `e` only where the cast syntax needs none (`N'(...)` already groups).
+
+Primary operands. In context an operator's operands are extended to the
+context's width and sign before it runs; inside a cast they are
+self-determined. So the sign and operand casts apply only to a primary operand
+(a name, select, member access, concatenation, call or explicit cast), whose
+value a cast cannot change: `(~c) | b` or `(c * d) + b` gets no fix.
+
+Parameterized scopes. A cast's width and sign come from the one elaboration
+slang saw. When the diagnostic's scope, or any scope enclosing it up to the
+instance body (or package or `$unit`), declares a parameter or localparam, or
+is a generate-loop iteration, the width, sign and operand casts are still
+offered but graded unsafe.
 
 ### PR 2: precedence and simple cleanup
 
@@ -218,6 +231,10 @@ needs intent (`casez-with-x`, `finish-num`, `index-oob`, `case-overlap`, ...).
 - `tests/test_lint_fix.cpp` (`[lint-fix]`): per catalog row, source in, fixed
   text out, then recompile the fixed text and require the code gone and no new
   diagnostic. Guard cases: macro body, macro argument, include file.
+- Recompiling is not enough for a cast graded safe: every safe cast needs a
+  value check, a function holding the construct called from localparams whose
+  values slang's constant evaluation must keep across the fix (and the
+  compound-operand cases that get no fix keep their value unchanged).
 - `tests/test_code_action.cpp` (or the existing code-action tests): a quick fix
   appears for a width warning, ordering and title follow the grade, a stale semantic
   diagnostic yields none, the three moved fixes still appear.

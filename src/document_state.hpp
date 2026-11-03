@@ -19,9 +19,6 @@ class SyntaxTree;
 // consumer, and the cache below holds it behind a shared_ptr, so this core
 // header does not have to pull in the protocol headers to name it.
 struct FoldingRange;
-/// Pre-formatted diagnostic info extracted at parse time.
-/// Avoids copying slang::Diagnostic (whose ConstantValue args are
-/// not safely copyable — internal arena pointers become dangling).
 // One text replacement of a fix; 0-based line, UTF-16 column.  An empty range
 // is a pure insertion.
 struct FixEdit {
@@ -36,6 +33,9 @@ struct FixInfo {
     std::vector<FixEdit> edits;
 };
 
+/// Pre-formatted diagnostic info extracted at parse time.
+/// Avoids copying slang::Diagnostic (whose ConstantValue args are
+/// not safely copyable — internal arena pointers become dangling).
 struct ParseDiagInfo {
     int line{0};     // 0-based
     int col{0};      // 0-based

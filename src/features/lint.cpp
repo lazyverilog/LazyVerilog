@@ -554,7 +554,7 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                         diags.back().fixes.push_back(
                             insert_fix("Add default case", true, end, "default: ; "));
                     } else {
-                        auto [__, indent] = line_prefix(node.caseKeyword.location());
+                        auto indent = line_prefix(node.caseKeyword.location()).second;
                         int line = (int)sm.getFileLineNumber(end) - 1;
                         diags.back().fixes.push_back(FixInfo{
                             "Add default case", true,
