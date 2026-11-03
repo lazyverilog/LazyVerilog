@@ -8,8 +8,10 @@
 #include <slang/diagnostics/ExpressionsDiags.h>
 
 #include <any>
+#include <concepts>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 
 namespace {
@@ -60,34 +62,71 @@ std::vector<FixInfo> wrap(const SourceManager& sm, SourceRange range, std::strin
     return {std::move(fix)};
 }
 
-std::string_view range_text(const SourceManager& sm, SourceRange range) {
-    return sm.getSourceText(range.start().buffer())
-        .substr(range.start().offset(), range.end().offset() - range.start().offset());
+// The operand's text for a title: whitespace runs collapsed, at most 40 chars.
+std::string title_text(const SourceManager& sm, SourceRange range) {
+    auto text = sm.getSourceText(range.start().buffer())
+                    .substr(range.start().offset(), range.end().offset() - range.start().offset());
+    std::string out;
+    for (char c : text) {
+        const bool space = c == ' ' || c == '\t' || c == '\r' || c == '\n';
+        if (!space)
+            out += c;
+        else if (!out.empty() && out.back() != ' ')
+            out += ' ';
+    }
+    if (!out.empty() && out.back() == ' ')
+        out.pop_back();
+    if (out.size() > 40)
+        out = out.substr(0, 37) + "...";
+    return out;
 }
 
-// Whether the text before @p range ends in `=`: the right side of an
-// assignment or initializer, never an output argument or port.
-bool after_equals(const SourceManager& sm, SourceRange range) {
-    auto text = sm.getSourceText(range.start().buffer()).substr(0, range.start().offset());
-    auto last = text.find_last_not_of(" \t\r\n");
-    return last != std::string_view::npos && text[last] == '=';
-}
+// What a scope binds at one source range: whether it is an output/inout
+// argument or port (bound as `actual = <placeholder>`), the outermost implicit
+// conversion there, and the outermost other expression there.
+struct RangeFacts {
+    bool lvalue = false;
+    const ConversionExpression* conversion = nullptr;
+    const Expression* expr = nullptr;
+};
 
-// What the diagnostic's scope binds at the operand's range: whether the range
-// is an output/inout argument or port (bound as `actual = <placeholder>`), and
-// the implicit conversion applied to it.
-struct OperandFinder : ASTVisitor<OperandFinder, VisitFlags::AllGood> {
-    explicit OperandFinder(SourceRange r) : range(r) {}
+struct RangeHash {
+    size_t operator()(SourceRange range) const {
+        size_t h = 0;
+        for (auto loc : {range.start(), range.end()})
+            h = (h * 1000003) ^ (size_t(loc.buffer().getId()) * 31 + size_t(loc.offset()));
+        return h;
+    }
+};
+
+using ScopeFacts = std::unordered_map<SourceRange, RangeFacts, RangeHash>;
+
+struct FactCollector : ASTVisitor<FactCollector, VisitFlags::AllGood> {
+    explicit FactCollector(ScopeFacts& f) : facts(f) {}
 
     void handle(const AssignmentExpression& expr) {
-        if (expr.isLValueArg() && expr.left().sourceRange == range)
-            lvalue = true;
+        if (expr.isLValueArg())
+            facts[expr.left().sourceRange].lvalue = true;
         visitDefault(expr);
     }
 
     void handle(const ConversionExpression& expr) {
-        if (!conversion && expr.isImplicit() && expr.sourceRange == range)
-            conversion = &expr;
+        auto& f = facts[expr.sourceRange];
+        if (!expr.isImplicit()) {
+            if (!f.expr)
+                f.expr = &expr;
+        }
+        else if (!f.conversion) {
+            f.conversion = &expr;
+        }
+        visitDefault(expr);
+    }
+
+    template<std::derived_from<Expression> T>
+    void handle(const T& expr) {
+        auto& f = facts[expr.sourceRange];
+        if (!f.expr)
+            f.expr = &expr;
         visitDefault(expr);
     }
 
@@ -98,10 +137,40 @@ struct OperandFinder : ASTVisitor<OperandFinder, VisitFlags::AllGood> {
                 expr->visit(*this);
     }
 
-    SourceRange range;
-    bool lvalue = false;
-    const ConversionExpression* conversion = nullptr;
+    ScopeFacts& facts;
 };
+
+} // namespace
+
+struct SlangFixContext::Impl {
+    std::unordered_map<const Symbol*, ScopeFacts> scopes;
+};
+
+SlangFixContext::SlangFixContext() : impl(std::make_unique<Impl>()) {}
+SlangFixContext::~SlangFixContext() = default;
+
+namespace {
+
+// The facts at @p range in the diagnostic's scope, walking it on first use.
+// nullopt when the diagnostic names no scope.
+std::optional<RangeFacts> facts_at(const Diagnostic& d, SourceRange range,
+                                   SlangFixContext& context) {
+    if (!d.symbol)
+        return std::nullopt;
+    auto [it, fresh] = context.impl->scopes.try_emplace(d.symbol);
+    if (fresh) {
+        try {
+            FactCollector collector(it->second);
+            d.symbol->visit(collector);
+        } catch (...) {
+            // A half-walked scope could miss an output argument.
+            context.impl->scopes.erase(it);
+            throw;
+        }
+    }
+    auto found = it->second.find(range);
+    return found == it->second.end() ? RangeFacts{} : found->second;
+}
 
 // The name to write @p type as in a cast at the diagnostic's scope: a typedef
 // that its plain name finds there, or a built-in keyword type.
@@ -140,39 +209,39 @@ bool is_conversion(DiagCode code) {
 }
 
 // checkImplicitConversions(): range 0 is the converted operand.
-std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic& d) {
+std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic& d,
+                                      SlangFixContext& context) {
     const auto code = d.code;
     if (d.ranges.empty() || !editable(sm, d, d.ranges[0]))
         return {};
     const auto range = d.ranges[0];
 
-    // The scope walk tells an output argument or port (no fix) from an input
-    // one; the right side of `=` is neither, so it skips the walk.  A widening
-    // walks anyway: an expression whose effective sign is "either" (a
-    // comparison, a 1-bit system call) is spared sign-conversion, and an N'()
-    // cast gives it a sign.  Such expressions are 1 bit wide, so a truncation
-    // never meets one.
-    const bool expand = code == diag::WidthExpand || code == diag::PortWidthExpand;
-    OperandFinder finder(range);
-    if (expand || !after_equals(sm, range)) {
-        if (!d.symbol)
-            return {};
-        d.symbol->visit(finder);
-        if (finder.lvalue)
-            return {};
-    }
+    // The scope facts confirm range 0 is an operand: a copy of the warning
+    // raised while a constant function is evaluated carries the `=` there.
+    // They also tell an output argument or port (no fix) from an input one.
+    auto found = facts_at(d, range, context);
+    if (!found || found->lvalue || (!found->expr && !found->conversion))
+        return {};
+    const RangeFacts facts = *found;
 
-    if (code == diag::WidthTruncate || code == diag::WidthExpand ||
-        code == diag::PortWidthTruncate || code == diag::PortWidthExpand) {
+    // An expression whose effective sign is "either" (a comparison, a 1-bit
+    // system call) is spared sign-conversion, and an N'() cast gives it a
+    // sign.  Such expressions are 1 bit wide, so only those widenings check.
+    const bool width_code = code == diag::WidthTruncate || code == diag::WidthExpand ||
+                            code == diag::PortWidthTruncate || code == diag::PortWidthExpand;
+    const bool one_bit_expand = (code == diag::WidthExpand || code == diag::PortWidthExpand) &&
+                                width_arg(d, 0) == 1u;
+
+    if (width_code) {
         auto width = width_arg(d, 1);
         if (!width)
             return {};
         std::string open = std::to_string(*width) + "'(", close = ")";
-        if (expand) {
-            if (!finder.conversion)
+        if (one_bit_expand) {
+            if (!facts.conversion)
                 return {};
-            const auto& operand = finder.conversion->unwrapImplicitConversions();
-            const bool target_signed = finder.conversion->type->isSigned();
+            const auto& operand = facts.conversion->unwrapImplicitConversions();
+            const bool target_signed = facts.conversion->type->isSigned();
             if (operand.getEffectiveSign(false) == Expression::EffectiveSign::Either &&
                 operand.type->isSigned() != target_signed) {
                 open = (target_signed ? "signed'(" : "unsigned'(") + open;
@@ -187,6 +256,11 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
         return {};
 
     if (code == diag::SignConversion) {
+        // Widening extends by the operand's sign; a sign cast would extend by
+        // the target's.  The width-expand fix leaves an equal-width case.  The
+        // operand's own width: slang's source type here is already widened.
+        if (!facts.expr || target->getBitWidth() > facts.expr->type->getBitWidth())
+            return {};
         const bool to_signed = target->isSigned();
         return wrap(sm, range, to_signed ? "signed'(" : "unsigned'(", ")",
                     to_signed ? "Cast to signed" : "Cast to unsigned");
@@ -214,8 +288,26 @@ std::vector<FixInfo> conversion_fixes(const SourceManager& sm, const Diagnostic&
     return wrap(sm, range, "real'(", ")", "Convert to real");
 }
 
+// An operand a cast cannot change the evaluation of: inside the comparison an
+// operator's operands are extended unsigned, inside a cast by their own sign.
+bool is_primary(const Expression& expr) {
+    switch (expr.kind) {
+        case ExpressionKind::NamedValue:
+        case ExpressionKind::HierarchicalValue:
+        case ExpressionKind::ElementSelect:
+        case ExpressionKind::RangeSelect:
+        case ExpressionKind::MemberAccess:
+        case ExpressionKind::Concatenation:
+        case ExpressionKind::Call:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // analyzeOpTypes(): args are the operand types, ranges 1 and 2 the operands.
-std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d) {
+std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d,
+                                   SlangFixContext& context) {
     auto lt = type_arg(d, 0), rt = type_arg(d, 1);
     if (!lt || !rt || d.ranges.size() < 3)
         return {};
@@ -225,6 +317,9 @@ std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d)
     if (d.code == diag::SignCompare) {
         auto range = left.isSigned() ? d.ranges[1] : d.ranges[2];
         if (!editable(sm, d, range))
+            return {};
+        auto facts = facts_at(d, range, context);
+        if (!facts || !facts->expr || !is_primary(*facts->expr))
             return {};
         return wrap(sm, range, "unsigned'(", ")", "Cast to unsigned");
     }
@@ -240,18 +335,19 @@ std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d)
         return {};
     const auto width = std::to_string(std::max(left.getBitWidth(), right.getBitWidth()));
     return wrap(sm, range, width + "'(", ")",
-                "Cast " + std::string(range_text(sm, range)) + " to " + width + " bits");
+                "Cast " + title_text(sm, range) + " to " + width + " bits");
 }
 
 } // namespace
 
-std::vector<FixInfo> slang_fixes(const SourceManager& sm, const Diagnostic& d) try {
+std::vector<FixInfo> slang_fixes(const SourceManager& sm, const Diagnostic& d,
+                                 SlangFixContext& context) try {
     const auto code = d.code;
     if (is_conversion(code))
-        return conversion_fixes(sm, d);
+        return conversion_fixes(sm, d, context);
     if (code == diag::ArithOpMismatch || code == diag::BitwiseOpMismatch ||
         code == diag::ComparisonMismatch || code == diag::SignCompare)
-        return operand_fixes(sm, d);
+        return operand_fixes(sm, d, context);
     if ((code == diag::IntBoolConv || code == diag::FloatBoolConv) && !d.ranges.empty() &&
         editable(sm, d, d.ranges[0])) {
         return code == diag::IntBoolConv

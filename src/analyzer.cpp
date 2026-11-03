@@ -127,6 +127,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
     const auto& diags = state.tree->diagnostics();
     auto& sm = state.tree->sourceManager();
     slang::DiagnosticEngine engine(sm);
+    SlangFixContext fix_context;
     for (const auto& d : diags) {
         if (slang_diagnostic_hidden(d.code))
             continue;
@@ -142,7 +143,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
         } catch (...) {
         }
         info.code = slang_diagnostic_code(engine, d.code);
-        info.fixes = slang_fixes(sm, d);
+        info.fixes = slang_fixes(sm, d, fix_context);
         auto sev = slang_diagnostic_severity(d.code);
         if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
             info.severity = 1;

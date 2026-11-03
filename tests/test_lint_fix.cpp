@@ -14,6 +14,9 @@
 #include <vector>
 
 #include <slang/ast/Compilation.h>
+#include <slang/ast/symbols/CompilationUnitSymbols.h>
+#include <slang/ast/symbols/InstanceSymbols.h>
+#include <slang/ast/symbols/ParameterSymbols.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
 #include <slang/syntax/SyntaxTree.h>
 #include <slang/text/SourceManager.h>
@@ -26,6 +29,7 @@ std::vector<ParseDiagInfo> compile_and_collect(std::string_view source) {
     slang::ast::Compilation compilation;
     compilation.addSyntaxTree(tree);
     slang::DiagnosticEngine engine(sm);
+    SlangFixContext fix_context;
     std::vector<ParseDiagInfo> out;
     for (const auto& diag : compilation.getAllDiagnostics()) {
         ParseDiagInfo info;
@@ -34,7 +38,7 @@ std::vector<ParseDiagInfo> compile_and_collect(std::string_view source) {
         info.col = lsp_column(sm, loc);
         info.code = slang_diagnostic_code(engine, diag.code);
         info.message = engine.formatMessage(diag);
-        info.fixes = slang_fixes(sm, diag);
+        info.fixes = slang_fixes(sm, diag, fix_context);
         out.push_back(std::move(info));
     }
     return out;
@@ -92,6 +96,38 @@ void check_fix(std::string_view src, std::string_view code, std::string_view exp
     CHECK(fixed.find(expected) != std::string::npos);
     CHECK(codes_of(compile_and_collect(fixed)).count(std::string(code)) == 0);
     CHECK(new_codes(src, fixed) == std::set<std::string>{});
+}
+
+// The values of the top module's localparams, in declaration order.
+std::vector<std::string> param_values(std::string_view source) {
+    slang::SourceManager sm;
+    auto tree = slang::syntax::SyntaxTree::fromText(source, sm);
+    slang::ast::Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    std::vector<std::string> values;
+    auto& top = *compilation.getRoot().topInstances[0];
+    for (auto& param : top.body.membersOfType<slang::ast::ParameterSymbol>())
+        values.push_back(param.getValue().toString());
+    return values;
+}
+
+// Apply the @p codes fixes @p passes times: @p expected appears, the codes are
+// gone, nothing new appears, and every localparam keeps its value.
+std::string check_values(std::string_view src, const std::set<std::string>& codes,
+                         std::string_view expected, int passes = 1) {
+    std::string fixed(src);
+    for (int i = 0; i < passes; ++i)
+        fixed = fix_codes(fixed, codes);
+    INFO(fixed);
+    CHECK(fixed.find(expected) != std::string::npos);
+    auto after = codes_of(compile_and_collect(fixed));
+    for (const auto& code : codes)
+        CHECK(after.count(code) == 0);
+    CHECK(new_codes(src, fixed) == std::set<std::string>{});
+    auto before = param_values(src);
+    REQUIRE(before.size() >= 2);
+    CHECK(param_values(fixed) == before);
+    return fixed;
 }
 
 std::string title_of(std::string_view src, std::string_view code) {
@@ -386,4 +422,125 @@ TEST_CASE("lint-fix: float-bool-conv compares with 0.0", "[lint-fix]") {
                       "  always_comb if (r) o = 1; else o = 0;\nendmodule\n";
     check_fix(src, "float-bool-conv", "if ((r) != 0.0)");
     CHECK(title_of(src, "float-bool-conv") == "Compare with 0.0");
+}
+
+TEST_CASE("lint-fix: sign-conversion on a widening gets no fix", "[lint-fix]") {
+    // The operand is extended by its own sign; a sign cast would extend by the
+    // target's (b = 4'h8: a = 8 implicitly, -8 through signed'(b)).
+    CHECK(fixes_of("module m(input logic [3:0] b, output logic signed [7:0] a);\n"
+                   "  assign a = b;\nendmodule\n",
+                   "sign-conversion")
+              .empty());
+    CHECK(fixes_of("module m(input logic signed [3:0] b, output logic [7:0] a);\n"
+                   "  assign a = b;\nendmodule\n",
+                   "sign-conversion")
+              .empty());
+}
+
+TEST_CASE("lint-fix: sign-compare on an operator operand gets no fix", "[lint-fix]") {
+    // In the comparison s is extended unsigned before the add; inside
+    // unsigned'(s + 1) the add runs signed.
+    const char* src = "module m(input logic signed [7:0] s, input logic [7:0] u, output logic o);\n"
+                      "  assign o = u < s + 1;\nendmodule\n";
+    CHECK(fixes_of(src, "sign-compare").empty());
+}
+
+TEST_CASE("lint-fix: many widenings in one module each get their own fix", "[lint-fix]") {
+    std::string src = "module m(input logic x, y);\n";
+    for (int i = 0; i < 40; ++i) {
+        auto n = std::to_string(i);
+        src += "  logic [3:0] b" + n + "; logic [7:0] a" + n + "; logic signed [7:0] s" + n +
+               ";\n  assign a" + n + " = b" + n + ";\n  assign s" + n + " = x == y;\n";
+    }
+    src += "endmodule\n";
+    auto fixed = fix_all(src, "width-expand");
+    for (int i = 0; i < 40; ++i) {
+        auto n = std::to_string(i);
+        CHECK(fixed.find("assign a" + n + " = 8'(b" + n + ");") != std::string::npos);
+        CHECK(fixed.find("assign s" + n + " = signed'(8'(x == y));") != std::string::npos);
+    }
+    CHECK(codes_of(compile_and_collect(fixed)).count("width-expand") == 0);
+    CHECK(new_codes(src, fixed) == std::set<std::string>{});
+}
+
+TEST_CASE("lint-fix: an operand title is one line of at most 40 chars", "[lint-fix]") {
+    const char* src =
+        "module m(input logic [7:0] a, input logic [3:0] in0, in1, in2, in3, in4, in5, in6,\n"
+        "         in7, output logic [7:0] c);\n"
+        "  assign c = a + (in0 +\n      in1 + in2 + in3 + in4 + in5 + in6 + in7);\nendmodule\n";
+    auto title = title_of(src, "arith-op-mismatch");
+    INFO(title);
+    CHECK(title.find('\n') == std::string::npos);
+    CHECK(title.find("  ") == std::string::npos);
+    CHECK(title.rfind("Cast in0 + in1 + in2", 0) == 0);
+    CHECK(title.size() == std::string("Cast ").size() + 40 + std::string(" to 8 bits").size());
+    CHECK(title.find("... to 8 bits") != std::string::npos);
+}
+
+TEST_CASE("lint-fix: value - width-trunc", "[lint-fix]") {
+    check_values("module m;\n"
+                 "  function automatic logic [7:0] f(logic [15:0] b);\n"
+                 "    logic [7:0] a; a = b; return a;\n  endfunction\n"
+                 "  localparam logic [7:0] R0 = f(16'hABCD);\n"
+                 "  localparam logic [7:0] R1 = f(16'hFF80);\nendmodule\n",
+                 {"width-trunc"}, "a = 8'(b);");
+}
+
+TEST_CASE("lint-fix: value - width-expand into a signed target", "[lint-fix]") {
+    check_values("module m;\n"
+                 "  function automatic logic signed [7:0] f(logic x, logic y);\n"
+                 "    logic signed [7:0] a; a = x == y; return a;\n  endfunction\n"
+                 "  localparam logic signed [7:0] R0 = f(1, 1);\n"
+                 "  localparam logic signed [7:0] R1 = f(0, 1);\nendmodule\n",
+                 {"width-expand"}, "a = signed'(8'(x == y));");
+    check_values("module m;\n"
+                 "  function automatic logic [7:0] f(logic [3:0] x);\n"
+                 "    logic [7:0] a; a = x; return a;\n  endfunction\n"
+                 "  localparam logic [7:0] R0 = f(4'hF);\n"
+                 "  localparam logic [7:0] R1 = f(4'h8);\nendmodule\n",
+                 {"width-expand"}, "a = 8'(x);");
+}
+
+TEST_CASE("lint-fix: value - sign-conversion at equal width", "[lint-fix]") {
+    check_values("module m;\n"
+                 "  function automatic logic signed [7:0] f(logic [7:0] b);\n"
+                 "    logic signed [7:0] a; a = b; return a;\n  endfunction\n"
+                 "  localparam logic signed [7:0] R0 = f(8'hFF);\n"
+                 "  localparam logic signed [7:0] R1 = f(8'h01);\nendmodule\n",
+                 {"sign-conversion"}, "a = signed'(b);");
+}
+
+TEST_CASE("lint-fix: value - sign-compare with a primary operand", "[lint-fix]") {
+    // s = -1 is 8'hFF zero-extended to 16'h00FF in the comparison, not 16'hFFFF.
+    check_values("module m;\n"
+                 "  function automatic logic f(logic [15:0] u, logic signed [7:0] s);\n"
+                 "    return u < s;\n  endfunction\n"
+                 "  localparam logic R0 = f(16'h00FF, -8'sd1);\n"
+                 "  localparam logic R1 = f(16'h00FE, -8'sd1);\n"
+                 "  localparam logic R2 = f(16'h0001, 8'sd16);\nendmodule\n",
+                 {"sign-compare"}, "return u < unsigned'(s);");
+}
+
+TEST_CASE("lint-fix: value - width and sign on a widening, in two runs", "[lint-fix]") {
+    // Run one casts the width only (no sign fix on a widening); run two meets
+    // an equal-width sign-conversion.
+    const char* src = "module m;\n"
+                      "  function automatic logic signed [7:0] f(logic [3:0] b);\n"
+                      "    logic signed [7:0] a; a = b; return a;\n  endfunction\n"
+                      "  localparam logic signed [7:0] R0 = f(4'h8);\n"
+                      "  localparam logic signed [7:0] R1 = f(4'h7);\nendmodule\n";
+    CHECK(fix_codes(src, {"width-expand", "sign-conversion"}).find("a = 8'(b);") !=
+          std::string::npos);
+    check_values(src, {"width-expand", "sign-conversion"}, "a = signed'(8'(b));", 2);
+}
+
+TEST_CASE("lint-fix: value - width and sign on a truncation, in one run", "[lint-fix]") {
+    auto fixed = check_values("module m;\n"
+                              "  function automatic logic signed [7:0] f(logic [15:0] b);\n"
+                              "    logic signed [7:0] a; a = b; return a;\n  endfunction\n"
+                              "  localparam logic signed [7:0] R0 = f(16'h00F0);\n"
+                              "  localparam logic signed [7:0] R1 = f(16'h8170);\nendmodule\n",
+                              {"width-trunc", "sign-conversion"}, "a = ");
+    CHECK((fixed.find("a = signed'(8'(b));") != std::string::npos ||
+           fixed.find("a = 8'(signed'(b));") != std::string::npos));
 }
