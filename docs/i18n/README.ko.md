@@ -1,4 +1,4 @@
-> 이 문서는 영문 [README.md](../../README.md)의 번역본입니다. 내용이 다르면 영문이 기준입니다.
+> 이 문서는 Claude가 생성한 자동 번역본이며, 기준이 되는 원문은 영어 버전인 [README.md](../../README.md)입니다.
 
 <p align="center">
   <img src="../../docs/public/logo.webp" alt="LazyVerilog logo" width="260">
@@ -39,7 +39,7 @@
 <p align="center">
   <a href="#-데모">데모</a>
   ·
-  <a href="#️-비교">비교</a>
+  <a href="#-비교">비교</a>
   ·
   <a href="#-기능">기능</a>
   ·
@@ -48,16 +48,16 @@
 
 
 <p align="center">
-  LazyVerilog는 C++로 작성된 SystemVerilog LSP이며 neovim과 vscode를 지원합니다.
-  실제 SystemVerilog 프로젝트를 대상으로 포매팅, 린팅, 코드 탐색, hover, 자동 완성, inlay hint, RTL code action을 제공합니다.
+  LazyVerilog는 C++로 작성된 SystemVerilog LSP로, Neovim과 VS Code를 지원합니다.
+  실제 SystemVerilog 프로젝트를 위한 포매팅, 린팅, 코드 탐색, 호버, 자동 완성, 인레이 힌트, RTL 코드 액션을 제공합니다.
 </p>
 
 <p align="center">
-  <img src="../../assets/videos/AutoInst.gif" alt="자동 인스턴스화: 포트가 연결된 모듈 인스턴스 생성" width="720">
+  <img src="../../assets/videos/AutoInst.gif" alt="Auto-instantiation: generate a module instance with its ports connected" width="720">
 </p>
 
 <p align="center">
-  <sub>LazyVerilog가 시간을 아껴 주었다면 ⭐ 하나가 다른 RTL 엔지니어들이 찾는 데 도움이 됩니다.</sub>
+  <sub>LazyVerilog가 시간을 아껴주었다면, ⭐ 하나가 다른 RTL 엔지니어들이 이 프로젝트를 발견하는 데 도움이 됩니다.</sub>
 </p>
 
 &nbsp;
@@ -72,7 +72,7 @@
 </details>
 
 <details>
-<summary><b>🚨 Lint 진단</b></summary>
+<summary><b>🚨 린트 진단</b></summary>
 
 ![Lint diagnostics](../../assets/videos/lint_diagnostics.png)
 
@@ -93,7 +93,7 @@
 </details>
 
 <details>
-<summary><b>📂 코드 접기</b></summary>
+<summary><b>📂 코드 폴딩</b></summary>
 
 ![Folding](../../assets/videos/Folding.gif)
 
@@ -121,28 +121,28 @@
 </details>
 
 <details>
-<summary><b>🔌 Auto-wire</b></summary>
+<summary><b>🔌 자동 와이어 생성</b></summary>
 
 ![Auto-wire](../../assets/videos/AutoWire.gif)
 
 </details>
 
 <details>
-<summary><b>🛠️ Auto-arg</b></summary>
+<summary><b>🛠️ 자동 포트 목록 생성</b></summary>
 
 ![Auto-arg](../../assets/videos/AutoArg.gif)
 
 </details>
 
 <details>
-<summary><b>💡 Hover</b></summary>
+<summary><b>💡 호버</b></summary>
 
 ![Hover](../../assets/videos/hover.gif)
 
 </details>
 
 <details>
-<summary><b>💬 Inlay hint</b></summary>
+<summary><b>💬 인레이 힌트</b></summary>
 
 ![Inlay hints](../../assets/videos/inlay_hint.png)
 
@@ -156,7 +156,7 @@
 </details>
 
 <details>
-<summary><b>✏️ 이름 변경</b></summary>
+<summary><b>✏️ 이름 바꾸기</b></summary>
 
 ![Rename](../../assets/videos/rename.gif)
 
@@ -186,52 +186,52 @@ LazyVerilog와 가장 널리 쓰이는 두 오픈소스 SystemVerilog LSP인
 
 | | ⚡ LazyVerilog | Verible LS | svlangserver |
 |---|---|---|---|
-| UVM, class, package | ✅ | ⚠️ | ❌ |
+| UVM, 클래스, 패키지 | ✅ | ⚠️ | ❌ |
 | 런타임 | C++ | C++ | Node.js |
 | 파서 | slang | Verible | 자체 인덱서 |
-| 진단 | 파싱, lint, 시맨틱 | 파싱, lint | Verilator |
+| 진단 | 파싱, 린트, 시맨틱 | 파싱, 린트 | Verilator |
 | 포매팅 | ✅ | ✅ | Verible 사용 |
 | 정의로 이동 | ✅ | ✅ | ✅ |
 | 참조 찾기 | ✅ | ✅ | ❌ |
-| 이름 변경 | ✅ | ❌ | ❌ |
-| Hover | ✅ | ⚠️ | ✅ |
+| 이름 바꾸기 | ✅ | ❌ | ❌ |
+| 호버 | ✅ | ⚠️ | ✅ |
 | 자동 완성 | ✅ | ❌ | ✅ |
 | 시그니처 도움말 | ✅ | ❌ | ✅ |
-| Inlay hint | ✅ | ❌ | ❌ |
+| 인레이 힌트 | ✅ | ❌ | ❌ |
 | 심볼 | ✅ | ✅ | ✅ |
-| Lint 자동 수정 | ⚠️ | ✅ | ❌ |
+| 린트 자동 수정 | ✅ (`--fix`) | ✅ | ❌ |
 | RTL 코드 생성 | ✅ | ❌ | ❌ |
-| RTL 계층 뷰 | ✅ | ❌ | ✅ |
-| 인터페이스 / 연결 | ✅ | ❌ | ❌ |
+| RTL 계층 구조 보기 | ✅ | ❌ | ✅ |
+| 인터페이스 및 연결 | ✅ | ❌ | ❌ |
 
-⚠️는 일부 지원 또는 실험적 기능입니다.
+⚠️ 는 부분 지원 또는 실험적 지원을 의미합니다.
 
 &nbsp;
 
 ## 📊 기능
 
-LazyVerilog가 현재 지원하는 기능:
+현재 LazyVerilog가 지원하는 기능:
 
 | 기능 | 상태 | 비고 |
 |---------|--------|-------|
-| 포매팅 | ✅ | `lazyverilog.toml`로 설정 |
-| Lint 진단 | ✅ | 파싱 진단, 선택적 시맨틱 진단, 설정 가능한 lint/스타일 규칙 |
-| Lint quick fix | ⚠️ | 빠진 `default` 추가, `automatic` lifetime 추가 |
-| 정의로 이동 | ✅ | 모듈, 인스턴스, 포트, 이름 지정 인자, 심볼, 매크로 |
-| 참조 찾기 | ✅ | 열린 파일과 프로젝트 파일 전체의 심볼과 매크로 |
-| 심볼 이름 변경 | ✅ | 프로젝트 파일 전체에 걸쳐 최선 노력 방식 |
-| Hover | ✅ | 모듈, 포트, 신호, 파라미터, typedef, 서브루틴, 매크로의 정보 |
-| 자동 완성 | ✅ | 문맥을 인식하는 자동 완성 |
-| 시그니처 도움말 | ✅ | 함수와 태스크 |
-| Inlay hint | ✅ | 인스턴스의 포트 방향 |
+| 포매팅 | ✅ | `lazyverilog.toml`로 설정 가능 |
+| 린트 진단 | ✅ | 파싱 진단, 선택적 시맨틱 진단, 설정 가능한 린트/스타일 규칙 |
+| 린트 퀵 픽스 | ⚠️ | 누락된 `default` 추가, `automatic` 라이프타임 추가 |
+| 정의로 이동 | ✅ | 모듈, 인스턴스, 포트, 네임드 인자, 심볼, 매크로 |
+| 참조 찾기 | ✅ | 열려 있는 파일과 설정된 프로젝트 파일 전체의 심볼 및 매크로 |
+| 심볼 이름 바꾸기 | ✅ | 프로젝트 파일 전체에 대해 최선 노력(best-effort) 방식으로 수행 |
+| 호버 | ✅ | 모듈, 포트, 신호, 파라미터, typedef, 서브루틴, 매크로의 심볼 상세 정보 |
+| 자동 완성 | ✅ | 컨텍스트를 인식하는 자동 완성 |
+| 시그니처 도움말 | ✅ | function 및 task |
+| 인레이 힌트 | ✅ | 인스턴스화 시 포트 방향 표시 |
 | 문서 심볼 | ✅ | 현재 파일의 아웃라인 |
-| 워크스페이스 심볼 | ✅ | 모듈, 인터페이스, 패키지, class와 method, 함수, 태스크, typedef, `pkg::name` 검색 |
-| RTL 트리 | ✅ | 모듈 인스턴스 계층 |
-| 자동 인스턴스화 / Auto-wire / Auto-arg / Auto-function / Auto-FF | ✅ | RTL 생성을 위한 여러 Code Action |
-| 프로젝트별 설정 | ✅ | 프로젝트의 `lazyverilog.toml`로 설정 |
+| 워크스페이스 심볼 | ✅ | 모듈, 인터페이스, 패키지, 클래스 및 메서드, function, task, typedef, `pkg::name` 형식 쿼리 |
+| RTL 트리 | ✅ | 모듈 인스턴스화 계층 구조 |
+| 자동 인스턴스화 / 자동 와이어 / 자동 포트 목록 / 자동 function / 자동 FF | ✅ | RTL 생성을 위한 다양한 코드 액션 |
+| 프로젝트 로컬 설정 | ✅ | 프로젝트 루트의 `lazyverilog.toml`을 통해 전체 커스터마이징 가능 |
 
 &nbsp;
 
 ## 🚀 시작하기
 
-Neovim과 VS Code의 설치, 사용법, 설정: **https://lazyverilog.github.io** (영문)
+Neovim 및 VS Code 설치 방법, 사용법, 설정: **https://lazyverilog.github.io**

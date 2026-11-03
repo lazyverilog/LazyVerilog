@@ -1,12 +1,54 @@
 {
   "version": 1,
   "entries": {
-    "ko": {
-      "sourceHash": "1148bd3e207b842a8de0fe33dda5caa5b5f70a3f8cb2b4c4d672a822559d7c39",
+    "de": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
       "model": "claude-opus-5",
       "promptVersion": 1,
-      "generatedAt": "2026-09-19T12:58:24.892Z",
-      "costUsd": 0.42465299999999995
+      "generatedAt": "2026-11-03T05:25:48.110Z",
+      "costUsd": 0.15692499999999998
+    },
+    "es": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:47.209Z",
+      "costUsd": 0.15028500000000003
+    },
+    "fr": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:51.862Z",
+      "costUsd": 0.15939
+    },
+    "ja": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:52.560Z",
+      "costUsd": 0.15973
+    },
+    "ko": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:52.216Z",
+      "costUsd": 0.15629499999999996
+    },
+    "pt": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:48.893Z",
+      "costUsd": 0.154897
+    },
+    "zh-CN": {
+      "sourceHash": "2cbd718a8a8f8eb678b4d9a9e2ce2c3a8fde53ba02c96259e82939834905bd65",
+      "model": "claude-opus-5",
+      "promptVersion": 1,
+      "generatedAt": "2026-11-03T05:25:48.412Z",
+      "costUsd": 0.15093599999999996
     }
   }
 }
