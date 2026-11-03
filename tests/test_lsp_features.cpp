@@ -1981,6 +1981,37 @@ TEST_CASE("code action: unsafe fixes carry a suffix and sort after safe ones",
     CHECK(fixes[1] == "Risky (may change behavior)");
 }
 
+TEST_CASE("code action: identical request diagnostics give one action per fix",
+          "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_dedup.sv";
+    analyzer.open(uri, "module top; endmodule\n");
+    ParseDiagInfo d;
+    d.message = "dup";
+    d.fixes.push_back(FixInfo{"Plain", true, {FixEdit{0, 0, 0, 0, "y"}}});
+    analyzer.set_semantic_diagnostics({{uri, {d, d}}}, {});
+
+    lsDiagnostic diag;
+    diag.message = "dup";
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.context.diagnostics = {diag, diag};
+    int n = 0;
+    for (const auto& a : provide_code_actions(analyzer, config, params))
+        if (a.kind && *a.kind == "quickfix")
+            ++n;
+    CHECK(n == 1);
+
+    // No request diagnostics: no quick fixes, other actions still offered.
+    params.context.diagnostics.clear();
+    n = 0;
+    for (const auto& a : provide_code_actions(analyzer, config, params))
+        if (a.kind && *a.kind == "quickfix")
+            ++n;
+    CHECK(n == 0);
+}
+
 TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
     // UVM's `uvm_component_utils(T) reaches the typedef through a second macro:
     //

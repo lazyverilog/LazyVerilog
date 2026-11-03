@@ -9,6 +9,7 @@
 #include "formatter.hpp"
 #include "lint.hpp"
 #include <iostream>
+#include <set>
 #include <span>
 #include <slang/syntax/AllSyntax.h>
 #include <slang/syntax/SyntaxTree.h>
@@ -315,32 +316,61 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     // A request diagnostic is matched to the current one by position and message
     // (the server publishes no code).  Semantic diagnostics are already dropped
     // by the analyzer once the buffer is edited past the compile.
+    // Parse and semantic diagnostics are cached; lint is walked only when a
+    // request diagnostic matched neither (and never for an empty request).
     std::vector<ParseDiagInfo> current = state->parse_diagnostics;
     {
-        auto lint = run_lint(*state, config.lint, project_index.get());
-        current.insert(current.end(), std::make_move_iterator(lint.begin()),
-                       std::make_move_iterator(lint.end()));
         auto semantic = analyzer.semantic_diagnostics(uri);
         current.insert(current.end(), std::make_move_iterator(semantic.begin()),
                        std::make_move_iterator(semantic.end()));
     }
+    std::vector<ParseDiagInfo> lint_diags;
+    bool lint_done = false;
+    auto find_match = [&](const std::vector<ParseDiagInfo>& pool, const lsDiagnostic& diag) {
+        std::vector<const ParseDiagInfo*> out;
+        for (const auto& cur : pool)
+            if ((cur.uri.empty() || cur.uri == uri) && cur.line == diag.range.start.line &&
+                cur.col == diag.range.start.character && cur.message == diag.message)
+                out.push_back(&cur);
+        return out;
+    };
+    std::set<std::string> seen_fixes;
     std::vector<CodeAction> safe_fixes, unsafe_fixes;
     for (const auto& diag : params.context.diagnostics) {
-        for (const auto& cur : current) {
-            if ((!cur.uri.empty() && cur.uri != uri) || cur.line != diag.range.start.line ||
-                cur.col != diag.range.start.character || cur.message != diag.message)
-                continue;
-            for (const auto& fix : cur.fixes) {
+        auto matched = find_match(current, diag);
+        if (matched.empty() && !lint_done && state->tree) {
+            lint_done = true;
+            try {
+                // Same inputs as the publish path, so the sets are equal.
+                std::shared_ptr<const ProjectIndexSnapshot> lint_index;
+                if (config.lint.instance.enable && config.lint.instance.stale_instance_diagnostic)
+                    lint_index = analyzer.project_index_snapshot();
+                lint_diags = run_lint(*state, config.lint, lint_index.get());
+            } catch (const SafeModeError&) {
+                throw;
+            } catch (...) {
+            }
+        }
+        if (matched.empty())
+            matched = find_match(lint_diags, diag);
+        for (const auto* cur : matched) {
+            for (const auto& fix : cur->fixes) {
                 lsWorkspaceEdit we;
                 we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
                 auto& edits = (*we.changes)[uri];
+                std::string key = fix.title + (fix.safe ? "|s" : "|u");
                 for (const auto& e : fix.edits) {
                     lsTextEdit te;
                     te.range.start = lsPosition(e.start_line, e.start_col);
                     te.range.end = lsPosition(e.end_line, e.end_col);
                     te.newText = e.new_text;
                     edits.push_back(std::move(te));
+                    key += "|" + std::to_string(e.start_line) + ":" + std::to_string(e.start_col) +
+                           "-" + std::to_string(e.end_line) + ":" + std::to_string(e.end_col) +
+                           "=" + e.new_text;
                 }
+                if (!seen_fixes.insert(std::move(key)).second)
+                    continue;
                 CodeAction action;
                 action.title = fix.safe ? fix.title : fix.title + " (may change behavior)";
                 action.kind = optional<std::string>(std::string("quickfix"));
