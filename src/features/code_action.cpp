@@ -7,6 +7,7 @@
 #include "autoinst.hpp"
 #include "autowire.hpp"
 #include "formatter.hpp"
+#include "lint.hpp"
 #include <iostream>
 #include <span>
 #include <slang/syntax/AllSyntax.h>
@@ -110,45 +111,6 @@ static int token_line(const SourceManager& sm, const slang::parsing::Token& tok)
     auto line = sm.getFileLineNumber(tok.location());
     return line > 0 ? (int)line - 1 : 0;
 }
-
-static int token_col(const SourceManager& sm, const slang::parsing::Token& tok) {
-    if (!tok || !tok.location().valid())
-        return 0;
-    return lsp_column(sm, tok.location());
-}
-
-struct QuickFixLocator : public SyntaxVisitor<QuickFixLocator> {
-    const SourceManager& sm;
-    int line;
-    const CaseStatementSyntax* case_stmt{nullptr};
-    const FunctionDeclarationSyntax* function_decl{nullptr};
-    const FunctionDeclarationSyntax* task_decl{nullptr};
-
-    QuickFixLocator(const SourceManager& sm, int line) : sm(sm), line(line) {}
-
-    bool contains_line(const SyntaxNode& node) const {
-        auto first = node.getFirstToken();
-        auto last = node.getLastToken();
-        if (!first || !last || !first.location().valid() || !last.location().valid())
-            return false;
-        return token_line(sm, first) <= line && line <= token_line(sm, last);
-    }
-
-    void handle(const CaseStatementSyntax& node) {
-        if (!case_stmt && contains_line(node))
-            case_stmt = &node;
-        visitDefault(node);
-    }
-    void handle(const FunctionDeclarationSyntax& node) {
-        if (token_line(sm, node.getFirstToken()) == line) {
-            if (node.kind == SyntaxKind::TaskDeclaration)
-                task_decl = &node;
-            else
-                function_decl = &node;
-        }
-        visitDefault(node);
-    }
-};
 
 // True when `line` falls inside a class body.  The RTL generators below emit
 // net declarations and always_ff/always_comb blocks, none of which are legal
@@ -349,118 +311,48 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     } catch (...) {
     }
 
-    // ── 7. Lint quick-fixes from diagnostics ─────────────────────────────────
-    // Pre-split lines once for all diagnostic handlers
-    std::vector<std::string> doc_lines;
+    // ── 7. Quick-fixes the current diagnostics carry ─────────────────────────
+    // A request diagnostic is matched to the current one by position and message
+    // (the server publishes no code).  Semantic diagnostics are already dropped
+    // by the analyzer once the buffer is edited past the compile.
+    std::vector<ParseDiagInfo> current = state->parse_diagnostics;
     {
-        size_t start = 0;
-        const std::string& t = state->text;
-        while (start <= t.size()) {
-            size_t end = t.find('\n', start);
-            if (end == std::string::npos) {
-                doc_lines.push_back(t.substr(start));
-                break;
-            }
-            doc_lines.push_back(t.substr(start, end - start));
-            start = end + 1;
-        }
+        auto lint = run_lint(*state, config.lint, project_index.get());
+        current.insert(current.end(), std::make_move_iterator(lint.begin()),
+                       std::make_move_iterator(lint.end()));
+        auto semantic = analyzer.semantic_diagnostics(uri);
+        current.insert(current.end(), std::make_move_iterator(semantic.begin()),
+                       std::make_move_iterator(semantic.end()));
     }
-
-    const CaseStatementSyntax* case_stmt = nullptr;
-    if (state->tree) {
-        QuickFixLocator locator(state->tree->sourceManager(), line);
-        state->tree->root().visit(locator);
-        case_stmt = locator.case_stmt;
-    }
-
-    // Replace an existing lifetime (`function static`) rather than add a second one.
-    auto lifetime_edit = [&](const FunctionDeclarationSyntax& decl) {
-        const auto& sm = state->tree->sourceManager();
-        const auto& proto = *decl.prototype;
-        if (proto.lifetime && !proto.lifetime.isMissing()) {
-            int col = token_col(sm, proto.lifetime);
-            int ln = token_line(sm, proto.lifetime);
-            return make_range_edit(uri, ln, col, ln, col + (int)proto.lifetime.rawText().size(),
-                                   "automatic");
-        }
-        int col = token_col(sm, proto.keyword) + (int)proto.keyword.rawText().size();
-        int ln = token_line(sm, proto.keyword);
-        return make_range_edit(uri, ln, col, ln, col, " automatic");
-    };
-
+    std::vector<CodeAction> safe_fixes, unsafe_fixes;
     for (const auto& diag : params.context.diagnostics) {
-        try {
-            const std::string& msg = diag.message;
-            if (msg.find("case_missing_default") != std::string::npos ||
-                msg.find("case statement missing default") != std::string::npos) {
-                int endcase_line = -1;
-                if (case_stmt)
-                    endcase_line = token_line(state->tree->sourceManager(), case_stmt->endcase);
-                if (endcase_line >= 0) {
-                    int col = token_col(state->tree->sourceManager(), case_stmt->endcase);
-                    std::string text;
-                    if (doc_lines[endcase_line].find_first_not_of(" \t") < (size_t)col) {
-                        // `endcase` shares its line with code: put the item right before it.
-                        text = "default: ; ";
-                    } else {
-                        col = 0;
-                        for (char c : doc_lines[line]) {
-                            if (c == ' ' || c == '\t')
-                                text += c;
-                            else
-                                break;
-                        }
-                        text += "  default: ;\n";
-                    }
-                    auto we = make_range_edit(uri, endcase_line, col, endcase_line, col, text);
-                    CodeAction action;
-                    action.title = "Add default case";
-                    action.kind = optional<std::string>(std::string("quickfix"));
-                    action.edit = optional<lsWorkspaceEdit>(we);
-                    action.diagnostics = optional<std::vector<lsDiagnostic>>({diag});
-                    actions.push_back(std::move(action));
+        for (const auto& cur : current) {
+            if ((!cur.uri.empty() && cur.uri != uri) || cur.line != diag.range.start.line ||
+                cur.col != diag.range.start.character || cur.message != diag.message)
+                continue;
+            for (const auto& fix : cur.fixes) {
+                lsWorkspaceEdit we;
+                we.changes = std::map<std::string, std::vector<lsTextEdit>>{};
+                auto& edits = (*we.changes)[uri];
+                for (const auto& e : fix.edits) {
+                    lsTextEdit te;
+                    te.range.start = lsPosition(e.start_line, e.start_col);
+                    te.range.end = lsPosition(e.end_line, e.end_col);
+                    te.newText = e.new_text;
+                    edits.push_back(std::move(te));
                 }
-            } else if (msg.find("functions_automatic") != std::string::npos ||
-                       msg.find("function declaration should use 'automatic'") !=
-                           std::string::npos ||
-                       msg.find("explicit_function_lifetime") != std::string::npos ||
-                       msg.find("function declaration missing explicit lifetime") !=
-                           std::string::npos) {
-                int diag_line = diag.range.start.line;
-                if (diag_line < (int)doc_lines.size() && state->tree) {
-                    QuickFixLocator locator(state->tree->sourceManager(), diag_line);
-                    state->tree->root().visit(locator);
-                    if (locator.function_decl) {
-                        auto we = lifetime_edit(*locator.function_decl);
-                        CodeAction action;
-                        action.title = "Add 'automatic' lifetime";
-                        action.kind = optional<std::string>(std::string("quickfix"));
-                        action.edit = optional<lsWorkspaceEdit>(we);
-                        action.diagnostics = optional<std::vector<lsDiagnostic>>({diag});
-                        actions.push_back(std::move(action));
-                    }
-                }
-            } else if (msg.find("explicit_task_lifetime") != std::string::npos ||
-                       msg.find("task declaration missing explicit lifetime") !=
-                           std::string::npos) {
-                int diag_line = diag.range.start.line;
-                if (diag_line < (int)doc_lines.size() && state->tree) {
-                    QuickFixLocator locator(state->tree->sourceManager(), diag_line);
-                    state->tree->root().visit(locator);
-                    if (locator.task_decl) {
-                        auto we = lifetime_edit(*locator.task_decl);
-                        CodeAction action;
-                        action.title = "Add 'automatic' lifetime to task";
-                        action.kind = optional<std::string>(std::string("quickfix"));
-                        action.edit = optional<lsWorkspaceEdit>(we);
-                        action.diagnostics = optional<std::vector<lsDiagnostic>>({diag});
-                        actions.push_back(std::move(action));
-                    }
-                }
+                CodeAction action;
+                action.title = fix.safe ? fix.title : fix.title + " (may change behavior)";
+                action.kind = optional<std::string>(std::string("quickfix"));
+                action.edit = optional<lsWorkspaceEdit>(we);
+                action.diagnostics = optional<std::vector<lsDiagnostic>>({diag});
+                (fix.safe ? safe_fixes : unsafe_fixes).push_back(std::move(action));
             }
-        } catch (...) {
         }
     }
+    for (auto* group : {&safe_fixes, &unsafe_fixes})
+        for (auto& a : *group)
+            actions.push_back(std::move(a));
 
     // ── 8. Template snippets ─────────────────────────────────────────────────
     if (!in_class_body) {

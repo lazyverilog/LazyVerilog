@@ -5,6 +5,7 @@
 #include "features/autoinst.hpp"
 #include "features/code_action.hpp"
 #include "features/hover.hpp"
+#include "features/lint.hpp"
 #include "features/signature_help.hpp"
 #include "features/workspace_symbols.hpp"
 #include "string_utils.hpp"
@@ -1767,9 +1768,29 @@ TEST_CASE("code action: RTL generators are not offered inside a class body", "[c
     CHECK(has(in_module, "always_comb"));
 }
 
+// The diagnostic the server would publish for `message` on `line`, taken from the
+// real lint run so its position matches what a client sends back.
+static lsDiagnostic published_lint_diag(const Analyzer& analyzer, const Config& config,
+                                        const std::string& uri, int line,
+                                        const std::string& message) {
+    lsDiagnostic diag;
+    diag.range.start = lsPosition(line, 0);
+    diag.message = message;
+    for (const auto& d : run_lint(*analyzer.get_state(uri), config.lint))
+        if (d.line == line && d.message == message) {
+            diag.range.start = lsPosition(d.line, d.col);
+            break;
+        }
+    diag.range.end = diag.range.start;
+    return diag;
+}
+
 TEST_CASE("code action: lifetime quick fix replaces an existing 'static'", "[codeAction][lint]") {
     Analyzer analyzer;
     Config config;
+    config.lint.function.enable = true;
+    config.lint.function.functions_automatic = true;
+    config.lint.function.explicit_task_lifetime = true;
     const std::string uri = "file:///tmp/lazyverilog_codeaction_lifetime.sv";
     const std::vector<std::string> lines = {
         "module top;",
@@ -1786,10 +1807,7 @@ TEST_CASE("code action: lifetime quick fix replaces an existing 'static'", "[cod
 
     // Apply the quick fix offered for `message` on `line`; return the edited line.
     auto fixed = [&](int line, const std::string& message) -> std::string {
-        lsDiagnostic diag;
-        diag.range.start = lsPosition(line, 0);
-        diag.range.end = lsPosition(line, 0);
-        diag.message = message;
+        lsDiagnostic diag = published_lint_diag(analyzer, config, uri, line, message);
         lsCodeActionParams params;
         params.textDocument.uri.raw_uri_ = uri;
         params.range.start = lsPosition(line, 0);
@@ -1825,6 +1843,8 @@ TEST_CASE("code action: default case lands before an endcase that shares its lin
           "[codeAction][lint]") {
     Analyzer analyzer;
     Config config;
+    config.lint.statement.enable = true;
+    config.lint.statement.case_missing_default = true;
     const std::string uri = "file:///tmp/lazyverilog_codeaction_default_case.sv";
     const std::string text = "module top(input logic [1:0] x, output logic y);\n"
                              "  always_comb case (x) 0: y = 1; endcase\n"
@@ -1842,10 +1862,8 @@ TEST_CASE("code action: default case lands before an endcase that shares its lin
 
     // Apply the "Add default case" fix requested on `line`; return the whole edited text.
     auto fixed = [&](int line) -> std::string {
-        lsDiagnostic diag;
-        diag.range.start = lsPosition(line, 0);
-        diag.range.end = lsPosition(line, 0);
-        diag.message = "[statement] case statement missing default item";
+        lsDiagnostic diag = published_lint_diag(
+            analyzer, config, uri, line, "[statement] case statement missing default item");
         lsCodeActionParams params;
         params.textDocument.uri.raw_uri_ = uri;
         params.range.start = lsPosition(line, 0);
@@ -1883,6 +1901,84 @@ TEST_CASE("code action: default case lands before an endcase that shares its lin
     CHECK(fixed(3) == with_line(4, "      0: begin y = 1; end default: ; endcase"));
     // endcase on its own line keeps the indented line before it.
     CHECK(fixed(7) == with_line(9, "      default: ;\n    endcase"));
+}
+
+TEST_CASE("code action: semantic diagnostic fix is offered, and not once the buffer moved on",
+          "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_semantic_fix.sv";
+    analyzer.open(uri, "module top; logic [7:0] a; logic [15:0] b; assign a = b; endmodule\n");
+    ParseDiagInfo d;
+    d.line = 0;
+    d.col = 61;
+    d.message = "implicit conversion truncates from 16 to 8 bits";
+    d.code = "width-trunc";
+    d.fixes.push_back(FixInfo{"Cast to 8 bits", true, {FixEdit{0, 61, 0, 62, "8'(b)"}}});
+    analyzer.set_semantic_diagnostics({{uri, {d}}}, {});
+
+    lsDiagnostic diag;
+    diag.range.start = lsPosition(0, 61);
+    diag.range.end = diag.range.start;
+    diag.message = d.message;
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.range.start = diag.range.start;
+    params.range.end = diag.range.start;
+    params.context.diagnostics = {diag};
+
+    auto find_cast = [&] {
+        auto actions = provide_code_actions(analyzer, config, params);
+        return std::find_if(actions.begin(), actions.end(),
+                            [](const CodeAction& a) { return a.title == "Cast to 8 bits"; }) !=
+               actions.end();
+    };
+    auto actions = provide_code_actions(analyzer, config, params);
+    auto it = std::find_if(actions.begin(), actions.end(),
+                           [](const CodeAction& a) { return a.title == "Cast to 8 bits"; });
+    REQUIRE(it != actions.end());
+    REQUIRE(it->kind.has_value());
+    CHECK(*it->kind == "quickfix");
+    const auto& edits = it->edit->changes->at(uri);
+    REQUIRE(edits.size() == 1);
+    CHECK(edits[0].newText == "8'(b)");
+    CHECK(edits[0].range.start.character == 61);
+    CHECK(edits[0].range.end.character == 62);
+
+    // A different message at the same spot does not match.
+    params.context.diagnostics[0].message = "something else";
+    CHECK_FALSE(find_cast());
+    params.context.diagnostics[0].message = d.message;
+    CHECK(find_cast());
+
+    analyzer.enqueue_parse(uri, "module top; logic [7:0] a; logic [15:0] b;  assign a = b; endmodule\n");
+    CHECK_FALSE(find_cast());
+}
+
+TEST_CASE("code action: unsafe fixes carry a suffix and sort after safe ones",
+          "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_unsafe_order.sv";
+    analyzer.open(uri, "module top; endmodule\n");
+    ParseDiagInfo d;
+    d.message = "both";
+    d.fixes.push_back(FixInfo{"Risky", false, {FixEdit{0, 0, 0, 0, "x"}}});
+    d.fixes.push_back(FixInfo{"Plain", true, {FixEdit{0, 0, 0, 0, "y"}}});
+    analyzer.set_semantic_diagnostics({{uri, {d}}}, {});
+
+    lsDiagnostic diag;
+    diag.message = "both";
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.context.diagnostics = {diag};
+    std::vector<std::string> fixes;
+    for (const auto& a : provide_code_actions(analyzer, config, params))
+        if (a.kind && *a.kind == "quickfix")
+            fixes.push_back(a.title);
+    REQUIRE(fixes.size() == 2);
+    CHECK(fixes[0] == "Plain");
+    CHECK(fixes[1] == "Risky (may change behavior)");
 }
 
 TEST_CASE("hover: a typedef expanded from a nested macro keeps its full type", "[hover][macro]") {
