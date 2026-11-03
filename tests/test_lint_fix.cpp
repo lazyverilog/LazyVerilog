@@ -661,7 +661,8 @@ std::string lint_fixed(const std::string& text, const LintConfig& cfg, const cha
     auto state = analyzer.get_state("file:///lint_fix.sv");
     REQUIRE(state != nullptr);
     std::vector<const FixInfo*> fixes;
-    for (const auto& d : run_lint(*state, cfg))
+    const auto diags = run_lint(*state, cfg);  // keep alive: fixes points into it
+    for (const auto& d : diags)
         if (d.code == code) {
             REQUIRE(d.fixes.size() == 1);
             CHECK(d.fixes[0].title == title);
