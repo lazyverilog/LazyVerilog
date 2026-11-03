@@ -1955,6 +1955,33 @@ TEST_CASE("code action: semantic diagnostic fix is offered, and not once the buf
     CHECK_FALSE(find_cast());
 }
 
+TEST_CASE("code action: the published lint diagnostics are used instead of linting",
+          "[codeAction][lint]") {
+    Analyzer analyzer;
+    Config config;  // lint off: a lint run would not produce "published"
+    const std::string uri = "file:///tmp/lazyverilog_codeaction_published_lint.sv";
+    analyzer.open(uri, "module top; endmodule\n");
+    ParseDiagInfo d;
+    d.message = "published";
+    d.fixes.push_back(FixInfo{"From publish", true, {FixEdit{0, 0, 0, 0, "x"}}});
+    const std::vector<ParseDiagInfo> published{d};
+
+    lsDiagnostic diag;
+    diag.message = "published";
+    lsCodeActionParams params;
+    params.textDocument.uri.raw_uri_ = uri;
+    params.context.diagnostics = {diag};
+    auto has_fix = [&](const std::vector<ParseDiagInfo>* lint) {
+        for (const auto& a : provide_code_actions(analyzer, config, params, lint))
+            if (a.title == "From publish")
+                return true;
+        return false;
+    };
+    CHECK(has_fix(&published));
+    // nullptr falls back to linting the buffer, which has no such diagnostic.
+    CHECK_FALSE(has_fix(nullptr));
+}
+
 TEST_CASE("code action: unsafe fixes carry a suffix and sort after safe ones",
           "[codeAction][lint]") {
     Analyzer analyzer;

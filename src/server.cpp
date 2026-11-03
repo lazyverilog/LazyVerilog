@@ -1277,9 +1277,12 @@ void LazyVerilogServer::publish_diagnostics(const std::string& uri) {
                 file_config->lint.instance.stale_instance_diagnostic)
                 project_lint_index = analyzer_.project_index_snapshot();
 
-            auto lint_diags = run_lint(*state, file_config->lint, project_lint_index.get());
-            for (auto diag : lint_diags)
+            auto lint_diags = std::make_shared<const std::vector<ParseDiagInfo>>(
+                run_lint(*state, file_config->lint, project_lint_index.get()));
+            for (auto diag : *lint_diags)
                 add_diag(std::move(diag));
+            std::lock_guard<std::mutex> lock(published_lint_mutex_);
+            published_lint_[uri] = {state, std::move(lint_diags)};
         }
 
         // Gated on this file's own project, inside semantic_diagnostics_for().
@@ -1342,6 +1345,10 @@ void LazyVerilogServer::clear_published_diagnostics_for_owner(const std::string&
     std::unordered_set<std::string> uris_to_clear;
     uris_to_clear.insert(owner_uri);
 
+    {
+        std::lock_guard<std::mutex> lock(published_lint_mutex_);
+        published_lint_.erase(owner_uri);
+    }
     if (auto it = diagnostic_uris_by_owner_.find(owner_uri);
         it != diagnostic_uris_by_owner_.end()) {
         uris_to_clear.insert(it->second.begin(), it->second.end());
@@ -2341,8 +2348,17 @@ void LazyVerilogServer::register_handlers() {
             // project was gated on another project's `[lint]` and `[format]`
             // -- and with no rootUri, on whatever sat above the working
             // directory.
-            rsp.result = provide_code_actions(
-                analyzer_, *config_for(req.params.textDocument.uri.raw_uri_), req.params);
+            const auto& uri = req.params.textDocument.uri.raw_uri_;
+            // The publish's lint, if it was computed from the current state.
+            std::shared_ptr<const std::vector<ParseDiagInfo>> published;
+            if (auto state = analyzer_.get_state(uri)) {
+                std::lock_guard<std::mutex> lock(published_lint_mutex_);
+                if (auto it = published_lint_.find(uri);
+                    it != published_lint_.end() && it->second.state.lock() == state)
+                    published = it->second.diags;
+            }
+            rsp.result =
+                provide_code_actions(analyzer_, *config_for(uri), req.params, published.get());
         } catch (const SafeModeError& e) {
             show_warning(e.what());
         } catch (const std::exception& e) {

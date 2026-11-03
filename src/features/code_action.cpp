@@ -141,7 +141,8 @@ static bool line_inside_class_body(const SyntaxTree& tree, int line) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Config& config,
-                                             const lsCodeActionParams& params) {
+                                             const lsCodeActionParams& params,
+                                             const std::vector<ParseDiagInfo>* published_lint) {
     std::vector<CodeAction> actions;
 
     const std::string& uri = params.textDocument.uri.raw_uri_;
@@ -316,8 +317,9 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
     // A request diagnostic is matched to the current one by position and message
     // (the server publishes no code).  Semantic diagnostics are already dropped
     // by the analyzer once the buffer is edited past the compile.
-    // Parse and semantic diagnostics are cached; lint is walked only when a
-    // request diagnostic matched neither (and never for an empty request).
+    // Parse and semantic diagnostics are cached, lint ones come from the
+    // publish; lint is walked here only without those, when a request
+    // diagnostic matched neither (and never for an empty request).
     std::vector<ParseDiagInfo> current = state->parse_diagnostics;
     {
         auto semantic = analyzer.semantic_diagnostics(uri);
@@ -325,7 +327,8 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
                        std::make_move_iterator(semantic.end()));
     }
     std::vector<ParseDiagInfo> lint_diags;
-    bool lint_done = false;
+    const auto& lint_pool = published_lint ? *published_lint : lint_diags;
+    bool lint_done = published_lint != nullptr;
     auto find_match = [&](const std::vector<ParseDiagInfo>& pool, const lsDiagnostic& diag) {
         std::vector<const ParseDiagInfo*> out;
         for (const auto& cur : pool)
@@ -352,7 +355,7 @@ std::vector<CodeAction> provide_code_actions(const Analyzer& analyzer, const Con
             }
         }
         if (matched.empty())
-            matched = find_match(lint_diags, diag);
+            matched = find_match(lint_pool, diag);
         for (const auto* cur : matched) {
             for (const auto& fix : cur->fixes) {
                 lsWorkspaceEdit we;

@@ -18,6 +18,9 @@ namespace td_codeActionCode {
 MAKE_REFLECT_STRUCT(td_codeActionCode::request, jsonrpc, id, method, params);
 MAKE_REFLECT_STRUCT(td_codeActionCode::response, jsonrpc, id, result);
 
+/// @p published_lint: the lint diagnostics last published for this buffer's
+/// current state, or nullptr to lint it here when a request needs them.
 std::vector<CodeAction> provide_code_actions(
     const Analyzer& analyzer, const Config& config,
-    const lsCodeActionParams& params);
+    const lsCodeActionParams& params,
+    const std::vector<ParseDiagInfo>* published_lint = nullptr);
