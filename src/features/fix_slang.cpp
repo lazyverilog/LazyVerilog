@@ -144,6 +144,7 @@ struct FactCollector : ASTVisitor<FactCollector, VisitFlags::AllGood> {
 
 struct SlangFixContext::Impl {
     std::unordered_map<const Symbol*, ScopeFacts> scopes;
+    std::unordered_map<const Symbol*, bool> parameterized;
 };
 
 SlangFixContext::SlangFixContext() : impl(std::make_unique<Impl>()) {}
@@ -168,13 +169,42 @@ std::optional<RangeFacts> facts_at(const Diagnostic& d, SourceRange range,
             FactCollector collector(it->second);
             scope->visit(collector);
         } catch (...) {
-            // A half-walked scope could miss an output argument.
-            context.impl->scopes.erase(it);
-            throw;
+            // A half-walked scope could miss an output argument: keep it empty
+            // (no facts, so no fix) rather than walk it again per diagnostic.
+            it->second.clear();
         }
     }
     auto found = it->second.find(range);
     return found == it->second.end() ? RangeFacts{} : found->second;
+}
+
+// Whether a cast written at @p symbol is compiled with more than one value:
+// some enclosing scope up to the instance body, package or $unit (classes
+// included) declares a parameter or localparam, or is a generate-loop
+// iteration.  The cast's width and sign come from the one elaboration slang
+// saw.
+bool parameterized(const Symbol* symbol, SlangFixContext& context) {
+    if (!symbol)
+        return false;
+    auto [it, fresh] = context.impl->parameterized.try_emplace(symbol, false);
+    if (!fresh)
+        return it->second;
+    for (auto s = symbol; s && !it->second;
+         s = s->getParentScope() ? &s->getParentScope()->asSymbol() : nullptr) {
+        if (s->kind == SymbolKind::GenerateBlockArray)
+            it->second = true;
+        else if (auto scope = s->as_if<Scope>())
+            for (auto& member : scope->members())
+                if (member.kind == SymbolKind::Parameter ||
+                    member.kind == SymbolKind::TypeParameter) {
+                    it->second = true;
+                    break;
+                }
+        if (s->kind == SymbolKind::InstanceBody || s->kind == SymbolKind::Package ||
+            s->kind == SymbolKind::CompilationUnit)
+            break;
+    }
+    return it->second;
 }
 
 // The name to write @p type as in a cast at the diagnostic's scope: a typedef
@@ -343,6 +373,11 @@ std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d,
     auto range = left_narrower ? d.ranges[1] : d.ranges[2];
     if (!editable(sm, d, range))
         return {};
+    // An operator operand is evaluated at the context's width (~c, c * d);
+    // inside the cast it would be evaluated at its own.
+    auto facts = facts_at(d, range, context);
+    if (!facts || !facts->expr || !is_primary(*facts->expr))
+        return {};
     const auto width = std::to_string(std::max(left.getBitWidth(), right.getBitWidth()));
     return wrap(sm, range, width + "'(", ")",
                 "Cast " + title_text(sm, range) + " to " + width + " bits");
@@ -353,11 +388,23 @@ std::vector<FixInfo> operand_fixes(const SourceManager& sm, const Diagnostic& d,
 std::vector<FixInfo> slang_fixes(const SourceManager& sm, const Diagnostic& d,
                                  SlangFixContext& context) try {
     const auto code = d.code;
+    std::vector<FixInfo> fixes;
     if (is_conversion(code))
-        return conversion_fixes(sm, d, context);
-    if (code == diag::ArithOpMismatch || code == diag::BitwiseOpMismatch ||
-        code == diag::ComparisonMismatch || code == diag::SignCompare)
-        return operand_fixes(sm, d, context);
+        fixes = conversion_fixes(sm, d, context);
+    else if (code == diag::ArithOpMismatch || code == diag::BitwiseOpMismatch ||
+             code == diag::SignCompare)
+        fixes = operand_fixes(sm, d, context);
+    // Width and sign casts bake in the elaborated widths and signs.
+    const bool cast = code == diag::WidthTruncate || code == diag::WidthExpand ||
+                      code == diag::PortWidthTruncate || code == diag::PortWidthExpand ||
+                      code == diag::SignConversion || code == diag::ArithOpMismatch ||
+                      code == diag::BitwiseOpMismatch || code == diag::SignCompare;
+    if (!fixes.empty()) {
+        if (cast && parameterized(d.symbol, context))
+            for (auto& fix : fixes)
+                fix.safe = false;
+        return fixes;
+    }
     if ((code == diag::IntBoolConv || code == diag::FloatBoolConv) && !d.ranges.empty() &&
         editable(sm, d, d.ranges[0])) {
         return code == diag::IntBoolConv

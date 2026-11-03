@@ -360,6 +360,19 @@ int main(int argc, char** argv) {
         }
 
         {
+            // 8'(b) holds only for the default W; --fix must not bake it in.
+            const std::string param = "module p #(parameter int W = 8) (input logic [15:0] b,"
+                                      " output logic [W-1:0] y);\n  assign y = b;\nendmodule\n";
+            const fs::path f = write("p.sv", param);
+            run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(cli_process::read_file(f) == param,
+                   "--fix leaves a cast in a parameterized module alone");
+            run_command(lint_bin, "--fix-unsafe --compile-only " + shell_quote(f));
+            expect(contains(cli_process::read_file(f), "assign y = 8'(b);"),
+                   "--fix-unsafe applies a cast in a parameterized module");
+        }
+
+        {
             const fs::path f = write("i.sv", widths);
             const std::string answers = "y\nn\n";
             auto r = run_command(lint_bin, "--fix-interactive --compile-only " + shell_quote(f),

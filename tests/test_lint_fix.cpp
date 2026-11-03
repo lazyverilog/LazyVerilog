@@ -467,16 +467,16 @@ TEST_CASE("lint-fix: many widenings in one module each get their own fix", "[lin
 
 TEST_CASE("lint-fix: an operand title is one line of at most 40 chars", "[lint-fix]") {
     const char* src =
-        "module m(input logic [7:0] a, input logic [3:0] in0, in1, in2, in3, in4, in5, in6,\n"
-        "         in7, output logic [7:0] c);\n"
-        "  assign c = a + (in0 +\n      in1 + in2 + in3 + in4 + in5 + in6 + in7);\nendmodule\n";
+        "module m(input logic [31:0] a, input logic [1:0] in0, in1, in2, in3, in4, in5, in6,\n"
+        "         in7, in8, output logic [31:0] c);\n"
+        "  assign c = a + {in0,\n      in1, in2, in3, in4, in5, in6, in7, in8};\nendmodule\n";
     auto title = title_of(src, "arith-op-mismatch");
     INFO(title);
     CHECK(title.find('\n') == std::string::npos);
     CHECK(title.find("  ") == std::string::npos);
-    CHECK(title.rfind("Cast in0 + in1 + in2", 0) == 0);
-    CHECK(title.size() == std::string("Cast ").size() + 40 + std::string(" to 8 bits").size());
-    CHECK(title.find("... to 8 bits") != std::string::npos);
+    CHECK(title.rfind("Cast {in0, in1, in2", 0) == 0);
+    CHECK(title.size() == std::string("Cast ").size() + 40 + std::string(" to 32 bits").size());
+    CHECK(title.find("... to 32 bits") != std::string::npos);
 }
 
 TEST_CASE("lint-fix: value - width-trunc", "[lint-fix]") {
@@ -562,6 +562,83 @@ TEST_CASE("lint-fix: sign-conversion on an operator operand gets no fix", "[lint
     CHECK(param_values(src).front() == "8'sd30");
 }
 
+TEST_CASE("lint-fix: casts in a parameterized scope are unsafe", "[lint-fix]") {
+    // The cast width is the elaborated W (8); any other W makes 8'(b) wrong.
+    const char* param = "module p #(parameter int W = 8) (input logic [15:0] b,"
+                        " output logic [W-1:0] y);\n  assign y = b;\nendmodule\n";
+    auto fixes = fixes_of(param, "width-trunc");
+    REQUIRE(fixes.size() == 1);
+    CHECK(!fixes[0].safe);
+    CHECK(fix_all(param, "width-trunc").find("assign y = 8'(b);") != std::string::npos);
+
+    // A localparam counts too, and so do sign and operand casts.
+    const char* local = "module m(input logic [7:0] b, input logic [3:0] c,"
+                        " input logic signed [7:0] s, output logic signed [7:0] a,"
+                        " output logic [7:0] d, output logic o);\n"
+                        "  localparam int K = 1;\n"
+                        "  assign a = b;\n  assign d = b + c;\n  assign o = b < s;\nendmodule\n";
+    for (const char* code : {"sign-conversion", "arith-op-mismatch", "sign-compare"}) {
+        INFO(code);
+        auto f = fixes_of(local, code);
+        REQUIRE(f.size() == 1);
+        CHECK(!f[0].safe);
+    }
+
+    // A generate-for body: every iteration shares the text.
+    const char* gen = "module g(input logic [15:0] b);\n"
+                      "  for (genvar i = 0; i < 2; i++) begin : gl\n"
+                      "    logic [7:0] t;\n    assign t = b;\n  end\nendmodule\n";
+    auto gen_fixes = fixes_of(gen, "width-trunc");
+    REQUIRE(!gen_fixes.empty());
+    for (const auto& f : gen_fixes)
+        CHECK(!f.safe);
+
+    // No parameter anywhere: still safe.
+    auto plain = fixes_of("module m(input logic [15:0] b, output logic [7:0] y);\n"
+                          "  assign y = b;\nendmodule\n",
+                          "width-trunc");
+    REQUIRE(plain.size() == 1);
+    CHECK(plain[0].safe);
+}
+
+TEST_CASE("lint-fix: value - a compound narrower operand gets no fix", "[lint-fix]") {
+    // ~c in context is extended to 32 bits first (bits 31:8 come out 1);
+    // 8'(~c) would complement at 4 bits and zero-extend.
+    const char* bitwise = "module m;\n"
+                          "  function automatic logic [31:0] f(logic [3:0] c, logic [7:0] b);\n"
+                          "    return (~c) | b;\n  endfunction\n"
+                          "  localparam logic [31:0] R0 = f(4'h0, 8'h00);\n"
+                          "  localparam logic [31:0] R1 = f(4'hF, 8'h01);\nendmodule\n";
+    CHECK(fixes_of(bitwise, "bitwise-op-mismatch").empty());
+    CHECK(fix_codes(bitwise, {"bitwise-op-mismatch"}) == bitwise);
+    CHECK(param_values(bitwise).front() == "32'd4294967295");
+    // c * d is 12 bits in context; 8'(c * d) would truncate it.
+    const char* arith = "module m;\n"
+                        "  function automatic logic [31:0] f(logic [5:0] c, logic [5:0] d,"
+                        " logic [7:0] b);\n"
+                        "    return (c * d) + b;\n  endfunction\n"
+                        "  localparam logic [31:0] R0 = f(6'h3F, 6'h3F, 8'h00);\n"
+                        "  localparam logic [31:0] R1 = f(6'h01, 6'h02, 8'h03);\nendmodule\n";
+    CHECK(fixes_of(arith, "arith-op-mismatch").empty());
+    CHECK(fix_codes(arith, {"arith-op-mismatch"}) == arith);
+    CHECK(param_values(arith).front() == "32'd3969");
+}
+
+TEST_CASE("lint-fix: value - a primary narrower operand keeps the value", "[lint-fix]") {
+    check_values("module m;\n"
+                 "  function automatic logic [31:0] f(logic [3:0] c, logic [7:0] b);\n"
+                 "    return c + b;\n  endfunction\n"
+                 "  localparam logic [31:0] R0 = f(4'hF, 8'hFF);\n"
+                 "  localparam logic [31:0] R1 = f(4'h1, 8'h02);\nendmodule\n",
+                 {"arith-op-mismatch"}, "return 8'(c) + b;");
+    check_values("module m;\n"
+                 "  function automatic logic [31:0] f(logic [3:0] c, logic [7:0] b);\n"
+                 "    return c | b;\n  endfunction\n"
+                 "  localparam logic [31:0] R0 = f(4'hF, 8'h80);\n"
+                 "  localparam logic [31:0] R1 = f(4'h1, 8'h02);\nendmodule\n",
+                 {"bitwise-op-mismatch"}, "return 8'(c) | b;");
+}
+
 TEST_CASE("lint-fix: a conversion inside a block scope still gets its fix", "[lint-fix]") {
     check_fix("module m(input logic [15:0] w, output logic [7:0] q);\n"
               "  always_comb begin : blk q = w; end\nendmodule\n",
@@ -637,10 +714,16 @@ TEST_CASE("lint-fix: no fix inside a macro expansion", "[lint-fix]") {
     cfg.function.enable = true;
     cfg.function.explicit_task_lifetime = true;
     Analyzer analyzer;
+    // A macro body's findings are dropped (push_diag); an argument's are kept
+    // and reported, but its text is still not edited.
     analyzer.open("file:///lint_fix_macro.sv",
-                  "`define T task t(); endtask\nmodule m;\n  `T\nendmodule\n");
+                  "`define T(x) x\nmodule m;\n  `T(task t(); endtask)\nendmodule\n");
     auto state = analyzer.get_state("file:///lint_fix_macro.sv");
     REQUIRE(state != nullptr);
-    for (const auto& d : run_lint(*state, cfg))
+    bool seen = false;
+    for (const auto& d : run_lint(*state, cfg)) {
+        seen = seen || d.code == "lint-task-explicit-lifetime";
         CHECK(d.fixes.empty());
+    }
+    CHECK(seen);
 }
