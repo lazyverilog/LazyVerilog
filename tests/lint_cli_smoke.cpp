@@ -395,6 +395,29 @@ int main(int argc, char** argv) {
                             "--fix, --fix-unsafe and --fix-interactive cannot be used together"),
                    "--fix with --fix-unsafe explains");
         }
+        {
+            const fs::path f = write("ro.sv", widths);
+            fs::permissions(f, fs::perms::owner_write, fs::perm_options::remove);
+            auto r = run_command(lint_bin, "--fix --compile-only " + shell_quote(f));
+            expect(contains(r.stderr_text, "cannot write; not fixed"), "read-only file is refused");
+            expect(cli_process::read_file(f) == widths, "read-only file is unchanged");
+            expect(contains(r.stdout_text, "[width-trunc]"), "read-only file keeps its diagnostics");
+            fs::permissions(f, fs::perms::owner_write, fs::perm_options::add);
+        }
+#ifndef _WIN32
+        {
+            const fs::path real = write("real.sv", widths);
+            const fs::path link = dir / "link.sv";
+            std::error_code ec;
+            fs::create_symlink(real, link, ec);
+            if (!ec) {
+                run_command(lint_bin, "--fix --compile-only " + shell_quote(link));
+                expect(fs::is_symlink(link), "--fix keeps a symlink a symlink");
+                expect(contains(cli_process::read_file(real), "8'(b)"),
+                       "--fix writes through a symlink");
+            }
+        }
+#endif
         fs::remove_all(dir);
     }
 

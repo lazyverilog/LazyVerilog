@@ -353,20 +353,31 @@ void apply_cli_fixes(FixMode mode, const std::vector<std::shared_ptr<const Docum
 
         // Write beside the original and rename over it, so a failed write cannot truncate it.
         bool wrote = true;
+        // shortcut: hard links and ownership are not preserved, upgrade to an in-place write if that matters
         if (result.text != original) {
-            const std::filesystem::path tmp = file + ".lazyverilog-fix.tmp";
-            {
-                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                out << result.text;
-                out.flush();
-                wrote = static_cast<bool>(out);
-            }
+            namespace fs = std::filesystem;
             std::error_code ec;
-            if (wrote)
-                std::filesystem::rename(tmp, file, ec);
-            if (!wrote || ec) {
-                wrote = false;
-                std::filesystem::remove(tmp, ec);
+            const fs::path target = fs::canonical(file, ec); // follow symlinks
+            const auto perms = ec ? fs::perms::none : fs::status(target, ec).permissions();
+            if (ec || (perms & fs::perms::owner_write) == fs::perms::none) {
+                wrote = false; // missing or read-only: leave it alone
+            } else {
+                const fs::path tmp = target.string() + ".lazyverilog-fix.tmp";
+                {
+                    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                    out << result.text;
+                    out.flush();
+                    out.close();
+                    wrote = static_cast<bool>(out);
+                }
+                if (wrote)
+                    fs::permissions(tmp, perms, ec);
+                if (wrote && !ec)
+                    fs::rename(tmp, target, ec);
+                if (!wrote || ec) {
+                    wrote = false;
+                    fs::remove(tmp, ec);
+                }
             }
         }
         if (!wrote) {
