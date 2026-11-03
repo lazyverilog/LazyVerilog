@@ -146,6 +146,19 @@ diagnostic is gone and no new diagnostic appears.
 | lint-statement-case-missing-default | `default: ;` before `endcase` (moved) | safe |
 | lint-function-automatic, lint-function-explicit-lifetime, lint-task-explicit-lifetime | add `automatic`, or replace `static` with it (moved) | unsafe |
 
+Call arguments and port connections. slang binds an input argument of a
+function, task, or system call, and an input port connection, with the same
+implicit conversion as an assignment, so the rows above fire on the argument
+expression and the cast goes there: `f(8'(b))`, `.d(8'(b))`. An output or
+inout argument or port is bound the other way round: the converted operand is
+slang's `EmptyArgumentExpression` placeholder whose range is the actual
+argument, an lvalue that cannot be cast. Those diagnostics get no fix. They are
+told apart by visiting `Diagnostic::symbol` for an assignment whose right side
+is an `EmptyArgumentExpression` with the diagnostic's range (or an output/inout
+port connection with that range). Tests cover an input argument (width and
+type), a named-argument call, a task call, an input port, and an output
+argument and output port that get no fix.
+
 `N'(e)` uses the bare width; the target's signedness is handled by the
 separate sign-conversion fix when slang reports one. Parentheses are added
 around `e` only where the cast syntax needs none (`N'(...)` already groups).
