@@ -443,6 +443,30 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                own_buffers_.end();
     }
 
+    /// A location a fix may edit: a plain file location in this document's own
+    /// buffer, never inside a macro expansion or an included file.
+    bool editable(SourceLocation loc) const {
+        return loc.valid() && !sm.isMacroLoc(loc) &&
+               std::find(own_buffers_.begin(), own_buffers_.end(), loc.buffer()) !=
+                   own_buffers_.end();
+    }
+
+    /// Text of @p loc's line before the token, and its leading blanks.
+    std::pair<std::string_view, std::string_view> line_prefix(SourceLocation loc) const {
+        auto text = sm.getSourceText(loc.buffer());
+        size_t off = loc.offset();
+        size_t bol = off ? text.rfind('\n', off - 1) : std::string_view::npos;
+        bol = bol == std::string_view::npos ? 0 : bol + 1;
+        auto prefix = text.substr(bol, off - bol);
+        return {prefix, prefix.substr(0, prefix.find_first_not_of(" 	"))};
+    }
+
+    FixInfo insert_fix(std::string title, bool safe, SourceLocation at, std::string text) const {
+        int line = (int)sm.getFileLineNumber(at) - 1;
+        int col  = lsp_column(sm, at);
+        return FixInfo{std::move(title), safe, {FixEdit{line, col, line, col, std::move(text)}}};
+    }
+
     /// Shadows SyntaxVisitor::visit so the check runs at every level: the base
     /// visitDefault() dispatches children through `child->visit(DERIVED)`, which
     /// resolves here.
@@ -516,10 +540,28 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
             for (uint32_t i = 0; i < node.items.size() && !has_default; ++i)
                 if (node.items[i]->as_if<DefaultCaseItemSyntax>())
                     has_default = true;
-            if (!has_default)
+            if (!has_default) {
+                size_t before = diags.size();
                 push_diag(diags, sm, node.caseKeyword.location(), statement_sev(),
                     LintCode::StatementCaseMissingDefault,
                     "[statement] case statement missing default item");
+                auto end = node.endcase.location();
+                if (diags.size() > before && editable(end) &&
+                    editable(node.caseKeyword.location())) {
+                    auto [prefix, _] = line_prefix(end);
+                    if (prefix.find_first_not_of(" 	") != std::string_view::npos) {
+                        // `endcase` shares its line with code: put the item right before it.
+                        diags.back().fixes.push_back(
+                            insert_fix("Add default case", true, end, "default: ; "));
+                    } else {
+                        auto [__, indent] = line_prefix(node.caseKeyword.location());
+                        int line = (int)sm.getFileLineNumber(end) - 1;
+                        diags.back().fixes.push_back(FixInfo{
+                            "Add default case", true,
+                            {FixEdit{line, 0, line, 0, std::string(indent) + "  default: ;\n"}}});
+                    }
+                }
+            }
         }
         visitDefault(node);
     }
@@ -534,6 +576,26 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
         bool is_task   = (node.kind == SyntaxKind::TaskDeclaration);
         auto& proto    = *node.prototype;
         bool  has_life = proto.lifetime.valid() && !proto.lifetime.rawText().empty();
+        // Replace an existing lifetime (`function static`) rather than add a second one.
+        auto attach = [&](size_t before, const char* title) {
+            if (diags.size() == before)
+                return;
+            if (has_life && editable(proto.lifetime.location())) {
+                auto at = proto.lifetime.location();
+                int line = (int)sm.getFileLineNumber(at) - 1;
+                int col  = lsp_column(sm, at);
+                int len  = (int)proto.lifetime.rawText().size();
+                diags.back().fixes.push_back(
+                    FixInfo{title, false, {FixEdit{line, col, line, col + len, "automatic"}}});
+            } else if (!has_life && editable(proto.keyword.location())) {
+                auto at = proto.keyword.location();
+                int line = (int)sm.getFileLineNumber(at) - 1;
+                int col  = lsp_column(sm, at) + (int)proto.keyword.rawText().size();
+                diags.back().fixes.push_back(
+                    FixInfo{title, false, {FixEdit{line, col, line, col, " automatic"}}});
+            }
+        };
+        size_t before = diags.size();
 
         if (!is_task) {
             if (cfg.function.functions_automatic) {
@@ -542,15 +604,18 @@ struct LintVisitor : public SyntaxVisitor<LintVisitor> {
                     push_diag(diags, sm, proto.keyword.location(), function_sev(),
                         LintCode::FunctionAutomatic,
                         "[function] function declaration should use 'automatic' lifetime");
+                attach(before, "Add 'automatic' lifetime");
             } else if (cfg.function.explicit_function_lifetime && !has_life) {
                 push_diag(diags, sm, proto.keyword.location(), function_sev(),
                     LintCode::FunctionExplicitLifetime,
                     "[function] function declaration missing explicit lifetime (automatic/static)");
+                attach(before, "Add 'automatic' lifetime");
             }
         } else if (cfg.function.explicit_task_lifetime && !has_life) {
             push_diag(diags, sm, proto.keyword.location(), function_sev(),
                 LintCode::TaskExplicitLifetime,
                 "[task] task declaration missing explicit lifetime (automatic/static)");
+            attach(before, "Add 'automatic' lifetime to task");
         }
         visitDefault(node);
     }

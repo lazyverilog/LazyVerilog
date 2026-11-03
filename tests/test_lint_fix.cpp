@@ -6,6 +6,8 @@
 
 #include "diagnostic_code.hpp"
 #include "features/fix_slang.hpp"
+#include "analyzer.hpp"
+#include "features/lint.hpp"
 #include "fix_apply.hpp"
 #include "lsp_position.hpp"
 
@@ -570,4 +572,75 @@ TEST_CASE("lint-fix: a conversion inside a block scope still gets its fix", "[li
     check_fix("module m(input logic [15:0] w, output logic [7:0] q);\n"
               "  always_comb begin logic [7:0] t; t = w; q = t; end\nendmodule\n",
               "width-trunc", "t = 8'(w);");
+}
+
+namespace {
+
+// Lint `text` with `cfg`, apply the one fix on the one diagnostic with `code`.
+std::string lint_fixed(const std::string& text, const LintConfig& cfg, const char* code,
+                       std::string_view title, bool safe) {
+    Analyzer analyzer;
+    analyzer.open("file:///lint_fix.sv", text);
+    auto state = analyzer.get_state("file:///lint_fix.sv");
+    REQUIRE(state != nullptr);
+    std::vector<const FixInfo*> fixes;
+    for (const auto& d : run_lint(*state, cfg))
+        if (d.code == code) {
+            REQUIRE(d.fixes.size() == 1);
+            CHECK(d.fixes[0].title == title);
+            CHECK(d.fixes[0].safe == safe);
+            fixes.push_back(&d.fixes[0]);
+        }
+    REQUIRE(fixes.size() == 1);
+    return apply_fixes(text, fixes).text;
+}
+
+}  // namespace
+
+TEST_CASE("lint-fix: case without default gets a default item", "[lint-fix]") {
+    LintConfig cfg;
+    cfg.statement.enable = true;
+    cfg.statement.case_missing_default = true;
+    const char* code = "lint-statement-case-missing-default";
+    CHECK(lint_fixed("module m(input logic x, output logic y);\n  always_comb case (x) 0: y = 1; endcase\nendmodule\n",
+                     cfg, code, "Add default case", true) ==
+          "module m(input logic x, output logic y);\n  always_comb case (x) 0: y = 1; default: ; endcase\nendmodule\n");
+    CHECK(lint_fixed("module m(input logic x, output logic y);\n  always_comb begin\n    case (x)\n      0: y = 1;\n    endcase\n  end\nendmodule\n",
+                     cfg, code, "Add default case", true) ==
+          "module m(input logic x, output logic y);\n  always_comb begin\n    case (x)\n      0: y = 1;\n      default: ;\n    endcase\n  end\nendmodule\n");
+}
+
+TEST_CASE("lint-fix: function and task lifetimes", "[lint-fix]") {
+    LintConfig cfg;
+    cfg.function.enable = true;
+    cfg.function.functions_automatic = true;
+    cfg.function.explicit_task_lifetime = true;
+    CHECK(lint_fixed("module m;\n  function int f(); return 1; endfunction\nendmodule\n", cfg,
+                     "lint-function-automatic", "Add 'automatic' lifetime", false) ==
+          "module m;\n  function automatic int f(); return 1; endfunction\nendmodule\n");
+    CHECK(lint_fixed("module m;\n  function static int f(); return 1; endfunction\nendmodule\n", cfg,
+                     "lint-function-automatic", "Add 'automatic' lifetime", false) ==
+          "module m;\n  function automatic int f(); return 1; endfunction\nendmodule\n");
+    CHECK(lint_fixed("module m;\n  task t(); endtask\nendmodule\n", cfg,
+                     "lint-task-explicit-lifetime", "Add 'automatic' lifetime to task", false) ==
+          "module m;\n  task automatic t(); endtask\nendmodule\n");
+    LintConfig explicit_cfg;
+    explicit_cfg.function.enable = true;
+    explicit_cfg.function.explicit_function_lifetime = true;
+    CHECK(lint_fixed("module m;\n  function int f(); return 1; endfunction\nendmodule\n", explicit_cfg,
+                     "lint-function-explicit-lifetime", "Add 'automatic' lifetime", false) ==
+          "module m;\n  function automatic int f(); return 1; endfunction\nendmodule\n");
+}
+
+TEST_CASE("lint-fix: no fix inside a macro expansion", "[lint-fix]") {
+    LintConfig cfg;
+    cfg.function.enable = true;
+    cfg.function.explicit_task_lifetime = true;
+    Analyzer analyzer;
+    analyzer.open("file:///lint_fix_macro.sv",
+                  "`define T task t(); endtask\nmodule m;\n  `T\nendmodule\n");
+    auto state = analyzer.get_state("file:///lint_fix_macro.sv");
+    REQUIRE(state != nullptr);
+    for (const auto& d : run_lint(*state, cfg))
+        CHECK(d.fixes.empty());
 }
