@@ -6,6 +6,7 @@
 #include "syntax_index_shared.hpp"
 #include "string_utils.hpp"
 #include "diagnostic_code.hpp"
+#include "features/fix_slang.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -141,6 +142,7 @@ static void collect_parse_diagnostics(DocumentState& state, const std::string& f
         } catch (...) {
         }
         info.code = slang_diagnostic_code(engine, d.code);
+        info.fixes = slang_fixes(sm, d);
         auto sev = slang_diagnostic_severity(d.code);
         if (sev == slang::DiagnosticSeverity::Error || sev == slang::DiagnosticSeverity::Fatal)
             info.severity = 1;
