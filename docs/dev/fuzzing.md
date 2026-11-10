@@ -52,9 +52,10 @@ hand) builds with `-DLAZYVERILOG_SANITIZE=address,undefined`, fuzzes the rtl1k
 corpus (`tools/make_rtl1k.sh`: cva6 + ibex) for an hour, then runs
 `[invariants]` on their RTL. Failing sessions are uploaded as the
 `fuzz-out-<run id>` artifact. Any GCC or Clang build takes the same option.
-Every 5 minutes the fuzzer prints the step count and the server's RSS and peak
-RSS, so a run whose runner dies (`exit code 143`, "runner has received a
-shutdown signal") still leaves a trail in the job log.
+Every minute the fuzzer prints the step count, the server's RSS and peak RSS,
+the machine's available memory and the free disk, so a run whose runner dies
+(`exit code 143`, "runner has received a shutdown signal") still leaves a
+trail in the job log.
 
 ## Reading a report
 

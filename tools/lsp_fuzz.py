@@ -25,6 +25,7 @@ import json
 import os
 import random
 import shlex
+import shutil
 import string
 import subprocess
 import sys
@@ -37,7 +38,7 @@ from lsp_client import Client  # noqa: E402
 MAX_PENDING = 8
 MAX_OPEN = 8
 SANITIZER_REPORT_WAIT_S = 30
-HEARTBEAT_S = 300
+HEARTBEAT_S = 60
 SOURCE_SUFFIXES = (".sv", ".svh", ".v")
 VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "*/", "//",
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
@@ -464,14 +465,20 @@ def write_failure(out: Path, header: dict, record: list[dict], failure: Failure,
           file=sys.stderr)
 
 
-def server_memory(pid: int) -> str:
-    """Current and peak RSS from /proc (Linux only)."""
+def _proc_fields(path: str) -> dict:
     try:
-        status = Path(f"/proc/{pid}/status").read_text().splitlines()
+        lines = Path(path).read_text().splitlines()
     except OSError:
-        return "rss unknown"
-    fields = dict(line.split(":", 1) for line in status if ":" in line)
-    return f"rss {fields.get('VmRSS', '?').strip()}, peak {fields.get('VmHWM', '?').strip()}"
+        return {}
+    return {k: v.strip() for k, v in (line.split(":", 1) for line in lines if ":" in line)}
+
+
+def resource_usage(pid: int) -> str:
+    """Server RSS and peak, machine MemAvailable (/proc, Linux only), free disk in cwd."""
+    status, meminfo = _proc_fields(f"/proc/{pid}/status"), _proc_fields("/proc/meminfo")
+    free_gb = shutil.disk_usage(".").free / 2**30
+    return (f"server rss {status.get('VmRSS', '?')}, peak {status.get('VmHWM', '?')}; "
+            f"machine available {meminfo.get('MemAvailable', '?')}, disk free {free_gb:.1f} GB")
 
 
 def start(server: str, root: Path) -> Client:
@@ -503,7 +510,7 @@ def fuzz(args) -> int:
                 # A CI runner that dies takes the session with it; this is what is left.
                 next_beat += HEARTBEAT_S
                 print(f"step {steps}, {len(record)} messages, {len(runner.pending)} pending, "
-                      f"server {server_memory(client.proc.pid)}", flush=True)
+                      f"{resource_usage(client.proc.pid)}", flush=True)
             messages = gen.step()
             for comparison in gen.take_comparisons():
                 runner.compare(*comparison)
