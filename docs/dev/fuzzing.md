@@ -10,7 +10,7 @@ cancels for both live and never-issued ids. It needs Python 3 and nothing else.
 | Kind | Meaning |
 |---|---|
 | `crash` | the server exited or closed stdout before `exit`, or exited non-zero after it |
-| `hang` | a request stayed unanswered for `--reply-timeout` seconds (default 10) |
+| `hang` | a request stayed unanswered for `--reply-timeout` seconds (default 10); `--command-timeout` for `workspace/executeCommand` and for any request sent while one was pending, even if the command's answer is read first |
 | `protocol` | the server sent a message that is not UTF-8 JSON |
 | `incremental-mismatch` | after incremental edits, `foldingRange` or `formatting` answered differently than right after a close and reopen with the fuzzer's own copy of the text |
 | `sanitizer` | an ASan/LSan/UBSan report appeared on stderr |
@@ -52,6 +52,9 @@ hand) builds with `-DLAZYVERILOG_SANITIZE=address,undefined`, fuzzes the rtl1k
 corpus (`tools/make_rtl1k.sh`: cva6 + ibex) for an hour, then runs
 `[invariants]` on their RTL. Failing sessions are uploaded as the
 `fuzz-out-<run id>` artifact. Any GCC or Clang build takes the same option.
+Every 5 minutes the fuzzer prints the step count and the server's RSS and peak
+RSS, so a run whose runner dies (`exit code 143`, "runner has received a
+shutdown signal") still leaves a trail in the job log.
 
 ## Reading a report
 

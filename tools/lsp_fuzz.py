@@ -37,6 +37,7 @@ from lsp_client import Client  # noqa: E402
 MAX_PENDING = 8
 MAX_OPEN = 8
 SANITIZER_REPORT_WAIT_S = 30
+HEARTBEAT_S = 300
 SOURCE_SUFFIXES = (".sv", ".svh", ".v")
 VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "*/", "//",
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
@@ -334,7 +335,7 @@ class Runner:
         # workspace/executeCommand (lintAll compiles the project) and everything
         # queued behind it get this instead of reply_timeout.
         self.command_timeout = command_timeout or reply_timeout
-        self.pending: dict = {}           # id -> (sent_at, method)
+        self.pending: dict = {}           # id -> (sent_at, method, behind a command)
         self.answers: dict = {}           # id -> response, for ids in `keep`
         self.keep: set = set()
         self.comparisons: list = []       # (before id, after id, method, uri)
@@ -354,7 +355,11 @@ class Runner:
         self.wait(lambda: not self.keep.intersection(self.pending))
         self.record.append({"send": msg})
         if "id" in msg and "method" in msg:
-            self.pending[msg["id"]] = (time.monotonic(), msg["method"])
+            # Decided at send time: the command's answer can be read before the
+            # answers queued behind it, which still waited out the whole command.
+            behind = any(m == "workspace/executeCommand"
+                         for m in [msg["method"]] + [p[1] for p in self.pending.values()])
+            self.pending[msg["id"]] = (time.monotonic(), msg["method"], behind)
         self.client.send(msg)  # queued; a dead server shows up as EOF in poll()
 
     def poll(self):
@@ -391,9 +396,7 @@ class Runner:
                               f"  incremental: {json.dumps(first)[:2000]}\n"
                               f"  fresh open:  {json.dumps(second)[:2000]}")
         now = time.monotonic()
-        behind_command = False  # pending is in send order
-        for rid, (sent, method) in self.pending.items():
-            behind_command |= method == "workspace/executeCommand"
+        for rid, (sent, method, behind_command) in self.pending.items():
             limit = self.command_timeout if behind_command else self.reply_timeout
             if now - sent > limit:
                 raise Failure("hang", f"{method} id={rid} unanswered after {limit:g} s")
@@ -461,6 +464,16 @@ def write_failure(out: Path, header: dict, record: list[dict], failure: Failure,
           file=sys.stderr)
 
 
+def server_memory(pid: int) -> str:
+    """Current and peak RSS from /proc (Linux only)."""
+    try:
+        status = Path(f"/proc/{pid}/status").read_text().splitlines()
+    except OSError:
+        return "rss unknown"
+    fields = dict(line.split(":", 1) for line in status if ":" in line)
+    return f"rss {fields.get('VmRSS', '?').strip()}, peak {fields.get('VmHWM', '?').strip()}"
+
+
 def start(server: str, root: Path) -> Client:
     argv = shlex.split(server)
     # The server runs in `root`, so a relative binary path is resolved here first.
@@ -484,7 +497,13 @@ def fuzz(args) -> int:
             raise Failure("setup", f"no {'/'.join(SOURCE_SUFFIXES)} files under {srcs}")
         deadline = time.monotonic() + args.seconds
         steps = 0
+        next_beat = time.monotonic() + HEARTBEAT_S
         while time.monotonic() < deadline:
+            if time.monotonic() >= next_beat:
+                # A CI runner that dies takes the session with it; this is what is left.
+                next_beat += HEARTBEAT_S
+                print(f"step {steps}, {len(record)} messages, {len(runner.pending)} pending, "
+                      f"server {server_memory(client.proc.pid)}", flush=True)
             messages = gen.step()
             for comparison in gen.take_comparisons():
                 runner.compare(*comparison)
