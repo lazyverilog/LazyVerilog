@@ -330,7 +330,7 @@ class Generator:
 # -- running a session against the server -------------------------------------
 
 class Runner:
-    def __init__(self, client: Client, record: list[dict], reply_timeout: float,
+    def __init__(self, client: Client, record: list[dict] | SessionFile, reply_timeout: float,
                  command_timeout: float | None = None):
         self.client, self.record, self.reply_timeout = client, record, reply_timeout
         # workspace/executeCommand (lintAll compiles the project) and everything
@@ -442,13 +442,37 @@ class Runner:
             raise Failure("crash", f"server exit code {code} after exit")
 
 
-def write_failure(out: Path, header: dict, record: list[dict], failure: Failure, client: Client):
+class SessionFile:
+    """The session as it is sent, one JSON line per entry, kept on disk: an hour
+    of messages (whole-file texts included) held in memory took gigabytes and,
+    next to the ASan server, could run a 16 GB CI runner out of memory."""
+
+    def __init__(self, path: Path, header: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path, self.count = path, 0
+        self.file = open(path, "w", encoding="utf-8")
+        self.file.write(json.dumps(header) + "\n")
+
+    def append(self, entry: dict):
+        self.file.write(json.dumps(entry) + "\n")
+        self.count += 1
+
+    def __len__(self) -> int:
+        return self.count
+
+
+def write_failure(out: Path, header: dict, record: list[dict] | SessionFile, failure: Failure,
+                  client: Client):
     out.mkdir(parents=True, exist_ok=True)
     name = f"fail-{header.get('seed', 'replay')}"
-    with open(out / f"{name}.jsonl", "w", encoding="utf-8") as f:
-        f.write(json.dumps(header) + "\n")
-        for line in record:
-            f.write(json.dumps(line) + "\n")
+    if isinstance(record, SessionFile):
+        record.file.close()
+        os.replace(record.path, out / f"{name}.jsonl")
+    else:
+        with open(out / f"{name}.jsonl", "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+            for line in record:
+                f.write(json.dumps(line) + "\n")
     if failure.kind == "sanitizer":
         # The marker is the report's first line; ASan writes the stack after it, then aborts.
         try:
@@ -474,10 +498,12 @@ def _proc_fields(path: str) -> dict:
 
 
 def resource_usage(pid: int) -> str:
-    """Server RSS and peak, machine MemAvailable (/proc, Linux only), free disk in cwd."""
+    """Server and fuzzer RSS, machine MemAvailable (/proc, Linux only), free disk in cwd."""
     status, meminfo = _proc_fields(f"/proc/{pid}/status"), _proc_fields("/proc/meminfo")
+    own = _proc_fields("/proc/self/status")
     free_gb = shutil.disk_usage(".").free / 2**30
     return (f"server rss {status.get('VmRSS', '?')}, peak {status.get('VmHWM', '?')}; "
+            f"fuzzer rss {own.get('VmRSS', '?')}; "
             f"machine available {meminfo.get('MemAvailable', '?')}, disk free {free_gb:.1f} GB")
 
 
@@ -494,7 +520,7 @@ def fuzz(args) -> int:
     srcs = [Path(s).resolve() for s in (args.src or [root])]
     header = {"seed": args.seed, "root": str(root), "src": [str(s) for s in srcs]}
     client = start(args.server, root)
-    record: list[dict] = []
+    record = SessionFile(Path(args.out) / f"session-{args.seed}.jsonl.part", header)
     runner = Runner(client, record, args.reply_timeout, args.command_timeout)
     try:
         caps = runner.initialize(root)
@@ -524,6 +550,8 @@ def fuzz(args) -> int:
         write_failure(Path(args.out), header, record, failure, client)
         client.proc.kill()
         return 1
+    record.file.close()
+    record.path.unlink()
     print(f"ok: seed {args.seed}, {steps} steps, {len(record)} messages")
     return 0
 

@@ -59,7 +59,9 @@ trail in the job log.
 
 ## Reading a report
 
-A failure writes two files to `--out`:
+The session is streamed to `--out/session-<seed>.jsonl.part` as it is sent, not
+held in memory (an hour of messages took gigabytes), and removed when the run
+passes. A failure writes two files to `--out`:
 
 - `fail-<seed>.jsonl` -- the session: a header line, then one `{"send": ...}`
   line per message, in order. Replies to server-to-client requests are not

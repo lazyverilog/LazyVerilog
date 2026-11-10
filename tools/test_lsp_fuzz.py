@@ -206,11 +206,15 @@ class Oracle(unittest.TestCase):
     def test_clean_server_passes(self):
         code, _ = self.fuzz("")
         self.assertEqual(code, 0)
+        self.assertEqual(list(self.out.iterdir()), [])  # the streamed session is removed
 
     def test_crash_is_reported(self):
         code, _ = self.fuzz("--exit-after 5")
         self.assertEqual(code, 1)
-        self.assertTrue(list(self.out.glob("fail-*.jsonl")))
+        session = next(self.out.glob("fail-*.jsonl")).read_text().splitlines()
+        self.assertEqual(json.loads(session[0])["seed"], 1)
+        self.assertIn("send", json.loads(session[1]))
+        self.assertFalse(list(self.out.glob("*.part")))
         self.assertIn("crash", next(self.out.glob("fail-*.txt")).read_text())
 
     def test_hang_is_reported(self):
