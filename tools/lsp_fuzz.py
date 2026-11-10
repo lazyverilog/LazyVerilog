@@ -25,6 +25,7 @@ import json
 import os
 import random
 import shlex
+import shutil
 import string
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from lsp_client import Client  # noqa: E402
 MAX_PENDING = 8
 MAX_OPEN = 8
 SANITIZER_REPORT_WAIT_S = 30
+HEARTBEAT_S = 60
 SOURCE_SUFFIXES = (".sv", ".svh", ".v")
 VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "*/", "//",
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
@@ -328,13 +330,13 @@ class Generator:
 # -- running a session against the server -------------------------------------
 
 class Runner:
-    def __init__(self, client: Client, record: list[dict], reply_timeout: float,
+    def __init__(self, client: Client, record: list[dict] | SessionFile, reply_timeout: float,
                  command_timeout: float | None = None):
         self.client, self.record, self.reply_timeout = client, record, reply_timeout
         # workspace/executeCommand (lintAll compiles the project) and everything
         # queued behind it get this instead of reply_timeout.
         self.command_timeout = command_timeout or reply_timeout
-        self.pending: dict = {}           # id -> (sent_at, method)
+        self.pending: dict = {}           # id -> (sent_at, method, behind a command)
         self.answers: dict = {}           # id -> response, for ids in `keep`
         self.keep: set = set()
         self.comparisons: list = []       # (before id, after id, method, uri)
@@ -354,7 +356,11 @@ class Runner:
         self.wait(lambda: not self.keep.intersection(self.pending))
         self.record.append({"send": msg})
         if "id" in msg and "method" in msg:
-            self.pending[msg["id"]] = (time.monotonic(), msg["method"])
+            # Decided at send time: the command's answer can be read before the
+            # answers queued behind it, which still waited out the whole command.
+            behind = any(m == "workspace/executeCommand"
+                         for m in [msg["method"]] + [p[1] for p in self.pending.values()])
+            self.pending[msg["id"]] = (time.monotonic(), msg["method"], behind)
         self.client.send(msg)  # queued; a dead server shows up as EOF in poll()
 
     def poll(self):
@@ -391,9 +397,7 @@ class Runner:
                               f"  incremental: {json.dumps(first)[:2000]}\n"
                               f"  fresh open:  {json.dumps(second)[:2000]}")
         now = time.monotonic()
-        behind_command = False  # pending is in send order
-        for rid, (sent, method) in self.pending.items():
-            behind_command |= method == "workspace/executeCommand"
+        for rid, (sent, method, behind_command) in self.pending.items():
             limit = self.command_timeout if behind_command else self.reply_timeout
             if now - sent > limit:
                 raise Failure("hang", f"{method} id={rid} unanswered after {limit:g} s")
@@ -438,13 +442,37 @@ class Runner:
             raise Failure("crash", f"server exit code {code} after exit")
 
 
-def write_failure(out: Path, header: dict, record: list[dict], failure: Failure, client: Client):
+class SessionFile:
+    """The session as it is sent, one JSON line per entry, kept on disk: an hour
+    of messages (whole-file texts included) held in memory took gigabytes and,
+    next to the ASan server, could run a 16 GB CI runner out of memory."""
+
+    def __init__(self, path: Path, header: dict):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path, self.count = path, 0
+        self.file = open(path, "w", encoding="utf-8")
+        self.file.write(json.dumps(header) + "\n")
+
+    def append(self, entry: dict):
+        self.file.write(json.dumps(entry) + "\n")
+        self.count += 1
+
+    def __len__(self) -> int:
+        return self.count
+
+
+def write_failure(out: Path, header: dict, record: list[dict] | SessionFile, failure: Failure,
+                  client: Client):
     out.mkdir(parents=True, exist_ok=True)
     name = f"fail-{header.get('seed', 'replay')}"
-    with open(out / f"{name}.jsonl", "w", encoding="utf-8") as f:
-        f.write(json.dumps(header) + "\n")
-        for line in record:
-            f.write(json.dumps(line) + "\n")
+    if isinstance(record, SessionFile):
+        record.file.close()
+        os.replace(record.path, out / f"{name}.jsonl")
+    else:
+        with open(out / f"{name}.jsonl", "w", encoding="utf-8") as f:
+            f.write(json.dumps(header) + "\n")
+            for line in record:
+                f.write(json.dumps(line) + "\n")
     if failure.kind == "sanitizer":
         # The marker is the report's first line; ASan writes the stack after it, then aborts.
         try:
@@ -461,6 +489,24 @@ def write_failure(out: Path, header: dict, record: list[dict], failure: Failure,
           file=sys.stderr)
 
 
+def _proc_fields(path: str) -> dict:
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return {}
+    return {k: v.strip() for k, v in (line.split(":", 1) for line in lines if ":" in line)}
+
+
+def resource_usage(pid: int) -> str:
+    """Server and fuzzer RSS, machine MemAvailable (/proc, Linux only), free disk in cwd."""
+    status, meminfo = _proc_fields(f"/proc/{pid}/status"), _proc_fields("/proc/meminfo")
+    own = _proc_fields("/proc/self/status")
+    free_gb = shutil.disk_usage(".").free / 2**30
+    return (f"server rss {status.get('VmRSS', '?')}, peak {status.get('VmHWM', '?')}; "
+            f"fuzzer rss {own.get('VmRSS', '?')}; "
+            f"machine available {meminfo.get('MemAvailable', '?')}, disk free {free_gb:.1f} GB")
+
+
 def start(server: str, root: Path) -> Client:
     argv = shlex.split(server)
     # The server runs in `root`, so a relative binary path is resolved here first.
@@ -474,7 +520,7 @@ def fuzz(args) -> int:
     srcs = [Path(s).resolve() for s in (args.src or [root])]
     header = {"seed": args.seed, "root": str(root), "src": [str(s) for s in srcs]}
     client = start(args.server, root)
-    record: list[dict] = []
+    record = SessionFile(Path(args.out) / f"session-{args.seed}.jsonl.part", header)
     runner = Runner(client, record, args.reply_timeout, args.command_timeout)
     try:
         caps = runner.initialize(root)
@@ -484,7 +530,13 @@ def fuzz(args) -> int:
             raise Failure("setup", f"no {'/'.join(SOURCE_SUFFIXES)} files under {srcs}")
         deadline = time.monotonic() + args.seconds
         steps = 0
+        next_beat = time.monotonic() + HEARTBEAT_S
         while time.monotonic() < deadline:
+            if time.monotonic() >= next_beat:
+                # A CI runner that dies takes the session with it; this is what is left.
+                next_beat += HEARTBEAT_S
+                print(f"step {steps}, {len(record)} messages, {len(runner.pending)} pending, "
+                      f"{resource_usage(client.proc.pid)}", flush=True)
             messages = gen.step()
             for comparison in gen.take_comparisons():
                 runner.compare(*comparison)
@@ -498,6 +550,8 @@ def fuzz(args) -> int:
         write_failure(Path(args.out), header, record, failure, client)
         client.proc.kill()
         return 1
+    record.file.close()
+    record.path.unlink()
     print(f"ok: seed {args.seed}, {steps} steps, {len(record)} messages")
     return 0
 

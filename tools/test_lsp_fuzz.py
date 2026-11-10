@@ -135,12 +135,15 @@ class StubClient:
         self.sanitizer_hit, self.bad_messages, self.eof = False, [], False
         self.proc = type("Proc", (), {"poll": staticmethod(lambda: None)})()
 
+    def send(self, msg: dict):
+        pass
+
 
 class Comparison(unittest.TestCase):
     def poll(self, first: dict, second: dict):
         runner = lsp_fuzz.Runner(StubClient({1: first, 2: second}), [], reply_timeout=60)
         runner.compare(1, 2, "textDocument/foldingRange", "file:///a.sv")
-        runner.pending = {1: (time.monotonic(), "m"), 2: (time.monotonic(), "m")}
+        runner.pending = {1: (time.monotonic(), "m", False), 2: (time.monotonic(), "m", False)}
         runner.poll()
 
     def test_different_answers_are_a_mismatch(self):
@@ -155,33 +158,39 @@ class Comparison(unittest.TestCase):
 
 
 class Watchdog(unittest.TestCase):
-    def runner(self, pending: dict, responses: dict | None = None):
+    def runner(self, methods: list[str], responses: dict | None = None):
+        """Sends one request per method (ids from 1), all 5 s ago."""
         runner = lsp_fuzz.Runner(StubClient(responses or {}), [], reply_timeout=1,
                                  command_timeout=60)
-        runner.pending = pending
+        for rid, method in enumerate(methods, 1):
+            runner.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": {}})
+        runner.pending = {rid: (time.monotonic() - 5, *rest)
+                          for rid, (_, *rest) in runner.pending.items()}
         return runner
 
     def test_slow_command_is_not_a_hang(self):
-        late = time.monotonic() - 5
         # A request queued behind the command waits for it too.
-        self.runner({1: (late, "workspace/executeCommand"),
-                     2: (late, "textDocument/hover")}).poll()
+        self.runner(["workspace/executeCommand", "textDocument/hover"]).poll()
+
+    def test_request_behind_an_answered_command_keeps_the_command_timeout(self):
+        # The command's answer is read first; the hover queued behind it is
+        # answered a moment later and still waited out the whole command.
+        runner = self.runner(["workspace/executeCommand", "textDocument/hover"])
+        del runner.pending[1]
+        runner.poll()
 
     def test_slow_request_is_a_hang_whatever_the_command_timeout(self):
-        late = time.monotonic() - 5
         with self.assertRaises(lsp_fuzz.Failure) as caught:
-            self.runner({2: (late, "textDocument/hover")}).poll()
+            self.runner(["textDocument/hover"]).poll()
         self.assertEqual(caught.exception.kind, "hang")
 
     def test_request_sent_before_a_command_keeps_its_timeout(self):
-        late = time.monotonic() - 5
         with self.assertRaises(lsp_fuzz.Failure):
-            self.runner({1: (late, "textDocument/hover"),
-                         2: (late, "workspace/executeCommand")}).poll()
+            self.runner(["textDocument/hover", "workspace/executeCommand"]).poll()
 
     def test_response_to_an_id_not_pending_is_a_protocol_failure(self):
         with self.assertRaises(lsp_fuzz.Failure) as caught:
-            self.runner({}, {7: {"id": 7, "result": None}}).poll()
+            self.runner([], {7: {"id": 7, "result": None}}).poll()
         self.assertEqual(caught.exception.kind, "protocol")
 
 
@@ -197,11 +206,15 @@ class Oracle(unittest.TestCase):
     def test_clean_server_passes(self):
         code, _ = self.fuzz("")
         self.assertEqual(code, 0)
+        self.assertEqual(list(self.out.iterdir()), [])  # the streamed session is removed
 
     def test_crash_is_reported(self):
         code, _ = self.fuzz("--exit-after 5")
         self.assertEqual(code, 1)
-        self.assertTrue(list(self.out.glob("fail-*.jsonl")))
+        session = next(self.out.glob("fail-*.jsonl")).read_text().splitlines()
+        self.assertEqual(json.loads(session[0])["seed"], 1)
+        self.assertIn("send", json.loads(session[1]))
+        self.assertFalse(list(self.out.glob("*.part")))
         self.assertIn("crash", next(self.out.glob("fail-*.txt")).read_text())
 
     def test_hang_is_reported(self):
