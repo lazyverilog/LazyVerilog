@@ -10,7 +10,7 @@ cancels for both live and never-issued ids. It needs Python 3 and nothing else.
 | Kind | Meaning |
 |---|---|
 | `crash` | the server exited or closed stdout before `exit`, or exited non-zero after it |
-| `hang` | a request stayed unanswered for `--reply-timeout` seconds (default 10) |
+| `hang` | a request stayed unanswered for `--reply-timeout` seconds (default 10); `--command-timeout` for `workspace/executeCommand` and for any request sent while one was pending, even if the command's answer is read first |
 | `protocol` | the server sent a message that is not UTF-8 JSON |
 | `incremental-mismatch` | after incremental edits, `foldingRange` or `formatting` answered differently than right after a close and reopen with the fuzzer's own copy of the text |
 | `sanitizer` | an ASan/LSan/UBSan report appeared on stderr |
@@ -52,10 +52,16 @@ hand) builds with `-DLAZYVERILOG_SANITIZE=address,undefined`, fuzzes the rtl1k
 corpus (`tools/make_rtl1k.sh`: cva6 + ibex) for an hour, then runs
 `[invariants]` on their RTL. Failing sessions are uploaded as the
 `fuzz-out-<run id>` artifact. Any GCC or Clang build takes the same option.
+Every minute the fuzzer prints the step count, the server's RSS and peak RSS,
+the machine's available memory and the free disk, so a run whose runner dies
+(`exit code 143`, "runner has received a shutdown signal") still leaves a
+trail in the job log.
 
 ## Reading a report
 
-A failure writes two files to `--out`:
+The session is streamed to `--out/session-<seed>.jsonl.part` as it is sent, not
+held in memory (an hour of messages took gigabytes), and removed when the run
+passes. A failure writes two files to `--out`:
 
 - `fail-<seed>.jsonl` -- the session: a header line, then one `{"send": ...}`
   line per message, in order. Replies to server-to-client requests are not
