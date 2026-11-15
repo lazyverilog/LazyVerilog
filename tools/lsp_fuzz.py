@@ -39,6 +39,9 @@ MAX_PENDING = 8
 MAX_OPEN = 8
 SANITIZER_REPORT_WAIT_S = 30
 HEARTBEAT_S = 60
+# Below this the runner is about to be killed with nothing saved; fail first so
+# the session and the memory numbers are uploaded.
+LOW_MEMORY_KB = 1024 * 1024
 SOURCE_SUFFIXES = (".sv", ".svh", ".v")
 VOCAB = ["begin", "end", "module", "endmodule", "`", "(", ")", ";", '"', "/*", "*/", "//",
          "é", "\U0001F600", "\n", " ", "`define ", "`include \"x.svh\"\n", "always_ff"]
@@ -497,6 +500,11 @@ def _proc_fields(path: str) -> dict:
     return {k: v.strip() for k, v in (line.split(":", 1) for line in lines if ":" in line)}
 
 
+def machine_available_kb() -> int | None:
+    value = _proc_fields("/proc/meminfo").get("MemAvailable", "")
+    return int(value.split()[0]) if value else None
+
+
 def resource_usage(pid: int) -> str:
     """Server and fuzzer RSS, machine MemAvailable (/proc, Linux only), free disk in cwd."""
     status, meminfo = _proc_fields(f"/proc/{pid}/status"), _proc_fields("/proc/meminfo")
@@ -512,7 +520,8 @@ def start(server: str, root: Path) -> Client:
     # The server runs in `root`, so a relative binary path is resolved here first.
     if Path(argv[0]).exists():
         argv[0] = str(Path(argv[0]).resolve())
-    return Client(argv, str(root), capture_stderr=True)
+    # An hour of publishDiagnostics nobody reads grew the fuzzer to 1.5 GB.
+    return Client(argv, str(root), capture_stderr=True, keep_notifications=False)
 
 
 def fuzz(args) -> int:
@@ -531,7 +540,14 @@ def fuzz(args) -> int:
         deadline = time.monotonic() + args.seconds
         steps = 0
         next_beat = time.monotonic() + HEARTBEAT_S
+        next_memory_check = 0.0
         while time.monotonic() < deadline:
+            if time.monotonic() >= next_memory_check:
+                next_memory_check = time.monotonic() + 1
+                available = machine_available_kb()
+                if available is not None and available < LOW_MEMORY_KB:
+                    raise Failure("memory", f"machine nearly out of memory at step {steps}: "
+                                            f"{resource_usage(client.proc.pid)}")
             if time.monotonic() >= next_beat:
                 # A CI runner that dies takes the session with it; this is what is left.
                 next_beat += HEARTBEAT_S

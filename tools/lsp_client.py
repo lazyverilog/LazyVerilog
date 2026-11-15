@@ -29,7 +29,8 @@ class Client:
     draining stdout, and a server blocked writing stdout may stop reading stdin.
     """
 
-    def __init__(self, cmd: list[str], cwd: str, capture_stderr: bool = False):
+    def __init__(self, cmd: list[str], cwd: str, capture_stderr: bool = False,
+                 keep_notifications: bool = True):
         self.proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE if capture_stderr else None)
@@ -38,6 +39,7 @@ class Client:
         self.write_error = None
         self.responses = {}
         self.notifications = []          # (arrival_time, method, params)
+        self.keep_notifications = keep_notifications
         self.bad_messages = []           # bodies that are not UTF-8 JSON
         self.last_message = time.monotonic()
         self.eof = False
@@ -85,7 +87,8 @@ class Client:
                 if "id" in msg and "method" not in msg:
                     self.responses[msg["id"]] = (arrived_precise, msg)
                 elif "method" in msg:
-                    self.notifications.append((arrived, msg["method"], msg.get("params")))
+                    if self.keep_notifications:
+                        self.notifications.append((arrived, msg["method"], msg.get("params")))
                     if "id" in msg:      # server->client request, e.g. inlayHint/refresh
                         self.send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
                     if (msg["method"] == "workspace/inlayHint/refresh"

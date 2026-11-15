@@ -223,6 +223,15 @@ class Oracle(unittest.TestCase):
         self.assertLess(elapsed, 15)
         self.assertIn("textDocument/hover", next(self.out.glob("fail-*.txt")).read_text())
 
+    def test_low_machine_memory_fails_before_the_runner_dies(self):
+        import argparse
+        from unittest import mock
+        args = argparse.Namespace(server=FAKE, root=str(CORPUS), src=None, seed=1, seconds=5,
+                                  out=str(self.out), reply_timeout=2, command_timeout=None)
+        with mock.patch.object(lsp_fuzz, "machine_available_kb", return_value=1),                 mock.patch("sys.stderr"):
+            self.assertEqual(lsp_fuzz.fuzz(args), 1)
+        self.assertIn("memory", next(self.out.glob("fail-*.txt")).read_text())
+
     def test_stderr_flood_is_not_a_hang(self):
         code, _ = self.fuzz(f"--stderr-bytes {10 * 1024 * 1024}", seconds="3")
         self.assertEqual(code, 0)
