@@ -10,3 +10,7 @@ dist
 docs/node_modules
 docs/.vitepress/cache
 docs/public/videos
+
+# Formatter bug-hunt round reports (local working notes)
+/FORMAT_BUG_FIX*
+/FORMATTER_BUG.*

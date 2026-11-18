@@ -275,21 +275,9 @@ std::optional<AutoinstResult> autoinst_impl(const DocumentState& state, int line
     return autoinst_impl_layers(state, line, col, nullptr, opened_shards, project_index);
 }
 
-// ── Parse existing port connections ──────────────────────────────────────────
-
-std::map<std::string, std::string> autoinst_parse_connections(const std::string& source,
-                                                              int line_start, int line_end) {
-    (void)source;
-    (void)line_start;
-    (void)line_end;
-    return {};
-}
-
 // ── Format autoinst ───────────────────────────────────────────────────────────
 
-std::string format_autoinst(const AutoinstResult& result, const std::string& source,
-                            const AutoinstOptions& options) {
-    (void)options;
+std::string format_autoinst(const AutoinstResult& result, const std::string& source) {
     auto lines = split_lines_owned(source);
 
     // Detect base indent from original line

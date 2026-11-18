@@ -148,27 +148,14 @@ void add_port(ModuleEntry& module, SyntaxIndex& index, SourceFileIdResolver& res
                                       .col = col});
 }
 
-std::string port_direction(const PortHeaderSyntax& header) {
-    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return token_value_text(variable->direction).empty() ? "unknown" : token_value_text(variable->direction);
-    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
-        return token_value_text(net->direction).empty() ? "unknown" : token_value_text(net->direction);
-    return "unknown";
-}
-
 std::string port_type(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
         return node_text_raw(sm, *variable->dataType);
     if (const auto* net = header.as_if<NetPortHeaderSyntax>())
         return node_text_raw(sm, *net->dataType);
-    // `AXI_BUS.Slave bus`: mirrors type_of() in syntax_index.cpp so an open
-    // buffer records the same interface port type a closed shard does.
-    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>()) {
-        std::string text = token_value_text(iface->nameOrKeyword);
-        if (iface->modport && iface->modport->member)
-            text += "." + token_value_text(iface->modport->member);
-        return text;
-    }
+    // `AXI_BUS.Slave bus`: the same text a closed shard records.
+    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>())
+        return interface_port_type_text(*iface);
     return {};
 }
 
@@ -206,14 +193,6 @@ int instance_end_line(const std::vector<std::string_view>& lines, int start_line
     return start_line;
 }
 
-int node_end_line0(const slang::SourceManager& sm, const SyntaxNode& node, int fallback_line) {
-    const auto end = node.sourceRange().end();
-    if (!end.valid())
-        return fallback_line;
-    const auto line = sm.getFileLineNumber(end);
-    return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
-}
-
 void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxIndex& index,
                        SourceFileIdResolver& resolver, const slang::SourceManager& sm, const std::vector<std::string_view>& lines,
                        const std::string& parent_module) {
@@ -234,7 +213,7 @@ void process_hierarchy(const HierarchyInstantiationSyntax& hierarchy, SyntaxInde
         // scanner remains only as a fallback for malformed/incomplete syntax
         // where the parser cannot provide a valid range; raw text can be
         // fooled by semicolons inside strings or comments.
-        entry.end_line = node_end_line0(
+        entry.end_line = syntax_end_line0(
             sm, hierarchy,
             lines.empty() ? entry.start_line : instance_end_line(lines, entry.start_line));
         for (const auto* conn : inst->connections) {

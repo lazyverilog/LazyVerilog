@@ -192,3 +192,10 @@ std::optional<FormattedSpan> formatted_span(const std::string& source, const std
     }
     return span;
 }
+
+std::string format_emit_text(const std::string& text, const FormatOptions& options) {
+    std::string formatted = format_source(text, options);
+    while (!formatted.empty() && formatted.back() == '\n')
+        formatted.pop_back();
+    return formatted;
+}

@@ -13,6 +13,13 @@ public:
 
 std::string format_source(const std::string& source, const FormatOptions& opts);
 
+// Format a generated replacement fragment and strip final newlines so it can be
+// used as an LSP TextEdit.newText value for a bounded range.  `format_source()`
+// renders complete files with a trailing newline, but range replacements such as
+// AutoArg's module-header edit should not accidentally insert an extra blank line
+// before the untouched body that follows the edited range.
+std::string format_emit_text(const std::string& text, const FormatOptions& options);
+
 // Where `source[begin, end)` went in `formatted`, the format_source() output
 // of the whole of `source`.  Formatting changes only whitespace, so both hold
 // the same non-blank characters in order, and the two spans run between the

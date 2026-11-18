@@ -113,7 +113,6 @@ Consequences:
 The extra-file cache is cleared and rebuilt asynchronously when:
 
 - configuration reload calls `set_project_config(...)`
-- preprocessor defines change via `Analyzer::set_defines(...)`
 - include directories change via `Analyzer::set_include_dirs(...)`
 - the server restarts
 

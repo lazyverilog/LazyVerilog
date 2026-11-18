@@ -66,7 +66,7 @@ public:
 
     /// Inputs used for a file in no registered project.
     ///
-    /// Also what `Analyzer::set_defines()` / `set_include_dirs()` write, and
+    /// Also what `Analyzer::set_include_dirs()` writes, and
     /// what a single-project session uses for everything -- so the behaviour
     /// with one project is exactly what it was before this existed.
     void set_defaults(ParseInputs inputs);

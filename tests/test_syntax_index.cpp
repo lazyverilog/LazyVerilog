@@ -642,56 +642,6 @@ endmodule
     CHECK(unresolved == 0);
 }
 
-TEST_CASE("syntax_index: merge keeps same-named types from different packages", "[index]") {
-    const std::string a_text = R"(package pkg_a;
-    typedef logic [3:0] shared_t;
-    parameter int SHARED_P = 1;
-    class shared_c;
-    endclass
-endpackage
-)";
-    const std::string b_text = R"(package pkg_b;
-    typedef logic [7:0] shared_t;
-    parameter int SHARED_P = 2;
-    class shared_c;
-    endclass
-endpackage
-)";
-
-    auto a_tree = slang::syntax::SyntaxTree::fromText(a_text);
-    auto b_tree = slang::syntax::SyntaxTree::fromText(b_text);
-    REQUIRE(a_tree != nullptr);
-    REQUIRE(b_tree != nullptr);
-
-    auto merged = SyntaxIndex::build(*a_tree, a_text);
-    merged.merge(SyntaxIndex::build(*b_tree, b_text));
-
-    // The bare-name maps stay first-wins, so they cannot distinguish the two.
-    // The scoped maps must resolve each package's own declaration.
-    auto type_a = merged.package_type_by_scoped_name.find(package_scoped_key("pkg_a", "shared_t"));
-    auto type_b = merged.package_type_by_scoped_name.find(package_scoped_key("pkg_b", "shared_t"));
-    REQUIRE(type_a != merged.package_type_by_scoped_name.end());
-    REQUIRE(type_b != merged.package_type_by_scoped_name.end());
-    CHECK(type_a->second != type_b->second);
-    CHECK(merged.typedefs[type_a->second].resolved == "logic [3:0]");
-    CHECK(merged.typedefs[type_b->second].resolved == "logic [7:0]");
-
-    auto class_a = merged.package_class_by_scoped_name.find(package_scoped_key("pkg_a", "shared_c"));
-    auto class_b = merged.package_class_by_scoped_name.find(package_scoped_key("pkg_b", "shared_c"));
-    REQUIRE(class_a != merged.package_class_by_scoped_name.end());
-    REQUIRE(class_b != merged.package_class_by_scoped_name.end());
-    CHECK(class_a->second != class_b->second);
-    CHECK(merged.classes[class_a->second].parent_scope == "pkg_a");
-    CHECK(merged.classes[class_b->second].parent_scope == "pkg_b");
-
-    auto value_a = merged.package_value_by_scoped_name.find(package_scoped_key("pkg_a", "SHARED_P"));
-    auto value_b = merged.package_value_by_scoped_name.find(package_scoped_key("pkg_b", "SHARED_P"));
-    REQUIRE(value_a != merged.package_value_by_scoped_name.end());
-    REQUIRE(value_b != merged.package_value_by_scoped_name.end());
-    CHECK(merged.values[value_a->second].default_value == "1");
-    CHECK(merged.values[value_b->second].default_value == "2");
-}
-
 TEST_CASE("header text cache: a new generation drops previously cached text", "[index]") {
     // Every path that invalidates parse results bumps the background generation:
     // config reload, a changed header, a changed open buffer.  Cached text from

@@ -15,7 +15,7 @@ namespace svfmt {
 using TK = slang::parsing::TokenKind;
 
 inline bool kind_is(const Tok& t, TK k) { return t.lex.kind == k; }
-inline bool is_passthrough(const Tok& t) { return t.mutable_.macro.passthrough || t.lex.is_whitespace_sensitive; }
+inline bool is_passthrough(const Tok& t) { return t.lex.is_whitespace_sensitive; }
 inline size_t last_newline_offset(std::string_view text) {
     for (size_t n = text.size(); n > 0; --n)
         if (text[n - 1] == '\n')
@@ -1055,7 +1055,7 @@ inline int rendered_width(const TokenStream& tokens, size_t first, size_t end) {
                                     !t.mutable_.comment.force_own_line && !t.mutable_.wrap.must_break_before &&
                                     last_newline_offset(t.lex.text) == std::string_view::npos;
         if (!is_code_token(t) && !inline_comment) continue;
-        if (!first_code && !t.mutable_.space.suppress_space)
+        if (!first_code)
             w += t.mutable_.space.spaces_before;
         w += token_width(t);
         first_code = false;
@@ -1716,8 +1716,8 @@ inline bool is_var_declaration_trailing_dimension_open(const TokenStream& tokens
         return false;
 
     // Where the bracket's own list element starts: back to the `;` or `,` at
-    // its depth, or to the `(`/`{` enclosing it.  SyntaxFacts::stmt_begin
-    // splits at every comma whatever its depth, so for the `a[0]` in
+    // its depth, or to the `(`/`{` enclosing it.  A statement start that
+    // splits at every comma whatever its depth is wrong here: for the `a[0]` in
     // `wire [7:0] w = {4{a[0], b[0]}};` it named `wire` and the bracket read
     // as a declaration's trailing dimension (`{4{a [0], ...`).  A
     // declaration never nests inside an expression's braces or parentheses,
@@ -2300,19 +2300,15 @@ inline void mark_use_clause_colons(TokenStream& tokens) {
 // TopologyFacts, and CommentFacts from immutable lexemes/input trivia.  These
 // are parser-ish facts, not formatter decisions; downstream formatting-policy
 // passes must not mutate them.
-class SyntaxPass final : public IFormatPass {
+class SyntaxPass final {
 public:
-    const char* name() const override { return "syntax"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         mark_header_keywords(tokens);
         std::vector<size_t> parens, brackets, braces;
         // Paren/bracket depth at each open brace, so a `;` nested inside
         // parentheses is not mistaken for the brace's own statement separator.
         std::vector<std::pair<int, int>> brace_ctx;
         int pd = 0, bd = 0, brd = 0;
-        bool in_function_decl = false;
-        bool in_task_decl = false;
-        bool in_class_decl = false;
         bool in_covergroup = false;
         bool in_modport = false;
         bool in_clocking_block = false;
@@ -2398,9 +2394,6 @@ public:
             t.immutable.syntax.paren_depth = pd;
             t.immutable.syntax.bracket_depth = bd;
             t.immutable.syntax.brace_depth = brd;
-            t.immutable.syntax.in_function_decl = in_function_decl;
-            t.immutable.syntax.in_task_decl = in_task_decl;
-            t.immutable.syntax.in_class_decl = in_class_decl;
             t.immutable.syntax.in_covergroup = in_covergroup;
             t.immutable.syntax.in_modport = in_modport;
             t.immutable.syntax.in_clocking_block = in_clocking_block;
@@ -2466,7 +2459,6 @@ public:
                     ((t.immutable.input_trivia.starts_original_line && !comma_interstitial_block) ||
                      continues_own_line_run)
                     ? CommentRole::OwnLine : CommentRole::Trailing;
-                t.immutable.comment.anchor_token = i == 0 ? npos : i - 1;
                 t.immutable.comment.ends_line =
                     i + 1 >= tokens.size() ||
                     tokens[i + 1].immutable.input_trivia.original_newlines_before > 0;
@@ -2474,12 +2466,7 @@ public:
                     t.immutable.comment.role == CommentRole::OwnLine &&
                     t.lex.text.find('\n') != std::string::npos)
                     t.immutable.comment.source_column = t.immutable.input_trivia.original_column;
-                t.immutable.comment.inside_expression = pd > 0 || bd > 0 || brd > 0;
-                t.immutable.comment.inside_arg_list = pd > 0;
             }
-            if (kind_is(t, TK::FunctionKeyword)) in_function_decl = true;
-            if (kind_is(t, TK::TaskKeyword)) in_task_decl = true;
-            if (kind_is(t, TK::ClassKeyword)) in_class_decl = true;
             if (kind_is(t, TK::CoverGroupKeyword)) in_covergroup = true;
             if (kind_is(t, TK::ModPortKeyword)) in_modport = true;
             if (kind_is(t, TK::ClockingKeyword) && t.immutable.topology.opens_indent_scope)
@@ -2514,12 +2501,8 @@ public:
                     tokens[braces.back()].immutable.topology.opens_brace_block = true;
                     t.immutable.topology.separates_brace_block_items = true;
                 }
-                in_function_decl = false;
-                in_task_decl = false;
                 in_modport = false;
             }
-            if (kind_is(t, TK::EndClassKeyword))
-                in_class_decl = false;
             if (kind_is(t, TK::EndGroupKeyword))
                 in_covergroup = false;
         }
@@ -2551,26 +2534,10 @@ public:
             if (kind_is(tokens[i], TK::Semicolon) && stmt_pd > 0)
                 continue;
             if (kind_is(tokens[i], TK::Semicolon) || kind_is(tokens[i], TK::Comma)) {
-                for (size_t j = stmt_start; j <= i && j < tokens.size(); ++j) { tokens[j].immutable.syntax.stmt_begin = stmt_start; tokens[j].immutable.syntax.stmt_end = i; }
+                for (size_t j = stmt_start; j <= i && j < tokens.size(); ++j) tokens[j].immutable.syntax.stmt_end = i;
                 stmt_start = i + 1;
             }
         }
-        // Precompute inside_argument_list: O(n).  A token is inside an
-        // argument list when
-        // depth > 0, with ( exclusive (depth increments after) and ) exclusive
-        // (depth decrements before), matching the original backward-scan semantics.
-        {
-            int depth = 0;
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                auto& tok = tokens[i];
-                if (kind_is(tok, TK::CloseParenthesis) && tok.immutable.topology.ends_argument_list)
-                    depth = std::max(0, depth - 1);
-                tok.immutable.topology.inside_argument_list = depth > 0;
-                if (kind_is(tok, TK::OpenParenthesis) && tok.immutable.topology.starts_argument_list)
-                    ++depth;
-            }
-        }
-
         // A constraint or coverpoint body with no item in it -- `constraint c {}`,
         // or one holding only a comment -- has no `;` to say so, and is a block
         // all the same: its `}` closes a scope and a label may follow it.
@@ -3270,11 +3237,10 @@ inline std::string extract_define_name(const std::string& raw_text) {
 
 // MacroPass owns MacroMetadata.  It never changes wrapping or spacing directly;
 // it only marks regions/macros that downstream passes must treat conservatively.
-class MacroPass final : public IFormatPass {
+class MacroPass final {
 public:
     explicit MacroPass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "macro"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         MacroClassifier mc(opts_.macros);
         std::unordered_set<std::string> local_whitespace_sensitive;
         for (const auto& t : tokens) {
@@ -3294,7 +3260,6 @@ public:
         }
         for (auto& t : tokens) {
             if (t.lex.is_whitespace_sensitive) {
-                t.mutable_.macro.passthrough = true;
                 t.mutable_.macro.suppress_alignment = true;
                 t.mutable_.macro.suppress_wrapping = true;
             } else if (t.lex.is_directive) {
@@ -3383,11 +3348,10 @@ private:
 
 // WrapPass owns WrapMetadata and reads syntax/macro metadata.  It uses stable
 // syntax/source facts only; there is no dependency on rendered columns.
-class WrapPass final : public IFormatPass {
+class WrapPass final {
 public:
     explicit WrapPass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "wrap"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         // A macro invocation that already carries its own trailing `;` in
         // source is an ordinary statement-terminated call, not the
         // semicolonless UVM/OpenTitan pattern the statement-macro line-break
@@ -3401,7 +3365,6 @@ public:
             return next != npos && kind_is(tokens[next], TK::Semicolon);
         };
 
-        int group = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (i == 0)
@@ -3435,7 +3398,6 @@ public:
                 t.mutable_.wrap.must_break_before = true;
             }
             if (t.mutable_.macro.suppress_wrapping) continue;
-            t.mutable_.wrap.wrap_group = group;
             // Force line break after statement-/declaration-/block-like macro invocations.
             // If the macro is followed by '(args)', break after the matching ')'; otherwise
             // break after the macro token itself.
@@ -3468,7 +3430,6 @@ public:
                 // be exempt.  The module-header `import p::*; #(...)` that
                 // exemption was for breaks as a header import anyway.
                 t.mutable_.wrap.must_break_after = true;
-                ++group;
                 // If a trailing comment immediately follows on the same line,
                 // defer the line break to after the comment so it renders inline.
                 for (size_t j = i + 1; j < tokens.size(); ++j) {
@@ -3521,7 +3482,6 @@ public:
             // `randcase` has no header; its first item starts the next line.
             if (kind_is(t, TK::RandCaseKeyword))
                 t.mutable_.wrap.must_break_after = true;
-            if (kind_is(t, TK::Comma)) t.mutable_.wrap.can_break_after = true;
             // Close-block keywords always start a new line; CloseBrace only when
             // not inside a parenthesised expression (e.g. `inside {A, B}`).
             const bool property_keyword = is_property_operator_keyword(t);
@@ -4648,9 +4608,7 @@ private:
             if (!tokens[i].lex.continues_vector_literal)
                 continue;
             tokens[i].mutable_.wrap.must_break_before = false;
-            tokens[i].mutable_.wrap.can_break_before = false;
             tokens[i - 1].mutable_.wrap.must_break_after = false;
-            tokens[i - 1].mutable_.wrap.can_break_after = false;
         }
     }
 
@@ -4671,10 +4629,8 @@ private:
             // A break before the attribute and after it stays available; only
             // the inside of the span is frozen.
             for (size_t k = i; k <= end; ++k) {
-                if (k != end) {
+                if (k != end)
                     tokens[k].mutable_.wrap.must_break_after = false;
-                    tokens[k].mutable_.wrap.can_break_after = false;
-                }
                 if (k != i)
                     tokens[k].mutable_.wrap.must_break_before = false;
             }
@@ -4907,11 +4863,10 @@ inline size_t scopes_closed_by(const std::vector<IndentScope>& scopes, size_t fl
     return 0;
 }
 
-class IndentPass final : public IFormatPass {
+class IndentPass final {
 public:
     explicit IndentPass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "indent"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         int level = 0;
         // Prototypes (`extern`/`pure virtual`/DPI `function`, `typedef class`)
         // open no scope: opens_indent_scope_at() reads
@@ -5155,9 +5110,7 @@ public:
                     continue;
                 }
                 if (k != s) {
-                    col += tok.mutable_.space.suppress_space
-                        ? 0
-                        : tok.mutable_.space.spaces_before;
+                    col += tok.mutable_.space.spaces_before;
                 }
                 // A block comment spanning lines leaves the column after its
                 // last line break.
@@ -5167,9 +5120,7 @@ public:
             }
             if (idx != s && idx < tokens.size() && is_code_token(tokens[idx])) {
                 const Tok& tok = tokens[idx];
-                col += tok.mutable_.space.suppress_space
-                    ? 0
-                    : tok.mutable_.space.spaces_before;
+                col += tok.mutable_.space.spaces_before;
             }
             return col;
         };
@@ -5225,8 +5176,7 @@ public:
             int after_open_col = column_before(open) + token_width(tokens[open]);
             if (const size_t first = next_code(tokens, open + 1, close);
                 first != npos && !tokens[first].mutable_.wrap.must_break_before &&
-                !tokens[open].mutable_.wrap.must_break_after &&
-                !tokens[first].mutable_.space.suppress_space)
+                !tokens[open].mutable_.wrap.must_break_after)
                 after_open_col += tokens[first].mutable_.space.spaces_before;
 
             switch (kind) {
@@ -5347,11 +5297,10 @@ private: const FormatOptions& opts_;
 
 // AlignPass owns AlignMetadata.  Groups consecutive lines with assignment
 // operators at the same indent level and aligns them.
-class AlignPass final : public IFormatPass {
+class AlignPass final {
 public:
     explicit AlignPass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "alignment"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         struct Line {
             size_t first{npos};
             size_t end{npos};
@@ -5726,7 +5675,7 @@ public:
         };
         // The gap SpacingPass put before `=`; its column follows from it.
         auto gap_before = [&](size_t k) {
-            return tokens[k].mutable_.space.suppress_space ? 0 : tokens[k].mutable_.space.spaces_before;
+            return tokens[k].mutable_.space.spaces_before;
         };
 
         // `continued_ok` also takes the first line of a declaration whose
@@ -6826,7 +6775,7 @@ public:
                         --row;
                     int w = 0;
                     for (size_t k = row; k <= last; ++k) {
-                        if (k != row && !tokens[k].mutable_.space.suppress_space)
+                        if (k != row)
                             w += tokens[k].mutable_.space.spaces_before;
                         w += token_width(tokens[k]);
                     }
@@ -7122,7 +7071,6 @@ public:
         // Instance named-port alignment.  WrapPass owns the decision to expand
         // the list; AlignPass only assigns target columns for the connection
         // parens and optional inside padding.
-        int group = 1000;
         for (size_t open = 0; open < tokens.size(); ++open) {
             if (!opts_.instance.align)
                 break;
@@ -7178,7 +7126,6 @@ public:
                 int item_indent = tokens[prev_code(tokens, c.name)].mutable_.indent.base_indent;
                 const int sig_width = sig_field.width(c.sigw);
                 tokens[c.op].mutable_.align.enabled = true;
-                tokens[c.op].mutable_.align.alignment_group = group;
                 // The field runs from `.` to `(`: the dot, the name and at
                 // least one space.  Non-adaptive sizes every row by the
                 // widest name so the `(` share one column.
@@ -7189,11 +7136,9 @@ public:
                 if (c.multiline)
                     continue;
                 tokens[c.cl].mutable_.align.enabled = true;
-                tokens[c.cl].mutable_.align.alignment_group = group;
                 tokens[c.cl].mutable_.align.target_column =
                     tokens[c.op].mutable_.align.target_column + option_width(1 + sig_width, opts_);
             }
-            ++group;
         }
 
         for (size_t open = 0; open < tokens.size(); ++open) {
@@ -7225,7 +7170,7 @@ public:
                 int base = tokens[items.front().first].mutable_.indent.base_indent;
                 // The gaps around `=` follow assignment_operator_spacing.
                 auto gap_before = [&](size_t k) {
-                    return tokens[k].mutable_.space.suppress_space ? 0 : tokens[k].mutable_.space.spaces_before;
+                    return tokens[k].mutable_.space.spaces_before;
                 };
                 int eq_gap = 1, value_gap = 1;
                 for (const auto& e : es) {
@@ -7369,8 +7314,7 @@ private:
                 continue;
             }
             if (at_line_start) {
-                const int indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent +
-                                   tok.mutable_.comment.relative_indent;
+                const int indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent;
                 const size_t anchor = tok.mutable_.indent.anchor_token;
                 line_shift = (anchor != npos && anchor < i) ? drift[anchor] : 0;
                 tok.mutable_.align.indent_shift = line_shift;
@@ -7378,7 +7322,7 @@ private:
                 col = std::max(0, indent + line_shift);
                 at_line_start = false;
             } else {
-                const int spaces = tok.mutable_.space.suppress_space ? 0 : tok.mutable_.space.spaces_before;
+                const int spaces = tok.mutable_.space.spaces_before;
                 natural += spaces;
                 int gap = spaces;
                 if (tok.mutable_.align.enabled && tok.mutable_.align.target_column >= 0) {
@@ -7404,10 +7348,9 @@ private:
 };
 
 // CommentPass owns CommentMetadata and reads stable syntax comment roles.
-class CommentPass final : public IFormatPass {
+class CommentPass final {
 public:
-    const char* name() const override { return "comment"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         for (auto& t : tokens) {
             if (t.lex.comment_kind == CommentLexemeKind::None)
                 continue;
@@ -7991,11 +7934,10 @@ inline int spacing_gap(const TokenStream& tokens, size_t i, const FormatOptions&
 
 // SpacingPass owns SpaceMetadata.  It reads upstream wrap/comment metadata to
 // avoid assigning in-line spaces before tokens that will start a line.
-class SpacingPass final : public IFormatPass {
+class SpacingPass final {
 public:
     explicit SpacingPass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "spacing"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         for (size_t i = 0; i < tokens.size(); ++i) {
             auto& t = tokens[i];
             if (i == 0 || t.mutable_.wrap.must_break_before || t.mutable_.comment.force_own_line || is_passthrough(t)) {
@@ -8008,7 +7950,6 @@ public:
                 continue;
             }
             t.mutable_.space.spaces_before = spacing_gap(tokens, i, opts_);
-            t.mutable_.space.suppress_space = t.mutable_.space.spaces_before == 0;
         }
     }
 private: const FormatOptions& opts_;
@@ -8017,11 +7958,10 @@ private: const FormatOptions& opts_;
 // BlankLinePass owns BlankLineMetadata.  It intentionally does not copy the
 // original source's blank-line count: once a syntactic blank-line boundary is
 // accepted, the rendered amount is canonical and config-driven.
-class BlankLinePass final : public IFormatPass {
+class BlankLinePass final {
 public:
     explicit BlankLinePass(const FormatOptions& opts) : opts_(opts) {}
-    const char* name() const override { return "blank_line"; }
-    void run(TokenStream& tokens) override {
+    void run(TokenStream& tokens) {
         for (size_t i = 0; i < tokens.size(); ++i) {
             if (is_blank_line_boundary(tokens, i))
                 tokens[i].mutable_.blank.before = std::max(0, opts_.blank_lines_between_items);

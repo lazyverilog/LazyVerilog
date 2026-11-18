@@ -24,11 +24,6 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Keep optional semantic compilation conservative.  This is a background
-// diagnostic path, not a throughput benchmark; every worker compiles the whole
-// design, so extra workers multiply peak memory rather than splitting work.
-constexpr int kMaxBackgroundCompilerThreads = 4;
-
 // Semantic compilation is the most deferrable work the server does: nothing
 // waits on it, and it is the heaviest thing running.  Yield harder than the
 // project indexer, which gates when cross-file features start answering.
@@ -119,27 +114,6 @@ static bool is_foreign_macro_warning(const slang::SourceManager& sm,
 
 } // namespace
 
-struct BackgroundCompiler::WorkerSlot {
-    explicit WorkerSlot(size_t worker_id) : id(worker_id) {}
-
-    // Monotonic debug identity.  Do not use this as the desired worker index:
-    // workers can retire and be erased, then later workers may be spawned with
-    // larger ids.  The explicit retire flag is the source of truth.
-    size_t id{0};
-
-    // Guarded by BackgroundCompiler::mutex_.  configure() sets retire when the
-    // configured worker count shrinks.  The worker checks it only between jobs,
-    // so currently-running slang compilation is allowed to finish cleanly.
-    bool retire{false};
-
-    // Guarded by BackgroundCompiler::mutex_.  Set immediately before the worker
-    // thread returns; configure() can then join and erase the thread without
-    // blocking on long background compilation work.
-    bool exited{false};
-
-    std::thread thread;
-};
-
 BackgroundCompiler::BackgroundCompiler(SnapshotCallback snapshot_callback,
                                        ResultCallback result_callback)
     : snapshot_callback_(std::move(snapshot_callback)),
@@ -147,88 +121,26 @@ BackgroundCompiler::BackgroundCompiler(SnapshotCallback snapshot_callback,
 
 BackgroundCompiler::~BackgroundCompiler() { stop(); }
 
-std::vector<std::thread> BackgroundCompiler::collect_exited_workers_locked() {
-    std::vector<std::thread> exited_threads;
-
-    auto it = workers_.begin();
-    while (it != workers_.end()) {
-        auto& slot = *it;
-        if (!slot->exited) {
-            ++it;
-            continue;
-        }
-
-        if (slot->thread.joinable())
-            exited_threads.push_back(std::move(slot->thread));
-        it = workers_.erase(it);
-    }
-
-    return exited_threads;
-}
-
 void BackgroundCompiler::configure(BackgroundCompilerConfig config) {
-    config.thread_count = std::clamp(config.thread_count, 1, kMaxBackgroundCompilerThreads);
-
-    std::vector<std::thread> exited_threads;
     {
-        std::unique_lock<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
         enabled_ = config.enabled;
         error_limit_ = config.error_limit;
-
-        exited_threads = collect_exited_workers_locked();
 
         if (!enabled_) {
             pending_ = false;
             ++latest_generation_;
-            lock.unlock();
-            cv_.notify_all();
-        } else {
-            // If the user raises the count again before previously-retired
-            // workers have exited, keep those workers instead of spawning an
-            // unnecessary replacement.  Retire requests are only a graceful
-            // shrink mechanism, not an irreversible cancellation.
-            if (static_cast<int>(workers_.size()) <= config.thread_count) {
-                for (auto& slot : workers_)
-                    slot->retire = false;
-            }
-
-            while (static_cast<int>(workers_.size()) < config.thread_count) {
-                auto slot = std::make_shared<WorkerSlot>(next_worker_id_++);
-                slot->thread = std::thread([this, slot] {
-                    apply_background_thread_nice(kBackgroundCompilerNiceValue);
-                    worker_loop(std::move(slot));
-                });
-                workers_.push_back(std::move(slot));
-            }
-
-            // Graceful shrink: mark newest excess workers for retirement.  An
-            // idle worker exits immediately after the notify below; a busy
-            // worker exits after publishing/skipping its current generation and
-            // before taking another pending snapshot.
-            int kept = 0;
-            for (auto& slot : workers_) {
-                if (slot->exited)
-                    continue;
-                if (kept < config.thread_count) {
-                    ++kept;
-                    continue;
-                }
-                slot->retire = true;
-            }
-
-            lock.unlock();
-            cv_.notify_all();
+        } else if (!stopping_ && !worker_.joinable()) {
+            // One worker, started the first time compilation is enabled.  It
+            // compiles the whole design, so a second one would only duplicate
+            // that compile and its peak memory.
+            worker_ = std::thread([this] {
+                apply_background_thread_nice(kBackgroundCompilerNiceValue);
+                worker_loop();
+            });
         }
     }
-
-    // Join only workers that have already reported exit.  This keeps config
-    // reload responsive: lowering the thread count does not block on a large
-    // in-progress semantic compile; cleanup happens on a later configure() or
-    // stop().
-    for (auto& worker : exited_threads) {
-        if (worker.joinable())
-            worker.join();
-    }
+    cv_.notify_all();
 }
 
 void BackgroundCompiler::schedule() {
@@ -251,7 +163,7 @@ void BackgroundCompiler::schedule_in(std::chrono::milliseconds delay) {
 }
 
 void BackgroundCompiler::stop() {
-    std::vector<std::thread> workers_to_join;
+    std::thread worker;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_)
@@ -260,49 +172,32 @@ void BackgroundCompiler::stop() {
         enabled_ = false;
         pending_ = false;
         ++latest_generation_;
-
-        // Move thread handles out while holding mutex_ so configure() cannot
-        // concurrently erase or append workers_ while stop() is deciding what
-        // must be joined.  The worker threads keep their WorkerSlot alive via
-        // the shared_ptr captured by the thread function; clearing this vector
-        // only drops the server's bookkeeping references.
-        workers_to_join.reserve(workers_.size());
-        for (auto& slot : workers_) {
-            if (slot->thread.joinable())
-                workers_to_join.push_back(std::move(slot->thread));
-        }
-        workers_.clear();
+        // Taken under mutex_ so a concurrent configure() cannot start a thread
+        // this call would then never join.
+        worker = std::move(worker_);
     }
     cv_.notify_all();
-    for (auto& worker : workers_to_join) {
-        if (worker.joinable())
-            worker.join();
-    }
+    if (worker.joinable())
+        worker.join();
 }
 
-void BackgroundCompiler::worker_loop(std::shared_ptr<WorkerSlot> slot) {
+void BackgroundCompiler::worker_loop() {
     while (true) {
         uint64_t generation = 0;
         CompilationSnapshot snapshot;
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [&] {
-                return stopping_ || slot->retire || (enabled_ && pending_);
-            });
-            if (stopping_ || slot->retire) {
-                slot->exited = true;
+            cv_.wait(lock, [&] { return stopping_ || (enabled_ && pending_); });
+            if (stopping_)
                 return;
-            }
 
-            while (!stopping_ && !slot->retire && pending_) {
+            while (!stopping_ && pending_) {
                 if (cv_.wait_until(lock, due_time_) == std::cv_status::timeout)
                     break;
             }
-            if (stopping_ || slot->retire) {
-                slot->exited = true;
+            if (stopping_)
                 return;
-            }
             if (!enabled_ || !pending_)
                 continue;
 

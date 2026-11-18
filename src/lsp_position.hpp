@@ -2,6 +2,7 @@
 
 #include "string_utils.hpp"
 
+#include <slang/parsing/Token.h>
 #include <slang/text/SourceLocation.h>
 #include <slang/text/SourceManager.h>
 
@@ -57,4 +58,12 @@ inline int lsp_column(const slang::SourceManager& sm, slang::SourceLocation loca
 
     // UTF-16 by construction: the byte-column case returned above.
     return static_cast<int>(utf16_length(buffer.substr(offset - bytes_into_line, bytes_into_line)));
+}
+
+/// 0-based line of @p tok in its file; 0 for a missing or invalid token.
+inline int token_line(const slang::SourceManager& sm, const slang::parsing::Token& tok) {
+    if (!tok || !tok.location().valid())
+        return 0;
+    auto line = sm.getFileLineNumber(tok.location());
+    return line > 0 ? (int)line - 1 : 0;
 }

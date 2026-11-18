@@ -20,9 +20,9 @@ struct RenderDecision {
 inline RenderDecision compose(const Tok& tok) {
     RenderDecision out;
     out.newline_before = tok.mutable_.wrap.must_break_before || tok.mutable_.comment.force_own_line;
-    out.indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent + tok.mutable_.comment.relative_indent +
+    out.indent = tok.mutable_.indent.base_indent + tok.mutable_.indent.continuation_indent +
                  tok.mutable_.align.indent_shift;
-    out.spaces_before = tok.mutable_.space.suppress_space ? 0 : tok.mutable_.space.spaces_before;
+    out.spaces_before = tok.mutable_.space.spaces_before;
     out.blank_lines = tok.mutable_.blank.before;
     out.passthrough = is_passthrough(tok);
     out.align_target = tok.mutable_.align.enabled ? tok.mutable_.align.target_column : -1;
@@ -198,19 +198,6 @@ inline void run_format_passes(TokenStream& tokens, const FormatOptions& opts) {
     IndentPass indent(opts); indent.run(tokens);
     AlignPass align(opts); align.run(tokens);
     BlankLinePass blank(opts); blank.run(tokens);
-}
-
-// Non-allocating whitespace-ignoring equality check.
-inline bool ws_equal(const std::string& a, const std::string& b) {
-    auto ia = a.begin(), ib = b.begin();
-    for (;;) {
-        while (ia != a.end() && std::isspace(static_cast<unsigned char>(*ia))) ++ia;
-        while (ib != b.end() && std::isspace(static_cast<unsigned char>(*ib))) ++ib;
-        if (ia == a.end() && ib == b.end()) return true;
-        if (ia == a.end() || ib == b.end()) return false;
-        if (*ia != *ib) return false;
-        ++ia; ++ib;
-    }
 }
 
 } // namespace svfmt

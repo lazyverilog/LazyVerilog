@@ -86,8 +86,8 @@ ctest --test-dir build                          # all tests
 
 ### Formatter Pass Ownership and Idempotency
 - Formatter flow is: lexer lexes source into Tokenflow, then `SyntaxPass`,
-  `MacroPass`, `WrapPass`, `IndentPass`, `AlignPass`, `CommentPass`,
-  `SpacingPass`, `BlankLinePass`, then rendering.
+  `MacroPass`, `WrapPass`, `CommentPass`, `SpacingPass`, `IndentPass`,
+  `AlignPass`, `BlankLinePass`, then rendering (`run_format_passes()`).
 - Token data is split into immutable facts and mutable formatting metadata.
 - Each pass has exclusive write ownership of its metadata family:
   - `SyntaxPass` writes `ImmutableData`
@@ -109,12 +109,15 @@ ctest --test-dir build                          # all tests
     positioning. This is unavoidable for distinguishing own-line comments from
     trailing comments, and must be handled carefully so it does not create
     non-idempotent formatting behavior.
+  - Exception: `is_blank_line_boundary()` reads `original_newlines_before` to
+    keep the user's blank lines; Wrap, Align and BlankLine all ask it.
 
 ## Dependencies
 
 ### External
-- slang (SystemVerilog parser) — via git submodule
-- nlohmann/json — JSON-RPC message handling
+- slang (SystemVerilog parser) — via CMake FetchContent
+- LspCpp — JSON-RPC transport and LSP types (vendors RapidJSON); FetchContent, patched in `CMakeLists.txt`
+- toml++ — `lazyverilog.toml` parsing
 
 <!-- MANUAL: -->
 

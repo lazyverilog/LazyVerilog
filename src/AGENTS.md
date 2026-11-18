@@ -49,8 +49,7 @@ C++ source for the lazyverilog LSP server. Split into server core (root of this 
 - JSON-RPC over stdin/stdout
 - Config reloaded on every `workspace/didChangeConfiguration`
 - Per-document request config (`[format]`, `[lint]`, `[autoff]`, ...): per file, via
-  `LazyVerilogServer::config_for(uri)`.  A handler that has a URI must not read
-  `config_`.
+  `LazyVerilogServer::config_for(uri)`.  There is no session-wide config member.
 - Parse inputs (defines, `+incdir+`): per file, via `ProjectParseInputs`.  There is
   one `Analyzer`; do not add a flat `defines_` member back.
 - Config search: walk up from the opened file to the nearest `lazyverilog.toml`
@@ -73,6 +72,6 @@ C++ source for the lazyverilog LSP server. Split into server core (root of this 
 
 ### External
 - slang — SystemVerilog parser
-- nlohmann/json — JSON-RPC messages
+- LspCpp — JSON-RPC transport and LSP types (vendors RapidJSON)
 
 <!-- MANUAL: -->

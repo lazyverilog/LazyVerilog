@@ -77,18 +77,17 @@ int main(int argc, char* argv[]) {
     // The file keeps the line ending its first line uses.
     const size_t first_lf = source.find('\n');
     const bool crlf = first_lf != std::string::npos && first_lf > 0 && source[first_lf - 1] == '\r';
-    // Walk up from file's directory to find lazyverilog.toml
-    auto dir = std::filesystem::absolute(std::filesystem::path(path)).parent_path();
+    // The nearest lazyverilog.toml above the file, found the way the other
+    // CLI tools find it.
     FormatOptions opts;
-    for (auto d = dir; !d.empty() && d != d.parent_path(); d = d.parent_path()) {
-        if (std::filesystem::exists(d / "lazyverilog.toml")) {
-            std::string warning;
-            Config cfg = load_config(d, &warning);
-            if (!warning.empty())
-                std::cerr << warning << "\n";
-            opts = cfg.format;
-            break;
-        }
+    if (const auto root = find_config_root(
+            std::filesystem::absolute(std::filesystem::path(path)).parent_path());
+        !root.empty()) {
+        std::string warning;
+        Config cfg = load_config(root, &warning);
+        if (!warning.empty())
+            std::cerr << warning << "\n";
+        opts = cfg.format;
     }
     if (log_path)
         opts.log_path = log_path;

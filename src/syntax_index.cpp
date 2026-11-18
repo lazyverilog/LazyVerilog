@@ -139,14 +139,6 @@ static void index_generate_block_declarations(const MemberSyntax& member, Syntax
     }
 }
 
-static std::string direction_of(const PortHeaderSyntax& header) {
-    if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
-        return token_value_text(variable->direction).empty() ? "unknown" : token_value_text(variable->direction);
-    if (const auto* net = header.as_if<NetPortHeaderSyntax>())
-        return token_value_text(net->direction).empty() ? "unknown" : token_value_text(net->direction);
-    return "unknown";
-}
-
 static std::string type_of(const slang::SourceManager& sm, const PortHeaderSyntax& header) {
     if (const auto* variable = header.as_if<VariablePortHeaderSyntax>())
         return declaration_type_text(sm, *variable->dataType);
@@ -157,12 +149,8 @@ static std::string type_of(const slang::SourceManager& sm, const PortHeaderSynta
     // resolve against.  Kept as written, modport included, because that is what
     // hover should show; interface_name_from_type_text() takes the half that
     // names the interface.
-    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>()) {
-        std::string text = token_value_text(iface->nameOrKeyword);
-        if (iface->modport && iface->modport->member)
-            text += "." + token_value_text(iface->modport->member);
-        return text;
-    }
+    if (const auto* iface = header.as_if<InterfacePortHeaderSyntax>())
+        return interface_port_type_text(*iface);
     return {};
 }
 
@@ -272,7 +260,7 @@ static void extract_ansi_ports(const AnsiPortListSyntax& port_list, std::vector<
             continue;
 
         if (const auto* implicit = member->as_if<ImplicitAnsiPortSyntax>()) {
-            add_port(ports, index, resolver, sm, implicit->declarator->name, direction_of(*implicit->header),
+            add_port(ports, index, resolver, sm, implicit->declarator->name, port_direction(*implicit->header),
                      with_declarator_dimensions(sm, type_of(sm, *implicit->header),
                                                 *implicit->declarator),
                      with_declarator_dimensions(sm, decl_type_of(sm, *implicit->header),
@@ -298,7 +286,7 @@ static void extract_port_declarations(const SyntaxList<MemberSyntax>& members,
         if (!declaration)
             continue;
 
-        const auto direction = direction_of(*declaration->header);
+        const auto direction = port_direction(*declaration->header);
         const auto type = type_of(sm, *declaration->header);
         const auto decl_type = decl_type_of(sm, *declaration->header);
         const auto signal_decl_type = signal_decl_type_of(sm, *declaration->header);
@@ -321,15 +309,6 @@ static int find_instance_end_line(const std::vector<std::string_view>& lines, in
             return line;
     }
     return lines.empty() ? 0 : (int)lines.size() - 1;
-}
-
-static int syntax_end_line0(const slang::SourceManager& sm, const SyntaxNode& node,
-                            int fallback_line) {
-    const auto end = node.sourceRange().end();
-    if (!end.valid())
-        return fallback_line;
-    const auto line = sm.getFileLineNumber(end);
-    return line > 0 ? static_cast<int>(line) - 1 : fallback_line;
 }
 
 namespace {
@@ -1506,12 +1485,6 @@ std::string SyntaxIndex::source_uri(SourceFileID file_id) const {
     return source_files[file_id];
 }
 
-static SourceFileID remap_file_id(const std::vector<SourceFileID>& remap, SourceFileID id) {
-    if (id == kInvalidSourceFileID || id >= remap.size())
-        return kInvalidSourceFileID;
-    return remap[id];
-}
-
 std::vector<SyntaxIndex>
 SyntaxIndex::split_by_source_file(const std::vector<std::string>& uris) const {
     constexpr size_t kNoSlot = std::numeric_limits<size_t>::max();
@@ -1549,7 +1522,7 @@ SyntaxIndex::split_by_source_file(const std::vector<std::string>& uris) const {
 
     // A package name is scope context, not a file-attributed fact: a class in
     // an `include`d header is still a member of the package the includer
-    // opened, and merge() reads this set to decide that.  Dropping it would
+    // opened, and whoever combines the shards reads this set to decide that.  Dropping it would
     // leave `pkg::cls` resolvable in no shard at all, because the includer's
     // own shard holds no entry for the class.
     for (auto& shard : shards)
@@ -1570,7 +1543,7 @@ SyntaxIndex::split_by_source_file(const std::vector<std::string>& uris) const {
             shard.interface_names.insert(copy.name);
         // Exported-symbol lists follow the file that declares the package, not
         // the headers whose declarations they name: one shard carries the list
-        // and merge() is first-wins over it.
+        // and lookups are first-wins over it.
         if (const auto it = package_symbols.find(copy.name); it != package_symbols.end())
             shard.package_symbols.try_emplace(copy.name, it->second);
         shard.module_by_name.try_emplace(copy.name, shard.modules.size());
@@ -1687,123 +1660,6 @@ SyntaxIndex::split_by_source_file(const std::vector<std::string>& uris) const {
     }
 
     return shards;
-}
-
-void SyntaxIndex::merge(const SyntaxIndex& other) {
-    std::vector<SourceFileID> file_remap;
-    file_remap.reserve(other.source_files.size());
-    for (const auto& uri : other.source_files)
-        file_remap.push_back(intern_source_file(uri));
-
-    auto remap_field = [&](FieldEntry& field) { field.file_id = remap_file_id(file_remap, field.file_id); };
-    auto remap_module = [&](ModuleEntry& module) {
-        module.file_id = remap_file_id(file_remap, module.file_id);
-        for (auto& port : module.ports)
-            port.file_id = remap_file_id(file_remap, port.file_id);
-        for (auto& modport : module.modports)
-            modport.file_id = remap_file_id(file_remap, modport.file_id);
-    };
-    auto remap_class = [&](ClassEntry& cls) {
-        cls.file_id = remap_file_id(file_remap, cls.file_id);
-        for (auto& field : cls.fields)
-            remap_field(field);
-        for (auto& method : cls.methods)
-            method.file_id = remap_file_id(file_remap, method.file_id);
-    };
-    auto remap_typedef = [&](TypedefEntry& td) {
-        td.file_id = remap_file_id(file_remap, td.file_id);
-        for (auto& member : td.enum_members)
-            member.file_id = remap_file_id(file_remap, member.file_id);
-        for (auto& field : td.fields)
-            remap_field(field);
-    };
-
-    // modules (includes interfaces and packages stored as modules)
-    for (const auto& m : other.modules) {
-        if (!module_by_name.count(m.name)) {
-            auto copy = m;
-            remap_module(copy);
-            module_by_name[m.name] = modules.size();
-            modules.push_back(std::move(copy));
-        }
-    }
-    for (auto instance : other.instances) {
-        instance.file_id = remap_file_id(file_remap, instance.file_id);
-        for (auto& conn : instance.connections)
-            conn.file_id = remap_file_id(file_remap, conn.file_id);
-        instances.push_back(std::move(instance));
-    }
-    interface_names.insert(other.interface_names.begin(), other.interface_names.end());
-    package_names.insert(other.package_names.begin(), other.package_names.end());
-    for (const auto& [pkg, syms] : other.package_symbols)
-        package_symbols.try_emplace(pkg, syms);
-
-    // classes.  Bare-name dedup stays first-wins, but an entry must still be
-    // appended when its package-scoped key is new: two packages may declare the
-    // same class name, and dropping the second would make `pkg_b::foo`
-    // unresolvable.
-    for (const auto& c : other.classes) {
-        const bool scoped =
-            !c.parent_scope.empty() && other.package_names.count(c.parent_scope) > 0;
-        const auto scoped_key = scoped ? package_scoped_key(c.parent_scope, c.name) : std::string{};
-        const bool scoped_is_new = scoped && !package_class_by_scoped_name.count(scoped_key);
-        if (class_by_name.count(c.name) && !scoped_is_new)
-            continue;
-        auto copy = c;
-        remap_class(copy);
-        if (scoped_is_new)
-            package_class_by_scoped_name.emplace(scoped_key, classes.size());
-        class_by_name.try_emplace(c.name, classes.size());
-        classes.push_back(std::move(copy));
-    }
-
-    // typedefs — scoped by any `::`-addressable owner, not just a package, so
-    // that the same-named typedef each class declares survives instead of the
-    // first one seen claiming the bare name for the whole project.  A
-    // module-scoped typedef stays unscoped: it matches what build() records,
-    // and scoping it would append one copy per shard that saw the header
-    // declaring it.
-    for (const auto& t : other.typedefs) {
-        const bool scoped = !t.parent_scope.empty() &&
-                            (other.package_names.count(t.parent_scope) > 0 ||
-                             other.class_by_name.count(t.parent_scope) > 0);
-        const auto scoped_key = scoped ? package_scoped_key(t.parent_scope, t.name) : std::string{};
-        const bool scoped_is_new = scoped && !package_type_by_scoped_name.count(scoped_key);
-        if (typedef_by_name.count(t.name) && !scoped_is_new)
-            continue;
-        auto copy = t;
-        remap_typedef(copy);
-        if (scoped_is_new)
-            package_type_by_scoped_name.emplace(scoped_key, typedefs.size());
-        typedef_by_name.try_emplace(t.name, typedefs.size());
-        typedefs.push_back(std::move(copy));
-    }
-
-    for (auto macro : other.macros) {
-        macro.file_id = remap_file_id(file_remap, macro.file_id);
-        macros.push_back(std::move(macro));
-    }
-    for (auto value : other.values) {
-        value.file_id = remap_file_id(file_remap, value.file_id);
-        if (!value.parent_scope.empty() && other.package_names.count(value.parent_scope))
-            package_value_by_scoped_name.try_emplace(
-                package_scoped_key(value.parent_scope, value.name), values.size());
-        values.push_back(std::move(value));
-    }
-    for (auto import : other.imports) {
-        import.file_id = remap_file_id(file_remap, import.file_id);
-        imports.push_back(std::move(import));
-    }
-    for (auto reference : other.references) {
-        reference.file_id = remap_file_id(file_remap, reference.file_id);
-        references.push_back(std::move(reference));
-    }
-    std::unordered_set<std::string> include_seen(include_dependencies.begin(),
-                                                 include_dependencies.end());
-    for (const auto& uri : other.include_dependencies) {
-        if (include_seen.insert(uri).second)
-            include_dependencies.push_back(uri);
-    }
 }
 
 size_t shared_path_prefix_components(std::string_view a, std::string_view b) {

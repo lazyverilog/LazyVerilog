@@ -1258,7 +1258,11 @@ TEST_CASE("formatter: parameter declarations are aligned by statement pass", "[f
 
 TEST_CASE("formatter: define continuation block is preserved through basic formatting", "[formatter]") {
     namespace fs = std::filesystem;
-    const fs::path base = fs::temp_directory_path() / "lazyverilog_define_basic_formatting_test";
+    // A new directory per run: the logger remembers which directories it has
+    // created, so one that was removed and reused would get no files.
+    static int run = 0;
+    const fs::path base = fs::temp_directory_path() /
+                          ("lazyverilog_define_basic_formatting_test_" + std::to_string(run++));
     fs::remove_all(base);
 
     FormatOptions opts;
@@ -1280,10 +1284,11 @@ TEST_CASE("formatter: define continuation block is preserved through basic forma
         return ss.str();
     };
 
-    CHECK(read_file(base / "org" / "01_normalization_pass.sv") ==
-          read_file(base / "once" / "01_normalization_pass.sv"));
-    CHECK(read_file(base / "org" / "02_basic_formatting.sv") ==
-          read_file(base / "once" / "02_basic_formatting.sv"));
+    // 99_output.sv is the log's copy of the formatted text.
+    const std::string org_out = read_file(base / "org" / "99_output.sv");
+    REQUIRE(!org_out.empty());
+    CHECK(org_out == once);
+    CHECK(org_out == read_file(base / "once" / "99_output.sv"));
 
     fs::remove_all(base);
 }

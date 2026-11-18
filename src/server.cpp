@@ -77,10 +77,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <filesystem>
-#include <fstream>
 #include <thread>
 #include <iostream>
 #include <map>
@@ -144,31 +141,6 @@ MAKE_REFLECT_STRUCT(RegistrationParamsWithOptions, registrations);
 
 DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterFileWatchers, RegistrationParamsWithOptions,
                              JsonNull, "client/registerCapability");
-
-// client/registerCapability for a per-document-language capability.  LibLsp's
-// plain Registration carries no registerOptions, and a registration without a
-// documentSelector is not something a client can scope, so carry
-// TextDocumentRegistrationOptions (from lsServerCapabilities.h) instead.
-struct ScopedRegistration {
-    std::string id;
-    std::string method;
-    TextDocumentRegistrationOptions registerOptions;
-    MAKE_SWAP_METHOD(ScopedRegistration, id, method, registerOptions);
-};
-MAKE_REFLECT_STRUCT(ScopedRegistration, id, method, registerOptions);
-
-struct ScopedRegistrationParams {
-    std::vector<ScopedRegistration> registrations;
-    MAKE_SWAP_METHOD(ScopedRegistrationParams, registrations);
-};
-MAKE_REFLECT_STRUCT(ScopedRegistrationParams, registrations);
-
-DEFINE_REQUEST_RESPONSE_TYPE(Req_ClientRegisterScoped, ScopedRegistrationParams, JsonNull,
-                             "client/registerCapability");
-
-// The ids both sides use to refer to these registrations.  Fixed rather than
-// generated: there is only ever one of each per session, and the unregister has
-// to name the same string the register used.
 
 struct StdOutStream : lsp::base_ostream<std::ostream> {
     explicit StdOutStream() : base_ostream<std::ostream>(std::cout) {}
@@ -249,18 +221,6 @@ static std::pair<size_t, size_t> lsp_offset_pair(const std::string& text,
     return {off1, off2};
 }
 
-// Format a generated replacement fragment and strip final newlines so it can be
-// used as an LSP TextEdit.newText value for a bounded range.  `format_source()`
-// renders complete files with a trailing newline, but range replacements such as
-// AutoArg's module-header edit should not accidentally insert an extra blank line
-// before the untouched body that follows the edited range.
-static std::string format_emit_text(const std::string& text, const FormatOptions& options) {
-    std::string formatted = format_source(text, options);
-    while (!formatted.empty() && formatted.back() == '\n')
-        formatted.pop_back();
-    return formatted;
-}
-
 static lsPosition document_end_position(const DocumentState& state) {
     return lsPosition(state.end_line, state.end_character);
 }
@@ -271,30 +231,6 @@ static lsTextEdit whole_document_edit(const DocumentState& state, const std::str
     edit.range.end = document_end_position(state);
     edit.newText = new_text;
     return edit;
-}
-
-static std::string whole_document_workspace_edit_json(const std::string& uri,
-                                                      const DocumentState& state,
-                                                      const std::string& new_text) {
-    const auto end = document_end_position(state);
-    const auto escaped_uri = json_quoted(uri);
-    const auto escaped_text = json_quoted(new_text);
-    const auto end_line = std::to_string(end.line);
-    const auto end_character = std::to_string(end.character);
-
-    std::string out;
-    out.reserve(escaped_uri.size() + escaped_text.size() + end_line.size() +
-                end_character.size() + 128);
-    out += "{\"changes\":{";
-    out += escaped_uri;
-    out += ":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":";
-    out += end_line;
-    out += ",\"character\":";
-    out += end_character;
-    out += "}},\"newText\":";
-    out += escaped_text;
-    out += "}]}}";
-    return out;
 }
 
 static std::string slice_lsp_range(const std::string& text, const lsRange& range) {
@@ -713,8 +649,6 @@ std::shared_ptr<const Config> LazyVerilogServer::config_for(std::string_view uri
     // The file decides, not the session.  Two buffers open at once can belong
     // to different projects, and before this each was served whichever config
     // the editor's guessed root happened to name.
-    if (!root_resolver_)
-        return config_for_root({});
     auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
                                              ProjectRootResolver::PathKind::File);
     // An implicit project has no config to read: built-in defaults, the same
@@ -747,8 +681,6 @@ LazyVerilogServer::config_for_root(const std::filesystem::path& source_root) con
 }
 
 bool LazyVerilogServer::discover_project_for(std::string_view uri) {
-    if (!root_resolver_)
-        return false;
     std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
     auto info = root_resolver_->project_info(path_from_file_uri(std::string(uri)),
                                              ProjectRootResolver::PathKind::File);
@@ -896,7 +828,7 @@ void LazyVerilogServer::reload_all_projects() {
     // leads is arbitrary but must be *stable*: fold order decides the order of
     // the merged defines and `+incdir+` below.  `root_` is fixed at initialize
     // and never moves, which is what makes this order the same on every reload.
-    if (root_resolver_ && !root_.empty()) {
+    if (!root_.empty()) {
         if (auto info = root_resolver_->project_info(root_); info && !info->implicit)
             fold_project_root(info->source_root);
     }
@@ -915,7 +847,7 @@ void LazyVerilogServer::reload_all_projects() {
     // different arbitrary subset of them on each save, and would let a header
     // searched for through the defaults resolve differently from one reload to
     // the next.  `previously_known` is ordered for the same reason.
-    if (root_resolver_) {
+    {
         std::set<std::string> open_roots;
         analyzer_.for_each_state([&](const std::string& open_uri,
                                      const std::shared_ptr<const DocumentState>& doc) {
@@ -934,7 +866,7 @@ void LazyVerilogServer::reload_all_projects() {
     // indexed once, in the explicit project's place.  A root a toml now
     // governs -- written at it or above it -- is released, and its shards in
     // the user's cache with it.
-    if (root_resolver_) {
+    {
         std::vector<std::filesystem::path> implicit_roots;
         for (auto it = implicit_scans_.begin(); it != implicit_scans_.end();) {
             const std::filesystem::path root(it->first);
@@ -978,7 +910,7 @@ void LazyVerilogServer::fold_implicit_root(const std::string& root, const Implic
 
 void LazyVerilogServer::consider_implicit_root(const std::filesystem::path& root) {
     std::lock_guard<std::recursive_mutex> lock(projects_mutex_);
-    if (implicit_mode_ == ImplicitProjectMode::Off || !root_resolver_ || stopping_)
+    if (implicit_mode_ == ImplicitProjectMode::Off || stopping_)
         return;
     std::error_code ec;
     if (root.empty() || !std::filesystem::is_directory(root, ec))
@@ -1121,8 +1053,7 @@ void LazyVerilogServer::register_file_watchers(bool replace) {
 }
 
 void LazyVerilogServer::invalidate_config_cache() {
-    if (root_resolver_)
-        root_resolver_->invalidate();
+    root_resolver_->invalidate();
     // The other process-wide memo of a filesystem answer.  A config appearing or
     // moving means the tree has been rearranged, which is exactly when a
     // remembered path resolution can have stopped being true.
@@ -1481,9 +1412,6 @@ void LazyVerilogServer::register_handlers() {
             caps.codeActionProvider =
                 std::make_pair(optional<bool>(true), optional<CodeActionOptions>{});
 
-            // Folding range is advertised further down, once the workspace
-            // root has been resolved and `[folding].enable` is known.
-
             // Extract workspace root from initialize params
             auto uri_to_path = [](const std::string& uri) -> std::filesystem::path {
                 return {path_from_file_uri(uri)};
@@ -1513,9 +1441,7 @@ void LazyVerilogServer::register_handlers() {
                 // the directory it named: an editor launched in a subdirectory
                 // sends that subdirectory, and the config it should be read
                 // with sits above it.
-                std::optional<ProjectInfo> info;
-                if (root_resolver_)
-                    info = root_resolver_->project_info(root_);
+                const std::optional<ProjectInfo> info = root_resolver_->project_info(root_);
                 if (!info)
                     return;
 
@@ -2148,11 +2074,9 @@ void LazyVerilogServer::register_handlers() {
         td_rename::response rsp;
         rsp.id = req.id;
         try {
-            const auto info = root_resolver_
-                                  ? root_resolver_->project_info(
-                                        path_from_file_uri(req.params.textDocument.uri.raw_uri_),
-                                        ProjectRootResolver::PathKind::File)
-                                  : std::nullopt;
+            const auto info = root_resolver_->project_info(
+                path_from_file_uri(req.params.textDocument.uri.raw_uri_),
+                ProjectRootResolver::PathKind::File);
             rsp.result = provide_rename(analyzer_, req.params, info && info->implicit);
         } catch (const std::exception& e) {
             // Answer with an error: the default response has no result, which
@@ -2672,18 +2596,10 @@ void LazyVerilogServer::register_handlers() {
                     auto result = autoff_all(*state, config_for(uri)->autoff.register_pattern);
                     apply_ff_edits(result, uri, state->text);
                 }
-            } else if (cmd == "lazyverilog.rtlTree") {
+            } else if (cmd == "lazyverilog.rtlTree" || cmd == "lazyverilog.rtlTreeReverse") {
                 std::string uri = get_string(0);
-                if (auto tree = analyzer_.rtl_tree(uri)) {
-                    const auto file_config = config_for(uri);
-                    rsp.result.SetJsonString(
-                        rtl_tree_json(*tree, file_config->rtltree.show_file,
-                                      file_config->rtltree.show_instance_name),
-                        lsp::Any::kObjectType);
-                }
-            } else if (cmd == "lazyverilog.rtlTreeReverse") {
-                std::string uri = get_string(0);
-                if (auto tree = analyzer_.rtl_tree_reverse(uri)) {
+                if (auto tree = cmd == "lazyverilog.rtlTree" ? analyzer_.rtl_tree(uri)
+                                                             : analyzer_.rtl_tree_reverse(uri)) {
                     const auto file_config = config_for(uri);
                     rsp.result.SetJsonString(
                         rtl_tree_json(*tree, file_config->rtltree.show_file,
@@ -2709,18 +2625,7 @@ void LazyVerilogServer::register_handlers() {
                         for (size_t i = 0; i < preview.size(); ++i) {
                             if (i > 0)
                                 json += ",";
-                            json += "\"";
-                            for (char c : preview[i]) {
-                                if (c == '"')
-                                    json += "\\\"";
-                                else if (c == '\\')
-                                    json += "\\\\";
-                                else if (c == '\n')
-                                    json += "\\n";
-                                else
-                                    json += c;
-                            }
-                            json += "\"";
+                            append_json_string(json, preview[i]);
                         }
                         json += "]";
                         rsp.result.SetJsonString(json, lsp::Any::kUnKnown);
@@ -2770,7 +2675,8 @@ void LazyVerilogServer::register_handlers() {
                 std::string parent_path = get_string(1);
                 rsp.result.SetJsonString(connect_hierarchy_children_json(analyzer_, uri, parent_path),
                                          lsp::Any::kObjectType);
-            } else if (cmd == "lazyverilog.connectApplyPreview") {
+            } else if (cmd == "lazyverilog.connectApplyPreview" ||
+                       cmd == "lazyverilog.connectApply") {
                 std::string uri = get_string(0);
                 std::string source_path = get_string(1);
                 std::string source_port = get_string(2);
@@ -2779,26 +2685,11 @@ void LazyVerilogServer::register_handlers() {
                 std::string wire_name = get_string(5);
                 auto source_boundary_ports = get_string_list(6);
                 auto dest_boundary_ports = get_string_list(7);
-                rsp.result.SetJsonString(connect_apply_preview_json(analyzer_, uri, source_path,
-                                                                     source_port, dest_path,
-                                                                     dest_port, wire_name,
-                                                                     source_boundary_ports,
-                                                                     dest_boundary_ports),
-                                         lsp::Any::kObjectType);
-            } else if (cmd == "lazyverilog.connectApply") {
-                std::string uri = get_string(0);
-                std::string source_path = get_string(1);
-                std::string source_port = get_string(2);
-                std::string dest_path = get_string(3);
-                std::string dest_port = get_string(4);
-                std::string wire_name = get_string(5);
-                auto source_boundary_ports = get_string_list(6);
-                auto dest_boundary_ports = get_string_list(7);
-                rsp.result.SetJsonString(connect_apply_edit_json(analyzer_, uri, source_path,
-                                                                 source_port, dest_path, dest_port,
-                                                                 wire_name,
-                                                                 source_boundary_ports,
-                                                                 dest_boundary_ports),
+                const auto to_json = cmd == "lazyverilog.connectApply" ? connect_apply_edit_json
+                                                                       : connect_apply_preview_json;
+                rsp.result.SetJsonString(to_json(analyzer_, uri, source_path, source_port,
+                                                 dest_path, dest_port, wire_name,
+                                                 source_boundary_ports, dest_boundary_ports),
                                          lsp::Any::kObjectType);
             } else if (cmd == "lazyverilog.interface") {
                 std::string uri = get_string(0);

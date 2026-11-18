@@ -33,8 +33,9 @@ One C++ file per LSP feature or command. Each file implements the handler logic 
 
 ### Formatter Architecture
 `formatter.cpp` → `format_source()` runs sequential passes:
-1. `pass0_populate_metadata` — builds token metadata
-2. `*_pass_v2` — named formatting passes (alignment, indentation, spacing, etc.)
+1. `TokenCollector` (lexer) — builds the token stream
+2. `run_format_passes()` — Syntax, Macro, Wrap, Comment, Spacing, Indent, Align, BlankLine
+3. `render_tokens()`
 
 Formatting is **token-based** and **idempotent**: formatting twice must yield the same result.
 Config options: `../../docs/formatter/options.md`

@@ -81,10 +81,6 @@ SelectionRange build_chain(const std::vector<ByteRange>& ranges, const Lines& li
     return first;
 }
 
-bool is_identifier_char(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
-}
-
 ByteRange word_at(const std::string& text, size_t offset) {
     if (offset >= text.size() || !is_identifier_char(text[offset]))
         return {offset, offset};

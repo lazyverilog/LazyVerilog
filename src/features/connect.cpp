@@ -133,13 +133,6 @@ static std::vector<std::string> split_lines(const std::string& text) {
     return lines;
 }
 
-static std::string trim(std::string s) {
-    auto not_space = [](unsigned char c) { return !std::isspace(c); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
-    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
-    return s;
-}
-
 static std::string read_file_text_best_effort(const std::string& path) {
     if (path.empty())
         return {};
@@ -661,7 +654,7 @@ static std::string render_syntax_text(const slang::syntax::SyntaxNode& node) {
             text += ' ';
         text += fragment;
     }
-    return trim(std::move(text));
+    return trim_copy(std::move(text));
 }
 
 static std::string append_declarator_dimensions(std::string type,
@@ -673,7 +666,7 @@ static std::string append_declarator_dimensions(std::string type,
         if (!rendered.empty())
             type += (type.empty() ? "" : " ") + rendered;
     }
-    return trim(std::move(type));
+    return trim_copy(std::move(type));
 }
 
 static std::string type_from_data_declaration(const slang::syntax::DataDeclarationSyntax& node,
@@ -884,7 +877,7 @@ static std::optional<TextEdit> declaration_delete_edit(const FileView& file,
             const size_t decl_start =
                 offset_from_position(text, decl.start_line, decl.start_col);
             const auto prefix = text.substr(line_start, decl_start - line_start);
-            if (trim(prefix).empty() && decl.end_line == decl.start_line) {
+            if (trim_copy(prefix).empty() && decl.end_line == decl.start_line) {
                 return TextEdit{file.uri, decl.start_line, 0, decl.start_line + 1, 0, ""};
             }
         }
@@ -1093,7 +1086,7 @@ static std::optional<TextEdit> replace_or_add_connections(const FileView& file,
 }
 
 static std::string type_for_decl(std::string type) {
-    type = trim(type);
+    type = trim_copy(type);
     if (type.empty())
         return "logic";
 
